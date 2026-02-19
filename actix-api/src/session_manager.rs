@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{ConnectionPhase, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::{FeatureFlags, SYSTEM_USER_EMAIL};
 
@@ -304,6 +304,7 @@ impl SessionManager {
             email: SYSTEM_USER_EMAIL.to_string(),
             session_id: session_id.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            connection_phase: ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED.into(),
             ..Default::default()
         };
 
@@ -323,6 +324,7 @@ impl SessionManager {
             packet_type: PacketType::MEETING.into(),
             email: SYSTEM_USER_EMAIL.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            connection_phase: ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED.into(),
             ..Default::default()
         };
 

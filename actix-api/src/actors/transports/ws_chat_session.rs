@@ -34,7 +34,10 @@ use actix::{
     Running, StreamHandler, WrapFuture,
 };
 use actix_web_actors::ws::{self, WebsocketContext};
+use protobuf::Message as ProtobufMessage;
 use tracing::{error, info, trace};
+use videocall_types::protos::packet_wrapper::packet_wrapper::ConnectionPhase;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{Email, RoomId, SessionId};
 
@@ -48,6 +51,9 @@ pub struct WsChatSession {
 
     /// Heartbeat tracking (transport-specific timing)
     heartbeat: Instant,
+
+    /// Track if ActivateConnection has been sent
+    activated: bool,
 }
 
 impl WsChatSession {
@@ -71,6 +77,7 @@ impl WsChatSession {
         WsChatSession {
             logic,
             heartbeat: Instant::now(),
+            activated: false,
         }
     }
 
@@ -106,38 +113,31 @@ impl Actor for WsChatSession {
 
         ctx.wait(
             async move { session_manager.start_session(&room, &email, &session_id).await }
-                .into_actor(self)
-                .map(|result, act, ctx| match result {
-                    Ok(result) => {
-                        let bytes = act
-                            .logic
-                            .build_meeting_started(result.start_time_ms, &result.creator_id);
-                        ctx.binary(bytes);
-                    }
-                    Err(e) => {
-                        error!("Failed to start session: {}", e);
-                        let bytes = act
-                            .logic
-                            .build_meeting_ended(&format!("Session rejected: {e}"));
-                        ctx.binary(bytes);
-                        ctx.close(Some(ws::CloseReason {
-                            code: ws::CloseCode::Policy,
-                            description: Some("Session rejected".to_string()),
-                        }));
-                        ctx.stop();
-                    }
-                }),
+            .into_actor(self)
+            .map(|result, act, ctx| match result {
+                Ok(result) => {
+                    let bytes = act
+                        .logic
+                        .build_meeting_started(result.start_time_ms, &result.creator_id);
+                    ctx.binary(bytes);
+                }
+                Err(e) => {
+                    error!("Failed to start session: {}", e);
+                    let bytes = act
+                        .logic
+                        .build_meeting_ended(&format!("Session rejected: {e}"));
+                    ctx.binary(bytes);
+                    ctx.close(Some(ws::CloseReason {
+                        code: ws::CloseCode::Policy,
+                        description: Some("Session rejected".to_string()),
+                    }));
+                    ctx.stop();
+                }
+            }),
         );
 
         // Start heartbeat
         self.start_heartbeat(ctx);
-
-        let addr = self.logic.addr.clone();
-        let session_id = self.logic.id.clone();
-        ctx.run_later(std::time::Duration::from_secs(5), move |_act, _ctx| {
-            let _ = addr.try_send(ActivateConnection { session: session_id.clone() });
-            info!("Auto-activating session {} after 5 seconds", session_id);
-        });
 
         // Register with ChatServer
         let addr = ctx.address();
@@ -216,6 +216,41 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             ws::Message::Binary(data) => {
                 // Update heartbeat
                 self.heartbeat = Instant::now();
+
+                // Check connection_phase from inbound packet
+                if !self.activated {
+                    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(&data) {
+                        if let Ok(phase) = packet_wrapper.connection_phase.enum_value() {
+                            match phase {
+                                ConnectionPhase::ACTIVE => {
+                                    // First ACTIVE packet - activate connection
+                                    self.logic.addr.do_send(ActivateConnection {
+                                        session: self.logic.id.clone(),
+                                    });
+                                    self.activated = true;
+                                    info!(
+                                        "Session {} activated on first ACTIVE packet",
+                                        self.logic.id
+                                    );
+                                }
+                                ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED => {
+                                    // Activate immediately for old clients
+                                    self.logic.addr.do_send(ActivateConnection {
+                                        session: self.logic.id.clone(),
+                                    });
+                                    self.activated = true;
+                                    info!(
+                                        "Session {} activated on UNSPECIFIED (old client)",
+                                        self.logic.id
+                                    );
+                                }
+                                ConnectionPhase::PROBING => {
+                                    // Do not activate during probing phase
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Delegate to shared logic
                 match self.logic.handle_inbound(&data) {

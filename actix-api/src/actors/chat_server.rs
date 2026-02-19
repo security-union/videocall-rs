@@ -37,7 +37,7 @@ use videocall_types::SYSTEM_USER_EMAIL;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use protobuf::Message as ProtobufMessage;
 
-use super::session_logic::{SessionId, ConnectionState};
+use super::session_logic::{ConnectionState, SessionId};
 
 /// Internal message to clean up active_subs when a spawned join task fails.
 /// This fixes a race condition where start_session could fail inside the spawned task,
@@ -201,36 +201,36 @@ impl Handler<ClientMessage> for ChatServer {
             user: _,
         } = msg;
         trace!("got message in server room {room} session {session}");
-        
+
         // Check connection state - only publish to NATS if Active
         let connection_state = self.connection_states.get(&session)
             .copied()
             .unwrap_or(ConnectionState::Testing);
-        
+
         if connection_state != ConnectionState::Active {
             trace!("Skipping NATS publish for session {} in Testing state", session);
             return; // Don't publish during Testing state
         }
-        
+
         let nc = self.nats_connection.clone();
         let subject = format!("room.{room}.{session}");
         let subject = subject.replace(' ', "_");
 
         let packet_bytes = if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
-            if packet_wrapper.session_id.is_empty() {
-                packet_wrapper.session_id = session.clone();
-            }
-            match packet_wrapper.write_to_bytes() {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    error!("Failed to serialize PacketWrapper with session_id: {}", e);
-                    msg.data.to_vec() 
+                if packet_wrapper.session_id.is_empty() {
+                    packet_wrapper.session_id = session.clone();
                 }
-            }
-        } else {
-            msg.data.to_vec()
-        };
-        
+                match packet_wrapper.write_to_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!("Failed to serialize PacketWrapper with session_id: {}", e);
+                        msg.data.to_vec()
+                    }
+                }
+            } else {
+                msg.data.to_vec()
+            };
+
         let b = bytes::Bytes::from(packet_bytes);
         let fut = async move {
             match nc.publish(subject.clone(), b).await {
@@ -303,7 +303,7 @@ impl Handler<JoinRoom> for ChatServer {
                         session_id,
                     );
                     send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id, &result.session_id)
-                        .await;
+                    .await;
                 }
                 Err(e) => {
                     error!(
@@ -645,5 +645,327 @@ mod tests {
         );
 
         FeatureFlags::clear_meeting_management_override();
+    }
+
+    // ==========================================================================
+    // TEST: Two clients with same email get unique session_id values
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_same_email_unique_session_ids() {
+        use crate::actors::session_logic::SessionLogic;
+        use crate::server_diagnostics::{TrackerMessage, TrackerSender};
+        use crate::session_manager::SessionManager;
+        use tokio::sync::mpsc;
+
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone(), Some(pool.clone()))
+            .await
+            .start();
+
+        let (tx, _rx) = mpsc::unbounded_channel::<TrackerMessage>();
+        let tracker_sender: TrackerSender = tx;
+        let session_manager = SessionManager::new(Some(pool));
+
+        // Create two sessions with the same email
+        let email = "same-user@example.com".to_string();
+        let room = "test-room-unique".to_string();
+
+        let session1 = SessionLogic::new(
+            chat_server.clone(),
+            room.clone(),
+            email.clone(),
+            nats_client.clone(),
+            tracker_sender.clone(),
+            session_manager.clone(),
+        );
+
+        let session2 = SessionLogic::new(
+            chat_server.clone(),
+            room.clone(),
+            email.clone(),
+            nats_client.clone(),
+            tracker_sender.clone(),
+            session_manager.clone(),
+        );
+
+        // Verify they have different session IDs
+        assert_ne!(
+            session1.id, session2.id,
+            "Two sessions with same email should have different session_id values"
+        );
+        assert!(!session1.id.is_empty(), "Session ID should not be empty");
+        assert!(!session2.id.is_empty(), "Session ID should not be empty");
+    }
+
+    // ==========================================================================
+    // TEST: ConnectionState transitions - Testing does not publish to NATS
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_connection_state_testing_does_not_publish() {
+        use crate::messages::server::Packet;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone(), Some(pool)).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = "test-session-state".to_string();
+        let room = "test-room-state".to_string();
+
+        // Register session - starts in Testing state
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Subscribe to NATS subject to detect publishes
+        let subject = format!("room.{}.{}", room, session_id).replace(' ', "_");
+        let published = Arc::new(AtomicBool::new(false));
+        let published_clone = published.clone();
+        let mut sub = nats_client
+            .subscribe(subject.clone())
+            .await
+            .expect("Failed to subscribe");
+
+        // Spawn task to check for messages
+        tokio::spawn(async move {
+            if let Ok(Some(_msg)) = tokio::time::timeout(Duration::from_millis(500), sub.next()).await
+            {
+                published_clone.store(true, Ordering::Relaxed);
+            }
+        });
+
+        // Send message while in Testing state - should NOT publish
+        chat_server
+            .send(ClientMessage {
+                session: session_id,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(b"test data".to_vec()),
+                },
+                user: "test@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        // Wait a bit to ensure no publish happened
+        sleep(Duration::from_millis(600)).await;
+
+        assert!(
+            !published.load(Ordering::Relaxed),
+            "Message should NOT be published while in Testing state"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: ConnectionState transitions - Active publishes to NATS
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_connection_state_active_publishes() {
+        use crate::messages::server::Packet;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone(), Some(pool)).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = "test-session-active".to_string();
+        let room = "test-room-active".to_string();
+
+        // Register session - starts in Testing state
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Activate the connection
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Subscribe to NATS subject to detect publishes
+        let subject = format!("room.{}.{}", room, session_id).replace(' ', "_");
+        let published = Arc::new(AtomicBool::new(false));
+        let published_clone = published.clone();
+        let mut sub = nats_client
+            .subscribe(subject.clone())
+            .await
+            .expect("Failed to subscribe");
+
+        // Spawn task to check for messages
+        tokio::spawn(async move {
+            if let Ok(Some(_msg)) = tokio::time::timeout(Duration::from_millis(500), sub.next()).await
+            {
+                published_clone.store(true, Ordering::Relaxed);
+            }
+        });
+
+        // Send message while in Active state - should publish
+        chat_server
+            .send(ClientMessage {
+                session: session_id,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(b"test data".to_vec()),
+                },
+                user: "test@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        // Wait for publish
+        sleep(Duration::from_millis(600)).await;
+
+        assert!(
+            published.load(Ordering::Relaxed),
+            "Message should be published while in Active state"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: ActivateConnection handler is idempotent
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_activate_connection_idempotent() {
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = "test-session-idempotent".to_string();
+
+        // Register session - starts in Testing state
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // First activation - should transition Testing -> Active
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Verify state is Active
+        let state1 = chat_server
+            .send(GetConnectionState {
+                session: session_id,
+            })
+            .await
+            .expect("GetConnectionState should succeed")
+            .expect("GetConnectionState should return Ok");
+        assert_eq!(
+            state1,
+            ConnectionState::Active,
+            "State should be Active after first activation"
+        );
+
+        // Second activation - should remain Active (idempotent)
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Verify state is still Active
+        let state2 = chat_server
+            .send(GetConnectionState {
+                session: session_id,
+            })
+            .await
+            .expect("GetConnectionState should succeed")
+            .expect("GetConnectionState should return Ok");
+        assert_eq!(
+            state2,
+            ConnectionState::Active,
+            "State should remain Active after second activation (idempotent)"
+        );
+    }
+
+    // Helper message to get connection state for testing
+    #[derive(ActixMessage)]
+    #[rtype(result = "Result<ConnectionState, ()>")]
+    struct GetConnectionState {
+        session: SessionId,
+    }
+
+    impl Handler<GetConnectionState> for ChatServer {
+        type Result = Result<ConnectionState, ()>;
+
+        fn handle(&mut self, msg: GetConnectionState, _ctx: &mut Self::Context) -> Self::Result {
+            Ok(self.connection_states
+                .get(&msg.session)
+                .copied()
+                .unwrap_or(ConnectionState::Testing))
+        }
     }
 }

@@ -27,7 +27,7 @@ use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
@@ -430,7 +430,7 @@ impl VideoCallClient {
                 peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
                 peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
-                if let Some(cb) = &opts.on_peer_removed {
+                if let Some(cb) = opts.on_peer_removed.as_ref() {
                     peer_decode_manager.on_peer_removed = cb.clone();
                 }
                 peer_decode_manager
@@ -440,7 +440,7 @@ impl VideoCallClient {
                 peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
                 peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
-                if let Some(cb) = &opts.on_peer_removed {
+                if let Some(cb) = opts.on_peer_removed.as_ref() {
                     peer_decode_manager.on_peer_removed = cb.clone();
                 }
                 peer_decode_manager
@@ -510,11 +510,14 @@ impl VideoCallClient {
 
     pub fn get_peer_email(&self, session_id: &str) -> Option<String> {
         match self.inner.try_borrow() {
-            Ok(inner) => {
-                inner.peer_decode_manager.get(&session_id.to_string())
-                    .map(|peer| peer.email.clone())
-           },
-            Err(_) => None,
+            Ok(inner) => inner
+                .peer_decode_manager
+                .get(&session_id.to_string())
+                .map(|peer| peer.email.clone()),
+            Err(_) => {
+                warn!("Failed to borrow inner in get_peer_email for session_id: {}", session_id);
+                None
+            }
         }
     }
 
@@ -948,8 +951,16 @@ impl Inner {
                                 );
                                 // Store own session_id for use in outgoing packets
                                 self.own_session_id = Some(meeting_packet.session_id.clone());
-                            
-                                
+
+                                // Set own_session_id in ConnectionManager for self-packet filtering
+                                if let Some(connection_controller) = &self.connection_controller {
+                                    if let Err(e) = connection_controller
+                                        .set_own_session_id(meeting_packet.session_id.clone())
+                                    {
+                                        warn!("Failed to set own_session_id in ConnectionManager: {e}");
+                                    }
+                                }
+
                                 if let Some(callback) = &self.options.on_meeting_info {
                                     callback.emit(meeting_packet.start_time_ms as f64);
                                 }

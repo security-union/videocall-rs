@@ -29,7 +29,7 @@ use std::rc::Rc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{ConnectionPhase, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
@@ -108,6 +108,7 @@ pub struct ConnectionManager {
     rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
+    own_session_id: Rc<RefCell<Option<String>>>, // Own session_id for filtering self-packets
 }
 
 impl ConnectionManager {
@@ -137,7 +138,8 @@ impl ConnectionManager {
             rtt_responses,
             options,
             aes,
-        };
+            own_session_id: Rc::new(RefCell::new(None)),
+         };
 
         // Immediately start creating connections and testing
         manager.start_election()?;
@@ -264,14 +266,15 @@ impl ConnectionManager {
         let aes = self.aes.clone();
         let on_inbound_media = self.options.on_inbound_media.clone();
         let rtt_responses = self.rtt_responses.clone();
+        let own_session_id = self.own_session_id.clone();
 
         Callback::from(move |packet: PacketWrapper| {
             // Handle RTT responses internally
             if packet.email == userid {
                 let reception_time = js_sys::Date::now();
-            if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
-                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
-                    if media_packet.media_type == MediaType::RTT.into() {
+                if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
+                    if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
+                        if media_packet.media_type == MediaType::RTT.into() {
                             debug!(
                                 "RTT response received on connection {} at {}, sent at {}",
                                 connection_id, reception_time, media_packet.timestamp
@@ -292,7 +295,18 @@ impl ConnectionManager {
                 }
             }
 
-            // Forward all non-RTT packets to the main handler
+            // Filter self-packets using session_id
+            if let Some(ref own_id) = *own_session_id.borrow() {
+                if !packet.session_id.is_empty() && packet.session_id == *own_id {
+                    debug!(
+                        "Rejecting packet from same session_id: {}",
+                        packet.session_id
+                    );
+                    return; // Don't forward self-packets
+                }
+            }
+
+            // Forward all non-RTT, non-self packets to the main handler
             on_inbound_media.emit(packet);
         })
     }
@@ -378,6 +392,7 @@ impl ConnectionManager {
         Ok(PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
             email: self.options.userid.clone(),
+            connection_phase: ConnectionPhase::PROBING.into(),
             data,
             ..Default::default()
         })
@@ -442,7 +457,7 @@ impl ConnectionManager {
                     connection_id: connection_id.clone(),
                     elected_at: js_sys::Date::now(),
                 };
-                
+
                 // Start heartbeat only on the elected connection
                 if let Some(connection) = self.connections.get_mut(&connection_id) {
                     connection.start_heartbeat(self.options.userid.clone());
@@ -809,6 +824,12 @@ impl ConnectionManager {
         }
 
         Err(anyhow!("No active connection available"))
+    }
+
+    /// Set own session_id for filtering self-packets
+    pub fn set_own_session_id(&self, session_id: String) {
+        *self.own_session_id.borrow_mut() = Some(session_id.clone());
+        debug!("Set own_session_id for self-packet filtering and stored for active connection");
     }
 
     /// Check if manager has an active connection

@@ -30,6 +30,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
+use videocall_types::protos::packet_wrapper::packet_wrapper::ConnectionPhase;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use yew::prelude::Callback;
@@ -130,19 +131,20 @@ impl Connection {
                 heartbeat_metadata: Some(heartbeat_metadata).into(),
                 ..Default::default()
             };
-            
+
             let data = aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap();
             let mut packet_wrapper = PacketWrapper {
                 data,
                 email: userid.clone(),
                 packet_type: PacketType::MEDIA.into(),
+                connection_phase: ConnectionPhase::ACTIVE.into(),
                 ..Default::default()
             };
-            
+
             if let Some(sid) = session_id.borrow().as_ref() {
                 packet_wrapper.session_id = sid.clone();
             }
-            
+
             if let Status::Connected = status.get() {
                 task.send_packet(packet_wrapper);
             }

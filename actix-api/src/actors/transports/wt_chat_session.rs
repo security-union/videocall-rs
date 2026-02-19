@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
-use crate::messages::server::{ClientMessage, Packet};
+use crate::messages::server::{ActivateConnection, ClientMessage, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -33,9 +33,12 @@ use actix::{
     Handler, Message as ActixMessage, Running, WrapFuture,
 };
 use bytes::Bytes;
+use protobuf::Message as ProtobufMessage;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
+use videocall_types::protos::packet_wrapper::packet_wrapper::ConnectionPhase;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{Email, RoomId, SessionId};
 
@@ -87,6 +90,9 @@ pub struct WtChatSession {
 
     /// Channel to send data back to WebTransport session
     outbound_tx: mpsc::Sender<WtOutbound>,
+
+    /// Track if ActivateConnection has been sent
+    activated: bool,
 }
 
 impl WtChatSession {
@@ -112,6 +118,7 @@ impl WtChatSession {
             logic,
             heartbeat: actix::clock::Instant::now(),
             outbound_tx,
+            activated: false,
         }
     }
 
@@ -189,34 +196,27 @@ impl Actor for WtChatSession {
 
         ctx.wait(
             async move { session_manager.start_session(&room, &email, &session_id).await }
-                .into_actor(self)
-                .map(|result, act, ctx| match result {
-                    Ok(result) => {
-                        let bytes = act
-                            .logic
-                            .build_meeting_started(result.start_time_ms, &result.creator_id);
-                        act.send(bytes);
-                    }
-                    Err(e) => {
-                        error!("Failed to start session: {}", e);
-                        let bytes = act
-                            .logic
-                            .build_meeting_ended(&format!("Session rejected: {e}"));
-                        act.send(bytes);
-                        ctx.stop();
-                    }
-                }),
+            .into_actor(self)
+            .map(|result, act, ctx| match result {
+                Ok(result) => {
+                    let bytes = act
+                        .logic
+                        .build_meeting_started(result.start_time_ms, &result.creator_id);
+                    act.send(bytes);
+                }
+                Err(e) => {
+                    error!("Failed to start session: {}", e);
+                    let bytes = act
+                        .logic
+                        .build_meeting_ended(&format!("Session rejected: {e}"));
+                    act.send(bytes);
+                    ctx.stop();
+                }
+            }),
         );
 
         // Start heartbeat
         self.start_heartbeat(ctx);
-
-       let addr = self.logic.addr.clone();
-        let session_id = self.logic.id.clone();
-        ctx.run_later(std::time::Duration::from_secs(5), move |_act, _ctx| {
-            let _ = addr.try_send(crate::messages::server::ActivateConnection { session: session_id.clone() });
-            info!("Auto-activating session {} after 5 seconds", session_id);
-        });
 
         // Register with ChatServer
         let addr = ctx.address();
@@ -272,6 +272,38 @@ impl Handler<WtInbound> for WtChatSession {
         if msg.source == WtInboundSource::Datagram && msg.data.as_ref() == KEEP_ALIVE_PING {
             trace!("Received keep-alive ping for session {}", self.logic.id);
             return;
+        }
+
+        // Check connection_phase from inbound packet
+        if !self.activated {
+            if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(msg.data.as_ref()) {
+                if let Ok(phase) = packet_wrapper.connection_phase.enum_value() {
+                    match phase {
+                        ConnectionPhase::ACTIVE => {
+                            // First ACTIVE packet - activate connection
+                            self.logic.addr.do_send(ActivateConnection {
+                                session: self.logic.id.clone(),
+                            });
+                            self.activated = true;
+                            info!("Session {} activated on first ACTIVE packet", self.logic.id);
+                        }
+                        ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED => {
+                            // Activate immediately for old clients (backward compatibility)
+                            self.logic.addr.do_send(ActivateConnection {
+                                session: self.logic.id.clone(),
+                            });
+                            self.activated = true;
+                            info!(
+                                "Session {} activated on UNSPECIFIED (old client)",
+                                self.logic.id
+                            );
+                        }
+                        ConnectionPhase::PROBING => {
+                            // Do not activate during probing phase
+                        }
+                    }
+                }
+            }
         }
 
         // Delegate to shared logic

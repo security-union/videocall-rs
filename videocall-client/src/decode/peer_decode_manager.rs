@@ -84,7 +84,7 @@ pub struct Peer {
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
     pub session_id: String,
-    pub email:String,
+    pub email: String,
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
@@ -112,7 +112,7 @@ impl Peer {
         video_canvas_id: String,
         screen_canvas_id: String,
         session_id: String,
-        email:String,
+        email: String,
         aes: Option<Aes128State>,
     ) -> Result<Self, JsValue> {
         let (mut audio, video, screen) =
@@ -180,8 +180,11 @@ impl Peer {
     }
 
     fn reset(&mut self) -> Result<(), JsValue> {
-        let (mut audio, video, screen) =
-            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &self.video_canvas_id)?;
+        let (mut audio, video, screen) = Self::new_decoders(
+            &self.video_canvas_id,
+            &self.screen_canvas_id,
+            &self.session_id,
+        )?;
 
         // Preserve the current mute state after reset
         audio.set_muted(!self.audio_enabled);
@@ -485,7 +488,7 @@ impl PeerDecodeManager {
         let packet = Arc::new(response);
         let peer_session_id = packet.session_id.clone();
     
-        
+
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             // Set worker diagnostics context once per peer
             if !peer.context_initialized {

@@ -100,7 +100,7 @@ services:
       - type: bind
         source: ../
         target: /app
-      - nix-store-backend:/nix
+      - nix-store-meeting-api:/nix
       - rustlemania-meeting-api-cargo-registry-cache:/root/.cargo/registry
       - rustlemania-meeting-api-cargo-git-cache:/root/.cargo/git
       - rustlemania-meeting-api-cache:/app/meeting-api/target
@@ -139,7 +139,7 @@ services:
       - type: bind
         source: ../
         target: /app
-      - nix-store-backend:/nix
+      - nix-store-websocket-api:/nix
       - rustlemania-actix-web-cargo-registry-cache:/root/.cargo/registry
       - rustlemania-actix-web-cargo-git-cache:/root/.cargo/git
       - rustlemania-actix-web-target-cache:/app/actix-api/target
@@ -172,7 +172,7 @@ services:
       - type: bind
         source: ../
         target: /app
-      - nix-store-backend:/nix
+      - nix-store-metrics-api:/nix
       - rustlemania-actix-web-cargo-registry-cache:/root/.cargo/registry
       - rustlemania-actix-web-cargo-git-cache:/root/.cargo/git
       - rustlemania-actix-web-target-cache:/app/actix-api/target
@@ -204,7 +204,7 @@ services:
       - type: bind
         source: ../
         target: /app
-      - nix-store-backend:/nix
+      - nix-store-server-stats-api:/nix
       - rustlemania-actix-web-cargo-registry-cache:/root/.cargo/registry
       - rustlemania-actix-web-cargo-git-cache:/root/.cargo/git
       - rustlemania-actix-web-target-cache:/app/actix-api/target
@@ -241,7 +241,7 @@ services:
       - type: bind
         source: ../
         target: /app
-      - nix-store-backend:/nix
+      - nix-store-webtransport-api:/nix
       - rustlemania-actix-web-cargo-registry-cache:/root/.cargo/registry
       - rustlemania-actix-web-cargo-git-cache:/root/.cargo/git
       - rustlemania-actix-web-target-cache:/app/actix-api/target
@@ -272,7 +272,7 @@ services:
         source: ./bot-config.yaml
         target: /config/bot-config.yaml
         read_only: true
-      - nix-store-backend:/nix
+      - nix-store-synthetic-clients:/nix
       - rustlemania-bot-cargo-registry-cache:/root/.cargo/registry
       - rustlemania-bot-cargo-git-cache:/root/.cargo/git
       - rustlemania-bot-cache:/app/bot/target
@@ -340,7 +340,12 @@ services:
 volumes:
   nix-store-yew:
   nix-store-website:
-  nix-store-backend:
+  nix-store-meeting-api:
+  nix-store-websocket-api:
+  nix-store-metrics-api:
+  nix-store-server-stats-api:
+  nix-store-webtransport-api:
+  nix-store-synthetic-clients:
   rustlemania-meeting-api-cargo-registry-cache:
   rustlemania-meeting-api-cargo-git-cache:
   rustlemania-meeting-api-cache:

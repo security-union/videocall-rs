@@ -24,7 +24,7 @@ on:
       - 'videocall-meeting-types/**'
       - 'Dockerfile.meeting-api'
       # Docker directory changes
-      - 'docker/Dockerfile.actix'
+      - 'docker/Dockerfile.actix.dev'
       - 'docker/Dockerfile.yew.dev'
       - 'docker/start-yew.sh'
       # Website image dependencies

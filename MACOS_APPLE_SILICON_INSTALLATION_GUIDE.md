@@ -15,7 +15,8 @@ If you're running on a Mac with Apple Silicon (M1/M2/M3/M4), follow these steps 
 
 - Open **Docker Desktop**
 - Go to **Settings → General**
-- Enable **"Use Rosetta for x86/amd64 emulation on Apple Silicon"**
+- Enable **"Use Apple Virtualization Framework"**
+- Keep **"Use Rosetta for x86/amd64 emulation on Apple Silicon"** disabled since nix will pull in the appropriate toolchain for the host architecture
 - Enable **"VirtioFS accelerated directory sharing"** (under Virtual Machine Options)
 - Click **"Apply & Restart"**
 

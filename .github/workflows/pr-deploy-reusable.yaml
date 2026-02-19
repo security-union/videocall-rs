@@ -109,7 +109,7 @@ jobs:
             sleep 30
 
             # Re-check for available slots
-            for SLOT in 1 2 3; do
+            for SLOT in $(seq 1 $MAX_SLOTS); do
               if ! kubectl get namespace preview-slot-${SLOT} >/dev/null 2>&1; then
                 AVAILABLE_SLOT=$SLOT
                 echo "✅ Found available slot after waiting: ${SLOT}"

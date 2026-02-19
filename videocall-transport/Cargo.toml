@@ -1,0 +1,53 @@
+[package]
+name = "videocall-transport"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Framework-agnostic WebSocket and WebTransport wrappers for videocall.rs"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+readme = "README.md"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>",
+]
+keywords = ["quic", "webtransport", "websocket", "wasm"]
+categories = ["network-programming", "wasm"]
+exclude = ["tests/"]
+
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "web_sys_unstable_apis"]
+all-features = true
+targets = ["wasm32-unknown-unknown"]
+
+[dependencies]
+anyhow = { workspace = true }
+futures = "0.3"
+gloo = "0.8.0"
+gloo-console = "0.3"
+js-sys = "0.3"
+log = "0.4"
+thiserror = "1.0"
+videocall-types = { path = "../videocall-types", version = "4.0.1" }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "BinaryType",
+    "Event",
+    "MessageEvent",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "WebSocket",
+    "WebTransport",
+    "WebTransportBidirectionalStream",
+    "WebTransportCloseInfo",
+    "WebTransportDatagramDuplexStream",
+    "WebTransportReceiveStream",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    "ReadableStreamReadResult",
+    "WebTransportSendStream",
+]

@@ -1,6 +1,6 @@
 [package]
 name = "videocall-ui"
-version = "1.1.37"
+version = "1.1.38"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A Yew UI for the videocall project"
@@ -21,11 +21,11 @@ path = "src/main.rs"
 [dependencies]
 yew = { version = "0.21", features = ["csr"] }
 wasm-bindgen = { workspace = true }
-videocall-client = { path= "../videocall-client", version = "4.0.1" }
+videocall-client = { path= "../videocall-client", version = "4.0.2" }
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.3" }
 videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.0" }
 videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.1" }
-videocall-types = { path= "../videocall-types", version = "4.0.0" }
+videocall-types = { path= "../videocall-types", version = "4.0.1" }
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
 once_cell = "1.19"
@@ -51,13 +51,17 @@ urlencoding = "2.1"
 [dependencies.web-sys]
 version = "0.3.72"
 features = [
+    "DomTokenList",
+    "Element",
+    "HtmlAudioElement",
     "HtmlDocument",
-    "console",
+    "HtmlSelectElement",
+    "MediaDeviceInfo",
     "Navigator",
     "Storage",
     "Document",
     "Clipboard",
-    "HtmlAudioElement",
+    "console",
 ]
 
 [dev-dependencies]

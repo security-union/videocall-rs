@@ -205,7 +205,7 @@ impl Drop for ConnectionController {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use yew::prelude::Callback;
+    use videocall_types::Callback;
 
     // Test helper to capture state changes
     #[derive(Debug, Clone)]

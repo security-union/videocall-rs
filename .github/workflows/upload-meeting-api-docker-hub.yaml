@@ -12,6 +12,8 @@ on:
       - Dockerfile.meeting-api
       - Cargo.lock
       - Cargo.toml
+      - flake.nix
+      - flake.lock
 
 jobs:
   push_to_registry:

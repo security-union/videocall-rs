@@ -21,7 +21,7 @@ path = "src/main.rs"
 [dependencies]
 yew = { version = "0.21", features = ["csr"] }
 wasm-bindgen = { workspace = true }
-videocall-client = { path= "../videocall-client", version = "4.0.3", features = ["wasm"] }
+videocall-client = { path= "../videocall-client", version = "4.0.3" }
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.3" }
 videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.0" }
 videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.1" }

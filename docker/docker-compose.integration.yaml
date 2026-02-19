@@ -44,6 +44,7 @@ services:
       - type: bind
         source: ../
         target: /app
+      - nix-store-it-tests:/nix
       - rustlemania-it-tests-registry:/root/.cargo/registry
       - rustlemania-it-tests-git:/root/.cargo/git
       - rustlemania-it-tests-cache:/app/actix-api/target
@@ -66,6 +67,7 @@ services:
       '
 
 volumes:
+  nix-store-it-tests:
   rustlemania-it-tests-registry:
   rustlemania-it-tests-git:
   rustlemania-it-tests-cache:

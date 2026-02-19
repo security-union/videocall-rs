@@ -123,7 +123,7 @@
         });
 
         devShells.backend-dev = pkgs.mkShell (backendEnv // {
-          nativeBuildInputs = [ backendRustDev pkgs.cargo-watch ] ++ backendBuildInputs;
+          nativeBuildInputs = [ backendRustDev pkgs.cargo-watch pkgs.cargo-machete ] ++ backendBuildInputs;
         });
 
         devShells.default = self.devShells.${system}.yew-ui-dev;

@@ -2,6 +2,8 @@ FROM nixos/nix:2.33.2
 
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 
+RUN git config --global --add safe.directory /app
+
 WORKDIR /app
 
 COPY flake.nix flake.lock ./

@@ -28,7 +28,7 @@ gloo-console = "0.3"
 js-sys = "0.3"
 log = "0.4"
 thiserror = "1.0"
-videocall-types = { path = "../videocall-types", version = "4.0.0" }
+videocall-types = { path = "../videocall-types", version = "4.0.1" }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 

@@ -8,6 +8,7 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  packages: read
 
 jobs:
   check-permissions:
@@ -226,21 +227,87 @@ jobs:
         if: steps.capacity.outputs.capacity_exceeded == 'true'
         run: exit 1
 
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Verify GHCR images exist
+        id: verify-images
         run: |
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
 
           echo "Checking if GHCR images exist for pr-${PR_NUM}..."
 
-          # Note: This is a best-effort check. GHCR API requires authentication for package listing.
-          # If images don't exist, the helm deployment will fail with ImagePullBackOff.
+          IMAGES=(
+            "ghcr.io/jboyd01/videocall-media-server:pr-${PR_NUM}"
+            "ghcr.io/jboyd01/videocall-meeting-api:pr-${PR_NUM}"
+            "ghcr.io/jboyd01/videocall-web-ui:pr-${PR_NUM}"
+          )
 
-          echo "Images expected:"
-          echo "  - ghcr.io/jboyd01/videocall-media-server:pr-${PR_NUM}"
-          echo "  - ghcr.io/jboyd01/videocall-meeting-api:pr-${PR_NUM}"
-          echo "  - ghcr.io/jboyd01/videocall-web-ui:pr-${PR_NUM}"
+          MISSING_IMAGES=()
 
-          echo "✅ Proceeding with deployment (images will be verified during pod startup)"
+          for IMAGE in "${IMAGES[@]}"; do
+            echo "Checking ${IMAGE}..."
+            if docker manifest inspect ${IMAGE} >/dev/null 2>&1; then
+              echo "  ✅ Found"
+            else
+              echo "  ❌ Not found"
+              MISSING_IMAGES+=("${IMAGE}")
+            fi
+          done
+
+          if [ ${#MISSING_IMAGES[@]} -gt 0 ]; then
+            echo "images_missing=true" >> $GITHUB_OUTPUT
+            echo "missing_list<<EOF" >> $GITHUB_OUTPUT
+            for IMG in "${MISSING_IMAGES[@]}"; do
+              echo "- \`${IMG}\`" >> $GITHUB_OUTPUT
+            done
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "images_missing=false" >> $GITHUB_OUTPUT
+            echo "✅ All images found"
+          fi
+
+      - name: Post images missing error comment
+        if: steps.verify-images.outputs.images_missing == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const missingList = `${{ steps.verify-images.outputs.missing_list }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Images not found**
+
+            Cannot deploy PR #${{ needs.check-permissions.outputs.pr_number }} because required Docker images have not been built yet.
+
+            **Missing images:**
+            ${missingList}
+
+            **Action required:** Comment \`/build-images\` to build and push the required images, then try \`/deploy\` again.
+
+            ⏱️ Image builds typically take 10-15 minutes.`
+            });
+
+      - name: React to comment (images missing)
+        if: steps.verify-images.outputs.images_missing == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'confused'
+            })
+
+      - name: Fail if images missing
+        if: steps.verify-images.outputs.images_missing == 'true'
+        run: exit 1
 
       - name: Create namespace
         run: |
@@ -518,8 +585,7 @@ jobs:
             If new commits are pushed to the PR, comment \`/deploy\` again to redeploy with the latest changes.
 
             **Deployment Logs:**
-            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}]
-            `
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`
             })
 
   cleanup-on-failure:

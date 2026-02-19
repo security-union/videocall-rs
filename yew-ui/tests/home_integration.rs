@@ -31,6 +31,9 @@ use videocall_ui::pages::home::Home;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
+use wasm_bindgen::JsCast;
+use web_sys::{Event, HtmlInputElement};
+
 // ---------------------------------------------------------------------------
 // Wrapper component — mirrors AppRoot's context without the route switch,
 // so we always render Home regardless of the test-runner's URL path.
@@ -200,4 +203,78 @@ async fn missing_config_shows_error_not_home() {
     );
 
     cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn home_rejects_invalid_display_name() {
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    yew::Renderer::<HomeTestWrapper>::with_root(mount.clone()).render();
+    sleep(Duration::ZERO).await;
+
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value("John&Doe");
+    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+
+    sleep(Duration::ZERO).await;
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Invalid character"),
+        "Expected invalid character error, got page text: {text}"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_normalizes_spaces_in_display_name() {
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    yew::Renderer::<HomeTestWrapper>::with_root(mount.clone()).render();
+    sleep(Duration::ZERO).await;
+
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value("  John    Doe   ");
+    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+
+    sleep(Duration::ZERO).await;
+
+    let username_after = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+
+    assert_eq!(username_after.value(), "John Doe");
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
 }

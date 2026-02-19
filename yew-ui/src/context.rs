@@ -107,3 +107,72 @@ static USERNAME_RE: Lazy<regex::Regex> =
 pub fn is_valid_username(name: &str) -> bool {
     !name.is_empty() && USERNAME_RE.is_match(name)
 }
+
+// -----------------------------------------------------------------------------
+// Display name validation
+// -----------------------------------------------------------------------------
+
+pub const DISPLAY_NAME_MAX_LEN: usize = 50;
+
+/// Trim and collapse multiple spaces into one
+pub fn normalize_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+
+    for ch in s.trim().chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+
+    out
+}
+
+/// Allowed characters for display names
+pub fn is_allowed_display_name_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || ch == ' '
+        || ch == '_'
+        || ch == '-'
+        || ch == '\''
+        || ch == '"'
+}
+
+/// Validate and normalize a display name
+/// Returns normalized value on success, otherwise a clear error message
+pub fn validate_display_name(raw: &str) -> Result<String, String> {
+    let value = normalize_spaces(raw);
+
+    if value.is_empty() {
+        return Err("Name cannot be empty.".to_string());
+    }
+
+    if value.chars().count() > DISPLAY_NAME_MAX_LEN {
+        return Err(format!(
+            "Name is too long (max {} characters).",
+            DISPLAY_NAME_MAX_LEN
+        ));
+    }
+
+    let mut invalid_chars: Vec<char> = Vec::new();
+    for ch in value.chars() {
+        if !is_allowed_display_name_char(ch) {
+            invalid_chars.push(ch);
+        }
+    }
+
+    if !invalid_chars.is_empty() {
+        return Err(format!(
+            "Invalid character(s): {:?}. Allowed: letters, numbers, spaces, '_', '-', apostrophe (') and double quote (\").",
+            invalid_chars
+        ));
+    }
+
+    Ok(value)
+}

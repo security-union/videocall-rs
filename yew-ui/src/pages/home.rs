@@ -23,7 +23,9 @@ use yew_router::prelude::*;
 use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::components::meetings_list::MeetingsList;
 use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
+    is_valid_username, load_username_from_storage, save_username_to_storage, validate_display_name,
+    DISPLAY_NAME_MAX_LEN,
+    UsernameCtx,
 };
 use crate::routing::Route;
 use web_time::SystemTime;
@@ -34,7 +36,6 @@ const TEXT_INPUT_CLASSES: &str = "input-apple";
 pub fn home() -> Html {
     let navigator = use_navigator().unwrap();
 
-    let username_ref = use_node_ref();
     let meeting_id_ref = use_node_ref();
 
     // Track meeting ID value for enabling/disabling the submit button
@@ -48,6 +49,13 @@ pub fn home() -> Html {
         load_username_from_storage().unwrap_or_default()
     };
 
+    // Controlled username value
+    let username_value = use_state(|| existing_username.clone());
+
+    // Inline error messages
+    let username_error = use_state(|| None as Option<String>);
+    let meeting_id_error = use_state(|| None as Option<String>);
+
     // If we already have a stored username, set the Matomo user id early
     use_effect_with((), {
         let uid = existing_username.clone();
@@ -60,26 +68,46 @@ pub fn home() -> Html {
     });
 
     let onsubmit = {
-        let username_ref = username_ref.clone();
         let meeting_id_ref = meeting_id_ref.clone();
         let navigator = navigator.clone();
         let username_ctx = username_ctx.clone();
+
+        let username_value = username_value.clone();
+        let username_error = username_error.clone();
+        let meeting_id_error = meeting_id_error.clone();
+
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
-            let username = username_ref.cast::<HtmlInputElement>().unwrap().value();
+
+            let username_raw = (*username_value).clone();
             let meeting_id = meeting_id_ref.cast::<HtmlInputElement>().unwrap().value();
-            if !is_valid_username(&username) || meeting_id.is_empty() {
-                let _ = web_sys::window().unwrap().alert_with_message(
-                    "Please provide a valid username and meeting id (a-z, A-Z, 0-9, _).",
-                );
+
+            // Reset errors
+            username_error.set(None);
+            meeting_id_error.set(None);
+
+            // Validate display name (user-friendly)
+            let username = match validate_display_name(&username_raw) {
+                Ok(v) => v,
+                Err(msg) => {
+                    username_error.set(Some(msg));
+                    return;
+                }
+            };
+
+            username_value.set(username.clone());
+
+            if meeting_id.is_empty() || !is_valid_username(&meeting_id) {
+                meeting_id_error.set(Some(
+                    "Please provide a valid meeting id (a-z, A-Z, 0-9, _).".to_string(),
+                ));
                 return;
             }
+
             save_username_to_storage(&username);
-            username_ctx.set(Some(username));
-            // Set Matomo user id for attribution
-            if let Some(name) = &*username_ctx {
-                matomo_logger::set_user_id(name);
-            }
+            username_ctx.set(Some(username.clone()));
+            matomo_logger::set_user_id(&username);
+
             navigator.push(&Route::Meeting { id: meeting_id });
         })
     };
@@ -98,24 +126,32 @@ pub fn home() -> Html {
     }
 
     let create_meeting = {
-        let username_ref = username_ref.clone();
         let navigator = navigator.clone();
         let username_ctx = username_ctx.clone();
+
+        let username_value = username_value.clone();
+        let username_error = username_error.clone();
+        let meeting_id_error = meeting_id_error.clone();
+
         Callback::from(move |_| {
-            let username = username_ref.cast::<HtmlInputElement>().unwrap().value();
-            if !is_valid_username(&username) {
-                let _ = web_sys::window()
-                    .unwrap()
-                    .alert_with_message("Please enter a valid username before creating a meeting.");
-                return;
-            }
+            username_error.set(None);
+            meeting_id_error.set(None);
+
+            let username_raw = (*username_value).clone();
+
+            let username = match validate_display_name(&username_raw) {
+                Ok(v) => v,
+                Err(msg) => {
+                    username_error.set(Some(msg));
+                    return;
+                }
+            };
+
             let meeting_id = generate_meeting_id();
             save_username_to_storage(&username);
-            username_ctx.set(Some(username));
-            // Set Matomo user id for attribution
-            if let Some(name) = &*username_ctx {
-                matomo_logger::set_user_id(name);
-            }
+            username_ctx.set(Some(username.clone()));
+            matomo_logger::set_user_id(&username);
+
             navigator.push(&Route::Meeting { id: meeting_id });
         })
     };
@@ -159,12 +195,30 @@ pub fn home() -> Html {
                                 class={TEXT_INPUT_CLASSES}
                                 type="text"
                                 placeholder="Enter your name"
-                                ref={username_ref}
                                 required={true}
-                                pattern="^[a-zA-Z0-9_]*$"
                                 autofocus={true}
-                                value={existing_username.clone()}
+                                maxlength={DISPLAY_NAME_MAX_LEN.to_string()}
+                                value={(*username_value).clone()}
+                                oninput={{
+                                    let username_value = username_value.clone();
+                                    let username_error = username_error.clone();
+                                    Callback::from(move |e: InputEvent| {
+                                        let input: HtmlInputElement = e.target_unchecked_into();
+                                        username_value.set(input.value());
+                                        username_error.set(None);
+                                    })
+                                }}
                             />
+                            <p class="text-sm text-foreground-subtle mt-2 ml-1">
+                                {"Allowed: letters, numbers, spaces, _ - ' \""}
+                            </p>
+                            {
+                                if let Some(err) = &*username_error {
+                                    html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
+                                } else {
+                                    html! {}
+                                }
+                            }
                         </div>
 
                         <div>
@@ -186,6 +240,13 @@ pub fn home() -> Html {
                                 }
                             />
                             <p class="text-sm text-foreground-subtle mt-2 ml-1">{ "Characters allowed: a-z, A-Z, 0-9, and _" }</p>
+                            {
+                                if let Some(err) = &*meeting_id_error {
+                                    html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
+                                } else {
+                                    html! {}
+                                }
+                            }
                         </div>
 
                         {

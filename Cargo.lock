@@ -960,8 +960,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "videocall-client",
  "videocall-types",
- "web-transport-quinn 0.8.1",
 ]
 
 [[package]]

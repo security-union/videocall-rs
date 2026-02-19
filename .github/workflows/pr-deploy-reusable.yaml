@@ -298,6 +298,24 @@ jobs:
 
           echo "✅ TLS secret copied"
 
+      - name: Create JWT secret for preview
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Creating JWT secret for slot ${SLOT}..."
+
+          # Generate a unique JWT secret for this preview slot
+          JWT_SECRET="preview-slot-${SLOT}-jwt-$(openssl rand -hex 16)"
+
+          kubectl create secret generic jwt-secret \
+            --from-literal=secret="${JWT_SECRET}" \
+            --namespace ${NAMESPACE} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "✅ JWT secret created for slot ${SLOT}"
+
       - name: Apply ResourceQuota
         run: |
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
@@ -382,9 +400,6 @@ jobs:
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
 
-          # Get postgres password
-          PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
-
           echo "Deploying WebSocket server to slot ${SLOT}..."
 
           helm upgrade --install preview-${PR_NUM}-ws helm/rustlemania-websocket/ \
@@ -394,14 +409,21 @@ jobs:
             --set fullnameOverride=websocket-pr-${PR_NUM} \
             --set "env[0].name=NATS_URL" \
             --set "env[0].value=nats://nats-pr-${PR_NUM}.${NAMESPACE}.svc.cluster.local:4222" \
-            --set "env[1].name=DATABASE_URL" \
-            --set "env[1].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.default.svc.cluster.local:5432/preview_slot_${SLOT}?sslmode=disable" \
+            --set "env[1].name=JWT_SECRET" \
+            --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
+            --set "env[1].valueFrom.secretKeyRef.key=secret" \
             --set "env[2].name=ACTIX_PORT" \
             --set-string "env[2].value=8080" \
             --set "env[3].name=RUST_LOG" \
             --set "env[3].value=info" \
-            --set "env[4].name=FEATURE_MEETING_MANAGEMENT" \
-            --set-string "env[4].value=false" \
+            --set "env[4].name=REGION" \
+            --set "env[4].value=preview-slot-${SLOT}" \
+            --set "env[5].name=SERVICE_TYPE" \
+            --set "env[5].value=websocket" \
+            --set "env[6].name=SERVER_STATS_INTERVAL_SECS" \
+            --set "env[6].value=5" \
+            --set "env[7].name=TOKIO_WORKER_THREADS" \
+            --set "env[7].value=1" \
             --set "ingress.hosts[0].host=pr${SLOT}-ws.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -426,10 +448,25 @@ jobs:
           # Get postgres password
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
 
-          # Get OAuth credentials
-          OAUTH_CLIENT_ID=$(kubectl get secret google-oauth-credentials -n default -o jsonpath='{.data.client-id}' | base64 -d || echo "")
-          OAUTH_CLIENT_SECRET=$(kubectl get secret google-oauth-credentials -n default -o jsonpath='{.data.client-secret}' | base64 -d || echo "")
+          # Validate OAuth credentials secret exists
+          echo "Validating OAuth credentials..."
+          if ! kubectl get secret google-oauth-credentials -n default >/dev/null 2>&1; then
+            echo "::error::Secret google-oauth-credentials not found in default namespace"
+            echo "Create it with: kubectl create secret generic google-oauth-credentials -n default --from-literal=client-id=YOUR_ID --from-literal=client-secret=YOUR_SECRET"
+            exit 1
+          fi
 
+          # Get OAuth credentials
+          OAUTH_CLIENT_ID=$(kubectl get secret google-oauth-credentials -n default -o jsonpath='{.data.client-id}' | base64 -d)
+          OAUTH_CLIENT_SECRET=$(kubectl get secret google-oauth-credentials -n default -o jsonpath='{.data.client-secret}' | base64 -d)
+
+          # Validate OAuth credentials are not empty
+          if [ -z "$OAUTH_CLIENT_ID" ] || [ -z "$OAUTH_CLIENT_SECRET" ]; then
+            echo "::error::OAuth credentials are empty. Check google-oauth-credentials secret contains client-id and client-secret keys."
+            exit 1
+          fi
+
+          echo "✅ OAuth credentials validated"
           echo "Deploying Meeting API to slot ${SLOT} with OAuth enabled..."
 
           helm upgrade --install preview-${PR_NUM}-api helm/meeting-api/ \
@@ -440,7 +477,8 @@ jobs:
             --set "env[0].name=DATABASE_URL" \
             --set "env[0].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.default.svc.cluster.local:5432/preview_slot_${SLOT}?sslmode=disable" \
             --set "env[1].name=JWT_SECRET" \
-            --set "env[1].value=preview-jwt-secret-slot-${SLOT}" \
+            --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
+            --set "env[1].valueFrom.secretKeyRef.key=secret" \
             --set "env[2].name=CORS_ALLOWED_ORIGIN" \
             --set "env[2].value=https://pr${SLOT}.sandbox.videocall.rs" \
             --set "env[3].name=COOKIE_DOMAIN" \
@@ -449,16 +487,18 @@ jobs:
             --set "env[4].value=https://accounts.google.com" \
             --set "env[5].name=OAUTH_CLIENT_ID" \
             --set "env[5].value=${OAUTH_CLIENT_ID}" \
-            --set "env[6].name=OAUTH_CLIENT_SECRET" \
+            --set "env[6].name=OAUTH_SECRET" \
             --set "env[6].value=${OAUTH_CLIENT_SECRET}" \
             --set "env[7].name=OAUTH_REDIRECT_URL" \
             --set "env[7].value=https://pr${SLOT}-api.sandbox.videocall.rs/login/callback" \
             --set "env[8].name=AFTER_LOGIN_URL" \
             --set "env[8].value=https://pr${SLOT}.sandbox.videocall.rs" \
-            --set "env[9].name=LISTEN_ADDR" \
-            --set "env[9].value=0.0.0.0:8081" \
-            --set "env[10].name=RUST_LOG" \
-            --set "env[10].value=info" \
+            --set "env[9].name=OAUTH_SCOPES" \
+            --set "env[9].value=openid email profile" \
+            --set "env[10].name=LISTEN_ADDR" \
+            --set "env[10].value=0.0.0.0:8081" \
+            --set "env[11].name=RUST_LOG" \
+            --set "env[11].value=info" \
             --set "ingress.hosts[0].host=pr${SLOT}-api.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

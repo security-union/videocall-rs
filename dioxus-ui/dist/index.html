@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html class="dark">
+    <head>
+        <meta charset="utf-8" />
+        <title>videocall.rs (Dioxus)</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        
+        
+<script type="module">
+import init, * as bindings from '/dioxus-ui-982beeba3e02afc7.js';
+const wasm = await init({ module_or_path: '/dioxus-ui-982beeba3e02afc7_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+        <link rel="stylesheet" href="/leptos-style-803f01429327104.css" integrity="sha384-aZsPb3tvD1RgEILNNoq3BHZuRbJZwI0ZGrbpPOxg6SwHz0GLQJelNYdVuAsZs/T8"/>
+        <link rel="stylesheet" href="/tailwind-659406adf03bc292.css" integrity="sha384-zDDTKtQ7gowl2/ORJoRNVdD+WxxqSuZ4JMcucpiJqGAfmuLMIxYFO/N4ZgkCH06U"/>
+        <link rel="stylesheet" href="/style-7867086c14ce63a7.css" integrity="sha384-Cd99GYQX7JT4wQGzwPbegSI6qXf4qC4vbudd7cBGv/DA/RzxkPiBAFJU3TCXS/rf"/>
+        <link rel="stylesheet" href="/global-8fa9326d44a5a202.css" integrity="sha384-dCwiw00abNanso+liIjlvrdSTNOnZaOGkAeWO8Kr+q9RRYTsCIG9wXQDZe/IGoZb"/>
+        
+        
+        <!-- TOFIX: these files are not being hashed correctly, so they are not being cached -->
+        
+        
+        <script src="/config.js"></script>
+        <!-- Compile videocall-codecs's `worker.rs` as a separate WASM module for WebCodecs -->
+        
+        <!-- Runtime link so the wasm decoder can find the built worker URL -->
+        <link id="codecs-worker" href="/worker_decoder_loader.js" />
+        <!-- NetEq worker -->
+        
+        <link id="neteq-worker" href="/neteq_worker_loader.js" />
+
+        <!-- Load wasm worker scripts from the videocall-codecs crate -->
+        <!-- MediaStreamTrackProcessor polyfill using LiveKit's approach:
+             Creates VideoFrame directly from video element instead of canvas copy.
+             See: https://github.com/livekit/track-processors-js/pull/65 -->
+        <script>
+            if (!self.MediaStreamTrackProcessor) {
+            self.MediaStreamTrackProcessor = class MediaStreamTrackProcessor {
+                constructor({track}) {
+                if (track.kind == "video") {
+                    this.readable = new ReadableStream({
+                    async start(controller) {
+                        this.video = document.createElement("video");
+                        this.video.muted = true;
+                        this.video.srcObject = new MediaStream([track]);
+                        await Promise.all([
+                            this.video.play(),
+                            new Promise(r => this.video.onloadedmetadata = r)
+                        ]);
+                        this.track = track;
+
+                        if (!this.video.videoWidth || !this.video.videoHeight) {
+                            console.warn("Video dimensions not available after metadata load");
+                        }
+
+                        // Try direct VideoFrame from video element (LiveKit approach)
+                        const supportsDirectVideoFrame = (() => {
+                            try {
+                                const testFrame = new VideoFrame(this.video);
+                                testFrame.close();
+                                return true;
+                            } catch (e) {
+                                return false;
+                            }
+                        })();
+
+                        if (supportsDirectVideoFrame) {
+                            console.log("Using direct VideoFrame(video) - LiveKit approach");
+
+                            let lastVideoTime = -1;
+
+                            if (this.video.requestVideoFrameCallback) {
+                                console.log("Using requestVideoFrameCallback with direct VideoFrame");
+                                const processFrame = (now, metadata) => {
+                                    if (!controller.desiredSize) {
+                                        this.video?.pause();
+                                        return;
+                                    }
+
+                                    const currentTime = this.video.currentTime;
+                                    if (currentTime !== lastVideoTime) {
+                                        lastVideoTime = currentTime;
+                                        try {
+                                            const frame = new VideoFrame(this.video, {
+                                                timestamp: metadata.mediaTime * 1e6
+                                            });
+                                            controller.enqueue(frame);
+                                        } catch (e) {
+                                            console.error("Error creating VideoFrame:", e);
+                                        }
+                                    }
+
+                                    if (controller.desiredSize > 0) {
+                                        this.video.requestVideoFrameCallback(processFrame);
+                                    }
+                                };
+                                this.video.requestVideoFrameCallback(processFrame);
+                            } else {
+                                console.warn("Using requestAnimationFrame with direct VideoFrame");
+                                let lastTimestamp = -1;
+                                const processFrameRAF = (timestamp) => {
+                                    if (!controller.desiredSize) {
+                                        this.video?.pause();
+                                        return;
+                                    }
+
+                                    const currentTime = this.video.currentTime;
+                                    if (currentTime !== lastVideoTime && timestamp !== lastTimestamp) {
+                                        lastVideoTime = currentTime;
+                                        lastTimestamp = timestamp;
+                                        try {
+                                            const frame = new VideoFrame(this.video, {
+                                                timestamp: performance.now() * 1000
+                                            });
+                                            controller.enqueue(frame);
+                                        } catch (e) {
+                                            console.error("Error creating VideoFrame:", e);
+                                        }
+                                    }
+
+                                    if (controller.desiredSize > 0) {
+                                        requestAnimationFrame(processFrameRAF);
+                                    }
+                                };
+                                requestAnimationFrame(processFrameRAF);
+                            }
+                        } else {
+                            console.log("Using canvas-based polyfill (direct VideoFrame not supported)");
+                            this.canvas = new OffscreenCanvas(
+                                this.video.videoWidth || 640,
+                                this.video.videoHeight || 480
+                            );
+                            this.ctx = this.canvas.getContext('2d', {desynchronized: true});
+
+                            if (this.video.requestVideoFrameCallback) {
+                                const processFrame = (now, metadata) => {
+                                    if (!controller.desiredSize) return;
+                                    try {
+                                        if (this.video.videoWidth && this.video.videoHeight) {
+                                            if (this.canvas.width !== this.video.videoWidth ||
+                                                this.canvas.height !== this.video.videoHeight) {
+                                                this.canvas.width = this.video.videoWidth;
+                                                this.canvas.height = this.video.videoHeight;
+                                            }
+                                            this.ctx.drawImage(this.video, 0, 0);
+                                            controller.enqueue(new VideoFrame(this.canvas, {
+                                                timestamp: metadata.mediaTime * 1e6
+                                            }));
+                                        }
+                                    } catch (e) {
+                                        console.error("Error processing video frame:", e);
+                                    }
+                                    if (controller.desiredSize > 0) {
+                                        this.video.requestVideoFrameCallback(processFrame);
+                                    } else {
+                                        this.video?.pause();
+                                    }
+                                };
+                                this.video.requestVideoFrameCallback(processFrame);
+                            } else {
+                                let lastTimestamp = -1;
+                                const processFrameRAF = (timestamp) => {
+                                    if (!controller.desiredSize) {
+                                        this.video?.pause();
+                                        return;
+                                    }
+                                    if (timestamp !== lastTimestamp) {
+                                        lastTimestamp = timestamp;
+                                        try {
+                                            if (this.video.videoWidth && this.video.videoHeight) {
+                                                if (this.canvas.width !== this.video.videoWidth ||
+                                                    this.canvas.height !== this.video.videoHeight) {
+                                                    this.canvas.width = this.video.videoWidth;
+                                                    this.canvas.height = this.video.videoHeight;
+                                                }
+                                                this.ctx.drawImage(this.video, 0, 0);
+                                                controller.enqueue(new VideoFrame(this.canvas, {
+                                                    timestamp: performance.now() * 1000
+                                                }));
+                                            }
+                                        } catch (e) {
+                                            console.error("Error processing video frame:", e);
+                                        }
+                                    }
+                                    if (controller.desiredSize > 0) {
+                                        requestAnimationFrame(processFrameRAF);
+                                    }
+                                };
+                                requestAnimationFrame(processFrameRAF);
+                            }
+                        }
+                    },
+                    cancel(reason) {
+                        console.log("Video track processor cancelled:", reason);
+                        if (this.video) {
+                            this.video.pause();
+                            this.video.srcObject = null;
+                        }
+                    }
+                    });
+                } else if (track.kind == "audio") {
+                    this.readable = new ReadableStream({
+                    async start(controller) {
+                        this.ac = new AudioContext;
+                        this.arrays = [];
+                        function worklet() {
+                        registerProcessor("mstp-shim", class Processor extends AudioWorkletProcessor {
+                            process(input) { this.port.postMessage(input); return true; }
+                        });
+                        }
+                        await this.ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);
+                        this.node = new AudioWorkletNode(this.ac, "mstp-shim");
+                        this.ac.createMediaStreamSource(new MediaStream([track])).connect(this.node);
+                        this.node.port.addEventListener("message", ({data}) => data[0][0] && this.arrays.push(data));
+                    },
+                    async pull(controller) {
+                        while (!this.arrays.length) await new Promise(r => this.node.port.onmessage = r);
+                        const [channels] = this.arrays.shift();
+                        const joined = new Float32Array(channels.reduce((a, b) => a + b.length, 0));
+                        channels.reduce((offset, a) => (joined.set(a, offset), offset + a.length), 0);
+                        controller.enqueue(new AudioData({
+                        format: "f32-planar",
+                        sampleRate: this.ac.sampleRate,
+                        numberOfFrames: channels[0].length,
+                        numberOfChannels: channels.length,
+                        timestamp: this.ac.currentTime * 1e6 | 0,
+                        data: joined,
+                        transfer: [joined.buffer]
+                        }));
+                    }
+                    });
+                }
+                }
+            };
+            }
+        </script>
+        <!-- MediaStreamTrackGenerator polyfill -->
+        <script>
+            if (!window.MediaStreamTrackGenerator) {
+            window.MediaStreamTrackGenerator = class MediaStreamTrackGenerator {
+                constructor({kind}) {
+                if (kind == "video") {
+                    const canvas = document.createElement("canvas");
+                    const ctx = canvas.getContext('2d', {desynchronized: true});
+                    const track = canvas.captureStream().getVideoTracks()[0];
+                    track.writable = new WritableStream({
+                    write(frame) {
+                        canvas.width = frame.displayWidth;
+                        canvas.height = frame.displayHeight;
+                        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                        frame.close();
+                    }
+                    });
+                    return track;
+                } else if (kind == "audio") {
+                    const ac = new AudioContext;
+                    const dest = ac.createMediaStreamDestination();
+                    const [track] = dest.stream.getAudioTracks();
+                    track.writable = new WritableStream({
+                    async start(controller) {
+                        this.arrays = [];
+                        function worklet() {
+                        registerProcessor("mstg-shim", class Processor extends AudioWorkletProcessor {
+                            constructor() {
+                            super();
+                            this.arrays = [];
+                            this.arrayOffset = 0;
+                            this.port.onmessage = ({data}) => this.arrays.push(data);
+                            this.emptyArray = new Float32Array(0);
+                            }
+                            process(inputs, [[output]]) {
+                            for (let i = 0; i < output.length; i++) {
+                                if (!this.array || this.arrayOffset >= this.array.length) {
+                                this.array = this.arrays.shift() || this.emptyArray;
+                                this.arrayOffset = 0;
+                                }
+                                output[i] = this.array[this.arrayOffset++] || 0;
+                            }
+                            return true;
+                            }
+                        });
+                        }
+                        await ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);
+                        this.node = new AudioWorkletNode(ac, "mstg-shim");
+                        this.node.connect(dest);
+                        return track;
+                    },
+                    write(audioData) {
+                        const array = new Float32Array(audioData.numberOfFrames * audioData.numberOfChannels);
+                        audioData.copyTo(array, {planeIndex: 0});
+                        this.node.port.postMessage(array, [array.buffer]);
+                        audioData.close();
+                    }
+                    });
+                    return track;
+                }
+                }
+            };
+            }
+        </script>
+    <link rel="modulepreload" href="/dioxus-ui-982beeba3e02afc7.js" crossorigin="anonymous" integrity="sha384-J64gO2yR0AYze3GaY3OjpsnFbup5hlkRjNWvgAsLf5p44TcQN7s49sSKgkdUDhNR"><link rel="modulepreload" href="/snippets/dioxus-web-afdd4c4e5aff9d11/inline0.js" crossorigin="anonymous" integrity="sha384-2v8X0XAeO26J0vmoLhIbIeAjVzFnrY9iLhlYJcksTMp7Ip2tbDcoX4vD/hCan7M7"><link rel="modulepreload" href="/snippets/dioxus-interpreter-js-c0f0333193e32f17/src/js/hydrate.js" crossorigin="anonymous" integrity="sha384-Ocp9HYCb7T7M2KNri/Y2CHx/JgjlahEvu2KUTc/YKyGLB0s0pgNeCaanjX7egjMz"><link rel="modulepreload" href="/snippets/dioxus-interpreter-js-c0f0333193e32f17/src/js/set_attribute.js" crossorigin="anonymous" integrity="sha384-KzHUe16NLJR2eaeVyqeB7zwb1qHGH3sV/aw0aS7V/+IeQwWH6OAnZ9nbGkwEyGzZ"><link rel="modulepreload" href="/snippets/dioxus-cli-config-8d0dd142fb491fe2/inline0.js" crossorigin="anonymous" integrity="sha384-63GOaGGIhEHCB9m4vzzYEBfUIIUWiAYuNlk/LB2TuDDcjK13LO2II01K9xxO0fFG"><link rel="modulepreload" href="/snippets/dioxus-web-afdd4c4e5aff9d11/src/js/eval.js" crossorigin="anonymous" integrity="sha384-p8SsdRWHMmi6kI0ok6n5NV3mpIQPM5rkaJiiTwobcDIXKNhvajvPCqsBACIQVcP8"><link rel="modulepreload" href="/snippets/dioxus-interpreter-js-c0f0333193e32f17/src/js/patch_console.js" crossorigin="anonymous" integrity="sha384-r+5veWcnM6yFNXixia5X8SIr1KdMZfaSc4dp0/8fqFpt3s6gK4zUXXSkvHdZ4TmG"><link rel="modulepreload" href="/snippets/dioxus-interpreter-js-c0f0333193e32f17/inline0.js" crossorigin="anonymous" integrity="sha384-j0LKwUivj+3TJqebf9mBv6v1Yu2sX+LAJanOVfQAVOZpWTU0+pzzo8XExJBFDUso"><link rel="preload" href="/dioxus-ui-982beeba3e02afc7_bg.wasm" crossorigin="anonymous" integrity="sha384-1Jvb/Tmoipv89fjjQ++nTUTzhxInjOTrMB0OX5SoYYwmAuckejbox7YW2IhQyCqn" as="fetch" type="application/wasm"></head>
+    <body class="bg-background text-foreground">
+        <div id="main"></div>
+    </body>
+</html>

@@ -421,9 +421,9 @@ jobs:
             --set "env[5].name=SERVICE_TYPE" \
             --set "env[5].value=websocket" \
             --set "env[6].name=SERVER_STATS_INTERVAL_SECS" \
-            --set "env[6].value=5" \
+            --set-string "env[6].value=5" \
             --set "env[7].name=TOKIO_WORKER_THREADS" \
-            --set "env[7].value=1" \
+            --set-string "env[7].value=1" \
             --set "ingress.hosts[0].host=pr${SLOT}-ws.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

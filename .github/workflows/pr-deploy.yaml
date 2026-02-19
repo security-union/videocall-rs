@@ -80,10 +80,8 @@ jobs:
 
             **Infrastructure:**
             - Assigning deployment slot (1-${maxSlots} available)
-            - Creating/reusing namespace for the slot
-            - Creating/reusing database for the slot
+            - Creating namespace & database for the slot
             - Deploying NATS, WebSocket, Meeting API, and UI
-            - Configuring Google OAuth authentication
 
             ⏱️ Deployment typically takes 3-5 minutes, I'll post another comment when it's ready.
 

@@ -122,6 +122,169 @@ impl MediaDevicesProvider for MockMediaDevicesProvider {
     }
 }
 
+/// Splits a flat device list into (audio_inputs, video_inputs, audio_outputs).
+fn categorize_devices(
+    devices: Vec<MediaDeviceInfo>,
+) -> (Vec<MediaDeviceInfo>, Vec<MediaDeviceInfo>, Vec<MediaDeviceInfo>) {
+    let audio_inputs = devices
+        .iter()
+        .filter(|d| d.kind() == MediaDeviceKind::Audioinput)
+        .cloned()
+        .collect();
+    let video_inputs = devices
+        .iter()
+        .filter(|d| d.kind() == MediaDeviceKind::Videoinput)
+        .cloned()
+        .collect();
+    let audio_outputs = devices
+        .into_iter()
+        .filter(|d| d.kind() == MediaDeviceKind::Audiooutput)
+        .collect();
+    (audio_inputs, video_inputs, audio_outputs)
+}
+
+/// Returns true if the device lists have changed (by comparing device IDs).
+fn devices_changed(
+    old_audio: &[MediaDeviceInfo],
+    new_audio: &[MediaDeviceInfo],
+    old_video: &[MediaDeviceInfo],
+    new_video: &[MediaDeviceInfo],
+    old_output: &[MediaDeviceInfo],
+    new_output: &[MediaDeviceInfo],
+) -> bool {
+    let ids = |devices: &[MediaDeviceInfo]| -> Vec<String> {
+        devices.iter().map(|d| d.device_id()).collect()
+    };
+    ids(old_audio) != ids(new_audio)
+        || ids(old_video) != ids(new_video)
+        || ids(old_output) != ids(new_output)
+}
+
+/// Returns true if a device with the given ID exists in the device list.
+fn device_still_exists(device_id: &str, devices: &[MediaDeviceInfo]) -> bool {
+    !device_id.is_empty() && devices.iter().any(|d| d.device_id() == device_id)
+}
+
+/// Shared async logic for the initial device load.
+///
+/// Fetches devices from the provider, categorizes them, stores them in the shared
+/// device lists, calls `on_loaded`, and auto-selects the first device of each type.
+async fn load_devices_async(
+    provider_promise: Promise,
+    audio_input_devices: Rc<RefCell<Vec<MediaDeviceInfo>>>,
+    video_input_devices: Rc<RefCell<Vec<MediaDeviceInfo>>>,
+    audio_output_devices: Rc<RefCell<Vec<MediaDeviceInfo>>>,
+    on_loaded: Rc<dyn Fn()>,
+    on_audio_selected: Rc<dyn Fn(String)>,
+    on_video_selected: Rc<dyn Fn(String)>,
+    on_audio_output_selected: Rc<dyn Fn(String)>,
+) {
+    let future = JsFuture::from(provider_promise);
+    let devices = future
+        .await
+        .expect("await devices")
+        .unchecked_into::<Array>();
+    let devices = devices.to_vec();
+    let devices = devices
+        .into_iter()
+        .map(|d| d.unchecked_into::<MediaDeviceInfo>())
+        .collect::<Vec<MediaDeviceInfo>>();
+
+    let (audio_devices, video_devices, audio_output_device_list) = categorize_devices(devices);
+
+    *audio_input_devices.borrow_mut() = audio_devices;
+    *video_input_devices.borrow_mut() = video_devices;
+    *audio_output_devices.borrow_mut() = audio_output_device_list;
+
+    on_loaded();
+
+    if let Some(device) = audio_input_devices.borrow().first() {
+        on_audio_selected(device.device_id());
+    }
+    if let Some(device) = video_input_devices.borrow().first() {
+        on_video_selected(device.device_id());
+    }
+    if let Some(device) = audio_output_devices.borrow().first() {
+        on_audio_output_selected(device.device_id());
+    }
+}
+
+/// Shared async logic for handling a device change event.
+///
+/// Fetches the current devices, compares with old lists, updates the shared device
+/// lists, notifies on change, and falls back to the first device if the selected
+/// device disappeared.
+async fn handle_device_change(
+    provider_promise: Promise,
+    audio_input_devices: Rc<RefCell<Vec<MediaDeviceInfo>>>,
+    video_input_devices: Rc<RefCell<Vec<MediaDeviceInfo>>>,
+    audio_output_devices: Rc<RefCell<Vec<MediaDeviceInfo>>>,
+    current_audio_selection: String,
+    current_video_selection: String,
+    current_audio_output_selection: String,
+    on_devices_changed: Rc<dyn Fn()>,
+    on_audio_selected: Rc<dyn Fn(String)>,
+    on_video_selected: Rc<dyn Fn(String)>,
+    on_audio_output_selected: Rc<dyn Fn(String)>,
+) {
+    let future = JsFuture::from(provider_promise);
+    let devices = future
+        .await
+        .expect("await devices")
+        .unchecked_into::<Array>();
+    let devices = devices.to_vec();
+    let devices = devices
+        .into_iter()
+        .map(|d| d.unchecked_into::<MediaDeviceInfo>())
+        .collect::<Vec<MediaDeviceInfo>>();
+
+    let (audio_devices, video_devices, audio_output_device_list) = categorize_devices(devices);
+
+    let old_audio_devices: Vec<MediaDeviceInfo> = audio_input_devices.borrow().clone();
+    let old_video_devices: Vec<MediaDeviceInfo> = video_input_devices.borrow().clone();
+    let old_audio_output_devices: Vec<MediaDeviceInfo> = audio_output_devices.borrow().clone();
+
+    *audio_input_devices.borrow_mut() = audio_devices.clone();
+    *video_input_devices.borrow_mut() = video_devices.clone();
+    *audio_output_devices.borrow_mut() = audio_output_device_list.clone();
+
+    let audio_still_exists = device_still_exists(&current_audio_selection, &audio_devices);
+    let video_still_exists = device_still_exists(&current_video_selection, &video_devices);
+    let audio_output_still_exists =
+        device_still_exists(&current_audio_output_selection, &audio_output_device_list);
+
+    let changed = devices_changed(
+        &old_audio_devices,
+        &audio_devices,
+        &old_video_devices,
+        &video_devices,
+        &old_audio_output_devices,
+        &audio_output_device_list,
+    );
+
+    if changed {
+        on_devices_changed();
+    }
+
+    if !audio_still_exists {
+        if let Some(device) = audio_devices.first() {
+            on_audio_selected(device.device_id());
+        }
+    }
+
+    if !video_still_exists {
+        if let Some(device) = video_devices.first() {
+            on_video_selected(device.device_id());
+        }
+    }
+
+    if !audio_output_still_exists {
+        if let Some(device) = audio_output_device_list.first() {
+            on_audio_output_selected(device.device_id());
+        }
+    }
+}
+
 /// A "smart" list of [web_sys::MediaDeviceInfo](web_sys::MediaDeviceInfo) items, used by [MediaDeviceList]
 ///
 /// The list keeps track of a currently selected device, supporting selection and a callback that
@@ -340,7 +503,11 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
     /// Sets up the device change listener that will automatically refresh devices when changes occur
     fn setup_device_change_listener(&mut self) {
         let provider_clone = self.provider.clone();
-        let on_devices_changed = self.on_devices_changed.clone();
+        let on_devices_changed_callback = self.on_devices_changed.clone();
+        let on_devices_changed: Rc<dyn Fn()> = Rc::new(move || {
+            emit_client_event(ClientEvent::DevicesChanged);
+            on_devices_changed_callback();
+        });
         let on_audio_selected = self.audio_inputs.on_selected.clone();
         let on_video_selected = self.video_inputs.on_selected.clone();
         let on_audio_output_selected = self.audio_outputs.on_selected.clone();
@@ -349,13 +516,6 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
         let audio_output_devices = Rc::clone(&self.audio_outputs.devices);
 
         let closure = Closure::wrap(Box::new(move |_event: Event| {
-            let audio_input_devices_clone = Rc::clone(&audio_input_devices);
-            let video_input_devices_clone = Rc::clone(&video_input_devices);
-            let audio_output_devices_clone = Rc::clone(&audio_output_devices);
-            let on_devices_changed_clone = on_devices_changed.clone();
-            let on_audio_selected_clone = on_audio_selected.clone();
-            let on_video_selected_clone = on_video_selected.clone();
-            let on_audio_output_selected_clone = on_audio_output_selected.clone();
             let provider_promise = provider_clone.enumerate_devices();
 
             let current_audio_selection = {
@@ -385,111 +545,19 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
                 }
             };
 
-            wasm_bindgen_futures::spawn_local(async move {
-                let future = JsFuture::from(provider_promise);
-                let devices = future
-                    .await
-                    .expect("await devices")
-                    .unchecked_into::<Array>();
-                let devices = devices.to_vec();
-                let devices = devices
-                    .into_iter()
-                    .map(|d| d.unchecked_into::<MediaDeviceInfo>())
-                    .collect::<Vec<MediaDeviceInfo>>();
-
-                let audio_devices = devices
-                    .clone()
-                    .into_iter()
-                    .filter(|device| device.kind() == MediaDeviceKind::Audioinput)
-                    .collect::<Vec<MediaDeviceInfo>>();
-
-                let video_devices = devices
-                    .clone()
-                    .into_iter()
-                    .filter(|device| device.kind() == MediaDeviceKind::Videoinput)
-                    .collect::<Vec<MediaDeviceInfo>>();
-
-                let audio_output_device_list = devices
-                    .into_iter()
-                    .filter(|device| device.kind() == MediaDeviceKind::Audiooutput)
-                    .collect::<Vec<MediaDeviceInfo>>();
-
-                let old_audio_devices: Vec<MediaDeviceInfo> =
-                    audio_input_devices_clone.borrow().clone();
-                let old_video_devices: Vec<MediaDeviceInfo> =
-                    video_input_devices_clone.borrow().clone();
-                let old_audio_output_devices: Vec<MediaDeviceInfo> =
-                    audio_output_devices_clone.borrow().clone();
-
-                *audio_input_devices_clone.borrow_mut() = audio_devices.clone();
-                *video_input_devices_clone.borrow_mut() = video_devices.clone();
-                *audio_output_devices_clone.borrow_mut() = audio_output_device_list.clone();
-
-                let audio_device_still_exists = !current_audio_selection.is_empty()
-                    && audio_devices
-                        .iter()
-                        .any(|device| device.device_id() == current_audio_selection);
-
-                let video_device_still_exists = !current_video_selection.is_empty()
-                    && video_devices
-                        .iter()
-                        .any(|device| device.device_id() == current_video_selection);
-
-                let audio_output_device_still_exists = !current_audio_output_selection.is_empty()
-                    && audio_output_device_list
-                        .iter()
-                        .any(|device| device.device_id() == current_audio_output_selection);
-
-                let devices_changed = {
-                    let old_audio_ids: Vec<String> =
-                        old_audio_devices.iter().map(|d| d.device_id()).collect();
-                    let new_audio_ids: Vec<String> =
-                        audio_devices.iter().map(|d| d.device_id()).collect();
-
-                    let old_video_ids: Vec<String> =
-                        old_video_devices.iter().map(|d| d.device_id()).collect();
-                    let new_video_ids: Vec<String> =
-                        video_devices.iter().map(|d| d.device_id()).collect();
-
-                    let old_audio_output_ids: Vec<String> = old_audio_output_devices
-                        .iter()
-                        .map(|d| d.device_id())
-                        .collect();
-                    let new_audio_output_ids: Vec<String> = audio_output_device_list
-                        .iter()
-                        .map(|d| d.device_id())
-                        .collect();
-
-                    old_audio_ids != new_audio_ids
-                        || old_video_ids != new_video_ids
-                        || old_audio_output_ids != new_audio_output_ids
-                };
-
-                if devices_changed {
-                    // Emit to event bus
-                    emit_client_event(ClientEvent::DevicesChanged);
-                    // Call callback
-                    on_devices_changed_clone();
-                }
-
-                if !audio_device_still_exists {
-                    if let Some(device) = audio_devices.first() {
-                        on_audio_selected_clone(device.device_id());
-                    }
-                }
-
-                if !video_device_still_exists {
-                    if let Some(device) = video_devices.first() {
-                        on_video_selected_clone(device.device_id());
-                    }
-                }
-
-                if !audio_output_device_still_exists {
-                    if let Some(device) = audio_output_device_list.first() {
-                        on_audio_output_selected_clone(device.device_id());
-                    }
-                }
-            });
+            wasm_bindgen_futures::spawn_local(handle_device_change(
+                provider_promise,
+                Rc::clone(&audio_input_devices),
+                Rc::clone(&video_input_devices),
+                Rc::clone(&audio_output_devices),
+                current_audio_selection,
+                current_video_selection,
+                current_audio_output_selection,
+                on_devices_changed.clone(),
+                on_audio_selected.clone(),
+                on_video_selected.clone(),
+                on_audio_output_selected.clone(),
+            ));
         }) as Box<dyn FnMut(Event)>);
 
         self.device_change_closure = Some(closure);
@@ -508,66 +576,27 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
     pub fn load(&mut self) {
         self.setup_device_change_listener();
 
-        let on_loaded = self.on_loaded.clone();
+        let on_loaded_callback = self.on_loaded.clone();
+        let on_loaded: Rc<dyn Fn()> = Rc::new(move || {
+            emit_client_event(ClientEvent::DevicesLoaded);
+            on_loaded_callback();
+        });
         let on_audio_selected = self.audio_inputs.on_selected.clone();
         let on_video_selected = self.video_inputs.on_selected.clone();
         let on_audio_output_selected = self.audio_outputs.on_selected.clone();
-        let audio_input_devices = Rc::clone(&self.audio_inputs.devices);
-        let video_input_devices = Rc::clone(&self.video_inputs.devices);
-        let audio_output_devices = Rc::clone(&self.audio_outputs.devices);
 
         let provider_promise = self.provider.enumerate_devices();
 
-        wasm_bindgen_futures::spawn_local(async move {
-            let future = JsFuture::from(provider_promise);
-            let devices = future
-                .await
-                .expect("await devices")
-                .unchecked_into::<Array>();
-            let devices = devices.to_vec();
-            let devices = devices
-                .into_iter()
-                .map(|d| d.unchecked_into::<MediaDeviceInfo>())
-                .collect::<Vec<MediaDeviceInfo>>();
-
-            let audio_devices = devices
-                .clone()
-                .into_iter()
-                .filter(|device| device.kind() == MediaDeviceKind::Audioinput)
-                .collect::<Vec<MediaDeviceInfo>>();
-
-            let video_devices = devices
-                .clone()
-                .into_iter()
-                .filter(|device| device.kind() == MediaDeviceKind::Videoinput)
-                .collect::<Vec<MediaDeviceInfo>>();
-
-            let audio_output_device_list = devices
-                .into_iter()
-                .filter(|device| device.kind() == MediaDeviceKind::Audiooutput)
-                .collect::<Vec<MediaDeviceInfo>>();
-
-            *audio_input_devices.borrow_mut() = audio_devices;
-            *video_input_devices.borrow_mut() = video_devices;
-            *audio_output_devices.borrow_mut() = audio_output_device_list;
-
-            // Emit to event bus
-            emit_client_event(ClientEvent::DevicesLoaded);
-            // Call callback
-            on_loaded();
-
-            if let Some(device) = audio_input_devices.borrow().first() {
-                on_audio_selected(device.device_id())
-            }
-
-            if let Some(device) = video_input_devices.borrow().first() {
-                on_video_selected(device.device_id())
-            }
-
-            if let Some(device) = audio_output_devices.borrow().first() {
-                on_audio_output_selected(device.device_id())
-            }
-        });
+        wasm_bindgen_futures::spawn_local(load_devices_async(
+            provider_promise,
+            Rc::clone(&self.audio_inputs.devices),
+            Rc::clone(&self.video_inputs.devices),
+            Rc::clone(&self.audio_outputs.devices),
+            on_loaded,
+            on_audio_selected,
+            on_video_selected,
+            on_audio_output_selected,
+        ));
     }
 }
 

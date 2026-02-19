@@ -29,55 +29,15 @@ impl MediaDeviceAccess {
         }
     }
 
-    /// Returns true if permission has been granted
-    pub fn is_granted(&self) -> bool {
-        self.granted.load(Ordering::Acquire)
-    }
-
     /// Causes the browser to request the user's permission to access the microphone and camera.
     ///
     /// This function returns immediately.  Eventually, either the [`on_granted`](Self::on_granted)
     /// or [`on_denied`](Self::on_denied) callback will be called.
     pub fn request(&self) {
-        let future = Self::request_permissions();
         let on_granted = self.on_granted.clone();
         let on_denied = self.on_denied.clone();
-        let granted = Arc::clone(&self.granted);
-        wasm_bindgen_futures::spawn_local(async move {
-            match future.await {
-                Ok(_) => {
-                    granted.store(true, Ordering::Release);
-                    // Emit to event bus
-                    emit_client_event(ClientEvent::PermissionGranted);
-                    // Call Yew callback
-                    on_granted.emit(());
-                }
-                Err(e) => {
-                    // Emit to event bus
-                    emit_client_event(ClientEvent::PermissionDenied(format!("{e:?}")));
-                    // Call Yew callback
-                    on_denied.emit(e);
-                }
-            }
-        });
-    }
-
-    async fn request_permissions() -> anyhow::Result<(), JsValue> {
-        let navigator = window().navigator();
-        let media_devices = navigator.media_devices()?;
-
-        let constraints = MediaStreamConstraints::new();
-
-        // Request access to the microphone
-        constraints.set_audio(&JsValue::from_bool(true));
-
-        // Request access to the camera
-        constraints.set_video(&JsValue::from_bool(true));
-
-        let promise = media_devices.get_user_media_with_constraints(&constraints)?;
-
-        JsFuture::from(promise).await?;
-
-        Ok(())
+        let wrapped_granted: Rc<dyn Fn()> = Rc::new(move || on_granted.emit(()));
+        let wrapped_denied: Rc<dyn Fn(JsValue)> = Rc::new(move |e| on_denied.emit(e));
+        run_request(Arc::clone(&self.granted), wrapped_granted, wrapped_denied);
     }
 }

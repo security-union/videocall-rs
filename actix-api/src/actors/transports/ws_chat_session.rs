@@ -112,7 +112,11 @@ impl Actor for WsChatSession {
         let session_id = self.logic.id.clone();
 
         ctx.wait(
-            async move { session_manager.start_session(&room, &email, &session_id).await }
+            async move {
+                session_manager
+                    .start_session(&room, &email, &session_id)
+                    .await
+            }
             .into_actor(self)
             .map(|result, act, ctx| match result {
                 Ok(result) => {

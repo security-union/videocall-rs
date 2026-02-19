@@ -29,12 +29,12 @@ use actix::{
     Actor, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
 };
 use futures::StreamExt;
+use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
-use videocall_types::SYSTEM_USER_EMAIL;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use protobuf::Message as ProtobufMessage;
+use videocall_types::SYSTEM_USER_EMAIL;
 
 use super::session_logic::{ConnectionState, SessionId};
 
@@ -183,8 +183,12 @@ impl Handler<ActivateConnection> for ChatServer {
                 info!("Session {} activated (Testing -> Active)", session);
             }
         } else {
-            self.connection_states.insert(session.clone(), ConnectionState::Active);
-            info!("Session {} activated (state was missing, created as Active)", session);
+            self.connection_states
+                .insert(session.clone(), ConnectionState::Active);
+            info!(
+                "Session {} activated (state was missing, created as Active)",
+                session
+            );
         }
     }
 }
@@ -202,12 +206,17 @@ impl Handler<ClientMessage> for ChatServer {
         trace!("got message in server room {room} session {session}");
 
         // Check connection state - only publish to NATS if Active
-        let connection_state = self.connection_states.get(&session)
+        let connection_state = self
+            .connection_states
+            .get(&session)
             .copied()
             .unwrap_or(ConnectionState::Testing);
 
         if connection_state != ConnectionState::Active {
-            trace!("Skipping NATS publish for session {} in Testing state", session);
+            trace!(
+                "Skipping NATS publish for session {} in Testing state",
+                session
+            );
             return; // Don't publish during Testing state
         }
 
@@ -215,7 +224,8 @@ impl Handler<ClientMessage> for ChatServer {
         let subject = format!("room.{room}.{session}");
         let subject = subject.replace(' ', "_");
 
-        let packet_bytes = if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
+        let packet_bytes =
+            if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
                 if packet_wrapper.session_id.is_empty() {
                     packet_wrapper.session_id = session.clone();
                 }
@@ -301,7 +311,13 @@ impl Handler<JoinRoom> for ChatServer {
                         result.creator_id,
                         session_id,
                     );
-                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id, &result.session_id)
+                    send_meeting_info(
+                        &nc,
+                        &room_clone,
+                        result.start_time_ms,
+                        &result.creator_id,
+                        &result.session_id,
+                    )
                     .await;
                 }
                 Err(e) => {
@@ -654,9 +670,7 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client.clone())
-            .await
-            .start();
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
 
         let (tx, _rx) = mpsc::unbounded_channel::<TrackerMessage>();
         let tracker_sender: TrackerSender = tx;
@@ -745,7 +759,8 @@ mod tests {
 
         // Spawn task to check for messages
         tokio::spawn(async move {
-            if let Ok(Some(_msg)) = tokio::time::timeout(Duration::from_millis(500), sub.next()).await
+            if let Ok(Some(_msg)) =
+                tokio::time::timeout(Duration::from_millis(500), sub.next()).await
             {
                 published_clone.store(true, Ordering::Relaxed);
             }
@@ -833,7 +848,8 @@ mod tests {
 
         // Spawn task to check for messages
         tokio::spawn(async move {
-            if let Ok(Some(_msg)) = tokio::time::timeout(Duration::from_millis(500), sub.next()).await
+            if let Ok(Some(_msg)) =
+                tokio::time::timeout(Duration::from_millis(500), sub.next()).await
             {
                 published_clone.store(true, Ordering::Relaxed);
             }
@@ -952,7 +968,8 @@ mod tests {
         type Result = Result<ConnectionState, ()>;
 
         fn handle(&mut self, msg: GetConnectionState, _ctx: &mut Self::Context) -> Self::Result {
-            Ok(self.connection_states
+            Ok(self
+                .connection_states
                 .get(&msg.session)
                 .copied()
                 .unwrap_or(ConnectionState::Testing))

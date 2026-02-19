@@ -182,7 +182,10 @@ mod tests {
     #[tokio::test]
     async fn test_start_session_returns_result() {
         let manager = SessionManager::new();
-        let result = manager.start_session("room-1", "alice", "alice-session-1").await.unwrap();
+        let result = manager
+            .start_session("room-1", "alice", "alice-session-1")
+            .await
+            .unwrap();
         assert!(result.start_time_ms > 0);
         assert!(result.is_first_participant);
         assert_eq!(result.creator_id, "alice");
@@ -214,8 +217,12 @@ mod tests {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-        let meeting_started =
-            SessionManager::build_meeting_started_packet("my-room", 1234567890, "alice", "session-123");
+        let meeting_started = SessionManager::build_meeting_started_packet(
+            "my-room",
+            1234567890,
+            "alice",
+            "session-123",
+        );
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_started).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();

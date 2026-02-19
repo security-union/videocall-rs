@@ -56,6 +56,34 @@ use tokio_tungstenite::MaybeTlsStream;
 
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Error type for WebSocket connection attempts.
+///
+/// Preserves the HTTP status code when the server rejects the WebSocket
+/// upgrade, which is essential for testing authentication flows (401, 403,
+/// 410, etc.).
+#[derive(Debug, thiserror::Error)]
+pub enum WebSocketConnectError {
+    /// The server rejected the upgrade with an HTTP error status.
+    #[error("HTTP {status}: WebSocket upgrade rejected")]
+    HttpError {
+        /// The HTTP status code returned by the server.
+        status: u16,
+    },
+    /// A transport-level or protocol-level error occurred.
+    #[error("WebSocket connection failed: {0}")]
+    Other(String),
+}
+
+impl WebSocketConnectError {
+    /// Returns the HTTP status code if this was an HTTP rejection, else `None`.
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::HttpError { status } => Some(*status),
+            Self::Other(_) => None,
+        }
+    }
+}
+
 /// A native WebSocket client wrapping `tokio-tungstenite`.
 ///
 /// Handles connection, binary message sending, and receiving inbound
@@ -67,27 +95,81 @@ pub struct NativeWebSocketClient {
     closed: Arc<AtomicBool>,
 }
 
+impl std::fmt::Debug for NativeWebSocketClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeWebSocketClient")
+            .field("connected", &self.is_connected())
+            .finish()
+    }
+}
+
 impl NativeWebSocketClient {
     /// Connect to a WebSocket server.
     ///
     /// Returns the client and a channel receiver for inbound binary
-    /// messages.
+    /// messages.  For a version that preserves HTTP status codes on
+    /// failed upgrades, see [`try_connect`](Self::try_connect).
     ///
     /// # Arguments
     /// * `url` — Full WebSocket URL, e.g. `"wss://host:port/lobby/user/room"`
     ///   or `"ws://host:port/lobby/user/room"` for unencrypted connections.
     pub async fn connect(url: &str) -> Result<(Self, mpsc::Receiver<Vec<u8>>)> {
+        Self::try_connect(url)
+            .await
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Connect to a WebSocket server, returning a typed error on failure.
+    ///
+    /// Unlike [`connect`](Self::connect), this preserves the HTTP status code
+    /// when the server rejects the WebSocket upgrade (e.g. 401, 403, 410).
+    /// This is particularly useful for integration tests that need to verify
+    /// authentication and authorization behaviour.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use videocall_transport::native_websocket::{NativeWebSocketClient, WebSocketConnectError};
+    ///
+    /// # async fn example() {
+    /// match NativeWebSocketClient::try_connect("ws://localhost/lobby?token=bad").await {
+    ///     Ok((client, rx)) => { /* connected */ }
+    ///     Err(WebSocketConnectError::HttpError { status: 401 }) => {
+    ///         println!("Unauthorized!");
+    ///     }
+    ///     Err(e) => { eprintln!("Error: {e}"); }
+    /// }
+    /// # }
+    /// ```
+    pub async fn try_connect(
+        url: &str,
+    ) -> std::result::Result<(Self, mpsc::Receiver<Vec<u8>>), WebSocketConnectError> {
         info!("NativeWebSocket connecting to {url}");
 
-        let (ws_stream, response) = tokio_tungstenite::connect_async(url)
-            .await
-            .map_err(|e| anyhow!("WebSocket connection to '{url}' failed: {e}"))?;
+        let (ws_stream, response) =
+            tokio_tungstenite::connect_async(url)
+                .await
+                .map_err(|e| match e {
+                    tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                        WebSocketConnectError::HttpError {
+                            status: resp.status().as_u16(),
+                        }
+                    }
+                    other => WebSocketConnectError::Other(format!(
+                        "WebSocket connection to '{url}' failed: {other}"
+                    )),
+                })?;
 
         info!(
             "WebSocket connected to {url} (HTTP {})",
             response.status()
         );
 
+        Ok(Self::setup_streams(ws_stream))
+    }
+
+    /// Internal: split the stream and spawn the reader task.
+    fn setup_streams(ws_stream: WsStream) -> (Self, mpsc::Receiver<Vec<u8>>) {
         let (writer, mut reader) = ws_stream.split();
 
         let closed = Arc::new(AtomicBool::new(false));
@@ -96,7 +178,6 @@ impl NativeWebSocketClient {
             closed: closed.clone(),
         };
 
-        // Spawn the inbound reader loop
         let (inbound_tx, inbound_rx) = mpsc::channel(100);
         let closed_reader = closed.clone();
 
@@ -119,7 +200,6 @@ impl NativeWebSocketClient {
                     }
                     Ok(Message::Ping(payload)) => {
                         debug!("WebSocket ping received ({} bytes)", payload.len());
-                        // Pong is sent automatically by tungstenite
                     }
                     Ok(Message::Pong(_)) => {
                         debug!("WebSocket pong received");
@@ -141,7 +221,7 @@ impl NativeWebSocketClient {
             debug!("WebSocket inbound reader loop ended");
         });
 
-        Ok((client, inbound_rx))
+        (client, inbound_rx)
     }
 
     /// Send binary data over the WebSocket connection.
@@ -177,9 +257,6 @@ impl NativeWebSocketClient {
     }
 
     /// Mark the connection as closed without sending a close frame.
-    ///
-    /// Useful for abrupt disconnects where we don't want to wait for
-    /// a graceful close handshake.
     pub fn force_close(&self) {
         self.closed.store(true, Ordering::Relaxed);
     }
@@ -187,9 +264,19 @@ impl NativeWebSocketClient {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn test_module_compiles() {
-        // Verifies the module compiles on native targets.
-        // Actual connection tests require a running WebSocket server.
+    fn test_connect_error_http_status() {
+        let err = WebSocketConnectError::HttpError { status: 401 };
+        assert_eq!(err.http_status(), Some(401));
+        assert!(format!("{err}").contains("401"));
+    }
+
+    #[test]
+    fn test_connect_error_other() {
+        let err = WebSocketConnectError::Other("timeout".into());
+        assert_eq!(err.http_status(), None);
+        assert!(format!("{err}").contains("timeout"));
     }
 }

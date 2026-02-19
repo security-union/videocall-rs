@@ -17,6 +17,9 @@
 //! lobby handlers (`sec_api::lobby`) and use the **real** token generation from
 //! the Meeting Backend (`meeting_api::token::generate_room_token`).
 //!
+//! Transport: uses [`NativeWebSocketClient`] from `videocall-transport` — the
+//! same shared transport layer used by all native clients (bot, CLI, etc.).
+//!
 //! Verified scenarios:
 //! - Valid tokens issued by meeting-api allow connection via `GET /lobby?token=`
 //! - Expired / invalid / unauthorized tokens are rejected
@@ -25,7 +28,6 @@
 
 use actix::Actor;
 use actix_web::{web, App, HttpServer};
-use futures_util::StreamExt;
 use protobuf::Message as ProtoMessage;
 use sec_api::{
     actors::chat_server::ChatServer,
@@ -36,7 +38,7 @@ use sec_api::{
 };
 use serial_test::serial;
 use std::time::Duration;
-use tokio_tungstenite::tungstenite::Message;
+use videocall_transport::native_websocket::{NativeWebSocketClient, WebSocketConnectError};
 use videocall_types::FeatureFlags;
 
 const JWT_SECRET: &str = "test-secret-for-integration-tests";
@@ -67,7 +69,6 @@ async fn start_real_ws_server(port: u16) {
 
     actix_rt::spawn(async move {
         let _ = HttpServer::new(move || {
-            // Register the REAL production handlers from sec_api::lobby
             App::new()
                 .app_data(web::Data::new(state.clone()))
                 .service(ws_connect_authenticated)
@@ -81,10 +82,9 @@ async fn start_real_ws_server(port: u16) {
 }
 
 async fn wait_for_server(port: u16) {
-    // Probe with the deprecated endpoint (FF is off during setup)
     let url = format!("ws://127.0.0.1:{port}/lobby/probe/probe");
     for _ in 0..50 {
-        if tokio_tungstenite::connect_async(&url).await.is_ok() {
+        if NativeWebSocketClient::connect(&url).await.is_ok() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -101,26 +101,27 @@ async fn setup(port: u16) {
 }
 
 // =========================================================================
-// Connection helpers
+// Connection helpers using videocall-transport
 // =========================================================================
 
 /// Connect via the primary token-based endpoint: GET /lobby?token=<JWT>
+///
+/// Returns `Ok(client, inbound_rx)` on success, or `Err(http_status)` when
+/// the server rejects the WebSocket upgrade.
 async fn try_connect_with_token(
     port: u16,
     token: &str,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    u16,
-> {
+) -> Result<(NativeWebSocketClient, tokio::sync::mpsc::Receiver<Vec<u8>>), u16> {
     let url = format!(
         "ws://127.0.0.1:{port}/lobby?token={token}",
         token = urlencoding::encode(token)
     );
-    match tokio_tungstenite::connect_async(&url).await {
-        Ok((ws, _)) => Ok(ws),
-        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
-        Err(e) => panic!("unexpected connection error: {e}"),
-    }
+    NativeWebSocketClient::try_connect(&url)
+        .await
+        .map_err(|e| match e {
+            WebSocketConnectError::HttpError { status } => status,
+            other => panic!("unexpected connection error: {other}"),
+        })
 }
 
 /// Connect via the deprecated path-based endpoint: GET /lobby/{email}/{room}
@@ -128,23 +129,19 @@ async fn try_connect_deprecated(
     port: u16,
     email: &str,
     room: &str,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    u16,
-> {
+) -> Result<(NativeWebSocketClient, tokio::sync::mpsc::Receiver<Vec<u8>>), u16> {
     let url = format!("ws://127.0.0.1:{port}/lobby/{email}/{room}");
-    match tokio_tungstenite::connect_async(&url).await {
-        Ok((ws, _)) => Ok(ws),
-        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
-        Err(e) => panic!("unexpected connection error: {e}"),
-    }
+    NativeWebSocketClient::try_connect(&url)
+        .await
+        .map_err(|e| match e {
+            WebSocketConnectError::HttpError { status } => status,
+            other => panic!("unexpected connection error: {other}"),
+        })
 }
 
 /// Wait for the MEETING_STARTED protobuf packet from the real server.
 async fn wait_for_meeting_started(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    inbound_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> anyhow::Result<()> {
     use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
     use videocall_types::protos::meeting_packet::MeetingPacket;
@@ -154,8 +151,8 @@ async fn wait_for_meeting_started(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         tokio::select! {
-            msg = ws.next() => {
-                if let Some(Ok(Message::Binary(data))) = msg {
+            msg = inbound_rx.recv() => {
+                if let Some(data) = msg {
                     if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&data) {
                         if wrapper.packet_type == PacketType::MEETING.into() {
                             if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
@@ -183,7 +180,6 @@ async fn test_valid_meeting_api_token_connects() {
     let port = JWT_PORT;
     setup(port).await;
 
-    // Use the REAL meeting-api token generation
     let token = meeting_api::token::generate_room_token(
         JWT_SECRET,
         TOKEN_TTL_SECS,
@@ -197,11 +193,10 @@ async fn test_valid_meeting_api_token_connects() {
     let result = try_connect_with_token(port, &token).await;
     assert!(result.is_ok(), "valid meeting-api token should connect");
 
-    let mut ws = result.unwrap();
-    wait_for_meeting_started(&mut ws)
+    let (_client, mut rx) = result.unwrap();
+    wait_for_meeting_started(&mut rx)
         .await
         .expect("should receive MEETING_STARTED from real server");
-    drop(ws);
 }
 
 #[actix_rt::test]
@@ -210,7 +205,6 @@ async fn test_expired_meeting_api_token_rejected() {
     let port = JWT_PORT + 1;
     setup(port).await;
 
-    // Generate a token that expired 120 seconds ago (past the 60s leeway)
     let token = meeting_api::token::generate_room_token(
         JWT_SECRET,
         -120,
@@ -232,7 +226,6 @@ async fn test_wrong_secret_token_rejected() {
     let port = JWT_PORT + 2;
     setup(port).await;
 
-    // Token signed with a different secret than what the server uses
     let token = meeting_api::token::generate_room_token(
         "completely-different-secret",
         TOKEN_TTL_SECS,
@@ -265,7 +258,6 @@ async fn test_token_identity_extracted_from_jwt() {
     let port = JWT_PORT + 4;
     setup(port).await;
 
-    // The token contains identity and room -- no need for URL params
     let token = meeting_api::token::generate_room_token(
         JWT_SECRET,
         TOKEN_TTL_SECS,
@@ -279,11 +271,10 @@ async fn test_token_identity_extracted_from_jwt() {
     let result = try_connect_with_token(port, &token).await;
     assert!(result.is_ok(), "token with identity in claims should work");
 
-    let mut ws = result.unwrap();
-    wait_for_meeting_started(&mut ws)
+    let (_client, mut rx) = result.unwrap();
+    wait_for_meeting_started(&mut rx)
         .await
         .expect("should receive MEETING_STARTED");
-    drop(ws);
 }
 
 // =========================================================================
@@ -303,11 +294,10 @@ async fn test_deprecated_endpoint_works_when_ff_off() {
         "deprecated endpoint with FF=off should allow connection"
     );
 
-    let mut ws = result.unwrap();
-    wait_for_meeting_started(&mut ws)
+    let (_client, mut rx) = result.unwrap();
+    wait_for_meeting_started(&mut rx)
         .await
         .expect("should receive MEETING_STARTED");
-    drop(ws);
 
     FeatureFlags::clear_meeting_management_override();
 }
@@ -341,7 +331,6 @@ async fn test_host_and_attendee_tokens_both_connect() {
 
     let room = "team-standup";
 
-    // Host token
     let host_token = meeting_api::token::generate_room_token(
         JWT_SECRET,
         TOKEN_TTL_SECS,
@@ -352,7 +341,6 @@ async fn test_host_and_attendee_tokens_both_connect() {
     )
     .expect("should generate host token");
 
-    // Attendee token
     let attendee_token = meeting_api::token::generate_room_token(
         JWT_SECRET,
         TOKEN_TTL_SECS,
@@ -366,18 +354,15 @@ async fn test_host_and_attendee_tokens_both_connect() {
     // Both should connect to the REAL server
     let host_result = try_connect_with_token(port, &host_token).await;
     assert!(host_result.is_ok(), "host token should connect");
-    let mut ws_host = host_result.unwrap();
-    wait_for_meeting_started(&mut ws_host)
+    let (_host_client, mut host_rx) = host_result.unwrap();
+    wait_for_meeting_started(&mut host_rx)
         .await
         .expect("host should receive MEETING_STARTED");
 
     let attendee_result = try_connect_with_token(port, &attendee_token).await;
     assert!(attendee_result.is_ok(), "attendee token should connect");
-    let mut ws_attendee = attendee_result.unwrap();
-    wait_for_meeting_started(&mut ws_attendee)
+    let (_attendee_client, mut attendee_rx) = attendee_result.unwrap();
+    wait_for_meeting_started(&mut attendee_rx)
         .await
         .expect("attendee should receive MEETING_STARTED");
-
-    drop(ws_host);
-    drop(ws_attendee);
 }

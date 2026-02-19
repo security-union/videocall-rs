@@ -1526,9 +1526,9 @@ dependencies = [
 
 [[package]]
 name = "crc"
-version = "3.4.0"
+version = "3.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+checksum = "69e6e4d7b33a94f0991c26729976b10ebde1d34c3ee82408fb536164fa10d636"
 dependencies = [
  "crc-catalog",
 ]
@@ -7130,13 +7130,13 @@ dependencies = [
  "serial_test",
  "sqlx",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "url",
  "urlencoding",
  "uuid",
  "videocall-meeting-types",
+ "videocall-transport",
  "videocall-types",
  "web-transport-quinn 0.8.1",
 ]

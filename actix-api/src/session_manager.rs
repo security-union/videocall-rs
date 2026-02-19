@@ -106,6 +106,7 @@ impl SessionManager {
             start_time_ms: now_ms,
             is_first_participant: true,
             creator_id: user_id.to_string(),
+            session_id: id.to_string(),
         })
     }
 
@@ -201,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn test_end_session_returns_result() {
         let manager = SessionManager::new();
-        let result = manager.end_session("room-1", "alice", "alice-session-1").await.unwrap();
+        let result = manager.end_session("room-1", "alice").await.unwrap();
         assert_eq!(
             result,
             SessionEndResult::MeetingContinues { remaining_count: 0 }

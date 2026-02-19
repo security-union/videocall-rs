@@ -61,7 +61,7 @@ impl ChatServer {
             nats_connection,
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
-            session_manager: SessionManager::new(pool),
+            session_manager: SessionManager::new(),
             connection_states: HashMap::new(),
         }
     }
@@ -648,19 +648,19 @@ mod tests {
         use crate::session_manager::SessionManager;
         use tokio::sync::mpsc;
 
-        let pool = get_test_pool().await;
+        let _pool = get_test_pool().await;
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client.clone(), Some(pool.clone()))
+        let chat_server = ChatServer::new(nats_client.clone())
             .await
             .start();
 
         let (tx, _rx) = mpsc::unbounded_channel::<TrackerMessage>();
         let tracker_sender: TrackerSender = tx;
-        let session_manager = SessionManager::new(Some(pool));
+        let session_manager = SessionManager::new();
 
         // Create two sessions with the same email
         let email = "same-user@example.com".to_string();
@@ -704,13 +704,13 @@ mod tests {
         use std::sync::Arc;
         use tokio::time::{sleep, Duration};
 
-        let pool = get_test_pool().await;
+        let _pool = get_test_pool().await;
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client.clone(), Some(pool)).await.start();
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
 
         struct DummySession;
         impl Actor for DummySession {
@@ -728,7 +728,7 @@ mod tests {
         // Register session - starts in Testing state
         chat_server
             .send(Connect {
-                id: session_id,
+                id: session_id.clone(),
                 addr: dummy.recipient(),
             })
             .await
@@ -754,7 +754,7 @@ mod tests {
         // Send message while in Testing state - should NOT publish
         chat_server
             .send(ClientMessage {
-                session: session_id,
+                session: session_id.clone(),
                 room: room.clone(),
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
@@ -784,13 +784,13 @@ mod tests {
         use std::sync::Arc;
         use tokio::time::{sleep, Duration};
 
-        let pool = get_test_pool().await;
+        let _pool = get_test_pool().await;
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client.clone(), Some(pool)).await.start();
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
 
         struct DummySession;
         impl Actor for DummySession {
@@ -808,7 +808,7 @@ mod tests {
         // Register session - starts in Testing state
         chat_server
             .send(Connect {
-                id: session_id,
+                id: session_id.clone(),
                 addr: dummy.recipient(),
             })
             .await
@@ -817,7 +817,7 @@ mod tests {
         // Activate the connection
         chat_server
             .send(ActivateConnection {
-                session: session_id,
+                session: session_id.clone(),
             })
             .await
             .expect("ActivateConnection should succeed");
@@ -842,7 +842,7 @@ mod tests {
         // Send message while in Active state - should publish
         chat_server
             .send(ClientMessage {
-                session: session_id,
+                session: session_id.clone(),
                 room: room.clone(),
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
@@ -867,13 +867,13 @@ mod tests {
     #[actix_rt::test]
     #[serial]
     async fn test_activate_connection_idempotent() {
-        let pool = get_test_pool().await;
+        let _pool = get_test_pool().await;
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
+        let chat_server = ChatServer::new(nats_client).await.start();
 
         struct DummySession;
         impl Actor for DummySession {
@@ -890,7 +890,7 @@ mod tests {
         // Register session - starts in Testing state
         chat_server
             .send(Connect {
-                id: session_id,
+                id: session_id.clone(),
                 addr: dummy.recipient(),
             })
             .await
@@ -899,7 +899,7 @@ mod tests {
         // First activation - should transition Testing -> Active
         chat_server
             .send(ActivateConnection {
-                session: session_id,
+                session: session_id.clone(),
             })
             .await
             .expect("ActivateConnection should succeed");
@@ -907,7 +907,7 @@ mod tests {
         // Verify state is Active
         let state1 = chat_server
             .send(GetConnectionState {
-                session: session_id,
+                session: session_id.clone(),
             })
             .await
             .expect("GetConnectionState should succeed")
@@ -921,7 +921,7 @@ mod tests {
         // Second activation - should remain Active (idempotent)
         chat_server
             .send(ActivateConnection {
-                session: session_id,
+                session: session_id.clone(),
             })
             .await
             .expect("ActivateConnection should succeed");
@@ -929,7 +929,7 @@ mod tests {
         // Verify state is still Active
         let state2 = chat_server
             .send(GetConnectionState {
-                session: session_id,
+                session: session_id.clone(),
             })
             .await
             .expect("GetConnectionState should succeed")

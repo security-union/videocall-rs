@@ -314,8 +314,8 @@ impl AttendantsComponent {
                     link.send_message(Msg::OnPeerRemoved(peer_id));
                 })
             }),
-            get_peer_video_canvas_id: Callback::from(|session_id| session_id),
-            get_peer_screen_canvas_id: Callback::from(|session_id| format!("screen-share-{}", &session_id)),
+            get_peer_video_canvas_id: VcCallback::from(|session_id| session_id),
+            get_peer_screen_canvas_id: VcCallback::from(|session_id| format!("screen-share-{}", &session_id)),
             enable_diagnostics: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,

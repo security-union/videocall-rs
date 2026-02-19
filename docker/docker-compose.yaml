@@ -4,16 +4,18 @@ services:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-yew-ui-cargo-registry-cache:/usr/local/cargo/registry
-      - rustlemania-yew-ui-cargo-git-cache:/usr/local/cargo/git
-      - rustlemania-yew-ui-cargo-target-cache:/usr/local/cargo/target
+      - rustlemania-yew-ui-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-yew-ui-cargo-git-cache:/root/.cargo/git
       - rustlemania-yew-ui-cache:/app/yew-ui/target
     build:
-      dockerfile: ../docker/Dockerfile.yew
-      context: ../docker
+      dockerfile: docker/Dockerfile.yew.dev
+      context: ../
     working_dir: /app/yew-ui
-    command: ["/bin/sh", "-lc", "/app/docker/start-yew.sh"]
+    command: >
+      nix develop /app#yew-ui --command bash -c
+      "/app/docker/start-yew.sh"
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
       - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
       - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
@@ -33,21 +35,7 @@ services:
       - UI_URL=${UI_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
     ports:
       - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
-    depends_on:
-      - tailwind-yew
 
-  tailwind-yew:
-    build:
-      dockerfile: ../docker/Dockerfile.tailwind
-      context: ../docker
-    volumes:
-      - type: bind
-        source: ../
-        target: /app
-    working_dir: /app/yew-ui
-    entrypoint: ["/bin/sh", "-c"]
-    command: "tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify"
-    
   website:
     volumes:
       - type: bind
@@ -352,7 +340,6 @@ volumes:
   rustlemania-actix-webtransport-cache:
   rustlemania-yew-ui-cargo-registry-cache:
   rustlemania-yew-ui-cargo-git-cache:
-  rustlemania-yew-ui-cargo-target-cache:
   rustlemania-yew-ui-cache:
   rustlemania-leptos-ui-cargo-registry-cache:
   rustlemania-leptos-ui-cargo-git-cache:

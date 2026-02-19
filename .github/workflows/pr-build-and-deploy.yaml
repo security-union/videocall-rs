@@ -1,4 +1,4 @@
-name: Deploy PR Preview
+name: Build and Deploy PR Preview
 
 on:
   issue_comment:
@@ -6,9 +6,9 @@ on:
 
 permissions:
   contents: read
+  packages: write
   pull-requests: write
   issues: write
-  packages: read
 
 jobs:
   check-permissions:
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     if: |
       github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, '/deploy')
+      startsWith(github.event.comment.body, '/build-and-deploy')
     outputs:
       authorized: ${{ steps.check.outputs.authorized }}
       pr_number: ${{ steps.get-pr.outputs.pr_number }}
@@ -63,7 +63,7 @@ jobs:
               content: 'rocket'
             })
 
-      - name: Comment deployment started
+      - name: Comment build-and-deploy started
         if: steps.check.outputs.authorized == 'true'
         uses: actions/github-script@v7
         with:
@@ -72,17 +72,20 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `🚀 **Deploying PR preview environment...**
+              body: `🚀 **Building images and deploying preview...**
 
             Started by @${{ github.event.comment.user.login }}
 
-            **Infrastructure:**
-            - Creating namespace \`preview-${{ steps.get-pr.outputs.pr_number }}\`
-            - Creating database \`preview_${{ steps.get-pr.outputs.pr_number }}\`
-            - Deploying NATS instance
-            - Deploying 3 services: WebSocket, Meeting API, UI
+            **Phase 1: Building Docker images** (~10-15 min)
+            - Media Server (WebSocket/WebTransport)
+            - Meeting API (REST backend)
+            - Web UI (WASM frontend)
 
-            ⏱️ Deployment typically takes 3-5 minutes.
+            **Phase 2: Deploying preview** (~3-5 min)
+            - Creating namespace \`preview-${{ steps.get-pr.outputs.pr_number }}\`
+            - Deploying services
+
+            ⏱️ Total time: ~15-20 minutes
 
             [View workflow run →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             })
@@ -99,33 +102,86 @@ jobs:
               repo: context.repo.repo,
               body: `❌ **Permission denied**
 
-            @${{ github.event.comment.user.login }}, only repository maintainers can deploy preview environments.
+            @${{ github.event.comment.user.login }}, only repository maintainers can trigger builds and deployments.
 
             **Your role**: \`${association}\`
-            **Required roles**: \`OWNER\`, \`MEMBER\`, or \`COLLABORATOR\`
-
-            If you believe this is an error, please ask a maintainer to run \`/deploy\`.`
-            })
-
-      - name: React to comment (unauthorized)
-        if: steps.check.outputs.authorized == 'false'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            github.rest.reactions.createForIssueComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              comment_id: context.payload.comment.id,
-              content: '-1'
+            **Required roles**: \`OWNER\`, \`MEMBER\`, or \`COLLABORATOR\``
             })
 
       - name: Fail if unauthorized
         if: steps.check.outputs.authorized == 'false'
         run: exit 1
 
+  build-images:
+    name: Build Docker images
+    needs: check-permissions
+    if: needs.check-permissions.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: media-server
+            dockerfile: Dockerfile.actix
+            image: videocall-media-server
+          - name: meeting-api
+            dockerfile: Dockerfile.meeting-api
+            image: videocall-meeting-api
+          - name: web-ui
+            dockerfile: Dockerfile.yew
+            image: videocall-web-ui
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-permissions.outputs.pr_sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.name }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ghcr.io/jboyd01/${{ matrix.image }}:pr-${{ needs.check-permissions.outputs.pr_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  comment-build-complete:
+    name: Comment build complete
+    needs: [check-permissions, build-images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment images built
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ needs.check-permissions.outputs.pr_number }};
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **Images built successfully!**
+
+            📦 **Images pushed to GHCR:**
+            - \`ghcr.io/jboyd01/videocall-media-server:pr-${prNumber}\`
+            - \`ghcr.io/jboyd01/videocall-meeting-api:pr-${prNumber}\`
+            - \`ghcr.io/jboyd01/videocall-web-ui:pr-${prNumber}\`
+
+            🚀 **Starting deployment...**`
+            });
+
   deploy:
     name: Deploy preview environment
-    needs: check-permissions
+    needs: [check-permissions, build-images]
     if: needs.check-permissions.outputs.authorized == 'true'
     uses: ./.github/workflows/pr-deploy-reusable.yaml
     with:

@@ -1,38 +1,75 @@
 # PR Preview Deployment - Implementation Summary
 
-**Date:** 2026-02-18
-**Status:** ✅ Workflows implemented, awaiting manual setup
+**Date:** 2026-02-19
+**Status:** ✅ Workflows implemented with reusable architecture
 
 ---
 
 ## What Was Implemented
 
-### Three GitHub Actions Workflows
+### GitHub Actions Workflows
 
-#### 1. `.github/workflows/pr-deploy.yaml`
-Deploys a complete preview environment when maintainers comment `/deploy` on a PR.
-
-**Trigger:** Issue comment matching `/deploy`
+#### 1. `.github/workflows/pr-deploy-reusable.yaml` (Core Deployment Logic)
+Reusable workflow containing all deployment logic. Called by other workflows.
 
 **What it does:**
 1. ✅ Permission check (OWNER/MEMBER/COLLABORATOR only)
 2. ✅ Capacity check (max 3 concurrent previews)
-3. ✅ Creates namespace `preview-{PR_NUM}` with labels
-4. ✅ Applies ResourceQuota (500m CPU, 1Gi memory limits)
-5. ✅ Creates postgres database `preview_{PR_NUM}`
-6. ✅ Deploys NATS instance (isolated, 50m CPU, 64Mi memory)
-7. ✅ Deploys WebSocket server with PR-specific images
-8. ✅ Deploys Meeting API with PR-specific images
-9. ✅ Deploys UI with PR-specific images
-10. ✅ Posts success comment with preview URLs
-11. ✅ Cleans up on failure
+3. ✅ GHCR image verification (fails fast if images missing)
+4. ✅ Creates namespace `preview-{PR_NUM}` with labels
+5. ✅ Applies ResourceQuota (500m CPU, 1Gi memory limits)
+6. ✅ Creates postgres database `preview_{PR_NUM}`
+7. ✅ Deploys NATS instance (isolated, 50m CPU, 64Mi memory)
+8. ✅ Deploys WebSocket server with PR-specific images
+9. ✅ Deploys Meeting API with PR-specific images
+10. ✅ Deploys UI with PR-specific images
+11. ✅ Posts success comment with preview URLs
+12. ✅ Cleans up on failure
 
 **Preview URLs created:**
 - `https://pr-{NUM}.sandbox.videocall.rs` (UI)
 - `https://pr-{NUM}-api.sandbox.videocall.rs` (Meeting API)
 - `wss://pr-{NUM}-ws.sandbox.videocall.rs` (WebSocket)
 
-#### 2. `.github/workflows/pr-undeploy.yaml`
+#### 2. `.github/workflows/pr-deploy.yaml`
+Deploys a preview environment when maintainers comment `/deploy` on a PR.
+
+**Trigger:** Issue comment matching `/deploy`
+
+**What it does:**
+1. ✅ Permission check
+2. ✅ Posts deployment started comment
+3. ✅ Calls reusable deployment workflow
+
+**Usage:** Comment `/deploy` on a PR (after images are built)
+
+#### 3. `.github/workflows/pr-build-images-command.yaml`
+Builds Docker images when maintainers comment `/build-images` on a PR.
+
+**Trigger:** Issue comment matching `/build-images`
+
+**What it does:**
+1. ✅ Permission check
+2. ✅ Builds 3 Docker images in parallel
+3. ✅ Pushes to GHCR with tag `pr-{NUM}`
+4. ✅ Posts success comment with image tags
+
+**Usage:** Comment `/build-images` on a PR (required before deploy)
+
+#### 4. `.github/workflows/pr-build-and-deploy.yaml`
+Combined workflow that builds images AND deploys in one command.
+
+**Trigger:** Issue comment matching `/build-and-deploy`
+
+**What it does:**
+1. ✅ Permission check
+2. ✅ Builds 3 Docker images in parallel (~10-15 min)
+3. ✅ Calls reusable deployment workflow (~3-5 min)
+4. ✅ Posts combined success comment
+
+**Usage:** Comment `/build-and-deploy` on a PR (convenience command)
+
+#### 5. `.github/workflows/pr-undeploy.yaml`
 Tears down a preview environment when maintainers comment `/undeploy` on a PR.
 
 **Trigger:** Issue comment matching `/undeploy`
@@ -44,7 +81,9 @@ Tears down a preview environment when maintainers comment `/undeploy` on a PR.
 4. ✅ Deletes GHCR images tagged `pr-{NUM}`
 5. ✅ Posts confirmation comment
 
-#### 3. `.github/workflows/pr-cleanup.yaml`
+**Usage:** Comment `/undeploy` on a PR
+
+#### 6. `.github/workflows/pr-cleanup.yaml`
 Automatically cleans up preview environments when PRs are closed or merged.
 
 **Trigger:** PR closed (merged or not)
@@ -54,6 +93,50 @@ Automatically cleans up preview environments when PRs are closed or merged.
 2. ✅ Deletes namespace if found
 3. ✅ Drops postgres database if found
 4. ✅ Deletes GHCR images
+
+#### 7. `.github/workflows/pr-welcome.yaml`
+Auto-comments on new PRs with deployment instructions.
+
+**Trigger:** PR opened
+
+**What it does:**
+1. ✅ Detects first-time contributors
+2. ✅ Posts welcome comment with deployment commands
+3. ✅ Links to contributing guidelines and docs
+
+**Features:**
+- Special welcome for first-time contributors
+- Lists all available commands
+- Mentions automated CI checks
+
+---
+
+## Workflow Architecture
+
+### Reusable Workflow Pattern
+
+The deployment logic is centralized in `pr-deploy-reusable.yaml` to avoid duplication:
+
+```
+pr-deploy-reusable.yaml (Core deployment logic)
+    ↑                        ↑
+    |                        |
+pr-deploy.yaml        pr-build-and-deploy.yaml
+(/deploy command)     (/build-and-deploy command)
+```
+
+**Benefits:**
+- ✅ Single source of truth for deployment
+- ✅ Zero code duplication
+- ✅ Easy to maintain and update
+- ✅ Both workflows automatically stay in sync
+
+**How it works:**
+1. User comments `/deploy` or `/build-and-deploy`
+2. Command workflow checks permissions
+3. Command workflow calls `pr-deploy-reusable.yaml` with inputs
+4. Reusable workflow performs all deployment steps
+5. Reusable workflow posts success/failure comments
 
 ---
 
@@ -301,22 +384,29 @@ All ingresses use:
 
 ## Usage
 
-### Deploy a Preview
+### Quick Start (Build and Deploy)
 
-1. Ensure PR images are built: comment `/build-images`
-2. Wait for images to push to GHCR (~10-15 min)
-3. Comment `/deploy` on the PR
-4. Wait for deployment (~3-5 min)
-5. Open preview URL from comment
+**Fastest method:** Comment `/build-and-deploy` on a PR
+- Builds all images and deploys in one step (~15-20 min total)
+- Posts single comment with preview URLs when complete
+
+### Two-Step Method (Build then Deploy)
+
+1. **Build images:** Comment `/build-images` (~10-15 min)
+2. **Deploy preview:** Comment `/deploy` (~3-5 min)
+
+**When to use:**
+- Want to test images locally before deploying
+- Need to rebuild images without redeploying
+- Prefer to separate build and deployment steps
 
 ### Update a Preview
 
 1. Push new commits to PR
-2. Comment `/build-images` to rebuild images
-3. Comment `/undeploy` to tear down old preview
-4. Comment `/deploy` to deploy new preview
+2. Comment `/build-and-deploy` to rebuild and redeploy
+   - OR: Comment `/build-images` → `/undeploy` → `/deploy`
 
-**Note:** In-place updates are not supported. Must undeploy then redeploy.
+**Note:** The deployment will reuse the existing namespace if it exists (automatic redeployment).
 
 ### Undeploy a Preview
 

@@ -1,0 +1,75 @@
+name: Welcome New PR
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  welcome:
+    name: Post welcome comment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if first-time contributor
+        id: check-first-time
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const author = context.payload.pull_request.user.login;
+
+            // Get all PRs by this author
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              creator: author
+            });
+
+            // First PR if this is the only one
+            const isFirstTime = prs.length === 1;
+            core.setOutput('first_time', isFirstTime);
+            return isFirstTime;
+
+      - name: Post welcome comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isFirstTime = ${{ steps.check-first-time.outputs.first_time }};
+
+            let welcomeSection = '';
+            if (isFirstTime) {
+              welcomeSection = `
+            Welcome to videocall-rs! 🎉 This appears to be your first contribution.
+            Please ensure your changes follow our [Contributing Guidelines](../blob/main/CONTRIBUTING.md).
+            `;
+            }
+
+            const body = `## 👋 Thanks for your contribution!
+            ${welcomeSection}
+            A maintainer will review your changes shortly.
+
+            ### ✅ Automated Checks
+
+            CI/CD tests will run automatically. Please ensure all checks pass before requesting review.
+
+            ### 🚀 Preview Deployments
+
+            **Maintainers** can test this PR in a live environment using these commands:
+
+            - \`/build-images\` — Build Docker images for this PR (~10-15 min)
+            - \`/deploy\` — Deploy preview environment (~3-5 min)
+            - \`/build-and-deploy\` — Build images and deploy in one step (~15-20 min)
+            - \`/undeploy\` — Tear down preview environment
+
+            Preview URLs will be posted automatically once deployed.
+
+            📚 [Deployment Documentation](../blob/main/docs/PR_PREVIEW_IMPLEMENTATION_SUMMARY.md)`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });

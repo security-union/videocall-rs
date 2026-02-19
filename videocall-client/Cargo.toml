@@ -33,9 +33,7 @@ wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 web-time = "1.1.0"
 serde = { version = "1", features = ["derive"] }
-yew = { version = "0.21" }
-yew-websocket = "1.21.0"
-yew-webtransport = "0.21.1"
+videocall-transport = { path = "../videocall-transport", version = "0.1.0" }
 prost = "0.11"
 videocall-codecs = { path = "../videocall-codecs", features = ["wasm"], version = "0.1.12" }
 neteq = { path = "../neteq", features = ["web"], version = "0.8.2", optional = true,  default-features = false }

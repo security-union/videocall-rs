@@ -19,10 +19,10 @@
 use gloo_utils::window;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use videocall_types::Callback;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::MediaStreamConstraints;
-use yew::prelude::Callback;
 
 /// [MediaDeviceAccess] is a utility to request the user's permission to access the microphone and
 /// camera.
@@ -46,7 +46,7 @@ impl MediaDeviceAccess {
     /// ```no_run
     /// # use videocall_client::MediaDeviceAccess;
     /// # use wasm_bindgen::JsValue;
-    /// # use yew::Callback;
+    /// # use videocall_client::Callback;
     /// let mut media_device_access = MediaDeviceAccess::new();
     /// media_device_access.on_granted = Callback::from(|_| {
     ///     // Handle granted permission

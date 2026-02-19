@@ -1,5 +1,5 @@
 {
-  description = "videocall-rs - WebRTC video calling platform";
+  description = "videocall-rs - WebTransport video calling platform";
 
   inputs = {
     # Pinned nixpkgs with pre-built:

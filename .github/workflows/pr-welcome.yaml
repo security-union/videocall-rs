@@ -65,7 +65,7 @@ jobs:
 
             Preview URLs will be posted automatically once deployed.
 
-            📚 [Deployment Documentation](../blob/main/docs/PR_PREVIEW_IMPLEMENTATION_SUMMARY.md)`;
+            📚 [PR Deployment Documentation](../blob/main/docs/PR_PREVIEW_IMPLEMENTATION_SUMMARY.md)`;
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,

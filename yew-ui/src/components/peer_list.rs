@@ -18,7 +18,6 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::UsernameCtx;
 use std::collections::HashMap;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -112,15 +111,9 @@ impl Component for PeerList {
         });
 
         // Get username from context and append (You)
-        let current_user_name: Option<String> = ctx
-            .link()
-            .context::<UsernameCtx>(Callback::noop())
-            .and_then(|(state, _handle)| state.as_ref().cloned());
+        let current_user_name = Some(ctx.props().local_user_name.clone());
 
-        let display_name = current_user_name
-            .clone()
-            .map(|name| format!("{name} (You)"))
-            .unwrap_or_else(|| "(You)".to_string());
+        let display_name = format!("{} (You)", ctx.props().local_user_name);
 
         // Check if current user is host by comparing display names
         let host_display_name = ctx.props().host_display_name.clone();

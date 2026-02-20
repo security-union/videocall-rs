@@ -251,6 +251,8 @@ mod tests {
             websocket_urls: vec!["ws://localhost:8080".to_string()],
             webtransport_urls: vec!["https://localhost:8443".to_string()],
             userid: "test_user".to_string(),
+            session_id: "test_session_id".to_string(),
+            display_name: "Test User".to_string(),
             on_inbound_media: Callback::from(|_| {}),
             on_state_changed: state_capture.callback(),
             peer_monitor: Callback::from(|_| {}),

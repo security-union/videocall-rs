@@ -4,13 +4,31 @@
 
 -- Meeting state: idle (not started), active (in progress), ended
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS state VARCHAR(50) NOT NULL DEFAULT 'idle';
-ALTER TABLE meetings ADD CONSTRAINT IF NOT EXISTS chk_meeting_state
-    CHECK (state IN ('idle', 'active', 'ended'));
+
+-- Add constraint only if it doesn't exist
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_meeting_state'
+    ) THEN
+        ALTER TABLE meetings ADD CONSTRAINT chk_meeting_state
+            CHECK (state IN ('idle', 'active', 'ended'));
+    END IF;
+END $$;
 
 -- Attendees list as JSONB array (max 100 attendees)
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS attendees JSONB NOT NULL DEFAULT '[]';
-ALTER TABLE meetings ADD CONSTRAINT IF NOT EXISTS chk_attendees_max_100
-    CHECK (jsonb_array_length(attendees) <= 100);
+
+-- Add constraint only if it doesn't exist
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_attendees_max_100'
+    ) THEN
+        ALTER TABLE meetings ADD CONSTRAINT chk_attendees_max_100
+            CHECK (jsonb_array_length(attendees) <= 100);
+    END IF;
+END $$;
 
 -- Index for faster state lookups
 CREATE INDEX IF NOT EXISTS idx_meetings_state ON meetings(state);

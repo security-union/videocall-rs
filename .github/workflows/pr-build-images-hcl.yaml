@@ -84,11 +84,13 @@ jobs:
       - name: Setup PATH
         run: echo "/home/jenkins/bin" >> $GITHUB_PATH
       - name: Checkout code
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           rm -rf /tmp/build-${{ github.event.issue.number }}
           mkdir -p /tmp/build-${{ github.event.issue.number }}
           cd /tmp/build-${{ github.event.issue.number }}
-          git clone https://github01.hclpnp.com/labs-projects/videocall.git .
+          git clone https://oauth2:${GH_TOKEN}@github01.hclpnp.com/labs-projects/videocall.git .
           git checkout ${{ needs.check-permissions.outputs.pr_sha }}
 
       - name: Login to Harbor

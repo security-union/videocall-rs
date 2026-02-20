@@ -101,13 +101,13 @@ jobs:
           # Get postgres password from secret in preview-infra namespace
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
 
-          # Drop database
-          kubectl exec -n preview-infra postgres-postgresql-0 -- \
-            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" || {
-              echo "⚠️  Failed to drop database, may need manual cleanup"
-            }
-
-          echo "✅ Database dropped for slot ${SLOT}"
+          # Drop database (ignore errors - database might not exist)
+          if kubectl exec -n preview-infra postgres-postgresql-0 -- \
+            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" 2>&1; then
+            echo "✅ Database dropped for slot ${SLOT}"
+          else
+            echo "⚠️ Failed to drop database (may not exist or already dropped)"
+          fi
 
       - name: Delete Harbor images (optional)
         if: steps.find-slot.outputs.exists == 'true'

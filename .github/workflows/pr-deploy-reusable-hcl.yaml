@@ -618,7 +618,7 @@ jobs:
 
             **Redeploy:** Push new commits, then comment \`/build-and-deploy\` to update.
 
-            [View deployment logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            [View deployment logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             });
 
   cleanup-on-failure:
@@ -650,13 +650,15 @@ jobs:
           # Delete namespace (cascades to all resources)
           kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
 
-          # Drop database
+          # Drop database (ignore errors - database might not exist)
           # CHANGED: preview-infra namespace
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
-          kubectl exec -n preview-infra postgres-postgresql-0 -- \
-            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" || {
-              echo "⚠️  Failed to drop database, may need manual cleanup"
-            }
+          if kubectl exec -n preview-infra postgres-postgresql-0 -- \
+            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" 2>&1; then
+            echo "✅ Database dropped for slot ${SLOT}"
+          else
+            echo "⚠️ Failed to drop database (may not exist or already dropped)"
+          fi
 
           echo "✅ Cleanup complete for slot ${SLOT}"
 

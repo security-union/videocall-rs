@@ -62,7 +62,7 @@ jobs:
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
             "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
-            -d "{\"body\":\"🔨 **Building Docker images for PR #${{ github.event.issue.number }}**\n\nStarted by @${{ github.event.comment.user.login }}\n\n**Building:**\n- Media server\n- Meeting API\n- Web UI\n\n⏱️ Build typically takes 10-15 minutes.\"}"
+            -d "{\"body\":\"🔨 **Building Docker images for PR #${{ github.event.issue.number }}**\n\nStarted by @${{ github.event.comment.user.login }}\n\n**Building:**\n- Media Server (WebSocket/WebTransport)\n- Meeting API (REST backend)\n- Web UI (WASM frontend)\n\n⏱️ Build typically takes 10-15 minutes. I'll post another comment when the build is complete.\n\n[View build logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}"
 
       - name: Post error if unauthorized
         if: steps.check.outputs.authorized == 'false'
@@ -142,3 +142,26 @@ jobs:
             -H "Content-Type: application/json" \
             "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -d '{"content":"hooray"}'
+
+  comment-failure:
+    name: Comment on build failure
+    needs: [check-permissions, build]
+    if: always() && needs.check-permissions.outputs.authorized == 'true' && needs.build.result == 'failure'
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Comment build failure
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -d "{\"body\":\"❌ **Image build failed**\n\nThe Docker image build encountered an error.\n\n**Common issues:**\n- Build script errors\n- Harbor registry connection issues\n- Insufficient disk space on build runner\n\nCheck the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\"}"
+
+      - name: React to comment (failure)
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -d '{"content":"confused"}'

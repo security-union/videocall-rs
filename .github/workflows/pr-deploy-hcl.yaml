@@ -76,7 +76,7 @@ jobs:
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
             "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
-            -d "{\"body\":\"🚀 **Deploying PR preview to available slot...**\n\nStarted by @${{ github.event.comment.user.login }}\n\n**Infrastructure:**\n- Assigning deployment slot (1-${MAX_SLOTS} available)\n- Creating namespace & database for the slot\n- Deploying NATS, WebSocket, Meeting API, and UI\n\n⏱️ Deployment typically takes 3-5 minutes.\"}"
+            -d "{\"body\":\"🚀 **Deploying PR preview to available slot...**\n\nStarted by @${{ github.event.comment.user.login }}\n\n**Infrastructure:**\n- Assigning deployment slot (1-${MAX_SLOTS} available)\n- Creating namespace & database for the slot\n- Deploying NATS, WebSocket, Meeting API, and UI\n\n⏱️ Deployment typically takes 3-5 minutes.\n\n[View deployment logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}"
 
       - name: Post error if unauthorized
         if: steps.check.outputs.authorized == 'false'

@@ -8,19 +8,35 @@ jobs:
     runs-on: [self-hosted, Linux]
 
     steps:
-      - name: Add tools to PATH
+      - name: Debug GITHUB_PATH
         run: |
+          echo "GITHUB_PATH file location: $GITHUB_PATH"
+          echo "Does GITHUB_PATH exist: $(test -f "$GITHUB_PATH" && echo YES || echo NO)"
+          echo "GITHUB_PATH permissions: $(ls -la "$GITHUB_PATH" 2>&1 || echo 'file not found')"
+          echo "Current PATH: $PATH"
           echo "/home/jenkins/bin" >> $GITHUB_PATH
+          echo "After adding to GITHUB_PATH:"
+          cat "$GITHUB_PATH"
 
       - name: Check environment
         run: |
           echo "Runner: $(hostname)"
           whoami
           pwd
+          echo "=== PATH VARIABLE ==="
+          echo "$PATH"
+          echo "=== FULL ENV ==="
           printenv | grep PATH
+          echo "=== /home/jenkins/bin contents ==="
           ls -la /home/jenkins/bin
+          echo "=== Which commands ==="
+          which docker || echo "docker not in PATH"
+          which kubectl || echo "kubectl not in PATH"
 
-      - name: Check Docker
+      - name: Check Docker (with explicit path)
+        run: /home/jenkins/bin/docker --version
+
+      - name: Check Docker (via PATH)
         run: docker --version
 
       - name: Check Helm

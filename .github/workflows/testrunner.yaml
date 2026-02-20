@@ -18,10 +18,16 @@ jobs:
 	  echo "$HOME/bin" >> $GITHUB_PATH
 
       - name: Check Docker
-        run: docker --version
+        run: |
+          export PATH=$PATH:/home/jenking/bin
+	  echo "$HOME/bin" >> $GITHUB_PATH
+	  docker --version
 
       - name: Check kubectl
-        run: kubectl version --client
+        run:  |
+          export PATH=$PATH:/home/jenking/bin
+	  echo "$HOME/bin" >> $GITHUB_PATH
+          kubectl version --client
 
       - name: Check Helm
         run: helm version

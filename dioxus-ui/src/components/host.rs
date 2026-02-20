@@ -192,9 +192,88 @@ pub fn Host(
     {
         let state = state.clone();
         use_effect(move || {
+            let state_for_loaded = state.clone();
             let mut s = state.borrow_mut();
             if !s.initialized {
-                s.media_devices.on_loaded = VcCallback::noop();
+                s.media_devices.on_loaded = VcCallback::from(move |_| {
+                    let mut s = state_for_loaded.borrow_mut();
+                    let video_id = s.media_devices.video_inputs.selected();
+                    let audio_id = s.media_devices.audio_inputs.selected();
+                    let num_cameras = s.media_devices.video_inputs.devices().len();
+                    let num_mics = s.media_devices.audio_inputs.devices().len();
+
+                    log::info!(
+                        "Host on_loaded: cameras={num_cameras} mics={num_mics} \
+                         video_id='{video_id}' audio_id='{audio_id}' \
+                         prev_video={} prev_mic={}",
+                        s.prev_video_enabled,
+                        s.prev_mic_enabled,
+                    );
+
+                    // Auto-select camera device
+                    let cam_needs_start = if !video_id.is_empty() {
+                        s.media_devices.video_inputs.select(&video_id);
+                        // stop() clears both enabled and switching flags so that
+                        // select() below does not set the switching flag (which
+                        // would cause the new encoding loop to exit immediately).
+                        let was_enabled = s.prev_video_enabled;
+                        if was_enabled {
+                            s.camera.stop();
+                        }
+                        s.camera.select(video_id);
+                        if was_enabled {
+                            s.camera.set_enabled(true);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    // Auto-select microphone device
+                    let mic_needs_start = if !audio_id.is_empty() {
+                        s.media_devices.audio_inputs.select(&audio_id);
+                        let was_enabled = s.prev_mic_enabled;
+                        if was_enabled {
+                            s.microphone.stop();
+                        }
+                        s.microphone.select(audio_id);
+                        if was_enabled {
+                            s.microphone.set_enabled(true);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    log::info!(
+                        "Host on_loaded: cam_needs_start={cam_needs_start} mic_needs_start={mic_needs_start}"
+                    );
+
+                    drop(s);
+
+                    // Start encoders that were already enabled (camera/mic were
+                    // toggled on before devices finished loading).
+                    if cam_needs_start {
+                        let sc = state_for_loaded.clone();
+                        Timeout::new(500, move || {
+                            log::info!("Host on_loaded: starting camera after timeout");
+                            sc.borrow_mut().camera.start();
+                        })
+                        .forget();
+                    }
+                    if mic_needs_start {
+                        let sc = state_for_loaded.clone();
+                        Timeout::new(500, move || {
+                            log::info!("Host on_loaded: starting microphone after timeout");
+                            sc.borrow_mut().microphone.start();
+                        })
+                        .forget();
+                    }
+                });
                 s.media_devices.on_devices_changed = VcCallback::noop();
                 s.media_devices.load();
                 s.initialized = true;
@@ -202,59 +281,110 @@ pub fn Host(
         });
     }
 
-    // Handle prop changes for screen/mic/video enables
+    // Handle prop changes for screen/mic/video enables.
+    // NOTE: This runs in the component body (not use_effect) because Dioxus 0.7
+    // use_effect does NOT re-run when ReadOnlySignal props change.  The component
+    // function itself re-runs whenever the parent passes new prop values.
     {
-        let state = state.clone();
-        let client = client.clone();
+        let mut s = state.borrow_mut();
 
+        log::info!(
+            "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
+            s.prev_video_enabled, s.prev_mic_enabled, s.prev_share_screen,
+        );
+
+        // Screen share
+        if s.prev_share_screen != share_screen {
+            s.prev_share_screen = share_screen;
+            if share_screen {
+                s.screen.set_enabled(true);
+                let state_clone = state.clone();
+                Timeout::new(1000, move || {
+                    state_clone.borrow_mut().screen.start();
+                }).forget();
+            } else {
+                s.screen.set_enabled(false);
+                s.screen.stop();
+                s.encoder_settings.screen = None;
+            }
+        }
+
+        // Microphone
+        if s.prev_mic_enabled != mic_enabled {
+            s.prev_mic_enabled = mic_enabled;
+            if mic_enabled {
+                let device_id = s.media_devices.audio_inputs.selected();
+                if !device_id.is_empty() {
+                    s.microphone.select(device_id);
+                }
+                s.microphone.set_enabled(true);
+                s.microphone.start();
+            } else {
+                s.microphone.set_enabled(false);
+                s.microphone.stop();
+                s.encoder_settings.microphone = None;
+            }
+        }
+
+        // Camera
+        if s.prev_video_enabled != video_enabled {
+            s.prev_video_enabled = video_enabled;
+            if video_enabled {
+                let device_id = s.media_devices.video_inputs.selected();
+                log::info!(
+                    "Host render: camera ON, auto-select device_id='{device_id}'"
+                );
+                if !device_id.is_empty() {
+                    s.camera.select(device_id);
+                }
+                s.camera.set_enabled(true);
+                s.camera.start();
+            } else {
+                log::info!("Host render: camera OFF");
+                s.camera.set_enabled(false);
+                s.camera.stop();
+                s.encoder_settings.camera = None;
+            }
+        }
+
+        // Update client flags
+        client.set_audio_enabled(mic_enabled);
+        client.set_video_enabled(video_enabled);
+        drop(s);
+    }
+
+    // Diagnostic: periodically log the state of the video element so we can
+    // see whether srcObject is set, whether the element is in the DOM, etc.
+    {
         use_effect(move || {
-            let mut s = state.borrow_mut();
-
-            // Screen share
-            if s.prev_share_screen != share_screen {
-                s.prev_share_screen = share_screen;
-                if share_screen {
-                    s.screen.set_enabled(true);
-                    let state_clone = state.clone();
-                    Timeout::new(1000, move || {
-                        state_clone.borrow_mut().screen.start();
-                    }).forget();
-                } else {
-                    s.screen.set_enabled(false);
-                    s.screen.stop();
-                    s.encoder_settings.screen = None;
+            spawn(async move {
+                loop {
+                    gloo_timers::future::TimeoutFuture::new(3_000).await;
+                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                        if let Some(elem) = doc.get_element_by_id(VIDEO_ELEMENT_ID) {
+                            use wasm_bindgen::JsCast;
+                            if let Ok(v) = elem.dyn_into::<web_sys::HtmlVideoElement>() {
+                                let has_src = v.src_object().is_some();
+                                let ready = v.ready_state();
+                                let paused = v.paused();
+                                let w = v.video_width();
+                                let h = v.video_height();
+                                let display = v.style().get_property_value("display").unwrap_or_default();
+                                let parent_display = v.parent_element()
+                                    .map(|p| p.get_attribute("style").unwrap_or_default())
+                                    .unwrap_or_default();
+                                log::info!(
+                                    "DIAG video#webcam: srcObject={has_src} readyState={ready} \
+                                     paused={paused} size={w}x{h} display='{display}' \
+                                     parent_style='{parent_display}'"
+                                );
+                            }
+                        } else {
+                            log::warn!("DIAG video#webcam: NOT FOUND IN DOM");
+                        }
+                    }
                 }
-            }
-
-            // Microphone
-            if s.prev_mic_enabled != mic_enabled {
-                s.prev_mic_enabled = mic_enabled;
-                if mic_enabled {
-                    s.microphone.set_enabled(true);
-                    s.microphone.start();
-                } else {
-                    s.microphone.set_enabled(false);
-                    s.microphone.stop();
-                    s.encoder_settings.microphone = None;
-                }
-            }
-
-            // Camera
-            if s.prev_video_enabled != video_enabled {
-                s.prev_video_enabled = video_enabled;
-                if video_enabled {
-                    s.camera.set_enabled(true);
-                    s.camera.start();
-                } else {
-                    s.camera.set_enabled(false);
-                    s.camera.stop();
-                    s.encoder_settings.camera = None;
-                }
-            }
-
-            // Update client flags
-            client.set_audio_enabled(mic_enabled);
-            client.set_video_enabled(video_enabled);
+            });
         });
     }
 
@@ -315,24 +445,34 @@ pub fn Host(
     drop(s);
 
     rsx! {
-        if video_enabled {
-            div { class: "host-video-wrapper", style: "position:relative;",
-                video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", controls: false }
-                button {
-                    class: "change-name-fab",
-                    title: "Change name",
-                    onclick: move |_| {
-                        pending_name.set(load_username_from_storage().unwrap_or_default());
-                        show_change_name.set(true);
-                        change_name_error.set(None);
-                    },
-                    svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                        path { d: "M12 20h9" }
-                        path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
-                    }
+        // Always render the <video> element so Dioxus never destroys it.
+        // The camera encoder attaches srcObject via JS; if Dioxus recreates
+        // the element on re-render the stream reference is lost (dark square).
+        // Dioxus patches individual CSS properties (doesn't replace the whole
+        // style attribute), so both branches must set ALL properties explicitly.
+        div {
+            class: "host-video-wrapper",
+            style: if video_enabled {
+                "position:relative; width:auto; height:auto; opacity:1; overflow:visible; pointer-events:auto;"
+            } else {
+                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
+            },
+            video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
+            button {
+                class: "change-name-fab",
+                title: "Change name",
+                onclick: move |_| {
+                    pending_name.set(load_username_from_storage().unwrap_or_default());
+                    show_change_name.set(true);
+                    change_name_error.set(None);
+                },
+                svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                    path { d: "M12 20h9" }
+                    path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
                 }
             }
-        } else {
+        }
+        if !video_enabled {
             div { style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 1rem; position:relative;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",

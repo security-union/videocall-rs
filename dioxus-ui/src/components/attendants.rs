@@ -482,6 +482,18 @@ pub fn AttendantsComponent(
                                                     if !video_enabled() {
                                                         if media_access_granted() {
                                                             video_enabled.set(true);
+                                                            // "Warm up" the video element in this user-gesture
+                                                            // call stack.  Safari blocks play() outside user
+                                                            // gestures; calling it here marks the element as
+                                                            // user-activated so later srcObject + autoplay works.
+                                                            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                                                                if let Some(elem) = doc.get_element_by_id("webcam") {
+                                                                    use wasm_bindgen::JsCast;
+                                                                    if let Ok(v) = elem.dyn_into::<web_sys::HtmlVideoElement>() {
+                                                                        let _ = v.play();
+                                                                    }
+                                                                }
+                                                            }
                                                         } else {
                                                             mda_cam.borrow().request();
                                                         }
@@ -663,10 +675,12 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                // Waiting room controls
-                HostControls {
-                    meeting_id: id.clone(),
-                    is_admitted: true,
+                // Waiting room controls (host only)
+                if is_owner {
+                    HostControls {
+                        meeting_id: id.clone(),
+                        is_admitted: true,
+                    }
                 }
 
                 // Meeting ended overlay

@@ -98,6 +98,8 @@ jobs:
       needs.check-permissions.outputs.is_build_and_deploy == 'true'
     runs-on: [self-hosted, linux, docker]
     steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
       - name: Checkout code
         run: |
           rm -rf /tmp/build-${{ needs.check-permissions.outputs.pr_number }}
@@ -132,6 +134,28 @@ jobs:
       - name: Cleanup build directory
         if: always()
         run: rm -rf /tmp/build-${{ needs.check-permissions.outputs.pr_number }}
+
+  build-failure:
+    name: Comment on build failure
+    needs: [check-permissions, build]
+    if: always() && needs.check-permissions.outputs.authorized == 'true' && needs.build.result == 'failure'
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Post build failure comment
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ needs.check-permissions.outputs.pr_number }}/comments" \
+            -d "{\"body\":\"❌ **Build failed**\\n\\nCheck the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\"}"
+
+      - name: React to comment (failure)
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -d '{"content":"confused"}'
 
   deploy:
     name: Deploy preview environment

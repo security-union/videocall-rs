@@ -12,6 +12,9 @@ jobs:
     name: Cleanup preview environment
     runs-on: [self-hosted, linux, docker]
     steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
       - name: Find deployment slot
         id: find-slot
         run: |

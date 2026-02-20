@@ -81,6 +81,8 @@ jobs:
     if: needs.check-permissions.outputs.authorized == 'true'
     runs-on: [self-hosted, linux, docker]
     steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
       - name: Checkout code
         run: |
           rm -rf /tmp/build-${{ github.event.issue.number }}
@@ -156,7 +158,7 @@ jobs:
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
             "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
-            -d "{\"body\":\"❌ **Image build failed**\n\nThe Docker image build encountered an error.\n\n**Common issues:**\n- Build script errors\n- Harbor registry connection issues\n- Insufficient disk space on build runner\n\nCheck the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\"}"
+            -d "{\"body\":\"❌ **Build failed**\\n\\nCheck the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\"}"
 
       - name: React to comment (failure)
         run: |

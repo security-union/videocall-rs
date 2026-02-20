@@ -1,9 +1,5 @@
 name: Deploy PR Preview (Reusable) - HCL
 
-# MINIMAL CHANGES VERSION for Option C
-# This keeps most of the opensource logic, changing only what's necessary for HCL
-# Test this first, then fix any issues incrementally
-
 on:
   workflow_call:
     inputs:
@@ -32,17 +28,15 @@ permissions:
 jobs:
   deploy:
     name: Deploy preview environment
-    runs-on: [self-hosted, linux, docker]  # CHANGED: self-hosted instead of ubuntu-latest
+    runs-on: [self-hosted, linux, docker]
     steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_sha }}
-
-      # NOTE: kubectl and helm should already be available on self-hosted runner
-      # Removed: Setup kubectl & Helm steps
-      # Removed: Configure kubectl for DigitalOcean (doctl)
-      # Removed: Setup kubectl context
 
       - name: Add NATS Helm repo
         run: |
@@ -137,8 +131,7 @@ jobs:
             kubectl get namespaces -l app=preview \
               -o custom-columns=SLOT:.metadata.labels.slot,PR:.metadata.labels.pr,AGE:.metadata.creationTimestamp \
               --no-headers | while read slot pr age; do
-              # CHANGED: HCL domain
-              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.preview.videocall.fnxlabs.com ([undeploy](https://github.com/${{ github.repository }}/pull/${pr}#issuecomment-new))"
+              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.preview.videocall.fnxlabs.com ([undeploy](https://github01.hclpnp.com/${{ github.repository }}/pull/${pr}#issuecomment-new))"
             done
             echo "EOF" >> $GITHUB_OUTPUT
           else
@@ -188,19 +181,18 @@ jobs:
         if: steps.assign-slot.outputs.slot_assigned == 'false'
         run: exit 1
 
-      - name: Login to Harbor  # CHANGED: Harbor instead of GHCR
+      - name: Login to Harbor
         env:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
           echo "$HARBOR_PASSWORD" | docker login hclcr.io -u "$HARBOR_USERNAME" --password-stdin
-          echo "✅ Harbor login successful"
 
-      - name: Verify Harbor images exist  # CHANGED: Harbor instead of GHCR
+      - name: Verify Harbor images exist
         id: verify-images
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          REGISTRY="${{ vars.DOCKER_REGISTRY }}"  # CHANGED: Use variable
+          REGISTRY="${{ vars.DOCKER_REGISTRY }}"
 
           echo "Checking if Harbor images exist for pr-${PR_NUM}..."
           echo "Registry: ${REGISTRY}"
@@ -292,13 +284,12 @@ jobs:
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
 
-          echo "Copying wildcard TLS secret from preview-infra to slot ${SLOT} namespace..."
-          # Copy from preview-infra namespace (created by setup-preview-infra.sh)
+          echo "Copying wildcard TLS secret to slot ${SLOT} namespace..."
           kubectl get secret preview-wildcard-tls -n preview-infra -o json \
             | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.selfLink, .metadata.managedFields) | .metadata.namespace = "'${NAMESPACE}'"' \
             | kubectl apply -f -
 
-          echo "✅ TLS secret copied from preview-infra"
+          echo "✅ TLS secret copied"
 
       - name: Create JWT secret for preview
         run: |
@@ -351,10 +342,10 @@ jobs:
 
           echo "Creating database: ${DB_NAME} for slot ${SLOT}"
 
-          # CHANGED: Get postgres password from preview-infra namespace
+          # Get postgres password from secret
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
 
-          # CHANGED: Execute in preview-infra namespace
+          # Create database (or reuse existing if slot being reassigned)
           kubectl exec -n preview-infra postgres-postgresql-0 -- \
             env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "CREATE DATABASE ${DB_NAME};" || {
               echo "⚠️  Database already exists (slot reuse), continuing..."
@@ -405,7 +396,7 @@ jobs:
           PR_NUM=${{ inputs.pr_number }}
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY="${{ vars.DOCKER_REGISTRY }}"  # CHANGED: Use variable
+          REGISTRY="${{ vars.DOCKER_REGISTRY }}"
 
           echo "Deploying WebSocket server to slot ${SLOT}..."
 
@@ -451,14 +442,13 @@ jobs:
           PR_NUM=${{ inputs.pr_number }}
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY="${{ vars.DOCKER_REGISTRY }}"  # CHANGED: Use variable
+          REGISTRY="${{ vars.DOCKER_REGISTRY }}"
 
-          # CHANGED: Get postgres password from preview-infra namespace
+          # Get postgres password
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
 
           # Validate OAuth credentials secret exists
           echo "Validating OAuth credentials..."
-          # CHANGED: Look in preview-infra namespace
           if ! kubectl get secret google-oauth-credentials -n preview-infra >/dev/null 2>&1; then
             echo "::error::Secret google-oauth-credentials not found in preview-infra namespace"
             echo "Create it with: kubectl create secret generic google-oauth-credentials -n preview-infra --from-literal=client-id=YOUR_ID --from-literal=client-secret=YOUR_SECRET"
@@ -526,7 +516,7 @@ jobs:
           PR_NUM=${{ inputs.pr_number }}
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY="${{ vars.DOCKER_REGISTRY }}"  # CHANGED: Use variable
+          REGISTRY="${{ vars.DOCKER_REGISTRY }}"
 
           echo "Deploying UI to slot ${SLOT} with OAuth enabled..."
 
@@ -629,9 +619,10 @@ jobs:
     name: Cleanup on deployment failure
     needs: deploy
     if: always() && needs.deploy.result == 'failure'
-    runs-on: [self-hosted, linux, docker]  # CHANGED: self-hosted
+    runs-on: [self-hosted, linux, docker]
     steps:
-      # Removed: Configure kubectl (already available on runner)
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
 
       - name: Cleanup failed deployment
         run: |
@@ -655,7 +646,6 @@ jobs:
           kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
 
           # Drop database (ignore errors - database might not exist)
-          # CHANGED: preview-infra namespace
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
           if kubectl exec -n preview-infra postgres-postgresql-0 -- \
             env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" 2>&1; then
@@ -676,14 +666,7 @@ jobs:
               issue_number: prNumber,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `❌ **Preview deployment failed**
+              body: `❌ **Deployment failed**
 
-            The deployment encountered an error and has been cleaned up.
-
-            **Common issues:**
-            - Harbor images not found (run \`/build-images\` first)
-            - Wildcard TLS certificate not configured
-            - Capacity limit reached (max 3 concurrent previews)
-
-            Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            Check the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
             });

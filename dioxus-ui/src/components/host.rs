@@ -353,36 +353,28 @@ pub fn Host(
         drop(s);
     }
 
-    // Diagnostic: periodically log the state of the video element so we can
-    // see whether srcObject is set, whether the element is in the DOM, etc.
+    // Periodically re-affirm audio/video enabled flags on the active connection.
+    //
+    // In Yew, the Host component re-renders ~every second (driven by encoder
+    // settings update messages), and rendered() calls set_video_enabled /
+    // set_audio_enabled each time.  In Dioxus, the component body only runs
+    // when props change, so after the initial enable the flags are never
+    // re-affirmed.  If the underlying connection is lost and re-established,
+    // the new Connection object starts with video_enabled=false.  Without
+    // periodic re-affirmation the heartbeat keeps reporting video_enabled=false
+    // to the server, causing peers to see the video toggling off.
     {
+        let state = state.clone();
+        let client = client.clone();
         use_effect(move || {
+            let state = state.clone();
+            let client = client.clone();
             spawn(async move {
                 loop {
-                    gloo_timers::future::TimeoutFuture::new(3_000).await;
-                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                        if let Some(elem) = doc.get_element_by_id(VIDEO_ELEMENT_ID) {
-                            use wasm_bindgen::JsCast;
-                            if let Ok(v) = elem.dyn_into::<web_sys::HtmlVideoElement>() {
-                                let has_src = v.src_object().is_some();
-                                let ready = v.ready_state();
-                                let paused = v.paused();
-                                let w = v.video_width();
-                                let h = v.video_height();
-                                let display = v.style().get_property_value("display").unwrap_or_default();
-                                let parent_display = v.parent_element()
-                                    .map(|p| p.get_attribute("style").unwrap_or_default())
-                                    .unwrap_or_default();
-                                log::info!(
-                                    "DIAG video#webcam: srcObject={has_src} readyState={ready} \
-                                     paused={paused} size={w}x{h} display='{display}' \
-                                     parent_style='{parent_display}'"
-                                );
-                            }
-                        } else {
-                            log::warn!("DIAG video#webcam: NOT FOUND IN DOM");
-                        }
-                    }
+                    gloo_timers::future::TimeoutFuture::new(1_000).await;
+                    let s = state.borrow();
+                    client.set_audio_enabled(s.prev_mic_enabled);
+                    client.set_video_enabled(s.prev_video_enabled);
                 }
             });
         });

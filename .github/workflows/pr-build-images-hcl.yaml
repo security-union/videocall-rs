@@ -107,6 +107,11 @@ jobs:
         run: |
           cd /tmp/build-${{ github.event.issue.number }}
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+
+          # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
+          export REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
+          echo "Using registry: $REGISTRY"
+
           ./cut_build_push_backend.sh pr-${PR_NUM}
 
       - name: Build and push meeting API
@@ -115,6 +120,11 @@ jobs:
         run: |
           cd /tmp/build-${{ github.event.issue.number }}
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+
+          # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
+          export REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
+          echo "Using registry: $REGISTRY"
+
           ./cut_build_push_meeting_api.sh pr-${PR_NUM}
 
       - name: Build and push UI
@@ -123,6 +133,11 @@ jobs:
         run: |
           cd /tmp/build-${{ github.event.issue.number }}
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+
+          # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
+          export REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
+          echo "Using registry: $REGISTRY"
+
           ./cut_build_push_ui.sh pr-${PR_NUM}
 
       - name: Cleanup build directory
@@ -133,6 +148,7 @@ jobs:
         run: |
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
           REGISTRY="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
           curl -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \

@@ -124,6 +124,10 @@ jobs:
           cd /tmp/build-${{ needs.check-permissions.outputs.pr_number }}
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
 
+          # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
+          export REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
+          echo "Using registry: $REGISTRY"
+
           echo "Building media server..."
           ./cut_build_push_backend.sh pr-${PR_NUM}
 

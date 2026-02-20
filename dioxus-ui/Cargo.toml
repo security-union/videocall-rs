@@ -88,6 +88,7 @@ web-sys = { version = "0.3.72", features = [
     "HtmlOptionsCollection",
     "DomTokenList",
     "Element",
+    "History",
     "Node",
     "NodeList",
     "Document",

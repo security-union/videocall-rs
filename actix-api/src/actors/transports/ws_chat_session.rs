@@ -297,11 +297,10 @@ mod tests {
     use actix::Actor;
     use actix_web::{web, App, HttpRequest, HttpServer};
     use actix_web_actors::ws;
-    use futures_util::StreamExt;
     use protobuf::Message as ProtoMessage;
     use serial_test::serial;
     use std::time::Duration;
-    use tokio_tungstenite::tungstenite::Message;
+    use videocall_transport::native_websocket::NativeWebSocketClient;
 
     /// Test helper: create a database pool for future JWT flow integration tests.
     #[allow(dead_code)]
@@ -371,7 +370,7 @@ mod tests {
     async fn wait_for_server_ready(port: u16) {
         let url = format!("ws://127.0.0.1:{port}/ws/test/test");
         for _ in 0..50 {
-            if tokio_tungstenite::connect_async(&url).await.is_ok() {
+            if NativeWebSocketClient::connect(&url).await.is_ok() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -384,20 +383,16 @@ mod tests {
         room: &str,
         user: &str,
     ) -> Result<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
+        (NativeWebSocketClient, tokio::sync::mpsc::Receiver<Vec<u8>>),
         Box<dyn std::error::Error>,
     > {
         let url = format!("ws://127.0.0.1:{port}/ws/{room}/{user}");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await?;
-        Ok(ws_stream)
+        let (client, rx) = NativeWebSocketClient::connect(&url).await?;
+        Ok((client, rx))
     }
 
     async fn wait_for_meeting_started(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
+        inbound_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
         timeout: Duration,
     ) -> anyhow::Result<()> {
         use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
@@ -408,8 +403,8 @@ mod tests {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             tokio::select! {
-                msg = ws.next() => {
-                    if let Some(Ok(Message::Binary(data))) = msg {
+                msg = inbound_rx.recv() => {
+                    if let Some(data) = msg {
                         if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&data) {
                             if wrapper.packet_type == PacketType::MEETING.into() {
                                 if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
@@ -464,45 +459,48 @@ mod tests {
         // ========== STEP 1: First user connects ==========
         println!("\n--- Step 1: Alice connects (first participant) ---");
 
-        let mut ws_alice = connect_ws_client(port, room_id, "alice")
+        let (_client_alice, mut rx_alice) = connect_ws_client(port, room_id, "alice")
             .await
             .expect("connect alice");
-        wait_for_meeting_started(&mut ws_alice, Duration::from_secs(5)).await?;
+        wait_for_meeting_started(&mut rx_alice, Duration::from_secs(5)).await?;
         println!("✓ Alice connected and received MEETING_STARTED");
 
         // ========== STEP 2: Second user connects ==========
         println!("\n--- Step 2: Bob connects (second participant) ---");
 
-        let mut ws_bob = connect_ws_client(port, room_id, "bob")
+        let (_client_bob, mut rx_bob) = connect_ws_client(port, room_id, "bob")
             .await
             .expect("connect bob");
-        wait_for_meeting_started(&mut ws_bob, Duration::from_secs(5)).await?;
+        wait_for_meeting_started(&mut rx_bob, Duration::from_secs(5)).await?;
         println!("✓ Bob connected and received MEETING_STARTED");
 
         // ========== STEP 3: Third user connects ==========
         println!("\n--- Step 3: Charlie connects (third participant) ---");
 
-        let mut ws_charlie = connect_ws_client(port, room_id, "charlie")
+        let (_client_charlie, mut rx_charlie) = connect_ws_client(port, room_id, "charlie")
             .await
             .expect("connect charlie");
-        wait_for_meeting_started(&mut ws_charlie, Duration::from_secs(5)).await?;
+        wait_for_meeting_started(&mut rx_charlie, Duration::from_secs(5)).await?;
         println!("✓ Charlie connected and received MEETING_STARTED");
 
         // ========== STEP 4: Charlie disconnects ==========
         println!("\n--- Step 4: Charlie disconnects ---");
-        drop(ws_charlie);
+        drop(_client_charlie);
+        drop(rx_charlie);
         tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Charlie disconnected");
 
         // ========== STEP 5: Bob disconnects ==========
         println!("\n--- Step 5: Bob disconnects ---");
-        drop(ws_bob);
+        drop(_client_bob);
+        drop(rx_bob);
         tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Bob disconnected");
 
         // ========== STEP 6: Alice (last) disconnects ==========
         println!("\n--- Step 6: Alice disconnects - session ends ---");
-        drop(ws_alice);
+        drop(_client_alice);
+        drop(rx_alice);
         tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Alice disconnected");
 

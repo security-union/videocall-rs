@@ -73,9 +73,12 @@ impl RsaWrapper {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::*;
 
-    #[wasm_bindgen_test]
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     fn test_rsa_thread_rng() {
         let key = RsaWrapper::new(true);
         let data = b"hello world";
@@ -84,7 +87,8 @@ mod test {
         assert_eq!(data, decrypted.as_slice());
     }
 
-    #[wasm_bindgen_test]
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     fn test_rsa_disabled() {
         let key = RsaWrapper::new(false);
         assert!(!key.enabled); // verify it's actually disabled

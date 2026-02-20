@@ -1,4 +1,4 @@
-name: WebAssembly Tests
+name: Client Tests (WASM & Native)
 
 on:
   push:
@@ -6,21 +6,28 @@ on:
     paths:
       - 'videocall-client/**'
       - 'videocall-codecs/**'
+      - 'videocall-transport/**'
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'yew-ui/**'
+      - 'bot/**'
+      - 'videocall-cli/**'
+      - 'neteq/**'
   pull_request:
     paths:
       - 'videocall-client/**'
       - 'videocall-codecs/**'
-      - 'neteq/**'
+      - 'videocall-transport/**'
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'yew-ui/**'
+      - 'bot/**'
+      - 'videocall-cli/**'
+      - 'neteq/**'
 
 jobs:
   wasm-test:
-    name: WebAssembly Tests
+    name: WASM Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -55,9 +62,54 @@ jobs:
 
       - name: Run wasm-pack tests for videocall-codecs
         run: cd videocall-codecs && cargo test
-      
+
       - name: Run tests for neteq
         run: cd neteq && cargo test --no-default-features --features web
+
+  native-test:
+    name: Native Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          profile: minimal
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-native-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-native-
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libvpx-dev libasound2-dev libv4l-dev libssl-dev
+
+      - name: Clippy (videocall-client native)
+        run: cargo clippy -p videocall-client --features native -- -D warnings
+
+      - name: Clippy (videocall-transport native)
+        run: cargo clippy -p videocall-transport --features native -- -D warnings
+
+      - name: Test videocall-client (native)
+        run: cargo test -p videocall-client --features native
+
+      - name: Test videocall-transport (native)
+        run: cargo test -p videocall-transport --features native
+
+      - name: Check bot compiles
+        run: cargo check -p bot
+
+      - name: Check videocall-cli compiles
+        run: cargo check -p videocall-cli
 
   yew-ui-component-tests:
     name: Yew UI Component Tests

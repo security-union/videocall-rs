@@ -16,176 +16,107 @@
  * conditions.
  */
 
-//! This crate provides a client-side (browser) interface to the videocall protocol.  The purpose is to
-//! take care of the media I/O both for the encoding the current participant and for rendering the
-//! media from the remote peers.  It also provides tools for listing available media devices and
-//! granting access.
+//! Cross-platform video conferencing client for videocall.rs.
 //!
-//! This crate intends to make no assumptions about the UI or the HTML of the client app.
-//! The only DOM data it needs is the ID of the `HtmlVideoElement` for the participant's own video
-//! display and the ID's of the `HtmlCanvasElement`s into which remote peer video should be renderered.
+//! This crate provides a client-side interface to the videocall protocol that works
+//! on both **WASM (browser)** and **native (desktop/server/embedded)** targets.
 //!
-//! In addition to its use by Rust UI apps (e.g. via Yew, Dioxus, or Leptos), it is intended that this crate be
-//! compiled to npm module that could be called from javascript, e.g. in an electron app.
+//! # Platform support
 //!
-//! Currently, only the Chrome browser is supported, due to some of the Web APIs that are used.
+//! Enable exactly one of the following Cargo features:
 //!
-//! **NOTE:** This initial version is a slightly frankenstein result of piecemeal refactoring bits
-//! from the original app and stitching them together.   It could use cleaning up both the API the
-//! internal design.
+//! - **`wasm`** — for browser targets (`wasm32-unknown-unknown`). Provides the full
+//!   media pipeline: camera/microphone/screen encoding, peer decoding, device
+//!   enumeration, and the [`VideoCallClient`] API.
 //!
-//! # Outline of usage
+//! - **`native`** — for desktop, server, and embedded targets. Provides the
+//!   [`NativeVideoCallClient`] API for connection lifecycle, heartbeat, and packet I/O.
+//!   Media capture and encoding are left to the application (see `videocall-codecs`).
 //!
-//! For more detailed documentation see the doc for each struct.
+//! # Architecture
 //!
-//! ## Client creation and connection:
-//! ```no_run
-//! use videocall_client::{VideoCallClient, VideoCallClientOptions};
-//! use videocall_client::Callback;
+//! The crate is layered:
 //!
-//! let options = VideoCallClientOptions {
-//!     enable_e2ee: true,
-//!     enable_webtransport: true,
-//!     on_peer_added: Callback::noop(),
-//!     on_peer_first_frame: Callback::noop(),
-//!     get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
-//!     get_peer_screen_canvas_id: Callback::from(|_| "screen-canvas".to_string()),
-//!     userid: "user123".to_string(),
-//!     meeting_id: "room456".to_string(),
-//!     websocket_urls: vec!["ws://localhost:8080".to_string()],
-//!     webtransport_urls: vec!["https://localhost:8443".to_string()],
-//!     on_connected: Callback::noop(),
-//!     on_connection_lost: Callback::noop(),
-//!     enable_diagnostics: false,
-//!     diagnostics_update_interval_ms: None,
-//!     enable_health_reporting: false,
-//!     on_encoder_settings_update: None,
-//!     rtt_testing_period_ms: 3000,
-//!     rtt_probe_interval_ms: None,
-//!     health_reporting_interval_ms: Some(5000), // Send health every 5 seconds
-//!     on_peer_removed: None,
-//!     on_meeting_info: None,
-//!     on_meeting_ended: None,
-//!    
-//! };
-//! let mut client = VideoCallClient::new(options);
-//!
-//! client.connect().unwrap();
-//! ```
-//!
-//! ## Encoder creation:
-//! ```no_run
-//! use videocall_client::{VideoCallClient, CameraEncoder, ScreenEncoder, create_microphone_encoder};
-//! use videocall_client::Callback;
-//!
-//! # use videocall_client::VideoCallClientOptions;
-//! # let options = VideoCallClientOptions {
-//! #     enable_e2ee: false, enable_webtransport: false, on_peer_added: Callback::noop(),
-//! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
-//! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), userid: "user".to_string(),
-//! #     meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],
-//! #     on_connected: Callback::noop(), on_connection_lost: Callback::noop(), enable_diagnostics: false, diagnostics_update_interval_ms: None,
-//! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
-//! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
-//! #     on_peer_removed: None,
-//! #     on_meeting_info: None,
-//! #     on_meeting_ended: None,
-//! #
-//! # };
-//! # let client = VideoCallClient::new(options);
-//! let mut camera = CameraEncoder::new(
-//!     client.clone(),
-//!     "video-element",
-//!     1000000, // 1 Mbps initial bitrate
-//!     Callback::noop(),
-//!     Callback::noop() // on_error callback for camera errors
-//! );
-//! let mut microphone = create_microphone_encoder(
-//!     client.clone(),
-//!     128, // 128 kbps bitrate
-//!     Callback::noop(),
-//!     Callback::noop(),
-//! );
-//! let mut screen = ScreenEncoder::new(
-//!     client,
-//!     2000, // 2 Mbps bitrate
-//!     Callback::noop(),
-//!     Callback::noop() // on_state_change callback for screen share events
-//! );
-//!
-//! // Select devices and start/stop encoding
-//! camera.select("camera-device-id".to_string());
-//! camera.start();
-//! camera.stop();
-//! microphone.select("microphone-device-id".to_string());
-//! microphone.start();
-//! microphone.stop();
-//! screen.set_enabled(true);
-//! screen.set_enabled(false);
-//! ```
-//!
-//! ## Device access permission:
-//!
-//! ```no_run
-//! use videocall_client::MediaDeviceAccess;
-//! use videocall_client::Callback;
-//!
-//! let mut media_device_access = MediaDeviceAccess::new();
-//! media_device_access.on_granted = Callback::from(|_| {
-//!     web_sys::console::log_1(&"Access granted!".into());
-//! });
-//! media_device_access.on_denied = Callback::from(|error| {
-//!     web_sys::console::log_2(&"Access denied:".into(), &error);
-//! });
-//! media_device_access.request();
-//! ```
-//!
-//! ### Device query and listing:
-//! ```no_run
-//! use videocall_client::MediaDeviceList;
-//! use videocall_client::Callback;
-//!
-//! let mut media_device_list = MediaDeviceList::new();
-//! media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
-//!     web_sys::console::log_2(&"Audio device selected:".into(), &device_id.into());
-//! });
-//! media_device_list.video_inputs.on_selected = Callback::from(|device_id: String| {
-//!     web_sys::console::log_2(&"Video device selected:".into(), &device_id.into());
-//! });
-//!
-//! media_device_list.load();
-//!
-//! let microphones = media_device_list.audio_inputs.devices();
-//! let cameras = media_device_list.video_inputs.devices();
-//! if let Some(mic) = microphones.first() {
-//!     media_device_list.audio_inputs.select(&mic.device_id());
-//! }
-//! if let Some(camera) = cameras.first() {
-//!     media_device_list.video_inputs.select(&camera.device_id());
-//! }
-//!
-//! ```
+//! 1. **Platform primitives** ([`platform`]) — timers, spawn, timestamps
+//! 2. **Transport** — WebSocket / WebTransport (via `videocall-transport`)
+//! 3. **Connection protocol** — heartbeat, RTT, E2EE, state machine
+//! 4. **Client API** — [`VideoCallClient`] (WASM) or [`NativeVideoCallClient`] (native)
+//! 5. **Media pipeline** — encoders, decoders, device access (WASM only)
 
-pub mod audio;
-pub mod audio_worklet_codec;
-mod client;
-mod connection;
-pub mod constants;
+// ── Always-available modules ──────────────────────────────────────────────────
+
+/// Platform abstraction layer (timers, spawn, timestamps).
+pub mod platform;
+
+/// Cryptographic primitives (AES-128-CBC, RSA key exchange).
 pub mod crypto;
+
+/// Constants shared across the client.
+pub mod constants;
+
+// ── WASM-only modules (browser media pipeline) ────────────────────────────────
+
+#[cfg(target_arch = "wasm32")]
+pub mod audio;
+
+#[cfg(target_arch = "wasm32")]
+pub mod audio_worklet_codec;
+
+#[cfg(target_arch = "wasm32")]
+mod connection;
+
+#[cfg(target_arch = "wasm32")]
+mod client;
+
+#[cfg(target_arch = "wasm32")]
 pub mod decode;
+
+/// Diagnostics and metrics collection (WASM only — uses browser timers).
+#[cfg(target_arch = "wasm32")]
 pub mod diagnostics;
+
+#[cfg(target_arch = "wasm32")]
 pub mod encode;
+
+/// Health reporting to the server (WASM only — uses browser APIs).
+#[cfg(target_arch = "wasm32")]
 pub mod health_reporter;
+
+#[cfg(target_arch = "wasm32")]
 mod media_devices;
+
+#[cfg(target_arch = "wasm32")]
 pub mod utils;
+
+#[cfg(target_arch = "wasm32")]
 mod wrappers;
+
+// ── WASM public API ───────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "wasm32")]
 pub use client::{VideoCallClient, VideoCallClientOptions};
+
+#[cfg(target_arch = "wasm32")]
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };
+
+#[cfg(target_arch = "wasm32")]
 pub use encode::{
     create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
     ScreenShareEvent,
 };
+
+#[cfg(target_arch = "wasm32")]
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};
+
+#[cfg(target_arch = "wasm32")]
 pub use videocall_types::Callback;
+
+// ── Native-only modules ───────────────────────────────────────────────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+mod native_client;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_client::{NativeClientOptions, NativeVideoCallClient};

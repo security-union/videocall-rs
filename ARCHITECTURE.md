@@ -201,6 +201,140 @@ graph TB
 4. **Server Independence**: Servers can be added or removed without disrupting service
 5. **Failover**: If a server fails, clients can reconnect to another server
 
+## Client Platform Architecture
+
+`videocall-client` is a **cross-platform** crate that compiles to both WASM (browser) and native (desktop/server/embedded) targets. All client applications depend on it for the protocol layer — connection lifecycle, heartbeat, packet I/O, and E2EE.
+
+```mermaid
+graph TB
+    subgraph "Client Applications"
+        YewUI["yew-ui<br/>(Browser / Yew)"]
+        Bot["bot<br/>(Native / Tokio)"]
+        CLI["videocall-cli<br/>(Native / Tokio)"]
+        Future["Your App<br/>(Native or WASM)"]
+    end
+
+    subgraph "videocall-client"
+        direction TB
+        subgraph "Always Available"
+            Platform["platform/<br/>now_ms, spawn, IntervalHandle"]
+            Crypto["crypto/<br/>AES-128-CBC, RSA"]
+            Constants["constants/<br/>Codec selection"]
+        end
+        subgraph "WASM Target (feature = wasm)"
+            VCC["VideoCallClient<br/>Full media pipeline"]
+            Encode["encode/<br/>Camera, Mic, Screen"]
+            Decode["decode/<br/>Peer video/audio"]
+            MediaDevices["media_devices/<br/>getUserMedia"]
+            ConnectionWASM["connection/<br/>RTT election, state machine"]
+        end
+        subgraph "Native Target (feature = native)"
+            NVC["NativeVideoCallClient<br/>Connection + Heartbeat + Packet I/O"]
+        end
+    end
+
+    subgraph "Shared Libraries"
+        Types["videocall-types<br/>Protobuf: PacketWrapper, MediaPacket"]
+        Transport["videocall-transport<br/>WASM: web-sys WebSocket/WebTransport<br/>Native: web-transport-quinn + tokio-tungstenite"]
+        Codecs["videocall-codecs<br/>VP9 encoder (VideoEncoderBuilder)<br/>VP9 decoder (native + WASM)"]
+        NetEq["neteq<br/>Adaptive audio jitter buffer"]
+        Diag["videocall-diagnostics<br/>Metrics event bus"]
+    end
+
+    subgraph "Server Infrastructure"
+        WT["WebTransport Server"]
+        WS["WebSocket Server (Actix)"]
+        NATS["NATS Messaging"]
+    end
+
+    YewUI -->|"features = [wasm]"| VCC
+    Bot -->|"features = [native]"| NVC
+    CLI -->|"features = [native]"| NVC
+    Future -.->|"wasm or native"| VCC
+    Future -.->|"wasm or native"| NVC
+
+    VCC --> ConnectionWASM --> Transport
+    VCC --> Encode
+    VCC --> Decode
+    NVC --> Transport
+
+    Bot --> Codecs
+    CLI --> Codecs
+
+    Encode --> Types
+    Decode --> Codecs
+    Decode --> NetEq
+    ConnectionWASM --> Types
+    NVC --> Types
+    Transport --> Types
+
+    VCC --> Crypto
+    NVC --> Crypto
+    VCC --> Diag
+
+    Transport -->|WebTransport| WT
+    Transport -->|WebSocket| WS
+    WT --> NATS
+    WS --> NATS
+
+    classDef wasm fill:#1a5276,stroke:#2980b9,color:white
+    classDef native fill:#1e8449,stroke:#27ae60,color:white
+    classDef shared fill:#7d3c98,stroke:#9b59b6,color:white
+    classDef server fill:#c0392b,stroke:#e74c3c,color:white
+    classDef app fill:#2c3e50,stroke:#34495e,color:white
+
+    class VCC,Encode,Decode,MediaDevices,ConnectionWASM wasm
+    class NVC native
+    class Types,Transport,Codecs,NetEq,Diag,Platform,Crypto,Constants shared
+    class WT,WS,NATS server
+    class YewUI,Bot,CLI,Future app
+```
+
+### How Each Client Uses videocall-client
+
+| Client | Target | Feature | API Used | Media Encoding | Media Decoding |
+|--------|--------|---------|----------|----------------|----------------|
+| **yew-ui** | `wasm32` | `wasm` | `VideoCallClient` | WebCodecs (browser) | WebCodecs + Web Workers |
+| **bot** | native | `native` | `NativeVideoCallClient` | `videocall-codecs` VP9 + Opus | _(does not decode)_ |
+| **videocall-cli** | native | `native` | `NativeVideoCallClient` | `videocall-codecs` VP9 + Opus | _(does not decode)_ |
+| **Your App** | either | `wasm` or `native` | Either client API | Your choice | Your choice |
+
+### What videocall-client Handles Automatically
+
+The client library handles the protocol layer so applications don't have to:
+
+- **Connection lifecycle** — WebTransport/WebSocket setup, connection packets
+- **Heartbeat** — 1 Hz `HEARTBEAT` packets with video/audio/screen enabled flags
+- **Packet framing** — Protobuf `PacketWrapper` serialization/deserialization
+- **E2EE** — RSA key exchange + AES-128-CBC encryption/decryption
+- **RTT testing** — Server election based on round-trip time (WASM only)
+- **Inbound packet routing** — Dispatching to peer decoders (WASM only)
+
+### Crate Dependency Graph
+
+```mermaid
+graph LR
+    YewUI[yew-ui] --> VC[videocall-client]
+    Bot[bot] --> VC
+    CLI[videocall-cli] --> VC
+    Bot --> VCodecs[videocall-codecs]
+    CLI --> VCodecs
+
+    VC --> VT[videocall-transport]
+    VC --> VTypes[videocall-types]
+    VC --> VDiag[videocall-diagnostics]
+    VC --> VCodecs
+
+    VT --> VTypes
+    VCodecs --> VDiag
+
+    classDef client fill:#2c3e50,stroke:#34495e,color:white
+    classDef lib fill:#7d3c98,stroke:#9b59b6,color:white
+
+    class YewUI,Bot,CLI client
+    class VC,VT,VTypes,VDiag,VCodecs lib
+```
+
 ## Media Processing
 
 The media processing component handles the encoding and decoding of video streams. It supports various codecs and formats, including H.264, VP8, and VP9.

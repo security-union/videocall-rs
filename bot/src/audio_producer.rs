@@ -21,10 +21,10 @@ use protobuf::Message;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, warn};
+use videocall_client::NativeVideoCallClient;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -41,16 +41,14 @@ impl AudioProducer {
     pub fn new(
         user_id: String,
         audio_data: Vec<f32>,
-        packet_sender: Sender<Vec<u8>>,
+        client: Arc<NativeVideoCallClient>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
         let user_id_clone = user_id.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                Self::audio_loop(user_id_clone, audio_data, packet_sender, quit_clone).await
-            {
+            if let Err(e) = Self::audio_loop(user_id_clone, audio_data, client, quit_clone).await {
                 error!("Audio producer error: {}", e);
             }
         });
@@ -65,7 +63,7 @@ impl AudioProducer {
     pub fn from_wav_file(
         user_id: String,
         wav_path: &str,
-        packet_sender: Sender<Vec<u8>>,
+        client: Arc<NativeVideoCallClient>,
     ) -> anyhow::Result<Self> {
         info!("Loading WAV file for {}: {}", user_id, wav_path);
 
@@ -79,7 +77,6 @@ impl AudioProducer {
             sample_rate, channels
         );
 
-        // Validate Opus requirements
         let opus_sample_rates = [8000, 12000, 16000, 24000, 48000];
         if !opus_sample_rates.contains(&sample_rate) {
             warn!(
@@ -95,7 +92,6 @@ impl AudioProducer {
             );
         }
 
-        // Read samples and convert to f32
         let wav_samples: Vec<f32> = match spec.sample_format {
             hound::SampleFormat::Int => reader
                 .samples::<i16>()
@@ -110,30 +106,27 @@ impl AudioProducer {
             wav_samples.len() as f32 / sample_rate as f32 / channels as f32
         );
 
-        Self::new(user_id, wav_samples, packet_sender)
+        Self::new(user_id, wav_samples, client)
     }
 
     async fn audio_loop(
         user_id: String,
         audio_data: Vec<f32>,
-        packet_sender: Sender<Vec<u8>>,
+        client: Arc<NativeVideoCallClient>,
         quit: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
-        // Audio configuration - targeting 50fps (20ms packets)
-        let sample_rate = 48000u32; // Standard Opus rate
-        let channels = 1u8; // Mono for simplicity
+        let sample_rate = 48000u32;
+        let _channels = 1u8;
         let samples_per_packet = (sample_rate as f32 * 0.02) as usize; // 20ms worth
         let packet_interval = Duration::from_millis(20);
 
-        // Create precise interval timer
         let mut interval_timer = interval(packet_interval);
         interval_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        // Create Opus encoder
         let mut opus_encoder = OpusEncoder::new(sample_rate, OpusChannels::Mono, OpusApp::Voip)?;
         info!(
-            "Audio producer started for {} ({}Hz, {}ch, {}ms packets)",
-            user_id, sample_rate, channels, 20
+            "Audio producer started for {} ({}Hz, 1ch, 20ms packets)",
+            user_id, sample_rate
         );
 
         let mut audio_position = 0;
@@ -145,20 +138,17 @@ impl AudioProducer {
                 break;
             }
 
-            // Extract 20ms worth of samples (with looping)
             let mut packet_samples = vec![0.0f32; samples_per_packet];
             for item in packet_samples.iter_mut().take(samples_per_packet) {
                 *item = audio_data[audio_position % audio_data.len()];
                 audio_position += 1;
             }
 
-            // Encode to Opus
             let mut encoded = vec![0u8; 4000];
             match opus_encoder.encode_float(&packet_samples, &mut encoded) {
                 Ok(bytes_written) => {
                     encoded.truncate(bytes_written);
 
-                    // Create media packet
                     let media_packet = MediaPacket {
                         email: user_id.clone(),
                         media_type: MediaType::AUDIO.into(),
@@ -173,7 +163,6 @@ impl AudioProducer {
                         ..Default::default()
                     };
 
-                    // Wrap in packet wrapper
                     let packet_wrapper = PacketWrapper {
                         data: media_packet.write_to_bytes()?,
                         email: user_id.clone(),
@@ -181,9 +170,8 @@ impl AudioProducer {
                         ..Default::default()
                     };
 
-                    // Send packet
-                    let packet_data = packet_wrapper.write_to_bytes()?;
-                    if let Err(e) = packet_sender.try_send(packet_data) {
+                    // Send via NativeVideoCallClient instead of raw channel
+                    if let Err(e) = client.send_packet(packet_wrapper) {
                         warn!("Failed to send audio packet for {}: {}", user_id, e);
                     }
 

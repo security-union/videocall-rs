@@ -20,4 +20,11 @@ pub mod cli_args;
 pub mod consumers;
 
 pub mod producers;
-pub mod video_encoder;
+
+/// Re-export the shared VP9 encoder from `videocall-codecs`.
+///
+/// Previously this was a local copy; now it lives in the `videocall-codecs` crate
+/// as the single source of truth for VP9 encoding.
+pub mod video_encoder {
+    pub use videocall_codecs::encoder::*;
+}

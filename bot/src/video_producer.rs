@@ -16,7 +16,6 @@
  * conditions.
  */
 
-use crate::video_encoder::VideoEncoderBuilder;
 use image::imageops::FilterType;
 use image::{ImageBuffer, ImageReader, Rgb};
 use protobuf::Message;
@@ -24,14 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, trace, warn};
+use videocall_client::NativeVideoCallClient;
+use videocall_codecs::encoder::VideoEncoderBuilder;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetadata};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-
-// Real VP9 encoder - exactly same approach as videocall-cli
 
 pub struct VideoProducer {
     #[allow(dead_code)]
@@ -44,7 +42,7 @@ impl VideoProducer {
     pub fn from_image_sequence(
         user_id: String,
         image_dir: &str,
-        packet_sender: Sender<Vec<u8>>,
+        client: Arc<NativeVideoCallClient>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -52,7 +50,7 @@ impl VideoProducer {
         let image_dir = image_dir.to_string();
 
         let handle = thread::spawn(move || {
-            if let Err(e) = Self::video_loop(user_id_clone, &image_dir, packet_sender, quit_clone) {
+            if let Err(e) = Self::video_loop(user_id_clone, &image_dir, client, quit_clone) {
                 error!("Video producer error: {}", e);
             }
         });
@@ -67,10 +65,9 @@ impl VideoProducer {
     fn video_loop(
         user_id: String,
         image_dir: &str,
-        packet_sender: Sender<Vec<u8>>,
+        client: Arc<NativeVideoCallClient>,
         quit: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
-        // Video configuration - targeting 30fps (~33ms packets)
         let width = 1280u32;
         let height = 720u32;
         let framerate = 30u32;
@@ -81,7 +78,7 @@ impl VideoProducer {
             user_id, width, height, framerate
         );
 
-        // Load image sequence (using videocall-cli pattern)
+        // Load image sequence
         let mut frames = Vec::new();
         for i in 120..125 {
             let path = format!("{image_dir}/output_{i}.jpg");
@@ -91,7 +88,6 @@ impl VideoProducer {
                         .with_guessed_format()?
                         .decode()?;
 
-                    // Resize and convert to I420 format
                     let img = img.resize_exact(width, height, FilterType::Nearest);
                     let img = img.to_rgb8();
                     let i420_data = rgb_to_i420(&img);
@@ -110,11 +106,11 @@ impl VideoProducer {
 
         info!("Loaded {} frames for {}", frames.len(), user_id);
 
-        // Initialize VP9 encoder (exactly same as videocall-cli)
-        let mut video_encoder = VideoEncoderBuilder::new(framerate, 5) // cpu_used=5 like videocall-cli
+        // Initialize VP9 encoder
+        let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
             .set_resolution(width, height)
             .build()?;
-        video_encoder.update_bitrate_kbps(500)?; // 500kbps default like videocall-cli
+        video_encoder.update_bitrate_kbps(500)?;
 
         let mut frame_iterator = frames.into_iter().cycle();
         let mut sequence = 0u64;
@@ -125,17 +121,13 @@ impl VideoProducer {
                 break;
             }
 
-            // Get next frame
             let frame_data = frame_iterator.next().unwrap();
-
-            // Encode to VP9 (exactly same as videocall-cli)
             let frames_result = video_encoder.encode(sequence as i64, &frame_data)?;
 
-            // Send each encoded frame (exactly same as videocall-cli)
             for frame in frames_result {
                 let media_packet = MediaPacket {
                     media_type: MediaType::VIDEO.into(),
-                    data: frame.data.to_vec(), // Real VP9 encoded data!
+                    data: frame.data.to_vec(),
                     email: user_id.clone(),
                     frame_type: if frame.key { "key" } else { "delta" }.to_string(),
                     timestamp: get_timestamp_ms(),
@@ -149,7 +141,6 @@ impl VideoProducer {
                     ..Default::default()
                 };
 
-                // Wrap in packet wrapper
                 let packet_wrapper = PacketWrapper {
                     packet_type: PacketType::MEDIA.into(),
                     email: user_id.clone(),
@@ -157,9 +148,8 @@ impl VideoProducer {
                     ..Default::default()
                 };
 
-                // Send packet
-                let packet_data = packet_wrapper.write_to_bytes()?;
-                if let Err(e) = packet_sender.try_send(packet_data) {
+                // Send via NativeVideoCallClient instead of raw channel
+                if let Err(e) = client.send_packet(packet_wrapper) {
                     warn!("Failed to send video packet for {}: {}", user_id, e);
                 } else {
                     trace!(
@@ -193,9 +183,6 @@ impl Drop for VideoProducer {
     }
 }
 
-// VP9 encoder implemented using exact same approach as videocall-cli
-
-// Convert RGB image to I420 format (same as videocall-cli)
 fn rgb_to_i420(image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Vec<u8> {
     let width = image.width() as usize;
     let height = image.height() as usize;
@@ -212,7 +199,6 @@ fn rgb_to_i420(image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Vec<u8> {
             let g = rgb[rgb_index + 1] as f32;
             let b = rgb[rgb_index + 2] as f32;
 
-            // Calculate Y, U, V components
             let y_value = (0.257 * r + 0.504 * g + 0.098 * b + 16.0).round() as u8;
             let u_value = (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).round() as u8;
             let v_value = (0.439 * r - 0.368 * g - 0.071 * b + 128.0).round() as u8;

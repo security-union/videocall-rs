@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2021"
 rust-version = "1.70"
 license = "MIT OR Apache-2.0"
-description = "Framework-agnostic WebSocket and WebTransport wrappers for videocall.rs"
+description = "Cross-platform WebSocket and WebTransport wrappers for videocall.rs"
 homepage = "https://github.com/security-union/videocall-rs"
 repository = "https://github.com/security-union/videocall-rs"
 readme = "README.md"
@@ -20,20 +20,49 @@ rustc-args = ["--cfg", "web_sys_unstable_apis"]
 all-features = true
 targets = ["wasm32-unknown-unknown"]
 
+[features]
+default = []
+wasm = [
+    "gloo",
+    "gloo-console",
+    "js-sys",
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "web-sys",
+]
+native = [
+    "web-transport-quinn",
+    "tokio",
+    "tokio-tungstenite",
+    "protobuf",
+    "url",
+]
+
 [dependencies]
+# === Platform-agnostic dependencies ===
 anyhow = { workspace = true }
 futures = "0.3"
-gloo = "0.8.0"
-gloo-console = "0.3"
-js-sys = "0.3"
 log = "0.4"
 thiserror = "1.0"
 videocall-types = { path = "../videocall-types", version = "4.0.1" }
-wasm-bindgen = { workspace = true }
-wasm-bindgen-futures = { workspace = true }
+
+# === WASM-only dependencies (optional, enabled by "wasm" feature) ===
+gloo = { version = "0.8.0", optional = true }
+gloo-console = { version = "0.3", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+
+# === Native-only dependencies (optional, enabled by "native" feature) ===
+web-transport-quinn = { workspace = true, optional = true }
+tokio = { version = "1.28.1", features = ["full"], optional = true }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = true }
+protobuf = { version = "3.3.0", optional = true }
+url = { version = "2.4.1", optional = true }
 
 [dependencies.web-sys]
 version = "0.3"
+optional = true
 features = [
     "BinaryType",
     "Event",
@@ -51,3 +80,6 @@ features = [
     "ReadableStreamReadResult",
     "WebTransportSendStream",
 ]
+
+[dev-dependencies]
+tokio = { version = "1.28.1", features = ["full", "test-util"] }

@@ -18,19 +18,16 @@
 
 mod audio_producer;
 mod config;
-mod video_encoder; // VP9 encoder from videocall-cli
 mod video_producer;
-mod webtransport_client;
 
 use audio_producer::AudioProducer;
 use config::{BotConfig, ClientConfig};
-// Removed unused Arc import
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{error, info, warn};
 use video_producer::VideoProducer;
-use webtransport_client::WebTransportClient;
+use videocall_client::{NativeClientOptions, NativeVideoCallClient};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -100,15 +97,47 @@ async fn run_client(
 ) -> anyhow::Result<()> {
     info!("Initializing client: {}", config.user_id);
 
-    // Create WebTransport client and connect
-    let mut client = WebTransportClient::new(config.clone());
-    client.connect(&server_url, insecure).await?;
+    // Build the WebTransport URL
+    let webtransport_url = format!(
+        "{}/lobby/{}/{}",
+        server_url.as_str().trim_end_matches('/'),
+        config.user_id,
+        config.meeting_id
+    );
 
-    // Create packet channel for media producers
-    let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
+    // Create NativeVideoCallClient from videocall-client
+    let user_id = config.user_id.clone();
+    let mut client = NativeVideoCallClient::new(NativeClientOptions {
+        userid: config.user_id.clone(),
+        meeting_id: config.meeting_id.clone(),
+        webtransport_url,
+        insecure,
+        on_inbound_packet: Box::new(|_pkt| {
+            // Bot doesn't consume inbound packets for now
+        }),
+        on_connected: Box::new({
+            let user_id = user_id.clone();
+            move || info!("Client {user_id} connected")
+        }),
+        on_disconnected: Box::new({
+            let user_id = user_id.clone();
+            move |err| warn!("Client {user_id} disconnected: {err}")
+        }),
+        enable_e2ee: false,
+    });
 
-    // Start packet sender task
-    client.start_packet_sender(packet_rx).await;
+    client.connect().await?;
+
+    // Wrap client in Arc for sharing with producers
+    let client = Arc::new(client);
+
+    // Set media enabled flags
+    if config.enable_video {
+        client.set_video_enabled(true);
+    }
+    if config.enable_audio {
+        client.set_audio_enabled(true);
+    }
 
     // Start media producers based on configuration
     let mut audio_producer: Option<AudioProducer> = None;
@@ -119,7 +148,7 @@ async fn run_client(
         match AudioProducer::from_wav_file(
             config.user_id.clone(),
             "BundyBests2.wav",
-            packet_tx.clone(),
+            client.clone(),
         ) {
             Ok(producer) => {
                 audio_producer = Some(producer);
@@ -136,11 +165,10 @@ async fn run_client(
 
     if config.enable_video {
         info!("Starting video producer for {}", config.user_id);
-        // Use local image directory (images are in current directory)
         match VideoProducer::from_image_sequence(
             config.user_id.clone(),
             ".", // Images are in current directory (bot working dir)
-            packet_tx.clone(),
+            client.clone(),
         ) {
             Ok(producer) => {
                 video_producer = Some(producer);
@@ -163,13 +191,11 @@ async fn run_client(
     );
 
     // Keep the client running
-    // In a real scenario, you might want to run for a specific duration or until a signal
     tokio::signal::ctrl_c().await?;
 
     info!("Shutting down client: {}", config.user_id);
 
     // Clean shutdown
-    client.stop();
     if let Some(mut audio) = audio_producer {
         audio.stop();
     }

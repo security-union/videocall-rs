@@ -6,28 +6,22 @@ on:
 jobs:
   test:
     runs-on: [self-hosted, Linux]
+
     steps:
+      - name: Add tools to PATH
+        run: |
+          echo "/home/jenkins/bin" >> $GITHUB_PATH
+
       - name: Check environment
         run: |
           echo "Runner: $(hostname)"
           whoami
           pwd
-	  printenv
-	  ps -aef
-	  export PATH=$PATH:/home/jenking/bin
-	  echo "$HOME/bin" >> $GITHUB_PATH
+          printenv | grep PATH
+          ls -la /home/jenkins/bin
 
       - name: Check Docker
-        run: |
-          export PATH=$PATH:/home/jenking/bin
-	  echo "$HOME/bin" >> $GITHUB_PATH
-	  docker --version
-
-      - name: Check kubectl
-        run:  |
-          export PATH=$PATH:/home/jenking/bin
-	  echo "$HOME/bin" >> $GITHUB_PATH
-          kubectl version --client
+        run: docker --version
 
       - name: Check Helm
         run: helm version

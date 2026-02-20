@@ -4,7 +4,7 @@
 .mov
 .mp4
 .env
-.claude
+
 #for jet brains products
 .idea/
 target/

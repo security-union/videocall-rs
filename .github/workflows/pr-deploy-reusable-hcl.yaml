@@ -25,6 +25,10 @@ on:
       HARBOR_PASSWORD:
         required: true
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   deploy:
     name: Deploy preview environment

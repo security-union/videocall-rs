@@ -360,7 +360,7 @@ impl AttendantsComponent {
             }),
             on_peer_display_name_changed: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |(session_id, new_name): (String, String)| {
+                VcCallback::from(move |(session_id, new_name): (String, String)| {
                     log::info!("Peer {session_id} changed name to: {new_name}");
                     link.send_message(Msg::OnPeerDisplayNameChanged(session_id, new_name));
                 })

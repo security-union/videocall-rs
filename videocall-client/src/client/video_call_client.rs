@@ -44,9 +44,9 @@ use web_time::{SystemTime, UNIX_EPOCH};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
+use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
-use yew::prelude::Callback;
 
 /// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
 #[derive(Clone, Debug, PartialEq)]

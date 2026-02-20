@@ -39,6 +39,7 @@ use videocall_types::protos::{
     media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
     packet_wrapper::packet_wrapper::PacketType,
 };
+use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -51,7 +52,6 @@ use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
 use web_time::SystemTime;
-use yew::Callback;
 
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,

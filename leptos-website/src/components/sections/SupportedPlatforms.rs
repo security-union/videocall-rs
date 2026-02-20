@@ -35,8 +35,8 @@ pub fn SupportedPlatformsSection() -> impl IntoView {
     view! {
         <section id="supported-platforms" class="relative">
             <div class="text-center mb-12">
-                <h2 class="text-headline text-foreground mb-4">"Supported platforms and Browsers"</h2>
-                <p class="text-body-large text-foreground-secondary max-w-3xl mx-auto">
+                <h2 class="text-4xl md:text-5xl font-semibold tracking-tight mb-4">"Supported Platforms"</h2>
+                <p class="text-lg md:text-xl text-white/50 max-w-2xl mx-auto">
                     "Runs beautifully on modern browsers and embedded devices"
                 </p>
             </div>

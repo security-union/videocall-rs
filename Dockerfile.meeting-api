@@ -1,17 +1,32 @@
-FROM securityunion/actix-base:meeting-ownership-branch-c4b19265 as build
+FROM nixos/nix:2.33.2 AS builder
+
+ENV NIX_CONFIG="experimental-features = nix-command flakes"
+
+WORKDIR /app
+
+COPY flake.nix flake.lock ./
+
+RUN git init && git add flake.nix flake.lock
+
+RUN nix develop .#backend --command true
+
+COPY . .
+RUN git add -A
 
 ENV CARGO_TARGET_DIR=/app/meeting-api/target
-COPY . /app
-WORKDIR /app/meeting-api
-RUN cargo build --release --bin meeting-api
 
-FROM debian:trixie-slim as production
+RUN nix develop .#backend --command bash -c "\
+    cd meeting-api && cargo build --release --bin meeting-api && \
+    cp \$(which dbmate) /app/dbmate-bin"
+
+# ---------------------------------------------------------------------------
+FROM debian:trixie-slim
 
 RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
 
-COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
-COPY --from=build /app/meeting-api/target/release/meeting-api /usr/bin/meeting-api
-COPY --from=build /app/dbmate /app/dbmate
+COPY --from=builder /app/meeting-api/target/release/meeting-api /usr/bin/meeting-api
+COPY --from=builder /app/dbmate-bin /usr/bin/dbmate
+COPY --from=builder /app/dbmate /app/dbmate
 
 STOPSIGNAL SIGINT
 

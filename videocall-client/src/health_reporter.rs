@@ -30,9 +30,9 @@ use videocall_types::protos::health_packet::{
 };
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::Callback;
 use wasm_bindgen_futures::spawn_local;
 use web_time::{SystemTime, UNIX_EPOCH};
-use yew::prelude::Callback;
 
 /// Health data cached for a specific peer
 #[derive(Debug, Clone)]

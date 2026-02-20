@@ -659,10 +659,12 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                     if oauth_enabled().unwrap_or(false) {
                                         if let Some(profile) = (*user_profile).clone() {
                                             html! {
-                                                <div class="absolute top-4 right-4 z-50">
+                                                <div class="fixed top-4 right-4 z-50">
                                                     <button
+                                                        type="button"
                                                         onclick={on_toggle_dropdown.clone()}
-                                                        class="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-white text-sm transition-colors"
+                                                        class="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-white text-sm transition-colors
+                                                              focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-black"
                                                     >
                                                         <span>{&profile.name}</span>
                                                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

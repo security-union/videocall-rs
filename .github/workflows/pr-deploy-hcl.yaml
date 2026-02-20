@@ -118,14 +118,13 @@ jobs:
           echo "$HARBOR_PASSWORD" | docker login hclcr.io -u "$HARBOR_USERNAME" --password-stdin
 
       - name: Build and push all images
-        env:
-          REGISTRY: ${{ vars.DOCKER_REGISTRY }}
         run: |
           cd /tmp/build-${{ needs.check-permissions.outputs.pr_number }}
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
 
           # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
-          export REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          export REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
           echo "Using registry: $REGISTRY"
 
           echo "Building media server..."

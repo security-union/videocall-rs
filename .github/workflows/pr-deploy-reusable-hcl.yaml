@@ -192,7 +192,8 @@ jobs:
         id: verify-images
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          REGISTRY="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
 
           echo "Checking if Harbor images exist for pr-${PR_NUM}..."
           echo "Registry: ${REGISTRY}"
@@ -290,6 +291,18 @@ jobs:
             | kubectl apply -f -
 
           echo "✅ TLS secret copied"
+
+      - name: Copy Harbor registry pull secret to preview namespace
+        run: |
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Copying Harbor pull secret to slot ${SLOT} namespace..."
+          kubectl get secret harbor-pull-secret -n preview-infra -o json \
+            | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.selfLink, .metadata.managedFields) | .metadata.namespace = "'${NAMESPACE}'"' \
+            | kubectl apply -f -
+
+          echo "✅ Harbor pull secret copied"
 
       - name: Create JWT secret for preview
         run: |
@@ -396,7 +409,8 @@ jobs:
           PR_NUM=${{ inputs.pr_number }}
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
 
           echo "Deploying WebSocket server to slot ${SLOT}..."
 
@@ -404,6 +418,7 @@ jobs:
             --namespace ${NAMESPACE} \
             --set image.repository=${REGISTRY}/videocall-media-server \
             --set image.tag=pr-${PR_NUM} \
+            --set imagePullSecrets[0].name=harbor-pull-secret \
             --set fullnameOverride=websocket-pr-${PR_NUM} \
             --set "env[0].name=NATS_URL" \
             --set "env[0].value=nats://nats-pr-${PR_NUM}.${NAMESPACE}.svc.cluster.local:4222" \
@@ -442,7 +457,8 @@ jobs:
           PR_NUM=${{ inputs.pr_number }}
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
 
           # Get postgres password
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
@@ -472,6 +488,7 @@ jobs:
             --namespace ${NAMESPACE} \
             --set image.repository=${REGISTRY}/videocall-meeting-api \
             --set image.tag=pr-${PR_NUM} \
+            --set imagePullSecrets[0].name=harbor-pull-secret \
             --set fullnameOverride=api-pr-${PR_NUM} \
             --set "env[0].name=DATABASE_URL" \
             --set "env[0].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.preview-infra.svc.cluster.local:5432/preview_slot_${SLOT}?sslmode=disable" \
@@ -516,7 +533,8 @@ jobs:
           PR_NUM=${{ inputs.pr_number }}
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
 
           echo "Deploying UI to slot ${SLOT} with OAuth enabled..."
 
@@ -524,6 +542,7 @@ jobs:
             --namespace ${NAMESPACE} \
             --set image.repository=${REGISTRY}/videocall-web-ui \
             --set image.tag=pr-${PR_NUM} \
+            --set imagePullSecrets[0].name=harbor-pull-secret \
             --set fullnameOverride=ui-pr-${PR_NUM} \
             --set ingress.redirect=false \
             --set "runtimeConfig.apiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \

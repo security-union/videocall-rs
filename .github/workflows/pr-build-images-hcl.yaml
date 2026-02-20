@@ -102,40 +102,37 @@ jobs:
           echo "✅ Harbor login successful"
 
       - name: Build and push media server
-        env:
-          REGISTRY: ${{ vars.DOCKER_REGISTRY }}
         run: |
           cd /tmp/build-${{ github.event.issue.number }}
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
 
           # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
-          export REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          export REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
           echo "Using registry: $REGISTRY"
 
           ./cut_build_push_backend.sh pr-${PR_NUM}
 
       - name: Build and push meeting API
-        env:
-          REGISTRY: ${{ vars.DOCKER_REGISTRY }}
         run: |
           cd /tmp/build-${{ github.event.issue.number }}
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
 
           # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
-          export REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          export REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
           echo "Using registry: $REGISTRY"
 
           ./cut_build_push_meeting_api.sh pr-${PR_NUM}
 
       - name: Build and push UI
-        env:
-          REGISTRY: ${{ vars.DOCKER_REGISTRY }}
         run: |
           cd /tmp/build-${{ github.event.issue.number }}
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
 
           # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
-          export REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          export REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
           echo "Using registry: $REGISTRY"
 
           ./cut_build_push_ui.sh pr-${PR_NUM}
@@ -147,8 +144,8 @@ jobs:
       - name: Comment build success
         run: |
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
-          REGISTRY="${{ vars.DOCKER_REGISTRY }}"
-          REGISTRY="${REGISTRY:-hclcr.io/hcllabs}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
           curl -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \

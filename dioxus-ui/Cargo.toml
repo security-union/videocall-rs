@@ -1,0 +1,107 @@
+[package]
+name = "dioxus-ui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A Dioxus UI for the videocall project"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+keywords = ["quic", "webtransport", "dioxus", "video-conferencing"]
+categories = ["network-programming", "multimedia", "web-programming"]
+readme = "../README.md"
+
+[lib]
+name = "dioxus_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dioxus-ui"
+path = "src/main.rs"
+
+[dependencies]
+dioxus = { version = "0.7.3", default-features = false, features = ["web", "router", "launch", "logger", "lib"] }
+wasm-bindgen = { workspace = true }
+videocall-client = { path = "../videocall-client", version = "4.0.2", default-features = false }
+videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.3" }
+videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.0" }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.1" }
+videocall-types = { path = "../videocall-types", version = "4.0.1" }
+console_error_panic_hook = "0.1.7"
+console_log = "1.0.0"
+once_cell = "1.19"
+log = "0.4.19"
+gloo-timers = { version = "0.2.6", features = ["futures"] }
+gloo-utils = "0.1"
+neteq = { path = "../neteq", version = "0.8.2", features = ["web"], default-features = false }
+wasm-bindgen-futures = { workspace = true }
+futures = "0.3.31"
+web-time = "1.1.0"
+regex = "1.10"
+js-sys = "0.3.72"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+matomo-logger = { path = "../matomo-logger", version = "0.1.0" }
+serde-wasm-bindgen = "0.6"
+anyhow = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+urlencoding = "2.1"
+
+[dependencies.web-sys]
+version = "0.3.72"
+features = [
+    "DomTokenList",
+    "Element",
+    "HtmlAudioElement",
+    "HtmlDocument",
+    "HtmlSelectElement",
+    "MediaDeviceInfo",
+    "Navigator",
+    "Storage",
+    "Document",
+    "Clipboard",
+    "console",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlVideoElement",
+    "Node",
+    "NodeList",
+    "Window",
+    "MediaDevices",
+    "MediaDeviceKind",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "Performance",
+    "CssStyleDeclaration",
+]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.37"
+wasm-bindgen-futures = { workspace = true }
+gloo-utils = "0.1"
+web-sys = { version = "0.3.72", features = [
+    "HtmlElement",
+    "HtmlButtonElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlOptionElement",
+    "HtmlOptionsCollection",
+    "DomTokenList",
+    "Element",
+    "History",
+    "Node",
+    "NodeList",
+    "Document",
+    "MediaDevices",
+    "MediaDeviceInfo",
+    "MediaDeviceKind",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "Navigator",
+] }
+
+[features]
+default = ["media-server-jwt-auth"]
+fake-peers = []
+oauth = []
+media-server-jwt-auth = []

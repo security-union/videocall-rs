@@ -9,6 +9,7 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'yew-ui/**'
+      - 'dioxus-ui/**'
   pull_request:
     paths:
       - 'videocall-client/**'
@@ -17,6 +18,7 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'yew-ui/**'
+      - 'dioxus-ui/**'
 
 jobs:
   wasm-test:
@@ -85,4 +87,32 @@ jobs:
         run: |
           nix develop .#yew-ui --command bash -c "\
             cd yew-ui && \
+            CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown"
+
+  dioxus-ui-component-tests:
+    name: Dioxus UI Component Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-dioxus-tests-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-dioxus-tests-
+
+      - uses: nanasess/setup-chromedriver@v2
+
+      - name: Run dioxus-ui component tests
+        run: |
+          nix develop .#yew-ui --command bash -c "\
+            cd dioxus-ui && \
             CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown"

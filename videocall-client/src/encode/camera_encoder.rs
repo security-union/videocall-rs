@@ -345,13 +345,37 @@ impl CameraEncoder {
             video_element.set_src_object(None);
             video_element.set_src_object(Some(&device));
 
-            if let Err(e) = video_element.play() {
-                error!("VIDEO PLAY ERROR: {:?}", e);
-            } else {
-                log::info!(
-                    "VIDEO PLAY started successfully on element {}",
-                    video_elem_id
-                );
+            // play() returns a Promise; await it so Safari's rejection doesn't
+            // become an unhandled Promise rejection.  If the first attempt fails
+            // (e.g. autoplay policy), retry once after a short delay.
+            match video_element.play() {
+                Ok(promise) => {
+                    if let Err(e) = JsFuture::from(promise).await {
+                        log::warn!(
+                            "VIDEO PLAY promise rejected on '{}': {:?}  — retrying in 200ms",
+                            video_elem_id, e
+                        );
+                        sleep(Duration::from_millis(200)).await;
+                        if let Ok(p2) = video_element.play() {
+                            if let Err(e2) = JsFuture::from(p2).await {
+                                log::warn!(
+                                    "VIDEO PLAY retry also rejected on '{}': {:?}",
+                                    video_elem_id, e2
+                                );
+                            } else {
+                                log::info!("VIDEO PLAY retry succeeded on {}", video_elem_id);
+                            }
+                        }
+                    } else {
+                        log::info!(
+                            "VIDEO PLAY started successfully on element {}",
+                            video_elem_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("VIDEO PLAY method call failed: {:?}", e);
+                }
             }
 
             let video_track = Box::new(

@@ -12,6 +12,8 @@ jobs:
           echo "Runner: $(hostname)"
           whoami
           pwd
+	  printenv
+	  ps -aef
 
       - name: Check Docker
         run: docker --version

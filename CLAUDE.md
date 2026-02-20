@@ -69,4 +69,5 @@ The `connection/` module was already properly separated before this refactoring.
 - Yew mode uses `yew::Callback<T>` for event callbacks
 - Non-yew mode uses `Rc<dyn Fn(T)>` or `Box<dyn Fn(T)>` closures
 - Non-yew mode uses `CanvasIdProvider` trait instead of yew `Callback` for canvas IDs
-- Non-yew mode uses `emit_client_event()` / `ClientEvent` event bus for framework-agnostic eventing
+- Non-yew mode uses `emit_client_event()` / `ClientEvent` event bus for framework-agnostic eventin
+

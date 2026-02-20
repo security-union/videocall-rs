@@ -125,18 +125,16 @@ jobs:
           # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
           REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
           REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
-          export REGISTRY
           echo "Using registry: $REGISTRY"
-          echo "REGISTRY env var: $REGISTRY"
 
           echo "Building media server..."
-          ./cut_build_push_backend.sh pr-${PR_NUM}
+          REGISTRY="$REGISTRY" ./cut_build_push_backend.sh pr-${PR_NUM}
 
           echo "Building meeting API..."
-          ./cut_build_push_meeting_api.sh pr-${PR_NUM}
+          REGISTRY="$REGISTRY" ./cut_build_push_meeting_api.sh pr-${PR_NUM}
 
           echo "Building UI..."
-          ./cut_build_push_ui.sh pr-${PR_NUM}
+          REGISTRY="$REGISTRY" ./cut_build_push_ui.sh pr-${PR_NUM}
 
       - name: Cleanup build directory
         if: always()

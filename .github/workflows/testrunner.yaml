@@ -1,0 +1,28 @@
+name: Test Self-Hosted Runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Check environment
+        run: |
+          echo "Runner: $(hostname)"
+          whoami
+          pwd
+
+      - name: Check Docker
+        run: docker --version
+
+      - name: Check kubectl
+        run: kubectl version --client
+
+      - name: Check Helm
+        run: helm version
+
+      - name: Test kubectl access
+        run: |
+          kubectl get nodes
+          kubectl get namespaces | grep preview-infra

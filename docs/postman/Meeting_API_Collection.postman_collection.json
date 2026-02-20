@@ -1,0 +1,492 @@
+{
+	"info": {
+		"_postman_id": "meeting-api-collection-v1",
+		"name": "Meeting API",
+		"description": "API collection for testing the videocall.rs Meeting Backend.\n\n## Setup\n\n1. **Local Development**: Set `baseUrl` to `http://localhost:8081`\n2. **Production**: Set `baseUrl` to your meeting-api endpoint\n\n## Authentication\n\nAll requests use JWT authentication via `Authorization: Bearer <session_token>` header.\n\nObtain a session token by completing the OAuth login flow, then set the `session_token` variable.\n\n## Variables\n\n- `baseUrl`: API base URL\n- `session_token`: JWT session token (obtained via OAuth login)\n- `email`: Your email (for reference)\n- `meeting_id`: Meeting ID for requests\n- `participant_email`: Email of participant to admit/reject",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8081",
+			"type": "string"
+		},
+		{
+			"key": "session_token",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "email",
+			"value": "host@example.com",
+			"type": "string"
+		},
+		{
+			"key": "meeting_id",
+			"value": "my-meeting",
+			"type": "string"
+		},
+		{
+			"key": "participant_email",
+			"value": "attendee@example.com",
+			"type": "string"
+		},
+		{
+			"key": "participant_session_token",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "display_name",
+			"value": "Test User",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Meetings",
+			"description": "Meeting CRUD operations",
+			"item": [
+				{
+					"name": "List My Meetings",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings?limit=20&offset=0",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings"],
+							"query": [
+								{
+									"key": "limit",
+									"value": "20",
+									"description": "Max meetings to return (1-100)"
+								},
+								{
+									"key": "offset",
+									"value": "0",
+									"description": "Pagination offset"
+								}
+							]
+						},
+						"description": "Lists all meetings owned by the authenticated user.\n\nReturns meetings with state, participant count, and waiting room count."
+					},
+					"response": []
+				},
+				{
+					"name": "Create Meeting",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"meeting_id\": \"{{meeting_id}}\",\n  \"attendees\": [],\n  \"password\": null\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings"]
+						},
+						"description": "Creates a new meeting. The authenticated user becomes the host.\n\n**Request Body:**\n- `meeting_id` (optional): Meeting identifier. Auto-generated if omitted.\n- `attendees` (optional): Pre-registered attendee emails (max 100).\n- `password` (optional): Meeting password."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Meeting Info",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}"]
+						},
+						"description": "Retrieves meeting information and your participation status.\n\nReturns meeting state, host info, and your current status (if you've joined)."
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Meeting",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}"]
+						},
+						"description": "Soft-deletes a meeting. Only the meeting owner can delete their meetings.\n\nThe meeting ID can be reused after deletion."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Join & Leave",
+			"description": "Joining and leaving meetings",
+			"item": [
+				{
+					"name": "Join Meeting",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"display_name\": \"{{display_name}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/join",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "join"]
+						},
+						"description": "Request to join a meeting.\n\n**Behavior:**\n- If meeting doesn't exist: Creates it with you as host\n- If you're the host: Auto-admitted, receives `room_token`\n- If you're an attendee: Enters waiting room (no token until admitted)\n\n**Request Body:**\n- `display_name` (optional): Your display name in the meeting"
+					},
+					"response": []
+				},
+				{
+					"name": "Get My Status",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/status",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "status"]
+						},
+						"description": "Check your current status in a meeting.\n\nThis is the primary polling endpoint for attendees in the waiting room. When status becomes `admitted`, the response includes the `room_token` needed to connect to the Media Server.\n\n**Statuses:**\n- `waiting`: In waiting room, pending approval\n- `admitted`: Approved, `room_token` included\n- `rejected`: Denied entry\n- `left`: Previously in meeting, now left"
+					},
+					"response": []
+				},
+				{
+					"name": "Leave Meeting",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/leave",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "leave"]
+						},
+						"description": "Leave a meeting.\n\nThe meeting automatically ends when:\n- The host leaves, OR\n- All admitted participants have left"
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Waiting Room",
+			"description": "Waiting room management (host operations)",
+			"item": [
+				{
+					"name": "Get Waiting Room",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/waiting",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "waiting"]
+						},
+						"description": "Lists all participants waiting to be admitted.\n\nAny admitted participant can view the waiting room."
+					},
+					"response": []
+				},
+				{
+					"name": "Admit Participant",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"{{participant_email}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/admit",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "admit"]
+						},
+						"description": "Admits a participant from the waiting room.\n\nAny admitted participant can admit others. A room access token is generated for the admitted participant (they receive it via their next `/status` poll)."
+					},
+					"response": []
+				},
+				{
+					"name": "Admit All Participants",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/admit-all",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "admit-all"]
+						},
+						"description": "Admits all participants currently in the waiting room at once.\n\nRoom access tokens are generated for each admitted participant."
+					},
+					"response": []
+				},
+				{
+					"name": "Reject Participant",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"{{participant_email}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/reject",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "reject"]
+						},
+						"description": "Rejects a participant from the waiting room.\n\nRejected participants cannot join the meeting."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Participants",
+			"description": "Participant management",
+			"item": [
+				{
+					"name": "Get Participants",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/participants",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "participants"]
+						},
+						"description": "Lists all admitted participants currently in the meeting.\n\nThe `room_token` field is `null` in participant listings. Tokens are only delivered to the participant themselves."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Workflows",
+			"description": "Example workflows combining multiple requests",
+			"item": [
+				{
+					"name": "1. Host - Create and Join",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"display_name\": \"Host\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/join",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "join"]
+						},
+						"description": "**Step 1 for Host**: Join a meeting (creates it if it doesn't exist).\n\nAs the first user to join, you become the host and receive a `room_token` immediately.\n\nUse this token to connect to the Media Server:\n```\nws://localhost:8081/lobby?token=<room_token>\n```"
+					},
+					"response": []
+				},
+				{
+					"name": "2. Attendee - Request to Join",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{participant_session_token}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"display_name\": \"Attendee\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/join",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "join"]
+						},
+						"description": "**Step 2 for Attendee**: Request to join the meeting.\n\nAs an attendee, you'll enter the waiting room with status `waiting`. No `room_token` is provided yet.\n\nPoll `/status` until your status changes to `admitted`."
+					},
+					"response": []
+				},
+				{
+					"name": "3. Host - Check Waiting Room",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/waiting",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "waiting"]
+						},
+						"description": "**Step 3 for Host**: Check who is waiting to be admitted."
+					},
+					"response": []
+				},
+				{
+					"name": "4. Host - Admit Attendee",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"{{participant_email}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/admit",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "admit"]
+						},
+						"description": "**Step 4 for Host**: Admit the attendee from the waiting room."
+					},
+					"response": []
+				},
+				{
+					"name": "5. Attendee - Poll for Token",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{participant_session_token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/meetings/{{meeting_id}}/status",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "v1", "meetings", "{{meeting_id}}", "status"]
+						},
+						"description": "**Step 5 for Attendee**: Poll for your status.\n\nOnce admitted, the response will include your `room_token`. Use it to connect to the Media Server."
+					},
+					"response": []
+				}
+			]
+		}
+	]
+}

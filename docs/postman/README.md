@@ -7,7 +7,7 @@ This directory contains Postman collection and environment files for testing the
 | File | Description |
 |------|-------------|
 | `Meeting_API_Collection.postman_collection.json` | Complete API collection with all endpoints |
-| `Local_Development.postman_environment.json` | Environment for local development (port 8080) |
+| `Local_Development.postman_environment.json` | Environment for local development (port 8081) |
 | `Production.postman_environment.json` | Environment template for production |
 
 ## Import Instructions
@@ -28,7 +28,12 @@ This directory contains Postman collection and environment files for testing the
 
 2. Select **Local Development** environment in Postman
 
-3. Update variables if needed:
+3. Obtain a JWT session token:
+   - Complete the OAuth login flow in your browser at `http://localhost:8081/login`
+   - Copy the `session` cookie value from your browser's DevTools
+   - Paste it into the `session_token` environment variable in Postman
+
+4. Update variables if needed:
    - `email`: Your test email
    - `meeting_id`: Meeting ID to test with
 
@@ -64,43 +69,44 @@ Step-by-step requests demonstrating a complete meeting flow:
 
 ## Authentication
 
-### Local Development (port 8080)
-Uses email cookies. The collection is pre-configured with:
+All endpoints require a JWT session token passed via the `Authorization` header:
+
 ```
-Cookie: email={{email}}
+Authorization: Bearer <session_token>
 ```
 
-### Production (port 8081)
-Uses JWT session tokens. For production:
-1. Complete OAuth login in browser
-2. Copy the `session` cookie value
-3. Update requests to use either:
-   - `Cookie: session={{session_token}}`
-   - `Authorization: Bearer {{session_token}}`
+To obtain a session token:
+1. Complete the OAuth login flow in a browser
+2. Copy the `session` cookie value from your browser's DevTools
+3. Set it as the `session_token` variable in your Postman environment
+
+For the attendee workflow, obtain a second token from a different user session and set it as `participant_session_token`.
 
 ## Variables Reference
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `baseUrl` | API base URL | `http://localhost:8080` |
-| `email` | Your email (host) | `host@example.com` |
+| `baseUrl` | Meeting API base URL | `http://localhost:8081` |
+| `session_token` | JWT session token (host) | `eyJ...` |
+| `participant_session_token` | JWT session token (attendee) | `eyJ...` |
+| `email` | Your email (for reference) | `host@example.com` |
 | `meeting_id` | Meeting identifier | `my-meeting` |
 | `participant_email` | Attendee email | `attendee@example.com` |
 | `display_name` | Display name in meeting | `Test User` |
-| `session_token` | JWT session token (production) | `eyJ...` |
 
 ## Testing Workflow
 
 ### Test as Host
-1. Run **"1. Host - Create and Join"** from Workflows
-2. Copy the `room_token` from response
-3. Connect to WebSocket: `ws://localhost:8080/lobby?token=<room_token>`
+1. Set `session_token` in your environment
+2. Run **"1. Host - Create and Join"** from Workflows
+3. Copy the `room_token` from response
+4. Connect to the Media Server: `ws://localhost:8080/lobby?token=<room_token>`
 
 ### Test as Attendee (requires two sessions)
-1. In Session 1 (Host): Run **"1. Host - Create and Join"**
-2. In Session 2 (Attendee): Change `email` variable to attendee email
+1. In Session 1 (Host): Set `session_token`, run **"1. Host - Create and Join"**
+2. In Session 2 (Attendee): Set `participant_session_token` from a different user's login
 3. In Session 2: Run **"2. Attendee - Request to Join"**
 4. In Session 1: Run **"3. Host - Check Waiting Room"**
 5. In Session 1: Run **"4. Host - Admit Attendee"**
 6. In Session 2: Run **"5. Attendee - Poll for Token"**
-7. Copy `room_token` and connect to Media Server
+7. Copy `room_token` and connect to the Media Server

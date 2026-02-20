@@ -5,7 +5,7 @@ on:
 
 jobs:
   test:
-    runs-on: [self-hosted, linux, docker]
+    runs-on: [self-hosted, Linux]
     steps:
       - name: Check environment
         run: |

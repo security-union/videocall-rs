@@ -108,8 +108,11 @@ jobs:
 
           # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
           REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          export REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          export REGISTRY
           echo "Using registry: $REGISTRY"
+          echo "Checking export worked:"
+          env | grep REGISTRY || echo "REGISTRY not in environment!"
 
           ./cut_build_push_backend.sh pr-${PR_NUM}
 
@@ -120,7 +123,8 @@ jobs:
 
           # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
           REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          export REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          export REGISTRY
           echo "Using registry: $REGISTRY"
 
           ./cut_build_push_meeting_api.sh pr-${PR_NUM}
@@ -132,7 +136,8 @@ jobs:
 
           # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
           REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          export REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          export REGISTRY
           echo "Using registry: $REGISTRY"
 
           ./cut_build_push_ui.sh pr-${PR_NUM}

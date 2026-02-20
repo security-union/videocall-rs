@@ -124,8 +124,10 @@ jobs:
 
           # Use hclcr.io/hcllabs if DOCKER_REGISTRY not set
           REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          export REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          export REGISTRY
           echo "Using registry: $REGISTRY"
+          echo "REGISTRY env var: $REGISTRY"
 
           echo "Building media server..."
           ./cut_build_push_backend.sh pr-${PR_NUM}

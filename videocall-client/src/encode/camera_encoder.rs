@@ -240,10 +240,7 @@ impl CameraEncoder {
         };
         let on_error = self.on_error.clone();
 
-        log::info!(
-            "CameraEncoder::start(): using video device_id = {}",
-            device_id
-        );
+        log::info!("CameraEncoder::start(): using video device_id = {device_id}");
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -256,9 +253,7 @@ impl CameraEncoder {
                     if let Some(elem) = doc.get_element_by_id(&video_elem_id) {
                         if let Ok(video_elem) = elem.dyn_into::<HtmlVideoElement>() {
                             log::info!(
-                                "CameraEncoder: found <video id='{}'> after {} attempts",
-                                video_elem_id,
-                                attempt
+                                "CameraEncoder: found <video id='{video_elem_id}'> after {attempt} attempts"
                             );
                             break video_elem;
                         }
@@ -269,8 +264,7 @@ impl CameraEncoder {
                 attempt += 1;
                 if attempt > 20 {
                     let msg = format!(
-                        "Camera error: video element '{}' not found in DOM after 1 second",
-                        video_elem_id
+                        "Camera error: video element '{video_elem_id}' not found in DOM after 1 second"
                     );
                     error!("{msg}");
                     if let Some(cb) = &on_error {
@@ -303,7 +297,7 @@ impl CameraEncoder {
             )
             .unwrap();
 
-            log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
+            log::debug!("CameraEncoder: deviceId.exact = {device_id}");
             media_info.set_device_id(&exact.into());
 
             constraints.set_video(&media_info.into());
@@ -346,12 +340,9 @@ impl CameraEncoder {
             video_element.set_src_object(Some(&device));
 
             if let Err(e) = video_element.play() {
-                error!("VIDEO PLAY ERROR: {:?}", e);
+                error!("VIDEO PLAY ERROR: {e:?}");
             } else {
-                log::info!(
-                    "VIDEO PLAY started successfully on element {}",
-                    video_elem_id
-                );
+                log::info!("VIDEO PLAY started successfully on element {video_elem_id}");
             }
 
             let video_track = Box::new(

@@ -34,6 +34,10 @@ pub struct PacketWrapper {
     pub email: ::std::string::String,
     // @@protoc_insertion_point(field:PacketWrapper.data)
     pub data: ::std::vec::Vec<u8>,
+    // @@protoc_insertion_point(field:PacketWrapper.session_id)
+    pub session_id: ::std::string::String,
+    // @@protoc_insertion_point(field:PacketWrapper.display_name)
+    pub display_name: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:PacketWrapper.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -51,7 +55,7 @@ impl PacketWrapper {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut fields = ::std::vec::Vec::with_capacity(5);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "packet_type",
@@ -67,6 +71,16 @@ impl PacketWrapper {
             "data",
             |m: &PacketWrapper| { &m.data },
             |m: &mut PacketWrapper| { &mut m.data },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "session_id",
+            |m: &PacketWrapper| { &m.session_id },
+            |m: &mut PacketWrapper| { &mut m.session_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "display_name",
+            |m: &PacketWrapper| { &m.display_name },
+            |m: &mut PacketWrapper| { &mut m.display_name },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<PacketWrapper>(
             "PacketWrapper",
@@ -95,6 +109,12 @@ impl ::protobuf::Message for PacketWrapper {
                 26 => {
                     self.data = is.read_bytes()?;
                 },
+                82 => {
+                    self.session_id = is.read_string()?;
+                },
+                90 => {
+                    self.display_name = is.read_string()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -116,6 +136,12 @@ impl ::protobuf::Message for PacketWrapper {
         if !self.data.is_empty() {
             my_size += ::protobuf::rt::bytes_size(3, &self.data);
         }
+        if !self.session_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(10, &self.session_id);
+        }
+        if !self.display_name.is_empty() {
+            my_size += ::protobuf::rt::string_size(11, &self.display_name);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -130,6 +156,12 @@ impl ::protobuf::Message for PacketWrapper {
         }
         if !self.data.is_empty() {
             os.write_bytes(3, &self.data)?;
+        }
+        if !self.session_id.is_empty() {
+            os.write_string(10, &self.session_id)?;
+        }
+        if !self.display_name.is_empty() {
+            os.write_string(11, &self.display_name)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -151,6 +183,8 @@ impl ::protobuf::Message for PacketWrapper {
         self.packet_type = ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::PACKET_TYPE_UNKNOWN);
         self.email.clear();
         self.data.clear();
+        self.session_id.clear();
+        self.display_name.clear();
         self.special_fields.clear();
     }
 
@@ -159,6 +193,8 @@ impl ::protobuf::Message for PacketWrapper {
             packet_type: ::protobuf::EnumOrUnknown::from_i32(0),
             email: ::std::string::String::new(),
             data: ::std::vec::Vec::new(),
+            session_id: ::std::string::String::new(),
+            display_name: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance

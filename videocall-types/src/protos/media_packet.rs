@@ -46,6 +46,10 @@ pub struct MediaPacket {
     pub video_metadata: ::protobuf::MessageField<VideoMetadata>,
     // @@protoc_insertion_point(field:MediaPacket.heartbeat_metadata)
     pub heartbeat_metadata: ::protobuf::MessageField<HeartbeatMetadata>,
+    // @@protoc_insertion_point(field:MediaPacket.session_id)
+    pub session_id: ::std::string::String,
+    // @@protoc_insertion_point(field:MediaPacket.display_name)
+    pub display_name: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:MediaPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -63,7 +67,7 @@ impl MediaPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(9);
+        let mut fields = ::std::vec::Vec::with_capacity(11);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "media_type",
@@ -110,6 +114,16 @@ impl MediaPacket {
             |m: &MediaPacket| { &m.heartbeat_metadata },
             |m: &mut MediaPacket| { &mut m.heartbeat_metadata },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "session_id",
+            |m: &MediaPacket| { &m.session_id },
+            |m: &mut MediaPacket| { &mut m.session_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "display_name",
+            |m: &MediaPacket| { &m.display_name },
+            |m: &mut MediaPacket| { &mut m.display_name },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MediaPacket>(
             "MediaPacket",
             fields,
@@ -155,6 +169,12 @@ impl ::protobuf::Message for MediaPacket {
                 74 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.heartbeat_metadata)?;
                 },
+                82 => {
+                    self.session_id = is.read_string()?;
+                },
+                90 => {
+                    self.display_name = is.read_string()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -197,6 +217,12 @@ impl ::protobuf::Message for MediaPacket {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
+        if !self.session_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(10, &self.session_id);
+        }
+        if !self.display_name.is_empty() {
+            my_size += ::protobuf::rt::string_size(11, &self.display_name);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -230,6 +256,12 @@ impl ::protobuf::Message for MediaPacket {
         if let Some(v) = self.heartbeat_metadata.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(9, v, os)?;
         }
+        if !self.session_id.is_empty() {
+            os.write_string(10, &self.session_id)?;
+        }
+        if !self.display_name.is_empty() {
+            os.write_string(11, &self.display_name)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -256,6 +288,8 @@ impl ::protobuf::Message for MediaPacket {
         self.audio_metadata.clear();
         self.video_metadata.clear();
         self.heartbeat_metadata.clear();
+        self.session_id.clear();
+        self.display_name.clear();
         self.special_fields.clear();
     }
 
@@ -270,6 +304,8 @@ impl ::protobuf::Message for MediaPacket {
             audio_metadata: ::protobuf::MessageField::none(),
             video_metadata: ::protobuf::MessageField::none(),
             heartbeat_metadata: ::protobuf::MessageField::none(),
+            session_id: ::std::string::String::new(),
+            display_name: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance

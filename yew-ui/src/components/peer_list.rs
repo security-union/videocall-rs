@@ -18,7 +18,7 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::UsernameCtx;
+use std::collections::HashMap;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew::{html, Component, Context};
@@ -31,7 +31,13 @@ pub struct PeerList {
 #[derive(Properties, Clone, PartialEq)]
 pub struct PeerListProperties {
     pub peers: Vec<String>,
+    /// Map of session_id -> display_name for looking up peer names
+    #[prop_or_default]
+    pub peer_display_names: HashMap<String, String>,
     pub onclose: yew::Callback<yew::MouseEvent>,
+
+    /// The local user's display name (shown with "(You)" suffix)
+    pub local_user_name: String,
 
     // meeting info
     pub show_meeting_info: bool,
@@ -76,12 +82,19 @@ impl Component for PeerList {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        let peer_names = &ctx.props().peer_display_names;
         let filtered_peers: Vec<_> = ctx
             .props()
             .peers
             .iter()
-            .filter(|peer| {
-                peer.to_lowercase()
+            .filter(|session_id| {
+                // Get display name for filtering, fallback to session_id
+                let display_name = peer_names
+                    .get(*session_id)
+                    .cloned()
+                    .unwrap_or_else(|| (*session_id).clone());
+                display_name
+                    .to_lowercase()
                     .contains(&self.search_query.to_lowercase())
             })
             .cloned()
@@ -98,15 +111,9 @@ impl Component for PeerList {
         });
 
         // Get username from context and append (You)
-        let current_user_name: Option<String> = ctx
-            .link()
-            .context::<UsernameCtx>(Callback::noop())
-            .and_then(|(state, _handle)| state.as_ref().cloned());
+        let current_user_name = Some(ctx.props().local_user_name.clone());
 
-        let display_name = current_user_name
-            .clone()
-            .map(|name| format!("{name} (You)"))
-            .unwrap_or_else(|| "(You)".to_string());
+        let display_name = format!("{} (You)", ctx.props().local_user_name);
 
         // Check if current user is host by comparing display names
         let host_display_name = ctx.props().host_display_name.clone();
@@ -197,14 +204,21 @@ impl Component for PeerList {
                                 // show self as the first item with actual username
                                 <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} /></li>
 
-                                { for filtered_peers.iter().map(|peer| {
+                                { for filtered_peers.iter().map(|session_id| {
+                                    // Look up display name, fallback to session_id
+                                    let name = peer_names
+                                        .get(session_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| session_id.clone());
+                                    // Check if this peer is the host
                                     let is_peer_host = host_display_name.as_ref()
-                                        .map(|h| h == peer)
+                                        .map(|h| h == &name)
                                         .unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={peer.clone()} is_host={is_peer_host} /></li>
+                                        <li><PeerListItem name={name} is_host={is_peer_host} /></li>
                                     }
-                                })}
+                                })
+                                }
                             </ul>
                         </div>
                     </div>

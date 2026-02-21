@@ -247,7 +247,7 @@ impl MicrophoneEncoder {
             )
             .unwrap();
 
-            log::info!("MicrophoneEncoder: deviceId.exact = {}", device_id);
+            log::info!("MicrophoneEncoder: deviceId.exact = {device_id}");
             media_info.set_device_id(&exact.into());
 
             constraints.set_audio(&media_info.into());

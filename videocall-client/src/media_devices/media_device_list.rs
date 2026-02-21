@@ -81,6 +81,7 @@ impl MockMediaDevicesProvider {
     }
 
     /// Simulate a device change event with a new set of devices
+    #[allow(dead_code)]
     pub fn simulate_device_change(&self, new_devices: Vec<MediaDeviceInfo>) {
         // Update the devices
         *self.devices.borrow_mut() = new_devices;

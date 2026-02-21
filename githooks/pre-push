@@ -8,4 +8,6 @@ echo "Running Clippy before push..."
 cargo clippy -- -D warnings
 echo "Running Fmt before push..."
 cargo fmt -- --check
+echo "Running doc tests..."
+cargo test --doc
 echo "Pushing to remote repository..."

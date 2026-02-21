@@ -564,7 +564,7 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::RequestMediaPermissions => {
-                    self.media_device_access.request();
+                    self.media_device_access.request(self.mic_enabled, self.video_enabled);
                     false
                 }
                 WsAction::MediaPermissionsGranted => {

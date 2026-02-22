@@ -108,7 +108,7 @@ pub struct ConnectionManager {
     rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
-    own_session_id: Rc<RefCell<Option<String>>>, // Own session_id for filtering self-packets
+    own_session_id: Rc<RefCell<Option<u64>>>, // Own session_id for filtering self-packets
 }
 
 impl ConnectionManager {
@@ -139,7 +139,7 @@ impl ConnectionManager {
             options,
             aes,
             own_session_id: Rc::new(RefCell::new(None)),
-         };
+        };
 
         // Immediately start creating connections and testing
         manager.start_election()?;
@@ -296,8 +296,8 @@ impl ConnectionManager {
             }
 
             // Filter self-packets using session_id
-            if let Some(ref own_id) = *own_session_id.borrow() {
-                if !packet.session_id.is_empty() && packet.session_id == *own_id {
+            if let Some(own_id) = *own_session_id.borrow() {
+                if packet.session_id != 0 && packet.session_id == own_id {
                     debug!(
                         "Rejecting packet from same session_id: {}",
                         packet.session_id
@@ -826,10 +826,17 @@ impl ConnectionManager {
         Err(anyhow!("No active connection available"))
     }
 
-    /// Set own session_id for filtering self-packets
-    pub fn set_own_session_id(&self, session_id: String) {
-        *self.own_session_id.borrow_mut() = Some(session_id.clone());
-        debug!("Set own_session_id for self-packet filtering and stored for active connection");
+    /// Set own session_id for filtering self-packets and for inclusion in outgoing heartbeats.
+    /// Propagates to all connections so the active one's heartbeat will include session_id.
+    pub fn set_own_session_id(&self, session_id: u64) {
+        *self.own_session_id.borrow_mut() = Some(session_id);
+        for connection in self.connections.values() {
+            connection.set_session_id(session_id);
+        }
+        debug!(
+            "Set own_session_id for self-packet filtering and heartbeat ({} connections updated)",
+            self.connections.len()
+        );
     }
 
     /// Check if manager has an active connection

@@ -50,7 +50,9 @@ const JWT_PORT: u16 = 18090;
 /// Start the real WebSocket server with the production lobby handlers.
 async fn start_real_ws_server(port: u16) {
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-    let nats_client = async_nats::connect(&nats_url)
+    let nats_client = async_nats::ConnectOptions::new()
+        .no_echo()
+        .connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");
 

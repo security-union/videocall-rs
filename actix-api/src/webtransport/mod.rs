@@ -407,11 +407,12 @@ mod tests {
 
         // Connect to NATS
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-        let nats_client = async_nats::connect(&nats_url)
+        let nats_client = async_nats::ConnectOptions::new()
+            .no_echo()
+            .connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        // Start ChatServer actor
         let chat_server = ChatServer::new(nats_client.clone()).await.start();
 
         // Create SessionManager
@@ -421,7 +422,6 @@ mod tests {
         let (_, tracker_sender, tracker_receiver) =
             ServerDiagnostics::new_with_channel(nats_client.clone());
 
-        // Clone nats_client for use in both spawned tasks
         let nats_client_for_tracker = nats_client.clone();
 
         // Start tracker message loop
@@ -751,9 +751,9 @@ mod tests {
         );
         assert_eq!(sent_packet.email, received_packet.email, "email must match");
         assert_eq!(sent_packet.data, received_packet.data, "data must match");
-        // Verify that server added session_id (it should not be empty)
+        // Verify that server added session_id (it should not be zero)
         assert!(
-            !received_packet.session_id.is_empty(),
+            received_packet.session_id != 0,
             "server should add session_id"
         );
 

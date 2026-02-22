@@ -35,7 +35,7 @@ pub struct PacketWrapper {
     // @@protoc_insertion_point(field:PacketWrapper.data)
     pub data: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:PacketWrapper.session_id)
-    pub session_id: ::std::string::String,
+    pub session_id: u64,
     // @@protoc_insertion_point(field:PacketWrapper.connection_phase)
     pub connection_phase: ::protobuf::EnumOrUnknown<packet_wrapper::ConnectionPhase>,
     // special fields
@@ -109,8 +109,8 @@ impl ::protobuf::Message for PacketWrapper {
                 26 => {
                     self.data = is.read_bytes()?;
                 },
-                34 => {
-                    self.session_id = is.read_string()?;
+                32 => {
+                    self.session_id = is.read_uint64()?;
                 },
                 40 => {
                     self.connection_phase = is.read_enum_or_unknown()?;
@@ -136,8 +136,8 @@ impl ::protobuf::Message for PacketWrapper {
         if !self.data.is_empty() {
             my_size += ::protobuf::rt::bytes_size(3, &self.data);
         }
-        if !self.session_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(4, &self.session_id);
+        if self.session_id != 0 {
+            my_size += ::protobuf::rt::uint64_size(4, self.session_id);
         }
         if self.connection_phase != ::protobuf::EnumOrUnknown::new(packet_wrapper::ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED) {
             my_size += ::protobuf::rt::int32_size(5, self.connection_phase.value());
@@ -157,8 +157,8 @@ impl ::protobuf::Message for PacketWrapper {
         if !self.data.is_empty() {
             os.write_bytes(3, &self.data)?;
         }
-        if !self.session_id.is_empty() {
-            os.write_string(4, &self.session_id)?;
+        if self.session_id != 0 {
+            os.write_uint64(4, self.session_id)?;
         }
         if self.connection_phase != ::protobuf::EnumOrUnknown::new(packet_wrapper::ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED) {
             os.write_enum(5, ::protobuf::EnumOrUnknown::value(&self.connection_phase))?;
@@ -183,7 +183,7 @@ impl ::protobuf::Message for PacketWrapper {
         self.packet_type = ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::PACKET_TYPE_UNKNOWN);
         self.email.clear();
         self.data.clear();
-        self.session_id.clear();
+        self.session_id = 0;
         self.connection_phase = ::protobuf::EnumOrUnknown::new(packet_wrapper::ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED);
         self.special_fields.clear();
     }
@@ -193,7 +193,7 @@ impl ::protobuf::Message for PacketWrapper {
             packet_type: ::protobuf::EnumOrUnknown::from_i32(0),
             email: ::std::string::String::new(),
             data: ::std::vec::Vec::new(),
-            session_id: ::std::string::String::new(),
+            session_id: 0,
             connection_phase: ::protobuf::EnumOrUnknown::from_i32(0),
             special_fields: ::protobuf::SpecialFields::new(),
         };

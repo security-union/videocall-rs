@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
-use crate::messages::server::{ActivateConnection, ClientMessage, Leave, Packet};
+use crate::messages::server::{ActivateConnection, ClientMessage, ForceDisconnect, Leave, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -109,12 +109,12 @@ impl Actor for WsChatSession {
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
         let email = self.logic.email.clone();
-        let session_id = self.logic.id.clone();
+        let session_id = self.logic.id;
 
         ctx.wait(
             async move {
                 session_manager
-                    .start_session(&room, &email, &session_id)
+                    .start_session(&room, &email, session_id)
                     .await
             }
             .into_actor(self)
@@ -147,7 +147,10 @@ impl Actor for WsChatSession {
         let addr = ctx.address();
         self.logic
             .addr
-            .send(self.logic.create_connect_message(addr.recipient()))
+            .send(self.logic.create_connect_message(
+                addr.clone().recipient(),
+                addr.recipient::<ForceDisconnect>(),
+            ))
             .into_actor(self)
             .then(|res, _act, ctx| {
                 if let Err(err) = res {
@@ -182,6 +185,19 @@ impl Handler<Message> for WsChatSession {
     }
 }
 
+/// Handle force disconnect (e.g. on session ID collision)
+impl Handler<ForceDisconnect> for WsChatSession {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ForceDisconnect, ctx: &mut Self::Context) -> Self::Result {
+        info!(
+            "Force disconnect for session {} in room {}",
+            self.logic.id, self.logic.room
+        );
+        ctx.stop();
+    }
+}
+
 /// Handle outbound packets (forwarding to ChatServer)
 impl Handler<Packet> for WsChatSession {
     type Result = ();
@@ -193,7 +209,7 @@ impl Handler<Packet> for WsChatSession {
             self.logic.room
         );
         self.logic.addr.do_send(ClientMessage {
-            session: self.logic.id.clone(),
+            session: self.logic.id,
             user: self.logic.email.clone(),
             room: self.logic.room.clone(),
             msg,
@@ -229,7 +245,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                                 ConnectionPhase::ACTIVE => {
                                     // First ACTIVE packet - activate connection
                                     self.logic.addr.do_send(ActivateConnection {
-                                        session: self.logic.id.clone(),
+                                        session: self.logic.id,
                                     });
                                     self.activated = true;
                                     info!(
@@ -240,7 +256,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                                 ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED => {
                                     // Activate immediately for old clients
                                     self.logic.addr.do_send(ActivateConnection {
-                                        session: self.logic.id.clone(),
+                                        session: self.logic.id,
                                     });
                                     self.activated = true;
                                     info!(
@@ -282,7 +298,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                     self.logic.id, self.logic.room
                 );
                 self.logic.addr.do_send(Leave {
-                    session: self.logic.id.clone(),
+                    session: self.logic.id,
                     room: self.logic.room.clone(),
                     user_id: self.logic.email.clone(),
                 });
@@ -363,16 +379,16 @@ mod tests {
     /// Start WebSocket server for testing
     async fn start_websocket_server(port: u16) {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-        let nats_client = async_nats::connect(&nats_url)
+        let nats_client = async_nats::ConnectOptions::new()
+            .no_echo()
+            .connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
-
         let chat = ChatServer::new(nats_client.clone()).await.start();
         let session_manager = SessionManager::new();
 
         let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());
 
-        // Use actix_rt::spawn which doesn't require Send
         actix_rt::spawn(async move {
             let _ = HttpServer::new(move || {
                 let chat = chat.clone();

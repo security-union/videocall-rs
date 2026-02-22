@@ -21,6 +21,6 @@ message PacketWrapper {
   PacketType packet_type = 1;
   string email = 2;
   bytes data = 3;
-  string session_id = 4;
+  uint64 session_id = 4;  // Unique per-connection ID (saves bandwidth vs 36-char UUID)
   ConnectionPhase connection_phase = 5;
 }

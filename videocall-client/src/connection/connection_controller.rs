@@ -151,7 +151,7 @@ impl ConnectionController {
     }
 
     /// Set own session_id for filtering self-packets
-    pub fn set_own_session_id(&self, session_id: String) -> Result<()> {
+    pub fn set_own_session_id(&self, session_id: u64) -> Result<()> {
         let inner = self
             .inner
             .try_borrow()

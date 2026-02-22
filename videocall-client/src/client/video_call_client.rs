@@ -141,7 +141,7 @@ struct Inner {
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
-    own_session_id: Option<String>,
+    own_session_id: Option<u64>,
 }
 
 /// The client struct for a video call connection.
@@ -519,22 +519,31 @@ impl VideoCallClient {
         }
     }
 
-    /// Returns a vector of the userids of the currently connected remote peers, sorted alphabetically.
+    /// Returns a vector of the session IDs of the currently connected remote peers, sorted.
     pub fn sorted_peer_keys(&self) -> Vec<String> {
         match self.inner.try_borrow() {
-            Ok(inner) => inner.peer_decode_manager.sorted_keys().to_vec(),
+            Ok(inner) => inner
+                .peer_decode_manager
+                .sorted_keys()
+                .iter()
+                .map(|k| k.to_string())
+                .collect(),
             Err(_) => Vec::<String>::new(),
         }
     }
 
     pub fn get_peer_email(&self, session_id: &str) -> Option<String> {
+        let sid = session_id.parse::<u64>().ok()?;
         match self.inner.try_borrow() {
             Ok(inner) => inner
                 .peer_decode_manager
-                .get(&session_id.to_string())
+                .get(&sid)
                 .map(|peer| peer.email.clone()),
             Err(_) => {
-                warn!("Failed to borrow inner in get_peer_email for session_id: {}", session_id);
+                warn!(
+                    "Failed to borrow inner in get_peer_email for session_id: {}",
+                    session_id
+                );
                 None
             }
         }
@@ -548,36 +557,44 @@ impl VideoCallClient {
     /// be more elegant to at least pass a `MediaType`.
     ///
     pub fn is_awaiting_peer_screen_frame(&self, key: &String) -> bool {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(peer) = inner.peer_decode_manager.get(key) {
-                return peer.screen.is_waiting_for_keyframe();
+        if let Ok(sid) = key.parse::<u64>() {
+            if let Ok(inner) = self.inner.try_borrow() {
+                if let Some(peer) = inner.peer_decode_manager.get(&sid) {
+                    return peer.screen.is_waiting_for_keyframe();
+                }
             }
         }
         false
     }
 
     pub fn is_video_enabled_for_peer(&self, key: &String) -> bool {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(peer) = inner.peer_decode_manager.get(key) {
-                return peer.video_enabled;
+        if let Ok(sid) = key.parse::<u64>() {
+            if let Ok(inner) = self.inner.try_borrow() {
+                if let Some(peer) = inner.peer_decode_manager.get(&sid) {
+                    return peer.video_enabled;
+                }
             }
         }
         false
     }
 
     pub fn is_screen_share_enabled_for_peer(&self, key: &String) -> bool {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(peer) = inner.peer_decode_manager.get(key) {
-                return peer.screen_enabled;
+        if let Ok(sid) = key.parse::<u64>() {
+            if let Ok(inner) = self.inner.try_borrow() {
+                if let Some(peer) = inner.peer_decode_manager.get(&sid) {
+                    return peer.screen_enabled;
+                }
             }
         }
         false
     }
 
     pub fn is_audio_enabled_for_peer(&self, key: &String) -> bool {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(peer) = inner.peer_decode_manager.get(key) {
-                return peer.audio_enabled;
+        if let Ok(sid) = key.parse::<u64>() {
+            if let Ok(inner) = self.inner.try_borrow() {
+                if let Some(peer) = inner.peer_decode_manager.get(&sid) {
+                    return peer.audio_enabled;
+                }
             }
         }
         false
@@ -840,9 +857,10 @@ impl Inner {
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         let peer_status = if response.email == SYSTEM_USER_EMAIL {
-           PeerStatus::NoChange
+            PeerStatus::NoChange
         } else {
-            self.peer_decode_manager.ensure_peer(&response.session_id, &response.email)
+            self.peer_decode_manager
+                .ensure_peer(response.session_id, &response.email)
         };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
@@ -854,7 +872,7 @@ impl Inner {
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
                             if let Err(e) = self.peer_decode_manager.set_peer_aes(
-                                &response.session_id,
+                                response.session_id,
                                 Aes128State::from_vecs(
                                     aes_packet.key,
                                     aes_packet.iv,
@@ -910,7 +928,7 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEDIA) => {
-                let peer_session_id = response.session_id.clone();
+                let peer_session_id = response.session_id;
 
                 // RTT responses are now handled directly by the ConnectionManager via individual connection callbacks
                 // No need to process them here anymore
@@ -924,7 +942,7 @@ impl Inner {
                             debug!("Rejecting packet from same user: {session_id}");
                         }
                         _ => {
-                            self.peer_decode_manager.delete_peer(&peer_session_id);
+                            self.peer_decode_manager.delete_peer(peer_session_id);
                         }
                     }
                 }
@@ -969,12 +987,12 @@ impl Inner {
                                     meeting_packet.session_id,
                                 );
                                 // Store own session_id for use in outgoing packets
-                                self.own_session_id = Some(meeting_packet.session_id.clone());
+                                self.own_session_id = Some(meeting_packet.session_id);
 
                                 // Set own_session_id in ConnectionManager for self-packet filtering
                                 if let Some(connection_controller) = &self.connection_controller {
                                     if let Err(e) = connection_controller
-                                        .set_own_session_id(meeting_packet.session_id.clone())
+                                        .set_own_session_id(meeting_packet.session_id)
                                     {
                                         warn!("Failed to set own_session_id in ConnectionManager: {e}");
                                     }
@@ -1007,7 +1025,9 @@ impl Inner {
                             Ok(MeetingEventType::PARTICIPANT_LEFT) => {
                                 info!(
                                     "Received PARTICIPANT_LEFT: room={}, count={}, session_id = {}",
-                                    meeting_packet.room_id, meeting_packet.participant_count,meeting_packet.session_id
+                                    meeting_packet.room_id,
+                                    meeting_packet.participant_count,
+                                    meeting_packet.session_id
                                 );
                                 // Future: could emit participant left event
                             }
@@ -1037,13 +1057,10 @@ impl Inner {
                 error!("Failed to parse packet type: {e}");
             }
         }
-        if let PeerStatus::Added(peer_userid) = peer_status {
-            if peer_userid != self.options.userid {
-                self.options.on_peer_added.emit(peer_userid);
-                self.send_public_key();
-            } else {
-                log::debug!("Rejecting packet from same user: {peer_userid}");
-            }
+        if let PeerStatus::Added(peer_session_id) = peer_status {
+            // peer_session_id is unique per connection, never equals userid (email)
+            self.options.on_peer_added.emit(peer_session_id.to_string());
+            self.send_public_key();
         }
     }
 

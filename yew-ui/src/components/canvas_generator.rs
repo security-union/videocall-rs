@@ -45,8 +45,7 @@ pub fn generate_for_peer(
     }
 
     // Convert session_id to email for display
-    let peer_email = client.get_peer_email(key)
-        .unwrap_or_else(|| key.clone());
+    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
 
     let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);

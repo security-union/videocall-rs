@@ -275,6 +275,7 @@ async fn main() -> std::io::Result<()> {
     let nats_client = async_nats::ConnectOptions::new()
         .require_tls(false)
         .ping_interval(std::time::Duration::from_secs(10))
+        .no_echo()
         .connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");

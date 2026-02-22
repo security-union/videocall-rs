@@ -18,9 +18,11 @@
 
 use actix::Message as ActixMessage;
 
+use crate::actors::session_logic::SessionId;
+
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 pub struct Message {
-    pub session: String,
+    pub session: SessionId,
     pub msg: Vec<u8>,
 }

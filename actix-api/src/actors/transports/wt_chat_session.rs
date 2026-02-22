@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
-use crate::messages::server::{ActivateConnection, ClientMessage, Packet};
+use crate::messages::server::{ActivateConnection, ClientMessage, ForceDisconnect, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -192,12 +192,12 @@ impl Actor for WtChatSession {
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
         let email = self.logic.email.clone();
-        let session_id = self.logic.id.clone();
+        let session_id = self.logic.id;
 
         ctx.wait(
             async move {
                 session_manager
-                    .start_session(&room, &email, &session_id)
+                    .start_session(&room, &email, session_id)
                     .await
             }
             .into_actor(self)
@@ -226,7 +226,10 @@ impl Actor for WtChatSession {
         let addr = ctx.address();
         self.logic
             .addr
-            .send(self.logic.create_connect_message(addr.recipient()))
+            .send(self.logic.create_connect_message(
+                addr.clone().recipient(),
+                addr.recipient::<ForceDisconnect>(),
+            ))
             .into_actor(self)
             .then(|res, _act, ctx| {
                 if let Err(err) = res {
@@ -264,6 +267,19 @@ impl Handler<Message> for WtChatSession {
     }
 }
 
+/// Handle force disconnect (e.g. on session ID collision)
+impl Handler<ForceDisconnect> for WtChatSession {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ForceDisconnect, ctx: &mut Self::Context) -> Self::Result {
+        info!(
+            "Force disconnect for session {} in room {}",
+            self.logic.id, self.logic.room
+        );
+        ctx.stop();
+    }
+}
+
 /// Handle inbound data from WebTransport session
 impl Handler<WtInbound> for WtChatSession {
     type Result = ();
@@ -286,7 +302,7 @@ impl Handler<WtInbound> for WtChatSession {
                         ConnectionPhase::ACTIVE => {
                             // First ACTIVE packet - activate connection
                             self.logic.addr.do_send(ActivateConnection {
-                                session: self.logic.id.clone(),
+                                session: self.logic.id,
                             });
                             self.activated = true;
                             info!("Session {} activated on first ACTIVE packet", self.logic.id);
@@ -294,7 +310,7 @@ impl Handler<WtInbound> for WtChatSession {
                         ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED => {
                             // Activate immediately for old clients (backward compatibility)
                             self.logic.addr.do_send(ActivateConnection {
-                                session: self.logic.id.clone(),
+                                session: self.logic.id,
                             });
                             self.activated = true;
                             info!(
@@ -373,7 +389,7 @@ impl Handler<Packet> for WtChatSession {
             self.logic.room
         );
         self.logic.addr.do_send(ClientMessage {
-            session: self.logic.id.clone(),
+            session: self.logic.id,
             user: self.logic.email.clone(),
             room: self.logic.room.clone(),
             msg,

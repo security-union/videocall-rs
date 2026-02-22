@@ -42,7 +42,7 @@ pub struct MeetingPacket {
     // @@protoc_insertion_point(field:MeetingPacket.participant_count)
     pub participant_count: i64,
     // @@protoc_insertion_point(field:MeetingPacket.session_id)
-    pub session_id: ::std::string::String,
+    pub session_id: u64,
     // special fields
     // @@protoc_insertion_point(special_field:MeetingPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -133,8 +133,8 @@ impl ::protobuf::Message for MeetingPacket {
                 48 => {
                     self.participant_count = is.read_int64()?;
                 },
-                58 => {
-                    self.session_id = is.read_string()?;
+                56 => {
+                    self.session_id = is.read_uint64()?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -166,8 +166,8 @@ impl ::protobuf::Message for MeetingPacket {
         if self.participant_count != 0 {
             my_size += ::protobuf::rt::int64_size(6, self.participant_count);
         }
-        if !self.session_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(7, &self.session_id);
+        if self.session_id != 0 {
+            my_size += ::protobuf::rt::uint64_size(7, self.session_id);
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -193,8 +193,8 @@ impl ::protobuf::Message for MeetingPacket {
         if self.participant_count != 0 {
             os.write_int64(6, self.participant_count)?;
         }
-        if !self.session_id.is_empty() {
-            os.write_string(7, &self.session_id)?;
+        if self.session_id != 0 {
+            os.write_uint64(7, self.session_id)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -219,7 +219,7 @@ impl ::protobuf::Message for MeetingPacket {
         self.message.clear();
         self.creator_id.clear();
         self.participant_count = 0;
-        self.session_id.clear();
+        self.session_id = 0;
         self.special_fields.clear();
     }
 
@@ -231,7 +231,7 @@ impl ::protobuf::Message for MeetingPacket {
             message: ::std::string::String::new(),
             creator_id: ::std::string::String::new(),
             participant_count: 0,
-            session_id: ::std::string::String::new(),
+            session_id: 0,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance

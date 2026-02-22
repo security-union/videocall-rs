@@ -52,7 +52,7 @@ pub struct Connection {
     video_enabled: Rc<AtomicBool>,
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
-    session_id: Rc<RefCell<Option<String>>>,
+    session_id: Rc<RefCell<Option<u64>>>,
     url: String,
 }
 
@@ -142,7 +142,7 @@ impl Connection {
             };
 
             if let Some(sid) = session_id.borrow().as_ref() {
-                packet_wrapper.session_id = sid.clone();
+                packet_wrapper.session_id = *sid;
             }
 
             if let Status::Connected = status.get() {
@@ -182,6 +182,12 @@ impl Connection {
         log::debug!("Setting screen enabled to {enabled}");
         self.screen_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set session_id for inclusion in outgoing heartbeat packets.
+    /// Must be called after MEETING_STARTED is received so heartbeats identify this connection.
+    pub fn set_session_id(&self, session_id: u64) {
+        *self.session_id.borrow_mut() = Some(session_id);
     }
 }
 

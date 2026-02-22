@@ -175,6 +175,35 @@ impl WtChatSession {
             }
         });
     }
+
+    /// Parse inbound packet and activate on first ACTIVE or UNSPECIFIED phase.
+    /// Skips if already activated or during PROBING.
+    fn try_activate_from_first_packet(&mut self, data: &[u8]) {
+        if self.activated {
+            return;
+        }
+        let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) else {
+            return;
+        };
+        let Ok(phase) = packet_wrapper.connection_phase.enum_value() else {
+            return;
+        };
+        let should_activate = matches!(
+            phase,
+            ConnectionPhase::ACTIVE | ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED
+        );
+        if !should_activate {
+            return;
+        }
+        self.logic.addr.do_send(ActivateConnection {
+            session: self.logic.id,
+        });
+        self.activated = true;
+        info!(
+            "Session {} activated on first {:?} packet",
+            self.logic.id, phase
+        );
+    }
 }
 
 // =============================================================================
@@ -294,37 +323,8 @@ impl Handler<WtInbound> for WtChatSession {
             return;
         }
 
-        // Check connection_phase from inbound packet
-        if !self.activated {
-            if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(msg.data.as_ref()) {
-                if let Ok(phase) = packet_wrapper.connection_phase.enum_value() {
-                    match phase {
-                        ConnectionPhase::ACTIVE => {
-                            // First ACTIVE packet - activate connection
-                            self.logic.addr.do_send(ActivateConnection {
-                                session: self.logic.id,
-                            });
-                            self.activated = true;
-                            info!("Session {} activated on first ACTIVE packet", self.logic.id);
-                        }
-                        ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED => {
-                            // Activate immediately for old clients (backward compatibility)
-                            self.logic.addr.do_send(ActivateConnection {
-                                session: self.logic.id,
-                            });
-                            self.activated = true;
-                            info!(
-                                "Session {} activated on UNSPECIFIED (old client)",
-                                self.logic.id
-                            );
-                        }
-                        ConnectionPhase::PROBING => {
-                            // Do not activate during probing phase
-                        }
-                    }
-                }
-            }
-        }
+        // Check connection_phase from inbound packet (guard: skip if already activated)
+        self.try_activate_from_first_packet(msg.data.as_ref());
 
         // Delegate to shared logic
         match self.logic.handle_inbound(&msg.data) {

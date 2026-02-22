@@ -237,40 +237,8 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 // Update heartbeat
                 self.heartbeat = Instant::now();
 
-                // Check connection_phase from inbound packet
-                if !self.activated {
-                    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(&data) {
-                        if let Ok(phase) = packet_wrapper.connection_phase.enum_value() {
-                            match phase {
-                                ConnectionPhase::ACTIVE => {
-                                    // First ACTIVE packet - activate connection
-                                    self.logic.addr.do_send(ActivateConnection {
-                                        session: self.logic.id,
-                                    });
-                                    self.activated = true;
-                                    info!(
-                                        "Session {} activated on first ACTIVE packet",
-                                        self.logic.id
-                                    );
-                                }
-                                ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED => {
-                                    // Activate immediately for old clients
-                                    self.logic.addr.do_send(ActivateConnection {
-                                        session: self.logic.id,
-                                    });
-                                    self.activated = true;
-                                    info!(
-                                        "Session {} activated on UNSPECIFIED (old client)",
-                                        self.logic.id
-                                    );
-                                }
-                                ConnectionPhase::PROBING => {
-                                    // Do not activate during probing phase
-                                }
-                            }
-                        }
-                    }
-                }
+                // Check connection_phase from inbound packet (guard: skip if already activated)
+                self.try_activate_from_first_packet(&data);
 
                 // Delegate to shared logic
                 match self.logic.handle_inbound(&data) {
@@ -321,6 +289,35 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 // =============================================================================
 
 impl WsChatSession {
+    /// Parse inbound packet and activate on first ACTIVE or UNSPECIFIED phase.
+    /// Skips if already activated or during PROBING.
+    fn try_activate_from_first_packet(&mut self, data: &[u8]) {
+        if self.activated {
+            return;
+        }
+        let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) else {
+            return;
+        };
+        let Ok(phase) = packet_wrapper.connection_phase.enum_value() else {
+            return;
+        };
+        let should_activate = matches!(
+            phase,
+            ConnectionPhase::ACTIVE | ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED
+        );
+        if !should_activate {
+            return;
+        }
+        self.logic.addr.do_send(ActivateConnection {
+            session: self.logic.id,
+        });
+        self.activated = true;
+        info!(
+            "Session {} activated on first {:?} packet",
+            self.logic.id, phase
+        );
+    }
+
     fn join_room(&self, ctx: &mut WebsocketContext<Self>) {
         let join_room = self.logic.addr.send(self.logic.create_join_room_message());
         let join_room = join_room.into_actor(self);

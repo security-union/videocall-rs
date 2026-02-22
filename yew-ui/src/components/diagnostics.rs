@@ -43,6 +43,17 @@ pub struct SerializableMetric {
     pub value: MetricValue,
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub struct PacketDebugEntry {
+    pub ts_ms: u64,
+    pub direction: String,
+    pub packet_type: String,
+    pub email: String,
+    pub session_id: u64,
+    pub size_bytes: usize,
+    pub inner: String,
+}
+
 impl From<DiagEvent> for SerializableDiagEvent {
     fn from(event: DiagEvent) -> Self {
         Self {
@@ -70,6 +81,7 @@ pub struct ConnectionManagerState {
     pub active_server_url: Option<String>,
     pub active_server_type: Option<String>,
     pub active_server_rtt: Option<f64>,
+    pub active_session_id: Option<u64>,
     pub failure_reason: Option<String>,
     pub servers: Vec<ServerInfo>,
 }
@@ -96,6 +108,7 @@ impl Default for ConnectionManagerState {
             active_server_url: None,
             active_server_type: None,
             active_server_rtt: None,
+            active_session_id: None,
             failure_reason: None,
             servers: Vec::new(),
         }
@@ -175,6 +188,11 @@ impl ConnectionManagerState {
                         state.active_server_rtt = Some(*rtt);
                     }
                 }
+                "active_session_id" => {
+                    if let MetricValue::U64(sid) = &metric.value {
+                        state.active_session_id = Some(*sid);
+                    }
+                }
                 "failure_reason" => {
                     if let MetricValue::Text(reason) = &metric.value {
                         state.failure_reason = Some(reason.clone());
@@ -242,6 +260,73 @@ impl ConnectionManagerState {
         }
 
         Some(server)
+    }
+}
+
+#[derive(Properties, PartialEq)]
+pub struct PacketDebugDisplayProps {
+    pub events: Vec<PacketDebugEntry>,
+}
+
+#[function_component(PacketDebugDisplay)]
+pub fn packet_debug_display(props: &PacketDebugDisplayProps) -> Html {
+    let styles = r#"
+        .packet-debug-container {
+            max-height: 280px;
+            overflow-y: auto;
+            font-family: 'SF Mono', Menlo, Monaco, 'Courier New', monospace;
+            font-size: 11px;
+            background: #1C1C1E;
+            border-radius: 8px;
+            border: 1px solid #38383A;
+            padding: 8px;
+        }
+        .packet-debug-entry {
+            padding: 4px 6px;
+            margin-bottom: 2px;
+            border-radius: 4px;
+            border-left: 3px solid transparent;
+            word-break: break-all;
+        }
+        .packet-debug-entry.in {
+            border-left-color: #30D158;
+            background: rgba(48,209,88,0.08);
+        }
+        .packet-debug-entry.out {
+            border-left-color: #0A84FF;
+            background: rgba(10,132,255,0.08);
+        }
+        .packet-debug-entry .dir { font-weight: 700; margin-right: 6px; }
+        .packet-debug-entry .ts { color: #8E8E93; font-size: 10px; }
+        .packet-debug-entry .type { color: #FF9F0A; }
+        .packet-debug-entry .email { color: #AEAEB2; }
+        .packet-debug-entry .sid { color: #0A84FF; }
+        .packet-debug-entry .inner { color: #30D158; font-size: 10px; }
+    "#;
+    html! {
+        <div class="packet-debug-panel">
+            <style>{styles}</style>
+            <div class="packet-debug-container">
+                if props.events.is_empty() {
+                    <p class="no-data" style="color:#8E8E93;font-style:italic;margin:12px 0;">{"No packets yet"}</p>
+                } else {
+                    {for props.events.iter().rev().take(150).enumerate().map(|(i, e)| {
+                        let dir_class = if e.direction == "in" { "in" } else { "out" };
+                        html! {
+                            <div class={format!("packet-debug-entry {}", dir_class)} key={format!("{}-{}", e.ts_ms, i)}>
+                                <span class="dir">{format!("{:>3}", e.direction)}</span>
+                                <span class="ts">{format!("{}.{:03}", e.ts_ms / 1000, e.ts_ms % 1000)}</span>
+                                <span class="type">{" "}{&e.packet_type}</span>
+                                <span class="email">{" "}{e.email.as_str()}</span>
+                                <span class="sid">{" sid="}{e.session_id}</span>
+                                <span class="inner">{" "}{&e.inner}</span>
+                                <span style="color:#8E8E93">{" ("}{e.size_bytes}{"B)"}</span>
+                            </div>
+                        }
+                    })}
+                }
+            </div>
+        </div>
     }
 }
 
@@ -448,6 +533,18 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
                                                 html! {}
                                             }
                                         }
+                                        {
+                                            if let Some(sid) = state.active_session_id {
+                                                html! {
+                                                    <div class="detail-item">
+                                                        <span class="detail-label">{"Session ID:"}</span>
+                                                        <span class="detail-value">{sid}</span>
+                                                    </div>
+                                                }
+                                            } else {
+                                                html! {}
+                                            }
+                                        }
                                     </div>
                                 </div>
                             }
@@ -642,12 +739,14 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     let neteq_stats_per_peer = use_state(HashMap::<String, Vec<String>>::new);
     let neteq_buffer_per_peer = use_state(HashMap::<String, Vec<u64>>::new);
     let neteq_jitter_per_peer = use_state(HashMap::<String, Vec<u64>>::new);
+    let packet_debug_events = use_state(Vec::<PacketDebugEntry>::new);
 
     // Create shared state containers for async operations
     let connection_events_async = Rc::new(RefCell::new(Vec::<SerializableDiagEvent>::new()));
     let neteq_stats_async = Rc::new(RefCell::new(HashMap::<String, Vec<String>>::new()));
     let neteq_buffer_async = Rc::new(RefCell::new(HashMap::<String, Vec<u64>>::new()));
     let neteq_jitter_async = Rc::new(RefCell::new(HashMap::<String, Vec<u64>>::new()));
+    let packet_debug_async = Rc::new(RefCell::new(Vec::<PacketDebugEntry>::new()));
 
     // Debounce handles to batch UI updates
     let stats_flush_timeout = use_mut_ref(|| Option::<Timeout>::None);
@@ -667,12 +766,14 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
         let neteq_stats_per_peer = neteq_stats_per_peer.clone();
         let neteq_buffer_per_peer = neteq_buffer_per_peer.clone();
         let neteq_jitter_per_peer = neteq_jitter_per_peer.clone();
+        let packet_debug_events = packet_debug_events.clone();
 
         // Clone async-safe shared containers
         let connection_events_async = connection_events_async.clone();
         let neteq_stats_async = neteq_stats_async.clone();
         let neteq_buffer_async = neteq_buffer_async.clone();
         let neteq_jitter_async = neteq_jitter_async.clone();
+        let packet_debug_async = packet_debug_async.clone();
         let stats_flush_timeout = stats_flush_timeout.clone();
         let buffer_flush_timeout = buffer_flush_timeout.clone();
         let jitter_flush_timeout = jitter_flush_timeout.clone();
@@ -694,12 +795,14 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 neteq_stats_per_peer.set(HashMap::new());
                 neteq_buffer_per_peer.set(HashMap::new());
                 neteq_jitter_per_peer.set(HashMap::new());
+                packet_debug_events.set(Vec::new());
 
                 // Clear async containers too
                 connection_events_async.borrow_mut().clear();
                 neteq_stats_async.borrow_mut().clear();
                 neteq_buffer_async.borrow_mut().clear();
                 neteq_jitter_async.borrow_mut().clear();
+                packet_debug_async.borrow_mut().clear();
 
                 // Cancel any pending flush timers
                 if let Some(t) = stats_flush_timeout.borrow_mut().take() {
@@ -918,6 +1021,60 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                 }
                             }
                         }
+                        // Packet debug: inbound/outbound packet log
+                        "packet_debug" => {
+                            let mut entry = PacketDebugEntry {
+                                ts_ms: evt.ts_ms,
+                                direction: evt
+                                    .stream_id
+                                    .clone()
+                                    .unwrap_or_else(|| "?".to_string()),
+                                packet_type: String::new(),
+                                email: String::new(),
+                                session_id: 0,
+                                size_bytes: 0,
+                                inner: String::new(),
+                            };
+                            for m in &evt.metrics {
+                                match m.name {
+                                    "packet_type" => {
+                                        if let MetricValue::Text(t) = &m.value {
+                                            entry.packet_type = t.clone();
+                                        }
+                                    }
+                                    "email" => {
+                                        if let MetricValue::Text(t) = &m.value {
+                                            entry.email = t.clone();
+                                        }
+                                    }
+                                    "session_id" => {
+                                        if let MetricValue::U64(v) = &m.value {
+                                            entry.session_id = *v;
+                                        }
+                                    }
+                                    "size_bytes" => {
+                                        if let MetricValue::U64(v) = &m.value {
+                                            entry.size_bytes = *v as usize;
+                                        }
+                                    }
+                                    "inner" => {
+                                        if let MetricValue::Text(t) = &m.value {
+                                            entry.inner = t.clone();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            {
+                                let mut list = packet_debug_async.borrow_mut();
+                                list.push(entry);
+                                if list.len() > 300 {
+                                    list.remove(0);
+                                }
+                            }
+                            let list = packet_debug_async.borrow().clone();
+                            packet_debug_events.set(list);
+                        }
                         // Connection manager state accumulation - this is the key fix!
                         "connection_manager" => {
                             // Update async-safe container first
@@ -1037,6 +1194,12 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 <div class="diagnostics-section">
                     <h3>{"Connection Manager"}</h3>
                     <ConnectionManagerDisplay connection_manager_state={(*connection_manager_state).clone()} />
+                </div>
+
+                // Packet Debug - Inbound/Outbound packet log
+                <div class="diagnostics-section">
+                    <h3>{"Packet Debug (In/Out)"}</h3>
+                    <PacketDebugDisplay events={(*packet_debug_events).clone()} />
                 </div>
 
                 // Peer Selection

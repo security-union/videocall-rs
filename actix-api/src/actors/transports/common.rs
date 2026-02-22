@@ -24,11 +24,10 @@ use crate::messages::server::{ActivateConnection, ClientMessage, Packet};
 use actix::Addr;
 use protobuf::Message as ProtobufMessage;
 use tracing::{error, info, trace};
-use videocall_types::protos::packet_wrapper::packet_wrapper::ConnectionPhase;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-/// Parse inbound packet and activate on first ACTIVE or UNSPECIFIED phase.
-/// Skips if already activated or during PROBING.
+/// Activate on first successfully parsed inbound packet.
+/// Server handles activation on its own; no connection phase check.
 /// Shared by WebSocket and WebTransport transports.
 pub fn try_activate_from_first_packet(
     addr: &Addr<ChatServer>,
@@ -39,27 +38,14 @@ pub fn try_activate_from_first_packet(
     if *activated {
         return;
     }
-    let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) else {
-        return;
-    };
-    let Ok(phase) = packet_wrapper.connection_phase.enum_value() else {
-        return;
-    };
-    let should_activate = matches!(
-        phase,
-        ConnectionPhase::ACTIVE | ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED
-    );
-    if !should_activate {
+    if PacketWrapper::parse_from_bytes(data).is_err() {
         return;
     }
     addr.do_send(ActivateConnection {
         session: session_id,
     });
     *activated = true;
-    info!(
-        "Session {} activated on first {:?} packet",
-        session_id, phase
-    );
+    info!("Session {} activated on first packet", session_id);
 }
 
 /// Log force disconnect event. Caller is responsible for stopping the actor.

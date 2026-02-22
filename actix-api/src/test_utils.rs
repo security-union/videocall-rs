@@ -30,6 +30,17 @@ pub async fn wait_for_meeting_started(
     >,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    let _ = wait_for_meeting_started_with_session_id(ws, timeout).await?;
+    Ok(())
+}
+
+/// Wait for MEETING_STARTED and return the session_id from the packet.
+pub async fn wait_for_meeting_started_with_session_id(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    timeout: Duration,
+) -> anyhow::Result<u64> {
     use tokio_tungstenite::tungstenite::Message;
     use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
     use videocall_types::protos::meeting_packet::MeetingPacket;
@@ -45,7 +56,7 @@ pub async fn wait_for_meeting_started(
                         if wrapper.packet_type == PacketType::MEETING.into() {
                             if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
                                 if meeting.event_type == MeetingEventType::MEETING_STARTED.into() {
-                                    return Ok(());
+                                    return Ok(meeting.session_id);
                                 }
                             }
                         }

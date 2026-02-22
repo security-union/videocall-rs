@@ -298,6 +298,11 @@ impl Handler<ClientMessage> for ChatServer {
             return;
         }
 
+        if crate::actors::packet_handler::is_rtt_packet(&msg.data) {
+            trace!("Skipping relay for RTT packet (never relay RTT)");
+            return;
+        }
+
         let packet_bytes =
             if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
                 if packet_wrapper.session_id == 0 {

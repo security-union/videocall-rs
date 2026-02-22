@@ -290,7 +290,7 @@ impl Handler<WtInbound> for WtChatSession {
             return;
         }
 
-        // Check connection_phase from inbound packet (guard: skip if already activated)
+        // Activate on first successfully parsed packet (guard: skip if already activated)
         common::try_activate_from_first_packet(
             &self.logic.addr,
             self.logic.id,

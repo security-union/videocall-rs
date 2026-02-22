@@ -229,7 +229,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 // Update heartbeat
                 self.heartbeat = Instant::now();
 
-                // Check connection_phase from inbound packet (guard: skip if already activated)
+                // Activate on first successfully parsed packet (guard: skip if already activated)
                 common::try_activate_from_first_packet(
                     &self.logic.addr,
                     self.logic.id,
@@ -489,6 +489,140 @@ mod tests {
         println!("✓ Alice disconnected");
 
         println!("\n=== SESSION LIFECYCLE TEST PASSED (WebSocket) ===");
+        Ok(())
+    }
+
+    /// Verifies that relayed packets carry consistent session_ids: when Alice sends,
+    /// Bob receives with session_id=Alice's; when Bob sends, Alice receives with Bob's.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_session_id_consistency_websocket() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::sink)
+            .try_init();
+
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+
+        let result = test_session_id_consistency_ws_impl().await;
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+
+        if let Err(e) = result {
+            panic!("Session ID consistency test failed: {e}");
+        }
+    }
+
+    async fn test_session_id_consistency_ws_impl() -> anyhow::Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use protobuf::Message as ProtoMessage;
+        use tokio_tungstenite::tungstenite::Message;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let room_id = "ws-session-id-test";
+        let port = 18081;
+
+        start_websocket_server(port).await;
+        wait_for_server_ready(port).await;
+
+        let mut ws_alice = connect_ws_client(port, room_id, "alice")
+            .await
+            .map_err(|e| anyhow::anyhow!("connect alice: {e}"))?;
+        let alice_session_id = test_utils::wait_for_meeting_started_with_session_id(
+            &mut ws_alice,
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        let mut ws_bob = connect_ws_client(port, room_id, "bob")
+            .await
+            .map_err(|e| anyhow::anyhow!("connect bob: {e}"))?;
+        let bob_session_id = test_utils::wait_for_meeting_started_with_session_id(
+            &mut ws_bob,
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        assert_ne!(
+            alice_session_id, bob_session_id,
+            "Alice and Bob must have different session_ids"
+        );
+        assert_ne!(alice_session_id, 0, "Alice session_id must not be zero");
+        assert_ne!(bob_session_id, 0, "Bob session_id must not be zero");
+
+        // Alice sends MEDIA packet with session_id=0; server should fill it and relay to Bob
+        let media = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            email: "alice".to_string(),
+            ..Default::default()
+        };
+        let packet = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            email: "alice".to_string(),
+            data: media.write_to_bytes()?,
+            session_id: 0,
+            ..Default::default()
+        };
+        let bytes = packet.write_to_bytes()?;
+
+        ws_alice
+            .send(Message::Binary(bytes))
+            .await
+            .map_err(|e| anyhow::anyhow!("alice send: {e}"))?;
+
+        // Bob receives: must have session_id == alice_session_id
+        let received = futures_util::StreamExt::next(&mut ws_bob)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No message from stream"))?
+            .map_err(|e| anyhow::anyhow!("bob recv: {e}"))?;
+        let recv_bytes = match &received {
+            Message::Binary(b) => b.clone(),
+            _ => anyhow::bail!("Expected binary message"),
+        };
+        let recv_packet = PacketWrapper::parse_from_bytes(&recv_bytes)?;
+        assert_eq!(
+            recv_packet.session_id, alice_session_id,
+            "Bob must receive packet with Alice's session_id, got {}",
+            recv_packet.session_id
+        );
+
+        // Bob sends MEDIA packet with session_id=0; server should fill it and relay to Alice
+        let media_b = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            email: "bob".to_string(),
+            ..Default::default()
+        };
+        let packet_b = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            email: "bob".to_string(),
+            data: media_b.write_to_bytes()?,
+            session_id: 0,
+            ..Default::default()
+        };
+        ws_bob
+            .send(Message::Binary(packet_b.write_to_bytes()?))
+            .await
+            .map_err(|e| anyhow::anyhow!("bob send: {e}"))?;
+
+        // Alice receives: must have session_id == bob_session_id
+        let received_a = futures_util::StreamExt::next(&mut ws_alice)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No message from stream"))?
+            .map_err(|e| anyhow::anyhow!("alice recv: {e}"))?;
+        let recv_bytes_a = match &received_a {
+            Message::Binary(b) => b.clone(),
+            _ => anyhow::bail!("Expected binary message"),
+        };
+        let recv_packet_a = PacketWrapper::parse_from_bytes(&recv_bytes_a)?;
+        assert_eq!(
+            recv_packet_a.session_id, bob_session_id,
+            "Alice must receive packet with Bob's session_id, got {}",
+            recv_packet_a.session_id
+        );
+
         Ok(())
     }
 }

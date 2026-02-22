@@ -48,6 +48,8 @@ use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
 
+use crate::packet_debug;
+
 /// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoCallClientOptions {
@@ -468,6 +470,7 @@ impl VideoCallClient {
     }
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
+        packet_debug::emit_packet_debug("out", &media);
         let packet_type = media.packet_type.enum_value();
         match self.inner.try_borrow() {
             Ok(inner) => {
@@ -849,6 +852,7 @@ impl VideoCallClient {
 
 impl Inner {
     fn on_inbound_media(&mut self, response: PacketWrapper) {
+        // Packet debug emitted in ConnectionManager callback (before filtering)
         debug!(
             "<< Received {:?} from {} (session: {})",
             response.packet_type.enum_value(),
@@ -986,17 +990,11 @@ impl Inner {
                                     meeting_packet.creator_id,
                                     meeting_packet.session_id,
                                 );
-                                // Store own session_id for use in outgoing packets
+                                // Store own session_id for UI/debug (primary from elected connection)
                                 self.own_session_id = Some(meeting_packet.session_id);
 
-                                // Set own_session_id in ConnectionManager for self-packet filtering
-                                if let Some(connection_controller) = &self.connection_controller {
-                                    if let Err(e) = connection_controller
-                                        .set_own_session_id(meeting_packet.session_id)
-                                    {
-                                        warn!("Failed to set own_session_id in ConnectionManager: {e}");
-                                    }
-                                }
+                                // ConnectionManager sets session_id per-connection from MEETING_STARTED
+                                // in its inbound callback; no need to call set_own_session_id here.
 
                                 if let Some(callback) = &self.options.on_meeting_info {
                                     callback.emit(meeting_packet.start_time_ms as f64);

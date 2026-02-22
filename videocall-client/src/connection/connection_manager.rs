@@ -19,17 +19,20 @@
 use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::crypto::aes::Aes128State;
+use crate::packet_debug::wrap_inbound_with_packet_debug;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
 use log::{debug, error, info, warn};
 use protobuf::Message;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::{ConnectionPhase, PacketType};
+use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+use videocall_types::protos::meeting_packet::MeetingPacket;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
@@ -108,7 +111,11 @@ pub struct ConnectionManager {
     rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
-    own_session_id: Rc<RefCell<Option<u64>>>, // Own session_id for filtering self-packets
+    /// Per-connection session_ids from MEETING_STARTED. Used for self-packet filter and heartbeat.
+    connection_session_ids: Rc<RefCell<HashMap<String, u64>>>,
+    /// Pending (connection_id, session_id) from MEETING_STARTED to apply to connections.
+    /// Processed by process_pending_session_ids (called from timer).
+    pending_session_id_updates: Rc<RefCell<Vec<(String, u64)>>>,
 }
 
 impl ConnectionManager {
@@ -138,7 +145,8 @@ impl ConnectionManager {
             rtt_responses,
             options,
             aes,
-            own_session_id: Rc::new(RefCell::new(None)),
+            connection_session_ids: Rc::new(RefCell::new(HashMap::new())),
+            pending_session_id_updates: Rc::new(RefCell::new(Vec::new())),
         };
 
         // Immediately start creating connections and testing
@@ -181,7 +189,9 @@ impl ConnectionManager {
             let connect_options = ConnectOptions {
                 websocket_url: url.clone(),
                 webtransport_url: String::new(), // Not used for WebSocket
-                on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
+                on_inbound_media: wrap_inbound_with_packet_debug(
+                    self.create_inbound_media_callback(conn_id.clone()),
+                ),
                 on_connected: self.create_connected_callback(conn_id.clone()),
                 on_connection_lost: self
                     .create_connection_lost_callback(conn_id.clone(), url.clone()),
@@ -217,7 +227,9 @@ impl ConnectionManager {
             let connect_options = ConnectOptions {
                 websocket_url: String::new(), // Not used for WebTransport
                 webtransport_url: url.clone(),
-                on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
+                on_inbound_media: wrap_inbound_with_packet_debug(
+                    self.create_inbound_media_callback(conn_id.clone()),
+                ),
                 on_connected: self.create_connected_callback(conn_id.clone()),
                 on_connection_lost: self
                     .create_connection_lost_callback(conn_id.clone(), url.clone()),
@@ -264,9 +276,38 @@ impl ConnectionManager {
         let aes = self.aes.clone();
         let on_inbound_media = self.options.on_inbound_media.clone();
         let rtt_responses = self.rtt_responses.clone();
-        let own_session_id = self.own_session_id.clone();
+        let connection_session_ids = self.connection_session_ids.clone();
+        let pending_session_id_updates = self.pending_session_id_updates.clone();
 
         Callback::from(move |packet: PacketWrapper| {
+            // Intercept MEETING_STARTED to store session_id per connection (heartbeats must use elected connection's session_id).
+            // Only store when creator_id matches us: our transport sends MEETING_STARTED when WE connect (our session).
+            // Broadcast when another joins has creator_id == them — we must NOT overwrite our session with theirs.
+            // Match: exact (creator_id == userid) or email local-part (creator_id "user@x.com" matches userid "user").
+            if packet.packet_type == PacketType::MEETING.into() {
+                if let Ok(meeting_packet) = MeetingPacket::parse_from_bytes(&packet.data) {
+                    let creator_matches = meeting_packet.creator_id == userid
+                        || (meeting_packet.creator_id.starts_with(&format!("{userid}@"))
+                            && meeting_packet.creator_id.len() > userid.len() + 1);
+                    if meeting_packet.event_type.enum_value()
+                        == Ok(MeetingEventType::MEETING_STARTED)
+                        && creator_matches
+                    {
+                        let sid = meeting_packet.session_id;
+                        connection_session_ids
+                            .borrow_mut()
+                            .insert(connection_id.clone(), sid);
+                        if let Ok(mut pending) = pending_session_id_updates.try_borrow_mut() {
+                            pending.push((connection_id.clone(), sid));
+                        }
+                        debug!(
+                            "MEETING_STARTED (our session) on connection {} -> session_id {}",
+                            connection_id, sid
+                        );
+                    }
+                }
+            }
+
             // Handle RTT responses internally
             if packet.email == userid {
                 let reception_time = js_sys::Date::now();
@@ -293,9 +334,11 @@ impl ConnectionManager {
                 }
             }
 
-            // Filter self-packets using session_id
-            if let Some(own_id) = *own_session_id.borrow() {
-                if packet.session_id != 0 && packet.session_id == own_id {
+            // Filter self-packets: reject if session_id matches any of our connections
+            if packet.session_id != 0 {
+                let our_ids: HashSet<u64> =
+                    connection_session_ids.borrow().values().copied().collect();
+                if our_ids.contains(&packet.session_id) {
                     debug!(
                         "Rejecting packet from same session_id: {}",
                         packet.session_id
@@ -390,7 +433,6 @@ impl ConnectionManager {
         Ok(PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
             email: self.options.userid.clone(),
-            connection_phase: ConnectionPhase::PROBING.into(),
             data,
             ..Default::default()
         })
@@ -421,9 +463,31 @@ impl ConnectionManager {
         }
     }
 
+    /// Apply pending (connection_id, session_id) from MEETING_STARTED to each connection.
+    /// Ensures elected connection's heartbeat uses the correct session_id for its server.
+    pub fn process_pending_session_ids(&mut self) {
+        let pending: Vec<(String, u64)> = self
+            .pending_session_id_updates
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        for (connection_id, session_id) in pending {
+            if let Some(connection) = self.connections.get(&connection_id) {
+                connection.set_session_id(session_id);
+                debug!(
+                    "Set session_id {} on connection {}",
+                    session_id, connection_id
+                );
+            }
+        }
+    }
+
     /// Complete the election and select the best connection
     fn complete_election(&mut self) {
         info!("Completing connection election");
+
+        // Apply any pending session_id updates so elected connection has correct session_id for heartbeats
+        self.process_pending_session_ids();
 
         // Stop probing
         if let ElectionState::Testing { probe_timer, .. } = &mut self.election_state {
@@ -611,7 +675,7 @@ impl ConnectionManager {
                 metrics.push(metric!("active_connection_id", connection_id.as_str()));
                 metrics.push(metric!("elected_at", *elected_at));
 
-                // Report active connection RTT
+                // Report active connection RTT and session_id
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     if let Some(avg_rtt) = measurement.average_rtt {
                         metrics.push(metric!("active_server_rtt", avg_rtt));
@@ -625,6 +689,9 @@ impl ConnectionManager {
                             }
                         ));
                     }
+                }
+                if let Some(sid) = self.connection_session_ids.borrow().get(connection_id) {
+                    metrics.push(metric!("active_session_id", *sid));
                 }
             }
             ElectionState::Failed { reason, failed_at } => {
@@ -824,17 +891,11 @@ impl ConnectionManager {
         Err(anyhow!("No active connection available"))
     }
 
-    /// Set own session_id for filtering self-packets and for inclusion in outgoing heartbeats.
-    /// Propagates to all connections so the active one's heartbeat will include session_id.
-    pub fn set_own_session_id(&self, session_id: u64) {
-        *self.own_session_id.borrow_mut() = Some(session_id);
-        for connection in self.connections.values() {
-            connection.set_session_id(session_id);
-        }
-        debug!(
-            "Set own_session_id for self-packet filtering and heartbeat ({} connections updated)",
-            self.connections.len()
-        );
+    /// Legacy: session_id is now set per-connection from MEETING_STARTED in the inbound callback.
+    /// This is a no-op to preserve API compatibility.
+    #[allow(dead_code)]
+    pub fn set_own_session_id(&self, _session_id: u64) {
+        // Session IDs are handled per-connection when MEETING_STARTED is received
     }
 
     /// Check if manager has an active connection

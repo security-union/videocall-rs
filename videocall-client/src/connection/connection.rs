@@ -30,10 +30,11 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
-use videocall_types::protos::packet_wrapper::packet_wrapper::ConnectionPhase;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
+
+use crate::packet_debug;
 
 #[derive(Clone, Copy, Debug)]
 enum Status {
@@ -137,7 +138,6 @@ impl Connection {
                 data,
                 email: userid.clone(),
                 packet_type: PacketType::MEDIA.into(),
-                connection_phase: ConnectionPhase::ACTIVE.into(),
                 ..Default::default()
             };
 
@@ -146,6 +146,7 @@ impl Connection {
             }
 
             if let Status::Connected = status.get() {
+                packet_debug::emit_packet_debug("out", &packet_wrapper);
                 task.send_packet(packet_wrapper);
             }
         }));
@@ -160,8 +161,14 @@ impl Connection {
         }
     }
 
-    pub fn send_packet(&self, packet: PacketWrapper) {
+    pub fn send_packet(&self, mut packet: PacketWrapper) {
         if let Status::Connected = self.status.get() {
+            // Fill session_id if missing (e.g. DIAGNOSTICS, HEALTH) so server/peers can identify sender
+            if packet.session_id == 0 {
+                if let Some(sid) = *self.session_id.borrow() {
+                    packet.session_id = sid;
+                }
+            }
             self.task.send_packet(packet);
         }
     }

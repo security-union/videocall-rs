@@ -60,7 +60,7 @@ services:
         cd /app/dbmate && dbmate wait && dbmate up
         cd /app/actix-api
         echo "=== TESTING videocall-api ==="
-        cargo test -p videocall-api -- --nocapture --test-threads=1
+        cargo test -p videocall-api --features testing -- --nocapture --test-threads=1
         echo "=== TESTING meeting-api ==="
         cargo test -p meeting-api -- --nocapture --test-threads=1
         echo "=== ALL TESTS FINISHED ==="

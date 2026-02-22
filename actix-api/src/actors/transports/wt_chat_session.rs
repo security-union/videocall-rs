@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
-use crate::messages::server::{ClientMessage, Packet};
+use crate::messages::server::{ForceDisconnect, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -36,6 +36,8 @@ use bytes::Bytes;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
+
+use super::common;
 
 pub use crate::actors::session_logic::{Email, RoomId, SessionId};
 
@@ -87,6 +89,9 @@ pub struct WtChatSession {
 
     /// Channel to send data back to WebTransport session
     outbound_tx: mpsc::Sender<WtOutbound>,
+
+    /// Track if ActivateConnection has been sent
+    activated: bool,
 }
 
 impl WtChatSession {
@@ -112,6 +117,7 @@ impl WtChatSession {
             logic,
             heartbeat: actix::clock::Instant::now(),
             outbound_tx,
+            activated: false,
         }
     }
 
@@ -185,26 +191,34 @@ impl Actor for WtChatSession {
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
         let email = self.logic.email.clone();
+        let session_id = self.logic.id;
 
         ctx.wait(
-            async move { session_manager.start_session(&room, &email).await }
-                .into_actor(self)
-                .map(|result, act, ctx| match result {
-                    Ok(result) => {
-                        let bytes = act
-                            .logic
-                            .build_meeting_started(result.start_time_ms, &result.creator_id);
-                        act.send(bytes);
-                    }
-                    Err(e) => {
-                        error!("Failed to start session: {}", e);
-                        let bytes = act
-                            .logic
-                            .build_meeting_ended(&format!("Session rejected: {e}"));
-                        act.send(bytes);
-                        ctx.stop();
-                    }
-                }),
+            async move {
+                session_manager
+                    .start_session(&room, &email, session_id)
+                    .await
+            }
+            .into_actor(self)
+            .map(|result, act, ctx| match result {
+                Ok(result) => {
+                    // Send SESSION_ASSIGNED first: explicit session_id for this connection
+                    let session_assigned = act.logic.build_session_assigned();
+                    act.send(session_assigned);
+                    let meeting_started = act
+                        .logic
+                        .build_meeting_started(result.start_time_ms, &result.creator_id);
+                    act.send(meeting_started);
+                }
+                Err(e) => {
+                    error!("Failed to start session: {}", e);
+                    let bytes = act
+                        .logic
+                        .build_meeting_ended(&format!("Session rejected: {e}"));
+                    act.send(bytes);
+                    ctx.stop();
+                }
+            }),
         );
 
         // Start heartbeat
@@ -214,7 +228,10 @@ impl Actor for WtChatSession {
         let addr = ctx.address();
         self.logic
             .addr
-            .send(self.logic.create_connect_message(addr.recipient()))
+            .send(self.logic.create_connect_message(
+                addr.clone().recipient(),
+                addr.recipient::<ForceDisconnect>(),
+            ))
             .into_actor(self)
             .then(|res, _act, ctx| {
                 if let Err(err) = res {
@@ -252,6 +269,16 @@ impl Handler<Message> for WtChatSession {
     }
 }
 
+/// Handle force disconnect (e.g. on session ID collision)
+impl Handler<ForceDisconnect> for WtChatSession {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ForceDisconnect, ctx: &mut Self::Context) -> Self::Result {
+        common::log_force_disconnect(self.logic.id, &self.logic.room);
+        ctx.stop();
+    }
+}
+
 /// Handle inbound data from WebTransport session
 impl Handler<WtInbound> for WtChatSession {
     type Result = ();
@@ -265,6 +292,14 @@ impl Handler<WtInbound> for WtChatSession {
             trace!("Received keep-alive ping for session {}", self.logic.id);
             return;
         }
+
+        // Activate on first successfully parsed packet (guard: skip if already activated)
+        common::try_activate_from_first_packet(
+            &self.logic.addr,
+            self.logic.id,
+            &mut self.activated,
+            msg.data.as_ref(),
+        );
 
         // Delegate to shared logic
         match self.logic.handle_inbound(&msg.data) {
@@ -323,17 +358,13 @@ impl Handler<Packet> for WtChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Packet, _ctx: &mut Self::Context) -> Self::Result {
-        trace!(
-            "Forwarding packet to ChatServer: session {} room {}",
+        common::forward_packet_to_chat_server(
+            &self.logic.addr,
             self.logic.id,
-            self.logic.room
-        );
-        self.logic.addr.do_send(ClientMessage {
-            session: self.logic.id.clone(),
-            user: self.logic.email.clone(),
-            room: self.logic.room.clone(),
+            self.logic.email.clone(),
+            self.logic.room.clone(),
             msg,
-        });
+        );
     }
 }
 
@@ -347,21 +378,10 @@ impl WtChatSession {
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {
-                match response {
-                    Ok(Ok(())) => {
-                        info!(
-                            "Successfully joined room {} for session {}",
-                            act.logic.room, act.logic.id
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        error!("Failed to join room: {}", e);
-                        ctx.stop();
-                    }
-                    Err(err) => {
-                        error!("Error sending JoinRoom: {:?}", err);
-                        ctx.stop();
-                    }
+                if common::handle_join_room_response(response, &act.logic.room, act.logic.id)
+                    .is_err()
+                {
+                    ctx.stop();
                 }
                 fut::ready(())
             })

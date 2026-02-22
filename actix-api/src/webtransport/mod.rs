@@ -407,11 +407,12 @@ mod tests {
 
         // Connect to NATS
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-        let nats_client = async_nats::connect(&nats_url)
+        let nats_client = async_nats::ConnectOptions::new()
+            .no_echo()
+            .connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        // Start ChatServer actor
         let chat_server = ChatServer::new(nats_client.clone()).await.start();
 
         // Create SessionManager
@@ -421,7 +422,6 @@ mod tests {
         let (_, tracker_sender, tracker_receiver) =
             ServerDiagnostics::new_with_channel(nats_client.clone());
 
-        // Clone nats_client for use in both spawned tasks
         let nats_client_for_tracker = nats_client.clone();
 
         // Start tracker message loop
@@ -738,7 +738,24 @@ mod tests {
         .expect("Should receive packet from A on B");
 
         println!("Packet successfully relayed!");
-        assert_eq!(bytes, received, "B must receive the exact bytes sent by A");
+
+        // Parse both packets to compare content (server may add session_id)
+        let sent_packet = VcPacketWrapper::parse_from_bytes(&bytes).expect("parse sent packet");
+        let received_packet =
+            VcPacketWrapper::parse_from_bytes(&received).expect("parse received packet");
+
+        // Compare meaningful fields (server adds session_id, so we ignore it)
+        assert_eq!(
+            sent_packet.packet_type, received_packet.packet_type,
+            "packet_type must match"
+        );
+        assert_eq!(sent_packet.email, received_packet.email, "email must match");
+        assert_eq!(sent_packet.data, received_packet.data, "data must match");
+        // Verify that server added session_id (it should not be zero)
+        assert!(
+            received_packet.session_id != 0,
+            "server should add session_id"
+        );
 
         println!("=== INTEGRATION TEST PASSED ===");
         Ok(())

@@ -46,12 +46,12 @@ async fn main() {
     let nats_client = async_nats::ConnectOptions::new()
         .require_tls(false)
         .ping_interval(std::time::Duration::from_secs(10))
+        .no_echo()
         .connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");
     info!("Connected to NATS at {}", nats_url);
 
-    // Start ChatServer actor
     let chat_server = ChatServer::new(nats_client.clone()).await.start();
     info!("ChatServer actor started");
 

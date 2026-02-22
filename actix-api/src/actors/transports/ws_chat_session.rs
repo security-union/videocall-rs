@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
-use crate::messages::server::{ClientMessage, Leave, Packet};
+use crate::messages::server::{ForceDisconnect, Leave, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -34,7 +34,9 @@ use actix::{
     Running, StreamHandler, WrapFuture,
 };
 use actix_web_actors::ws::{self, WebsocketContext};
-use tracing::{error, info, trace};
+use tracing::{error, info};
+
+use super::common;
 
 pub use crate::actors::session_logic::{Email, RoomId, SessionId};
 
@@ -48,6 +50,9 @@ pub struct WsChatSession {
 
     /// Heartbeat tracking (transport-specific timing)
     heartbeat: Instant,
+
+    /// Track if ActivateConnection has been sent
+    activated: bool,
 }
 
 impl WsChatSession {
@@ -71,6 +76,7 @@ impl WsChatSession {
         WsChatSession {
             logic,
             heartbeat: Instant::now(),
+            activated: false,
         }
     }
 
@@ -102,30 +108,38 @@ impl Actor for WsChatSession {
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
         let email = self.logic.email.clone();
+        let session_id = self.logic.id;
 
         ctx.wait(
-            async move { session_manager.start_session(&room, &email).await }
-                .into_actor(self)
-                .map(|result, act, ctx| match result {
-                    Ok(result) => {
-                        let bytes = act
-                            .logic
-                            .build_meeting_started(result.start_time_ms, &result.creator_id);
-                        ctx.binary(bytes);
-                    }
-                    Err(e) => {
-                        error!("Failed to start session: {}", e);
-                        let bytes = act
-                            .logic
-                            .build_meeting_ended(&format!("Session rejected: {e}"));
-                        ctx.binary(bytes);
-                        ctx.close(Some(ws::CloseReason {
-                            code: ws::CloseCode::Policy,
-                            description: Some("Session rejected".to_string()),
-                        }));
-                        ctx.stop();
-                    }
-                }),
+            async move {
+                session_manager
+                    .start_session(&room, &email, session_id)
+                    .await
+            }
+            .into_actor(self)
+            .map(|result, act, ctx| match result {
+                Ok(result) => {
+                    // Send SESSION_ASSIGNED first: explicit session_id for this connection
+                    let session_assigned = act.logic.build_session_assigned();
+                    ctx.binary(session_assigned);
+                    let meeting_started = act
+                        .logic
+                        .build_meeting_started(result.start_time_ms, &result.creator_id);
+                    ctx.binary(meeting_started);
+                }
+                Err(e) => {
+                    error!("Failed to start session: {}", e);
+                    let bytes = act
+                        .logic
+                        .build_meeting_ended(&format!("Session rejected: {e}"));
+                    ctx.binary(bytes);
+                    ctx.close(Some(ws::CloseReason {
+                        code: ws::CloseCode::Policy,
+                        description: Some("Session rejected".to_string()),
+                    }));
+                    ctx.stop();
+                }
+            }),
         );
 
         // Start heartbeat
@@ -135,7 +149,10 @@ impl Actor for WsChatSession {
         let addr = ctx.address();
         self.logic
             .addr
-            .send(self.logic.create_connect_message(addr.recipient()))
+            .send(self.logic.create_connect_message(
+                addr.clone().recipient(),
+                addr.recipient::<ForceDisconnect>(),
+            ))
             .into_actor(self)
             .then(|res, _act, ctx| {
                 if let Err(err) = res {
@@ -170,22 +187,28 @@ impl Handler<Message> for WsChatSession {
     }
 }
 
+/// Handle force disconnect (e.g. on session ID collision)
+impl Handler<ForceDisconnect> for WsChatSession {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ForceDisconnect, ctx: &mut Self::Context) -> Self::Result {
+        common::log_force_disconnect(self.logic.id, &self.logic.room);
+        ctx.stop();
+    }
+}
+
 /// Handle outbound packets (forwarding to ChatServer)
 impl Handler<Packet> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Packet, _ctx: &mut Self::Context) -> Self::Result {
-        trace!(
-            "Forwarding packet to ChatServer: session {} room {}",
+        common::forward_packet_to_chat_server(
+            &self.logic.addr,
             self.logic.id,
-            self.logic.room
-        );
-        self.logic.addr.do_send(ClientMessage {
-            session: self.logic.id.clone(),
-            user: self.logic.email.clone(),
-            room: self.logic.room.clone(),
+            self.logic.email.clone(),
+            self.logic.room.clone(),
             msg,
-        });
+        );
     }
 }
 
@@ -208,6 +231,14 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             ws::Message::Binary(data) => {
                 // Update heartbeat
                 self.heartbeat = Instant::now();
+
+                // Activate on first successfully parsed packet (guard: skip if already activated)
+                common::try_activate_from_first_packet(
+                    &self.logic.addr,
+                    self.logic.id,
+                    &mut self.activated,
+                    &data,
+                );
 
                 // Delegate to shared logic
                 match self.logic.handle_inbound(&data) {
@@ -235,7 +266,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                     self.logic.id, self.logic.room
                 );
                 self.logic.addr.do_send(Leave {
-                    session: self.logic.id.clone(),
+                    session: self.logic.id,
                     room: self.logic.room.clone(),
                     user_id: self.logic.email.clone(),
                 });
@@ -263,21 +294,10 @@ impl WsChatSession {
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {
-                match response {
-                    Ok(Ok(())) => {
-                        info!(
-                            "Successfully joined room {} for session {}",
-                            act.logic.room, act.logic.id
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        error!("Failed to join room: {}", e);
-                        ctx.stop();
-                    }
-                    Err(err) => {
-                        error!("Error sending JoinRoom: {:?}", err);
-                        ctx.stop();
-                    }
+                if common::handle_join_room_response(response, &act.logic.room, act.logic.id)
+                    .is_err()
+                {
+                    ctx.stop();
                 }
                 fut::ready(())
             })
@@ -294,14 +314,12 @@ mod tests {
     use crate::actors::chat_server::ChatServer;
     use crate::server_diagnostics::ServerDiagnostics;
     use crate::session_manager::SessionManager;
+    use crate::test_utils;
     use actix::Actor;
     use actix_web::{web, App, HttpRequest, HttpServer};
     use actix_web_actors::ws;
-    use futures_util::StreamExt;
-    use protobuf::Message as ProtoMessage;
     use serial_test::serial;
     use std::time::Duration;
-    use tokio_tungstenite::tungstenite::Message;
 
     /// Test helper: create a database pool for future JWT flow integration tests.
     #[allow(dead_code)]
@@ -316,16 +334,16 @@ mod tests {
     /// Start WebSocket server for testing
     async fn start_websocket_server(port: u16) {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-        let nats_client = async_nats::connect(&nats_url)
+        let nats_client = async_nats::ConnectOptions::new()
+            .no_echo()
+            .connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
-
         let chat = ChatServer::new(nats_client.clone()).await.start();
         let session_manager = SessionManager::new();
 
         let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());
 
-        // Use actix_rt::spawn which doesn't require Send
         actix_rt::spawn(async move {
             let _ = HttpServer::new(move || {
                 let chat = chat.clone();
@@ -394,39 +412,6 @@ mod tests {
         Ok(ws_stream)
     }
 
-    async fn wait_for_meeting_started(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
-        use videocall_types::protos::meeting_packet::MeetingPacket;
-        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-        use videocall_types::protos::packet_wrapper::PacketWrapper;
-
-        let deadline = tokio::time::Instant::now() + timeout;
-        while tokio::time::Instant::now() < deadline {
-            tokio::select! {
-                msg = ws.next() => {
-                    if let Some(Ok(Message::Binary(data))) = msg {
-                        if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&data) {
-                            if wrapper.packet_type == PacketType::MEETING.into() {
-                                if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
-                                    if meeting.event_type == MeetingEventType::MEETING_STARTED.into() {
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
-        }
-        anyhow::bail!("Timeout waiting for MEETING_STARTED")
-    }
-
     #[actix_rt::test]
     #[serial]
     async fn test_meeting_lifecycle_websocket() {
@@ -467,7 +452,7 @@ mod tests {
         let mut ws_alice = connect_ws_client(port, room_id, "alice")
             .await
             .expect("connect alice");
-        wait_for_meeting_started(&mut ws_alice, Duration::from_secs(5)).await?;
+        test_utils::wait_for_meeting_started(&mut ws_alice, Duration::from_secs(5)).await?;
         println!("✓ Alice connected and received MEETING_STARTED");
 
         // ========== STEP 2: Second user connects ==========
@@ -476,7 +461,7 @@ mod tests {
         let mut ws_bob = connect_ws_client(port, room_id, "bob")
             .await
             .expect("connect bob");
-        wait_for_meeting_started(&mut ws_bob, Duration::from_secs(5)).await?;
+        test_utils::wait_for_meeting_started(&mut ws_bob, Duration::from_secs(5)).await?;
         println!("✓ Bob connected and received MEETING_STARTED");
 
         // ========== STEP 3: Third user connects ==========
@@ -485,7 +470,7 @@ mod tests {
         let mut ws_charlie = connect_ws_client(port, room_id, "charlie")
             .await
             .expect("connect charlie");
-        wait_for_meeting_started(&mut ws_charlie, Duration::from_secs(5)).await?;
+        test_utils::wait_for_meeting_started(&mut ws_charlie, Duration::from_secs(5)).await?;
         println!("✓ Charlie connected and received MEETING_STARTED");
 
         // ========== STEP 4: Charlie disconnects ==========
@@ -507,6 +492,140 @@ mod tests {
         println!("✓ Alice disconnected");
 
         println!("\n=== SESSION LIFECYCLE TEST PASSED (WebSocket) ===");
+        Ok(())
+    }
+
+    /// Verifies that relayed packets carry consistent session_ids: when Alice sends,
+    /// Bob receives with session_id=Alice's; when Bob sends, Alice receives with Bob's.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_session_id_consistency_websocket() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::sink)
+            .try_init();
+
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+
+        let result = test_session_id_consistency_ws_impl().await;
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+
+        if let Err(e) = result {
+            panic!("Session ID consistency test failed: {e}");
+        }
+    }
+
+    async fn test_session_id_consistency_ws_impl() -> anyhow::Result<()> {
+        use futures_util::SinkExt;
+        use protobuf::Message as ProtoMessage;
+        use tokio_tungstenite::tungstenite::Message;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let room_id = "ws-session-id-test";
+        let port = 18081;
+
+        start_websocket_server(port).await;
+        wait_for_server_ready(port).await;
+
+        let mut ws_alice = connect_ws_client(port, room_id, "alice")
+            .await
+            .map_err(|e| anyhow::anyhow!("connect alice: {e}"))?;
+        let alice_session_id = test_utils::wait_for_meeting_started_with_session_id(
+            &mut ws_alice,
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        let mut ws_bob = connect_ws_client(port, room_id, "bob")
+            .await
+            .map_err(|e| anyhow::anyhow!("connect bob: {e}"))?;
+        let bob_session_id = test_utils::wait_for_meeting_started_with_session_id(
+            &mut ws_bob,
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        assert_ne!(
+            alice_session_id, bob_session_id,
+            "Alice and Bob must have different session_ids"
+        );
+        assert_ne!(alice_session_id, 0, "Alice session_id must not be zero");
+        assert_ne!(bob_session_id, 0, "Bob session_id must not be zero");
+
+        // Alice sends MEDIA packet with session_id=0; server should fill it and relay to Bob
+        let media = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            email: "alice".to_string(),
+            ..Default::default()
+        };
+        let packet = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            email: "alice".to_string(),
+            data: media.write_to_bytes()?,
+            session_id: 0,
+            ..Default::default()
+        };
+        let bytes = packet.write_to_bytes()?;
+
+        ws_alice
+            .send(Message::Binary(bytes))
+            .await
+            .map_err(|e| anyhow::anyhow!("alice send: {e}"))?;
+
+        // Bob receives: must have session_id == alice_session_id
+        let received = futures_util::StreamExt::next(&mut ws_bob)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No message from stream"))?
+            .map_err(|e| anyhow::anyhow!("bob recv: {e}"))?;
+        let recv_bytes = match &received {
+            Message::Binary(b) => b.clone(),
+            _ => anyhow::bail!("Expected binary message"),
+        };
+        let recv_packet = PacketWrapper::parse_from_bytes(&recv_bytes)?;
+        assert_eq!(
+            recv_packet.session_id, alice_session_id,
+            "Bob must receive packet with Alice's session_id, got {}",
+            recv_packet.session_id
+        );
+
+        // Bob sends MEDIA packet with session_id=0; server should fill it and relay to Alice
+        let media_b = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            email: "bob".to_string(),
+            ..Default::default()
+        };
+        let packet_b = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            email: "bob".to_string(),
+            data: media_b.write_to_bytes()?,
+            session_id: 0,
+            ..Default::default()
+        };
+        ws_bob
+            .send(Message::Binary(packet_b.write_to_bytes()?))
+            .await
+            .map_err(|e| anyhow::anyhow!("bob send: {e}"))?;
+
+        // Alice receives: must have session_id == bob_session_id
+        let received_a = futures_util::StreamExt::next(&mut ws_alice)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No message from stream"))?
+            .map_err(|e| anyhow::anyhow!("alice recv: {e}"))?;
+        let recv_bytes_a = match &received_a {
+            Message::Binary(b) => b.clone(),
+            _ => anyhow::bail!("Expected binary message"),
+        };
+        let recv_packet_a = PacketWrapper::parse_from_bytes(&recv_bytes_a)?;
+        assert_eq!(
+            recv_packet_a.session_id, bob_session_id,
+            "Alice must receive packet with Bob's session_id, got {}",
+            recv_packet_a.session_id
+        );
+
         Ok(())
     }
 }

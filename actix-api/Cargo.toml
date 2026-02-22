@@ -9,6 +9,7 @@ categories = ["network-programming", "multimedia"]
 
 [features]
 default = []
+testing = ["tokio-tungstenite", "futures-util"]
 
 [lib]
 name = "sec_api"
@@ -59,6 +60,8 @@ videocall-types = { path= "../videocall-types", version = "4.0.1" }
 urlencoding = "2.1.3"
 uuid = { version = "0.8", features = ["serde", "v4"] }
 web-transport-quinn = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 chrono = "0.4"

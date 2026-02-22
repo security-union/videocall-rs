@@ -25,18 +25,16 @@
 
 use actix::Actor;
 use actix_web::{web, App, HttpServer};
-use futures_util::StreamExt;
-use protobuf::Message as ProtoMessage;
 use sec_api::{
     actors::chat_server::ChatServer,
     lobby::{ws_connect, ws_connect_authenticated},
     models::AppState,
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
+    test_utils,
 };
 use serial_test::serial;
 use std::time::Duration;
-use tokio_tungstenite::tungstenite::Message;
 use videocall_types::FeatureFlags;
 
 const JWT_SECRET: &str = "test-secret-for-integration-tests";
@@ -50,7 +48,9 @@ const JWT_PORT: u16 = 18090;
 /// Start the real WebSocket server with the production lobby handlers.
 async fn start_real_ws_server(port: u16) {
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-    let nats_client = async_nats::connect(&nats_url)
+    let nats_client = async_nats::ConnectOptions::new()
+        .no_echo()
+        .connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");
 
@@ -140,39 +140,6 @@ async fn try_connect_deprecated(
     }
 }
 
-/// Wait for the MEETING_STARTED protobuf packet from the real server.
-async fn wait_for_meeting_started(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) -> anyhow::Result<()> {
-    use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
-    use videocall_types::protos::meeting_packet::MeetingPacket;
-    use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-    use videocall_types::protos::packet_wrapper::PacketWrapper;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            msg = ws.next() => {
-                if let Some(Ok(Message::Binary(data))) = msg {
-                    if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&data) {
-                        if wrapper.packet_type == PacketType::MEETING.into() {
-                            if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
-                                if meeting.event_type == MeetingEventType::MEETING_STARTED.into() {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-    }
-    anyhow::bail!("Timeout waiting for MEETING_STARTED")
-}
-
 // =========================================================================
 // Tests: token-based endpoint with REAL meeting-api token generation
 // =========================================================================
@@ -198,7 +165,7 @@ async fn test_valid_meeting_api_token_connects() {
     assert!(result.is_ok(), "valid meeting-api token should connect");
 
     let mut ws = result.unwrap();
-    wait_for_meeting_started(&mut ws)
+    test_utils::wait_for_meeting_started(&mut ws, Duration::from_secs(5))
         .await
         .expect("should receive MEETING_STARTED from real server");
     drop(ws);
@@ -280,7 +247,7 @@ async fn test_token_identity_extracted_from_jwt() {
     assert!(result.is_ok(), "token with identity in claims should work");
 
     let mut ws = result.unwrap();
-    wait_for_meeting_started(&mut ws)
+    test_utils::wait_for_meeting_started(&mut ws, Duration::from_secs(5))
         .await
         .expect("should receive MEETING_STARTED");
     drop(ws);
@@ -304,7 +271,7 @@ async fn test_deprecated_endpoint_works_when_ff_off() {
     );
 
     let mut ws = result.unwrap();
-    wait_for_meeting_started(&mut ws)
+    test_utils::wait_for_meeting_started(&mut ws, Duration::from_secs(5))
         .await
         .expect("should receive MEETING_STARTED");
     drop(ws);
@@ -367,14 +334,14 @@ async fn test_host_and_attendee_tokens_both_connect() {
     let host_result = try_connect_with_token(port, &host_token).await;
     assert!(host_result.is_ok(), "host token should connect");
     let mut ws_host = host_result.unwrap();
-    wait_for_meeting_started(&mut ws_host)
+    test_utils::wait_for_meeting_started(&mut ws_host, Duration::from_secs(5))
         .await
         .expect("host should receive MEETING_STARTED");
 
     let attendee_result = try_connect_with_token(port, &attendee_token).await;
     assert!(attendee_result.is_ok(), "attendee token should connect");
     let mut ws_attendee = attendee_result.unwrap();
-    wait_for_meeting_started(&mut ws_attendee)
+    test_utils::wait_for_meeting_started(&mut ws_attendee, Duration::from_secs(5))
         .await
         .expect("attendee should receive MEETING_STARTED");
 

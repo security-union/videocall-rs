@@ -45,7 +45,12 @@ pub struct JoinRoom {
 pub struct Connect {
     pub id: SessionId,
     pub addr: Recipient<Message>,
+    pub disconnect_addr: Recipient<ForceDisconnect>,
 }
+
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+pub struct ForceDisconnect;
 
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
@@ -64,6 +69,20 @@ pub struct Disconnect {
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 pub struct Leave {
+    pub session: SessionId,
+    pub room: RoomId,
+    pub user_id: String,
+}
+
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+pub struct ActivateConnection {
+    pub session: SessionId,
+}
+
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+pub struct SessionIdCollision {
     pub session: SessionId,
     pub room: RoomId,
     pub user_id: String,

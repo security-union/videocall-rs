@@ -998,6 +998,9 @@ impl Inner {
                     }
                 }
             }
+            Ok(PacketType::SESSION_ASSIGNED) => {
+                todo!();
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

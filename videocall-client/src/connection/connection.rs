@@ -192,7 +192,7 @@ impl Connection {
     }
 
     /// Set session_id for inclusion in outgoing heartbeat packets.
-    /// Must be called after MEETING_STARTED is received so heartbeats identify this connection.
+    /// Must be called after SESSION_ASSIGNED is received so heartbeats identify this connection.
     pub fn set_session_id(&self, session_id: u64) {
         *self.session_id.borrow_mut() = Some(session_id);
     }

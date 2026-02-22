@@ -119,10 +119,13 @@ impl Actor for WsChatSession {
             .into_actor(self)
             .map(|result, act, ctx| match result {
                 Ok(result) => {
-                    let bytes = act
+                    // Send SESSION_ASSIGNED first: explicit session_id for this connection
+                    let session_assigned = act.logic.build_session_assigned();
+                    ctx.binary(session_assigned);
+                    let meeting_started = act
                         .logic
                         .build_meeting_started(result.start_time_ms, &result.creator_id);
-                    ctx.binary(bytes);
+                    ctx.binary(meeting_started);
                 }
                 Err(e) => {
                     error!("Failed to start session: {}", e);
@@ -514,7 +517,7 @@ mod tests {
     }
 
     async fn test_session_id_consistency_ws_impl() -> anyhow::Result<()> {
-        use futures_util::{SinkExt, StreamExt};
+        use futures_util::SinkExt;
         use protobuf::Message as ProtoMessage;
         use tokio_tungstenite::tungstenite::Message;
         use videocall_types::protos::media_packet::media_packet::MediaType;

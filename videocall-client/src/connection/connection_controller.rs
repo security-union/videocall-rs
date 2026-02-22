@@ -65,7 +65,7 @@ impl ConnectionController {
         timers.push(Interval::new(1000, move || {
             if let Some(inner) = inner_ref.upgrade() {
                 if let Ok(mut inner) = inner.try_borrow_mut() {
-                    // Process any MEETING_STARTED session_ids that arrived (for heartbeat)
+                    // Process any SESSION_ASSIGNED session_ids that arrived (for heartbeat)
                     inner.connection_manager.process_pending_session_ids();
                     // Always drive diagnostics once per second
                     inner.connection_manager.trigger_diagnostics_report();
@@ -105,6 +105,8 @@ impl ConnectionController {
         timers.push(Interval::new(100, move || {
             if let Some(inner) = inner_ref.upgrade() {
                 if let Ok(mut inner) = inner.try_borrow_mut() {
+                    // Apply SESSION_ASSIGNED promptly so Connection has session_id for packets
+                    inner.connection_manager.process_pending_session_ids();
                     inner.connection_manager.check_and_complete_election();
                 }
             }
@@ -152,7 +154,7 @@ impl ConnectionController {
         inner.connection_manager.set_screen_enabled(enabled)
     }
 
-    /// Set own session_id (legacy no-op; now handled per-connection from MEETING_STARTED)
+    /// Set own session_id (legacy no-op; now handled per-connection from SESSION_ASSIGNED)
     #[allow(dead_code)]
     pub fn set_own_session_id(&self, session_id: u64) -> Result<()> {
         let inner = self

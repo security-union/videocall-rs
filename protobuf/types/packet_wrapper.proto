@@ -10,6 +10,7 @@ message PacketWrapper {
     DIAGNOSTICS = 5;
     HEALTH = 6;
     MEETING = 7;
+    SESSION_ASSIGNED = 8;  // Server->client: your session_id for this connection
   }
 
   PacketType packet_type = 1;
@@ -17,3 +18,7 @@ message PacketWrapper {
   bytes data = 3;
   uint64 session_id = 4;  // Unique per-connection ID (saves bandwidth vs 36-char UUID)
 }
+
+// SESSION_ASSIGNED: server sends immediately after connect with this connection's session_id.
+// Client must store it for heartbeats, DIAGNOSTICS, and self-packet filtering.
+// Sent before MEETING_STARTED; no creator_id guessing required.

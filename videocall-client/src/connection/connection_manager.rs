@@ -30,8 +30,6 @@ use std::rc::Rc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
-use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -111,9 +109,9 @@ pub struct ConnectionManager {
     rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
-    /// Per-connection session_ids from MEETING_STARTED. Used for self-packet filter and heartbeat.
+    /// Per-connection session_ids from SESSION_ASSIGNED. Used for self-packet filter and heartbeat.
     connection_session_ids: Rc<RefCell<HashMap<String, u64>>>,
-    /// Pending (connection_id, session_id) from MEETING_STARTED to apply to connections.
+    /// Pending (connection_id, session_id) from SESSION_ASSIGNED to apply to connections.
     /// Processed by process_pending_session_ids (called from timer).
     pending_session_id_updates: Rc<RefCell<Vec<(String, u64)>>>,
 }
@@ -280,32 +278,19 @@ impl ConnectionManager {
         let pending_session_id_updates = self.pending_session_id_updates.clone();
 
         Callback::from(move |packet: PacketWrapper| {
-            // Intercept MEETING_STARTED to store session_id per connection (heartbeats must use elected connection's session_id).
-            // Only store when creator_id matches us: our transport sends MEETING_STARTED when WE connect (our session).
-            // Broadcast when another joins has creator_id == them — we must NOT overwrite our session with theirs.
-            // Match: exact (creator_id == userid) or email local-part (creator_id "user@x.com" matches userid "user").
-            if packet.packet_type == PacketType::MEETING.into() {
-                if let Ok(meeting_packet) = MeetingPacket::parse_from_bytes(&packet.data) {
-                    let creator_matches = meeting_packet.creator_id == userid
-                        || (meeting_packet.creator_id.starts_with(&format!("{userid}@"))
-                            && meeting_packet.creator_id.len() > userid.len() + 1);
-                    if meeting_packet.event_type.enum_value()
-                        == Ok(MeetingEventType::MEETING_STARTED)
-                        && creator_matches
-                    {
-                        let sid = meeting_packet.session_id;
-                        connection_session_ids
-                            .borrow_mut()
-                            .insert(connection_id.clone(), sid);
-                        if let Ok(mut pending) = pending_session_id_updates.try_borrow_mut() {
-                            pending.push((connection_id.clone(), sid));
-                        }
-                        debug!(
-                            "MEETING_STARTED (our session) on connection {} -> session_id {}",
-                            connection_id, sid
-                        );
-                    }
+            // SESSION_ASSIGNED: server sends explicitly after connect with this connection's session_id
+            if packet.packet_type == PacketType::SESSION_ASSIGNED.into() && packet.session_id != 0 {
+                let sid = packet.session_id;
+                connection_session_ids
+                    .borrow_mut()
+                    .insert(connection_id.clone(), sid);
+                if let Ok(mut pending) = pending_session_id_updates.try_borrow_mut() {
+                    pending.push((connection_id.clone(), sid));
                 }
+                debug!(
+                    "SESSION_ASSIGNED on connection {} -> session_id {}",
+                    connection_id, sid
+                );
             }
 
             // Handle RTT responses internally
@@ -463,7 +448,7 @@ impl ConnectionManager {
         }
     }
 
-    /// Apply pending (connection_id, session_id) from MEETING_STARTED to each connection.
+    /// Apply pending (connection_id, session_id) from SESSION_ASSIGNED to each connection.
     /// Ensures elected connection's heartbeat uses the correct session_id for its server.
     pub fn process_pending_session_ids(&mut self) {
         let pending: Vec<(String, u64)> = self
@@ -891,11 +876,11 @@ impl ConnectionManager {
         Err(anyhow!("No active connection available"))
     }
 
-    /// Legacy: session_id is now set per-connection from MEETING_STARTED in the inbound callback.
+    /// Legacy: session_id is now set per-connection from SESSION_ASSIGNED in the inbound callback.
     /// This is a no-op to preserve API compatibility.
     #[allow(dead_code)]
     pub fn set_own_session_id(&self, _session_id: u64) {
-        // Session IDs are handled per-connection when MEETING_STARTED is received
+        // Session IDs are handled per-connection when SESSION_ASSIGNED is received
     }
 
     /// Check if manager has an active connection

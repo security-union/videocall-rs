@@ -120,6 +120,18 @@ impl SessionManager {
         Ok(SessionEndResult::MeetingContinues { remaining_count: 0 })
     }
 
+    /// Build SESSION_ASSIGNED packet: server sends immediately after connect.
+    /// Client stores session_id for heartbeats, DIAGNOSTICS, self-packet filtering.
+    pub fn build_session_assigned_packet(session_id: u64) -> Vec<u8> {
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::SESSION_ASSIGNED.into(),
+            email: SYSTEM_USER_EMAIL.to_string(),
+            session_id,
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
     /// Build MEETING_STARTED packet to send to client (protobuf)
     pub fn build_meeting_started_packet(
         room_id: &str,

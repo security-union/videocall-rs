@@ -119,6 +119,11 @@ impl SessionLogic {
         );
     }
 
+    /// Build SESSION_ASSIGNED packet: explicit session_id for this connection
+    pub fn build_session_assigned(&self) -> Vec<u8> {
+        SessionManager::build_session_assigned_packet(self.id)
+    }
+
     /// Build MEETING_STARTED packet
     pub fn build_meeting_started(&self, start_time_ms: u64, creator_id: &str) -> Vec<u8> {
         SessionManager::build_meeting_started_packet(&self.room, start_time_ms, creator_id, self.id)

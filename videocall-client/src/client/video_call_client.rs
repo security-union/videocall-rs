@@ -977,6 +977,11 @@ impl Inner {
                     response.email
                 );
             }
+            Ok(PacketType::SESSION_ASSIGNED) => {
+                // Handled in ConnectionManager::create_inbound_media_callback: stores session_id
+                // per-connection, process_pending_session_ids applies it to Connection. Never
+                // reaches here (filtered as self-packet before forward). Branch for exhaustiveness.
+            }
             Ok(PacketType::MEETING) => {
                 // Parse MeetingPacket protobuf
                 match MeetingPacket::parse_from_bytes(&response.data) {
@@ -993,7 +998,7 @@ impl Inner {
                                 // Store own session_id for UI/debug (primary from elected connection)
                                 self.own_session_id = Some(meeting_packet.session_id);
 
-                                // ConnectionManager sets session_id per-connection from MEETING_STARTED
+                                // ConnectionManager sets session_id per-connection from SESSION_ASSIGNED
                                 // in its inbound callback; no need to call set_own_session_id here.
 
                                 if let Some(callback) = &self.options.on_meeting_info {

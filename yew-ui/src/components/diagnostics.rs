@@ -533,18 +533,12 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
                                                 html! {}
                                             }
                                         }
-                                        {
-                                            if let Some(sid) = state.active_session_id {
-                                                html! {
-                                                    <div class="detail-item">
-                                                        <span class="detail-label">{"Session ID:"}</span>
-                                                        <span class="detail-value">{sid}</span>
-                                                    </div>
-                                                }
-                                            } else {
-                                                html! {}
-                                            }
-                                        }
+                                        <div class="detail-item">
+                                            <span class="detail-label">{"Session ID:"}</span>
+                                            <span class="detail-value">
+                                                {state.active_session_id.map(|sid| sid.to_string()).unwrap_or_else(|| "—".to_string())}
+                                            </span>
+                                        </div>
                                     </div>
                                 </div>
                             }
@@ -1025,10 +1019,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                         "packet_debug" => {
                             let mut entry = PacketDebugEntry {
                                 ts_ms: evt.ts_ms,
-                                direction: evt
-                                    .stream_id
-                                    .clone()
-                                    .unwrap_or_else(|| "?".to_string()),
+                                direction: evt.stream_id.clone().unwrap_or_else(|| "?".to_string()),
                                 packet_type: String::new(),
                                 email: String::new(),
                                 session_id: 0,

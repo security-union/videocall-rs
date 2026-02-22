@@ -19,13 +19,12 @@
 use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::crypto::aes::Aes128State;
-use crate::packet_debug::wrap_inbound_with_packet_debug;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
 use log::{debug, error, info, warn};
 use protobuf::Message;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -109,11 +108,6 @@ pub struct ConnectionManager {
     rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
-    /// Per-connection session_ids from SESSION_ASSIGNED. Used for self-packet filter and heartbeat.
-    connection_session_ids: Rc<RefCell<HashMap<String, u64>>>,
-    /// Pending (connection_id, session_id) from SESSION_ASSIGNED to apply to connections.
-    /// Processed by process_pending_session_ids (called from timer).
-    pending_session_id_updates: Rc<RefCell<Vec<(String, u64)>>>,
 }
 
 impl ConnectionManager {
@@ -143,8 +137,6 @@ impl ConnectionManager {
             rtt_responses,
             options,
             aes,
-            connection_session_ids: Rc::new(RefCell::new(HashMap::new())),
-            pending_session_id_updates: Rc::new(RefCell::new(Vec::new())),
         };
 
         // Immediately start creating connections and testing
@@ -185,11 +177,10 @@ impl ConnectionManager {
         for (i, url) in self.options.websocket_urls.iter().enumerate() {
             let conn_id = format!("ws_{i}");
             let connect_options = ConnectOptions {
+                userid: self.options.userid.clone(),
                 websocket_url: url.clone(),
                 webtransport_url: String::new(), // Not used for WebSocket
-                on_inbound_media: wrap_inbound_with_packet_debug(
-                    self.create_inbound_media_callback(conn_id.clone()),
-                ),
+                on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
                 on_connection_lost: self
                     .create_connection_lost_callback(conn_id.clone(), url.clone()),
@@ -223,11 +214,10 @@ impl ConnectionManager {
         for (i, url) in self.options.webtransport_urls.iter().enumerate() {
             let conn_id = format!("wt_{i}");
             let connect_options = ConnectOptions {
+                userid: self.options.userid.clone(),
                 websocket_url: String::new(), // Not used for WebTransport
                 webtransport_url: url.clone(),
-                on_inbound_media: wrap_inbound_with_packet_debug(
-                    self.create_inbound_media_callback(conn_id.clone()),
-                ),
+                on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
                 on_connection_lost: self
                     .create_connection_lost_callback(conn_id.clone(), url.clone()),
@@ -274,25 +264,8 @@ impl ConnectionManager {
         let aes = self.aes.clone();
         let on_inbound_media = self.options.on_inbound_media.clone();
         let rtt_responses = self.rtt_responses.clone();
-        let connection_session_ids = self.connection_session_ids.clone();
-        let pending_session_id_updates = self.pending_session_id_updates.clone();
 
         Callback::from(move |packet: PacketWrapper| {
-            // SESSION_ASSIGNED: server sends explicitly after connect with this connection's session_id
-            if packet.packet_type == PacketType::SESSION_ASSIGNED.into() && packet.session_id != 0 {
-                let sid = packet.session_id;
-                connection_session_ids
-                    .borrow_mut()
-                    .insert(connection_id.clone(), sid);
-                if let Ok(mut pending) = pending_session_id_updates.try_borrow_mut() {
-                    pending.push((connection_id.clone(), sid));
-                }
-                debug!(
-                    "SESSION_ASSIGNED on connection {} -> session_id {}",
-                    connection_id, sid
-                );
-            }
-
             // Handle RTT responses internally
             if packet.email == userid {
                 let reception_time = js_sys::Date::now();
@@ -319,21 +292,12 @@ impl ConnectionManager {
                 }
             }
 
-            // Filter self-packets: reject if session_id matches any of our connections
-            if packet.session_id != 0 {
-                let our_ids: HashSet<u64> =
-                    connection_session_ids.borrow().values().copied().collect();
-                if our_ids.contains(&packet.session_id) {
-                    debug!(
-                        "Rejecting packet from same session_id: {}",
-                        packet.session_id
-                    );
-                    return; // Don't forward self-packets
-                }
+            // Forward all non-RTT packets to the main handler
+            if packet.email != userid {
+                on_inbound_media.emit(packet);
+            } else {
+                debug!("Rejecting packet from same user: {}", packet.email);
             }
-
-            // Forward all non-RTT, non-self packets to the main handler
-            on_inbound_media.emit(packet);
         })
     }
 
@@ -448,31 +412,9 @@ impl ConnectionManager {
         }
     }
 
-    /// Apply pending (connection_id, session_id) from SESSION_ASSIGNED to each connection.
-    /// Ensures elected connection's heartbeat uses the correct session_id for its server.
-    pub fn process_pending_session_ids(&mut self) {
-        let pending: Vec<(String, u64)> = self
-            .pending_session_id_updates
-            .borrow_mut()
-            .drain(..)
-            .collect();
-        for (connection_id, session_id) in pending {
-            if let Some(connection) = self.connections.get(&connection_id) {
-                connection.set_session_id(session_id);
-                debug!(
-                    "Set session_id {} on connection {}",
-                    session_id, connection_id
-                );
-            }
-        }
-    }
-
     /// Complete the election and select the best connection
     fn complete_election(&mut self) {
         info!("Completing connection election");
-
-        // Apply any pending session_id updates so elected connection has correct session_id for heartbeats
-        self.process_pending_session_ids();
 
         // Stop probing
         if let ElectionState::Testing { probe_timer, .. } = &mut self.election_state {
@@ -504,12 +446,6 @@ impl ConnectionManager {
                     connection_id: connection_id.clone(),
                     elected_at: js_sys::Date::now(),
                 };
-
-                // Start heartbeat only on the elected connection
-                if let Some(connection) = self.connections.get_mut(&connection_id) {
-                    connection.start_heartbeat(self.options.userid.clone());
-                    info!("Started heartbeat on elected connection {}", connection_id);
-                }
 
                 // Close unused connections
                 self.close_unused_connections();
@@ -660,7 +596,7 @@ impl ConnectionManager {
                 metrics.push(metric!("active_connection_id", connection_id.as_str()));
                 metrics.push(metric!("elected_at", *elected_at));
 
-                // Report active connection RTT and session_id
+                // Report active connection RTT
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     if let Some(avg_rtt) = measurement.average_rtt {
                         metrics.push(metric!("active_server_rtt", avg_rtt));
@@ -674,9 +610,6 @@ impl ConnectionManager {
                             }
                         ));
                     }
-                }
-                if let Some(sid) = self.connection_session_ids.borrow().get(connection_id) {
-                    metrics.push(metric!("active_session_id", *sid));
                 }
             }
             ElectionState::Failed { reason, failed_at } => {
@@ -874,13 +807,6 @@ impl ConnectionManager {
         }
 
         Err(anyhow!("No active connection available"))
-    }
-
-    /// Legacy: session_id is now set per-connection from SESSION_ASSIGNED in the inbound callback.
-    /// This is a no-op to preserve API compatibility.
-    #[allow(dead_code)]
-    pub fn set_own_session_id(&self, _session_id: u64) {
-        // Session IDs are handled per-connection when SESSION_ASSIGNED is received
     }
 
     /// Check if manager has an active connection

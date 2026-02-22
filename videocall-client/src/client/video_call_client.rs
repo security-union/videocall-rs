@@ -27,7 +27,7 @@ use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
@@ -47,8 +47,6 @@ use videocall_types::protos::rsa_packet::RsaPacket;
 use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
-
-use crate::packet_debug;
 
 /// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
 #[derive(Clone, Debug, PartialEq)]
@@ -143,7 +141,6 @@ struct Inner {
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
-    own_session_id: Option<u64>,
 }
 
 /// The client struct for a video call connection.
@@ -250,7 +247,6 @@ impl VideoCallClient {
                     error: "Not connected".to_string(),
                     last_known_server: None,
                 },
-                own_session_id: None,
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -451,7 +447,7 @@ impl VideoCallClient {
                 peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
                 peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
-                if let Some(cb) = opts.on_peer_removed.as_ref() {
+                if let Some(cb) = &opts.on_peer_removed {
                     peer_decode_manager.on_peer_removed = cb.clone();
                 }
                 peer_decode_manager
@@ -461,7 +457,7 @@ impl VideoCallClient {
                 peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
                 peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
-                if let Some(cb) = opts.on_peer_removed.as_ref() {
+                if let Some(cb) = &opts.on_peer_removed {
                     peer_decode_manager.on_peer_removed = cb.clone();
                 }
                 peer_decode_manager
@@ -470,7 +466,6 @@ impl VideoCallClient {
     }
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
-        packet_debug::emit_packet_debug("out", &media);
         let packet_type = media.packet_type.enum_value();
         match self.inner.try_borrow() {
             Ok(inner) => {
@@ -522,33 +517,11 @@ impl VideoCallClient {
         }
     }
 
-    /// Returns a vector of the session IDs of the currently connected remote peers, sorted.
+    /// Returns a vector of the userids of the currently connected remote peers, sorted alphabetically.
     pub fn sorted_peer_keys(&self) -> Vec<String> {
         match self.inner.try_borrow() {
-            Ok(inner) => inner
-                .peer_decode_manager
-                .sorted_keys()
-                .iter()
-                .map(|k| k.to_string())
-                .collect(),
+            Ok(inner) => inner.peer_decode_manager.sorted_keys().to_vec(),
             Err(_) => Vec::<String>::new(),
-        }
-    }
-
-    pub fn get_peer_email(&self, session_id: &str) -> Option<String> {
-        let sid = session_id.parse::<u64>().ok()?;
-        match self.inner.try_borrow() {
-            Ok(inner) => inner
-                .peer_decode_manager
-                .get(&sid)
-                .map(|peer| peer.email.clone()),
-            Err(_) => {
-                warn!(
-                    "Failed to borrow inner in get_peer_email for session_id: {}",
-                    session_id
-                );
-                None
-            }
         }
     }
 
@@ -559,45 +532,37 @@ impl VideoCallClient {
     /// callback.   Or if polling is really necessary, instead of being hardwired for screen, it'd
     /// be more elegant to at least pass a `MediaType`.
     ///
-    pub fn is_awaiting_peer_screen_frame(&self, key: &str) -> bool {
-        if let Ok(sid) = key.parse::<u64>() {
-            if let Ok(inner) = self.inner.try_borrow() {
-                if let Some(peer) = inner.peer_decode_manager.get(&sid) {
-                    return peer.screen.is_waiting_for_keyframe();
-                }
+    pub fn is_awaiting_peer_screen_frame(&self, key: &String) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(key) {
+                return peer.screen.is_waiting_for_keyframe();
             }
         }
         false
     }
 
-    pub fn is_video_enabled_for_peer(&self, key: &str) -> bool {
-        if let Ok(sid) = key.parse::<u64>() {
-            if let Ok(inner) = self.inner.try_borrow() {
-                if let Some(peer) = inner.peer_decode_manager.get(&sid) {
-                    return peer.video_enabled;
-                }
+    pub fn is_video_enabled_for_peer(&self, key: &String) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(key) {
+                return peer.video_enabled;
             }
         }
         false
     }
 
-    pub fn is_screen_share_enabled_for_peer(&self, key: &str) -> bool {
-        if let Ok(sid) = key.parse::<u64>() {
-            if let Ok(inner) = self.inner.try_borrow() {
-                if let Some(peer) = inner.peer_decode_manager.get(&sid) {
-                    return peer.screen_enabled;
-                }
+    pub fn is_screen_share_enabled_for_peer(&self, key: &String) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(key) {
+                return peer.screen_enabled;
             }
         }
         false
     }
 
-    pub fn is_audio_enabled_for_peer(&self, key: &str) -> bool {
-        if let Ok(sid) = key.parse::<u64>() {
-            if let Ok(inner) = self.inner.try_borrow() {
-                if let Some(peer) = inner.peer_decode_manager.get(&sid) {
-                    return peer.audio_enabled;
-                }
+    pub fn is_audio_enabled_for_peer(&self, key: &String) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(key) {
+                return peer.audio_enabled;
             }
         }
         false
@@ -852,19 +817,16 @@ impl VideoCallClient {
 
 impl Inner {
     fn on_inbound_media(&mut self, response: PacketWrapper) {
-        // Packet debug emitted in ConnectionManager callback (before filtering)
         debug!(
-            "<< Received {:?} from {} (session: {})",
+            "<< Received {:?} from {}",
             response.packet_type.enum_value(),
-            response.email,
-            response.session_id
+            response.email
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         let peer_status = if response.email == SYSTEM_USER_EMAIL {
             PeerStatus::NoChange
         } else {
-            self.peer_decode_manager
-                .ensure_peer(response.session_id, &response.email)
+            self.peer_decode_manager.ensure_peer(&response.email)
         };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
@@ -876,7 +838,7 @@ impl Inner {
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
                             if let Err(e) = self.peer_decode_manager.set_peer_aes(
-                                response.session_id,
+                                &response.email,
                                 Aes128State::from_vecs(
                                     aes_packet.key,
                                     aes_packet.iv,
@@ -932,7 +894,7 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEDIA) => {
-                let peer_session_id = response.session_id;
+                let email = response.email.clone();
 
                 // RTT responses are now handled directly by the ConnectionManager via individual connection callbacks
                 // No need to process them here anymore
@@ -942,11 +904,11 @@ impl Inner {
                 {
                     error!("error decoding packet: {e}");
                     match e {
-                        PeerDecodeError::SameUserPacket(session_id) => {
-                            debug!("Rejecting packet from same user: {session_id}");
+                        PeerDecodeError::SameUserPacket(email) => {
+                            debug!("Rejecting packet from same user: {email}");
                         }
                         _ => {
-                            self.peer_decode_manager.delete_peer(peer_session_id);
+                            self.peer_decode_manager.delete_peer(&email);
                         }
                     }
                 }
@@ -977,11 +939,6 @@ impl Inner {
                     response.email
                 );
             }
-            Ok(PacketType::SESSION_ASSIGNED) => {
-                // Handled in ConnectionManager::create_inbound_media_callback: stores session_id
-                // per-connection, process_pending_session_ids applies it to Connection. Never
-                // reaches here (filtered as self-packet before forward). Branch for exhaustiveness.
-            }
             Ok(PacketType::MEETING) => {
                 // Parse MeetingPacket protobuf
                 match MeetingPacket::parse_from_bytes(&response.data) {
@@ -989,18 +946,11 @@ impl Inner {
                         match meeting_packet.event_type.enum_value() {
                             Ok(MeetingEventType::MEETING_STARTED) => {
                                 info!(
-                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}, session_id = {}",
+                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
                                     meeting_packet.room_id,
                                     meeting_packet.start_time_ms,
-                                    meeting_packet.creator_id,
-                                    meeting_packet.session_id,
+                                    meeting_packet.creator_id
                                 );
-                                // Store own session_id for UI/debug (primary from elected connection)
-                                self.own_session_id = Some(meeting_packet.session_id);
-
-                                // ConnectionManager sets session_id per-connection from SESSION_ASSIGNED
-                                // in its inbound callback; no need to call set_own_session_id here.
-
                                 if let Some(callback) = &self.options.on_meeting_info {
                                     callback.emit(meeting_packet.start_time_ms as f64);
                                 }
@@ -1019,18 +969,16 @@ impl Inner {
                                 }
                             }
                             Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                                debug!(
-                                    "Received PARTICIPANT_JOINED: room={}, count={}, session_id = {}",
-                                    meeting_packet.room_id, meeting_packet.participant_count,meeting_packet.session_id
+                                info!(
+                                    "Received PARTICIPANT_JOINED: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
                                 );
                                 // Future: could emit participant joined event
                             }
                             Ok(MeetingEventType::PARTICIPANT_LEFT) => {
                                 info!(
-                                    "Received PARTICIPANT_LEFT: room={}, count={}, session_id = {}",
-                                    meeting_packet.room_id,
-                                    meeting_packet.participant_count,
-                                    meeting_packet.session_id
+                                    "Received PARTICIPANT_LEFT: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
                                 );
                                 // Future: could emit participant left event
                             }
@@ -1060,10 +1008,13 @@ impl Inner {
                 error!("Failed to parse packet type: {e}");
             }
         }
-        if let PeerStatus::Added(peer_session_id) = peer_status {
-            // peer_session_id is unique per connection, never equals userid (email)
-            self.options.on_peer_added.emit(peer_session_id.to_string());
-            self.send_public_key();
+        if let PeerStatus::Added(peer_userid) = peer_status {
+            if peer_userid != self.options.userid {
+                self.options.on_peer_added.emit(peer_userid);
+                self.send_public_key();
+            } else {
+                log::debug!("Rejecting packet from same user: {peer_userid}");
+            }
         }
     }
 

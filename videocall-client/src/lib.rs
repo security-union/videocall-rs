@@ -177,7 +177,6 @@ pub mod diagnostics;
 pub mod encode;
 pub mod health_reporter;
 mod media_devices;
-mod packet_debug;
 pub mod utils;
 mod wrappers;
 pub use client::{VideoCallClient, VideoCallClientOptions};

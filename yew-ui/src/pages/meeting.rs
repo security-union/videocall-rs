@@ -530,13 +530,9 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                 match (&maybe_username, &current_meeting_status) {
                     // User is admitted - show the meeting
                     (Some(username), MeetingStatus::Admitted { is_host, host_display_name, room_token }) => {
-                        // Use canonical email from meeting API for media connection identity (must match JWT sub).
-                        // Display name (username) is for UI only.
-                        let connection_email = (*current_user_email).clone()
-                            .unwrap_or_else(|| username.clone());
                         html! {
                             <AttendantsComponent
-                                email={connection_email}
+                                email={username.clone()}
                                 id={props.id.clone()}
                                 webtransport_enabled={webtransport_enabled().unwrap_or(false)}
                                 e2ee_enabled={e2ee_enabled().unwrap_or(false)}

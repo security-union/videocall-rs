@@ -34,6 +34,10 @@ pub struct PacketWrapper {
     pub email: ::std::string::String,
     // @@protoc_insertion_point(field:PacketWrapper.data)
     pub data: ::std::vec::Vec<u8>,
+    // @@protoc_insertion_point(field:PacketWrapper.session_id)
+    pub session_id: ::std::string::String,
+    // @@protoc_insertion_point(field:PacketWrapper.connection_phase)
+    pub connection_phase: ::protobuf::EnumOrUnknown<packet_wrapper::ConnectionPhase>,
     // special fields
     // @@protoc_insertion_point(special_field:PacketWrapper.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -51,7 +55,7 @@ impl PacketWrapper {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut fields = ::std::vec::Vec::with_capacity(5);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "packet_type",
@@ -67,6 +71,16 @@ impl PacketWrapper {
             "data",
             |m: &PacketWrapper| { &m.data },
             |m: &mut PacketWrapper| { &mut m.data },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "session_id",
+            |m: &PacketWrapper| { &m.session_id },
+            |m: &mut PacketWrapper| { &mut m.session_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "connection_phase",
+            |m: &PacketWrapper| { &m.connection_phase },
+            |m: &mut PacketWrapper| { &mut m.connection_phase },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<PacketWrapper>(
             "PacketWrapper",
@@ -95,6 +109,12 @@ impl ::protobuf::Message for PacketWrapper {
                 26 => {
                     self.data = is.read_bytes()?;
                 },
+                34 => {
+                    self.session_id = is.read_string()?;
+                },
+                40 => {
+                    self.connection_phase = is.read_enum_or_unknown()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -116,6 +136,12 @@ impl ::protobuf::Message for PacketWrapper {
         if !self.data.is_empty() {
             my_size += ::protobuf::rt::bytes_size(3, &self.data);
         }
+        if !self.session_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(4, &self.session_id);
+        }
+        if self.connection_phase != ::protobuf::EnumOrUnknown::new(packet_wrapper::ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED) {
+            my_size += ::protobuf::rt::int32_size(5, self.connection_phase.value());
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -130,6 +156,12 @@ impl ::protobuf::Message for PacketWrapper {
         }
         if !self.data.is_empty() {
             os.write_bytes(3, &self.data)?;
+        }
+        if !self.session_id.is_empty() {
+            os.write_string(4, &self.session_id)?;
+        }
+        if self.connection_phase != ::protobuf::EnumOrUnknown::new(packet_wrapper::ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED) {
+            os.write_enum(5, ::protobuf::EnumOrUnknown::value(&self.connection_phase))?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -151,6 +183,8 @@ impl ::protobuf::Message for PacketWrapper {
         self.packet_type = ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::PACKET_TYPE_UNKNOWN);
         self.email.clear();
         self.data.clear();
+        self.session_id.clear();
+        self.connection_phase = ::protobuf::EnumOrUnknown::new(packet_wrapper::ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED);
         self.special_fields.clear();
     }
 
@@ -159,6 +193,8 @@ impl ::protobuf::Message for PacketWrapper {
             packet_type: ::protobuf::EnumOrUnknown::from_i32(0),
             email: ::std::string::String::new(),
             data: ::std::vec::Vec::new(),
+            session_id: ::std::string::String::new(),
+            connection_phase: ::protobuf::EnumOrUnknown::from_i32(0),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -275,28 +311,99 @@ pub mod packet_wrapper {
             ::protobuf::reflect::GeneratedEnumDescriptorData::new::<PacketType>("PacketWrapper.PacketType")
         }
     }
+
+    #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+    // @@protoc_insertion_point(enum:PacketWrapper.ConnectionPhase)
+    pub enum ConnectionPhase {
+        // @@protoc_insertion_point(enum_value:PacketWrapper.ConnectionPhase.CONNECTION_PHASE_UNSPECIFIED)
+        CONNECTION_PHASE_UNSPECIFIED = 0,
+        // @@protoc_insertion_point(enum_value:PacketWrapper.ConnectionPhase.PROBING)
+        PROBING = 1,
+        // @@protoc_insertion_point(enum_value:PacketWrapper.ConnectionPhase.ACTIVE)
+        ACTIVE = 2,
+    }
+
+    impl ::protobuf::Enum for ConnectionPhase {
+        const NAME: &'static str = "ConnectionPhase";
+
+        fn value(&self) -> i32 {
+            *self as i32
+        }
+
+        fn from_i32(value: i32) -> ::std::option::Option<ConnectionPhase> {
+            match value {
+                0 => ::std::option::Option::Some(ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED),
+                1 => ::std::option::Option::Some(ConnectionPhase::PROBING),
+                2 => ::std::option::Option::Some(ConnectionPhase::ACTIVE),
+                _ => ::std::option::Option::None
+            }
+        }
+
+        fn from_str(str: &str) -> ::std::option::Option<ConnectionPhase> {
+            match str {
+                "CONNECTION_PHASE_UNSPECIFIED" => ::std::option::Option::Some(ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED),
+                "PROBING" => ::std::option::Option::Some(ConnectionPhase::PROBING),
+                "ACTIVE" => ::std::option::Option::Some(ConnectionPhase::ACTIVE),
+                _ => ::std::option::Option::None
+            }
+        }
+
+        const VALUES: &'static [ConnectionPhase] = &[
+            ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED,
+            ConnectionPhase::PROBING,
+            ConnectionPhase::ACTIVE,
+        ];
+    }
+
+    impl ::protobuf::EnumFull for ConnectionPhase {
+        fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+            descriptor.get(|| super::file_descriptor().enum_by_package_relative_name("PacketWrapper.ConnectionPhase").unwrap()).clone()
+        }
+
+        fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+            let index = *self as usize;
+            Self::enum_descriptor().value_by_index(index)
+        }
+    }
+
+    impl ::std::default::Default for ConnectionPhase {
+        fn default() -> Self {
+            ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED
+        }
+    }
+
+    impl ConnectionPhase {
+        pub(in super) fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+            ::protobuf::reflect::GeneratedEnumDescriptorData::new::<ConnectionPhase>("PacketWrapper.ConnectionPhase")
+        }
+    }
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1atypes/packet_wrapper.proto\"\x80\x02\n\rPacketWrapper\x12:\n\x0bpa\
+    \n\x1atypes/packet_wrapper.proto\"\xb8\x03\n\rPacketWrapper\x12:\n\x0bpa\
     cket_type\x18\x01\x20\x01(\x0e2\x19.PacketWrapper.PacketTypeR\npacketTyp\
     e\x12\x14\n\x05email\x18\x02\x20\x01(\tR\x05email\x12\x12\n\x04data\x18\
-    \x03\x20\x01(\x0cR\x04data\"\x88\x01\n\nPacketType\x12\x17\n\x13PACKET_T\
-    YPE_UNKNOWN\x10\0\x12\x0f\n\x0bRSA_PUB_KEY\x10\x01\x12\x0b\n\x07AES_KEY\
-    \x10\x02\x12\t\n\x05MEDIA\x10\x03\x12\x0e\n\nCONNECTION\x10\x04\x12\x0f\
-    \n\x0bDIAGNOSTICS\x10\x05\x12\n\n\x06HEALTH\x10\x06\x12\x0b\n\x07MEETING\
-    \x10\x07J\xe3\x04\n\x06\x12\x04\0\0\x10\x01\n\x08\n\x01\x0c\x12\x03\0\0\
-    \x12\n\n\n\x02\x04\0\x12\x04\x02\0\x10\x01\n\n\n\x03\x04\0\x01\x12\x03\
-    \x02\x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x03\x02\x0c\x03\n\x0c\n\x05\
-    \x04\0\x04\0\x01\x12\x03\x03\x07\x11\n\r\n\x06\x04\0\x04\0\x02\0\x12\x03\
-    \x04\x04\x1c\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x04\x04\x17\n\x0e\
-    \n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x04\x1a\x1b\n\r\n\x06\x04\0\x04\0\
-    \x02\x01\x12\x03\x05\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\x03\
-    \x05\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\x05\x12\x13\n\r\
-    \n\x06\x04\0\x04\0\x02\x02\x12\x03\x06\x04\x10\n\x0e\n\x07\x04\0\x04\0\
-    \x02\x02\x01\x12\x03\x06\x04\x0b\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\
-    \x03\x06\x0e\x0f\n\r\n\x06\x04\0\x04\0\x02\x03\x12\x03\x07\x04\x0e\n\x0e\
-    \n\x07\x04\0\x04\0\x02\x03\x01\x12\x03\x07\x04\t\n\x0e\n\x07\x04\0\x04\0\
+    \x03\x20\x01(\x0cR\x04data\x12\x1d\n\nsession_id\x18\x04\x20\x01(\tR\tse\
+    ssionId\x12I\n\x10connection_phase\x18\x05\x20\x01(\x0e2\x1e.PacketWrapp\
+    er.ConnectionPhaseR\x0fconnectionPhase\"\x88\x01\n\nPacketType\x12\x17\n\
+    \x13PACKET_TYPE_UNKNOWN\x10\0\x12\x0f\n\x0bRSA_PUB_KEY\x10\x01\x12\x0b\n\
+    \x07AES_KEY\x10\x02\x12\t\n\x05MEDIA\x10\x03\x12\x0e\n\nCONNECTION\x10\
+    \x04\x12\x0f\n\x0bDIAGNOSTICS\x10\x05\x12\n\n\x06HEALTH\x10\x06\x12\x0b\
+    \n\x07MEETING\x10\x07\"L\n\x0fConnectionPhase\x12\x20\n\x1cCONNECTION_PH\
+    ASE_UNSPECIFIED\x10\0\x12\x0b\n\x07PROBING\x10\x01\x12\n\n\x06ACTIVE\x10\
+    \x02J\xaf\x07\n\x06\x12\x04\0\0\x19\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\
+    \n\n\n\x02\x04\0\x12\x04\x02\0\x19\x01\n\n\n\x03\x04\0\x01\x12\x03\x02\
+    \x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x03\x02\x0c\x03\n\x0c\n\x05\x04\
+    \0\x04\0\x01\x12\x03\x03\x07\x11\n\r\n\x06\x04\0\x04\0\x02\0\x12\x03\x04\
+    \x04\x1c\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x04\x04\x17\n\x0e\n\
+    \x07\x04\0\x04\0\x02\0\x02\x12\x03\x04\x1a\x1b\n\r\n\x06\x04\0\x04\0\x02\
+    \x01\x12\x03\x05\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\x03\x05\
+    \x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\x05\x12\x13\n\r\n\
+    \x06\x04\0\x04\0\x02\x02\x12\x03\x06\x04\x10\n\x0e\n\x07\x04\0\x04\0\x02\
+    \x02\x01\x12\x03\x06\x04\x0b\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\x03\
+    \x06\x0e\x0f\n\r\n\x06\x04\0\x04\0\x02\x03\x12\x03\x07\x04\x0e\n\x0e\n\
+    \x07\x04\0\x04\0\x02\x03\x01\x12\x03\x07\x04\t\n\x0e\n\x07\x04\0\x04\0\
     \x02\x03\x02\x12\x03\x07\x0c\r\n\r\n\x06\x04\0\x04\0\x02\x04\x12\x03\x08\
     \x04\x13\n\x0e\n\x07\x04\0\x04\0\x02\x04\x01\x12\x03\x08\x04\x0e\n\x0e\n\
     \x07\x04\0\x04\0\x02\x04\x02\x12\x03\x08\x11\x12\n\r\n\x06\x04\0\x04\0\
@@ -306,15 +413,30 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x01\x12\x03\n\x04\n\n\x0e\n\x07\x04\0\x04\0\x02\x06\x02\x12\x03\n\r\x0e\
     \n\r\n\x06\x04\0\x04\0\x02\x07\x12\x03\x0b\x04\x10\n\x0e\n\x07\x04\0\x04\
     \0\x02\x07\x01\x12\x03\x0b\x04\x0b\n\x0e\n\x07\x04\0\x04\0\x02\x07\x02\
-    \x12\x03\x0b\x0e\x0f\n\x0b\n\x04\x04\0\x02\0\x12\x03\r\x02\x1d\n\x0c\n\
-    \x05\x04\0\x02\0\x06\x12\x03\r\x02\x0c\n\x0c\n\x05\x04\0\x02\0\x01\x12\
-    \x03\r\r\x18\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\r\x1b\x1c\n\x0b\n\x04\
-    \x04\0\x02\x01\x12\x03\x0e\x02\x13\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\
-    \x0e\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x0e\t\x0e\n\x0c\n\x05\
-    \x04\0\x02\x01\x03\x12\x03\x0e\x11\x12\n\x0b\n\x04\x04\0\x02\x02\x12\x03\
-    \x0f\x02\x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x0f\x02\x07\n\x0c\n\
-    \x05\x04\0\x02\x02\x01\x12\x03\x0f\x08\x0c\n\x0c\n\x05\x04\0\x02\x02\x03\
-    \x12\x03\x0f\x0f\x10b\x06proto3\
+    \x12\x03\x0b\x0e\x0f\n\x0c\n\x04\x04\0\x04\x01\x12\x04\x0e\x02\x12\x03\n\
+    \x0c\n\x05\x04\0\x04\x01\x01\x12\x03\x0e\x07\x16\nB\n\x06\x04\0\x04\x01\
+    \x02\0\x12\x03\x0f\x04%\"3\x20Old\x20clients\x20\xe2\x86\x92\x20treat\
+    \x20as\x20active\x20(backward\x20compat)\n\n\x0e\n\x07\x04\0\x04\x01\x02\
+    \0\x01\x12\x03\x0f\x04\x20\n\x0e\n\x07\x04\0\x04\x01\x02\0\x02\x12\x03\
+    \x0f#$\n\r\n\x06\x04\0\x04\x01\x02\x01\x12\x03\x10\x04\x10\n\x0e\n\x07\
+    \x04\0\x04\x01\x02\x01\x01\x12\x03\x10\x04\x0b\n\x0e\n\x07\x04\0\x04\x01\
+    \x02\x01\x02\x12\x03\x10\x0e\x0f\n\r\n\x06\x04\0\x04\x01\x02\x02\x12\x03\
+    \x11\x04\x0f\n\x0e\n\x07\x04\0\x04\x01\x02\x02\x01\x12\x03\x11\x04\n\n\
+    \x0e\n\x07\x04\0\x04\x01\x02\x02\x02\x12\x03\x11\r\x0e\n\x0b\n\x04\x04\0\
+    \x02\0\x12\x03\x14\x02\x1d\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03\x14\x02\
+    \x0c\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x14\r\x18\n\x0c\n\x05\x04\0\x02\
+    \0\x03\x12\x03\x14\x1b\x1c\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x15\x02\x13\
+    \n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x15\x02\x08\n\x0c\n\x05\x04\0\x02\
+    \x01\x01\x12\x03\x15\t\x0e\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x15\x11\
+    \x12\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x16\x02\x11\n\x0c\n\x05\x04\0\x02\
+    \x02\x05\x12\x03\x16\x02\x07\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x16\
+    \x08\x0c\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x16\x0f\x10\n\x0b\n\x04\
+    \x04\0\x02\x03\x12\x03\x17\x02\x18\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\
+    \x17\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x17\t\x13\n\x0c\n\x05\
+    \x04\0\x02\x03\x03\x12\x03\x17\x16\x17\n\x0b\n\x04\x04\0\x02\x04\x12\x03\
+    \x18\x02'\n\x0c\n\x05\x04\0\x02\x04\x06\x12\x03\x18\x02\x11\n\x0c\n\x05\
+    \x04\0\x02\x04\x01\x12\x03\x18\x12\"\n\x0c\n\x05\x04\0\x02\x04\x03\x12\
+    \x03\x18%&b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -334,8 +456,9 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             let mut deps = ::std::vec::Vec::with_capacity(0);
             let mut messages = ::std::vec::Vec::with_capacity(1);
             messages.push(PacketWrapper::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(1);
+            let mut enums = ::std::vec::Vec::with_capacity(2);
             enums.push(packet_wrapper::PacketType::generated_enum_descriptor_data());
+            enums.push(packet_wrapper::ConnectionPhase::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),
                 deps,

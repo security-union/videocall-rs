@@ -40,6 +40,15 @@ pub type SessionId = String;
 pub type RoomId = String;
 pub type Email = String;
 
+/// Connection state for session management during election
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Connection is in testing phase (during election)
+    Testing,
+    /// Connection is active and should broadcast to NATS
+    Active,
+}
+
 /// Result of handling an inbound packet
 #[derive(Debug)]
 pub enum InboundAction {
@@ -112,7 +121,12 @@ impl SessionLogic {
 
     /// Build MEETING_STARTED packet
     pub fn build_meeting_started(&self, start_time_ms: u64, creator_id: &str) -> Vec<u8> {
-        SessionManager::build_meeting_started_packet(&self.room, start_time_ms, creator_id)
+        SessionManager::build_meeting_started_packet(
+            &self.room,
+            start_time_ms,
+            creator_id,
+            &self.id,
+        )
     }
 
     /// Build MEETING_ENDED packet (for errors)

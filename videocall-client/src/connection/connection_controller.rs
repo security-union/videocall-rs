@@ -150,6 +150,16 @@ impl ConnectionController {
         inner.connection_manager.set_screen_enabled(enabled)
     }
 
+    /// Set own session_id for filtering self-packets
+    pub fn set_own_session_id(&self, session_id: String) -> Result<()> {
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
+        inner.connection_manager.set_own_session_id(session_id);
+        Ok(())
+    }
+
     /// Check if manager has an active connection
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {

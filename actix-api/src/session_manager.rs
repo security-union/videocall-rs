@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{ConnectionPhase, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_EMAIL;
 
@@ -52,6 +52,7 @@ pub struct SessionStartResult {
     pub is_first_participant: bool,
     /// The user_id of the connecting user (host/creator info comes from JWT)
     pub creator_id: String,
+    pub session_id: String,
 }
 
 /// Result of ending a session
@@ -88,6 +89,7 @@ impl SessionManager {
         &self,
         room_id: &str,
         user_id: &str,
+        id: &str,
     ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
         if user_id == SYSTEM_USER_EMAIL {
             return Err(Box::new(SessionError::ReservedUserEmail));
@@ -104,6 +106,7 @@ impl SessionManager {
             start_time_ms: now_ms,
             is_first_participant: true,
             creator_id: user_id.to_string(),
+            session_id: id.to_string(),
         })
     }
 
@@ -122,19 +125,23 @@ impl SessionManager {
         room_id: &str,
         start_time_ms: u64,
         creator_id: &str,
+        session_id: &str,
     ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::MEETING_STARTED.into(),
             room_id: room_id.to_string(),
             start_time_ms,
             creator_id: creator_id.to_string(),
+            session_id: session_id.to_string(),
             ..Default::default()
         };
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
             email: SYSTEM_USER_EMAIL.to_string(),
+            session_id: session_id.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            connection_phase: ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED.into(),
             ..Default::default()
         };
 
@@ -154,6 +161,7 @@ impl SessionManager {
             packet_type: PacketType::MEETING.into(),
             email: SYSTEM_USER_EMAIL.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            connection_phase: ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED.into(),
             ..Default::default()
         };
 
@@ -174,7 +182,10 @@ mod tests {
     #[tokio::test]
     async fn test_start_session_returns_result() {
         let manager = SessionManager::new();
-        let result = manager.start_session("room-1", "alice").await.unwrap();
+        let result = manager
+            .start_session("room-1", "alice", "alice-session-1")
+            .await
+            .unwrap();
         assert!(result.start_time_ms > 0);
         assert!(result.is_first_participant);
         assert_eq!(result.creator_id, "alice");
@@ -183,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn test_system_email_rejected() {
         let manager = SessionManager::new();
-        let result = manager.start_session("room-1", SYSTEM_USER_EMAIL).await;
+        let result = manager.start_session("room-1", SYSTEM_USER_EMAIL, "").await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -206,8 +217,12 @@ mod tests {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-        let meeting_started =
-            SessionManager::build_meeting_started_packet("my-room", 1234567890, "alice");
+        let meeting_started = SessionManager::build_meeting_started_packet(
+            "my-room",
+            1234567890,
+            "alice",
+            "session-123",
+        );
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_started).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();

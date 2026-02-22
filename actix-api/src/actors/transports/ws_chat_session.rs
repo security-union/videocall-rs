@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
-use crate::messages::server::{ClientMessage, ForceDisconnect, Leave, Packet};
+use crate::messages::server::{ForceDisconnect, Leave, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -34,7 +34,7 @@ use actix::{
     Running, StreamHandler, WrapFuture,
 };
 use actix_web_actors::ws::{self, WebsocketContext};
-use tracing::{error, info, trace};
+use tracing::{error, info};
 
 use super::common;
 
@@ -189,10 +189,7 @@ impl Handler<ForceDisconnect> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, _msg: ForceDisconnect, ctx: &mut Self::Context) -> Self::Result {
-        info!(
-            "Force disconnect for session {} in room {}",
-            self.logic.id, self.logic.room
-        );
+        common::log_force_disconnect(self.logic.id, &self.logic.room);
         ctx.stop();
     }
 }
@@ -202,17 +199,13 @@ impl Handler<Packet> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Packet, _ctx: &mut Self::Context) -> Self::Result {
-        trace!(
-            "Forwarding packet to ChatServer: session {} room {}",
+        common::forward_packet_to_chat_server(
+            &self.logic.addr,
             self.logic.id,
-            self.logic.room
-        );
-        self.logic.addr.do_send(ClientMessage {
-            session: self.logic.id,
-            user: self.logic.email.clone(),
-            room: self.logic.room.clone(),
+            self.logic.email.clone(),
+            self.logic.room.clone(),
             msg,
-        });
+        );
     }
 }
 
@@ -298,21 +291,10 @@ impl WsChatSession {
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {
-                match response {
-                    Ok(Ok(())) => {
-                        info!(
-                            "Successfully joined room {} for session {}",
-                            act.logic.room, act.logic.id
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        error!("Failed to join room: {}", e);
-                        ctx.stop();
-                    }
-                    Err(err) => {
-                        error!("Error sending JoinRoom: {:?}", err);
-                        ctx.stop();
-                    }
+                if common::handle_join_room_response(response, &act.logic.room, act.logic.id)
+                    .is_err()
+                {
+                    ctx.stop();
                 }
                 fut::ready(())
             })
@@ -329,14 +311,12 @@ mod tests {
     use crate::actors::chat_server::ChatServer;
     use crate::server_diagnostics::ServerDiagnostics;
     use crate::session_manager::SessionManager;
+    use crate::test_utils;
     use actix::Actor;
     use actix_web::{web, App, HttpRequest, HttpServer};
     use actix_web_actors::ws;
-    use futures_util::StreamExt;
-    use protobuf::Message as ProtoMessage;
     use serial_test::serial;
     use std::time::Duration;
-    use tokio_tungstenite::tungstenite::Message;
 
     /// Test helper: create a database pool for future JWT flow integration tests.
     #[allow(dead_code)]
@@ -429,39 +409,6 @@ mod tests {
         Ok(ws_stream)
     }
 
-    async fn wait_for_meeting_started(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
-        use videocall_types::protos::meeting_packet::MeetingPacket;
-        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-        use videocall_types::protos::packet_wrapper::PacketWrapper;
-
-        let deadline = tokio::time::Instant::now() + timeout;
-        while tokio::time::Instant::now() < deadline {
-            tokio::select! {
-                msg = ws.next() => {
-                    if let Some(Ok(Message::Binary(data))) = msg {
-                        if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&data) {
-                            if wrapper.packet_type == PacketType::MEETING.into() {
-                                if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
-                                    if meeting.event_type == MeetingEventType::MEETING_STARTED.into() {
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
-        }
-        anyhow::bail!("Timeout waiting for MEETING_STARTED")
-    }
-
     #[actix_rt::test]
     #[serial]
     async fn test_meeting_lifecycle_websocket() {
@@ -502,7 +449,7 @@ mod tests {
         let mut ws_alice = connect_ws_client(port, room_id, "alice")
             .await
             .expect("connect alice");
-        wait_for_meeting_started(&mut ws_alice, Duration::from_secs(5)).await?;
+        test_utils::wait_for_meeting_started(&mut ws_alice, Duration::from_secs(5)).await?;
         println!("✓ Alice connected and received MEETING_STARTED");
 
         // ========== STEP 2: Second user connects ==========
@@ -511,7 +458,7 @@ mod tests {
         let mut ws_bob = connect_ws_client(port, room_id, "bob")
             .await
             .expect("connect bob");
-        wait_for_meeting_started(&mut ws_bob, Duration::from_secs(5)).await?;
+        test_utils::wait_for_meeting_started(&mut ws_bob, Duration::from_secs(5)).await?;
         println!("✓ Bob connected and received MEETING_STARTED");
 
         // ========== STEP 3: Third user connects ==========
@@ -520,7 +467,7 @@ mod tests {
         let mut ws_charlie = connect_ws_client(port, room_id, "charlie")
             .await
             .expect("connect charlie");
-        wait_for_meeting_started(&mut ws_charlie, Duration::from_secs(5)).await?;
+        test_utils::wait_for_meeting_started(&mut ws_charlie, Duration::from_secs(5)).await?;
         println!("✓ Charlie connected and received MEETING_STARTED");
 
         // ========== STEP 4: Charlie disconnects ==========

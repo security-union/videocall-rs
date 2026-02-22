@@ -10,7 +10,7 @@ tests_run:
 		cargo clippy -- -D warnings && \
 		cargo fmt --check && \
 		cargo machete && \
-		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
+		cargo test -p videocall-api --features testing -- --nocapture --test-threads=1 && \
 		cargo test -p meeting-api -- --nocapture --test-threads=1"
 
 tests_build:

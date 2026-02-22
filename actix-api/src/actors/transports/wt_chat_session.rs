@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
-use crate::messages::server::{ClientMessage, ForceDisconnect, Packet};
+use crate::messages::server::{ForceDisconnect, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -271,10 +271,7 @@ impl Handler<ForceDisconnect> for WtChatSession {
     type Result = ();
 
     fn handle(&mut self, _msg: ForceDisconnect, ctx: &mut Self::Context) -> Self::Result {
-        info!(
-            "Force disconnect for session {} in room {}",
-            self.logic.id, self.logic.room
-        );
+        common::log_force_disconnect(self.logic.id, &self.logic.room);
         ctx.stop();
     }
 }
@@ -358,17 +355,13 @@ impl Handler<Packet> for WtChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Packet, _ctx: &mut Self::Context) -> Self::Result {
-        trace!(
-            "Forwarding packet to ChatServer: session {} room {}",
+        common::forward_packet_to_chat_server(
+            &self.logic.addr,
             self.logic.id,
-            self.logic.room
-        );
-        self.logic.addr.do_send(ClientMessage {
-            session: self.logic.id,
-            user: self.logic.email.clone(),
-            room: self.logic.room.clone(),
+            self.logic.email.clone(),
+            self.logic.room.clone(),
             msg,
-        });
+        );
     }
 }
 
@@ -382,21 +375,10 @@ impl WtChatSession {
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {
-                match response {
-                    Ok(Ok(())) => {
-                        info!(
-                            "Successfully joined room {} for session {}",
-                            act.logic.room, act.logic.id
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        error!("Failed to join room: {}", e);
-                        ctx.stop();
-                    }
-                    Err(err) => {
-                        error!("Error sending JoinRoom: {:?}", err);
-                        ctx.stop();
-                    }
+                if common::handle_join_room_response(response, &act.logic.room, act.logic.id)
+                    .is_err()
+                {
+                    ctx.stop();
                 }
                 fut::ready(())
             })

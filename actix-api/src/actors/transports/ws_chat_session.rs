@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
-use crate::messages::server::{ActivateConnection, ClientMessage, ForceDisconnect, Leave, Packet};
+use crate::messages::server::{ClientMessage, ForceDisconnect, Leave, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -34,10 +34,9 @@ use actix::{
     Running, StreamHandler, WrapFuture,
 };
 use actix_web_actors::ws::{self, WebsocketContext};
-use protobuf::Message as ProtobufMessage;
 use tracing::{error, info, trace};
-use videocall_types::protos::packet_wrapper::packet_wrapper::ConnectionPhase;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+use super::common;
 
 pub use crate::actors::session_logic::{Email, RoomId, SessionId};
 
@@ -238,7 +237,12 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 self.heartbeat = Instant::now();
 
                 // Check connection_phase from inbound packet (guard: skip if already activated)
-                self.try_activate_from_first_packet(&data);
+                common::try_activate_from_first_packet(
+                    &self.logic.addr,
+                    self.logic.id,
+                    &mut self.activated,
+                    &data,
+                );
 
                 // Delegate to shared logic
                 match self.logic.handle_inbound(&data) {
@@ -289,35 +293,6 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 // =============================================================================
 
 impl WsChatSession {
-    /// Parse inbound packet and activate on first ACTIVE or UNSPECIFIED phase.
-    /// Skips if already activated or during PROBING.
-    fn try_activate_from_first_packet(&mut self, data: &[u8]) {
-        if self.activated {
-            return;
-        }
-        let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) else {
-            return;
-        };
-        let Ok(phase) = packet_wrapper.connection_phase.enum_value() else {
-            return;
-        };
-        let should_activate = matches!(
-            phase,
-            ConnectionPhase::ACTIVE | ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED
-        );
-        if !should_activate {
-            return;
-        }
-        self.logic.addr.do_send(ActivateConnection {
-            session: self.logic.id,
-        });
-        self.activated = true;
-        info!(
-            "Session {} activated on first {:?} packet",
-            self.logic.id, phase
-        );
-    }
-
     fn join_room(&self, ctx: &mut WebsocketContext<Self>) {
         let join_room = self.logic.addr.send(self.logic.create_join_room_message());
         let join_room = join_room.into_actor(self);

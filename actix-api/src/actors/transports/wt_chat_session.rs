@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
-use crate::messages::server::{ActivateConnection, ClientMessage, ForceDisconnect, Packet};
+use crate::messages::server::{ClientMessage, ForceDisconnect, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -33,12 +33,11 @@ use actix::{
     Handler, Message as ActixMessage, Running, WrapFuture,
 };
 use bytes::Bytes;
-use protobuf::Message as ProtobufMessage;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
-use videocall_types::protos::packet_wrapper::packet_wrapper::ConnectionPhase;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+use super::common;
 
 pub use crate::actors::session_logic::{Email, RoomId, SessionId};
 
@@ -175,35 +174,6 @@ impl WtChatSession {
             }
         });
     }
-
-    /// Parse inbound packet and activate on first ACTIVE or UNSPECIFIED phase.
-    /// Skips if already activated or during PROBING.
-    fn try_activate_from_first_packet(&mut self, data: &[u8]) {
-        if self.activated {
-            return;
-        }
-        let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) else {
-            return;
-        };
-        let Ok(phase) = packet_wrapper.connection_phase.enum_value() else {
-            return;
-        };
-        let should_activate = matches!(
-            phase,
-            ConnectionPhase::ACTIVE | ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED
-        );
-        if !should_activate {
-            return;
-        }
-        self.logic.addr.do_send(ActivateConnection {
-            session: self.logic.id,
-        });
-        self.activated = true;
-        info!(
-            "Session {} activated on first {:?} packet",
-            self.logic.id, phase
-        );
-    }
 }
 
 // =============================================================================
@@ -324,7 +294,12 @@ impl Handler<WtInbound> for WtChatSession {
         }
 
         // Check connection_phase from inbound packet (guard: skip if already activated)
-        self.try_activate_from_first_packet(msg.data.as_ref());
+        common::try_activate_from_first_packet(
+            &self.logic.addr,
+            self.logic.id,
+            &mut self.activated,
+            msg.data.as_ref(),
+        );
 
         // Delegate to shared logic
         match self.logic.handle_inbound(&msg.data) {

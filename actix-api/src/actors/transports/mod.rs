@@ -27,6 +27,7 @@
 //! 3. Implement transport-specific send/receive
 //! 4. Delegate to `SessionLogic` for all business logic
 
+pub(crate) mod common;
 pub mod ws_chat_session;
 pub mod wt_chat_session;
 

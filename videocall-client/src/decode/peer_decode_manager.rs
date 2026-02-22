@@ -330,7 +330,7 @@ impl Peer {
                         ts_ms: now_ms(),
                         metrics: vec![
                             // from_peer will be attached by higher layer that knows the local user id
-                            metric!("to_peer", self.session_id.clone()),
+                            metric!("to_peer", self.session_id),
                             metric!(
                                 "audio_enabled",
                                 if metadata.audio_enabled { 1u64 } else { 0u64 }

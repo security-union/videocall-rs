@@ -7353,7 +7353,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-sdk"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "anyhow",
  "bytes",

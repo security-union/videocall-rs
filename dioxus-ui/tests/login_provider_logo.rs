@@ -36,10 +36,7 @@ fn inject_app_config_with_provider(provider: &str) {
     set("firefoxEnabled", &"false".into());
     set("usersAllowedToStream", &"".into());
     set("oauthProvider", &provider.into());
-    set(
-        "serverElectionPeriodMs",
-        &wasm_bindgen::JsValue::from(2000),
-    );
+    set("serverElectionPeriodMs", &wasm_bindgen::JsValue::from(2000));
     set("audioBitrateKbps", &wasm_bindgen::JsValue::from(65));
     set("videoBitrateKbps", &wasm_bindgen::JsValue::from(100));
     set("screenBitrateKbps", &wasm_bindgen::JsValue::from(100));
@@ -83,9 +80,7 @@ async fn google_provider_shows_google_logo_and_text() {
     );
 
     // Should contain the Google SVG logo inside the icon wrapper.
-    let logo = btn
-        .query_selector(".gsi-material-button-icon svg")
-        .unwrap();
+    let logo = btn.query_selector(".gsi-material-button-icon svg").unwrap();
     assert!(logo.is_some(), "Google SVG logo should be present");
 
     // Should NOT have Okta or generic buttons.

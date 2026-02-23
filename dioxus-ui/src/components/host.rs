@@ -75,12 +75,18 @@ pub fn Host(
     let client = use_context::<VideoCallClientCtx>();
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
-    let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> = use_hook(|| Rc::new(RefCell::new(None)));
-    let mic_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> = use_hook(|| Rc::new(RefCell::new(None)));
-    let screen_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> = use_hook(|| Rc::new(RefCell::new(None)));
-    let camera_error_handler: Rc<RefCell<Option<EventHandler<String>>>> = use_hook(|| Rc::new(RefCell::new(None)));
-    let mic_error_handler: Rc<RefCell<Option<EventHandler<String>>>> = use_hook(|| Rc::new(RefCell::new(None)));
-    let screen_state_handler: Rc<RefCell<Option<EventHandler<ScreenShareEvent>>>> = use_hook(|| Rc::new(RefCell::new(None)));
+    let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    let mic_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    let screen_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    let camera_error_handler: Rc<RefCell<Option<EventHandler<String>>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    let mic_error_handler: Rc<RefCell<Option<EventHandler<String>>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    let screen_state_handler: Rc<RefCell<Option<EventHandler<ScreenShareEvent>>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
 
     // Use Rc<RefCell<>> to hold mutable encoder state that persists across renders
     let state = use_hook(|| {
@@ -120,12 +126,8 @@ pub fn Host(
                 handler.call(err);
             }
         });
-        let mut microphone = create_microphone_encoder(
-            client.clone(),
-            audio_bitrate,
-            mic_settings_cb,
-            mic_error_cb,
-        );
+        let mut microphone =
+            create_microphone_encoder(client.clone(), audio_bitrate, mic_settings_cb, mic_error_cb);
 
         let screen_settings_cell = screen_settings_handler.clone();
         let screen_settings_cb = VcCallback::from(move |settings: String| {
@@ -301,7 +303,8 @@ pub fn Host(
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
                     state_clone.borrow_mut().screen.start();
-                }).forget();
+                })
+                .forget();
             } else {
                 s.screen.set_enabled(false);
                 s.screen.stop();
@@ -331,9 +334,7 @@ pub fn Host(
             s.prev_video_enabled = video_enabled;
             if video_enabled {
                 let device_id = s.media_devices.video_inputs.selected();
-                log::info!(
-                    "Host render: camera ON, auto-select device_id='{device_id}'"
-                );
+                log::info!("Host render: camera ON, auto-select device_id='{device_id}'");
                 if !device_id.is_empty() {
                     s.camera.select(device_id);
                 }
@@ -390,7 +391,8 @@ pub fn Host(
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
                     state_clone.borrow_mut().microphone.start();
-                }).forget();
+                })
+                .forget();
             }
         })
     };
@@ -404,7 +406,8 @@ pub fn Host(
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
                     state_clone.borrow_mut().camera.start();
-                }).forget();
+                })
+                .forget();
             }
         })
     };

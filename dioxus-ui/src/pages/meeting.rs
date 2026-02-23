@@ -72,7 +72,10 @@ pub fn MeetingPage(id: String) -> Element {
                     Err(_) => {
                         if let Some(win) = window() {
                             if let Ok(current_url) = win.location().href() {
-                                let login_url = format!("/login?returnTo={}", urlencoding::encode(&current_url));
+                                let login_url = format!(
+                                    "/login?returnTo={}",
+                                    urlencoding::encode(&current_url)
+                                );
                                 let _ = win.location().set_href(&login_url);
                             }
                         }
@@ -99,7 +102,8 @@ pub fn MeetingPage(id: String) -> Element {
     }
 
     // Poll for meeting activation when WaitingForMeeting
-    let _meeting_poll_interval: Rc<RefCell<Option<Interval>>> = use_hook(|| Rc::new(RefCell::new(None)));
+    let _meeting_poll_interval: Rc<RefCell<Option<Interval>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
     {
         let meeting_id = id.clone();
         let current_status = meeting_status();
@@ -134,19 +138,28 @@ pub fn MeetingPage(id: String) -> Element {
                                                         room_token: token,
                                                     });
                                                 } else {
-                                                    meeting_status.set(MeetingStatus::Error("Admitted but no room token".to_string()));
+                                                    meeting_status.set(MeetingStatus::Error(
+                                                        "Admitted but no room token".to_string(),
+                                                    ));
                                                 }
                                             }
                                             "waiting" => {
                                                 came_from_waiting_room.set(true);
                                                 meeting_status.set(MeetingStatus::Waiting);
                                             }
-                                            "rejected" => meeting_status.set(MeetingStatus::Rejected),
-                                            _ => meeting_status.set(MeetingStatus::Error(format!("Unknown status: {}", response.status))),
+                                            "rejected" => {
+                                                meeting_status.set(MeetingStatus::Rejected)
+                                            }
+                                            _ => meeting_status.set(MeetingStatus::Error(format!(
+                                                "Unknown status: {}",
+                                                response.status
+                                            ))),
                                         }
                                     }
                                     Err(JoinError::MeetingNotActive) => {}
-                                    Err(e) => meeting_status.set(MeetingStatus::Error(e.to_string())),
+                                    Err(e) => {
+                                        meeting_status.set(MeetingStatus::Error(e.to_string()))
+                                    }
                                 }
                             }
                         }
@@ -207,7 +220,9 @@ pub fn MeetingPage(id: String) -> Element {
                                         room_token: token,
                                     });
                                 } else {
-                                    meeting_status.set(MeetingStatus::Error("Admitted but no room token".to_string()));
+                                    meeting_status.set(MeetingStatus::Error(
+                                        "Admitted but no room token".to_string(),
+                                    ));
                                 }
                             }
                             "waiting" => {
@@ -215,10 +230,15 @@ pub fn MeetingPage(id: String) -> Element {
                                 meeting_status.set(MeetingStatus::Waiting);
                             }
                             "rejected" => meeting_status.set(MeetingStatus::Rejected),
-                            _ => meeting_status.set(MeetingStatus::Error(format!("Unknown status: {}", response.status))),
+                            _ => meeting_status.set(MeetingStatus::Error(format!(
+                                "Unknown status: {}",
+                                response.status
+                            ))),
                         }
                     }
-                    Err(JoinError::MeetingNotActive) => meeting_status.set(MeetingStatus::WaitingForMeeting),
+                    Err(JoinError::MeetingNotActive) => {
+                        meeting_status.set(MeetingStatus::WaitingForMeeting)
+                    }
                     Err(e) => meeting_status.set(MeetingStatus::Error(e.to_string())),
                 }
             });
@@ -231,7 +251,8 @@ pub fn MeetingPage(id: String) -> Element {
         move |room_token: String| {
             let meeting_id = meeting_id.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let determined_host = match crate::meeting_api::get_meeting_info(&meeting_id).await {
+                let determined_host = match crate::meeting_api::get_meeting_info(&meeting_id).await
+                {
                     Ok(info) => info.host_display_name,
                     Err(_) => None,
                 };
@@ -287,7 +308,9 @@ pub fn MeetingPage(id: String) -> Element {
                 error_state.set(None);
                 on_join();
             } else {
-                error_state.set(Some("Please enter a valid username (letters, numbers, underscore).".to_string()));
+                error_state.set(Some(
+                    "Please enter a valid username (letters, numbers, underscore).".to_string(),
+                ));
             }
         }
     };

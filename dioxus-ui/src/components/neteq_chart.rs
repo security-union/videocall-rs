@@ -1,5 +1,5 @@
-pub use neteq::NetEqStats as RawNetEqStats;
 use dioxus::prelude::*;
+pub use neteq::NetEqStats as RawNetEqStats;
 use serde::{Deserialize, Serialize};
 
 // UI-friendly structure for charts (keeping the old one)
@@ -162,10 +162,7 @@ fn BaseChart(config: ChartConfig, data_len: usize, width: u32, height: u32) -> E
     let max_str = format!("{:.1}", config.max_value);
     let mid_time = format!("{}s", data_len / 2);
     let max_time = format!("{}s", data_len);
-    let rotate_transform = format!(
-        "rotate(-90, 5, {})",
-        margin_top + plot_height / 2.0
-    );
+    let rotate_transform = format!("rotate(-90, 5, {})", margin_top + plot_height / 2.0);
     let view_box = format!("0 0 {width} {height}");
     let cx2 = (chart_width / 2.0).to_string();
 
@@ -335,8 +332,18 @@ impl ChartConfig {
             y_axis_label: "Buffer (ms)",
             max_value: max_buffer,
             series: vec![
-                ChartSeries { data_points: buffer_data, color: "#007bff", label: "Current Buffer", scale_factor: 1.0 },
-                ChartSeries { data_points: target_data, color: "#28a745", label: "Target Buffer", scale_factor: 1.0 },
+                ChartSeries {
+                    data_points: buffer_data,
+                    color: "#007bff",
+                    label: "Current Buffer",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: target_data,
+                    color: "#28a745",
+                    label: "Target Buffer",
+                    scale_factor: 1.0,
+                },
             ],
         }
     }
@@ -361,52 +368,162 @@ impl ChartConfig {
             y_axis_label: "Operations/sec",
             max_value: max_ops,
             series: vec![
-                ChartSeries { data_points: stats_history.iter().map(|s| s.normal_per_sec as f64).collect(), color: "#28a745", label: "Normal", scale_factor: 1.0 },
-                ChartSeries { data_points: stats_history.iter().map(|s| s.expand_per_sec as f64).collect(), color: "#dc3545", label: "Expand", scale_factor: 1.0 },
-                ChartSeries { data_points: stats_history.iter().map(|s| s.accelerate_per_sec as f64).collect(), color: "#fd7e14", label: "Accelerate", scale_factor: 1.0 },
-                ChartSeries { data_points: stats_history.iter().map(|s| s.preemptive_expand_per_sec as f64).collect(), color: "#6f42c1", label: "Preemptive Expand", scale_factor: 1.0 },
-                ChartSeries { data_points: stats_history.iter().map(|s| s.merge_per_sec as f64).collect(), color: "#17a2b8", label: "Merge", scale_factor: 1.0 },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.normal_per_sec as f64)
+                        .collect(),
+                    color: "#28a745",
+                    label: "Normal",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.expand_per_sec as f64)
+                        .collect(),
+                    color: "#dc3545",
+                    label: "Expand",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.accelerate_per_sec as f64)
+                        .collect(),
+                    color: "#fd7e14",
+                    label: "Accelerate",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.preemptive_expand_per_sec as f64)
+                        .collect(),
+                    color: "#6f42c1",
+                    label: "Preemptive Expand",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.merge_per_sec as f64)
+                        .collect(),
+                    color: "#17a2b8",
+                    label: "Merge",
+                    scale_factor: 1.0,
+                },
             ],
         }
     }
 
     pub fn quality_metrics(stats_history: &[NetEqStats]) -> Self {
-        let max_packets = stats_history.iter().map(|s| s.packets_awaiting_decode).max().unwrap_or(1).max(1) as f64;
+        let max_packets = stats_history
+            .iter()
+            .map(|s| s.packets_awaiting_decode)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f64;
         Self {
             title: "Packet Count & Audio Quality",
             y_axis_label: "Count",
             max_value: max_packets,
             series: vec![
-                ChartSeries { data_points: stats_history.iter().map(|s| s.packets_awaiting_decode as f64).collect(), color: "#6f42c1", label: "Packets", scale_factor: 1.0 },
-                ChartSeries { data_points: stats_history.iter().map(|s| s.underruns as f64 * 0.3).collect(), color: "#dc3545", label: "Underruns", scale_factor: 0.3 },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.packets_awaiting_decode as f64)
+                        .collect(),
+                    color: "#6f42c1",
+                    label: "Packets",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.underruns as f64 * 0.3)
+                        .collect(),
+                    color: "#dc3545",
+                    label: "Underruns",
+                    scale_factor: 0.3,
+                },
             ],
         }
     }
 
     pub fn reordering_analysis(stats_history: &[NetEqStats]) -> Self {
-        let max_rate = stats_history.iter().map(|s| s.reorder_rate).max().unwrap_or(1).max(1) as f64;
-        let max_distance = stats_history.iter().map(|s| s.max_reorder_distance).max().unwrap_or(1).max(1) as f64;
+        let max_rate = stats_history
+            .iter()
+            .map(|s| s.reorder_rate)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f64;
+        let max_distance = stats_history
+            .iter()
+            .map(|s| s.max_reorder_distance)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f64;
         Self {
             title: "Packet Reordering Analysis",
             y_axis_label: "Rate/Distance",
             max_value: max_rate.max(max_distance),
             series: vec![
-                ChartSeries { data_points: stats_history.iter().map(|s| s.reorder_rate as f64).collect(), color: "#dc3545", label: "Reorder Rate", scale_factor: 1.0 },
-                ChartSeries { data_points: stats_history.iter().map(|s| s.max_reorder_distance as f64).collect(), color: "#17a2b8", label: "Max Distance", scale_factor: 1.0 },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.reorder_rate as f64)
+                        .collect(),
+                    color: "#dc3545",
+                    label: "Reorder Rate",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.max_reorder_distance as f64)
+                        .collect(),
+                    color: "#17a2b8",
+                    label: "Max Distance",
+                    scale_factor: 1.0,
+                },
             ],
         }
     }
 
     pub fn system_performance(stats_history: &[NetEqStats]) -> Self {
-        let max_calls = stats_history.iter().map(|s| s.calls_per_sec).max().unwrap_or(1).max(1) as f64;
-        let max_frames = stats_history.iter().map(|s| s.avg_frames).max().unwrap_or(1).max(1) as f64;
+        let max_calls = stats_history
+            .iter()
+            .map(|s| s.calls_per_sec)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f64;
+        let max_frames = stats_history
+            .iter()
+            .map(|s| s.avg_frames)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f64;
         Self {
             title: "System Performance",
             y_axis_label: "Performance",
             max_value: max_calls.max(max_frames),
             series: vec![
-                ChartSeries { data_points: stats_history.iter().map(|s| s.calls_per_sec as f64).collect(), color: "#28a745", label: "Calls/sec", scale_factor: 1.0 },
-                ChartSeries { data_points: stats_history.iter().map(|s| s.avg_frames as f64).collect(), color: "#ffc107", label: "Avg Frames", scale_factor: 1.0 },
+                ChartSeries {
+                    data_points: stats_history
+                        .iter()
+                        .map(|s| s.calls_per_sec as f64)
+                        .collect(),
+                    color: "#28a745",
+                    label: "Calls/sec",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: stats_history.iter().map(|s| s.avg_frames as f64).collect(),
+                    color: "#ffc107",
+                    label: "Avg Frames",
+                    scale_factor: 1.0,
+                },
             ],
         }
     }
@@ -465,7 +582,11 @@ pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
         } else {
             "status-value"
         };
-        let underrun_class = if stats.underruns > 0 { "status-value warning" } else { "status-value good" };
+        let underrun_class = if stats.underruns > 0 {
+            "status-value warning"
+        } else {
+            "status-value good"
+        };
         let expand_str = format!("{:.1}", stats.expand_rate);
         let accel_str = format!("{:.1}", stats.accel_rate);
 

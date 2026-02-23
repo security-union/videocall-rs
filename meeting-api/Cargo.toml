@@ -18,7 +18,7 @@ name = "meeting-api"
 path = "src/main.rs"
 
 [dependencies]
-videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.1" }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.2" }
 
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }

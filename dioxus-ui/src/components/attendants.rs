@@ -699,12 +699,10 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                // Waiting room controls (host only)
-                if is_owner {
-                    HostControls {
-                        meeting_id: id.clone(),
-                        is_admitted: true,
-                    }
+                // Waiting room controls - all admitted participants can manage waiting room
+                HostControls {
+                    meeting_id: id.clone(),
+                    is_admitted: true,
                 }
 
                 // Meeting ended overlay

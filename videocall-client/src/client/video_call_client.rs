@@ -869,9 +869,13 @@ impl Inner {
             response.email,
             response.session_id
         );
-        // Skip creating peers for system messages (meeting info, meeting started/ended)
-        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let mut peer_status = if response.email == SYSTEM_USER_EMAIL || response.session_id == 0 {
+        // Skip creating peers for system messages (meeting info, meeting started/ended),
+        // session_id 0 (reserved; MEETING packets and unassigned packets use 0),
+        // and SESSION_ASSIGNED (which carries our own session_id, not a remote peer's).
+        let mut peer_status = if response.email == SYSTEM_USER_EMAIL
+            || response.session_id == 0
+            || response.packet_type == PacketType::SESSION_ASSIGNED.into()
+        {
             PeerStatus::NoChange
         } else {
             self.peer_decode_manager
@@ -995,9 +999,14 @@ impl Inner {
                 );
                 self.own_session_id = Some(response.session_id);
 
+                // Note: During election, complete_election() already sets session_id
+                // on the ConnectionManager and Connection before emitting this callback.
+                // The try_borrow may fail when called from within complete_election()'s
+                // timer context (RefCell already borrowed). This is safe to ignore since
+                // the session_id is already set at that point.
                 if let Some(connection_controller) = &self.connection_controller {
                     if let Err(e) = connection_controller.set_own_session_id(response.session_id) {
-                        warn!("Failed to set own_session_id in ConnectionManager: {e}");
+                        debug!("set_own_session_id on ConnectionController skipped (likely already set during election): {e}");
                     }
                 }
             }

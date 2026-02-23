@@ -21,6 +21,7 @@
 /// track of connection status.
 ///
 use super::task::Task;
+use super::webmedia::TransportHint;
 use super::ConnectOptions;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
@@ -137,7 +138,7 @@ impl Connection {
                 ..Default::default()
             };
             if let Status::Connected = status.get() {
-                task.send_packet(packet);
+                task.send_packet_with_hint(packet, TransportHint::Datagram);
             }
         }));
     }
@@ -151,9 +152,9 @@ impl Connection {
         }
     }
 
-    pub fn send_packet(&self, packet: PacketWrapper) {
+    pub fn send_packet_with_hint(&self, packet: PacketWrapper, hint: TransportHint) {
         if let Status::Connected = self.status.get() {
-            self.task.send_packet(packet);
+            self.task.send_packet_with_hint(packet, hint);
         }
     }
 

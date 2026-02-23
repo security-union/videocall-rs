@@ -21,7 +21,7 @@
 // Sets up all the stream handling to support the callbacks on_connected, on_connection_lost, and
 // on_inbound_media
 //
-use super::webmedia::{ConnectOptions, WebMedia};
+use super::webmedia::{ConnectOptions, TransportHint, WebMedia};
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
@@ -96,6 +96,26 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
 
     fn send_bytes(&self, bytes: Vec<u8>) {
         WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+    }
+
+    fn send_bytes_with_hint(&self, bytes: Vec<u8>, hint: TransportHint) {
+        match hint {
+            TransportHint::Datagram => {
+                // MTU guard: datagrams > 1200 bytes risk fragmentation/drop; fall back to stream.
+                if bytes.len() > 1200 {
+                    log::debug!(
+                        "Packet too large for datagram ({} bytes), falling back to stream",
+                        bytes.len()
+                    );
+                    WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+                } else {
+                    WebTransportTask::send_datagram(self.transport.clone(), bytes);
+                }
+            }
+            TransportHint::Reliable => {
+                WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+            }
+        }
     }
 }
 

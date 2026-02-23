@@ -27,4 +27,4 @@ mod webtransport;
 
 pub use connection_controller::ConnectionController;
 pub use connection_manager::{ConnectionManagerOptions, ConnectionState};
-pub use webmedia::ConnectOptions;
+pub use webmedia::{ConnectOptions, TransportHint};

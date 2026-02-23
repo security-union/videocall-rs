@@ -240,7 +240,20 @@ impl WebSocketTask {
     }
 
     /// Sends binary data to a WebSocket connection.
+    ///
+    /// Applies backpressure: if the browser's send buffer exceeds 256 KB the packet is
+    /// dropped with a warning instead of queueing unbounded data in memory.
     pub fn send_binary(&self, data: Vec<u8>) {
+        const HIGH_WATER_MARK: u32 = 256 * 1024; // 256 KB
+
+        if self.ws.buffered_amount() > HIGH_WATER_MARK {
+            gloo_console::log!(
+                "warn: WebSocket backpressure — dropping packet, buffered_amount =",
+                self.ws.buffered_amount()
+            );
+            return;
+        }
+
         let result = self.ws.send_with_u8_array(&data);
 
         if result.is_err() {

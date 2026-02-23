@@ -16,7 +16,9 @@
  * conditions.
  */
 
-use super::super::connection::{ConnectionController, ConnectionManagerOptions, ConnectionState};
+use super::super::connection::{
+    ConnectionController, ConnectionManagerOptions, ConnectionState, TransportHint,
+};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
@@ -466,11 +468,15 @@ impl VideoCallClient {
     }
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
+        self.send_packet_with_hint(media, TransportHint::Reliable);
+    }
+
+    pub(crate) fn send_packet_with_hint(&self, media: PacketWrapper, hint: TransportHint) {
         let packet_type = media.packet_type.enum_value();
         match self.inner.try_borrow() {
             Ok(inner) => {
                 if let Some(connection_controller) = &inner.connection_controller {
-                    if let Err(e) = connection_controller.send_packet(media) {
+                    if let Err(e) = connection_controller.send_packet_with_hint(media, hint) {
                         debug!("Failed to send {packet_type:?} packet: {e}");
                     }
                 } else {
@@ -703,7 +709,7 @@ impl VideoCallClient {
             data: packet.write_to_bytes().unwrap(),
             ..Default::default()
         };
-        self.send_packet(wrapper);
+        self.send_packet_with_hint(wrapper, TransportHint::Datagram);
     }
 
     pub fn subscribe_diagnostics(
@@ -881,7 +887,7 @@ impl Inner {
                                 ..Default::default()
                             };
 
-                            if let Err(e) = connection_controller.send_packet(packet) {
+                            if let Err(e) = connection_controller.send_packet_with_hint(packet, TransportHint::Reliable) {
                                 error!("Failed to send AES key packet: {e}");
                             }
                         } else {
@@ -1044,7 +1050,7 @@ impl Inner {
                                 ..Default::default()
                             };
 
-                            if let Err(e) = connection_controller.send_packet(packet) {
+                            if let Err(e) = connection_controller.send_packet_with_hint(packet, TransportHint::Reliable) {
                                 error!("Failed to send RSA public key packet: {e}");
                             }
                         } else {

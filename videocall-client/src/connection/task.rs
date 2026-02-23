@@ -26,7 +26,7 @@ use videocall_transport::websocket::WebSocketTask;
 use videocall_transport::webtransport::WebTransportTask;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-use super::webmedia::{ConnectOptions, WebMedia};
+use super::webmedia::{ConnectOptions, TransportHint, WebMedia};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -48,10 +48,10 @@ impl Task {
         WebSocketTask::connect(options).map(Task::WebSocket)
     }
 
-    pub fn send_packet(&self, packet: PacketWrapper) {
+    pub fn send_packet_with_hint(&self, packet: PacketWrapper, hint: TransportHint) {
         match self {
-            Task::WebSocket(ws) => ws.send_packet(packet),
-            Task::WebTransport(wt) => wt.send_packet(packet),
+            Task::WebSocket(ws) => ws.send_packet_with_hint(packet, hint),
+            Task::WebTransport(wt) => wt.send_packet_with_hint(packet, hint),
         }
     }
 }

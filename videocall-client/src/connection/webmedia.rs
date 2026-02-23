@@ -27,6 +27,21 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
 
+/// Hint for how a packet should be transported.
+///
+/// When using WebTransport, `Datagram` sends via unreliable datagrams (low latency, no
+/// head-of-line blocking, but may be dropped). `Reliable` sends via a new unidirectional
+/// stream (guaranteed delivery, ordered).
+///
+/// WebSocket ignores the hint and always sends reliably.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportHint {
+    /// Send via a reliable, ordered channel (unidirectional stream / WebSocket).
+    Reliable,
+    /// Send via an unreliable datagram (WebTransport only; falls back to reliable on WebSocket).
+    Datagram,
+}
+
 #[derive(Clone)]
 pub struct ConnectOptions {
     pub userid: String,
@@ -42,12 +57,18 @@ pub(super) trait WebMedia<TASK> {
     fn connect(options: ConnectOptions) -> anyhow::Result<TASK>;
     fn send_bytes(&self, bytes: Vec<u8>);
 
-    fn send_packet(&self, packet: PacketWrapper) {
+    /// Send raw bytes with a transport hint. The default implementation ignores the hint and
+    /// delegates to [`send_bytes`]. WebTransport overrides this to route datagrams.
+    fn send_bytes_with_hint(&self, bytes: Vec<u8>, _hint: TransportHint) {
+        self.send_bytes(bytes);
+    }
+
+    fn send_packet_with_hint(&self, packet: PacketWrapper, hint: TransportHint) {
         match packet
             .write_to_bytes()
             .map_err(|w| JsValue::from(format!("{w:?}")))
         {
-            Ok(bytes) => self.send_bytes(bytes),
+            Ok(bytes) => self.send_bytes_with_hint(bytes, hint),
             Err(e) => {
                 let packet_type = packet.packet_type.enum_value_or_default();
                 error!("error sending {packet_type} packet: {e:?}");

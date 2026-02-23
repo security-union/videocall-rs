@@ -17,6 +17,7 @@
  */
 
 use super::connection_manager::{ConnectionManager, ConnectionManagerOptions, ConnectionState};
+use super::webmedia::TransportHint;
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
@@ -114,13 +115,17 @@ impl ConnectionController {
 
     // Delegate methods to ConnectionManager
 
-    /// Send packet through active connection
-    pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
+    /// Send packet through active connection with a transport hint
+    pub fn send_packet_with_hint(
+        &self,
+        packet: PacketWrapper,
+        hint: TransportHint,
+    ) -> Result<()> {
         let inner = self
             .inner
             .try_borrow()
             .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
-        inner.connection_manager.send_packet(packet)
+        inner.connection_manager.send_packet_with_hint(packet, hint)
     }
 
     /// Set video enabled on active connection

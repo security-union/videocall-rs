@@ -17,7 +17,7 @@
  */
 
 use super::connection::Connection;
-use super::webmedia::ConnectOptions;
+use super::webmedia::{ConnectOptions, TransportHint};
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
@@ -364,7 +364,7 @@ impl ConnectionManager {
         let timestamp = js_sys::Date::now();
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
-        connection.send_packet(rtt_packet);
+        connection.send_packet_with_hint(rtt_packet, TransportHint::Datagram);
         debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
@@ -761,11 +761,15 @@ impl ConnectionManager {
         self.options.on_state_changed.emit(state);
     }
 
-    /// Send packet through active connection
-    pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
+    /// Send packet through active connection with a transport hint
+    pub fn send_packet_with_hint(
+        &self,
+        packet: PacketWrapper,
+        hint: TransportHint,
+    ) -> Result<()> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {
-                connection.send_packet(packet);
+                connection.send_packet_with_hint(packet, hint);
                 return Ok(());
             }
         }

@@ -279,17 +279,19 @@ pub fn process_binary(bytes: &Uint8Array, callback: &Callback<Vec<u8>>) {
 }
 
 impl WebTransportTask {
-    /// Sends data to a WebTransport connection.
+    /// Sends data as a WebTransport datagram (unreliable, unordered).
+    ///
+    /// Datagram loss is expected and non-fatal — errors are logged as warnings rather than
+    /// closing the transport.
     pub fn send_datagram(transport: Rc<WebTransport>, data: Vec<u8>) {
         wasm_bindgen_futures::spawn_local(async move {
-            let transport = transport.clone();
             let result: Result<(), anyhow::Error> = {
                 let transport = transport.clone();
                 async move {
                     let stream = transport.datagrams();
                     let stream: WritableStream = stream.writable();
                     if stream.locked() {
-                        return Err(anyhow::anyhow!("Stream is locked"));
+                        return Err(anyhow::anyhow!("Datagram writable stream is locked"));
                     }
                     let writer = stream.get_writer().map_err(|e| anyhow!("{:?}", e))?;
                     let data = Uint8Array::from(data.as_slice());
@@ -305,9 +307,8 @@ impl WebTransportTask {
             }
             .await;
             if let Err(e) = result {
-                let e = e.to_string();
-                log!("error: ", e);
-                transport.close();
+                // Datagram loss is expected; do NOT close the transport.
+                log!("warn: datagram send failed (non-fatal): ", e.to_string());
             }
         });
     }

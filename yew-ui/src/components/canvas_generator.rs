@@ -42,7 +42,7 @@ pub fn generate_for_peer(
 
     let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
-    if !allowed.is_empty() && !allowed.iter().any(|a| *a == peer_email) {
+    if !allowed.is_empty() && !allowed.contains(&peer_email) {
         return html! {};
     }
 

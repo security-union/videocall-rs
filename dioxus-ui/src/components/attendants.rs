@@ -43,7 +43,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
-use videocall_client::{MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
+use videocall_client::{
+    MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+};
 use web_sys::HtmlAudioElement;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,7 +128,7 @@ pub fn AttendantsComponent(
     let mut show_dropdown = use_signal(|| false);
     let meeting_ended_message = use_signal(|| None::<String>);
     let mut meeting_info_open = use_signal(|| false);
-    let peers = use_signal(Vec::<String>::new);
+    let peer_list_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
 
     // Create VideoCallClient and MediaDeviceAccess once
@@ -134,7 +136,10 @@ pub fn AttendantsComponent(
         #[cfg(feature = "media-server-jwt-auth")]
         let token = {
             let t = room_token.clone();
-            assert!(!t.is_empty(), "media-server-jwt-auth is enabled but room_token is empty");
+            assert!(
+                !t.is_empty(),
+                "media-server-jwt-auth is enabled but room_token is empty"
+            );
             t
         };
         #[cfg(not(feature = "media-server-jwt-auth"))]
@@ -142,7 +147,11 @@ pub fn AttendantsComponent(
 
         let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &email, &id);
 
-        log::info!("DIOXUS-UI: Creating VideoCallClient for {} in meeting {}", email, id);
+        log::info!(
+            "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
+            email,
+            id
+        );
 
         let opts = VideoCallClientOptions {
             userid: email.clone(),
@@ -181,14 +190,18 @@ pub fn AttendantsComponent(
                                         connection_error.set(None);
                                     }
                                     Err(crate::meeting_api::JoinError::MeetingNotActive) => {
-                                        meeting_ended_message.set(Some("The meeting has ended.".to_string()));
+                                        meeting_ended_message
+                                            .set(Some("The meeting has ended.".to_string()));
                                     }
                                     Err(e) => {
-                                        connection_error.set(Some(format!("Connection lost, retrying... ({e})")));
+                                        connection_error.set(Some(format!(
+                                            "Connection lost, retrying... ({e})"
+                                        )));
                                     }
                                 }
                             });
-                        }).forget();
+                        })
+                        .forget();
                     }
 
                     #[cfg(not(feature = "media-server-jwt-auth"))]
@@ -197,17 +210,17 @@ pub fn AttendantsComponent(
                     }
                 })
             },
-            on_peer_added: VcCallback::from(move |email: String| {
-                log::info!("New user joined: {email}");
+            on_peer_added: VcCallback::from(move |session_id: String| {
+                log::info!("New user joined: {session_id}");
                 play_user_joined();
-                let mut peers = peers;
-                peers.write().push(email);
+                let mut v = peer_list_version;
+                v.set(v() + 1);
             }),
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: Some(VcCallback::from(move |peer_id: String| {
                 log::info!("Peer removed: {peer_id}");
-                let mut peers = peers;
-                peers.write().retain(|p| p != &peer_id);
+                let mut v = peer_list_version;
+                v.set(v() + 1);
             })),
             get_peer_video_canvas_id: VcCallback::from(|email| email),
             get_peer_screen_canvas_id: VcCallback::from(|email| format!("screen-share-{}", &email)),
@@ -223,13 +236,15 @@ pub fn AttendantsComponent(
                 let mut meeting_start_time_server = meeting_start_time_server;
                 meeting_start_time_server.set(Some(start_time_ms));
             })),
-            on_meeting_ended: Some(VcCallback::from(move |(end_time_ms, message): (f64, String)| {
-                log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
-                let mut meeting_start_time_server = meeting_start_time_server;
-                let mut meeting_ended_message = meeting_ended_message;
-                meeting_start_time_server.set(Some(end_time_ms));
-                meeting_ended_message.set(Some(message));
-            })),
+            on_meeting_ended: Some(VcCallback::from(
+                move |(end_time_ms, message): (f64, String)| {
+                    log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
+                    let mut meeting_start_time_server = meeting_start_time_server;
+                    let mut meeting_ended_message = meeting_ended_message;
+                    meeting_start_time_server.set(Some(end_time_ms));
+                    meeting_ended_message.set(Some(message));
+                },
+            )),
         };
 
         VideoCallClient::new(opts)
@@ -261,7 +276,7 @@ pub fn AttendantsComponent(
 
     // Provide contexts for child components
     use_context_provider(|| client.clone());
-    let mut meeting_time_signal = use_signal(|| MeetingTime::default());
+    let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
 
     // Check for config errors
@@ -283,7 +298,16 @@ pub fn AttendantsComponent(
     }
 
     // --- Derived values ---
-    let display_peers = peers();
+    let _ = peer_list_version(); // subscribe to trigger re-renders when peers change
+    let display_peers = client.sorted_peer_keys();
+    let peers_for_display: Vec<String> = display_peers
+        .iter()
+        .map(|session_id| {
+            client
+                .get_peer_email(session_id)
+                .unwrap_or_else(|| session_id.clone())
+        })
+        .collect();
     let num_display_peers = display_peers.len();
     let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
@@ -657,7 +681,7 @@ pub fn AttendantsComponent(
                     class: if peer_list_open() { "visible" } else { "" },
                     if peer_list_open() {
                         PeerList {
-                            peers: display_peers.clone(),
+                            peers: peers_for_display.clone(),
                             onclose: move |_| peer_list_open.set(false),
                             show_meeting_info: meeting_info_open(),
                             room_id: id_for_peer_list.clone(),

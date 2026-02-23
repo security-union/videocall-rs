@@ -32,10 +32,11 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 /// Push the browser URL to "/" so that Router renders the Home route, then
 /// render the full app shell (UsernameCtx + Router) matching `main.rs`.
 fn ensure_root_url() {
-    let _ = gloo_utils::window()
-        .history()
-        .unwrap()
-        .push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some("/"));
+    let _ = gloo_utils::window().history().unwrap().push_state_with_url(
+        &wasm_bindgen::JsValue::NULL,
+        "",
+        Some("/"),
+    );
 }
 
 /// Full app wrapper: provides UsernameCtx then renders Router<Route>.

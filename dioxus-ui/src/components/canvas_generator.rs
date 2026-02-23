@@ -37,9 +37,10 @@ pub fn generate_for_peer(
     full_bleed: bool,
     host_display_name: Option<&str>,
 ) -> Element {
-    let is_host = host_display_name.map(|h| h == key).unwrap_or(false);
+    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
+    let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
-    if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {
+    if !allowed.is_empty() && !allowed.contains(&peer_email) {
         return rsx! {};
     }
 
@@ -54,10 +55,11 @@ pub fn generate_for_peer(
         let div_id_pin = (*peer_video_div_id).clone();
         let canvas_id_crop = key.clone();
         let key_clone = key.clone();
+        let peer_email_display = peer_email.clone();
         let title = if is_host {
-            format!("Host: {key}")
+            format!("Host: {peer_email}")
         } else {
-            key.clone()
+            peer_email.clone()
         };
         return rsx! {
             div {
@@ -86,7 +88,7 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{title}",
                         dir: "auto",
-                        "{key}"
+                        "{peer_email_display}"
                         if is_host {
                             CrownIcon {}
                         }
@@ -121,16 +123,17 @@ pub fn generate_for_peer(
     let ss_div_mobile = (*screen_share_div_id).clone();
     let ss_div_pin = (*screen_share_div_id).clone();
     let ss_canvas_crop = format!("screen-share-{}", key);
-    let ss_name = format!("{}-screen", key);
+    let ss_name = format!("{}-screen", peer_email);
 
     let pv_div_mobile = (*peer_video_div_id).clone();
     let pv_div_pin = (*peer_video_div_id).clone();
     let pv_canvas_crop = key.clone();
     let key_clone = key.clone();
-    let title = if is_host {
-        format!("Host: {key}")
+    let peer_email_grid = peer_email.clone();
+    let title_grid = if is_host {
+        format!("Host: {peer_email}")
     } else {
-        key.clone()
+        peer_email.clone()
     };
 
     rsx! {
@@ -187,9 +190,9 @@ pub fn generate_for_peer(
                 }
                 h4 {
                     class: "floating-name",
-                    title: "{title}",
+                    title: "{title_grid}",
                     dir: "auto",
-                    "{key}"
+                    "{peer_email_grid}"
                     if is_host {
                         CrownIcon {}
                     }

@@ -54,14 +54,14 @@ pub fn MeetingsList(
 
     // Fetch on mount
     use_effect({
-        let mut fetch_meetings = fetch_meetings.clone();
+        let mut fetch_meetings = fetch_meetings;
         move || {
             fetch_meetings();
         }
     });
 
     let toggle_expanded = {
-        let mut fetch_meetings = fetch_meetings.clone();
+        let mut fetch_meetings = fetch_meetings;
         move |_| {
             let new_expanded = !expanded();
             expanded.set(new_expanded);
@@ -72,7 +72,7 @@ pub fn MeetingsList(
     };
 
     let refresh = {
-        let mut fetch_meetings = fetch_meetings.clone();
+        let mut fetch_meetings = fetch_meetings;
         move |_| {
             fetch_meetings();
         }
@@ -129,14 +129,14 @@ pub fn MeetingsList(
                                     on_select_meeting: on_select_meeting,
                                     on_delete: {
                                         #[allow(unused_mut)]
-                                        let mut fetch_meetings = fetch_meetings.clone();
+                                        let mut fetch_meetings = fetch_meetings;
                                         move |meeting_id: String| {
                                             // Optimistic removal
                                             meetings.write().retain(|m| m.meeting_id != meeting_id);
                                             total.set(total().saturating_sub(1));
 
                                             let meeting_id = meeting_id.clone();
-                                            let mut fetch_meetings = fetch_meetings.clone();
+                                            let mut fetch_meetings = fetch_meetings;
                                             spawn(async move {
                                                 match do_delete_meeting(&meeting_id).await {
                                                     Ok(_) => fetch_meetings(),

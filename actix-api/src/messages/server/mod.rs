@@ -68,3 +68,9 @@ pub struct Leave {
     pub room: RoomId,
     pub user_id: String,
 }
+
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+pub struct ActivateConnection {
+    pub session: SessionId,
+}

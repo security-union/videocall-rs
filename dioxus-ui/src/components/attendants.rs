@@ -128,7 +128,7 @@ pub fn AttendantsComponent(
     let mut show_dropdown = use_signal(|| false);
     let meeting_ended_message = use_signal(|| None::<String>);
     let mut meeting_info_open = use_signal(|| false);
-    let peers = use_signal(Vec::<String>::new);
+    let peer_list_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
 
     // Create VideoCallClient and MediaDeviceAccess once
@@ -210,17 +210,17 @@ pub fn AttendantsComponent(
                     }
                 })
             },
-            on_peer_added: VcCallback::from(move |email: String| {
-                log::info!("New user joined: {email}");
+            on_peer_added: VcCallback::from(move |session_id: String| {
+                log::info!("New user joined: {session_id}");
                 play_user_joined();
-                let mut peers = peers;
-                peers.write().push(email);
+                let mut v = peer_list_version;
+                v.set(v() + 1);
             }),
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: Some(VcCallback::from(move |peer_id: String| {
                 log::info!("Peer removed: {peer_id}");
-                let mut peers = peers;
-                peers.write().retain(|p| p != &peer_id);
+                let mut v = peer_list_version;
+                v.set(v() + 1);
             })),
             get_peer_video_canvas_id: VcCallback::from(|email| email),
             get_peer_screen_canvas_id: VcCallback::from(|email| format!("screen-share-{}", &email)),
@@ -298,7 +298,16 @@ pub fn AttendantsComponent(
     }
 
     // --- Derived values ---
-    let display_peers = peers();
+    let _ = peer_list_version(); // subscribe to trigger re-renders when peers change
+    let display_peers = client.sorted_peer_keys();
+    let peers_for_display: Vec<String> = display_peers
+        .iter()
+        .map(|session_id| {
+            client
+                .get_peer_email(session_id)
+                .unwrap_or_else(|| session_id.clone())
+        })
+        .collect();
     let num_display_peers = display_peers.len();
     let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
@@ -672,7 +681,7 @@ pub fn AttendantsComponent(
                     class: if peer_list_open() { "visible" } else { "" },
                     if peer_list_open() {
                         PeerList {
-                            peers: display_peers.clone(),
+                            peers: peers_for_display.clone(),
                             onclose: move |_| peer_list_open.set(false),
                             show_meeting_info: meeting_info_open(),
                             room_id: id_for_peer_list.clone(),

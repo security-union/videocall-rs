@@ -270,10 +270,10 @@ async fn run_webtransport_connection_from_request(
             anyhow!("token validation failed: {}", e.client_message())
         })?;
         info!(
-            "WT token-based connection: email={}, room={}",
-            claims.sub, claims.room
+            "WT token-based connection: display_name={}, room={}",
+            claims.display_name, claims.room
         );
-        (claims.sub, claims.room)
+        (claims.display_name, claims.room)
     } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
         // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
         if parts.len() != 3 {

@@ -98,7 +98,7 @@ pub async fn ws_connect_authenticated(
         }
     };
 
-    let email = claims.sub;
+    let email = claims.display_name;
     let room = claims.room;
 
     debug!("socket connected (token-based) for email={email}, room={room}");

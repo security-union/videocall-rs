@@ -556,7 +556,7 @@ impl VideoCallClient {
     /// callback.   Or if polling is really necessary, instead of being hardwired for screen, it'd
     /// be more elegant to at least pass a `MediaType`.
     ///
-    pub fn is_awaiting_peer_screen_frame(&self, key: &String) -> bool {
+    pub fn is_awaiting_peer_screen_frame(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,
@@ -569,7 +569,7 @@ impl VideoCallClient {
         false
     }
 
-    pub fn is_video_enabled_for_peer(&self, key: &String) -> bool {
+    pub fn is_video_enabled_for_peer(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,
@@ -582,7 +582,7 @@ impl VideoCallClient {
         false
     }
 
-    pub fn is_screen_share_enabled_for_peer(&self, key: &String) -> bool {
+    pub fn is_screen_share_enabled_for_peer(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,
@@ -595,7 +595,7 @@ impl VideoCallClient {
         false
     }
 
-    pub fn is_audio_enabled_for_peer(&self, key: &String) -> bool {
+    pub fn is_audio_enabled_for_peer(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,

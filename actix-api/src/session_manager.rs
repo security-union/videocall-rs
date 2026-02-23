@@ -156,6 +156,33 @@ impl SessionManager {
         wrapper.write_to_bytes().unwrap_or_default()
     }
 
+    /// Build PARTICIPANT_JOINED packet to announce an existing peer to a joining user.
+    ///
+    /// Unlike the system-level MEETING packets, this uses the peer's actual email and
+    /// session_id in the PacketWrapper so the receiving client's `ensure_peer()` logic
+    /// automatically creates the peer entry.
+    pub fn build_participant_joined_packet(
+        room_id: &str,
+        peer_email: &str,
+        peer_session_id: u64,
+    ) -> Vec<u8> {
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_JOINED.into(),
+            room_id: room_id.to_string(),
+            ..Default::default()
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            email: peer_email.to_string(),
+            session_id: peer_session_id,
+            data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
     /// Build MEETING_ENDED packet to send to clients (protobuf)
     pub fn build_meeting_ended_packet(room_id: &str, message: &str) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
@@ -242,5 +269,18 @@ mod tests {
         assert_eq!(inner.event_type, MeetingEventType::MEETING_ENDED.into());
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.message, "Host left");
+    }
+
+    #[tokio::test]
+    async fn test_build_participant_joined_packet() {
+        let bytes = SessionManager::build_participant_joined_packet("my-room", "alice@example.com", 42);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
+        // The key difference: email and session_id carry the peer's identity
+        assert_eq!(wrapper.email, "alice@example.com");
+        assert_eq!(wrapper.session_id, 42);
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(inner.event_type, MeetingEventType::PARTICIPANT_JOINED.into());
+        assert_eq!(inner.room_id, "my-room");
     }
 }

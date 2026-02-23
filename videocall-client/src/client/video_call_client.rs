@@ -1025,9 +1025,12 @@ impl Inner {
                         }
                     }
                     Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                        debug!(
-                            "Received PARTICIPANT_JOINED: room={}, count={}",
-                            meeting_packet.room_id, meeting_packet.participant_count
+                        info!(
+                            "Received PARTICIPANT_JOINED: room={}, email={}, session_id={}, count={}",
+                            meeting_packet.room_id,
+                            response.email,
+                            response.session_id,
+                            meeting_packet.participant_count
                         );
                     }
                     Ok(MeetingEventType::PARTICIPANT_LEFT) => {

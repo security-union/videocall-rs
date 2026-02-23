@@ -36,15 +36,16 @@ use tracing::{error, info, trace, warn};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_EMAIL;
 
-use super::session_logic::{ConnectionState, SessionId};
+use super::session_logic::{ConnectionState, RoomId, SessionId};
 
-/// Internal message to clean up active_subs when a spawned join task fails.
+/// Internal message to clean up active_subs and room_members when a spawned join task fails.
 /// This fixes a race condition where start_session could fail inside the spawned task,
 /// leaving a stale entry in active_subs that blocks future join attempts.
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct CleanupFailedJoin {
     session: SessionId,
+    room: RoomId,
 }
 
 pub struct ChatServer {
@@ -53,6 +54,8 @@ pub struct ChatServer {
     active_subs: HashMap<SessionId, JoinHandle<()>>,
     session_manager: SessionManager,
     connection_states: HashMap<SessionId, ConnectionState>,
+    /// Tracks which sessions are in each room: room -> (session_id -> email)
+    room_members: HashMap<RoomId, HashMap<SessionId, String>>,
 }
 
 impl ChatServer {
@@ -63,6 +66,7 @@ impl ChatServer {
             sessions: HashMap::new(),
             session_manager: SessionManager::new(),
             connection_states: HashMap::new(),
+            room_members: HashMap::new(),
         }
     }
 
@@ -75,6 +79,16 @@ impl ChatServer {
         // Remove the subscription task if it exists
         if let Some(task) = self.active_subs.remove(session_id) {
             task.abort();
+        }
+
+        // Remove from room_members tracking
+        if let Some(room_id) = room {
+            if let Some(members) = self.room_members.get_mut(room_id) {
+                members.remove(session_id);
+                if members.is_empty() {
+                    self.room_members.remove(room_id);
+                }
+            }
         }
 
         // End session using SessionManager
@@ -290,12 +304,48 @@ impl Handler<JoinRoom> for ChatServer {
             }
         };
 
+        // Send existing room members to the joining user so they can discover peers
+        // immediately rather than waiting for media packets.
+        if let Some(members) = self.room_members.get(&room) {
+            for (&peer_session_id, peer_email) in members.iter() {
+                let bytes = SessionManager::build_participant_joined_packet(
+                    &room,
+                    peer_email,
+                    peer_session_id,
+                );
+                let message = Message {
+                    msg: bytes,
+                    session,
+                };
+                if let Err(e) = session_recipient.try_send(message) {
+                    warn!(
+                        "Failed to send existing peer (session={}, email={}) to joining session {}: {}",
+                        peer_session_id, peer_email, session, e
+                    );
+                }
+            }
+            info!(
+                "Sent {} existing peer(s) to joining session {} in room {}",
+                members.len(),
+                session,
+                room
+            );
+        }
+
+        // Add the new member AFTER sending existing peers (so joiner doesn't get
+        // an announce for themselves).
+        self.room_members
+            .entry(room.clone())
+            .or_default()
+            .insert(session, user_id.clone());
+
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
 
         // Get ChatServer address for cleanup on failure
         let chat_server_addr = ctx.address();
         let session_for_cleanup = session;
+        let room_for_cleanup = room.clone();
 
         let handle = tokio::spawn(async move {
             // Start session using SessionManager - await result before subscribing
@@ -329,6 +379,7 @@ impl Handler<JoinRoom> for ChatServer {
                     // leave a stale entry in active_subs, blocking future join attempts.
                     let _ = chat_server_addr.try_send(CleanupFailedJoin {
                         session: session_for_cleanup,
+                        room: room_for_cleanup,
                     });
                     return;
                 }
@@ -374,6 +425,13 @@ impl Handler<CleanupFailedJoin> for ChatServer {
                 "Cleaned up failed join for session {} from active_subs",
                 msg.session
             );
+        }
+        // Also remove from room_members since the join failed
+        if let Some(members) = self.room_members.get_mut(&msg.room) {
+            members.remove(&msg.session);
+            if members.is_empty() {
+                self.room_members.remove(&msg.room);
+            }
         }
     }
 }
@@ -1047,5 +1105,259 @@ mod tests {
                 .copied()
                 .unwrap_or(ConnectionState::Testing))
         }
+    }
+
+    // Helper message to query room_members for testing
+    #[derive(ActixMessage)]
+    #[rtype(result = "Option<HashMap<SessionId, String>>")]
+    struct GetRoomMembers {
+        room: String,
+    }
+
+    impl Handler<GetRoomMembers> for ChatServer {
+        type Result = Option<HashMap<SessionId, String>>;
+
+        fn handle(&mut self, msg: GetRoomMembers, _ctx: &mut Self::Context) -> Self::Result {
+            self.room_members.get(&msg.room).cloned()
+        }
+    }
+
+    // ==========================================================================
+    // TEST: room_members is updated on join and leave
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_room_members_tracking_on_join_and_leave() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy1 = DummySession.start();
+        let dummy2 = DummySession.start();
+        let session_id_1 = 2001u64;
+        let session_id_2 = 2002u64;
+        let room = "test-room-members".to_string();
+
+        // Register both sessions
+        chat_server
+            .send(Connect {
+                id: session_id_1,
+                addr: dummy1.recipient(),
+            })
+            .await
+            .unwrap();
+        chat_server
+            .send(Connect {
+                id: session_id_2,
+                addr: dummy2.recipient(),
+            })
+            .await
+            .unwrap();
+
+        // Join first user
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id_1,
+                room: room.clone(),
+                user_id: "alice@example.com".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+
+        // Verify room_members has one entry
+        let members = chat_server
+            .send(GetRoomMembers { room: room.clone() })
+            .await
+            .unwrap();
+        assert!(members.is_some());
+        let members = members.unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members.get(&session_id_1).unwrap(), "alice@example.com");
+
+        // Join second user
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id_2,
+                room: room.clone(),
+                user_id: "bob@example.com".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+
+        // Verify room_members has two entries
+        let members = chat_server
+            .send(GetRoomMembers { room: room.clone() })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members.get(&session_id_1).unwrap(), "alice@example.com");
+        assert_eq!(members.get(&session_id_2).unwrap(), "bob@example.com");
+
+        // First user leaves
+        chat_server
+            .send(Leave {
+                session: session_id_1,
+                room: room.clone(),
+                user_id: "alice@example.com".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Verify room_members has one entry
+        let members = chat_server
+            .send(GetRoomMembers { room: room.clone() })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members.get(&session_id_2).unwrap(), "bob@example.com");
+
+        // Second user disconnects
+        chat_server
+            .send(Disconnect {
+                session: session_id_2,
+                room: room.clone(),
+                user_id: "bob@example.com".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Verify room is cleaned up entirely
+        let members = chat_server
+            .send(GetRoomMembers { room: room.clone() })
+            .await
+            .unwrap();
+        assert!(
+            members.is_none(),
+            "Room should be removed when last member leaves"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: Joining user receives PARTICIPANT_JOINED for existing peers
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_joining_user_receives_existing_peers() {
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        // First user joins (no peers to receive)
+        let dummy1 = DummySession.start();
+        let session_id_1 = 3001u64;
+        chat_server
+            .send(Connect {
+                id: session_id_1,
+                addr: dummy1.recipient(),
+            })
+            .await
+            .unwrap();
+        chat_server
+            .send(JoinRoom {
+                session: session_id_1,
+                room: "test-room-peers".to_string(),
+                user_id: "alice@example.com".to_string(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Second user joins -- should receive PARTICIPANT_JOINED for alice
+        let received: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct CapturingSession {
+            received: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let session_id_2 = 3002u64;
+
+        chat_server
+            .send(Connect {
+                id: session_id_2,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+        chat_server
+            .send(JoinRoom {
+                session: session_id_2,
+                room: "test-room-peers".to_string(),
+                user_id: "bob@example.com".to_string(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Give a moment for the message to be delivered
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Check that bob received at least one PARTICIPANT_JOINED for alice
+        let msgs = received.lock().unwrap();
+        let mut found_alice = false;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::MEETING.into()
+                    && wrapper.email == "alice@example.com"
+                    && wrapper.session_id == session_id_1
+                {
+                    let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+                    assert_eq!(
+                        inner.event_type,
+                        MeetingEventType::PARTICIPANT_JOINED.into()
+                    );
+                    found_alice = true;
+                }
+            }
+        }
+        assert!(
+            found_alice,
+            "Joining user should receive PARTICIPANT_JOINED for existing peer alice"
+        );
     }
 }

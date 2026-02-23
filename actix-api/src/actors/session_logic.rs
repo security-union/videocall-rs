@@ -25,7 +25,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::{classify_packet, PacketKind};
 use crate::client_diagnostics::health_processor;
-use crate::messages::server::{Connect, Disconnect, JoinRoom};
+use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
@@ -33,7 +33,7 @@ use crate::server_diagnostics::{
 use crate::session_manager::SessionManager;
 use actix::Addr;
 use std::sync::Arc;
-use tracing::{info, trace};
+use tracing::{error, info, trace};
 use uuid::Uuid;
 
 pub type SessionId = u64;
@@ -154,6 +154,40 @@ impl SessionLogic {
         }
     }
 
+    /// Create ClientMessage for forwarding a packet to ChatServer (NATS broadcast).
+    pub fn create_client_message(&self, msg: Packet) -> ClientMessage {
+        ClientMessage {
+            session: self.id,
+            user: self.email.clone(),
+            room: self.room.clone(),
+            msg,
+        }
+    }
+
+    /// Handle JoinRoom response. Returns true if the session should stop (error case).
+    pub fn handle_join_room_result(
+        &self,
+        result: Result<Result<(), String>, actix::MailboxError>,
+    ) -> bool {
+        match result {
+            Ok(Ok(())) => {
+                info!(
+                    "Successfully joined room {} for session {}",
+                    self.room, self.id
+                );
+                false
+            }
+            Ok(Err(e)) => {
+                error!("Failed to join room: {}", e);
+                true
+            }
+            Err(err) => {
+                error!("Error sending JoinRoom: {:?}", err);
+                true
+            }
+        }
+    }
+
     /// Handle actor stopping - cleanup
     pub fn on_stopping(&self) {
         info!("Session stopping: {} in room {}", self.id, self.room);
@@ -168,6 +202,12 @@ impl SessionLogic {
     // =========================================================================
     // Packet Handling
     // =========================================================================
+
+    /// Returns true if this action should trigger connection activation.
+    /// RTT probes (Echo) do not activate; any other packet does.
+    pub fn should_activate_on_action(action: &InboundAction) -> bool {
+        !matches!(action, InboundAction::Echo(_))
+    }
 
     /// Handle an inbound packet from the client.
     ///

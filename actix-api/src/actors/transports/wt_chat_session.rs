@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
-use crate::messages::server::{ActivateConnection, ClientMessage, Packet};
+use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -278,20 +278,15 @@ impl Handler<WtInbound> for WtChatSession {
 
         let action = self.logic.handle_inbound(&msg.data);
 
-        if !self.activated {
-            match action {
-                InboundAction::Echo(_) => { /* RTT probe -- do not activate */ }
-                _ => {
-                    self.logic.addr.do_send(ActivateConnection {
-                        session: self.logic.id,
-                    });
-                    self.activated = true;
-                    info!(
-                        "Session {} activated on first non-RTT packet",
-                        self.logic.id
-                    );
-                }
-            }
+        if !self.activated && SessionLogic::should_activate_on_action(&action) {
+            self.logic.addr.do_send(ActivateConnection {
+                session: self.logic.id,
+            });
+            self.activated = true;
+            info!(
+                "Session {} activated on first non-RTT packet",
+                self.logic.id
+            );
         }
 
         match action {
@@ -352,12 +347,9 @@ impl Handler<Packet> for WtChatSession {
             self.logic.id,
             self.logic.room
         );
-        self.logic.addr.do_send(ClientMessage {
-            session: self.logic.id,
-            user: self.logic.email.clone(),
-            room: self.logic.room.clone(),
-            msg,
-        });
+        self.logic
+            .addr
+            .do_send(self.logic.create_client_message(msg));
     }
 }
 
@@ -371,21 +363,8 @@ impl WtChatSession {
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {
-                match response {
-                    Ok(Ok(())) => {
-                        info!(
-                            "Successfully joined room {} for session {}",
-                            act.logic.room, act.logic.id
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        error!("Failed to join room: {}", e);
-                        ctx.stop();
-                    }
-                    Err(err) => {
-                        error!("Error sending JoinRoom: {:?}", err);
-                        ctx.stop();
-                    }
+                if act.logic.handle_join_room_result(response) {
+                    ctx.stop();
                 }
                 fut::ready(())
             })

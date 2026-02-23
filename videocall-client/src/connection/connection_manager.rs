@@ -218,7 +218,6 @@ impl ConnectionManager {
         for (i, url) in self.options.webtransport_urls.iter().enumerate() {
             let conn_id = format!("wt_{i}");
             let connect_options = ConnectOptions {
-                userid: self.options.userid.clone(),
                 websocket_url: String::new(), // Not used for WebTransport
                 webtransport_url: url.clone(),
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),

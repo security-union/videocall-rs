@@ -290,12 +290,7 @@ jobs:
               issue_number: prNumber,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `❌ **Image build failed**
+              body: `❌ **Build failed**
 
-            One or more images failed to build. Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
-
-            Build results:
-            - API: ${{ needs.build-api.result }}
-            - Meeting API: ${{ needs.build-meeting-api.result }}
-            - UI: ${{ needs.build-ui.result }}`
+            Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
             })

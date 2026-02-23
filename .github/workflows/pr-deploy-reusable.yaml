@@ -655,12 +655,14 @@ jobs:
           # Delete namespace (cascades to all resources)
           kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
 
-          # Drop database
+          # Drop database (ignore errors - database might not exist)
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
-          kubectl exec -n default postgres-postgresql-0 -- \
-            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" || {
-              echo "⚠️  Failed to drop database, may need manual cleanup"
-            }
+          if kubectl exec -n default postgres-postgresql-0 -- \
+            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" 2>&1; then
+            echo "✅ Database dropped for slot ${SLOT}"
+          else
+            echo "⚠️ Failed to drop database (may not exist or already dropped)"
+          fi
 
           echo "✅ Cleanup complete for slot ${SLOT}"
 
@@ -674,14 +676,7 @@ jobs:
               issue_number: prNumber,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `❌ **Preview deployment failed**
-
-            The deployment encountered an error and has been cleaned up.
-
-            **Common issues:**
-            - GHCR images not found (run \`/build-images\` first)
-            - Wildcard TLS certificate not configured
-            - Capacity limit reached (max 3 concurrent previews)
+              body: `❌ **Deployment failed**
 
             Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
             });

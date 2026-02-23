@@ -104,7 +104,7 @@ pub struct ListMeetingsResponse {
 }
 
 /// Single meeting entry inside [`ListMeetingsResponse`].
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct MeetingSummary {
     pub meeting_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]

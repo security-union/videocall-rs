@@ -2,12 +2,10 @@
 <html class="dark">
     <head>
         <meta charset="utf-8" />
-        <title>videocall.rs (Yew)</title>
+        <title>videocall.rs (Dioxus)</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
         <link data-trunk rel="copy-dir" href="./assets" />
-        <!-- TODO: Uncomment this when we have a way to pass features to the build -->
-        <!-- <link data-trunk rel="rust" href="Cargo.toml" data-cargo-features="fake-peers" data-cargo-no-default-features /> -->
-        <link data-trunk rel="rust" href="Cargo.toml"/> 
+        <link data-trunk rel="rust" href="Cargo.toml"/>
         <link data-trunk rel="css" href="./static/leptos-style.css" />
         <link data-trunk rel="css" href="./static/tailwind.css" />
         <link data-trunk rel="css" href="./static/style.css" />
@@ -28,7 +26,7 @@
             data-cargo-features="wasm"
             data-cargo-no-default-features
             data-loader-shim
-        /> 
+        />
         <!-- Runtime link so the wasm decoder can find the built worker URL -->
         <link id="codecs-worker" href="/worker_decoder_loader.js" />
         <!-- NetEq worker -->
@@ -48,28 +46,27 @@
         <!-- MediaStreamTrackProcessor polyfill using LiveKit's approach:
              Creates VideoFrame directly from video element instead of canvas copy.
              See: https://github.com/livekit/track-processors-js/pull/65 -->
-        <script>	
-            if (!self.MediaStreamTrackProcessor) {	
+        <script>
+            if (!self.MediaStreamTrackProcessor) {
             self.MediaStreamTrackProcessor = class MediaStreamTrackProcessor {
-                constructor({track}) {	
-                if (track.kind == "video") {	
-                    this.readable = new ReadableStream({	
-                    async start(controller) {	
+                constructor({track}) {
+                if (track.kind == "video") {
+                    this.readable = new ReadableStream({
+                    async start(controller) {
                         this.video = document.createElement("video");
                         this.video.muted = true;
-                        this.video.srcObject = new MediaStream([track]);	
+                        this.video.srcObject = new MediaStream([track]);
                         await Promise.all([
                             this.video.play(),
                             new Promise(r => this.video.onloadedmetadata = r)
                         ]);
-                        this.track = track;	
+                        this.track = track;
 
                         if (!this.video.videoWidth || !this.video.videoHeight) {
                             console.warn("Video dimensions not available after metadata load");
                         }
 
                         // Try direct VideoFrame from video element (LiveKit approach)
-                        // This may be faster than canvas copy in some browsers
                         const supportsDirectVideoFrame = (() => {
                             try {
                                 const testFrame = new VideoFrame(this.video);
@@ -82,10 +79,9 @@
 
                         if (supportsDirectVideoFrame) {
                             console.log("Using direct VideoFrame(video) - LiveKit approach");
-                            
-                            // Track last video time to avoid duplicate frames
+
                             let lastVideoTime = -1;
-                            
+
                             if (this.video.requestVideoFrameCallback) {
                                 console.log("Using requestVideoFrameCallback with direct VideoFrame");
                                 const processFrame = (now, metadata) => {
@@ -94,12 +90,10 @@
                                         return;
                                     }
 
-                                    // Only process if video has new frame
                                     const currentTime = this.video.currentTime;
                                     if (currentTime !== lastVideoTime) {
                                         lastVideoTime = currentTime;
                                         try {
-                                            // Create VideoFrame directly from video element
                                             const frame = new VideoFrame(this.video, {
                                                 timestamp: metadata.mediaTime * 1e6
                                             });
@@ -144,10 +138,9 @@
                                 requestAnimationFrame(processFrameRAF);
                             }
                         } else {
-                            // Fallback: Canvas-based approach (original polyfill)
                             console.log("Using canvas-based polyfill (direct VideoFrame not supported)");
                             this.canvas = new OffscreenCanvas(
-                                this.video.videoWidth || 640, 
+                                this.video.videoWidth || 640,
                                 this.video.videoHeight || 480
                             );
                             this.ctx = this.canvas.getContext('2d', {desynchronized: true});
@@ -157,7 +150,7 @@
                                     if (!controller.desiredSize) return;
                                     try {
                                         if (this.video.videoWidth && this.video.videoHeight) {
-                                            if (this.canvas.width !== this.video.videoWidth || 
+                                            if (this.canvas.width !== this.video.videoWidth ||
                                                 this.canvas.height !== this.video.videoHeight) {
                                                 this.canvas.width = this.video.videoWidth;
                                                 this.canvas.height = this.video.videoHeight;
@@ -188,7 +181,7 @@
                                         lastTimestamp = timestamp;
                                         try {
                                             if (this.video.videoWidth && this.video.videoHeight) {
-                                                if (this.canvas.width !== this.video.videoWidth || 
+                                                if (this.canvas.width !== this.video.videoWidth ||
                                                     this.canvas.height !== this.video.videoHeight) {
                                                     this.canvas.width = this.video.videoWidth;
                                                     this.canvas.height = this.video.videoHeight;
@@ -209,116 +202,117 @@
                                 requestAnimationFrame(processFrameRAF);
                             }
                         }
-                    },	
+                    },
                     cancel(reason) {
                         console.log("Video track processor cancelled:", reason);
                         if (this.video) {
                             this.video.pause();
                             this.video.srcObject = null;
                         }
-                    }	
-                    });	
-                } else if (track.kind == "audio") {	
-                    this.readable = new ReadableStream({	
-                    async start(controller) {	
-                        this.ac = new AudioContext;	
-                        this.arrays = [];	
-                        function worklet() {	
-                        registerProcessor("mstp-shim", class Processor extends AudioWorkletProcessor {	
-                            process(input) { this.port.postMessage(input); return true; }	
-                        });	
-                        }	
-                        await this.ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);	
-                        this.node = new AudioWorkletNode(this.ac, "mstp-shim");	
-                        this.ac.createMediaStreamSource(new MediaStream([track])).connect(this.node);	
-                        this.node.port.addEventListener("message", ({data}) => data[0][0] && this.arrays.push(data));	
-                    },	
-                    async pull(controller) {	
-                        while (!this.arrays.length) await new Promise(r => this.node.port.onmessage = r);	
-                        const [channels] = this.arrays.shift();	
-                        const joined = new Float32Array(channels.reduce((a, b) => a + b.length, 0));	
-                        channels.reduce((offset, a) => (joined.set(a, offset), offset + a.length), 0);	
-                        controller.enqueue(new AudioData({	
-                        format: "f32-planar",	
-                        sampleRate: this.ac.sampleRate,	
-                        numberOfFrames: channels[0].length,	
-                        numberOfChannels: channels.length,	
-                        timestamp: this.ac.currentTime * 1e6 | 0,	
-                        data: joined,	
-                        transfer: [joined.buffer]	
-                        }));	
-                    }	
-                    });	
-                }	
-                }	
-            };	
-            }	
-        </script>	
-        <!-- MediaStreamTrackGenerator polyfill -->	
-        <script>	
-            if (!window.MediaStreamTrackGenerator) {	
-            window.MediaStreamTrackGenerator = class MediaStreamTrackGenerator {	
-                constructor({kind}) {	
-                if (kind == "video") {	
-                    const canvas = document.createElement("canvas");	
-                    const ctx = canvas.getContext('2d', {desynchronized: true});	
-                    const track = canvas.captureStream().getVideoTracks()[0];	
-                    track.writable = new WritableStream({	
-                    write(frame) {	
-                        canvas.width = frame.displayWidth;	
-                        canvas.height = frame.displayHeight;	
-                        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);	
-                        frame.close();	
-                    }	
-                    });	
-                    return track;	
-                } else if (kind == "audio") {	
-                    const ac = new AudioContext;	
-                    const dest = ac.createMediaStreamDestination();	
-                    const [track] = dest.stream.getAudioTracks();	
-                    track.writable = new WritableStream({	
-                    async start(controller) {	
-                        this.arrays = [];	
-                        function worklet() {	
-                        registerProcessor("mstg-shim", class Processor extends AudioWorkletProcessor {	
-                            constructor() {	
-                            super();	
-                            this.arrays = [];	
-                            this.arrayOffset = 0;	
-                            this.port.onmessage = ({data}) => this.arrays.push(data);	
-                            this.emptyArray = new Float32Array(0);	
-                            }	
-                            process(inputs, [[output]]) {	
-                            for (let i = 0; i < output.length; i++) {	
-                                if (!this.array || this.arrayOffset >= this.array.length) {	
-                                this.array = this.arrays.shift() || this.emptyArray;	
-                                this.arrayOffset = 0;	
-                                }	
-                                output[i] = this.array[this.arrayOffset++] || 0;	
-                            }	
-                            return true;	
-                            }	
-                        });	
-                        }	
-                        await ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);	
-                        this.node = new AudioWorkletNode(ac, "mstg-shim");	
-                        this.node.connect(dest);	
-                        return track;	
-                    },	
-                    write(audioData) {	
-                        const array = new Float32Array(audioData.numberOfFrames * audioData.numberOfChannels);	
-                        audioData.copyTo(array, {planeIndex: 0});	
-                        this.node.port.postMessage(array, [array.buffer]);	
-                        audioData.close();	
-                    }	
-                    });	
-                    return track;	
-                }	
-                }	
-            };	
-            }	
+                    }
+                    });
+                } else if (track.kind == "audio") {
+                    this.readable = new ReadableStream({
+                    async start(controller) {
+                        this.ac = new AudioContext;
+                        this.arrays = [];
+                        function worklet() {
+                        registerProcessor("mstp-shim", class Processor extends AudioWorkletProcessor {
+                            process(input) { this.port.postMessage(input); return true; }
+                        });
+                        }
+                        await this.ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);
+                        this.node = new AudioWorkletNode(this.ac, "mstp-shim");
+                        this.ac.createMediaStreamSource(new MediaStream([track])).connect(this.node);
+                        this.node.port.addEventListener("message", ({data}) => data[0][0] && this.arrays.push(data));
+                    },
+                    async pull(controller) {
+                        while (!this.arrays.length) await new Promise(r => this.node.port.onmessage = r);
+                        const [channels] = this.arrays.shift();
+                        const joined = new Float32Array(channels.reduce((a, b) => a + b.length, 0));
+                        channels.reduce((offset, a) => (joined.set(a, offset), offset + a.length), 0);
+                        controller.enqueue(new AudioData({
+                        format: "f32-planar",
+                        sampleRate: this.ac.sampleRate,
+                        numberOfFrames: channels[0].length,
+                        numberOfChannels: channels.length,
+                        timestamp: this.ac.currentTime * 1e6 | 0,
+                        data: joined,
+                        transfer: [joined.buffer]
+                        }));
+                    }
+                    });
+                }
+                }
+            };
+            }
+        </script>
+        <!-- MediaStreamTrackGenerator polyfill -->
+        <script>
+            if (!window.MediaStreamTrackGenerator) {
+            window.MediaStreamTrackGenerator = class MediaStreamTrackGenerator {
+                constructor({kind}) {
+                if (kind == "video") {
+                    const canvas = document.createElement("canvas");
+                    const ctx = canvas.getContext('2d', {desynchronized: true});
+                    const track = canvas.captureStream().getVideoTracks()[0];
+                    track.writable = new WritableStream({
+                    write(frame) {
+                        canvas.width = frame.displayWidth;
+                        canvas.height = frame.displayHeight;
+                        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                        frame.close();
+                    }
+                    });
+                    return track;
+                } else if (kind == "audio") {
+                    const ac = new AudioContext;
+                    const dest = ac.createMediaStreamDestination();
+                    const [track] = dest.stream.getAudioTracks();
+                    track.writable = new WritableStream({
+                    async start(controller) {
+                        this.arrays = [];
+                        function worklet() {
+                        registerProcessor("mstg-shim", class Processor extends AudioWorkletProcessor {
+                            constructor() {
+                            super();
+                            this.arrays = [];
+                            this.arrayOffset = 0;
+                            this.port.onmessage = ({data}) => this.arrays.push(data);
+                            this.emptyArray = new Float32Array(0);
+                            }
+                            process(inputs, [[output]]) {
+                            for (let i = 0; i < output.length; i++) {
+                                if (!this.array || this.arrayOffset >= this.array.length) {
+                                this.array = this.arrays.shift() || this.emptyArray;
+                                this.arrayOffset = 0;
+                                }
+                                output[i] = this.array[this.arrayOffset++] || 0;
+                            }
+                            return true;
+                            }
+                        });
+                        }
+                        await ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);
+                        this.node = new AudioWorkletNode(ac, "mstg-shim");
+                        this.node.connect(dest);
+                        return track;
+                    },
+                    write(audioData) {
+                        const array = new Float32Array(audioData.numberOfFrames * audioData.numberOfChannels);
+                        audioData.copyTo(array, {planeIndex: 0});
+                        this.node.port.postMessage(array, [array.buffer]);
+                        audioData.close();
+                    }
+                    });
+                    return track;
+                }
+                }
+            };
+            }
         </script>
     </head>
     <body class="bg-background text-foreground">
+        <div id="main"></div>
     </body>
 </html>

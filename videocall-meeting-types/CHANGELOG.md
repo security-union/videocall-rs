@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/security-union/videocall-rs/compare/videocall-meeting-types-v0.1.1...videocall-meeting-types-v0.1.2) - 2026-02-23
+
+### Other
+
+- dioxus UI client ([#646](https://github.com/security-union/videocall-rs/pull/646))
+
 ## [0.1.1](https://github.com/security-union/videocall-rs/compare/videocall-meeting-types-v0.1.0...videocall-meeting-types-v0.1.1) - 2026-02-15
 
 ### Other

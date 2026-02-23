@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.5](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.4...videocall-client-v4.0.5) - 2026-02-23
+
+### Other
+
+- Same-display-name peers can't see each other (Closes #412) ([#649](https://github.com/security-union/videocall-rs/pull/649))
+- Fix dioxus crate name and lint ([#652](https://github.com/security-union/videocall-rs/pull/652))
+
+## [4.0.4](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.3...videocall-client-v4.0.4) - 2026-02-23
+
+### Other
+
+- dioxus UI client ([#646](https://github.com/security-union/videocall-rs/pull/646))
+
+## [4.0.3](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.2...videocall-client-v4.0.3) - 2026-02-19
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [4.0.2](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.1...videocall-client-v4.0.2) - 2026-02-19
 
 ### Other

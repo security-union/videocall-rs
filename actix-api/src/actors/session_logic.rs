@@ -25,7 +25,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::{classify_packet, PacketKind};
 use crate::client_diagnostics::health_processor;
-use crate::messages::server::{Connect, Disconnect, JoinRoom};
+use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
@@ -33,12 +33,21 @@ use crate::server_diagnostics::{
 use crate::session_manager::SessionManager;
 use actix::Addr;
 use std::sync::Arc;
-use tracing::{info, trace};
+use tracing::{error, info, trace};
 use uuid::Uuid;
 
-pub type SessionId = String;
+pub type SessionId = u64;
 pub type RoomId = String;
 pub type Email = String;
+
+/// Connection state for session management during election
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Connection is in testing phase (during election)
+    Testing,
+    /// Connection is active and should broadcast to NATS
+    Active,
+}
 
 /// Result of handling an inbound packet
 #[derive(Debug)]
@@ -59,7 +68,7 @@ pub enum InboundAction {
 /// The transport-specific actors (`WsChatSession`, `WtChatSession`)
 /// own an instance of this and delegate to it.
 pub struct SessionLogic {
-    pub id: SessionId,
+    pub id: u64,
     pub room: RoomId,
     pub email: Email,
     pub addr: Addr<ChatServer>,
@@ -78,7 +87,7 @@ impl SessionLogic {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
     ) -> Self {
-        let id = Uuid::new_v4().to_string();
+        let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
             "new session: room={} email={} session_id={}",
             room, email, id
@@ -103,7 +112,7 @@ impl SessionLogic {
     pub fn track_connection_start(&self, transport: &str) {
         send_connection_started(
             &self.tracker_sender,
-            self.id.clone(),
+            self.id,
             self.email.clone(),
             self.room.clone(),
             transport.to_string(),
@@ -113,6 +122,11 @@ impl SessionLogic {
     /// Build MEETING_STARTED packet
     pub fn build_meeting_started(&self, start_time_ms: u64, creator_id: &str) -> Vec<u8> {
         SessionManager::build_meeting_started_packet(&self.room, start_time_ms, creator_id)
+    }
+
+    /// Build SESSION_ASSIGNED packet for this session
+    pub fn build_session_assigned(&self) -> Vec<u8> {
+        SessionManager::build_session_assigned_packet(self.id)
     }
 
     /// Build MEETING_ENDED packet (for errors)
@@ -126,7 +140,7 @@ impl SessionLogic {
         R: Into<actix::Recipient<Message>>,
     {
         Connect {
-            id: self.id.clone(),
+            id: self.id,
             addr: recipient.into(),
         }
     }
@@ -135,17 +149,51 @@ impl SessionLogic {
     pub fn create_join_room_message(&self) -> JoinRoom {
         JoinRoom {
             room: self.room.clone(),
-            session: self.id.clone(),
+            session: self.id,
             user_id: self.email.clone(),
+        }
+    }
+
+    /// Create ClientMessage for forwarding a packet to ChatServer (NATS broadcast).
+    pub fn create_client_message(&self, msg: Packet) -> ClientMessage {
+        ClientMessage {
+            session: self.id,
+            user: self.email.clone(),
+            room: self.room.clone(),
+            msg,
+        }
+    }
+
+    /// Handle JoinRoom response. Returns true if the session should stop (error case).
+    pub fn handle_join_room_result(
+        &self,
+        result: Result<Result<(), String>, actix::MailboxError>,
+    ) -> bool {
+        match result {
+            Ok(Ok(())) => {
+                info!(
+                    "Successfully joined room {} for session {}",
+                    self.room, self.id
+                );
+                false
+            }
+            Ok(Err(e)) => {
+                error!("Failed to join room: {}", e);
+                true
+            }
+            Err(err) => {
+                error!("Error sending JoinRoom: {:?}", err);
+                true
+            }
         }
     }
 
     /// Handle actor stopping - cleanup
     pub fn on_stopping(&self) {
         info!("Session stopping: {} in room {}", self.id, self.room);
-        send_connection_ended(&self.tracker_sender, self.id.clone());
+        send_connection_ended(&self.tracker_sender, self.id);
         self.addr.do_send(Disconnect {
-            session: self.id.clone(),
+            session: self.id,
             room: self.room.clone(),
             user_id: self.email.clone(),
         });
@@ -155,20 +203,26 @@ impl SessionLogic {
     // Packet Handling
     // =========================================================================
 
+    /// Returns true if this action should trigger connection activation.
+    /// RTT probes (Echo) do not activate; any other packet does.
+    pub fn should_activate_on_action(action: &InboundAction) -> bool {
+        !matches!(action, InboundAction::Echo(_))
+    }
+
     /// Handle an inbound packet from the client.
     ///
     /// Returns the action the transport should take.
     pub fn handle_inbound(&self, data: &[u8]) -> InboundAction {
         // Track received data
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
-        data_tracker.track_received(&self.id, data.len() as u64);
+        data_tracker.track_received(self.id, data.len() as u64);
 
         // Classify and handle
         match classify_packet(data) {
             PacketKind::Rtt => {
                 trace!("RTT packet from {}, echoing back", self.email);
                 let data_tracker = DataTracker::new(self.tracker_sender.clone());
-                data_tracker.track_sent(&self.id, data.len() as u64);
+                data_tracker.track_sent(self.id, data.len() as u64);
                 InboundAction::Echo(Arc::new(data.to_vec()))
             }
             PacketKind::Health => {
@@ -185,7 +239,7 @@ impl SessionLogic {
     /// Returns the bytes to send and tracks metrics.
     pub fn handle_outbound(&self, msg: &Message) -> Vec<u8> {
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
-        data_tracker.track_sent(&self.id, msg.msg.len() as u64);
+        data_tracker.track_sent(self.id, msg.msg.len() as u64);
         msg.msg.clone()
     }
 }

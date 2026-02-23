@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.41](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.40...videocall-ui-v1.1.41) - 2026-02-23
+
+### Other
+
+- Same-display-name peers can't see each other (Closes #412) ([#649](https://github.com/security-union/videocall-rs/pull/649))
+
+## [1.1.40](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.39...videocall-ui-v1.1.40) - 2026-02-23
+
+### Other
+
+- dioxus UI client ([#646](https://github.com/security-union/videocall-rs/pull/646))
+
+## [1.1.39](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.38...videocall-ui-v1.1.39) - 2026-02-19
+
+### Other
+
+- yew-ui ([#635](https://github.com/security-union/videocall-rs/pull/635))
+
 ## [1.1.38](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.37...videocall-ui-v1.1.38) - 2026-02-19
 
 ### Other

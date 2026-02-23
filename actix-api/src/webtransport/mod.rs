@@ -753,7 +753,7 @@ mod tests {
         assert_eq!(sent_packet.data, received_packet.data, "data must match");
         // Verify that server added session_id (it should not be empty)
         assert!(
-            !received_packet.session_id.is_empty(),
+            received_packet.session_id != 0,
             "server should add session_id"
         );
 

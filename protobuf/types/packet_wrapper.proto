@@ -12,16 +12,9 @@ message PacketWrapper {
     MEETING = 7;
     SESSION_ASSIGNED = 8;
   }
-
-  enum ConnectionPhase {
-    CONNECTION_PHASE_UNSPECIFIED = 0;  // Old clients → treat as active (backward compat)
-    PROBING = 1;
-    ACTIVE = 2;
-  }
   
   PacketType packet_type = 1;
   string email = 2;
   bytes data = 3;
-  string session_id = 4;
-  ConnectionPhase connection_phase = 5;
+  uint64 session_id = 4;
 }

@@ -68,7 +68,7 @@ pub enum InboundAction {
 /// The transport-specific actors (`WsChatSession`, `WtChatSession`)
 /// own an instance of this and delegate to it.
 pub struct SessionLogic {
-    pub id: SessionId,
+    pub id: u64,
     pub room: RoomId,
     pub email: Email,
     pub addr: Addr<ChatServer>,
@@ -87,7 +87,7 @@ impl SessionLogic {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
     ) -> Self {
-        let id = Uuid::new_v4().to_string();
+        let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
             "new session: room={} email={} session_id={}",
             room, email, id

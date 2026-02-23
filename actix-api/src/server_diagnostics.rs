@@ -34,20 +34,20 @@ use videocall_types::protos::server_connection_packet::{
 #[derive(Debug, Clone)]
 pub enum TrackerMessage {
     ConnectionStarted {
-        session_id: String,
+        session_id: u64,
         customer_email: String,
         meeting_id: String,
         protocol: String,
     },
     ConnectionEnded {
-        session_id: String,
+        session_id: u64,
     },
     DataSent {
-        session_id: String,
+        session_id: u64,
         bytes: u64,
     },
     DataReceived {
-        session_id: String,
+        session_id: u64,
         bytes: u64,
     },
 }
@@ -63,7 +63,7 @@ pub type TrackerSender = mpsc::UnboundedSender<TrackerMessage>;
 /// Convenience functions for sending tracker messages
 pub fn send_connection_started(
     sender: &TrackerSender,
-    session_id: String,
+    session_id: u64,
     customer_email: String,
     meeting_id: String,
     protocol: String,
@@ -76,7 +76,7 @@ pub fn send_connection_started(
     });
 }
 
-pub fn send_connection_ended(sender: &TrackerSender, session_id: String) {
+pub fn send_connection_ended(sender: &TrackerSender, session_id: u64) {
     let _ = sender.send(TrackerMessage::ConnectionEnded { session_id });
 }
 
@@ -86,23 +86,21 @@ impl DataTracker {
     }
 
     /// Track received data and update metrics
-    pub fn track_received(&self, session_id: &str, bytes: u64) {
-        let _ = self.sender.send(TrackerMessage::DataReceived {
-            session_id: session_id.to_string(),
-            bytes,
-        });
+    pub fn track_received(&self, session_id: u64, bytes: u64) {
+        let _ = self
+            .sender
+            .send(TrackerMessage::DataReceived { session_id, bytes });
     }
 
     /// Track sent data and update metrics
-    pub fn track_sent(&self, session_id: &str, bytes: u64) {
-        let _ = self.sender.send(TrackerMessage::DataSent {
-            session_id: session_id.to_string(),
-            bytes,
-        });
+    pub fn track_sent(&self, session_id: u64, bytes: u64) {
+        let _ = self
+            .sender
+            .send(TrackerMessage::DataSent { session_id, bytes });
     }
 
     /// Track echo (received + sent in one call)
-    pub fn track_echo(&self, session_id: &str, bytes: u64) {
+    pub fn track_echo(&self, session_id: u64, bytes: u64) {
         self.track_received(session_id, bytes);
         self.track_sent(session_id, bytes);
     }
@@ -110,7 +108,7 @@ impl DataTracker {
 
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
-    pub session_id: String,
+    pub session_id: u64,
     pub customer_email: String,
     pub meeting_id: String,
     pub protocol: String, // "websocket", "webtransport", "quic"
@@ -135,7 +133,7 @@ fn get_reporting_interval() -> Duration {
 
 #[derive(Debug)]
 pub struct ServerDiagnostics {
-    connections: Mutex<HashMap<String, ConnectionInfo>>,
+    connections: Mutex<HashMap<u64, ConnectionInfo>>,
     // (customer_email, meeting_id) -> reconnection_count
     reconnections: Mutex<HashMap<(String, String), u64>>,
     nats_client: Client,
@@ -187,13 +185,13 @@ impl ServerDiagnostics {
     /// Create connection metadata
     fn create_metadata(
         &self,
-        session_id: &str,
+        session_id: u64,
         customer_email: &str,
         meeting_id: &str,
         protocol: &str,
     ) -> ConnectionMetadata {
         let mut metadata = ConnectionMetadata::new();
-        metadata.session_id = session_id.to_string();
+        metadata.session_id = session_id;
         metadata.customer_email = customer_email.to_string();
         metadata.meeting_id = meeting_id.to_string();
         metadata.protocol = protocol.to_string();
@@ -233,7 +231,7 @@ impl ServerDiagnostics {
     /// Track a new connection starting
     pub fn connection_started(
         &self,
-        session_id: String,
+        session_id: u64,
         customer_email: String,
         meeting_id: String,
         protocol: String,
@@ -255,7 +253,7 @@ impl ServerDiagnostics {
 
         let now = Instant::now();
         let info = ConnectionInfo {
-            session_id: session_id.clone(),
+            session_id,
             customer_email: customer_email.clone(),
             meeting_id: meeting_id.clone(),
             protocol: protocol.clone(),
@@ -264,7 +262,7 @@ impl ServerDiagnostics {
             bytes_received: 0,
             last_data_report: now,
         };
-        connections.insert(session_id.clone(), info);
+        connections.insert(session_id, info);
 
         debug!(
             "Connection started: session={}, customer={}, meeting={}, protocol={}",
@@ -272,7 +270,7 @@ impl ServerDiagnostics {
         );
 
         // Publish connection started event
-        let metadata = self.create_metadata(&session_id, &customer_email, &meeting_id, &protocol);
+        let metadata = self.create_metadata(session_id, &customer_email, &meeting_id, &protocol);
         let mut packet = ServerConnectionPacket::new();
         packet.event_type = EventType::CONNECTION_STARTED.into();
         packet.timestamp_ms = Self::current_timestamp_ms();
@@ -306,7 +304,7 @@ impl ServerDiagnostics {
     }
 
     /// Track a connection ending
-    pub fn connection_ended(&self, session_id: &str) {
+    pub fn connection_ended(&self, session_id: u64) {
         let mut connections = self.connections.lock().unwrap();
         if let Some(info) = connections.remove(session_id) {
             let duration_ms = info.start_time.elapsed().as_millis() as u64;
@@ -318,7 +316,7 @@ impl ServerDiagnostics {
 
             // Publish connection ended event
             let metadata = self.create_metadata(
-                &info.session_id,
+                info.session_id,
                 &info.customer_email,
                 &info.meeting_id,
                 &info.protocol,
@@ -360,22 +358,22 @@ impl ServerDiagnostics {
                 }
             });
         } else {
-            debug!("Connection ended for unknown session_id: {}", session_id);
+            debug!("Connection ended for unknown session_id: {session_id}");
         }
     }
 
     /// Track data sent through a connection
-    pub fn track_data_sent(&self, session_id: &str, bytes: u64) {
+    pub fn track_data_sent(&self, session_id: u64, bytes: u64) {
         let mut connections = self.connections.lock().unwrap();
-        if let Some(info) = connections.get_mut(session_id) {
+        if let Some(info) = connections.get_mut(&session_id) {
             info.bytes_sent += bytes;
         }
     }
 
     /// Track data received through a connection
-    pub fn track_data_received(&self, session_id: &str, bytes: u64) {
+    pub fn track_data_received(&self, session_id: u64, bytes: u64) {
         let mut connections = self.connections.lock().unwrap();
-        if let Some(info) = connections.get_mut(session_id) {
+        if let Some(info) = connections.get_mut(&session_id) {
             info.bytes_received += bytes;
         }
     }
@@ -430,13 +428,13 @@ impl ServerDiagnostics {
                 self.connection_started(session_id, customer_email, meeting_id, protocol);
             }
             TrackerMessage::ConnectionEnded { session_id } => {
-                self.connection_ended(&session_id);
+                self.connection_ended(session_id);
             }
             TrackerMessage::DataSent { session_id, bytes } => {
-                self.track_data_sent(&session_id, bytes);
+                self.track_data_sent(session_id, bytes);
             }
             TrackerMessage::DataReceived { session_id, bytes } => {
-                self.track_data_received(&session_id, bytes);
+                self.track_data_received(session_id, bytes);
             }
         }
     }
@@ -454,7 +452,7 @@ impl ServerDiagnostics {
 
             if should_report {
                 let metadata = self.create_metadata(
-                    &info.session_id,
+                    info.session_id,
                     &info.customer_email,
                     &info.meeting_id,
                     &info.protocol,

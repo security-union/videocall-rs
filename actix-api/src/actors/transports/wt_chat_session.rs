@@ -37,7 +37,6 @@ use protobuf::Message as ProtobufMessage;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
-use videocall_types::protos::packet_wrapper::packet_wrapper::ConnectionPhase;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{Email, RoomId, SessionId};
@@ -192,12 +191,12 @@ impl Actor for WtChatSession {
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
         let email = self.logic.email.clone();
-        let session_id = self.logic.id.clone();
+        let session_id = self.logic.id;
 
         ctx.wait(
             async move {
                 session_manager
-                    .start_session(&room, &email, &session_id)
+                    .start_session(&room, &email, session_id)
                     .await
             }
             .into_actor(self)

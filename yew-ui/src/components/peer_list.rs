@@ -105,8 +105,7 @@ impl Component for PeerList {
 
         let display_name = current_user_name
             .clone()
-            .map(|name| format!("{name} (You)"))
-            .unwrap_or_else(|| "(You)".to_string());
+            .unwrap_or_default();
 
         // Check if current user is host by comparing display names
         let host_display_name = ctx.props().host_display_name.clone();
@@ -195,7 +194,7 @@ impl Component for PeerList {
                         <div class="peer-list">
                             <ul>
                                 // show self as the first item with actual username
-                                <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} /></li>
+                                <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} is_you={true} /></li>
 
                                 { for filtered_peers.iter().map(|peer| {
                                     let is_peer_host = host_display_name.as_ref()

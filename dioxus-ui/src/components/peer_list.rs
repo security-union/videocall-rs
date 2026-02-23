@@ -47,8 +47,7 @@ pub fn PeerList(
 
     let display_name = current_user_name
         .clone()
-        .map(|name| format!("{name} (You)"))
-        .unwrap_or_else(|| "(You)".to_string());
+        .unwrap_or_default();
 
     // Check if current user is host
     let is_current_user_host = host_display_name
@@ -144,7 +143,7 @@ pub fn PeerList(
                     div { class: "peer-list",
                         ul {
                             // show self as the first item with actual username
-                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host } }
+                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_you: true } }
 
                             for peer in filtered_peers.iter() {
                                 li {

@@ -16,7 +16,6 @@
  * conditions.
  */
 
-use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::peer::PeerIcon;
 use yew::prelude::*;
 use yew::{html, Component, Html};
@@ -28,6 +27,8 @@ pub struct PeerListItemProps {
     pub name: String,
     #[prop_or_default]
     pub is_host: bool,
+    #[prop_or_default]
+    pub is_you: bool,
 }
 
 impl Component for PeerListItem {
@@ -42,10 +43,18 @@ impl Component for PeerListItem {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let name = ctx.props().name.clone();
         let is_host = ctx.props().is_host;
+        let is_you = ctx.props().is_you;
         let title = if is_host {
             format!("Host: {name}")
         } else {
             name.clone()
+        };
+
+        let indicator = match (is_you, is_host) {
+            (true, true) => Some("(You/Host)"),
+            (true, false) => Some("(You)"),
+            (false, true) => Some("(Host)"),
+            (false, false) => None,
         };
 
         html! {
@@ -55,8 +64,10 @@ impl Component for PeerListItem {
                 </div>
                 <div class="peer_item_text">
                     {name}
-                    if is_host {
-                        <CrownIcon />
+                    if let Some(label) = indicator {
+                        <span class="host-indicator" style="color: #888; font-size: 0.85em; margin-left: 4px;">
+                            {label}
+                        </span>
                     }
                 </div>
             </div>

@@ -16,16 +16,26 @@
  * conditions.
  */
 
-use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::peer::PeerIcon;
 use dioxus::prelude::*;
 
 #[component]
-pub fn PeerListItem(name: String, #[props(default)] is_host: bool) -> Element {
+pub fn PeerListItem(
+    name: String,
+    #[props(default)] is_host: bool,
+    #[props(default)] is_you: bool,
+) -> Element {
     let title = if is_host {
         format!("Host: {name}")
     } else {
         name.clone()
+    };
+
+    let indicator = match (is_you, is_host) {
+        (true, true) => Some("(You/Host)"),
+        (true, false) => Some("(You)"),
+        (false, true) => Some("(Host)"),
+        (false, false) => None,
     };
 
     rsx! {
@@ -35,8 +45,12 @@ pub fn PeerListItem(name: String, #[props(default)] is_host: bool) -> Element {
             }
             div { class: "peer_item_text",
                 "{name}"
-                if is_host {
-                    CrownIcon {}
+                if let Some(label) = indicator {
+                    span {
+                        class: "host-indicator",
+                        style: "color: #888; font-size: 0.85em; margin-left: 4px;",
+                        "{label}"
+                    }
                 }
             }
         }

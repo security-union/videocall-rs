@@ -550,7 +550,7 @@ impl PeerDecodeManager {
         self.on_peer_removed.emit(session_id.clone());
     }
 
-    pub fn ensure_peer(&mut self, session_id: &String, email: &String) -> PeerStatus {
+    pub fn ensure_peer(&mut self, session_id: &String, email: &str) -> PeerStatus {
         if self.connected_peers.contains_key(session_id) {
             PeerStatus::NoChange
         } else if let Err(e) = self.add_peer(email, session_id, None) {

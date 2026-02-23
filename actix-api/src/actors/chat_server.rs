@@ -38,14 +38,21 @@ use videocall_types::SYSTEM_USER_EMAIL;
 
 use super::session_logic::{ConnectionState, RoomId, SessionId};
 
-/// Internal message to clean up active_subs and room_members when a spawned join task fails.
+/// Message to clean up active_subs and room_members when a spawned join task fails.
 /// This fixes a race condition where start_session could fail inside the spawned task,
 /// leaving a stale entry in active_subs that blocks future join attempts.
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
-struct CleanupFailedJoin {
-    session: SessionId,
-    room: RoomId,
+pub struct CleanupFailedJoin {
+    pub session: SessionId,
+    pub room: RoomId,
+}
+
+/// Query message to inspect which sessions are in a room.
+#[derive(ActixMessage)]
+#[rtype(result = "Option<HashMap<SessionId, String>>")]
+pub struct GetRoomMembers {
+    pub room: String,
 }
 
 pub struct ChatServer {
@@ -435,6 +442,14 @@ impl Handler<JoinRoom> for ChatServer {
         self.active_subs.insert(session, handle);
 
         MessageResult(Ok(()))
+    }
+}
+
+impl Handler<GetRoomMembers> for ChatServer {
+    type Result = Option<HashMap<SessionId, String>>;
+
+    fn handle(&mut self, msg: GetRoomMembers, _ctx: &mut Self::Context) -> Self::Result {
+        self.room_members.get(&msg.room).cloned()
     }
 }
 
@@ -1131,21 +1146,6 @@ mod tests {
                 .get(&msg.session)
                 .copied()
                 .unwrap_or(ConnectionState::Testing))
-        }
-    }
-
-    // Helper message to query room_members for testing
-    #[derive(ActixMessage)]
-    #[rtype(result = "Option<HashMap<SessionId, String>>")]
-    struct GetRoomMembers {
-        room: String,
-    }
-
-    impl Handler<GetRoomMembers> for ChatServer {
-        type Result = Option<HashMap<SessionId, String>>;
-
-        fn handle(&mut self, msg: GetRoomMembers, _ctx: &mut Self::Context) -> Self::Result {
-            self.room_members.get(&msg.room).cloned()
         }
     }
 

@@ -39,11 +39,8 @@ pub struct AppConfig {
     pub after_login_url: String,
 }
 
-/// Build NATS subject and queue name for room subscriptions
-/// Used by both WebSocket and WebTransport implementations
-pub fn build_subject_and_queue(room: &str, session: &str) -> (String, String) {
-    (
-        format!("room.{room}.*").replace(' ', "_"),
-        format!("{session}-{room}").replace(' ', "_"),
-    )
+/// Build NATS subject for room subscriptions.
+/// Used by both WebSocket and WebTransport implementations.
+pub fn build_room_subject(room: &str) -> String {
+    format!("room.{room}.*").replace(' ', "_")
 }

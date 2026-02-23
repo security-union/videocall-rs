@@ -47,7 +47,7 @@ impl ConnectionController {
             connection_manager,
         }));
 
-        let timers = Self::start_timers(Rc::downgrade(&inner));
+        let timers = Self::start_timers(Rc::downgrade(&inner), options.peer_monitor.clone());
 
         info!("ConnectionController created with all timers started");
         Ok(Self {
@@ -57,8 +57,17 @@ impl ConnectionController {
     }
 
     /// Start all necessary timers for connection management
-    fn start_timers(inner_weak: Weak<RefCell<ConnectionControllerInner>>) -> Vec<Interval> {
+    fn start_timers(
+        inner_weak: Weak<RefCell<ConnectionControllerInner>>,
+        peer_monitor: videocall_types::Callback<()>,
+    ) -> Vec<Interval> {
         let mut timers = Vec::new();
+
+        // Single 5-second peer monitor timer (instead of one per Connection)
+        let peer_monitor_cb = peer_monitor;
+        timers.push(Interval::new(5000, move || {
+            peer_monitor_cb.emit(());
+        }));
 
         // 1Hz diagnostics reporting timer
         let inner_ref = inner_weak.clone();

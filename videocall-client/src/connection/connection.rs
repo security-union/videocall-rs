@@ -45,7 +45,6 @@ enum Status {
 pub struct Connection {
     task: Rc<Task>,
     heartbeat: Option<Interval>,
-    heartbeat_monitor: Option<Interval>,
     status: Rc<Cell<Status>>,
     aes: Rc<Aes128State>,
     video_enabled: Rc<AtomicBool>,
@@ -82,15 +81,11 @@ impl Connection {
         };
         new_options.on_connection_lost = tap_callback(new_options.on_connection_lost, on_lost_tap);
 
-        let monitor = new_options.peer_monitor.clone();
         let task = Task::connect(webtransport, new_options)?;
 
         let connection = Self {
             task: Rc::new(task),
             heartbeat: None,
-            heartbeat_monitor: Some(Interval::new(5000, move || {
-                monitor.emit(());
-            })),
             status,
             aes,
             audio_enabled: Rc::new(AtomicBool::new(false)),
@@ -152,9 +147,6 @@ impl Connection {
     fn stop_heartbeat(&mut self) {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.cancel();
-        }
-        if let Some(heartbeat_monitor) = self.heartbeat_monitor.take() {
-            heartbeat_monitor.cancel();
         }
     }
 

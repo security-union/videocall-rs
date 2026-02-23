@@ -513,6 +513,8 @@ impl VideoCallClient {
                 error: "Disconnected".to_string(),
                 last_known_server: None,
             };
+            inner.peer_decode_manager.clear_all_peers();
+            inner.own_session_id = None;
             Ok(())
         } else {
             Err(anyhow::anyhow!("Unable to borrow inner"))
@@ -869,7 +871,7 @@ impl Inner {
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let peer_status = if response.email == SYSTEM_USER_EMAIL || response.session_id == 0 {
+        let mut peer_status = if response.email == SYSTEM_USER_EMAIL || response.session_id == 0 {
             PeerStatus::NoChange
         } else {
             self.peer_decode_manager
@@ -953,7 +955,9 @@ impl Inner {
                             debug!("Rejecting packet from same user: {session_id}");
                         }
                         _ => {
-                            self.peer_decode_manager.delete_peer(peer_session_id);
+                            warn!(
+                                "Decode error for peer {peer_session_id}: {e} — peer left in reset state, heartbeat timeout will clean up if dead"
+                            );
                         }
                     }
                 }
@@ -1035,9 +1039,16 @@ impl Inner {
                     }
                     Ok(MeetingEventType::PARTICIPANT_LEFT) => {
                         info!(
-                            "Received PARTICIPANT_LEFT: room={}, count={}",
-                            meeting_packet.room_id, meeting_packet.participant_count
+                            "Received PARTICIPANT_LEFT: room={}, email={}, session_id={}, count={}",
+                            meeting_packet.room_id,
+                            response.email,
+                            response.session_id,
+                            meeting_packet.participant_count
                         );
+                        if response.session_id != 0 {
+                            self.peer_decode_manager.delete_peer(response.session_id);
+                            peer_status = PeerStatus::NoChange;
+                        }
                     }
                     Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
                         error!(

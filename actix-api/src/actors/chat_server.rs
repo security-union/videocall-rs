@@ -21,7 +21,7 @@ use crate::{
         server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
         session::Message,
     },
-    models::build_subject_and_queue,
+    models::build_room_subject,
     session_manager::{SessionEndResult, SessionManager},
 };
 
@@ -81,13 +81,41 @@ impl ChatServer {
             task.abort();
         }
 
-        // Remove from room_members tracking
+        // Remove from room_members tracking and publish PARTICIPANT_LEFT
         if let Some(room_id) = room {
+            // Capture the leaving peer's email before removing from the map
+            let leaving_email = self
+                .room_members
+                .get(room_id)
+                .and_then(|members| members.get(session_id))
+                .cloned();
+
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.remove(session_id);
                 if members.is_empty() {
                     self.room_members.remove(room_id);
                 }
+            }
+
+            // Publish PARTICIPANT_LEFT so other clients can remove the peer immediately
+            if let Some(email) = &leaving_email {
+                let bytes = SessionManager::build_participant_left_packet(
+                    room_id,
+                    email,
+                    *session_id,
+                );
+                let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                let nc = self.nats_connection.clone();
+                let subject_clone = subject.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = nc.publish(subject_clone, bytes.into()).await {
+                        error!("Error publishing PARTICIPANT_LEFT: {}", e);
+                    }
+                });
+                info!(
+                    "Published PARTICIPANT_LEFT for {} (session {}) in room {}",
+                    email, session_id, room_id
+                );
             }
         }
 
@@ -295,8 +323,7 @@ impl Handler<JoinRoom> for ChatServer {
         let session_id = session;
         let nc = self.nats_connection.clone();
 
-        let session_str = session.to_string();
-        let (subject, queue) = build_subject_and_queue(&room, &session_str);
+        let subject = build_room_subject(&room);
         let session_recipient = match self.sessions.get(&session) {
             Some(addr) => addr.clone(),
             None => {
@@ -385,7 +412,7 @@ impl Handler<JoinRoom> for ChatServer {
                 }
             }
 
-            match nc2.queue_subscribe(subject, queue).await {
+            match nc2.subscribe(subject).await {
                 Ok(mut sub) => {
                     while let Some(msg) = sub.next().await {
                         if let Err(e) = handle_msg(

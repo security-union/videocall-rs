@@ -88,7 +88,7 @@ pub struct Peer {
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
-    heartbeat_count: u8,
+    heartbeat_count: u32,
     pub video_enabled: bool,
     pub audio_enabled: bool,
     pub screen_enabled: bool,
@@ -378,7 +378,7 @@ impl Peer {
     }
 
     fn on_heartbeat(&mut self) {
-        self.heartbeat_count += 1;
+        self.heartbeat_count = self.heartbeat_count.saturating_add(1);
     }
 
     pub fn check_heartbeat(&mut self) -> bool {
@@ -543,6 +543,16 @@ impl PeerDecodeManager {
     pub fn delete_peer(&mut self, session_id: u64) {
         self.connected_peers.remove(&session_id);
         self.on_peer_removed.emit(session_id.to_string());
+    }
+
+    /// Remove all peers, emitting `on_peer_removed` for each.
+    /// Called during disconnect to prevent stale peer state on reconnect.
+    pub fn clear_all_peers(&mut self) {
+        let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
+        for session_id in keys {
+            self.connected_peers.remove(&session_id);
+            self.on_peer_removed.emit(session_id.to_string());
+        }
     }
 
     pub fn ensure_peer(&mut self, session_id: u64, email: &str) -> PeerStatus {

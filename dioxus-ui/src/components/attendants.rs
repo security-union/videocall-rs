@@ -276,7 +276,7 @@ pub fn AttendantsComponent(
 
     // Provide contexts for child components
     use_context_provider(|| client.clone());
-    let mut meeting_time_signal = use_signal(|| MeetingTime::default());
+    let mut meeting_time_signal = use_signal(|| Some(MeetingTime::default()));
     use_context_provider(|| meeting_time_signal);
 
     // Check for config errors

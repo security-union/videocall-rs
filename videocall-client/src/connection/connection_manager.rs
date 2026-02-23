@@ -489,22 +489,19 @@ impl ConnectionManager {
                     .get(&connection_id)
                     .copied()
                 {
-                    info!(
-                        "Applying pending SESSION_ASSIGNED for elected connection {}: {}",
-                        connection_id, sid
-                    );
-                    *self.own_session_id.borrow_mut() = Some(sid);
+                    if *self.own_session_id.borrow() == Some(sid) {
+                        debug!("Pending SESSION_ASSIGNED already processed for session {}, skipping", sid);
+                    } else {
+                        info!(
+                            "Applying pending SESSION_ASSIGNED for elected connection {}: {}",
+                            connection_id, sid
+                        );
+                        *self.own_session_id.borrow_mut() = Some(sid);
 
-                    if let Some(connection) = self.connections.get(&connection_id) {
-                        connection.set_session_id(sid);
+                        if let Some(connection) = self.connections.get(&connection_id) {
+                            connection.set_session_id(sid);
+                        }
                     }
-
-                    let wrapper = PacketWrapper {
-                        packet_type: PacketType::SESSION_ASSIGNED.into(),
-                        session_id: sid,
-                        ..Default::default()
-                    };
-                    self.options.on_inbound_media.emit(wrapper);
                 }
                 self.pending_session_ids.borrow_mut().clear();
 

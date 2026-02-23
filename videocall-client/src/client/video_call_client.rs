@@ -868,7 +868,8 @@ impl Inner {
             response.session_id
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
-        let peer_status = if response.email == SYSTEM_USER_EMAIL {
+        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
+        let peer_status = if response.email == SYSTEM_USER_EMAIL || response.session_id == 0 {
             PeerStatus::NoChange
         } else {
             self.peer_decode_manager

@@ -120,6 +120,7 @@ impl Actor for WsChatSession {
             .into_actor(self)
             .map(|result, act, ctx| match result {
                 Ok(result) => {
+                    ctx.binary(act.logic.build_session_assigned());
                     let bytes = act
                         .logic
                         .build_meeting_started(result.start_time_ms, &result.creator_id);

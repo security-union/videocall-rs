@@ -108,7 +108,9 @@ pub struct ConnectionManager {
     rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
-    own_session_id: Rc<RefCell<Option<String>>>, // Own session_id for filtering self-packets
+    own_session_id: Rc<RefCell<Option<String>>>,
+    /// Per-connection session_ids received via SESSION_ASSIGNED before election completes.
+    pending_session_ids: Rc<RefCell<HashMap<String, String>>>,
 }
 
 impl ConnectionManager {
@@ -139,7 +141,8 @@ impl ConnectionManager {
             options,
             aes,
             own_session_id: Rc::new(RefCell::new(None)),
-         };
+            pending_session_ids: Rc::new(RefCell::new(HashMap::new())),
+        };
 
         // Immediately start creating connections and testing
         manager.start_election()?;
@@ -267,8 +270,38 @@ impl ConnectionManager {
         let on_inbound_media = self.options.on_inbound_media.clone();
         let rtt_responses = self.rtt_responses.clone();
         let own_session_id = self.own_session_id.clone();
+        let pending_session_ids = self.pending_session_ids.clone();
+        let active_connection_id = self.active_connection_id.clone();
 
         Callback::from(move |packet: PacketWrapper| {
+            // Intercept SESSION_ASSIGNED before anything else
+            if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
+                let sid = packet.session_id.clone();
+                info!(
+                    "SESSION_ASSIGNED received on connection {}: {}",
+                    connection_id, sid
+                );
+
+                // If this connection is already the elected one, apply immediately
+                let is_elected = active_connection_id
+                    .borrow()
+                    .as_deref()
+                    .map(|id| id == connection_id)
+                    .unwrap_or(false);
+
+                if is_elected {
+                    info!("Applying SESSION_ASSIGNED immediately (connection already elected)");
+                    *own_session_id.borrow_mut() = Some(sid.clone());
+                    on_inbound_media.emit(packet);
+                } else {
+                    // Store for later; will be applied after election completes
+                    pending_session_ids
+                        .borrow_mut()
+                        .insert(connection_id.clone(), sid);
+                }
+                return;
+            }
+
             // Handle RTT responses internally
             if packet.email == userid {
                 let reception_time = js_sys::Date::now();
@@ -279,7 +312,6 @@ impl ConnectionManager {
                                 "RTT response received on connection {} at {}, sent at {}",
                                 connection_id, reception_time, media_packet.timestamp
                             );
-                            // Add RTT response to shared queue for processing
                             if let Ok(mut responses) = rtt_responses.try_borrow_mut() {
                                 responses.push((
                                     connection_id.clone(),
@@ -289,7 +321,7 @@ impl ConnectionManager {
                             } else {
                                 warn!("Unable to add RTT response to queue - queue is borrowed");
                             }
-                            return; // Don't forward RTT packets
+                            return;
                         }
                     }
                 }
@@ -302,11 +334,10 @@ impl ConnectionManager {
                         "Rejecting packet from same session_id: {}",
                         packet.session_id
                     );
-                    return; // Don't forward self-packets
+                    return;
                 }
             }
 
-            // Forward all non-RTT, non-self packets to the main handler
             on_inbound_media.emit(packet);
         })
     }
@@ -457,6 +488,33 @@ impl ConnectionManager {
                     connection_id: connection_id.clone(),
                     elected_at: js_sys::Date::now(),
                 };
+
+                // Apply pending session_id for the elected connection
+                if let Some(sid) = self
+                    .pending_session_ids
+                    .borrow()
+                    .get(&connection_id)
+                    .cloned()
+                {
+                    info!(
+                        "Applying pending SESSION_ASSIGNED for elected connection {}: {}",
+                        connection_id, sid
+                    );
+                    *self.own_session_id.borrow_mut() = Some(sid.clone());
+
+                    if let Some(connection) = self.connections.get(&connection_id) {
+                        connection.set_session_id(sid.clone());
+                    }
+
+                    // Forward SESSION_ASSIGNED upstream so VideoCallClient can store it too
+                    let wrapper = PacketWrapper {
+                        packet_type: PacketType::SESSION_ASSIGNED.into(),
+                        session_id: sid,
+                        ..Default::default()
+                    };
+                    self.options.on_inbound_media.emit(wrapper);
+                }
+                self.pending_session_ids.borrow_mut().clear();
 
                 // Start heartbeat only on the elected connection
                 if let Some(connection) = self.connections.get_mut(&connection_id) {
@@ -826,10 +884,16 @@ impl ConnectionManager {
         Err(anyhow!("No active connection available"))
     }
 
-    /// Set own session_id for filtering self-packets
+    /// Set own session_id for filtering self-packets and stamp outgoing heartbeats
     pub fn set_own_session_id(&self, session_id: String) {
         *self.own_session_id.borrow_mut() = Some(session_id.clone());
-        debug!("Set own_session_id for self-packet filtering and stored for active connection");
+
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            if let Some(connection) = self.connections.get(active_id) {
+                connection.set_session_id(session_id.clone());
+            }
+        }
+        debug!("Set own_session_id to {session_id}");
     }
 
     /// Check if manager has an active connection

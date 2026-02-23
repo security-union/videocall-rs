@@ -311,14 +311,17 @@ impl Handler<JoinRoom> for ChatServer {
                         result.creator_id,
                         session_id,
                     );
-                    send_meeting_info(
-                        &nc,
-                        &room_clone,
-                        result.start_time_ms,
-                        &result.creator_id,
-                        &result.session_id,
-                    )
-                    .await;
+
+                    // Tell *this* client its server-assigned session_id (direct, not via NATS).
+                    let session_assigned_bytes =
+                        SessionManager::build_session_assigned_packet(&result.session_id);
+                    let _ = session_recipient.try_send(Message {
+                        msg: session_assigned_bytes,
+                        session: session_id.clone(),
+                    });
+
+                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
+                        .await;
                 }
                 Err(e) => {
                     error!(
@@ -384,12 +387,9 @@ async fn send_meeting_info(
     room: &str,
     start_time_ms: u64,
     creator_id: &str,
-    session_id: &str,
 ) {
-    // Use SessionManager's packet builder to create a proper MEETING packet with protobuf
-    // This ensures WebSocket clients receive the same format as WebTransport clients
     let packet_bytes =
-        SessionManager::build_meeting_started_packet(room, start_time_ms, creator_id, session_id);
+        SessionManager::build_meeting_started_packet(room, start_time_ms, creator_id);
 
     let subject = format!("room.{}.system", room.replace(' ', "_"));
     match nc.publish(subject.clone(), packet_bytes.into()).await {
@@ -954,6 +954,84 @@ mod tests {
             state2,
             ConnectionState::Active,
             "State should remain Active after second activation (idempotent)"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: JoinRoom sends SESSION_ASSIGNED to the session
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_sends_session_assigned() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let session_id = "test-session-assigned".to_string();
+
+        chat_server
+            .send(Connect {
+                id: session_id.clone(),
+                addr: capturing.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id.clone(),
+                room: "test-room-assigned".to_string(),
+                user_id: "alice@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(result.is_ok(), "JoinRoom should succeed");
+
+        // Wait for the spawned async task to complete
+        sleep(Duration::from_millis(500)).await;
+
+        let msgs = received.lock().unwrap();
+        assert!(
+            !msgs.is_empty(),
+            "Session should have received at least one message"
+        );
+
+        let first = <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msgs[0]).unwrap();
+        assert_eq!(
+            first.packet_type,
+            PacketType::SESSION_ASSIGNED.into(),
+            "First message to session should be SESSION_ASSIGNED"
+        );
+        assert_eq!(
+            first.session_id, session_id,
+            "SESSION_ASSIGNED should carry the correct session_id"
         );
     }
 

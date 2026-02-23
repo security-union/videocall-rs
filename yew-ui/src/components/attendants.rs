@@ -315,7 +315,9 @@ impl AttendantsComponent {
                 })
             }),
             get_peer_video_canvas_id: VcCallback::from(|session_id| session_id),
-            get_peer_screen_canvas_id: VcCallback::from(|session_id| format!("screen-share-{}", &session_id)),
+            get_peer_screen_canvas_id: VcCallback::from(|session_id| {
+                format!("screen-share-{}", &session_id)
+            }),
             enable_diagnostics: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
@@ -842,12 +844,13 @@ impl Component for AttendantsComponent {
         let mut peers_for_display: Vec<String> = real_peers_vec
             .iter()
             .map(|session_id| {
-                self.client.get_peer_email(session_id)
+                self.client
+                    .get_peer_email(session_id)
                     .unwrap_or_else(|| session_id.clone())
             })
             .collect();
         peers_for_display.extend(self.fake_peer_ids.iter().cloned());
-        
+
         // Keep session_id for PeerTile (needs session_id for identification)
         let mut display_peers_vec = real_peers_vec.clone();
         display_peers_vec.extend(self.fake_peer_ids.iter().cloned());

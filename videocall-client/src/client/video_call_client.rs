@@ -534,7 +534,10 @@ impl VideoCallClient {
                 .get(&session_id.to_string())
                 .map(|peer| peer.email.clone()),
             Err(_) => {
-                warn!("Failed to borrow inner in get_peer_email for session_id: {}", session_id);
+                warn!(
+                    "Failed to borrow inner in get_peer_email for session_id: {}",
+                    session_id
+                );
                 None
             }
         }
@@ -840,9 +843,10 @@ impl Inner {
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         let peer_status = if response.email == SYSTEM_USER_EMAIL {
-           PeerStatus::NoChange
+            PeerStatus::NoChange
         } else {
-            self.peer_decode_manager.ensure_peer(&response.session_id, &response.email)
+            self.peer_decode_manager
+                .ensure_peer(&response.session_id, &response.email)
         };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
@@ -955,30 +959,32 @@ impl Inner {
                     response.email
                 );
             }
+            Ok(PacketType::SESSION_ASSIGNED) => {
+                info!(
+                    "Received SESSION_ASSIGNED: session_id={}",
+                    response.session_id
+                );
+                self.own_session_id = Some(response.session_id.clone());
+
+                if let Some(connection_controller) = &self.connection_controller {
+                    if let Err(e) =
+                        connection_controller.set_own_session_id(response.session_id.clone())
+                    {
+                        warn!("Failed to set own_session_id in ConnectionManager: {e}");
+                    }
+                }
+            }
             Ok(PacketType::MEETING) => {
-                // Parse MeetingPacket protobuf
                 match MeetingPacket::parse_from_bytes(&response.data) {
                     Ok(meeting_packet) => {
                         match meeting_packet.event_type.enum_value() {
                             Ok(MeetingEventType::MEETING_STARTED) => {
                                 info!(
-                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}, session_id = {}",
+                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
                                     meeting_packet.room_id,
                                     meeting_packet.start_time_ms,
                                     meeting_packet.creator_id,
-                                    meeting_packet.session_id,
                                 );
-                                // Store own session_id for use in outgoing packets
-                                self.own_session_id = Some(meeting_packet.session_id.clone());
-
-                                // Set own_session_id in ConnectionManager for self-packet filtering
-                                if let Some(connection_controller) = &self.connection_controller {
-                                    if let Err(e) = connection_controller
-                                        .set_own_session_id(meeting_packet.session_id.clone())
-                                    {
-                                        warn!("Failed to set own_session_id in ConnectionManager: {e}");
-                                    }
-                                }
 
                                 if let Some(callback) = &self.options.on_meeting_info {
                                     callback.emit(meeting_packet.start_time_ms as f64);
@@ -1007,7 +1013,9 @@ impl Inner {
                             Ok(MeetingEventType::PARTICIPANT_LEFT) => {
                                 info!(
                                     "Received PARTICIPANT_LEFT: room={}, count={}, session_id = {}",
-                                    meeting_packet.room_id, meeting_packet.participant_count,meeting_packet.session_id
+                                    meeting_packet.room_id,
+                                    meeting_packet.participant_count,
+                                    meeting_packet.session_id
                                 );
                                 // Future: could emit participant left event
                             }

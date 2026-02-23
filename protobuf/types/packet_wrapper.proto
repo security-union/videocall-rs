@@ -10,6 +10,7 @@ message PacketWrapper {
     DIAGNOSTICS = 5;
     HEALTH = 6;
     MEETING = 7;
+    SESSION_ASSIGNED = 8;
   }
 
   enum ConnectionPhase {

@@ -120,28 +120,43 @@ impl SessionManager {
         Ok(SessionEndResult::MeetingContinues { remaining_count: 0 })
     }
 
-    /// Build MEETING_STARTED packet to send to client (protobuf)
+    /// Build MEETING_STARTED packet to send to client (protobuf).
+    ///
+    /// Session identity is conveyed separately via SESSION_ASSIGNED, so this
+    /// packet intentionally omits `session_id`.
     pub fn build_meeting_started_packet(
         room_id: &str,
         start_time_ms: u64,
         creator_id: &str,
-        session_id: &str,
     ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::MEETING_STARTED.into(),
             room_id: room_id.to_string(),
             start_time_ms,
             creator_id: creator_id.to_string(),
-            session_id: session_id.to_string(),
             ..Default::default()
         };
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
             email: SYSTEM_USER_EMAIL.to_string(),
-            session_id: session_id.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             connection_phase: ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED.into(),
+            ..Default::default()
+        };
+
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
+    /// Build SESSION_ASSIGNED packet sent directly to a client after JoinRoom.
+    ///
+    /// Tells the client its server-assigned session_id so it can stamp outgoing
+    /// packets and so the ConnectionManager can filter self-echoed packets.
+    pub fn build_session_assigned_packet(session_id: &str) -> Vec<u8> {
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::SESSION_ASSIGNED.into(),
+            email: SYSTEM_USER_EMAIL.to_string(),
+            session_id: session_id.to_string(),
             ..Default::default()
         };
 
@@ -217,19 +232,23 @@ mod tests {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-        let meeting_started = SessionManager::build_meeting_started_packet(
-            "my-room",
-            1234567890,
-            "alice",
-            "session-123",
-        );
+        let meeting_started =
+            SessionManager::build_meeting_started_packet("my-room", 1234567890, "alice");
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_started).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
+        assert!(
+            wrapper.session_id.is_empty(),
+            "MEETING_STARTED must not carry session_id"
+        );
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
         assert_eq!(inner.event_type, MeetingEventType::MEETING_STARTED.into());
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.start_time_ms, 1234567890);
         assert_eq!(inner.creator_id, "alice");
+        assert!(
+            inner.session_id.is_empty(),
+            "Inner MeetingPacket must not carry session_id"
+        );
 
         let meeting_ended = SessionManager::build_meeting_ended_packet("my-room", "Host left");
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_ended).unwrap();
@@ -238,5 +257,16 @@ mod tests {
         assert_eq!(inner.event_type, MeetingEventType::MEETING_ENDED.into());
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.message, "Host left");
+    }
+
+    #[tokio::test]
+    async fn test_session_assigned_packet_builder() {
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let packet = SessionManager::build_session_assigned_packet("sess-42");
+        let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
+        assert_eq!(wrapper.packet_type, PacketType::SESSION_ASSIGNED.into());
+        assert_eq!(wrapper.session_id, "sess-42");
+        assert_eq!(wrapper.email, SYSTEM_USER_EMAIL);
     }
 }

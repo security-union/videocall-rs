@@ -487,7 +487,6 @@ impl PeerDecodeManager {
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
         let peer_session_id = packet.session_id.clone();
-    
 
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             // Set worker diagnostics context once per peer
@@ -505,11 +504,16 @@ impl PeerDecodeManager {
                 }
                 Ok((media_type, decode_status)) => {
                     if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.track_frame(&peer_session_id, media_type, packet.data.len() as u64);
+                        diagnostics.track_frame(
+                            &peer_session_id,
+                            media_type,
+                            packet.data.len() as u64,
+                        );
                     }
 
                     if decode_status.first_frame {
-                        self.on_first_frame.emit((peer_session_id.clone(), media_type));
+                        self.on_first_frame
+                            .emit((peer_session_id.clone(), media_type));
                     }
 
                     Ok(())
@@ -521,7 +525,12 @@ impl PeerDecodeManager {
         }
     }
 
-    fn add_peer(&mut self, email: &str, session_id:&str, aes: Option<Aes128State>) -> Result<(), JsValue> {
+    fn add_peer(
+        &mut self,
+        email: &str,
+        session_id: &str,
+        aes: Option<Aes128State>,
+    ) -> Result<(), JsValue> {
         debug!("Adding peer {email} with session_id {session_id}");
         self.connected_peers.insert(
             session_id.to_owned(),
@@ -544,7 +553,7 @@ impl PeerDecodeManager {
     pub fn ensure_peer(&mut self, session_id: &String, email: &String) -> PeerStatus {
         if self.connected_peers.contains_key(session_id) {
             PeerStatus::NoChange
-        } else if let Err(e) = self.add_peer(email, session_id,None) {
+        } else if let Err(e) = self.add_peer(email, session_id, None) {
             log::error!("Error adding peer: {e:?}");
             PeerStatus::NoChange
         } else {

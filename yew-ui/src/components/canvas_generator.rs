@@ -38,15 +38,13 @@ pub fn generate_for_peer(
     full_bleed: bool,
     host_display_name: Option<&str>,
 ) -> Html {
-    let is_host = host_display_name.map(|h| h == key).unwrap_or(false);
+    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
+
+    let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
-    if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {
+    if !allowed.is_empty() && !allowed.iter().any(|a| *a == peer_email) {
         return html! {};
     }
-
-    // Convert session_id to email for display
-    let peer_email = client.get_peer_email(key)
-        .unwrap_or_else(|| key.clone());
 
     let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);

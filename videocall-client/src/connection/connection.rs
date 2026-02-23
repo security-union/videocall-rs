@@ -183,6 +183,10 @@ impl Connection {
         self.screen_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
+
+    pub fn set_session_id(&self, session_id: String) {
+        *self.session_id.borrow_mut() = Some(session_id);
+    }
 }
 
 impl Drop for Connection {

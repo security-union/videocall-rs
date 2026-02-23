@@ -422,13 +422,11 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
         }
     }
     if stats.is_empty() {
-        match serde_json::from_str::<crate::components::neteq_chart::RawNetEqStats>(neteq_stats_str)
+        if let Ok(raw_stat) =
+            serde_json::from_str::<crate::components::neteq_chart::RawNetEqStats>(neteq_stats_str)
         {
-            Ok(raw_stat) => {
-                let stat: NetEqStats = raw_stat.into();
-                stats.push(stat);
-            }
-            Err(_) => {}
+            let stat: NetEqStats = raw_stat.into();
+            stats.push(stat);
         }
     }
     if stats.len() > 60 {

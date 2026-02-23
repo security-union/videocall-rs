@@ -183,12 +183,12 @@ pub fn Host(
 
     // Update the indirection cells so encoder callbacks route to the current EventHandlers.
     // This runs on every render to keep them in sync with the latest prop values.
-    *camera_settings_handler.borrow_mut() = Some(on_encoder_settings_update.clone());
-    *mic_settings_handler.borrow_mut() = Some(on_encoder_settings_update.clone());
-    *screen_settings_handler.borrow_mut() = Some(on_encoder_settings_update.clone());
-    *camera_error_handler.borrow_mut() = Some(on_camera_error.clone());
-    *mic_error_handler.borrow_mut() = Some(on_microphone_error.clone());
-    *screen_state_handler.borrow_mut() = Some(on_screen_share_state.clone());
+    *camera_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
+    *mic_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
+    *screen_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
+    *camera_error_handler.borrow_mut() = Some(on_camera_error);
+    *mic_error_handler.borrow_mut() = Some(on_microphone_error);
+    *screen_state_handler.borrow_mut() = Some(on_screen_share_state);
 
     // Initialize devices once
     {

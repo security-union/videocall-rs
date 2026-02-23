@@ -312,13 +312,8 @@ impl Handler<JoinRoom> for ChatServer {
                         session_id,
                     );
 
-                    // Tell *this* client its server-assigned session_id (direct, not via NATS).
-                    let session_assigned_bytes =
-                        SessionManager::build_session_assigned_packet(&result.session_id);
-                    let _ = session_recipient.try_send(Message {
-                        msg: session_assigned_bytes,
-                        session: session_id.clone(),
-                    });
+                    // SESSION_ASSIGNED is sent by ws_chat_session / wt_chat_session
+                    // in their started() method before this JoinRoom handler runs.
 
                     send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
                         .await;
@@ -958,11 +953,11 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: JoinRoom sends SESSION_ASSIGNED to the session
+    // TEST: JoinRoom broadcasts MEETING_STARTED via NATS (no session_id)
     // ==========================================================================
     #[actix_rt::test]
     #[serial]
-    async fn test_join_room_sends_session_assigned() {
+    async fn test_join_room_broadcasts_meeting_started() {
         use std::sync::{Arc, Mutex};
         use tokio::time::{sleep, Duration};
         use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -993,7 +988,7 @@ mod tests {
             received: received.clone(),
         }
         .start();
-        let session_id = "test-session-assigned".to_string();
+        let session_id = "test-session-broadcast".to_string();
 
         chat_server
             .send(Connect {
@@ -1006,7 +1001,7 @@ mod tests {
         let result = chat_server
             .send(JoinRoom {
                 session: session_id.clone(),
-                room: "test-room-assigned".to_string(),
+                room: "test-room-broadcast".to_string(),
                 user_id: "alice@example.com".to_string(),
             })
             .await
@@ -1014,25 +1009,28 @@ mod tests {
 
         assert!(result.is_ok(), "JoinRoom should succeed");
 
-        // Wait for the spawned async task to complete
+        // Wait for the spawned async task to complete and NATS subscription to deliver
         sleep(Duration::from_millis(500)).await;
 
         let msgs = received.lock().unwrap();
-        assert!(
-            !msgs.is_empty(),
-            "Session should have received at least one message"
-        );
-
-        let first = <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msgs[0]).unwrap();
-        assert_eq!(
-            first.packet_type,
-            PacketType::SESSION_ASSIGNED.into(),
-            "First message to session should be SESSION_ASSIGNED"
-        );
-        assert_eq!(
-            first.session_id, session_id,
-            "SESSION_ASSIGNED should carry the correct session_id"
-        );
+        // The session should NOT receive SESSION_ASSIGNED from ChatServer
+        // (that's the transport layer's job). It may receive MEETING_STARTED
+        // via NATS if the subscription was set up in time.
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                assert_ne!(
+                    wrapper.packet_type,
+                    PacketType::SESSION_ASSIGNED.into(),
+                    "ChatServer JoinRoom should NOT send SESSION_ASSIGNED directly"
+                );
+                if wrapper.packet_type == PacketType::MEETING.into() {
+                    assert!(
+                        wrapper.session_id.is_empty(),
+                        "MEETING_STARTED must not carry session_id"
+                    );
+                }
+            }
+        }
     }
 
     // Helper message to get connection state for testing

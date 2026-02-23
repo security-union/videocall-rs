@@ -2449,40 +2449,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dioxus-ui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "console_error_panic_hook",
- "console_log",
- "dioxus",
- "futures",
- "gloo-timers 0.2.6",
- "gloo-utils 0.1.7",
- "js-sys",
- "log",
- "matomo-logger",
- "neteq",
- "once_cell",
- "regex",
- "reqwest 0.12.26",
- "serde",
- "serde-wasm-bindgen 0.6.5",
- "serde_json",
- "urlencoding",
- "videocall-client",
- "videocall-diagnostics",
- "videocall-meeting-client",
- "videocall-meeting-types",
- "videocall-types",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
- "web-time",
-]
-
-[[package]]
 name = "dioxus-web"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8582,6 +8548,40 @@ dependencies = [
  "web-time",
  "yew",
  "yew-router",
+]
+
+[[package]]
+name = "videocall-ui-dioxus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "console_error_panic_hook",
+ "console_log",
+ "dioxus",
+ "futures",
+ "gloo-timers 0.2.6",
+ "gloo-utils 0.1.7",
+ "js-sys",
+ "log",
+ "matomo-logger",
+ "neteq",
+ "once_cell",
+ "regex",
+ "reqwest 0.12.26",
+ "serde",
+ "serde-wasm-bindgen 0.6.5",
+ "serde_json",
+ "urlencoding",
+ "videocall-client",
+ "videocall-diagnostics",
+ "videocall-meeting-client",
+ "videocall-meeting-types",
+ "videocall-types",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]

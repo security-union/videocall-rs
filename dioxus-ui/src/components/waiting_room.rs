@@ -29,8 +29,7 @@ pub fn WaitingRoom(
             let meeting_id = meeting_id.clone();
             spawn(async move {
                 loop {
-                    handle_status_check(&meeting_id, &on_admitted, &on_rejected, &mut error)
-                        .await;
+                    handle_status_check(&meeting_id, &on_admitted, &on_rejected, &mut error).await;
                     TimeoutFuture::new(2_000).await;
                 }
             });
@@ -87,9 +86,7 @@ async fn handle_status_check(
                     if let Some(token) = status.room_token {
                         on_admitted.call(token);
                     } else {
-                        error.set(Some(
-                            "Admitted but no room token received".to_string(),
-                        ));
+                        error.set(Some("Admitted but no room token received".to_string()));
                     }
                 }
                 "rejected" => {

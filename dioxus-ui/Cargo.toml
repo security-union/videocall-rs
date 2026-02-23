@@ -1,5 +1,5 @@
 [package]
-name = "dioxus-ui"
+name = "videocall-ui-dioxus"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -9,6 +9,7 @@ repository = "https://github.com/security-union/videocall-rs"
 keywords = ["quic", "webtransport", "dioxus", "video-conferencing"]
 categories = ["network-programming", "multimedia", "web-programming"]
 readme = "../README.md"
+publish = false
 
 [lib]
 name = "dioxus_ui"

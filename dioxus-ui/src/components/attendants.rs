@@ -43,7 +43,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
-use videocall_client::{MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
+use videocall_client::{
+    MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+};
 use web_sys::HtmlAudioElement;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,7 +136,10 @@ pub fn AttendantsComponent(
         #[cfg(feature = "media-server-jwt-auth")]
         let token = {
             let t = room_token.clone();
-            assert!(!t.is_empty(), "media-server-jwt-auth is enabled but room_token is empty");
+            assert!(
+                !t.is_empty(),
+                "media-server-jwt-auth is enabled but room_token is empty"
+            );
             t
         };
         #[cfg(not(feature = "media-server-jwt-auth"))]
@@ -142,7 +147,11 @@ pub fn AttendantsComponent(
 
         let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &email, &id);
 
-        log::info!("DIOXUS-UI: Creating VideoCallClient for {} in meeting {}", email, id);
+        log::info!(
+            "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
+            email,
+            id
+        );
 
         let opts = VideoCallClientOptions {
             userid: email.clone(),
@@ -181,14 +190,18 @@ pub fn AttendantsComponent(
                                         connection_error.set(None);
                                     }
                                     Err(crate::meeting_api::JoinError::MeetingNotActive) => {
-                                        meeting_ended_message.set(Some("The meeting has ended.".to_string()));
+                                        meeting_ended_message
+                                            .set(Some("The meeting has ended.".to_string()));
                                     }
                                     Err(e) => {
-                                        connection_error.set(Some(format!("Connection lost, retrying... ({e})")));
+                                        connection_error.set(Some(format!(
+                                            "Connection lost, retrying... ({e})"
+                                        )));
                                     }
                                 }
                             });
-                        }).forget();
+                        })
+                        .forget();
                     }
 
                     #[cfg(not(feature = "media-server-jwt-auth"))]
@@ -223,13 +236,15 @@ pub fn AttendantsComponent(
                 let mut meeting_start_time_server = meeting_start_time_server;
                 meeting_start_time_server.set(Some(start_time_ms));
             })),
-            on_meeting_ended: Some(VcCallback::from(move |(end_time_ms, message): (f64, String)| {
-                log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
-                let mut meeting_start_time_server = meeting_start_time_server;
-                let mut meeting_ended_message = meeting_ended_message;
-                meeting_start_time_server.set(Some(end_time_ms));
-                meeting_ended_message.set(Some(message));
-            })),
+            on_meeting_ended: Some(VcCallback::from(
+                move |(end_time_ms, message): (f64, String)| {
+                    log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
+                    let mut meeting_start_time_server = meeting_start_time_server;
+                    let mut meeting_ended_message = meeting_ended_message;
+                    meeting_start_time_server.set(Some(end_time_ms));
+                    meeting_ended_message.set(Some(message));
+                },
+            )),
         };
 
         VideoCallClient::new(opts)
@@ -261,7 +276,7 @@ pub fn AttendantsComponent(
 
     // Provide contexts for child components
     use_context_provider(|| client.clone());
-    let mut meeting_time_signal = use_signal(|| MeetingTime::default());
+    let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
 
     // Check for config errors

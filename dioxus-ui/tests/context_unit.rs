@@ -10,9 +10,7 @@
 
 use wasm_bindgen_test::*;
 
-use dioxus_ui::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage,
-};
+use dioxus_ui::context::{is_valid_username, load_username_from_storage, save_username_to_storage};
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
@@ -55,9 +53,7 @@ fn usernames_with_special_chars_rejected() {
 #[wasm_bindgen_test]
 fn storage_round_trip() {
     // Clear any previous value
-    if let Some(storage) = web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-    {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item("vc_username");
     }
 
@@ -66,22 +62,14 @@ fn storage_round_trip() {
 
     // Save and reload
     save_username_to_storage("test_user");
-    assert_eq!(
-        load_username_from_storage(),
-        Some("test_user".to_string())
-    );
+    assert_eq!(load_username_from_storage(), Some("test_user".to_string()));
 
     // Overwrite
     save_username_to_storage("new_user");
-    assert_eq!(
-        load_username_from_storage(),
-        Some("new_user".to_string())
-    );
+    assert_eq!(load_username_from_storage(), Some("new_user".to_string()));
 
     // Cleanup
-    if let Some(storage) = web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-    {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item("vc_username");
     }
 }

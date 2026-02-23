@@ -10,7 +10,9 @@
 
 mod support;
 
-use support::{cleanup, create_mount_point, mock_camera, mock_mic, mock_speaker, render_into, yield_now};
+use support::{
+    cleanup, create_mount_point, mock_camera, mock_mic, mock_speaker, render_into, yield_now,
+};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
 
@@ -248,7 +250,10 @@ async fn device_settings_modal_hidden_when_not_visible() {
     // Dioxus may render placeholder nodes (e.g. empty comment) for rsx! {}.
     // The key assertion is that no modal content is rendered.
     assert!(
-        mount.query_selector(".device-settings-modal").unwrap().is_none(),
+        mount
+            .query_selector(".device-settings-modal")
+            .unwrap()
+            .is_none(),
         "modal should not render its content when visible=false"
     );
 

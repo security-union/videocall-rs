@@ -137,21 +137,18 @@ impl SessionManager {
         room_id: &str,
         start_time_ms: u64,
         creator_id: &str,
-        session_id: u64,
     ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::MEETING_STARTED.into(),
             room_id: room_id.to_string(),
             start_time_ms,
             creator_id: creator_id.to_string(),
-            session_id,
             ..Default::default()
         };
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
             email: SYSTEM_USER_EMAIL.to_string(),
-            session_id,
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -229,7 +226,7 @@ mod tests {
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
         let meeting_started =
-            SessionManager::build_meeting_started_packet("my-room", 1234567890, "alice", 98765);
+            SessionManager::build_meeting_started_packet("my-room", 1234567890, "alice");
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_started).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
@@ -237,7 +234,6 @@ mod tests {
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.start_time_ms, 1234567890);
         assert_eq!(inner.creator_id, "alice");
-        assert_eq!(inner.session_id, 98765);
 
         let meeting_ended = SessionManager::build_meeting_ended_packet("my-room", "Host left");
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_ended).unwrap();

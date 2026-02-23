@@ -30,7 +30,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
-use videocall_types::protos::packet_wrapper::packet_wrapper::ConnectionPhase;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -52,7 +51,7 @@ pub struct Connection {
     video_enabled: Rc<AtomicBool>,
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
-    session_id: Rc<RefCell<Option<String>>>,
+    session_id: Rc<RefCell<Option<u64>>>,
     url: String,
 }
 
@@ -137,12 +136,11 @@ impl Connection {
                 data,
                 email: userid.clone(),
                 packet_type: PacketType::MEDIA.into(),
-                connection_phase: ConnectionPhase::ACTIVE.into(),
                 ..Default::default()
             };
 
             if let Some(sid) = session_id.borrow().as_ref() {
-                packet_wrapper.session_id = sid.clone();
+                packet_wrapper.session_id = *sid;
             }
 
             if let Status::Connected = status.get() {
@@ -184,7 +182,7 @@ impl Connection {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn set_session_id(&self, session_id: String) {
+    pub fn set_session_id(&self, session_id: u64) {
         *self.session_id.borrow_mut() = Some(session_id);
     }
 }

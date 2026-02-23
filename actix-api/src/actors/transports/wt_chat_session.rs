@@ -33,11 +33,9 @@ use actix::{
     Handler, Message as ActixMessage, Running, WrapFuture,
 };
 use bytes::Bytes;
-use protobuf::Message as ProtobufMessage;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
-use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{Email, RoomId, SessionId};
 
@@ -278,42 +276,26 @@ impl Handler<WtInbound> for WtChatSession {
             return;
         }
 
-        // Check connection_phase from inbound packet
+        let action = self.logic.handle_inbound(&msg.data);
+
         if !self.activated {
-            if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(msg.data.as_ref()) {
-                if let Ok(phase) = packet_wrapper.connection_phase.enum_value() {
-                    match phase {
-                        ConnectionPhase::ACTIVE => {
-                            // First ACTIVE packet - activate connection
-                            self.logic.addr.do_send(ActivateConnection {
-                                session: self.logic.id.clone(),
-                            });
-                            self.activated = true;
-                            info!("Session {} activated on first ACTIVE packet", self.logic.id);
-                        }
-                        ConnectionPhase::CONNECTION_PHASE_UNSPECIFIED => {
-                            // Activate immediately for old clients (backward compatibility)
-                            self.logic.addr.do_send(ActivateConnection {
-                                session: self.logic.id.clone(),
-                            });
-                            self.activated = true;
-                            info!(
-                                "Session {} activated on UNSPECIFIED (old client)",
-                                self.logic.id
-                            );
-                        }
-                        ConnectionPhase::PROBING => {
-                            // Do not activate during probing phase
-                        }
-                    }
+            match action {
+                InboundAction::Echo(_) => { /* RTT probe -- do not activate */ }
+                _ => {
+                    self.logic.addr.do_send(ActivateConnection {
+                        session: self.logic.id,
+                    });
+                    self.activated = true;
+                    info!(
+                        "Session {} activated on first non-RTT packet",
+                        self.logic.id
+                    );
                 }
             }
         }
 
-        // Delegate to shared logic
-        match self.logic.handle_inbound(&msg.data) {
+        match action {
             InboundAction::Echo(data) => {
-                // Echo via the same channel it arrived on
                 let outbound = match msg.source {
                     WtInboundSource::UniStream => {
                         WtOutbound::UniStream(Bytes::from(data.as_ref().clone()))
@@ -342,9 +324,7 @@ impl Handler<WtInbound> for WtChatSession {
             InboundAction::Forward(data) => {
                 ctx.notify(Packet { data });
             }
-            InboundAction::Processed | InboundAction::KeepAlive => {
-                // Already handled
-            }
+            InboundAction::Processed | InboundAction::KeepAlive => {}
         }
     }
 }
@@ -373,7 +353,7 @@ impl Handler<Packet> for WtChatSession {
             self.logic.room
         );
         self.logic.addr.do_send(ClientMessage {
-            session: self.logic.id.clone(),
+            session: self.logic.id,
             user: self.logic.email.clone(),
             room: self.logic.room.clone(),
             msg,

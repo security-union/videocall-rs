@@ -133,7 +133,7 @@ impl Handler<Connect> for ChatServer {
 
     fn handle(&mut self, msg: Connect, _ctx: &mut Self::Context) -> Self::Result {
         let Connect { id, addr } = msg;
-        self.sessions.insert(id.clone(), addr);
+        self.sessions.insert(id, addr);
         self.connection_states.insert(id, ConnectionState::Testing);
     }
 }
@@ -184,7 +184,7 @@ impl Handler<ActivateConnection> for ChatServer {
             }
         } else {
             self.connection_states
-                .insert(session.clone(), ConnectionState::Active);
+                .insert(session, ConnectionState::Active);
             info!(
                 "Session {} activated (state was missing, created as Active)",
                 session
@@ -226,8 +226,8 @@ impl Handler<ClientMessage> for ChatServer {
 
         let packet_bytes =
             if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
-                if packet_wrapper.session_id.is_empty() {
-                    packet_wrapper.session_id = session.clone();
+                if packet_wrapper.session_id == 0 {
+                    packet_wrapper.session_id = session;
                 }
                 match packet_wrapper.write_to_bytes() {
                     Ok(bytes) => bytes,
@@ -278,10 +278,11 @@ impl Handler<JoinRoom> for ChatServer {
         let session_manager = self.session_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
-        let session_id = session.clone();
+        let session_id = session;
         let nc = self.nats_connection.clone();
 
-        let (subject, queue) = build_subject_and_queue(&room, session.as_str());
+        let session_str = session.to_string();
+        let (subject, queue) = build_subject_and_queue(&room, &session_str);
         let session_recipient = match self.sessions.get(&session) {
             Some(addr) => addr.clone(),
             None => {
@@ -290,16 +291,16 @@ impl Handler<JoinRoom> for ChatServer {
         };
 
         let nc2 = self.nats_connection.clone();
-        let session_clone = session.clone();
+        let session_clone = session;
 
         // Get ChatServer address for cleanup on failure
         let chat_server_addr = ctx.address();
-        let session_for_cleanup = session.clone();
+        let session_for_cleanup = session;
 
         let handle = tokio::spawn(async move {
             // Start session using SessionManager - await result before subscribing
             match session_manager
-                .start_session(&room_clone, &user_id_clone, &session_id)
+                .start_session(&room_clone, &user_id_clone, session_id)
                 .await
             {
                 Ok(result) => {
@@ -339,7 +340,7 @@ impl Handler<JoinRoom> for ChatServer {
                         if let Err(e) = handle_msg(
                             session_recipient.clone(),
                             room_clone.clone(),
-                            session_clone.clone(),
+                            session_clone,
                         )(msg)
                         {
                             error!("Error handling message: {}", e);
@@ -404,7 +405,7 @@ fn handle_msg(
         }
         let message = Message {
             msg: msg.payload.to_vec(),
-            session: session.clone(),
+            session,
         };
 
         session_recipient.try_send(message).map_err(|e| {
@@ -463,12 +464,12 @@ mod tests {
         }
 
         let dummy = DummySession.start();
-        let session_id = "test-session-1".to_string();
+        let session_id = 1001u64;
 
         // Register the session first
         chat_server
             .send(Connect {
-                id: session_id.clone(),
+                id: session_id,
                 addr: dummy.recipient(),
             })
             .await
@@ -478,7 +479,7 @@ mod tests {
         // This should return an error SYNCHRONOUSLY (not Ok then fail async)
         let result = chat_server
             .send(JoinRoom {
-                session: session_id.clone(),
+                session: session_id,
                 room: "test-room".to_string(),
                 user_id: SYSTEM_USER_EMAIL.to_string(),
             })
@@ -521,12 +522,12 @@ mod tests {
         }
 
         let dummy = DummySession.start();
-        let session_id = "test-session-valid".to_string();
+        let session_id = 1002u64;
 
         // Register the session
         chat_server
             .send(Connect {
-                id: session_id.clone(),
+                id: session_id,
                 addr: dummy.recipient(),
             })
             .await
@@ -535,7 +536,7 @@ mod tests {
         // Join with a valid user_id - should succeed
         let result = chat_server
             .send(JoinRoom {
-                session: session_id.clone(),
+                session: session_id,
                 room: "test-room-valid".to_string(),
                 user_id: "valid-user@example.com".to_string(),
             })
@@ -564,7 +565,7 @@ mod tests {
         // Try to join WITHOUT registering the session first
         let result = chat_server
             .send(JoinRoom {
-                session: "nonexistent-session".to_string(),
+                session: 9999u64,
                 room: "test-room".to_string(),
                 user_id: "valid-user@example.com".to_string(),
             })
@@ -607,12 +608,12 @@ mod tests {
         }
 
         let dummy = DummySession.start();
-        let session_id = "test-session-cleanup".to_string();
+        let session_id = 1003u64;
 
         // Register the session
         chat_server
             .send(Connect {
-                id: session_id.clone(),
+                id: session_id,
                 addr: dummy.recipient(),
             })
             .await
@@ -622,7 +623,7 @@ mod tests {
         // spawns async task which will also succeed with valid user)
         let result1 = chat_server
             .send(JoinRoom {
-                session: session_id.clone(),
+                session: session_id,
                 room: "test-room-cleanup".to_string(),
                 user_id: "valid-user@example.com".to_string(),
             })
@@ -635,7 +636,7 @@ mod tests {
         // immediately because session is already in active_subs
         let result2 = chat_server
             .send(JoinRoom {
-                session: session_id.clone(),
+                session: session_id,
                 room: "test-room-cleanup".to_string(),
                 user_id: "valid-user@example.com".to_string(),
             })
@@ -698,8 +699,8 @@ mod tests {
             session1.id, session2.id,
             "Two sessions with same email should have different session_id values"
         );
-        assert!(!session1.id.is_empty(), "Session ID should not be empty");
-        assert!(!session2.id.is_empty(), "Session ID should not be empty");
+        assert!(session1.id != 0, "Session ID should not be zero");
+        assert!(session2.id != 0, "Session ID should not be zero");
     }
 
     // ==========================================================================
@@ -731,20 +732,19 @@ mod tests {
         }
 
         let dummy = DummySession.start();
-        let session_id = "test-session-state".to_string();
+        let session_id = 1004u64;
         let room = "test-room-state".to_string();
 
         // Register session - starts in Testing state
         chat_server
             .send(Connect {
-                id: session_id.clone(),
+                id: session_id,
                 addr: dummy.recipient(),
             })
             .await
             .expect("Connect should succeed");
 
-        // Subscribe to NATS subject to detect publishes
-        let subject = format!("room.{}.{}", room, session_id).replace(' ', "_");
+        let subject = format!("room.{room}.{session_id}").replace(' ', "_");
         let published = Arc::new(AtomicBool::new(false));
         let published_clone = published.clone();
         let mut sub = nats_client
@@ -752,7 +752,6 @@ mod tests {
             .await
             .expect("Failed to subscribe");
 
-        // Spawn task to check for messages
         tokio::spawn(async move {
             if let Ok(Some(_msg)) =
                 tokio::time::timeout(Duration::from_millis(500), sub.next()).await
@@ -764,7 +763,7 @@ mod tests {
         // Send message while in Testing state - should NOT publish
         chat_server
             .send(ClientMessage {
-                session: session_id.clone(),
+                session: session_id,
                 room: room.clone(),
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
@@ -812,13 +811,13 @@ mod tests {
         }
 
         let dummy = DummySession.start();
-        let session_id = "test-session-active".to_string();
+        let session_id = 1005u64;
         let room = "test-room-active".to_string();
 
         // Register session - starts in Testing state
         chat_server
             .send(Connect {
-                id: session_id.clone(),
+                id: session_id,
                 addr: dummy.recipient(),
             })
             .await
@@ -827,13 +826,12 @@ mod tests {
         // Activate the connection
         chat_server
             .send(ActivateConnection {
-                session: session_id.clone(),
+                session: session_id,
             })
             .await
             .expect("ActivateConnection should succeed");
 
-        // Subscribe to NATS subject to detect publishes
-        let subject = format!("room.{}.{}", room, session_id).replace(' ', "_");
+        let subject = format!("room.{room}.{session_id}").replace(' ', "_");
         let published = Arc::new(AtomicBool::new(false));
         let published_clone = published.clone();
         let mut sub = nats_client
@@ -841,7 +839,6 @@ mod tests {
             .await
             .expect("Failed to subscribe");
 
-        // Spawn task to check for messages
         tokio::spawn(async move {
             if let Ok(Some(_msg)) =
                 tokio::time::timeout(Duration::from_millis(500), sub.next()).await
@@ -853,7 +850,7 @@ mod tests {
         // Send message while in Active state - should publish
         chat_server
             .send(ClientMessage {
-                session: session_id.clone(),
+                session: session_id,
                 room: room.clone(),
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
@@ -896,12 +893,12 @@ mod tests {
         }
 
         let dummy = DummySession.start();
-        let session_id = "test-session-idempotent".to_string();
+        let session_id = 1006u64;
 
         // Register session - starts in Testing state
         chat_server
             .send(Connect {
-                id: session_id.clone(),
+                id: session_id,
                 addr: dummy.recipient(),
             })
             .await
@@ -910,7 +907,7 @@ mod tests {
         // First activation - should transition Testing -> Active
         chat_server
             .send(ActivateConnection {
-                session: session_id.clone(),
+                session: session_id,
             })
             .await
             .expect("ActivateConnection should succeed");
@@ -918,7 +915,7 @@ mod tests {
         // Verify state is Active
         let state1 = chat_server
             .send(GetConnectionState {
-                session: session_id.clone(),
+                session: session_id,
             })
             .await
             .expect("GetConnectionState should succeed")
@@ -932,7 +929,7 @@ mod tests {
         // Second activation - should remain Active (idempotent)
         chat_server
             .send(ActivateConnection {
-                session: session_id.clone(),
+                session: session_id,
             })
             .await
             .expect("ActivateConnection should succeed");
@@ -940,7 +937,7 @@ mod tests {
         // Verify state is still Active
         let state2 = chat_server
             .send(GetConnectionState {
-                session: session_id.clone(),
+                session: session_id,
             })
             .await
             .expect("GetConnectionState should succeed")
@@ -988,11 +985,11 @@ mod tests {
             received: received.clone(),
         }
         .start();
-        let session_id = "test-session-broadcast".to_string();
+        let session_id = 1007u64;
 
         chat_server
             .send(Connect {
-                id: session_id.clone(),
+                id: session_id,
                 addr: capturing.recipient(),
             })
             .await
@@ -1000,7 +997,7 @@ mod tests {
 
         let result = chat_server
             .send(JoinRoom {
-                session: session_id.clone(),
+                session: session_id,
                 room: "test-room-broadcast".to_string(),
                 user_id: "alice@example.com".to_string(),
             })
@@ -1024,8 +1021,8 @@ mod tests {
                     "ChatServer JoinRoom should NOT send SESSION_ASSIGNED directly"
                 );
                 if wrapper.packet_type == PacketType::MEETING.into() {
-                    assert!(
-                        wrapper.session_id.is_empty(),
+                    assert_eq!(
+                        wrapper.session_id, 0,
                         "MEETING_STARTED must not carry session_id"
                     );
                 }

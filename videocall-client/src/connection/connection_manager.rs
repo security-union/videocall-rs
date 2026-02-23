@@ -29,7 +29,7 @@ use std::rc::Rc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::{ConnectionPhase, PacketType};
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
@@ -108,9 +108,9 @@ pub struct ConnectionManager {
     rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
-    own_session_id: Rc<RefCell<Option<String>>>,
+    own_session_id: Rc<RefCell<Option<u64>>>,
     /// Per-connection session_ids received via SESSION_ASSIGNED before election completes.
-    pending_session_ids: Rc<RefCell<HashMap<String, String>>>,
+    pending_session_ids: Rc<RefCell<HashMap<String, u64>>>,
 }
 
 impl ConnectionManager {
@@ -274,13 +274,12 @@ impl ConnectionManager {
         Callback::from(move |packet: PacketWrapper| {
             // Intercept SESSION_ASSIGNED before anything else
             if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
-                let sid = packet.session_id.clone();
+                let sid = packet.session_id;
                 info!(
                     "SESSION_ASSIGNED received on connection {}: {}",
                     connection_id, sid
                 );
 
-                // If this connection is already the elected one, apply immediately
                 let is_elected = active_connection_id
                     .borrow()
                     .as_deref()
@@ -289,10 +288,9 @@ impl ConnectionManager {
 
                 if is_elected {
                     info!("Applying SESSION_ASSIGNED immediately (connection already elected)");
-                    *own_session_id.borrow_mut() = Some(sid.clone());
+                    *own_session_id.borrow_mut() = Some(sid);
                     on_inbound_media.emit(packet);
                 } else {
-                    // Store for later; will be applied after election completes
                     pending_session_ids
                         .borrow_mut()
                         .insert(connection_id.clone(), sid);
@@ -326,8 +324,8 @@ impl ConnectionManager {
             }
 
             // Filter self-packets using session_id
-            if let Some(ref own_id) = *own_session_id.borrow() {
-                if !packet.session_id.is_empty() && packet.session_id == *own_id {
+            if let Some(own_id) = *own_session_id.borrow() {
+                if packet.session_id != 0 && packet.session_id == own_id {
                     debug!(
                         "Rejecting packet from same session_id: {}",
                         packet.session_id
@@ -421,7 +419,6 @@ impl ConnectionManager {
         Ok(PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
             email: self.options.userid.clone(),
-            connection_phase: ConnectionPhase::PROBING.into(),
             data,
             ..Default::default()
         })
@@ -492,19 +489,18 @@ impl ConnectionManager {
                     .pending_session_ids
                     .borrow()
                     .get(&connection_id)
-                    .cloned()
+                    .copied()
                 {
                     info!(
                         "Applying pending SESSION_ASSIGNED for elected connection {}: {}",
                         connection_id, sid
                     );
-                    *self.own_session_id.borrow_mut() = Some(sid.clone());
+                    *self.own_session_id.borrow_mut() = Some(sid);
 
                     if let Some(connection) = self.connections.get(&connection_id) {
-                        connection.set_session_id(sid.clone());
+                        connection.set_session_id(sid);
                     }
 
-                    // Forward SESSION_ASSIGNED upstream so VideoCallClient can store it too
                     let wrapper = PacketWrapper {
                         packet_type: PacketType::SESSION_ASSIGNED.into(),
                         session_id: sid,
@@ -883,12 +879,12 @@ impl ConnectionManager {
     }
 
     /// Set own session_id for filtering self-packets and stamp outgoing heartbeats
-    pub fn set_own_session_id(&self, session_id: String) {
-        *self.own_session_id.borrow_mut() = Some(session_id.clone());
+    pub fn set_own_session_id(&self, session_id: u64) {
+        *self.own_session_id.borrow_mut() = Some(session_id);
 
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {
-                connection.set_session_id(session_id.clone());
+                connection.set_session_id(session_id);
             }
         }
         debug!("Set own_session_id to {session_id}");

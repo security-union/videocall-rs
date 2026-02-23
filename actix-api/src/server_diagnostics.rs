@@ -191,7 +191,7 @@ impl ServerDiagnostics {
         protocol: &str,
     ) -> ConnectionMetadata {
         let mut metadata = ConnectionMetadata::new();
-        metadata.session_id = session_id;
+        metadata.session_id = session_id.to_string();
         metadata.customer_email = customer_email.to_string();
         metadata.meeting_id = meeting_id.to_string();
         metadata.protocol = protocol.to_string();
@@ -306,7 +306,7 @@ impl ServerDiagnostics {
     /// Track a connection ending
     pub fn connection_ended(&self, session_id: u64) {
         let mut connections = self.connections.lock().unwrap();
-        if let Some(info) = connections.remove(session_id) {
+        if let Some(info) = connections.remove(&session_id) {
             let duration_ms = info.start_time.elapsed().as_millis() as u64;
 
             debug!(

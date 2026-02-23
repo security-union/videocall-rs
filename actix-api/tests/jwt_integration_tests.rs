@@ -160,7 +160,7 @@ async fn wait_for_meeting_started(
                 if let Some(Ok(Message::Binary(data))) = msg {
                     if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&data) {
                         if wrapper.packet_type == PacketType::SESSION_ASSIGNED.into() {
-                            assert!(!wrapper.session_id.is_empty(), "SESSION_ASSIGNED must carry session_id");
+                            assert!(wrapper.session_id != 0, "SESSION_ASSIGNED must carry session_id");
                             saw_session_assigned = true;
                         } else if wrapper.packet_type == PacketType::MEETING.into() {
                             if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {

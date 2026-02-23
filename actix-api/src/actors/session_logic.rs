@@ -36,7 +36,7 @@ use std::sync::Arc;
 use tracing::{info, trace};
 use uuid::Uuid;
 
-pub type SessionId = String;
+pub type SessionId = u64;
 pub type RoomId = String;
 pub type Email = String;
 
@@ -112,7 +112,7 @@ impl SessionLogic {
     pub fn track_connection_start(&self, transport: &str) {
         send_connection_started(
             &self.tracker_sender,
-            self.id.clone(),
+            self.id,
             self.email.clone(),
             self.room.clone(),
             transport.to_string(),
@@ -126,7 +126,7 @@ impl SessionLogic {
 
     /// Build SESSION_ASSIGNED packet for this session
     pub fn build_session_assigned(&self) -> Vec<u8> {
-        SessionManager::build_session_assigned_packet(&self.id)
+        SessionManager::build_session_assigned_packet(self.id)
     }
 
     /// Build MEETING_ENDED packet (for errors)
@@ -140,7 +140,7 @@ impl SessionLogic {
         R: Into<actix::Recipient<Message>>,
     {
         Connect {
-            id: self.id.clone(),
+            id: self.id,
             addr: recipient.into(),
         }
     }
@@ -149,7 +149,7 @@ impl SessionLogic {
     pub fn create_join_room_message(&self) -> JoinRoom {
         JoinRoom {
             room: self.room.clone(),
-            session: self.id.clone(),
+            session: self.id,
             user_id: self.email.clone(),
         }
     }
@@ -157,9 +157,9 @@ impl SessionLogic {
     /// Handle actor stopping - cleanup
     pub fn on_stopping(&self) {
         info!("Session stopping: {} in room {}", self.id, self.room);
-        send_connection_ended(&self.tracker_sender, self.id.clone());
+        send_connection_ended(&self.tracker_sender, self.id);
         self.addr.do_send(Disconnect {
-            session: self.id.clone(),
+            session: self.id,
             room: self.room.clone(),
             user_id: self.email.clone(),
         });
@@ -175,14 +175,14 @@ impl SessionLogic {
     pub fn handle_inbound(&self, data: &[u8]) -> InboundAction {
         // Track received data
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
-        data_tracker.track_received(&self.id, data.len() as u64);
+        data_tracker.track_received(self.id, data.len() as u64);
 
         // Classify and handle
         match classify_packet(data) {
             PacketKind::Rtt => {
                 trace!("RTT packet from {}, echoing back", self.email);
                 let data_tracker = DataTracker::new(self.tracker_sender.clone());
-                data_tracker.track_sent(&self.id, data.len() as u64);
+                data_tracker.track_sent(self.id, data.len() as u64);
                 InboundAction::Echo(Arc::new(data.to_vec()))
             }
             PacketKind::Health => {
@@ -199,7 +199,7 @@ impl SessionLogic {
     /// Returns the bytes to send and tracks metrics.
     pub fn handle_outbound(&self, msg: &Message) -> Vec<u8> {
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
-        data_tracker.track_sent(&self.id, msg.msg.len() as u64);
+        data_tracker.track_sent(self.id, msg.msg.len() as u64);
         msg.msg.clone()
     }
 }

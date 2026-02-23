@@ -10,8 +10,11 @@ message PacketWrapper {
     DIAGNOSTICS = 5;
     HEALTH = 6;
     MEETING = 7;
+    SESSION_ASSIGNED = 8;
   }
+  
   PacketType packet_type = 1;
   string email = 2;
   bytes data = 3;
+  uint64 session_id = 4;
 }

@@ -37,6 +37,44 @@ services:
     ports:
       - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
 
+  dioxus-ui:
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - nix-store-dioxus:/nix
+      - rustlemania-dioxus-ui-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-dioxus-ui-cargo-git-cache:/root/.cargo/git
+      - rustlemania-dioxus-ui-cache:/app/dioxus-ui/target
+    build:
+      dockerfile: docker/Dockerfile.dioxus.dev
+      context: ../
+    working_dir: /app/dioxus-ui
+    command: >
+      nix develop /app#yew-ui --command bash -c
+      "/app/docker/start-dioxus.sh"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
+      - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
+      - TRUNK_SERVE_PORT=${DIOXUS_SERVE_PORT:-3001}
+      - ENABLE_OAUTH=${ENABLE_OAUTH:-false}
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:8081}
+      - LOGIN_URL=http://localhost:8081/login
+      - RUSTFLAGS=--cfg=web_sys_unstable_apis
+      - RUST_BACKTRACE=1
+      - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
+      - E2EE_ENABLED=${E2EE_ENABLED:-false}
+      - FIREFOX_ENABLED=${FIREFOX_ENABLED:-false}
+      - USERS_ALLOWED_TO_STREAM=${USERS_ALLOWED_TO_STREAM:-}
+      - CARGO_TARGET_DIR=/app/dioxus-ui/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+      - OAUTH_PROVIDER=${OAUTH_PROVIDER:-google}
+      - UI_URL=${UI_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
+    ports:
+      - "${DIOXUS_SERVE_PORT:-3001}:${DIOXUS_SERVE_PORT:-3001}"
+
   website:
     volumes:
       - type: bind
@@ -355,6 +393,10 @@ volumes:
   rustlemania-yew-ui-cargo-registry-cache:
   rustlemania-yew-ui-cargo-git-cache:
   rustlemania-yew-ui-cache:
+  nix-store-dioxus:
+  rustlemania-dioxus-ui-cargo-registry-cache:
+  rustlemania-dioxus-ui-cargo-git-cache:
+  rustlemania-dioxus-ui-cache:
   rustlemania-leptos-ui-cargo-registry-cache:
   rustlemania-leptos-ui-cargo-git-cache:
   rustlemania-leptos-ui-cache:

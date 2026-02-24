@@ -8,8 +8,6 @@ WORKDIR /app
 COPY flake.nix flake.lock ./
 RUN git init && git add flake.nix flake.lock
 
-RUN nix develop .#backend --command true
-
 COPY . .
 RUN git add -A
 

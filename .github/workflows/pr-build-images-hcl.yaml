@@ -1,0 +1,175 @@
+name: Build PR Images
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-permissions:
+    name: Check permissions
+    runs-on: [self-hosted, linux, docker]
+    if: |
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/build-images')
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+      pr_number: ${{ steps.get-pr.outputs.pr_number }}
+      pr_sha: ${{ steps.get-pr.outputs.pr_sha }}
+      pr_ref: ${{ steps.get-pr.outputs.pr_ref }}
+    steps:
+      - name: Get PR details
+        id: get-pr
+        run: |
+          PR_DATA=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
+          PR_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+          PR_REF=$(echo "$PR_DATA" | jq -r '.head.ref')
+          echo "pr_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          echo "pr_sha=${PR_SHA}" >> $GITHUB_OUTPUT
+          echo "pr_ref=${PR_REF}" >> $GITHUB_OUTPUT
+
+      - name: Check if user is maintainer
+        id: check
+        run: |
+          ASSOCIATION="${{ github.event.comment.author_association }}"
+          echo "User association: $ASSOCIATION"
+          if [[ "$ASSOCIATION" =~ ^(OWNER|MEMBER|COLLABORATOR)$ ]]; then
+            echo "✅ User is authorized"
+            echo "authorized=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ User is not authorized"
+            echo "authorized=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: React to comment (processing)
+        if: steps.check.outputs.authorized == 'true'
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -d '{"content":"rocket"}'
+
+      - name: Comment build started
+        if: steps.check.outputs.authorized == 'true'
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -d "{\"body\":\"🔨 **Building Docker images for PR #${{ github.event.issue.number }}**\n\nStarted by @${{ github.event.comment.user.login }}\n\n**Building:**\n- Media Server (WebSocket/WebTransport)\n- Meeting API (REST backend)\n- Web UI (WASM frontend)\n\n⏱️ Build typically takes 10-15 minutes. I'll post another comment when the build is complete.\n\n[View build logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}"
+
+      - name: Post error if unauthorized
+        if: steps.check.outputs.authorized == 'false'
+        run: |
+          ASSOCIATION="${{ github.event.comment.author_association }}"
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -d "{\"body\":\"❌ **Permission denied**\n\n@${{ github.event.comment.user.login }}, only repository maintainers can build images.\n\n**Your role**: \\\`${ASSOCIATION}\\\`\n**Required roles**: \\\`OWNER\\\`, \\\`MEMBER\\\`, or \\\`COLLABORATOR\\\`\"}"
+          exit 1
+
+  build:
+    name: Build and push images
+    needs: check-permissions
+    if: needs.check-permissions.outputs.authorized == 'true'
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+      - name: Checkout code
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf /tmp/build-${{ github.event.issue.number }}
+          mkdir -p /tmp/build-${{ github.event.issue.number }}
+          cd /tmp/build-${{ github.event.issue.number }}
+          git clone https://oauth2:${GH_TOKEN}@github01.hclpnp.com/labs-projects/videocall.git .
+          git checkout ${{ needs.check-permissions.outputs.pr_sha }}
+
+      - name: Login to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          echo "$HARBOR_PASSWORD" | docker login hclcr.io -u "$HARBOR_USERNAME" --password-stdin
+          echo "✅ Harbor login successful"
+
+      - name: Build and push media server
+        env:
+          REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+        run: |
+          cd /tmp/build-${{ github.event.issue.number }}
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+
+          ./cut_build_push_backend.sh pr-${PR_NUM}
+
+      - name: Build and push meeting API
+        env:
+          REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+        run: |
+          cd /tmp/build-${{ github.event.issue.number }}
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+
+          ./cut_build_push_meeting_api.sh pr-${PR_NUM}
+
+      - name: Build and push UI
+        env:
+          REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+        run: |
+          cd /tmp/build-${{ github.event.issue.number }}
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+
+          ./cut_build_push_ui.sh pr-${PR_NUM}
+
+      - name: Cleanup build directory
+        if: always()
+        run: rm -rf /tmp/build-${{ github.event.issue.number }}
+
+      - name: Comment build success
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -d "{\"body\":\"✅ **Images built successfully!**\n\n**Images:**\n- \\\`${REGISTRY}/videocall-media-server:pr-${PR_NUM}\\\`\n- \\\`${REGISTRY}/videocall-meeting-api:pr-${PR_NUM}\\\`\n- \\\`${REGISTRY}/videocall-web-ui:pr-${PR_NUM}\\\`\n\nComment \\\`/deploy\\\` to create a preview environment.\"}"
+
+      - name: React to comment (success)
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -d '{"content":"hooray"}'
+
+  comment-failure:
+    name: Comment on build failure
+    needs: [check-permissions, build]
+    if: always() && needs.check-permissions.outputs.authorized == 'true' && needs.build.result == 'failure'
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Comment build failure
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -d "{\"body\":\"❌ **Build failed**\\n\\nCheck the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\"}"
+
+      - name: React to comment (failure)
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -d '{"content":"confused"}'

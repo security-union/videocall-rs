@@ -1,31 +1,25 @@
-# Stage 1: Nix build with musl target
-FROM nixos/nix:2.33.2 AS builder
-
-ENV NIX_CONFIG="experimental-features = nix-command flakes"
-
-WORKDIR /app
-
-COPY flake.nix flake.lock ./
-RUN git init && git add flake.nix flake.lock
-
-COPY . .
-RUN git add -A
+FROM securityunion/actix-base:meeting-ownership-branch-c4b19265 as build
 
 ENV CARGO_TARGET_DIR=/app/actix-api/target
+COPY . /app
+WORKDIR /app/actix-api
+RUN cargo build --release
 
-RUN nix develop .#backend --command bash -c "\
-    cd actix-api && cargo build --release --target x86_64-unknown-linux-musl"
+# Create a directory with all binary executables for easier copying
+RUN mkdir -p /app/binaries && \
+    find /app/actix-api/target/release -maxdepth 1 -type f -executable \
+    -not -name "*.so" -not -name "*.a" -not -name "*.d" -not -name "build_*" \
+    -exec cp {} /app/binaries/ \;
 
-RUN mkdir -p /artifacts && \
-    find /app/actix-api/target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f -executable \
-        -not -name "*.so" -not -name "*.a" -not -name "*.d" -not -name "build_*" \
-        -exec cp {} /artifacts/ \;
-
-# Stage 2: Minimal image with static binaries
 FROM debian:trixie-slim as production
 
-COPY --from=builder /artifacts/ /
+RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
+
+COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
+# Copy all binary executables from actix-api
+COPY --from=build /app/binaries/* /usr/bin/
+COPY --from=build /app/dbmate /app/dbmate
 
 STOPSIGNAL SIGINT
 
-CMD ["/websocket_server"]
+CMD [ "websocket_server" ]

@@ -33,7 +33,7 @@ jsonwebtoken = "9"
 argon2 = "0.5"
 regex = "1"
 rand = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 base64 = "0.22"
 oauth2 = "4"
 

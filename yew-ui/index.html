@@ -44,280 +44,230 @@
         />
         <link id="neteq-worker" href="/neteq_worker_loader.js" />
 
-        <!-- Load wasm worker scripts from the videocall-codecs crate -->
-        <!-- MediaStreamTrackProcessor polyfill using LiveKit's approach:
-             Creates VideoFrame directly from video element instead of canvas copy.
-             See: https://github.com/livekit/track-processors-js/pull/65 -->
-        <script>	
-            if (!self.MediaStreamTrackProcessor) {	
-            self.MediaStreamTrackProcessor = class MediaStreamTrackProcessor {
-                constructor({track}) {	
-                if (track.kind == "video") {	
-                    this.readable = new ReadableStream({	
-                    async start(controller) {	
-                        this.video = document.createElement("video");
-                        this.video.muted = true;
-                        this.video.srcObject = new MediaStream([track]);	
-                        await Promise.all([
-                            this.video.play(),
-                            new Promise(r => this.video.onloadedmetadata = r)
-                        ]);
-                        this.track = track;	
-
-                        if (!this.video.videoWidth || !this.video.videoHeight) {
-                            console.warn("Video dimensions not available after metadata load");
-                        }
-
-                        // Try direct VideoFrame from video element (LiveKit approach)
-                        // This may be faster than canvas copy in some browsers
-                        const supportsDirectVideoFrame = (() => {
-                            try {
-                                const testFrame = new VideoFrame(this.video);
-                                testFrame.close();
-                                return true;
-                            } catch (e) {
-                                return false;
+               <!-- Load wasm worker scripts from the videocall-codecs crate -->
+               <script>	
+                if (!self.MediaStreamTrackProcessor) {	
+                self.MediaStreamTrackProcessor = class MediaStreamTrackProcessor {
+                    constructor({track}) {	
+                    if (track.kind == "video") {	
+                        this.readable = new ReadableStream({	
+                        async start(controller) {	
+                            this.video = document.createElement("video");
+                            this.video.muted = true; // Prevent potential audio feedback	
+                            this.video.srcObject = new MediaStream([track]);	
+                            await Promise.all([
+                                this.video.play(),
+                                new Promise(r => this.video.onloadedmetadata = r) // Wait for metadata
+                            ]);
+                            this.track = track;	
+    
+                            // Ensure initial dimensions are set before creating canvas
+                            if (!this.video.videoWidth || !this.video.videoHeight) {
+                                console.warn("Video dimensions not available immediately after metadata load.");
+                                // Potential fallback or wait mechanism might be needed if this happens often
                             }
-                        })();
-
-                        if (supportsDirectVideoFrame) {
-                            console.log("Using direct VideoFrame(video) - LiveKit approach");
-                            
-                            // Track last video time to avoid duplicate frames
-                            let lastVideoTime = -1;
-                            
+    
+                            this.canvas = new OffscreenCanvas(this.video.videoWidth || 640, this.video.videoHeight || 480); // Use default dimensions as fallback
+                            this.ctx = this.canvas.getContext('2d', {desynchronized: true});	
+    
+                            // --- Performance Improvement: Use requestVideoFrameCallback if available ---
                             if (this.video.requestVideoFrameCallback) {
-                                console.log("Using requestVideoFrameCallback with direct VideoFrame");
+                                console.log("Using requestVideoFrameCallback for MediaStreamTrackProcessor polyfill");
                                 const processFrame = (now, metadata) => {
-                                    if (!controller.desiredSize) {
-                                        this.video?.pause();
-                                        return;
-                                    }
-
-                                    // Only process if video has new frame
-                                    const currentTime = this.video.currentTime;
-                                    if (currentTime !== lastVideoTime) {
-                                        lastVideoTime = currentTime;
-                                        try {
-                                            // Create VideoFrame directly from video element
-                                            const frame = new VideoFrame(this.video, {
-                                                timestamp: metadata.mediaTime * 1e6
-                                            });
-                                            controller.enqueue(frame);
-                                        } catch (e) {
-                                            console.error("Error creating VideoFrame:", e);
-                                        }
-                                    }
-
-                                    if (controller.desiredSize > 0) {
-                                        this.video.requestVideoFrameCallback(processFrame);
-                                    }
-                                };
-                                this.video.requestVideoFrameCallback(processFrame);
-                            } else {
-                                console.warn("Using requestAnimationFrame with direct VideoFrame");
-                                let lastTimestamp = -1;
-                                const processFrameRAF = (timestamp) => {
-                                    if (!controller.desiredSize) {
-                                        this.video?.pause();
-                                        return;
-                                    }
-
-                                    const currentTime = this.video.currentTime;
-                                    if (currentTime !== lastVideoTime && timestamp !== lastTimestamp) {
-                                        lastVideoTime = currentTime;
-                                        lastTimestamp = timestamp;
-                                        try {
-                                            const frame = new VideoFrame(this.video, {
-                                                timestamp: performance.now() * 1000
-                                            });
-                                            controller.enqueue(frame);
-                                        } catch (e) {
-                                            console.error("Error creating VideoFrame:", e);
-                                        }
-                                    }
-
-                                    if (controller.desiredSize > 0) {
-                                        requestAnimationFrame(processFrameRAF);
-                                    }
-                                };
-                                requestAnimationFrame(processFrameRAF);
-                            }
-                        } else {
-                            // Fallback: Canvas-based approach (original polyfill)
-                            console.log("Using canvas-based polyfill (direct VideoFrame not supported)");
-                            this.canvas = new OffscreenCanvas(
-                                this.video.videoWidth || 640, 
-                                this.video.videoHeight || 480
-                            );
-                            this.ctx = this.canvas.getContext('2d', {desynchronized: true});
-
-                            if (this.video.requestVideoFrameCallback) {
-                                const processFrame = (now, metadata) => {
+                                    // Check if stream is closed before processing
                                     if (!controller.desiredSize) return;
+    
                                     try {
                                         if (this.video.videoWidth && this.video.videoHeight) {
-                                            if (this.canvas.width !== this.video.videoWidth || 
-                                                this.canvas.height !== this.video.videoHeight) {
+                                             // Resize canvas if video dimensions changed
+                                             if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
                                                 this.canvas.width = this.video.videoWidth;
                                                 this.canvas.height = this.video.videoHeight;
-                                            }
+                                                // Re-get context if needed, although usually not necessary for 2d
+                                                // this.ctx = this.canvas.getContext('2d', {desynchronized: true});
+                                             }
                                             this.ctx.drawImage(this.video, 0, 0);
-                                            controller.enqueue(new VideoFrame(this.canvas, {
-                                                timestamp: metadata.mediaTime * 1e6
-                                            }));
+                                            // Use mediaTime for more accurate timestamp
+                                            controller.enqueue(new VideoFrame(this.canvas, {timestamp: metadata.mediaTime * 1e6 }));
                                         }
                                     } catch (e) {
-                                        console.error("Error processing video frame:", e);
-                                    }
-                                    if (controller.desiredSize > 0) {
-                                        this.video.requestVideoFrameCallback(processFrame);
-                                    } else {
-                                        this.video?.pause();
+                                        console.error("Error processing video frame (rVFC):", e);
+                                         try { controller.error(e); } catch {} // Close stream on error
+                                    } finally {
+                                         // Schedule the next frame processing only if stream is still active
+                                         if (controller.desiredSize > 0) {
+                                             try {
+                                                this.video.requestVideoFrameCallback(processFrame);
+                                             } catch (e) {
+                                                 console.error("Error requesting next video frame callback:", e);
+                                                 try { controller.error(e); } catch {}
+                                             }
+                                         } else {
+                                             console.log("Stopping rVFC loop as stream is closed or backed up.");
+                                             this.video?.pause(); // Pause video when stopping
+                                         }
                                     }
                                 };
+                                // Start the loop
                                 this.video.requestVideoFrameCallback(processFrame);
                             } else {
+                                // --- Fallback to simplified requestAnimationFrame ---
+                                console.warn("requestVideoFrameCallback not supported, falling back to requestAnimationFrame for MediaStreamTrackProcessor polyfill");
                                 let lastTimestamp = -1;
                                 const processFrameRAF = (timestamp) => {
-                                    if (!controller.desiredSize) {
-                                        this.video?.pause();
-                                        return;
-                                    }
-                                    if (timestamp !== lastTimestamp) {
-                                        lastTimestamp = timestamp;
-                                        try {
-                                            if (this.video.videoWidth && this.video.videoHeight) {
-                                                if (this.canvas.width !== this.video.videoWidth || 
-                                                    this.canvas.height !== this.video.videoHeight) {
-                                                    this.canvas.width = this.video.videoWidth;
-                                                    this.canvas.height = this.video.videoHeight;
-                                                }
-                                                this.ctx.drawImage(this.video, 0, 0);
-                                                controller.enqueue(new VideoFrame(this.canvas, {
-                                                    timestamp: performance.now() * 1000
-                                                }));
-                                            }
-                                        } catch (e) {
-                                            console.error("Error processing video frame:", e);
+                                     // Check if stream is closed
+                                     if (!controller.desiredSize) {
+                                         console.log("Stopping rAF loop as stream is closed or backed up.");
+                                         this.video?.pause(); // Pause video when stopping
+                                         return;
+                                     }
+    
+                                     // Avoid processing the same frame multiple times if RAF fires rapidly
+                                     if (timestamp === lastTimestamp) {
+                                         requestAnimationFrame(processFrameRAF);
+                                         return;
+                                     }
+                                     lastTimestamp = timestamp;
+    
+                                     try {
+                                         if (this.video.videoWidth && this.video.videoHeight) {
+                                            // Resize canvas if video dimensions changed
+                                             if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
+                                                this.canvas.width = this.video.videoWidth;
+                                                this.canvas.height = this.video.videoHeight;
+                                             }
+                                            this.ctx.drawImage(this.video, 0, 0);
+                                            // Use performance.now() for timestamp as RAF timestamp isn't media time
+                                            controller.enqueue(new VideoFrame(this.canvas, { timestamp: performance.now() * 1000 }));
                                         }
-                                    }
-                                    if (controller.desiredSize > 0) {
-                                        requestAnimationFrame(processFrameRAF);
-                                    }
+                                     } catch (e) {
+                                         console.error("Error processing video frame (RAF):", e);
+                                         try { controller.error(e); } catch {} // Close stream on error
+                                     } finally {
+                                         // Schedule the next frame
+                                         if (controller.desiredSize > 0) {
+                                             requestAnimationFrame(processFrameRAF);
+                                         } else {
+                                              console.log("Stopping rAF loop as stream is closed or backed up.");
+                                              this.video?.pause(); // Pause video when stopping
+                                         }
+                                     }
                                 };
+                                 // Start the loop
                                 requestAnimationFrame(processFrameRAF);
                             }
-                        }
-                    },	
-                    cancel(reason) {
-                        console.log("Video track processor cancelled:", reason);
-                        if (this.video) {
-                            this.video.pause();
-                            this.video.srcObject = null;
-                        }
-                    }	
-                    });	
-                } else if (track.kind == "audio") {	
-                    this.readable = new ReadableStream({	
-                    async start(controller) {	
-                        this.ac = new AudioContext;	
-                        this.arrays = [];	
-                        function worklet() {	
-                        registerProcessor("mstp-shim", class Processor extends AudioWorkletProcessor {	
-                            process(input) { this.port.postMessage(input); return true; }	
-                        });	
+                        },	
+                        // Pull is no longer needed as the stream is now push-based
+                        // pull(controller) { ... },
+                        cancel(reason) {
+                            console.log("Video track processor cancelled:", reason);
+                            if (this.video) {
+                                this.video.pause();
+                                this.video.srcObject = null; // Release stream resources
+                            }
+                            // The rVFC/rAF loops will stop automatically due to the desiredSize check
                         }	
-                        await this.ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);	
-                        this.node = new AudioWorkletNode(this.ac, "mstp-shim");	
-                        this.ac.createMediaStreamSource(new MediaStream([track])).connect(this.node);	
-                        this.node.port.addEventListener("message", ({data}) => data[0][0] && this.arrays.push(data));	
-                    },	
-                    async pull(controller) {	
-                        while (!this.arrays.length) await new Promise(r => this.node.port.onmessage = r);	
-                        const [channels] = this.arrays.shift();	
-                        const joined = new Float32Array(channels.reduce((a, b) => a + b.length, 0));	
-                        channels.reduce((offset, a) => (joined.set(a, offset), offset + a.length), 0);	
-                        controller.enqueue(new AudioData({	
-                        format: "f32-planar",	
-                        sampleRate: this.ac.sampleRate,	
-                        numberOfFrames: channels[0].length,	
-                        numberOfChannels: channels.length,	
-                        timestamp: this.ac.currentTime * 1e6 | 0,	
-                        data: joined,	
-                        transfer: [joined.buffer]	
-                        }));	
-                    }	
-                    });	
-                }	
-                }	
-            };	
-            }	
-        </script>	
-        <!-- MediaStreamTrackGenerator polyfill -->	
-        <script>	
-            if (!window.MediaStreamTrackGenerator) {	
-            window.MediaStreamTrackGenerator = class MediaStreamTrackGenerator {	
-                constructor({kind}) {	
-                if (kind == "video") {	
-                    const canvas = document.createElement("canvas");	
-                    const ctx = canvas.getContext('2d', {desynchronized: true});	
-                    const track = canvas.captureStream().getVideoTracks()[0];	
-                    track.writable = new WritableStream({	
-                    write(frame) {	
-                        canvas.width = frame.displayWidth;	
-                        canvas.height = frame.displayHeight;	
-                        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);	
-                        frame.close();	
-                    }	
-                    });	
-                    return track;	
-                } else if (kind == "audio") {	
-                    const ac = new AudioContext;	
-                    const dest = ac.createMediaStreamDestination();	
-                    const [track] = dest.stream.getAudioTracks();	
-                    track.writable = new WritableStream({	
-                    async start(controller) {	
-                        this.arrays = [];	
-                        function worklet() {	
-                        registerProcessor("mstg-shim", class Processor extends AudioWorkletProcessor {	
-                            constructor() {	
-                            super();	
+                        });	
+                    } else if (track.kind == "audio") {	
+                        this.readable = new ReadableStream({	
+                        async start(controller) {	
+                            this.ac = new AudioContext;	
                             this.arrays = [];	
-                            this.arrayOffset = 0;	
-                            this.port.onmessage = ({data}) => this.arrays.push(data);	
-                            this.emptyArray = new Float32Array(0);	
+                            function worklet() {	
+                            registerProcessor("mstp-shim", class Processor extends AudioWorkletProcessor {	
+                                process(input) { this.port.postMessage(input); return true; }	
+                            });	
                             }	
-                            process(inputs, [[output]]) {	
-                            for (let i = 0; i < output.length; i++) {	
-                                if (!this.array || this.arrayOffset >= this.array.length) {	
-                                this.array = this.arrays.shift() || this.emptyArray;	
-                                this.arrayOffset = 0;	
-                                }	
-                                output[i] = this.array[this.arrayOffset++] || 0;	
-                            }	
-                            return true;	
-                            }	
-                        });	
+                            await this.ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);	
+                            this.node = new AudioWorkletNode(this.ac, "mstp-shim");	
+                            this.ac.createMediaStreamSource(new MediaStream([track])).connect(this.node);	
+                            this.node.port.addEventListener("message", ({data}) => data[0][0] && this.arrays.push(data));	
+                        },	
+                        async pull(controller) {	
+                            while (!this.arrays.length) await new Promise(r => this.node.port.onmessage = r);	
+                            const [channels] = this.arrays.shift();	
+                            const joined = new Float32Array(channels.reduce((a, b) => a + b.length, 0));	
+                            channels.reduce((offset, a) => (joined.set(a, offset), offset + a.length), 0);	
+                            controller.enqueue(new AudioData({	
+                            format: "f32-planar",	
+                            sampleRate: this.ac.sampleRate,	
+                            numberOfFrames: channels[0].length,	
+                            numberOfChannels: channels.length,	
+                            timestamp: this.ac.currentTime * 1e6 | 0,	
+                            data: joined,	
+                            transfer: [joined.buffer]	
+                            }));	
                         }	
-                        await ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);	
-                        this.node = new AudioWorkletNode(ac, "mstg-shim");	
-                        this.node.connect(dest);	
-                        return track;	
-                    },	
-                    write(audioData) {	
-                        const array = new Float32Array(audioData.numberOfFrames * audioData.numberOfChannels);	
-                        audioData.copyTo(array, {planeIndex: 0});	
-                        this.node.port.postMessage(array, [array.buffer]);	
-                        audioData.close();	
+                        });	
                     }	
-                    });	
-                    return track;	
+                    }	
+                };	
                 }	
+            </script>	
+            <!-- MediaStreamTrackGenerator polyfill -->	
+            <script>	
+                if (!window.MediaStreamTrackGenerator) {	
+                window.MediaStreamTrackGenerator = class MediaStreamTrackGenerator {	
+                    constructor({kind}) {	
+                    if (kind == "video") {	
+                        const canvas = document.createElement("canvas");	
+                        const ctx = canvas.getContext('2d', {desynchronized: true});	
+                        const track = canvas.captureStream().getVideoTracks()[0];	
+                        track.writable = new WritableStream({	
+                        write(frame) {	
+                            canvas.width = frame.displayWidth;	
+                            canvas.height = frame.displayHeight;	
+                            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);	
+                            frame.close();	
+                        }	
+                        });	
+                        return track;	
+                    } else if (kind == "audio") {	
+                        const ac = new AudioContext;	
+                        const dest = ac.createMediaStreamDestination();	
+                        const [track] = dest.stream.getAudioTracks();	
+                        track.writable = new WritableStream({	
+                        async start(controller) {	
+                            this.arrays = [];	
+                            function worklet() {	
+                            registerProcessor("mstg-shim", class Processor extends AudioWorkletProcessor {	
+                                constructor() {	
+                                super();	
+                                this.arrays = [];	
+                                this.arrayOffset = 0;	
+                                this.port.onmessage = ({data}) => this.arrays.push(data);	
+                                this.emptyArray = new Float32Array(0);	
+                                }	
+                                process(inputs, [[output]]) {	
+                                for (let i = 0; i < output.length; i++) {	
+                                    if (!this.array || this.arrayOffset >= this.array.length) {	
+                                    this.array = this.arrays.shift() || this.emptyArray;	
+                                    this.arrayOffset = 0;	
+                                    }	
+                                    output[i] = this.array[this.arrayOffset++] || 0;	
+                                }	
+                                return true;	
+                                }	
+                            });	
+                            }	
+                            await ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);	
+                            this.node = new AudioWorkletNode(ac, "mstg-shim");	
+                            this.node.connect(dest);	
+                            return track;	
+                        },	
+                        write(audioData) {	
+                            const array = new Float32Array(audioData.numberOfFrames * audioData.numberOfChannels);	
+                            audioData.copyTo(array, {planeIndex: 0});	
+                            this.node.port.postMessage(array, [array.buffer]);	
+                            audioData.close();	
+                        }	
+                        });	
+                        return track;	
+                    }	
+                    }	
+                };	
                 }	
-            };	
-            }	
-        </script>
+            </script>
     </head>
     <body class="bg-background text-foreground">
     </body>

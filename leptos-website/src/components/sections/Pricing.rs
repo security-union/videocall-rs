@@ -23,11 +23,11 @@ use leptos::*;
 pub fn PricingSection() -> impl IntoView {
     view! {
         <section id="pricing" class="relative">
-            <div class="text-center mb-20">
-                <h2 class="text-headline text-foreground mb-6">
+            <div class="text-center mb-16">
+                <h2 class="text-4xl md:text-5xl font-semibold tracking-tight mb-4">
                     "Pricing"
                 </h2>
-                <p class="text-body-large text-foreground-secondary max-w-3xl mx-auto">
+                <p class="text-lg md:text-xl text-white/50 max-w-2xl mx-auto">
                     "Choose the deployment option that works best for your needs"
                 </p>
             </div>

@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
-use crate::messages::server::{ClientMessage, Packet};
+use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -87,6 +87,9 @@ pub struct WtChatSession {
 
     /// Channel to send data back to WebTransport session
     outbound_tx: mpsc::Sender<WtOutbound>,
+
+    /// Track if ActivateConnection has been sent
+    activated: bool,
 }
 
 impl WtChatSession {
@@ -112,6 +115,7 @@ impl WtChatSession {
             logic,
             heartbeat: actix::clock::Instant::now(),
             outbound_tx,
+            activated: false,
         }
     }
 
@@ -185,26 +189,32 @@ impl Actor for WtChatSession {
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
         let email = self.logic.email.clone();
+        let session_id = self.logic.id;
 
         ctx.wait(
-            async move { session_manager.start_session(&room, &email).await }
-                .into_actor(self)
-                .map(|result, act, ctx| match result {
-                    Ok(result) => {
-                        let bytes = act
-                            .logic
-                            .build_meeting_started(result.start_time_ms, &result.creator_id);
-                        act.send(bytes);
-                    }
-                    Err(e) => {
-                        error!("Failed to start session: {}", e);
-                        let bytes = act
-                            .logic
-                            .build_meeting_ended(&format!("Session rejected: {e}"));
-                        act.send(bytes);
-                        ctx.stop();
-                    }
-                }),
+            async move {
+                session_manager
+                    .start_session(&room, &email, session_id)
+                    .await
+            }
+            .into_actor(self)
+            .map(|result, act, ctx| match result {
+                Ok(result) => {
+                    act.send(act.logic.build_session_assigned());
+                    let bytes = act
+                        .logic
+                        .build_meeting_started(result.start_time_ms, &result.creator_id);
+                    act.send(bytes);
+                }
+                Err(e) => {
+                    error!("Failed to start session: {}", e);
+                    let bytes = act
+                        .logic
+                        .build_meeting_ended(&format!("Session rejected: {e}"));
+                    act.send(bytes);
+                    ctx.stop();
+                }
+            }),
         );
 
         // Start heartbeat
@@ -266,10 +276,21 @@ impl Handler<WtInbound> for WtChatSession {
             return;
         }
 
-        // Delegate to shared logic
-        match self.logic.handle_inbound(&msg.data) {
+        let action = self.logic.handle_inbound(&msg.data);
+
+        if !self.activated && SessionLogic::should_activate_on_action(&action) {
+            self.logic.addr.do_send(ActivateConnection {
+                session: self.logic.id,
+            });
+            self.activated = true;
+            info!(
+                "Session {} activated on first non-RTT packet",
+                self.logic.id
+            );
+        }
+
+        match action {
             InboundAction::Echo(data) => {
-                // Echo via the same channel it arrived on
                 let outbound = match msg.source {
                     WtInboundSource::UniStream => {
                         WtOutbound::UniStream(Bytes::from(data.as_ref().clone()))
@@ -298,9 +319,7 @@ impl Handler<WtInbound> for WtChatSession {
             InboundAction::Forward(data) => {
                 ctx.notify(Packet { data });
             }
-            InboundAction::Processed | InboundAction::KeepAlive => {
-                // Already handled
-            }
+            InboundAction::Processed | InboundAction::KeepAlive => {}
         }
     }
 }
@@ -328,12 +347,9 @@ impl Handler<Packet> for WtChatSession {
             self.logic.id,
             self.logic.room
         );
-        self.logic.addr.do_send(ClientMessage {
-            session: self.logic.id.clone(),
-            user: self.logic.email.clone(),
-            room: self.logic.room.clone(),
-            msg,
-        });
+        self.logic
+            .addr
+            .do_send(self.logic.create_client_message(msg));
     }
 }
 
@@ -347,21 +363,8 @@ impl WtChatSession {
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {
-                match response {
-                    Ok(Ok(())) => {
-                        info!(
-                            "Successfully joined room {} for session {}",
-                            act.logic.room, act.logic.id
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        error!("Failed to join room: {}", e);
-                        ctx.stop();
-                    }
-                    Err(err) => {
-                        error!("Error sending JoinRoom: {:?}", err);
-                        ctx.stop();
-                    }
+                if act.logic.handle_join_room_result(response) {
+                    ctx.stop();
                 }
                 fut::ready(())
             })

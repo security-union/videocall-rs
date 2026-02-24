@@ -4,13 +4,14 @@
 
 @layer base {
   html {
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, system-ui, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
     background-color: #000000;
-    color: #FFFFFF;
+    color: #f5f5f7;
     font-size: 16px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    scroll-behavior: smooth;
   }
 
   body {
@@ -19,107 +20,135 @@
     background-color: #000000;
   }
 
-  * {
-    box-sizing: border-box;
-  }
+  * { box-sizing: border-box; }
 }
 
 @layer components {
-  /* Apple-style button base */
-  .btn-apple {
-    @apply inline-flex items-center justify-center rounded-lg px-6 py-3 text-base font-medium transition-all duration-200 ease-out;
-    @apply focus:outline-none focus:ring-2 focus:ring-primary/20 focus:ring-offset-2 focus:ring-offset-background;
+  /* Hero gradient — animated shimmer */
+  .hero-gradient {
+    background: linear-gradient(135deg, #2997ff 0%, #a855f7 40%, #2997ff 80%);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: gradient-shift 4s ease-in-out infinite;
   }
 
-  .btn-primary {
-    @apply btn-apple bg-primary text-white hover:bg-primary-dark;
-    @apply shadow-sm hover:shadow-md;
+  @keyframes gradient-shift {
+    0%, 100% { background-position: 0% center; }
+    50% { background-position: 100% center; }
   }
+
+  /* Hero buttons — Apple style */
+  .hero-btn-primary {
+    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
+    @apply px-8 py-3.5 text-[15px];
+    background: #2997ff;
+    color: #fff;
+  }
+  .hero-btn-primary:hover {
+    background: #0077ed;
+    transform: scale(1.02);
+  }
+
+  .hero-btn-secondary {
+    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
+    @apply px-8 py-3.5 text-[15px];
+    color: #2997ff;
+    background: transparent;
+    border: 1px solid rgba(41, 151, 255, 0.3);
+  }
+  .hero-btn-secondary:hover {
+    background: rgba(41, 151, 255, 0.08);
+    border-color: rgba(41, 151, 255, 0.5);
+  }
+
+  /* Section buttons */
+  .btn-primary {
+    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
+    @apply px-6 py-3 text-[15px];
+    background: #2997ff;
+    color: #fff;
+  }
+  .btn-primary:hover { background: #0077ed; }
 
   .btn-secondary {
-    @apply btn-apple bg-background-secondary text-foreground border border-border;
-    @apply hover:bg-background-tertiary hover:border-border-secondary;
+    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
+    @apply px-6 py-3 text-[15px];
+    color: #f5f5f7;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  .btn-secondary:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.16);
   }
 
-  /* Apple-style card */
+  /* Apple-style surface card — no visible border */
   .card-apple {
-    background-color: #1C1C1E;
-    border: 1px solid #38383A;
-    border-radius: 0.75rem;
-    padding: 1.5rem;
-    backdrop-filter: blur(8px);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 1.25rem;
+    padding: 2rem;
+    transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+  }
+  .card-apple:hover {
+    background: rgba(255, 255, 255, 0.06);
+    transform: translateY(-2px);
   }
 
-  /* Apple-style text hierarchy */
-  .text-hero {
-    @apply text-5xl md:text-6xl lg:text-7xl font-bold tracking-tight;
-  }
-
-  .text-headline {
-    @apply text-3xl md:text-4xl lg:text-5xl font-semibold tracking-tight;
-  }
-
-  .text-subheadline {
-    @apply text-xl md:text-2xl lg:text-3xl font-medium;
-  }
-
-  .text-body-large {
-    @apply text-lg md:text-xl leading-relaxed;
-  }
-
-  .text-body {
-    @apply text-base leading-relaxed;
-  }
-
-  .text-caption {
-    @apply text-sm text-foreground-secondary;
-  }
+  /* Typography — Apple scale */
+  .text-hero     { @apply text-5xl md:text-6xl lg:text-7xl font-bold tracking-tight; }
+  .text-headline { @apply text-3xl md:text-4xl lg:text-5xl font-semibold tracking-tight; }
+  .text-subheadline { @apply text-xl md:text-2xl font-medium; }
+  .text-body-large  { @apply text-lg md:text-xl leading-relaxed; }
+  .text-body        { @apply text-base leading-relaxed; }
+  .text-caption     { @apply text-sm; color: rgba(255,255,255,0.5); }
 }
 
-/* Leptos-specific */
-leptos-island {
-  display: contents;
-}
+leptos-island { display: contents; }
 
-/* Code syntax highlighting - Apple-inspired */
+/* Code syntax highlighting */
+.hl-comment { color: #6e7681; }
+.hl-keyword { color: #ff7b72; }
+.hl-type    { color: #79c0ff; }
+.hl-fn      { color: #d2a8ff; }
+.hl-string  { color: #a5d6ff; }
+
+/* Legacy syntax classes */
+.hh1  { color: #ff7b72; }
+.hh2  { color: #79c0ff; }
+.hh3  { color: #d2a8ff; }
+.hh4  { color: #d2a8ff; }
+.hh5  { color: #ff7b72; }
+.hh6  { color: rgba(255,255,255,0.4); }
+.hh7  { color: #79c0ff; }
+.hh8  { color: rgba(255,255,255,0.7); }
+.hh9  { color: rgba(255,255,255,0.7); }
+.hh10 { color: rgba(255,255,255,0.7); }
+.hh11 { color: #a5d6ff; }
+.hh12 { color: #a5d6ff; }
+.hh13 { color: #ff7b72; }
+.hh14 { color: #79c0ff; }
+.hh15 { color: #79c0ff; }
+.hh16 { color: rgba(255,255,255,0.9); }
+.hh17 { color: #ffa657; }
+.hh18 { color: #ffa657; }
+.hh19 { color: #6e7681; }
+.hh20 { color: #d2a8ff; }
+.hh21 { color: #ff7b72; }
+
+/* Code block */
 .code-block {
-  @apply bg-background-secondary border border-border rounded-lg p-4 font-mono text-sm;
-  @apply overflow-x-auto;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 0.75rem;
+  padding: 1rem;
+  overflow-x: auto;
 }
-
-.code-block .language-tag {
-  display: none;
-}
-
 .code-block .code-block-inner {
   font-family: 'SF Mono', 'Fira Code', Menlo, Monaco, monospace;
   font-style: normal;
 }
 
-pre i {
-  font-style: normal;
-}
-
-/* Code syntax colors - Apple-inspired */
-.hh1 { color: #FF6B6B; } /* attribute */
-.hh2 { color: #4ECDC4; } /* constant */
-.hh3 { color: #FFFFFF; } /* function.builtin */
-.hh4 { color: #FFFFFF; } /* function */
-.hh5 { color: #4ECDC4; } /* keyword */
-.hh6 { color: #C7C7CC; } /* operator */
-.hh7 { color: #4ECDC4; } /* property */
-.hh8 { color: #FFFFFF; } /* punctuation */
-.hh9 { color: #FFFFFF; } /* punctuation.bracket */
-.hh10 { color: #FFFFFF; } /* punctuation.delimiter */
-.hh11 { color: #FFFFFF; } /* string */
-.hh12 { color: #FFFFFF; } /* string.special */
-.hh13 { color: #FFFFFF; } /* tag */
-.hh14 { color: #C7C7CC; } /* type */
-.hh15 { color: #C7C7CC; } /* type.builtin */
-.hh16 { color: #4ECDC4; } /* variable */
-.hh17 { color: #4ECDC4; } /* variable.builtin */
-.hh18 { color: #AEAEB2; } /* variable.parameter */
-.hh19 { color: #8E8E93; } /* comment */
-.hh20 { color: #C7C7CC; } /* macro */
-.hh21 { color: #C7C7CC; } /* label */
-
+pre i { font-style: normal; }

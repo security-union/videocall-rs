@@ -1,13 +1,27 @@
-FROM securityunion/yew-base:meeting-ownership-branch-c4b19265 as build
+FROM nixos/nix:2.33.2 AS builder
+
+ENV NIX_CONFIG="experimental-features = nix-command flakes"
 
 WORKDIR /app
+
+COPY flake.nix flake.lock ./
+
+RUN git init && git add flake.nix flake.lock
+
+# Downloads all tools from the Nix binary cache (~seconds).
+# This layer is cached by Docker as long as flake.nix/flake.lock are unchanged.
+RUN nix develop .#yew-ui --command true
+
 COPY . .
-WORKDIR /app/yew-ui
+RUN git add -A
 
-RUN trunk build --release
+RUN nix develop .#yew-ui --command bash -c "\
+    cd yew-ui && \
+    tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify && \
+    trunk build --release"
 
-FROM nginx:1.21.5-alpine as production
+# ---------------------------------------------------------------------------
+FROM nginx:1.21.5-alpine
 
 COPY nginx.conf /etc/nginx/nginx.conf
-
-COPY --from=build /app/yew-ui/dist /usr/share/nginx/html
+COPY --from=builder /app/yew-ui/dist /usr/share/nginx/html

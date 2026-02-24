@@ -23,7 +23,7 @@ mod screen_encoder;
 mod transform;
 
 use crate::VideoCallClient;
-use yew::Callback;
+use videocall_types::Callback;
 
 pub use camera_encoder::CameraEncoder;
 pub use microphone_encoder::MicrophoneEncoder;
@@ -35,7 +35,7 @@ pub trait MicrophoneEncoderTrait {
     fn stop(&mut self);
     fn select(&mut self, device_id: String) -> bool;
     fn set_enabled(&mut self, enabled: bool) -> bool;
-    fn set_error_callback(&mut self, on_error: yew::Callback<String>);
+    fn set_error_callback(&mut self, on_error: Callback<String>);
     fn set_encoder_control(
         &mut self,
         rx: futures::channel::mpsc::UnboundedReceiver<
@@ -62,7 +62,7 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
         self.set_enabled(enabled)
     }
 
-    fn set_error_callback(&mut self, on_error: yew::Callback<String>) {
+    fn set_error_callback(&mut self, on_error: Callback<String>) {
         self.set_error_callback(on_error)
     }
 

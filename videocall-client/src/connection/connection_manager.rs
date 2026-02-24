@@ -490,7 +490,10 @@ impl ConnectionManager {
                     .copied()
                 {
                     if *self.own_session_id.borrow() == Some(sid) {
-                        debug!("Pending SESSION_ASSIGNED already processed for session {}, skipping", sid);
+                        debug!(
+                            "Pending SESSION_ASSIGNED already processed for session {}, skipping",
+                            sid
+                        );
                     } else {
                         info!(
                             "Applying pending SESSION_ASSIGNED for elected connection {}: {}",

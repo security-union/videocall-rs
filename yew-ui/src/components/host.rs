@@ -111,6 +111,9 @@ pub struct MeetingProps {
 
     pub video_enabled: bool,
 
+    #[prop_or_default]
+    pub is_speaking: bool,
+
     pub on_encoder_settings_update: Callback<String>,
 
     pub device_settings_open: bool,
@@ -492,11 +495,13 @@ impl Component for Host {
             "grid-item self-tile"
         };
 
+        let speaking_class = if ctx.props().is_speaking { "speaking-tile" } else { "" };
+
         html! {
             <>
                 // Self tile - rendered as grid item or floating overlay based on is_floating prop
                 <div class={container_class} id="self-video-div">
-                    <div class={classes!("canvas-container", if ctx.props().video_enabled { "video-on" } else { "" })}>
+                    <div class={classes!("canvas-container", speaking_class, if ctx.props().video_enabled { "video-on" } else { "" })}>
                         // Video element - ALWAYS present in DOM for CameraEncoder, hidden via CSS when video is off
                         <video
                             class={classes!("self-camera", "uncropped", if !ctx.props().video_enabled { "video-hidden" } else { "" })}
@@ -515,7 +520,7 @@ impl Component for Host {
                                             <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
                                             <line x1="1" y1="1" x2="23" y2="23"></line>
                                         </svg>
-                                        <span class="placeholder-text">{"Camera Off"}</span>
+                                        <span class="placeholder-text">{"Camera Off 3222 "}</span>
                                     </div>
                                 }
                             } else {

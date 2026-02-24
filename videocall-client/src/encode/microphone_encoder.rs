@@ -151,6 +151,9 @@ impl MicrophoneEncoder {
                 if let Some(interval) = self.vad_interval.borrow_mut().take() {
                     drop(interval);
                 }
+                // Reset speaking state when mic is disabled
+                self.is_speaking.store(false, Ordering::Relaxed);
+                self.client.set_speaking(false);
             };
         }
         is_changed
@@ -165,6 +168,9 @@ impl MicrophoneEncoder {
         if let Some(interval) = self.vad_interval.borrow_mut().take() {
             drop(interval);
         }
+        // Reset speaking state when encoder stops
+        self.is_speaking.store(false, Ordering::Relaxed);
+        self.client.set_speaking(false);
     }
 
     pub fn start(&mut self) {

@@ -837,6 +837,7 @@ impl Component for AttendantsComponent {
                                 <Host
                                     share_screen={self.share_screen}
                                     mic_enabled={self.mic_enabled}
+                                    is_speaking={self.local_speaking}
                                     video_enabled={self.video_enabled}
                                     on_encoder_settings_update={on_encoder_settings_update.clone()}
                                     device_settings_open={self.device_settings_open}

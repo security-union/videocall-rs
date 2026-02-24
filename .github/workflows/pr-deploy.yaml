@@ -11,6 +11,14 @@ permissions:
   issues: write
   packages: read
 
+concurrency:
+  group: pr-preview-slot-allocator
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 jobs:
   check-permissions:
     name: Check permissions

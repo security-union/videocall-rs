@@ -7,6 +7,15 @@ on:
 permissions:
   contents: read
   packages: write
+  issues: write
+
+concurrency:
+  group: pr-preview-slot-allocator
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
 
 jobs:
   cleanup:
@@ -155,3 +164,24 @@ jobs:
           echo "  - GHCR images tagged pr-${PR_NUM}"
           echo ""
           echo "📊 Slot ${SLOT} is now available for other PRs"
+
+  comment-failure:
+    name: Comment on cleanup failure
+    needs: cleanup
+    if: always() && needs.cleanup.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on cleanup failure
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: ${{ github.event.pull_request.number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **PR cleanup failed**
+
+            Automatic preview cleanup encountered an error when PR #${{ github.event.pull_request.number }} was closed.
+
+            Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            })

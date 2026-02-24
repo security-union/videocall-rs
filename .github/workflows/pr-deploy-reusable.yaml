@@ -19,6 +19,10 @@ on:
       DIGITALOCEAN_ACCESS_TOKEN:
         required: true
 
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 jobs:
   deploy:
     name: Deploy preview environment

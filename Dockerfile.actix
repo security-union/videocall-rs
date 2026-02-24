@@ -23,6 +23,9 @@ RUN find /app/actix-api/target/release -maxdepth 1 -type f -executable \
     -not -name "*.so" -not -name "*.a" -not -name "*.d" -not -name "build_*" \
     -exec cp {} /usr/bin/ \; && cp /app/dbmate-bin /usr/bin/dbmate
 
+# Remove source tree (not needed at runtime; avoids leaking code)
+RUN rm -rf /app
+
 STOPSIGNAL SIGINT
 
 CMD [ "websocket_server" ]

@@ -2,9 +2,6 @@ FROM nixos/nix:2.33.2 AS builder
 
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 
-# filter-syscalls = false required for QEMU-emulated arm64 builds (seccomp fails under emulation)
-RUN mkdir -p /etc/nix && echo 'filter-syscalls = false' >> /etc/nix/nix.conf
-
 WORKDIR /app
 
 COPY flake.nix flake.lock ./

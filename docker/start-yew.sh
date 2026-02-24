@@ -21,9 +21,6 @@ window.__APP_CONFIG = Object.freeze({
 });
 EOF
 
-# Ensure trunk is on PATH (common install locations)
-# trigger ci
-export PATH="$PATH:/usr/local/cargo/bin:/root/.cargo/bin"
+tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify &
 
-# Run the dev server
 exec trunk serve --address 0.0.0.0 --port "${TRUNK_SERVE_PORT:-80}"

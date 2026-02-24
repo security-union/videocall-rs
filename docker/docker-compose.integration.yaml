@@ -17,13 +17,14 @@ services:
 
   rust-tests:
     build:
-      dockerfile: ../docker/Dockerfile.actix
-      context: ../docker
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
     working_dir: /app/actix-api
     dns:
       - 8.8.8.8
       - 1.1.1.1
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - RUST_LOG=info
       - WEBTRANSPORT_URL=https://127.0.0.1:4433
       - HEALTH_URL=http://127.0.0.1:5321/healthz
@@ -43,9 +44,9 @@ services:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-it-tests-registry:/usr/local/cargo/registry
-      - rustlemania-it-tests-git:/usr/local/cargo/git
-      - rustlemania-it-tests-target:/usr/local/cargo/target
+      - nix-store-it-tests:/nix
+      - rustlemania-it-tests-registry:/root/.cargo/registry
+      - rustlemania-it-tests-git:/root/.cargo/git
       - rustlemania-it-tests-cache:/app/actix-api/target
     depends_on:
       postgres:
@@ -53,7 +54,7 @@ services:
       nats:
         condition: service_started
     command: >
-      bash -lc '
+      nix develop /app#backend-dev --command bash -c '
         set -euo pipefail
         echo "=== RUNNING DATABASE MIGRATIONS ==="
         cd /app/dbmate && dbmate wait && dbmate up
@@ -66,9 +67,9 @@ services:
       '
 
 volumes:
+  nix-store-it-tests:
   rustlemania-it-tests-registry:
   rustlemania-it-tests-git:
-  rustlemania-it-tests-target:
   rustlemania-it-tests-cache:
 
 

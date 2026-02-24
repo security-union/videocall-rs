@@ -1,3 +1,7 @@
 **/target
 **/dist
+**/node_modules
 Dockerfile*
+result
+result-*
+.git

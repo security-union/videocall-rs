@@ -38,6 +38,7 @@ use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
 use videocall_client::utils::is_ios;
+use videocall_client::Callback as VcCallback;
 use videocall_client::{
     MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
@@ -279,7 +280,7 @@ impl AttendantsComponent {
             on_connected: {
                 let link = ctx.link().clone();
                 let webtransport_enabled = ctx.props().webtransport_enabled;
-                Callback::from(move |_| {
+                VcCallback::from(move |_| {
                     log::info!(
                         "YEW-UI: Connection established (webtransport_enabled={webtransport_enabled})",
                     );
@@ -289,7 +290,7 @@ impl AttendantsComponent {
             on_connection_lost: {
                 let link = ctx.link().clone();
                 let webtransport_enabled = ctx.props().webtransport_enabled;
-                Callback::from(move |_| {
+                VcCallback::from(move |_| {
                     log::warn!(
                         "YEW-UI: Connection lost (webtransport_enabled={webtransport_enabled})",
                     );
@@ -298,30 +299,32 @@ impl AttendantsComponent {
             },
             on_peer_added: {
                 let link = ctx.link().clone();
-                Callback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
+                VcCallback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
             },
             on_peer_first_frame: {
                 let link = ctx.link().clone();
-                Callback::from(move |(email, media_type)| {
+                VcCallback::from(move |(email, media_type)| {
                     link.send_message(Msg::OnFirstFrame((email, media_type)))
                 })
             },
             on_peer_removed: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |peer_id: String| {
+                VcCallback::from(move |peer_id: String| {
                     log::info!("Peer removed: {peer_id}");
                     link.send_message(Msg::OnPeerRemoved(peer_id));
                 })
             }),
-            get_peer_video_canvas_id: Callback::from(|email| email),
-            get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
+            get_peer_video_canvas_id: VcCallback::from(|session_id| session_id),
+            get_peer_screen_canvas_id: VcCallback::from(|session_id| {
+                format!("screen-share-{}", &session_id)
+            }),
             enable_diagnostics: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),
             on_encoder_settings_update: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |settings| {
+                VcCallback::from(move |settings| {
                     link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
                 })
             }),
@@ -329,7 +332,7 @@ impl AttendantsComponent {
             rtt_probe_interval_ms: Some(200),
             on_meeting_info: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |start_time_ms: f64| {
+                VcCallback::from(move |start_time_ms: f64| {
                     log::info!("Meeting started at Unix timestamp: {start_time_ms}");
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         start_time_ms as u64,
@@ -338,11 +341,8 @@ impl AttendantsComponent {
             }),
             on_meeting_ended: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |(end_time_ms, message): (f64, String)| {
+                VcCallback::from(move |(end_time_ms, message): (f64, String)| {
                     log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
-                    // link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
-                    //     end_time_ms as u64,
-                    // )));
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         end_time_ms as u64,
                     )));
@@ -358,11 +358,11 @@ impl AttendantsComponent {
         let mut media_device_access = MediaDeviceAccess::new();
         media_device_access.on_granted = {
             let link = ctx.link().clone();
-            Callback::from(move |_| link.send_message(WsAction::MediaPermissionsGranted))
+            VcCallback::from(move |_| link.send_message(WsAction::MediaPermissionsGranted))
         };
         media_device_access.on_denied = {
             let link = ctx.link().clone();
-            Callback::from(move |e| {
+            VcCallback::from(move |e| {
                 let complete_error = format!("Error requesting permissions: Please make sure to allow access to both camera and microphone. ({e:?})");
                 error!("{complete_error}");
                 link.send_message(WsAction::MediaPermissionsError(complete_error.to_string()))
@@ -840,6 +840,18 @@ impl Component for AttendantsComponent {
         let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
+        // Convert session_id to email for display in PeerList
+        let mut peers_for_display: Vec<String> = real_peers_vec
+            .iter()
+            .map(|session_id| {
+                self.client
+                    .get_peer_email(session_id)
+                    .unwrap_or_else(|| session_id.clone())
+            })
+            .collect();
+        peers_for_display.extend(self.fake_peer_ids.iter().cloned());
+
+        // Keep session_id for PeerTile (needs session_id for identification)
         let mut display_peers_vec = real_peers_vec.clone();
         display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
 
@@ -1142,7 +1154,7 @@ impl Component for AttendantsComponent {
                             let toggle_meeting_info = ctx.link().callback(|_| UserScreenToggleAction::MeetingInfo);
                             html! {
                                 <PeerList
-                                    peers={display_peers_vec.clone()}
+                                    peers={peers_for_display.clone()}
                                     onclose={toggle_peer_list}
                                     show_meeting_info={self.meeting_info_open}
                                     room_id={ctx.props().id.clone()}

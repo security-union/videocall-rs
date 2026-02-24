@@ -21,6 +21,7 @@ use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
+use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -143,12 +144,24 @@ impl Component for Host {
             .expect("VideoCallClient context missing");
 
         // Create 3 callbacks for the 3 encoders
-        let camera_callback = ctx.link().callback(Msg::CameraEncoderSettingsUpdated);
-        let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
-        let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
+        let camera_callback = VcCallback::from({
+            let link = ctx.link().clone();
+            move |s: String| link.send_message(Msg::CameraEncoderSettingsUpdated(s))
+        });
+        let microphone_callback = VcCallback::from({
+            let link = ctx.link().clone();
+            move |s: String| link.send_message(Msg::MicrophoneEncoderSettingsUpdated(s))
+        });
+        let screen_callback = VcCallback::from({
+            let link = ctx.link().clone();
+            move |s: String| link.send_message(Msg::ScreenEncoderSettingsUpdated(s))
+        });
 
         let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
-        let camera_error_cb = ctx.link().callback(Msg::CameraError);
+        let camera_error_cb = VcCallback::from({
+            let link = ctx.link().clone();
+            move |s: String| link.send_message(Msg::CameraError(s))
+        });
         let mut camera = CameraEncoder::new(
             client.clone(),
             VIDEO_ELEMENT_ID,
@@ -159,7 +172,10 @@ impl Component for Host {
 
         // Use the factory function to create the appropriate microphone encoder
         let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
-        let microphone_error_cb = ctx.link().callback(Msg::MicrophoneError);
+        let microphone_error_cb = VcCallback::from({
+            let link = ctx.link().clone();
+            move |s: String| link.send_message(Msg::MicrophoneError(s))
+        });
         let mut microphone = create_microphone_encoder(
             client.clone(),
             audio_bitrate,
@@ -168,7 +184,10 @@ impl Component for Host {
         );
 
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
-        let screen_state_callback = ctx.props().on_screen_share_state.clone();
+        let screen_state_callback = VcCallback::from({
+            let cb = ctx.props().on_screen_share_state.clone();
+            move |e: ScreenShareEvent| cb.emit(e)
+        });
         let mut screen = ScreenEncoder::new(
             client.clone(),
             screen_bitrate,
@@ -195,13 +214,13 @@ impl Component for Host {
         media_devices.on_loaded = {
             let link = ctx.link().clone();
             log::info!("Devices loaded 1");
-            Callback::from(move |_| link.send_message(Msg::DevicesLoaded))
+            VcCallback::from(move |_| link.send_message(Msg::DevicesLoaded))
         };
 
         media_devices.on_devices_changed = {
             let link = ctx.link().clone();
             log::info!("Devices changed");
-            Callback::from(move |_| link.send_message(Msg::DevicesChanged))
+            VcCallback::from(move |_| link.send_message(Msg::DevicesChanged))
         };
 
         // Load devices

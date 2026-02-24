@@ -76,13 +76,9 @@
         '';
 
         # Backend: native Rust servers (actix-api, meeting-api, bot)
-        # musl target for static binaries in Docker images
-        backendRustMinimal = pkgs.rust-bin.stable."1.93.1".minimal.override {
-          targets = [ "x86_64-unknown-linux-musl" ];
-        };
+        backendRustMinimal = pkgs.rust-bin.stable."1.93.1".minimal;
 
         backendRustDev = pkgs.rust-bin.stable."1.93.1".default.override {
-          targets = [ "x86_64-unknown-linux-musl" ];
           extensions = [ "rust-src" "rust-analyzer" ];
         };
 
@@ -94,8 +90,6 @@
           pkgs.cmake
           pkgs.nasm
         ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-          pkgs.glibc
-          pkgs.musl
           pkgs.libvpx
           pkgs.alsa-lib
           pkgs.libclang
@@ -103,11 +97,6 @@
 
         backendEnv = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-          CC_x86_64_unknown_linux_musl = "musl-gcc";
-          # nixos/nix image uses musl; rust build scripts need glibc (gnu_get_libc_version).
-          # Force linker to find glibc when linking host binaries (build scripts).
-          LIBRARY_PATH = "${pkgs.glibc}/lib";
-          NIX_LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.glibc ];
         };
       in
       {

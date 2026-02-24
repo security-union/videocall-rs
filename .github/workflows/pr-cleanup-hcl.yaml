@@ -6,6 +6,15 @@ on:
 
 permissions:
   contents: read
+  issues: write
+
+concurrency:
+  group: pr-preview-slot-allocator-hcl
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
 
 env:
   KUBECONFIG: /home/jenkins/.kube/k3s-config
@@ -17,6 +26,15 @@ jobs:
     steps:
       - name: Setup PATH
         run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
+      - name: Validate kubectl and kubeconfig access
+        run: |
+          test -f "${KUBECONFIG}"
+          test -r "${KUBECONFIG}"
+          kubectl config current-context
+          CLUSTER_INFO=$(kubectl cluster-info)
+          echo "${CLUSTER_INFO}"
+          echo "${CLUSTER_INFO}" | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
 
       - name: Find deployment slot
         id: find-slot
@@ -89,3 +107,18 @@ jobs:
           echo "  - Harbor images tagged pr-${PR_NUM} (via retention policy)"
           echo ""
           echo "📊 Slot ${SLOT} is now available for other PRs"
+
+  comment-failure:
+    name: Comment on cleanup failure
+    needs: cleanup
+    if: always() && needs.cleanup.result == 'failure'
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Post cleanup failure comment
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+            -d "{\"body\":\"❌ **PR cleanup failed**\\n\\nAutomatic preview cleanup encountered an error. Check the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\"}"

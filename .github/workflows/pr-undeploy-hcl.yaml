@@ -9,6 +9,14 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: pr-preview-slot-allocator-hcl
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 env:
   KUBECONFIG: /home/jenkins/.kube/k3s-config
 
@@ -23,6 +31,9 @@ jobs:
       authorized: ${{ steps.check.outputs.authorized }}
       pr_number: ${{ github.event.issue.number }}
     steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
       - name: Check if user is maintainer
         id: check
         run: |
@@ -64,6 +75,15 @@ jobs:
     steps:
       - name: Setup PATH
         run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
+      - name: Validate kubectl and kubeconfig access
+        run: |
+          test -f "${KUBECONFIG}"
+          test -r "${KUBECONFIG}"
+          kubectl config current-context
+          CLUSTER_INFO=$(kubectl cluster-info)
+          echo "${CLUSTER_INFO}"
+          echo "${CLUSTER_INFO}" | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
 
       - name: Find deployment slot
         id: find-slot
@@ -160,3 +180,26 @@ jobs:
             -H "Content-Type: application/json" \
             "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
             -d "{\"body\":\"ℹ️ **No preview environment found**\n\nPR #${PR_NUM} is not currently deployed to any slot.\n\nTo deploy, comment \\\`/build-and-deploy\\\`.\"}"
+
+  comment-failure:
+    name: Comment on undeploy failure
+    needs: [check-permissions, undeploy]
+    if: always() && needs.check-permissions.outputs.authorized == 'true' && needs.undeploy.result == 'failure'
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Post undeploy failure comment
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+            -d "{\"body\":\"❌ **Undeploy failed**\\n\\nCheck the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\"}"
+
+      - name: React to comment (failure)
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -d '{"content":"confused"}'

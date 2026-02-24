@@ -9,6 +9,10 @@ permissions:
   pull-requests: write
   issues: write
 
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 jobs:
   check-permissions:
     name: Check permissions
@@ -22,10 +26,13 @@ jobs:
       pr_sha: ${{ steps.get-pr.outputs.pr_sha }}
       pr_ref: ${{ steps.get-pr.outputs.pr_ref }}
     steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
       - name: Get PR details
         id: get-pr
         run: |
-          PR_DATA=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          PR_DATA=$(curl --fail --show-error --silent -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
           PR_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
           PR_REF=$(echo "$PR_DATA" | jq -r '.head.ref')

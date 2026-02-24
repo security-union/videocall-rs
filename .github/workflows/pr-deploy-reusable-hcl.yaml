@@ -27,6 +27,10 @@ permissions:
   issues: write
   pull-requests: write
 
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 env:
   KUBECONFIG: /home/jenkins/.kube/k3s-config
 
@@ -37,6 +41,15 @@ jobs:
     steps:
       - name: Setup PATH
         run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
+      - name: Validate kubectl and kubeconfig access
+        run: |
+          test -f "${KUBECONFIG}"
+          test -r "${KUBECONFIG}"
+          kubectl config current-context
+          CLUSTER_INFO=$(kubectl cluster-info)
+          echo "${CLUSTER_INFO}"
+          echo "${CLUSTER_INFO}" | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
 
       - name: Checkout repository
         uses: actions/checkout@v4

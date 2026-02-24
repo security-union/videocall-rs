@@ -39,7 +39,6 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.website
-          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             securityunion/video-call-rs-website:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}

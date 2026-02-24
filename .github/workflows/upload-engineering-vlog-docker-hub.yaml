@@ -44,7 +44,6 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.engineering-vlog
-          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             securityunion/videocall-engineering-vlog:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}

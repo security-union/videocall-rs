@@ -1,9 +1,6 @@
-FROM nixos/nix:2.33.2 AS builder
+FROM nixos/nix:2.33.2
 
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
-
-# filter-syscalls = false required for QEMU-emulated arm64 builds (seccomp fails under emulation)
-RUN mkdir -p /etc/nix && echo 'filter-syscalls = false' >> /etc/nix/nix.conf
 
 WORKDIR /app
 
@@ -22,19 +19,9 @@ RUN nix develop .#backend --command bash -c "\
     cd actix-api && cargo build --release && \
     cp \$(which dbmate) /app/dbmate-bin"
 
-RUN mkdir -p /app/binaries && \
-    find /app/actix-api/target/release -maxdepth 1 -type f -executable \
+RUN find /app/actix-api/target/release -maxdepth 1 -type f -executable \
     -not -name "*.so" -not -name "*.a" -not -name "*.d" -not -name "build_*" \
-    -exec cp {} /app/binaries/ \;
-
-# ---------------------------------------------------------------------------
-FROM debian:trixie-slim
-
-RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
-
-COPY --from=builder /app/binaries/* /usr/bin/
-COPY --from=builder /app/dbmate-bin /usr/bin/dbmate
-COPY --from=builder /app/dbmate /app/dbmate
+    -exec cp {} /usr/bin/ \; && cp /app/dbmate-bin /usr/bin/dbmate
 
 STOPSIGNAL SIGINT
 

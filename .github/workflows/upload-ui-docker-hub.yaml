@@ -51,7 +51,6 @@ jobs:
         with:
           context: .
           file: Dockerfile.yew
-          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             securityunion/videocall-web-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}

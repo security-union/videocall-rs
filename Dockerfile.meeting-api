@@ -1,17 +1,12 @@
-FROM nixos/nix:2.33.2 AS builder
+FROM nixos/nix:2.33.2
 
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
-
-# filter-syscalls = false required for QEMU-emulated arm64 builds (seccomp fails under emulation)
-RUN mkdir -p /etc/nix && echo 'filter-syscalls = false' >> /etc/nix/nix.conf
 
 WORKDIR /app
 
 COPY flake.nix flake.lock ./
 
 RUN git init && git add flake.nix flake.lock
-
-RUN nix develop .#backend --command true
 
 COPY . .
 RUN git add -A
@@ -22,15 +17,8 @@ RUN nix develop .#backend --command bash -c "\
     cd meeting-api && cargo build --release --bin meeting-api && \
     cp \$(which dbmate) /app/dbmate-bin"
 
-# ---------------------------------------------------------------------------
-FROM debian:trixie-slim
-
-RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
-
-COPY --from=builder /app/meeting-api/target/release/meeting-api /usr/bin/meeting-api
-COPY --from=builder /app/dbmate-bin /usr/bin/dbmate
-COPY --from=builder /app/dbmate /app/dbmate
-
+RUN cp /app/meeting-api/target/release/meeting-api /usr/bin/ && \
+    cp /app/dbmate-bin /usr/bin/dbmate
 STOPSIGNAL SIGINT
 
 CMD [ "/bin/bash", "-c", "/app/dbmate/startup.sh && meeting-api" ]

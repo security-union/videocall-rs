@@ -17,9 +17,11 @@ RUN nix develop .#backend --command bash -c "\
     cd meeting-api && cargo build --release --target x86_64-unknown-linux-musl --bin meeting-api"
 
 # Stage 2: Debian slim + dbmate, copy binary and migrations
-FROM debian:trixie-slim as production
+FROM debian:trixie-slim AS production
 
-RUN ARCH=$(dpkg --print-architecture) && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then \
         curl -fsSL https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-arm64 -o /usr/bin/dbmate; \
     else \

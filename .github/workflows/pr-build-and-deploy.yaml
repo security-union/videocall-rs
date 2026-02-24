@@ -10,6 +10,14 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: pr-preview-slot-allocator
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 jobs:
   check-permissions:
     name: Check permissions
@@ -194,3 +202,34 @@ jobs:
       comment_id: ${{ github.event.comment.id }}
     secrets:
       DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+  comment-build-failure:
+    name: Comment on build failure
+    needs: [check-permissions, build-images]
+    if: always() && needs.check-permissions.outputs.authorized == 'true' && needs.build-images.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: React to comment (failure)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'confused'
+            })
+
+      - name: Comment on build failure
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ needs.check-permissions.outputs.pr_number }};
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Build failed**
+
+            Image builds failed — deployment has been skipped. Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            })

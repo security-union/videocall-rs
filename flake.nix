@@ -76,9 +76,13 @@
         '';
 
         # Backend: native Rust servers (actix-api, meeting-api, bot)
-        backendRustMinimal = pkgs.rust-bin.stable."1.93.1".minimal;
+        # musl target for static binaries in Docker images
+        backendRustMinimal = pkgs.rust-bin.stable."1.93.1".minimal.override {
+          targets = [ "x86_64-unknown-linux-musl" ];
+        };
 
         backendRustDev = pkgs.rust-bin.stable."1.93.1".default.override {
+          targets = [ "x86_64-unknown-linux-musl" ];
           extensions = [ "rust-src" "rust-analyzer" ];
         };
 
@@ -90,6 +94,7 @@
           pkgs.cmake
           pkgs.nasm
         ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+          pkgs.musl
           pkgs.libvpx
           pkgs.alsa-lib
           pkgs.libclang
@@ -97,6 +102,7 @@
 
         backendEnv = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          CC_x86_64_unknown_linux_musl = "${pkgs.musl}/bin/musl-gcc";
         };
       in
       {

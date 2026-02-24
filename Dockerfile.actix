@@ -1,11 +1,11 @@
-FROM nixos/nix:2.33.2
+# Stage 1: Nix build with musl target
+FROM nixos/nix:2.33.2 AS builder
 
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 
 WORKDIR /app
 
 COPY flake.nix flake.lock ./
-
 RUN git init && git add flake.nix flake.lock
 
 RUN nix develop .#backend --command true
@@ -16,16 +16,18 @@ RUN git add -A
 ENV CARGO_TARGET_DIR=/app/actix-api/target
 
 RUN nix develop .#backend --command bash -c "\
-    cd actix-api && cargo build --release && \
-    cp \$(which dbmate) /app/dbmate-bin"
+    cd actix-api && cargo build --release --target x86_64-unknown-linux-musl"
 
-RUN find /app/actix-api/target/release -maxdepth 1 -type f -executable \
-    -not -name "*.so" -not -name "*.a" -not -name "*.d" -not -name "build_*" \
-    -exec cp {} /usr/bin/ \; && cp /app/dbmate-bin /usr/bin/dbmate
+RUN mkdir -p /artifacts && \
+    find /app/actix-api/target/x86_64-unknown-linux-musl/release -maxdepth 1 -type f -executable \
+        -not -name "*.so" -not -name "*.a" -not -name "*.d" -not -name "build_*" \
+        -exec cp {} /artifacts/ \;
 
-# Remove source tree (not needed at runtime; avoids leaking code)
-RUN rm -rf /app
+# Stage 2: Minimal image with static binaries
+FROM debian:trixie-slim as production
+
+COPY --from=builder /artifacts/ /
 
 STOPSIGNAL SIGINT
 
-CMD [ "websocket_server" ]
+CMD ["/websocket_server"]

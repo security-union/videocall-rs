@@ -1,11 +1,11 @@
-FROM nixos/nix:2.33.2
+# Stage 1: Nix build with musl target
+FROM nixos/nix:2.33.2 AS builder
 
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 
 WORKDIR /app
 
 COPY flake.nix flake.lock ./
-
 RUN git init && git add flake.nix flake.lock
 
 COPY . .
@@ -14,12 +14,24 @@ RUN git add -A
 ENV CARGO_TARGET_DIR=/app/meeting-api/target
 
 RUN nix develop .#backend --command bash -c "\
-    cd meeting-api && cargo build --release --bin meeting-api && \
-    cp \$(which dbmate) /app/dbmate-bin"
+    cd meeting-api && cargo build --release --target x86_64-unknown-linux-musl --bin meeting-api"
 
-RUN cp /app/meeting-api/target/release/meeting-api /usr/bin/ && \
-    cp /app/dbmate-bin /usr/bin/dbmate
+# Stage 2: Debian slim + dbmate, copy binary and migrations
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then \
+        curl -fsSL https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-arm64 -o /usr/bin/dbmate; \
+    else \
+        curl -fsSL https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -o /usr/bin/dbmate; \
+    fi && \
+    chmod +x /usr/bin/dbmate
+
+COPY --from=builder /app/meeting-api/target/x86_64-unknown-linux-musl/release/meeting-api /usr/bin/meeting-api
+COPY dbmate/ /app/dbmate/
 
 STOPSIGNAL SIGINT
 
-CMD [ "/bin/bash", "-c", "/app/dbmate/startup.sh && meeting-api" ]
+CMD ["/bin/bash", "-c", "/app/dbmate/startup.sh && meeting-api"]

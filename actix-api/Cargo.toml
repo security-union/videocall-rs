@@ -46,7 +46,7 @@ protobuf = "3.3.0"
 r2d2 = "0.8.10"
 r2d2_postgres = "0.18.1"
 regex = "1.9.5"
-reqwest = { version = "0.11.11", features = ["json"]}
+reqwest = { version = "0.11.11", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 serde = "1.0.140"
@@ -66,7 +66,7 @@ url = "2"
 serial_test = "3"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
 videocall-types = { path = "../videocall-types", version = "5.0.0", features = ["testing"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 meeting-api = { path = "../meeting-api" }
 

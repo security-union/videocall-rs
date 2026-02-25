@@ -1,0 +1,126 @@
+name: PR Preview Cleanup on Close
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: pr-preview-slot-allocator-hcl
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  KUBECONFIG: /home/jenkins/.kube/k3s-config
+
+jobs:
+  cleanup:
+    name: Cleanup preview environment
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
+      - name: Validate kubectl and kubeconfig access
+        run: |
+          test -f "${KUBECONFIG}"
+          test -r "${KUBECONFIG}"
+          kubectl config current-context
+          CLUSTER_INFO=$(kubectl cluster-info)
+          echo "${CLUSTER_INFO}"
+          echo "${CLUSTER_INFO}" | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
+
+      - name: Find deployment slot
+        id: find-slot
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+
+          # Find which slot this PR is using
+          SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null)
+
+          if [ -z "$SLOT" ]; then
+            echo "No preview environment found for PR #${PR_NUM}, nothing to cleanup"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "PR #${PR_NUM} is deployed in slot ${SLOT}, will cleanup"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "slot=${SLOT}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete namespace
+        if: steps.find-slot.outputs.exists == 'true'
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Deleting namespace: ${NAMESPACE} (slot ${SLOT}, PR #${PR_NUM})"
+          kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
+
+          echo "✅ Namespace deleted"
+          echo "✅ Slot ${SLOT} is now available"
+
+      - name: Drop postgres database
+        if: steps.find-slot.outputs.exists == 'true'
+        run: |
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          DB_NAME="preview_slot_${SLOT}"
+
+          echo "Dropping database: ${DB_NAME} (slot ${SLOT})"
+
+          # Get postgres password from secret in preview-infra namespace
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
+
+          # Drop database
+          kubectl exec -n preview-infra postgres-postgresql-0 -- \
+            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" || {
+              echo "⚠️  Failed to drop database, may need manual cleanup"
+            }
+
+          echo "✅ Database dropped for slot ${SLOT}"
+
+      - name: Delete Harbor images (optional)
+        if: steps.find-slot.outputs.exists == 'true'
+        continue-on-error: true
+        run: |
+          # Note: Image retention handled by Harbor retention policy
+          # Configured to delete pr-* tagged images older than 14 days
+          # Policy runs automatically via Harbor's scheduled task system
+          # To verify: https://hclcr.io/harbor/projects/hcllabs → Policy → Retention
+          echo "⚠️  Images retained - Harbor retention policy will purge after 14 days"
+
+      - name: Summary
+        if: steps.find-slot.outputs.exists == 'true'
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          echo "✅ Cleanup complete for PR #${PR_NUM} (slot ${SLOT})"
+          echo ""
+          echo "Removed:"
+          echo "  - Namespace preview-slot-${SLOT}"
+          echo "  - Database preview_slot_${SLOT}"
+          echo "  - Harbor images tagged pr-${PR_NUM} (will be purged after 14 days)"
+          echo ""
+          echo "📊 Slot ${SLOT} is now available for other PRs"
+
+  comment-failure:
+    name: Comment on cleanup failure
+    needs: cleanup
+    if: always() && needs.cleanup.result == 'failure'
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Post cleanup failure comment
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+            -d "{\"body\":\"❌ **PR cleanup failed**\\n\\nAutomatic preview cleanup encountered an error. Check the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\"}"

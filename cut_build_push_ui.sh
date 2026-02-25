@@ -1,18 +1,20 @@
 #!/bin/bash
 set -e
 
-TAG=$1
-if [ -z "$1" ]
-then
-    TAG=$(git rev-parse HEAD)
+REGISTRY="${REGISTRY:-securityunion}"
+
+# Tag from argument or git SHA
+TAG="${1:-$(git rev-parse HEAD)}"
+
+IMAGE_URL="${REGISTRY}/videocall-web-ui:${TAG}"
+echo "Building image ${IMAGE_URL}"
+
+if ! docker build -t "$IMAGE_URL" \
+    --build-arg USERS_ALLOWED_TO_STREAM="dario,griffin,hamdy" \
+    -f Dockerfile.yew .; then
+    echo "Failed to build videocall-web-ui"
+    exit 1
 fi
 
-IMAGE_URL=securityunion/videocall-web-ui:$TAG
-echo "Building image "$IMAGE_URL
-
-if ! docker build -t $IMAGE_URL --build-arg USERS_ALLOWED_TO_STREAM="dario,griffin,hamdy" . --file Dockerfile.yew; then
-    echo "Failed to build server_rust"
-else
-    docker push $IMAGE_URL
-    echo "New image uploaded to "$IMAGE_URL
-fi
+docker push "$IMAGE_URL"
+echo "✓ Pushed ${IMAGE_URL}"

@@ -142,15 +142,12 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
-          # Note: Harbor image deletion can be handled via Harbor retention policies
-          # or manually deleted from Harbor UI. This step is optional.
-          #
-          # To delete via API:
-          # PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
-          # curl -u "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" -X DELETE \
-          #   "https://hclcr.io/api/v2.0/projects/hcllabs/repositories/videocall-media-server/artifacts/pr-${PR_NUM}"
+          # Note: Image retention handled by Harbor retention policy
+          # Configured to delete pr-* tagged images older than 14 days
+          # Policy runs automatically via Harbor's scheduled task system
+          # To verify: https://hclcr.io/harbor/projects/hcllabs → Policy → Retention
 
-          echo "⚠️  Harbor image cleanup skipped (configure retention policies in Harbor UI)"
+          echo "⚠️  Images retained - Harbor retention policy will purge after 14 days"
 
       - name: React to comment (success)
         run: |

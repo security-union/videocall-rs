@@ -363,8 +363,8 @@ jobs:
           else
             echo "Creating new JWT secret for slot ${SLOT}..."
 
-            # Generate a unique JWT secret for this preview slot
-            JWT_SECRET="preview-slot-${SLOT}-jwt-$(openssl rand -hex 16)"
+            # Generate a unique JWT secret for this preview slot (256-bit entropy)
+            JWT_SECRET=$(openssl rand -hex 32)
 
             kubectl create secret generic jwt-secret \
               --from-literal=secret="${JWT_SECRET}" \

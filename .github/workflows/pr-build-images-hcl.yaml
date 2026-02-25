@@ -69,7 +69,7 @@ jobs:
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
             "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
-            -d "{\"body\":\"🔨 **Building Docker images for PR #${{ github.event.issue.number }}**\n\nStarted by @${{ github.event.comment.user.login }}\n\n**Building:**\n- Media Server (WebSocket/WebTransport)\n- Meeting API (REST backend)\n- Web UI (WASM frontend)\n\n⏱️ Build typically takes 10-15 minutes. I'll post another comment when the build is complete.\n\n[View build logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}"
+            -d "{\"body\":\"🔨 **Building Docker images for PR #${{ github.event.issue.number }}**\n\nStarted by @${{ github.event.comment.user.login }}\n\n**Building (in parallel):**\n- Media Server (WebSocket/WebTransport)\n- Meeting API (REST backend)\n- Web UI (WASM frontend)\n\n⏱️ Build typically takes 5-7 minutes. I'll post another comment when the build is complete.\n\n[View build logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}"
 
       - name: Post error if unauthorized
         if: steps.check.outputs.authorized == 'false'
@@ -108,32 +108,103 @@ jobs:
           echo "$HARBOR_PASSWORD" | docker login hclcr.io -u "$HARBOR_USERNAME" --password-stdin
           echo "✅ Harbor login successful"
 
-      - name: Build and push media server
+      - name: Build and push all images (parallel)
         env:
           REGISTRY: ${{ vars.DOCKER_REGISTRY }}
         run: |
           cd /tmp/build-${{ github.event.issue.number }}
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
 
-          ./cut_build_push_backend.sh pr-${PR_NUM}
+          echo "🚀 Starting parallel builds for 3 images..."
+          echo "   - Media Server (WebSocket/WebTransport)"
+          echo "   - Meeting API (REST backend)"
+          echo "   - Web UI (WASM frontend)"
+          echo ""
 
-      - name: Build and push meeting API
-        env:
-          REGISTRY: ${{ vars.DOCKER_REGISTRY }}
-        run: |
-          cd /tmp/build-${{ github.event.issue.number }}
-          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          # Clean up old log directories (older than 2 hours) to prevent accumulation
+          echo "🧹 Cleaning up old build logs (>2 hours old)..."
+          find /tmp -maxdepth 1 -name "build-logs-*" -type d -mmin +120 -exec rm -rf {} \; 2>/dev/null || {
+            echo "⚠️  Warning: Could not clean some old log directories (non-fatal)"
+          }
 
-          ./cut_build_push_meeting_api.sh pr-${PR_NUM}
+          # Create timestamped log directory to avoid conflicts
+          TIMESTAMP=$(date +%s)
+          LOG_DIR="/tmp/build-logs-${PR_NUM}-${TIMESTAMP}"
+          mkdir -p ${LOG_DIR}
+          echo "📁 Build logs directory: ${LOG_DIR}"
+          echo ""
 
-      - name: Build and push UI
-        env:
-          REGISTRY: ${{ vars.DOCKER_REGISTRY }}
-        run: |
-          cd /tmp/build-${{ github.event.issue.number }}
-          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          # Start all builds in background with separate log files
+          ./cut_build_push_backend.sh pr-${PR_NUM} > ${LOG_DIR}/media-server.log 2>&1 &
+          PID_MEDIA=$!
 
-          ./cut_build_push_ui.sh pr-${PR_NUM}
+          ./cut_build_push_meeting_api.sh pr-${PR_NUM} > ${LOG_DIR}/meeting-api.log 2>&1 &
+          PID_API=$!
+
+          ./cut_build_push_ui.sh pr-${PR_NUM} > ${LOG_DIR}/ui.log 2>&1 &
+          PID_UI=$!
+
+          echo "Started background builds:"
+          echo "  - Media Server: PID $PID_MEDIA"
+          echo "  - Meeting API:  PID $PID_API"
+          echo "  - Web UI:       PID $PID_UI"
+          echo ""
+
+          # Wait for all builds to complete
+          FAILED=0
+
+          echo "⏳ Waiting for media server build..."
+          if wait $PID_MEDIA; then
+            echo "✅ Media server build completed"
+            tail -5 ${LOG_DIR}/media-server.log
+          else
+            echo "❌ Media server build FAILED (exit code: $?)"
+            echo "=== Last 20 lines of media server log ==="
+            tail -20 ${LOG_DIR}/media-server.log
+            FAILED=1
+          fi
+          echo ""
+
+          echo "⏳ Waiting for meeting API build..."
+          if wait $PID_API; then
+            echo "✅ Meeting API build completed"
+            tail -5 ${LOG_DIR}/meeting-api.log
+          else
+            echo "❌ Meeting API build FAILED (exit code: $?)"
+            echo "=== Last 20 lines of meeting API log ==="
+            tail -20 ${LOG_DIR}/meeting-api.log
+            FAILED=1
+          fi
+          echo ""
+
+          echo "⏳ Waiting for UI build..."
+          if wait $PID_UI; then
+            echo "✅ UI build completed"
+            tail -5 ${LOG_DIR}/ui.log
+          else
+            echo "❌ UI build FAILED (exit code: $?)"
+            echo "=== Last 20 lines of UI log ==="
+            tail -20 ${LOG_DIR}/ui.log
+            FAILED=1
+          fi
+          echo ""
+
+          # Conditional cleanup based on success/failure
+          if [ $FAILED -eq 1 ]; then
+            echo "❌ One or more builds failed"
+            echo "⚠️  Full build logs retained at: ${LOG_DIR}"
+            echo "   Logs will be automatically cleaned after 2 hours"
+            echo ""
+            echo "To view full logs, SSH to runner and:"
+            echo "   cat ${LOG_DIR}/media-server.log"
+            echo "   cat ${LOG_DIR}/meeting-api.log"
+            echo "   cat ${LOG_DIR}/ui.log"
+            exit 1
+          else
+            echo "✅ All builds completed successfully!"
+            echo "🧹 Cleaning up build logs..."
+            rm -rf ${LOG_DIR}
+          fi
 
       - name: Cleanup build directory
         if: always()

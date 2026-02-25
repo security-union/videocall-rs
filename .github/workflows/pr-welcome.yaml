@@ -10,7 +10,7 @@ permissions:
 jobs:
   welcome:
     name: Post welcome comment
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'self-hosted' }}
     steps:
       - name: Check if first-time contributor
         id: check-first-time
@@ -65,7 +65,7 @@ jobs:
 
             Preview URLs will be posted automatically once deployed.
 
-            📚 [PR Deployment Documentation](../blob/main/docs/PR_PREVIEW_IMPLEMENTATION_SUMMARY.md)`;
+            📚 [PR Deployment Documentation](../blob/main/docs/PR_PREVIEWS.md)`;
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,

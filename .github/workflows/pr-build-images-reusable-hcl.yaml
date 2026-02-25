@@ -12,8 +12,6 @@ on:
         required: true
         type: string
     secrets:
-      GITHUB_TOKEN:
-        required: true
       HARBOR_USERNAME:
         required: true
       HARBOR_PASSWORD:

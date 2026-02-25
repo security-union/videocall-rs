@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
   issues: write
+  pull-requests: write
 
 concurrency:
   group: pr-cleanup-${{ github.event.pull_request.number }}-hcl

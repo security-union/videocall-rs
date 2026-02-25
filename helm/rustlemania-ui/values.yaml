@@ -38,6 +38,7 @@ runtimeConfig:
   wsUrl: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
   webTransportHost: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"
   oauthEnabled: "false"
+  oauthProvider: ""  # Set to the provider name (e.g. "google") when oauthEnabled is "true"
   e2eeEnabled: "false"
   webTransportEnabled: "true"
   firefoxEnabled: "false"

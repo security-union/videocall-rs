@@ -9,7 +9,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: pr-preview-slot-allocator-hcl
+  group: pr-cleanup-${{ github.event.pull_request.number }}-hcl
   cancel-in-progress: false
 
 defaults:
@@ -117,10 +117,17 @@ jobs:
     runs-on: [self-hosted, linux, docker]
     steps:
       - name: Post cleanup failure comment
-        run: |
-          PR_NUM=${{ github.event.pull_request.number }}
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            "https://github01.hclpnp.com/api/v3/repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
-            -d "{\"body\":\"❌ **PR cleanup failed**\\n\\nAutomatic preview cleanup encountered an error. Check the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\"}"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const repo = context.repo.owner + '/' + context.repo.repo;
+            const runId = context.runId;
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **PR cleanup failed**
+
+            Automatic preview cleanup encountered an error. Check the [workflow logs](https://github01.hclpnp.com/${repo}/actions/runs/${runId}) for details.`
+            });

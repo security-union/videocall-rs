@@ -49,7 +49,8 @@ jobs:
           kubectl config current-context
           CLUSTER_INFO=$(kubectl cluster-info)
           echo "${CLUSTER_INFO}"
-          echo "${CLUSTER_INFO}" | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
+          # Strip ANSI color codes before grep (kubectl outputs colors even when not a TTY)
+          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
 
       - name: Checkout repository
         uses: actions/checkout@v4

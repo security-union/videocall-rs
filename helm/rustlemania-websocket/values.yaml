@@ -21,6 +21,13 @@ env:
     value: nats:4222
   - name: TOKIO_WORKER_THREADS
     value: "1"  # Default for WebSocket services - adjust per region as needed
+  # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.
+  # Create the secret with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
+  - name: JWT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: jwt-secret
+        key: secret
 resources:
   limits:
     cpu: "50m"

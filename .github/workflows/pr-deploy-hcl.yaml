@@ -169,7 +169,6 @@ jobs:
       pr_number: ${{ needs.check-permissions.outputs.pr_number }}
       pr_sha: ${{ needs.check-permissions.outputs.pr_sha }}
     secrets:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
       HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
 

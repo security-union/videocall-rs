@@ -40,8 +40,14 @@ use crate::token;
 // ---------------------------------------------------------------------------
 
 /// Build a `Set-Cookie` header value for the session JWT.
-fn build_session_cookie(jwt: &str, ttl_secs: i64, domain: Option<&str>, secure: bool) -> String {
-    let mut cookie = format!("session={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
+fn build_session_cookie(
+    name: &str,
+    jwt: &str,
+    ttl_secs: i64,
+    domain: Option<&str>,
+    secure: bool,
+) -> String {
+    let mut cookie = format!("{name}={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -51,9 +57,9 @@ fn build_session_cookie(jwt: &str, ttl_secs: i64, domain: Option<&str>, secure: 
     cookie
 }
 
-/// Build a `Set-Cookie` header that clears the `session` cookie.
-fn build_clear_session_cookie(domain: Option<&str>, secure: bool) -> String {
-    let mut cookie = "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
+/// Build a `Set-Cookie` header that clears the session cookie.
+fn build_clear_session_cookie(name: &str, domain: Option<&str>, secure: bool) -> String {
+    let mut cookie = format!("{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -227,6 +233,7 @@ pub async fn callback(
     };
 
     let session_cookie = build_session_cookie(
+        &state.cookie_name,
         &session_jwt,
         state.session_ttl_secs,
         state.cookie_domain.as_deref(),
@@ -268,7 +275,11 @@ pub async fn get_profile(AuthUser { email, name }: AuthUser) -> Json<APIResponse
 
 /// GET /logout -- clears the session cookie.
 pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError> {
-    let clear = build_clear_session_cookie(state.cookie_domain.as_deref(), state.cookie_secure);
+    let clear = build_clear_session_cookie(
+        &state.cookie_name,
+        state.cookie_domain.as_deref(),
+        state.cookie_secure,
+    );
     let mut response = StatusCode::OK.into_response();
     response.headers_mut().append(
         header::SET_COOKIE,

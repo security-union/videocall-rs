@@ -52,7 +52,7 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = extract_session_token(parts)
+        let token = extract_session_token(parts, &state.cookie_name)
             .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
 
         let claims = token::decode_session_token(&state.jwt_secret, &token)?;
@@ -67,18 +67,19 @@ impl FromRequestParts<AppState> for AuthUser {
 /// Extract the raw session JWT from the request.
 ///
 /// Checks (in order):
-/// 1. `Cookie: session=<jwt>`
+/// 1. `Cookie: <cookie_name>=<jwt>`
 /// 2. `Authorization: Bearer <jwt>`
-fn extract_session_token(parts: &Parts) -> Option<String> {
-    // 1. Try the `session` cookie.
+fn extract_session_token(parts: &Parts, cookie_name: &str) -> Option<String> {
+    // 1. Try the configured session cookie name.
     if let Some(cookie_header) = parts
         .headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
     {
+        let prefix = format!("{cookie_name}=");
         for pair in cookie_header.split(';') {
             let pair = pair.trim();
-            if let Some(value) = pair.strip_prefix("session=") {
+            if let Some(value) = pair.strip_prefix(prefix.as_str()) {
                 let value = value.trim();
                 if !value.is_empty() {
                     return Some(value.to_string());
@@ -126,6 +127,7 @@ mod tests {
             oauth: None,
             jwks_cache: None,
             cookie_domain: None,
+            cookie_name: "session".to_string(),
             cookie_secure: false,
         }
     }

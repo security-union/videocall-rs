@@ -113,6 +113,10 @@ mod tests {
     const TEST_SECRET: &str = "test-secret-for-auth-tests";
 
     fn make_test_state() -> AppState {
+        make_state_with_cookie_name("session")
+    }
+
+    fn make_state_with_cookie_name(name: &str) -> AppState {
         // connect_lazy creates a pool handle without actually connecting.
         // The URL is never used because no queries are executed in unit tests.
         let db = PgPoolOptions::new()
@@ -127,20 +131,27 @@ mod tests {
             oauth: None,
             jwks_cache: None,
             cookie_domain: None,
-            cookie_name: "session".to_string(),
+            cookie_name: name.to_string(),
             cookie_secure: false,
         }
     }
 
     async fn extract_with_cookie(cookie: Option<&str>) -> Result<AuthUser, AppError> {
         let state = make_test_state();
+        extract_with_cookie_and_state(cookie, &state).await
+    }
+
+    async fn extract_with_cookie_and_state(
+        cookie: Option<&str>,
+        state: &AppState,
+    ) -> Result<AuthUser, AppError> {
         let mut builder = Request::builder().uri("/test").method("GET");
         if let Some(val) = cookie {
             builder = builder.header(header::COOKIE, val);
         }
         let req = builder.body(()).unwrap();
         let (mut parts, _) = req.into_parts();
-        AuthUser::from_request_parts(&mut parts, &state).await
+        AuthUser::from_request_parts(&mut parts, state).await
     }
 
     async fn extract_with_bearer(token: &str) -> Result<AuthUser, AppError> {
@@ -270,5 +281,83 @@ mod tests {
             .await
             .expect("should find session in middle");
         assert_eq!(auth.email, "multi@test.com");
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom cookie name tests (PR preview collision fix)
+    // -----------------------------------------------------------------------
+
+    /// PR preview API configured with "pr1-session" accepts a pr1-session= cookie.
+    #[tokio::test]
+    async fn custom_cookie_name_is_accepted() {
+        let state = make_state_with_cookie_name("pr1-session");
+        let jwt = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
+        let auth = extract_with_cookie_and_state(Some(&format!("pr1-session={jwt}")), &state)
+            .await
+            .expect("pr1-session cookie should be accepted");
+        assert_eq!(auth.email, "alice@test.com");
+    }
+
+    /// Core regression test: PR preview API configured with "pr1-session" must
+    /// reject a "session=" cookie — exactly what the production API sets with
+    /// Domain=.videocall.rs, which the browser would otherwise send to
+    /// pr1-api.sandbox.videocall.rs causing a 401.
+    #[tokio::test]
+    async fn production_session_cookie_rejected_by_preview_api() {
+        let state = make_state_with_cookie_name("pr1-session");
+        let production_jwt =
+            generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
+        // Even with a valid JWT, the wrong cookie name must be rejected.
+        let err =
+            extract_with_cookie_and_state(Some(&format!("session={production_jwt}")), &state)
+                .await
+                .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Slot isolation: pr2-session= is rejected when the API expects pr1-session=.
+    #[tokio::test]
+    async fn different_slot_cookie_rejected() {
+        let state = make_state_with_cookie_name("pr1-session");
+        let jwt = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
+        let err = extract_with_cookie_and_state(Some(&format!("pr2-session={jwt}")), &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Custom cookie name is found correctly when mixed with other cookies,
+    /// including a same-named-prefix cookie that should not match.
+    #[tokio::test]
+    async fn custom_cookie_name_among_other_cookies() {
+        let state = make_state_with_cookie_name("pr1-session");
+        let jwt = generate_session_token(TEST_SECRET, "multi@test.com", "Multi", 3600).unwrap();
+        // "session" appears as a prefix of "pr1-session" in the cookie header —
+        // verify we match the full name and don't accidentally split on it.
+        let auth = extract_with_cookie_and_state(
+            Some(&format!("lang=en; session=garbage; pr1-session={jwt}; theme=dark")),
+            &state,
+        )
+        .await
+        .expect("should find pr1-session and ignore session=garbage");
+        assert_eq!(auth.email, "multi@test.com");
+    }
+
+    /// Bearer token still works regardless of cookie_name configuration.
+    #[tokio::test]
+    async fn bearer_works_with_custom_cookie_name() {
+        let state = make_state_with_cookie_name("pr1-session");
+        let jwt = generate_session_token(TEST_SECRET, "bob@test.com", "Bob", 3600).unwrap();
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let auth = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("bearer should work regardless of cookie_name");
+        assert_eq!(auth.email, "bob@test.com");
     }
 }

@@ -292,3 +292,83 @@ pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError>
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- build_session_cookie ---
+
+    #[test]
+    fn session_cookie_contains_name_and_jwt() {
+        let cookie = build_session_cookie("session", "my.jwt.token", 3600, None, false);
+        assert!(cookie.starts_with("session=my.jwt.token;"));
+    }
+
+    #[test]
+    fn session_cookie_custom_name() {
+        let cookie = build_session_cookie("pr1-session", "my.jwt.token", 3600, None, false);
+        assert!(cookie.starts_with("pr1-session=my.jwt.token;"));
+        // Must not accidentally also contain the old name.
+        assert!(!cookie.contains("session=my.jwt.token;") || cookie.starts_with("pr1-session="));
+    }
+
+    #[test]
+    fn session_cookie_includes_required_attributes() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=3600"));
+    }
+
+    #[test]
+    fn session_cookie_secure_flag_added_when_true() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, true);
+        assert!(cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn session_cookie_no_secure_flag_when_false() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(!cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn session_cookie_domain_appended() {
+        let cookie = build_session_cookie("session", "tok", 3600, Some(".sandbox.videocall.rs"), false);
+        assert!(cookie.contains("Domain=.sandbox.videocall.rs"));
+    }
+
+    #[test]
+    fn session_cookie_no_domain_when_none() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(!cookie.contains("Domain="));
+    }
+
+    // --- build_clear_session_cookie ---
+
+    #[test]
+    fn clear_cookie_uses_name() {
+        let cookie = build_clear_session_cookie("session", None, false);
+        assert!(cookie.starts_with("session=;"));
+    }
+
+    #[test]
+    fn clear_cookie_custom_name() {
+        let cookie = build_clear_session_cookie("pr1-session", None, false);
+        assert!(cookie.starts_with("pr1-session=;"));
+    }
+
+    #[test]
+    fn clear_cookie_sets_max_age_zero() {
+        let cookie = build_clear_session_cookie("session", None, false);
+        assert!(cookie.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn clear_cookie_domain_appended() {
+        let cookie = build_clear_session_cookie("session", Some(".videocall.rs"), false);
+        assert!(cookie.contains("Domain=.videocall.rs"));
+    }
+}

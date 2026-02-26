@@ -70,6 +70,8 @@ env:
     value: "openid email profile"
   - name: AFTER_LOGIN_URL
     value: "https://app.videocall.rs"
+  - name: ALLOWED_REDIRECT_URLS
+    value: "https://app.videocall.rs"
 resources:
   limits:
     cpu: "200m"

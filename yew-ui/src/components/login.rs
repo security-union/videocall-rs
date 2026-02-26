@@ -36,7 +36,11 @@ pub fn build_login_callback() -> Callback<MouseEvent> {
         Ok(mut url) => {
             if let Ok(search) = window().location().search() {
                 if !search.is_empty() {
+                    // Already has a returnTo (e.g. redirected from a meeting page).
                     url = format!("{url}{search}");
+                } else if let Ok(origin) = window().location().origin() {
+                    // No returnTo — tell the backend which frontend to return to.
+                    url = format!("{url}?returnTo={origin}/");
                 }
             }
             let _ = window().location().set_href(&url);

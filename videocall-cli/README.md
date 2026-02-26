@@ -1,6 +1,11 @@
 
 # Videocall-cli Rust Client
 
+<a href="https://crates.io/crates/videocall-cli"><img src="https://img.shields.io/crates/v/videocall-cli.svg" alt="Crates.io" height="28"></a>
+<a href="https://github.com/security-union/videocall-rs"><img src="https://img.shields.io/badge/GitHub-videocall--rs-blue?logo=github" alt="GitHub" height="28"></a>
+
+This is the official command-line client for [videocall.rs](https://github.com/security-union/videocall-rs), the open-source, ultra-low-latency video conferencing platform.
+
 ## ✨ Features
 - Stream video effortlessly from the CLI on your desktop, robot, or Raspberry Pi.
 - Works seamlessly with [videocall.rs](https://videocall.rs).

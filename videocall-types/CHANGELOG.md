@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v4.0.1...videocall-types-v5.0.0) - 2026-02-23
+
+### Other
+
+- Same-display-name peers can't see each other (Closes #412) ([#649](https://github.com/security-union/videocall-rs/pull/649))
+
+## [4.0.1](https://github.com/security-union/videocall-rs/compare/videocall-types-v4.0.0...videocall-types-v4.0.1) - 2026-02-19
+
+### Other
+
+- Decouple yew from videocall client ([#633](https://github.com/security-union/videocall-rs/pull/633))
+
+## [4.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v3.0.1...videocall-types-v4.0.0) - 2026-01-27
+
+### Other
+
+- breaking change: Protobuf enums should always have an _UNSPECIFIED = 0 variant ([#537](https://github.com/security-union/videocall-rs/pull/537))
+- Fix firefox support by sending vp8 instead of vp9 ([#535](https://github.com/security-union/videocall-rs/pull/535))
+- Fix GLIBC compatibility and make DATABASE_ENABLED optional ([#519](https://github.com/security-union/videocall-rs/pull/519))
+- Meeting Ownership Project (behind feature flag) ([#503](https://github.com/security-union/videocall-rs/pull/503))
+
 ## [3.0.1](https://github.com/security-union/videocall-rs/compare/videocall-types-v3.0.0...videocall-types-v3.0.1) - 2025-08-18
 
 ### Other

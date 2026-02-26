@@ -41,12 +41,11 @@ pub async fn perform_markdown_code_to_html(markdown: String) -> Result<String, S
 #[component]
 pub fn Home() -> impl IntoView {
     view! {
-        <Title text="Home"/>
+        <Title text="Ultra-low-latency Video API for Developers"/>
         <Page>
             <HeroHeader/>
 
-            // Apple-style content sections with generous spacing
-            <div class="max-w-7xl mx-auto relative space-y-32 py-24 px-4 sm:px-6 lg:px-8">
+            <div class="max-w-6xl mx-auto relative space-y-28 py-20 px-6">
                 <SupportedPlatformsSection/>
                 <DevelopersSection/>
                 <CompanySection/>

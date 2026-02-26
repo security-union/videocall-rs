@@ -49,11 +49,35 @@ pub struct MeetingTime {
 pub type MeetingTimeCtx = MeetingTime;
 
 // -----------------------------------------------------------------------------
+// Meeting Host Context
+// -----------------------------------------------------------------------------
+
+/// Holds meeting host information shared via Yew context.
+///
+/// Used to identify the meeting owner/host and display appropriate UI indicators.
+#[derive(Clone, PartialEq, Default)]
+pub struct MeetingHost {
+    /// Email/ID of the meeting host. `None` if not yet known.
+    pub host_email: Option<String>,
+}
+
+impl MeetingHost {
+    /// Check if the given email is the meeting host
+    #[allow(dead_code)]
+    pub fn is_host(&self, email: &str) -> bool {
+        self.host_email.as_deref() == Some(email)
+    }
+}
+
+/// Context type for meeting host - read-only access to host info.
+#[allow(dead_code)]
+pub type MeetingHostCtx = MeetingHost;
+
+// -----------------------------------------------------------------------------
 // Local-storage helpers
 // -----------------------------------------------------------------------------
 
 const STORAGE_KEY: &str = "vc_username";
-const SELF_VIDEO_POSITION_KEY: &str = "vc_self_video_floating";
 
 /// Read the username from `window.localStorage` (if present).
 pub fn load_username_from_storage() -> Option<String> {
@@ -66,23 +90,6 @@ pub fn load_username_from_storage() -> Option<String> {
 pub fn save_username_to_storage(username: &str) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item(STORAGE_KEY, username);
-    }
-}
-
-/// Read the self-video position preference from `window.localStorage`.
-/// Returns `true` if floating (corner position), `false` if grid position.
-pub fn load_self_video_position_from_storage() -> bool {
-    web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|storage| storage.get_item(SELF_VIDEO_POSITION_KEY).ok().flatten())
-        .map(|v| v == "true")
-        .unwrap_or(false) // Default to grid position
-}
-
-/// Persist the self-video position preference to `localStorage`.
-pub fn save_self_video_position_to_storage(is_floating: bool) {
-    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.set_item(SELF_VIDEO_POSITION_KEY, if is_floating { "true" } else { "false" });
     }
 }
 

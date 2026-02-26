@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use crate::actors::chat_session::{RoomId, SessionId};
+use crate::actors::session_logic::{RoomId, SessionId};
 
 use super::session::Message;
 use actix::{Message as ActixMessage, Recipient};
@@ -67,4 +67,10 @@ pub struct Leave {
     pub session: SessionId,
     pub room: RoomId,
     pub user_id: String,
+}
+
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+pub struct ActivateConnection {
+    pub session: SessionId,
 }

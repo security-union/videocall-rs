@@ -20,6 +20,8 @@ use crate::components::{
     browser_compatibility::BrowserCompatibility,
     diagnostics::Diagnostics,
     host::Host,
+    host_controls::HostControls,
+    meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::PeerList,
     peer_tile::PeerTile,
     video_control_buttons::{
@@ -31,20 +33,38 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::{
-    load_self_video_position_from_storage, save_self_video_position_to_storage, MeetingTime,
-    MeetingTimeCtx, VideoCallClientCtx,
-};
+use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
 use videocall_client::utils::is_ios;
-use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_client::Callback as VcCallback;
+use videocall_client::{
+    MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScreenShareState {
+    /// No screen share in progress.
+    Idle,
+    /// User clicked the button; browser picker is open, awaiting selection.
+    Requesting,
+    /// A screen is actively being shared and encoded.
+    Active,
+}
+
+impl ScreenShareState {
+    /// Returns `true` when the encoder should be running (Requesting or Active).
+    /// Use this to derive the boolean prop that `Host` needs.
+    pub fn is_sharing(&self) -> bool {
+        !matches!(self, ScreenShareState::Idle)
+    }
+}
 
 #[derive(Debug)]
 pub enum WsAction {
@@ -74,7 +94,6 @@ pub enum UserScreenToggleAction {
     Diagnostics,
     DeviceSettings,
     MeetingInfo,
-    SelfVideoPosition,
 }
 
 #[derive(Debug)]
@@ -85,7 +104,8 @@ pub enum Msg {
     OnPeerRemoved(String),
     OnFirstFrame((String, MediaType)),
     OnMicrophoneError(String),
-    DismissMicError,
+    OnCameraError(String),
+    DismissUserError,
     UserScreenAction(UserScreenToggleAction),
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
@@ -96,6 +116,11 @@ pub enum Msg {
     HangUp,
     ShowCopyToast(bool),
     MeetingEnded(String),
+    ScreenShareStateChange(ScreenShareEvent),
+    /// A fresh room access token was obtained from the meeting API.
+    TokenRefreshed(String),
+    /// Token refresh failed (session expired, kicked from meeting, network error).
+    TokenRefreshFailed(String),
 }
 
 impl From<WsAction> for Msg {
@@ -136,12 +161,30 @@ pub struct AttendantsComponentProps {
 
     #[prop_or_default]
     pub on_logout: Option<Callback<()>>,
+
+    /// Display name (username) of the meeting host/owner (for displaying crown icon)
+    #[prop_or_default]
+    pub host_display_name: Option<String>,
+
+    /// If true, automatically join the meeting without showing the "Join Meeting" button.
+    /// Used when user was admitted from the waiting room.
+    #[prop_or_default]
+    pub auto_join: bool,
+
+    /// If true, the current user is the owner of the meeting.
+    #[prop_or_default]
+    pub is_owner: bool,
+
+    /// Signed JWT room access token for connecting to the media server.
+    /// Obtained from the meeting API when the participant is admitted.
+    #[prop_or_default]
+    pub room_token: String,
 }
 
 pub struct AttendantsComponent {
     pub client: VideoCallClient,
     pub media_device_access: MediaDeviceAccess,
-    pub share_screen: bool,
+    pub screen_share_state: ScreenShareState,
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub peer_list_open: bool,
@@ -149,10 +192,10 @@ pub struct AttendantsComponent {
     pub device_settings_open: bool,
     pub error: Option<String>,
     pub encoder_settings: Option<String>,
-    pub mic_error: Option<String>,
+    /// Generic user-visible error message shown in a dialog
+    pub user_error: Option<String>,
     pending_mic_enable: bool,
     pending_video_enable: bool,
-    pending_screen_share: bool,
     pub meeting_joined: bool,
     fake_peer_ids: Vec<String>,
     #[cfg(feature = "fake-peers")]
@@ -165,31 +208,61 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
-    /// When true, self-video is rendered as floating overlay (original position);
-    /// when false, rendered as grid item
-    self_video_floating: bool,
 }
 
 impl AttendantsComponent {
-    fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
-        let email = ctx.props().email.clone();
-        let id = ctx.props().id.clone();
+    /// Build the WebSocket and WebTransport lobby URLs for the media server.
+    ///
+    /// When `media-server-jwt-auth` is enabled, the token is embedded as a query
+    /// parameter. When disabled, the legacy `/{email}/{room}` path is used.
+    #[allow(unused_variables)]
+    fn build_lobby_urls(token: &str, email: &str, id: &str) -> (Vec<String>, Vec<String>) {
+        #[cfg(feature = "media-server-jwt-auth")]
+        let lobby_url = |base: &str| format!("{base}/lobby?token={token}");
+
+        #[cfg(not(feature = "media-server-jwt-auth"))]
+        let lobby_url = |base: &str| format!("{base}/lobby/{email}/{id}");
+
         let websocket_urls = actix_websocket_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(lobby_url)
             .collect::<Vec<String>>();
         let webtransport_urls = webtransport_host_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(lobby_url)
             .collect::<Vec<String>>();
 
+        (websocket_urls, webtransport_urls)
+    }
+
+    fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
+        let email = ctx.props().email.clone();
+        let id = ctx.props().id.clone();
+
+        #[cfg(feature = "media-server-jwt-auth")]
+        let token = {
+            let t = ctx.props().room_token.clone();
+            assert!(
+                !t.is_empty(),
+                "media-server-jwt-auth is enabled but room_token is empty — \
+                 cannot connect to the media server without a signed JWT"
+            );
+            t
+        };
+
+        #[cfg(not(feature = "media-server-jwt-auth"))]
+        let token = String::new();
+
+        let (websocket_urls, webtransport_urls) = Self::build_lobby_urls(&token, &email, &id);
+
         log::info!(
-            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}",
+            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}, jwt_auth={}",
             email,
             id,
-            ctx.props().webtransport_enabled
+            ctx.props().webtransport_enabled,
+            cfg!(feature = "media-server-jwt-auth"),
         );
         if websocket_urls.is_empty() || webtransport_urls.is_empty() {
             log::error!("Runtime config missing or invalid: wsUrl or webTransportHost not set");
@@ -207,7 +280,7 @@ impl AttendantsComponent {
             on_connected: {
                 let link = ctx.link().clone();
                 let webtransport_enabled = ctx.props().webtransport_enabled;
-                Callback::from(move |_| {
+                VcCallback::from(move |_| {
                     log::info!(
                         "YEW-UI: Connection established (webtransport_enabled={webtransport_enabled})",
                     );
@@ -217,7 +290,7 @@ impl AttendantsComponent {
             on_connection_lost: {
                 let link = ctx.link().clone();
                 let webtransport_enabled = ctx.props().webtransport_enabled;
-                Callback::from(move |_| {
+                VcCallback::from(move |_| {
                     log::warn!(
                         "YEW-UI: Connection lost (webtransport_enabled={webtransport_enabled})",
                     );
@@ -226,30 +299,32 @@ impl AttendantsComponent {
             },
             on_peer_added: {
                 let link = ctx.link().clone();
-                Callback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
+                VcCallback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
             },
             on_peer_first_frame: {
                 let link = ctx.link().clone();
-                Callback::from(move |(email, media_type)| {
+                VcCallback::from(move |(email, media_type)| {
                     link.send_message(Msg::OnFirstFrame((email, media_type)))
                 })
             },
             on_peer_removed: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |peer_id: String| {
+                VcCallback::from(move |peer_id: String| {
                     log::info!("Peer removed: {peer_id}");
                     link.send_message(Msg::OnPeerRemoved(peer_id));
                 })
             }),
-            get_peer_video_canvas_id: Callback::from(|email| email),
-            get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
+            get_peer_video_canvas_id: VcCallback::from(|session_id| session_id),
+            get_peer_screen_canvas_id: VcCallback::from(|session_id| {
+                format!("screen-share-{}", &session_id)
+            }),
             enable_diagnostics: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),
             on_encoder_settings_update: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |settings| {
+                VcCallback::from(move |settings| {
                     link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
                 })
             }),
@@ -257,7 +332,7 @@ impl AttendantsComponent {
             rtt_probe_interval_ms: Some(200),
             on_meeting_info: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |start_time_ms: f64| {
+                VcCallback::from(move |start_time_ms: f64| {
                     log::info!("Meeting started at Unix timestamp: {start_time_ms}");
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         start_time_ms as u64,
@@ -266,11 +341,8 @@ impl AttendantsComponent {
             }),
             on_meeting_ended: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |(end_time_ms, message): (f64, String)| {
+                VcCallback::from(move |(end_time_ms, message): (f64, String)| {
                     log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
-                    // link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
-                    //     end_time_ms as u64,
-                    // )));
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         end_time_ms as u64,
                     )));
@@ -286,11 +358,11 @@ impl AttendantsComponent {
         let mut media_device_access = MediaDeviceAccess::new();
         media_device_access.on_granted = {
             let link = ctx.link().clone();
-            Callback::from(move |_| link.send_message(WsAction::MediaPermissionsGranted))
+            VcCallback::from(move |_| link.send_message(WsAction::MediaPermissionsGranted))
         };
         media_device_access.on_denied = {
             let link = ctx.link().clone();
-            Callback::from(move |e| {
+            VcCallback::from(move |e| {
                 let complete_error = format!("Error requesting permissions: Please make sure to allow access to both camera and microphone. ({e:?})");
                 error!("{complete_error}");
                 link.send_message(WsAction::MediaPermissionsError(complete_error.to_string()))
@@ -358,6 +430,28 @@ impl AttendantsComponent {
         html! {} // Empty html when feature is not enabled
     }
 
+    /// Schedule a token refresh attempt after 1 second.
+    ///
+    /// If the meeting has ended (`MeetingNotActive`), sends `MeetingEnded`
+    /// instead of retrying, so the user sees a clear "meeting ended" overlay.
+    #[cfg(feature = "media-server-jwt-auth")]
+    fn schedule_token_refresh(link: yew::html::Scope<Self>, meeting_id: String) {
+        Timeout::new(1_000, move || {
+            wasm_bindgen_futures::spawn_local(async move {
+                match crate::meeting_api::refresh_room_token(&meeting_id).await {
+                    Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
+                    Err(crate::meeting_api::JoinError::MeetingNotActive) => {
+                        link.send_message(Msg::MeetingEnded("The meeting has ended.".to_string()));
+                    }
+                    Err(e) => {
+                        link.send_message(Msg::TokenRefreshFailed(e.to_string()));
+                    }
+                }
+            });
+        })
+        .forget();
+    }
+
     fn play_user_joined() {
         if let Some(_window) = web_sys::window() {
             if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
@@ -382,7 +476,7 @@ impl Component for AttendantsComponent {
         let mut self_ = Self {
             client,
             media_device_access,
-            share_screen: false,
+            screen_share_state: ScreenShareState::Idle,
             mic_enabled: false,
             video_enabled: false,
             peer_list_open: false,
@@ -390,10 +484,9 @@ impl Component for AttendantsComponent {
             device_settings_open: false,
             error: None,
             encoder_settings: None,
-            mic_error: None,
+            user_error: None,
             pending_mic_enable: false,
             pending_video_enable: false,
-            pending_screen_share: false,
             meeting_joined: false,
             fake_peer_ids: Vec::new(),
             #[cfg(feature = "fake-peers")]
@@ -406,7 +499,6 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
-            self_video_floating: load_self_video_position_from_storage(),
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -416,9 +508,10 @@ impl Component for AttendantsComponent {
         self_
     }
 
-    fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            // Don't auto-connect anymore
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render && ctx.props().auto_join {
+            // Auto-join: request media permissions which will trigger connection
+            ctx.link().send_message(WsAction::RequestMediaPermissions);
         }
     }
 
@@ -441,6 +534,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
+                    self.error = None;
                     self.call_start_time = Some(js_sys::Date::now());
                     true
                 }
@@ -450,8 +544,25 @@ impl Component for AttendantsComponent {
                     false
                 }
                 WsAction::Lost(reason) => {
-                    warn!("Lost with reason {reason:?}");
-                    ctx.link().send_message(WsAction::Connect);
+                    warn!("Connection lost (reason: {reason:?})");
+                    self.error = Some("Connection lost, reconnecting...".to_string());
+
+                    #[cfg(feature = "media-server-jwt-auth")]
+                    {
+                        let link = ctx.link().clone();
+                        let meeting_id = ctx.props().id.clone();
+                        Self::schedule_token_refresh(link, meeting_id);
+                    }
+
+                    #[cfg(not(feature = "media-server-jwt-auth"))]
+                    {
+                        let link = ctx.link().clone();
+                        Timeout::new(1_000, move || {
+                            link.send_message(WsAction::Connect);
+                        })
+                        .forget();
+                    }
+
                     true
                 }
                 WsAction::RequestMediaPermissions => {
@@ -469,11 +580,6 @@ impl Component for AttendantsComponent {
                     if self.pending_video_enable {
                         self.video_enabled = true;
                         self.pending_video_enable = false;
-                    }
-
-                    if self.pending_screen_share {
-                        self.share_screen = true;
-                        self.pending_screen_share = false;
                     }
 
                     ctx.link().send_message(WsAction::Connect);
@@ -514,25 +620,30 @@ impl Component for AttendantsComponent {
                 // Disable mic at the top and show UI
                 log::error!("Microphone error (full): {err}");
                 self.mic_enabled = false;
-                self.mic_error = Some(err);
+                self.user_error = Some(format!("Microphone error: {err}"));
                 true
             }
-            Msg::DismissMicError => {
-                self.mic_error = None;
+            Msg::OnCameraError(err) => {
+                log::error!("Camera error (full): {err}");
+                self.video_enabled = false;
+                self.user_error = Some(format!("Camera error: {err}"));
+                true
+            }
+            Msg::DismissUserError => {
+                self.user_error = None;
                 true
             }
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
-                        if !self.share_screen {
-                            if self.media_device_access.is_granted() {
-                                self.share_screen = true;
-                            } else {
-                                self.pending_screen_share = true;
-                                ctx.link().send_message(WsAction::RequestMediaPermissions);
-                            }
+                        // No getUserMedia permission check needed here: getDisplayMedia()
+                        // has its own browser-native permission prompt, independent of
+                        // camera/mic permissions.
+                        // https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getDisplayMedia
+                        if matches!(self.screen_share_state, ScreenShareState::Idle) {
+                            self.screen_share_state = ScreenShareState::Requesting;
                         } else {
-                            self.share_screen = false;
+                            self.screen_share_state = ScreenShareState::Idle;
                         }
                     }
                     MeetingAction::ToggleMicMute => {
@@ -591,10 +702,6 @@ impl Component for AttendantsComponent {
                             self.diagnostics_open = false;
                             self.device_settings_open = false;
                         }
-                    }
-                    UserScreenToggleAction::SelfVideoPosition => {
-                        self.self_video_floating = !self.self_video_floating;
-                        save_self_video_position_to_storage(self.self_video_floating);
                     }
                 }
                 true
@@ -663,16 +770,62 @@ impl Component for AttendantsComponent {
                 self.call_start_time = None;
                 self.meeting_start_time_server = None;
 
-                Timeout::new(500, move || {
+                // Call leave_meeting API to update participant status in database
+                let meeting_id = ctx.props().id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
+                        log::error!("Error leaving meeting: {e}");
+                    }
+                    // Redirect to home after API call completes
                     let _ = window().location().set_href("/");
-                })
-                .forget();
+                });
 
                 true
             }
 
             Msg::MeetingEnded(end_time) => {
                 self.meeting_ended_message = Some(end_time);
+                true
+            }
+            Msg::ScreenShareStateChange(event) => {
+                log::info!("Screen share state changed: {event:?}");
+                match event {
+                    ScreenShareEvent::Started => {
+                        self.screen_share_state = ScreenShareState::Active;
+                    }
+                    ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
+                        self.screen_share_state = ScreenShareState::Idle;
+                    }
+                    ScreenShareEvent::Failed(ref msg) => {
+                        log::error!("Screen share failed: {msg}");
+                        self.screen_share_state = ScreenShareState::Idle;
+                        self.user_error = Some(format!("Screen share failed: {msg}"));
+                    }
+                }
+                true
+            }
+            Msg::TokenRefreshed(new_token) => {
+                log::info!("Room token refreshed, reconnecting with new token");
+                self.error = None;
+                let (ws_urls, wt_urls) =
+                    Self::build_lobby_urls(&new_token, &ctx.props().email, &ctx.props().id);
+                self.client.update_server_urls(ws_urls, wt_urls);
+                if let Err(e) = self.client.connect() {
+                    ctx.link().send_message(WsAction::Log(format!(
+                        "Reconnection with refreshed token failed: {e:?}"
+                    )));
+                }
+                true
+            }
+            Msg::TokenRefreshFailed(err) => {
+                warn!("Token refresh failed: {err}");
+                self.error = Some(format!("Connection lost, retrying... ({err})"));
+
+                // Schedule another attempt after 1 second.
+                let link = ctx.link().clone();
+                let meeting_id = ctx.props().id.clone();
+                Self::schedule_token_refresh(link, meeting_id);
+
                 true
             }
         }
@@ -687,6 +840,18 @@ impl Component for AttendantsComponent {
         let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
+        // Convert session_id to email for display in PeerList
+        let mut peers_for_display: Vec<String> = real_peers_vec
+            .iter()
+            .map(|session_id| {
+                self.client
+                    .get_peer_email(session_id)
+                    .unwrap_or_else(|| session_id.clone())
+            })
+            .collect();
+        peers_for_display.extend(self.fake_peer_ids.iter().cloned());
+
+        // Keep session_id for PeerTile (needs session_id for identification)
         let mut display_peers_vec = real_peers_vec.clone();
         display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
 
@@ -697,17 +862,15 @@ impl Component for AttendantsComponent {
         // Determine if the "Add Fake Peer" button should be disabled
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
+        let host_display_name = ctx.props().host_display_name.clone();
         let rows: Vec<Html> = display_peers_vec
             .iter()
             .take(CANVAS_LIMIT)
             .enumerate()
             .map(|(i, peer_id)| {
-                // Only apply full_bleed if we have exactly 1 peer AND no self-tile (media not granted)
-                // When media is granted, self-tile is shown so we have 2+ tiles
                 let full_bleed = display_peers_vec.len() == 1
-                    && !self.client.is_screen_share_enabled_for_peer(peer_id)
-                    && !media_access_granted;
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} /> }
+                    && !self.client.is_screen_share_enabled_for_peer(peer_id);
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_display_name={host_display_name.clone()} /> }
             })
             .collect();
 
@@ -808,7 +971,7 @@ impl Component for AttendantsComponent {
                             class="btn-apple btn-primary"
                             onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}
                         >
-                            {"Join Meeting"}
+                            { if ctx.props().is_owner { "Start Meeting" } else { "Join Meeting" } }
                         </button>
                     </div>
                     </div>
@@ -829,29 +992,8 @@ impl Component for AttendantsComponent {
                     <BrowserCompatibility/>
                 <div id="grid-container"
                     class={grid_container_classes}
-                    data-peers={(num_peers_for_styling + if media_access_granted && !self.self_video_floating { 1 } else { 0 }).to_string()}
+                    data-peers={num_peers_for_styling.to_string()}
                     style={container_style}>
-                    // Self-tile (Host component) rendered as grid item or floating based on state
-                    {
-                        if media_access_granted && (users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty()) {
-                            html! {
-                                <Host
-                                    share_screen={self.share_screen}
-                                    mic_enabled={self.mic_enabled}
-                                    video_enabled={self.video_enabled}
-                                    on_encoder_settings_update={on_encoder_settings_update.clone()}
-                                    device_settings_open={self.device_settings_open}
-                                    on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
-                                    on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
-                                    is_connected={self.client.is_connected()}
-                                    is_floating={self.self_video_floating}
-                                    on_position_toggle={ctx.link().callback(|_| UserScreenToggleAction::SelfVideoPosition)}
-                                />
-                            }
-                        } else {
-                            html! {}
-                        }
-                    }
                     { rows }
 
                     { // Invitation overlay when there are no connected peers
@@ -919,9 +1061,12 @@ impl Component for AttendantsComponent {
                                             // Hide screen share button on Safari/iOS devices
                                             {
                                                 if !is_ios() {
+                                                    let is_active = matches!(self.screen_share_state, ScreenShareState::Active);
+                                                    let is_disabled = matches!(self.screen_share_state, ScreenShareState::Requesting);
                                                     html! {
                                                         <ScreenShareButton
-                                                            active={self.share_screen}
+                                                            active={is_active}
+                                                            disabled={is_disabled}
                                                             onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}
                                                         />
                                                     }
@@ -959,23 +1104,40 @@ impl Component for AttendantsComponent {
                         }
                                     </div>
                                     {
-                                        if let Some(err) = &self.mic_error {
+                                        if let Some(err) = &self.user_error {
                                             let displayed: String = err.chars().take(200).collect();
                                             html!{
                                                 <div class="glass-backdrop">
                                                     <div class="card-apple" style="width: 380px;">
-                                                        <h4 style="margin-top:0;">{"Microphone issue"}</h4>
-                                                        <p style="color:#AEAEB2; margin-top:0.25rem;">{"We couldn't start your microphone."}</p>
+                                                        <h4 style="margin-top:0;">{"Error"}</h4>
                                                         <p style="margin-top:0.5rem;">{ displayed }</p>
                                                         <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
-                                                            <button class="btn-apple btn-secondary btn-sm" onclick={ctx.link().callback(|_| Msg::DismissMicError)}>{"Close"}</button>
-                                                            <button class="btn-apple btn-primary btn-sm" onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>{"Retry"}</button>
+                                                            <button class="btn-apple btn-primary btn-sm" onclick={ctx.link().callback(|_| Msg::DismissUserError)}>{"OK"}</button>
                                                         </div>
                                                     </div>
                                                 </div>
                                             }
                                         } else { html!{} }
                                     }
+                                    {
+                                         if media_access_granted {
+                                             html! {<Host
+                                                 share_screen={self.screen_share_state.is_sharing()}
+                                                 mic_enabled={self.mic_enabled}
+                                                 video_enabled={self.video_enabled}
+                                                 on_encoder_settings_update={on_encoder_settings_update}
+                                                 device_settings_open={self.device_settings_open}
+                                                 on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                                 on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                                 on_camera_error={ctx.link().callback(Msg::OnCameraError)}
+                                                 on_screen_share_state={ctx.link().callback(Msg::ScreenShareStateChange)}
+                                             />}
+                                         } else {
+                                             html! {<></>}
+                                         }
+                                    }
+                                    <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
+
                                 </nav>
                             }
                         } else {
@@ -992,13 +1154,14 @@ impl Component for AttendantsComponent {
                             let toggle_meeting_info = ctx.link().callback(|_| UserScreenToggleAction::MeetingInfo);
                             html! {
                                 <PeerList
-                                    peers={display_peers_vec.clone()}
+                                    peers={peers_for_display.clone()}
                                     onclose={toggle_peer_list}
                                     show_meeting_info={self.meeting_info_open}
                                     room_id={ctx.props().id.clone()}
                                     num_participants={num_display_peers}
                                     is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
                                     on_toggle_meeting_info={toggle_meeting_info}
+                                    host_display_name={ctx.props().host_display_name.clone()}
                                 />
                             }
                         } else {
@@ -1007,32 +1170,15 @@ impl Component for AttendantsComponent {
                     }
                 </div>
 
+                // Waiting room controls - all admitted participants can manage waiting room
+                <HostControls
+                    meeting_id={ctx.props().id.clone()}
+                    is_admitted={true}
+                />
+
                 {
                     if let Some(ref message) = self.meeting_ended_message {
-                        html! {
-                            <div class="glass-backdrop" style="z-index: 9999;">
-                                <div class="card-apple" style="width: 420px; text-align: center;">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="2" style="margin: 0 auto 1rem;">
-                                        <circle cx="12" cy="12" r="10"></circle>
-                                        <line x1="15" y1="9" x2="9" y2="15"></line>
-                                        <line x1="9" y1="9" x2="15" y2="15"></line>
-                                    </svg>
-                                    <h4 style="margin-top:0; margin-bottom: 0.5rem;">{"Meeting Ended"}</h4>
-                                    <p style="font-size: 1rem; margin: 1.5rem 0; color: #666;">
-                                        {message}
-                                    </p>
-                                    <button
-                                        class="btn-apple btn-primary"
-                                        onclick={Callback::from(|_| {
-                                            if let Some(window) = web_sys::window() {
-                                                let _ = window.location().set_href("/");
-                                            }
-                                        })}>
-                                        {"Return to Home"}
-                                    </button>
-                                </div>
-                            </div>
-                        }
+                        html! { <MeetingEndedOverlay message={message.clone()} /> }
                     } else {
                         html! {}
                     }
@@ -1046,7 +1192,7 @@ impl Component for AttendantsComponent {
                                 on_close={close_diagnostics}
                                 video_enabled={self.video_enabled}
                                 mic_enabled={self.mic_enabled}
-                                share_screen={self.share_screen}
+                                share_screen={self.screen_share_state.is_sharing()}
                             />
                         }
                     } else { html!{} }

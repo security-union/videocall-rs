@@ -25,7 +25,7 @@
 //! The only DOM data it needs is the ID of the `HtmlVideoElement` for the participant's own video
 //! display and the ID's of the `HtmlCanvasElement`s into which remote peer video should be renderered.
 //!
-//! In addition to its use by Rust UI apps (e.g. via yew), it is intended that this crate be
+//! In addition to its use by Rust UI apps (e.g. via Yew, Dioxus, or Leptos), it is intended that this crate be
 //! compiled to npm module that could be called from javascript, e.g. in an electron app.
 //!
 //! Currently, only the Chrome browser is supported, due to some of the Web APIs that are used.
@@ -41,7 +41,7 @@
 //! ## Client creation and connection:
 //! ```no_run
 //! use videocall_client::{VideoCallClient, VideoCallClientOptions};
-//! use yew::Callback;
+//! use videocall_client::Callback;
 //!
 //! let options = VideoCallClientOptions {
 //!     enable_e2ee: true,
@@ -76,7 +76,7 @@
 //! ## Encoder creation:
 //! ```no_run
 //! use videocall_client::{VideoCallClient, CameraEncoder, ScreenEncoder, create_microphone_encoder};
-//! use yew::Callback;
+//! use videocall_client::Callback;
 //!
 //! # use videocall_client::VideoCallClientOptions;
 //! # let options = VideoCallClientOptions {
@@ -97,7 +97,8 @@
 //!     client.clone(),
 //!     "video-element",
 //!     1000000, // 1 Mbps initial bitrate
-//!     Callback::noop()
+//!     Callback::noop(),
+//!     Callback::noop() // on_error callback for camera errors
 //! );
 //! let mut microphone = create_microphone_encoder(
 //!     client.clone(),
@@ -108,7 +109,8 @@
 //! let mut screen = ScreenEncoder::new(
 //!     client,
 //!     2000, // 2 Mbps bitrate
-//!     Callback::noop()
+//!     Callback::noop(),
+//!     Callback::noop() // on_state_change callback for screen share events
 //! );
 //!
 //! // Select devices and start/stop encoding
@@ -126,7 +128,7 @@
 //!
 //! ```no_run
 //! use videocall_client::MediaDeviceAccess;
-//! use yew::Callback;
+//! use videocall_client::Callback;
 //!
 //! let mut media_device_access = MediaDeviceAccess::new();
 //! media_device_access.on_granted = Callback::from(|_| {
@@ -141,7 +143,7 @@
 //! ### Device query and listing:
 //! ```no_run
 //! use videocall_client::MediaDeviceList;
-//! use yew::Callback;
+//! use videocall_client::Callback;
 //!
 //! let mut media_device_list = MediaDeviceList::new();
 //! media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
@@ -181,5 +183,9 @@ pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };
-pub use encode::{create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder};
+pub use encode::{
+    create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
+    ScreenShareEvent,
+};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};
+pub use videocall_types::Callback;

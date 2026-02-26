@@ -20,10 +20,11 @@ rustlemania-ui:
     audioBitrateKbps: 16
     videoBitrateKbps: 160
     screenBitrateKbps: 160
+    oauthProvider: "google"
 
 
   image:
-    repository: securityunion/rustlemania-ui
+    repository: securityunion/videocall-web-ui
     pullPolicy: Always
     tag: latest  # Use staging tag
 

@@ -7,7 +7,7 @@
 #   --services SERVICES    Deploy only specific services (comma-separated)
 #                         Available services: websocket, webtransport, ingress-nginx, 
 #                         engineering-vlog, matomo, rustlemania-ui, rustlemania-ui-staging,
-#                         videocall-website, prometheus, grafana, metrics-api
+#                         videocall-website, prometheus, grafana, metrics-api, meeting-api
 #   (other)               Pass through to deploy-global-infrastructure.sh
 #
 # Examples:
@@ -65,6 +65,11 @@ map_service_to_deployments() {
                 echo "webtransport-singapore"
             fi
             ;;
+        meeting-api)
+            if [[ "$region" == "us-east" ]]; then
+                echo "meeting-api-us-east"
+            fi
+            ;;
         metrics-api)
             if [[ "$region" == "us-east" ]]; then
                 echo "metrics-api-us-east"
@@ -115,7 +120,7 @@ get_deployments_to_restart() {
         # Return all deployments for the region
         case "$region" in
             "us-east")
-                echo "metrics-api-us-east websocket-us-east webtransport-us-east engineering-vlog-us-east videocall-ui-us-east"
+                echo "meeting-api-us-east metrics-api-us-east websocket-us-east webtransport-us-east engineering-vlog-us-east videocall-ui-us-east"
                 ;;
             "singapore")
                 echo "websocket-singapore webtransport-singapore"

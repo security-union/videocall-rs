@@ -17,13 +17,14 @@ services:
 
   rust-tests:
     build:
-      dockerfile: ../docker/Dockerfile.actix
-      context: ../docker
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
     working_dir: /app/actix-api
     dns:
       - 8.8.8.8
       - 1.1.1.1
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - RUST_LOG=info
       - WEBTRANSPORT_URL=https://127.0.0.1:4433
       - HEALTH_URL=http://127.0.0.1:5321/healthz
@@ -38,13 +39,14 @@ services:
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
+      - JWT_SECRET=test-secret-for-integration-tests
     volumes:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-it-tests-registry:/usr/local/cargo/registry
-      - rustlemania-it-tests-git:/usr/local/cargo/git
-      - rustlemania-it-tests-target:/usr/local/cargo/target
+      - nix-store-it-tests:/nix
+      - rustlemania-it-tests-registry:/root/.cargo/registry
+      - rustlemania-it-tests-git:/root/.cargo/git
       - rustlemania-it-tests-cache:/app/actix-api/target
     depends_on:
       postgres:
@@ -52,20 +54,22 @@ services:
       nats:
         condition: service_started
     command: >
-      bash -lc '
+      nix develop /app#backend-dev --command bash -c '
         set -euo pipefail
         echo "=== RUNNING DATABASE MIGRATIONS ==="
         cd /app/dbmate && dbmate wait && dbmate up
         cd /app/actix-api
-        echo "=== STARTING CARGO TEST ==="
+        echo "=== TESTING videocall-api ==="
         cargo test -p videocall-api -- --nocapture --test-threads=1
-        echo "=== CARGO TEST FINISHED WITH EXIT CODE: $? ==="
+        echo "=== TESTING meeting-api ==="
+        cargo test -p meeting-api -- --nocapture --test-threads=1
+        echo "=== ALL TESTS FINISHED ==="
       '
 
 volumes:
+  nix-store-it-tests:
   rustlemania-it-tests-registry:
   rustlemania-it-tests-git:
-  rustlemania-it-tests-target:
   rustlemania-it-tests-cache:
 
 

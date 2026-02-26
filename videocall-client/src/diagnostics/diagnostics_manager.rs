@@ -26,11 +26,11 @@ use futures::channel::mpsc::{self, Receiver, Sender, UnboundedSender};
 use futures::StreamExt;
 use js_sys::Date;
 use log::{debug, error};
+use videocall_types::Callback;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::window;
-use yew::Callback;
 
 use videocall_types::protos::diagnostics_packet::{AudioMetrics, DiagnosticsPacket, VideoMetrics};
 

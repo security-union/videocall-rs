@@ -694,6 +694,7 @@ pub fn AttendantsComponent(
                                     device_settings_open.set(false);
                                 }
                             },
+                            is_current_user_host: is_owner,
                             host_email: host_email.clone(),
                         }
                     }

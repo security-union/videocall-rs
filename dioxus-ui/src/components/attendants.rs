@@ -104,7 +104,7 @@ pub fn AttendantsComponent(
     #[props(default)] user_name: Option<String>,
     #[props(default)] user_email: Option<String>,
     #[props(default)] on_logout: Option<EventHandler<()>>,
-    #[props(default)] host_display_name: Option<String>,
+    #[props(default)] host_email: Option<String>,
     #[props(default)] auto_join: bool,
     #[props(default)] is_owner: bool,
     #[props(default)] room_token: String,
@@ -222,8 +222,8 @@ pub fn AttendantsComponent(
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
-            get_peer_video_canvas_id: VcCallback::from(|email| email),
-            get_peer_screen_canvas_id: VcCallback::from(|email| format!("screen-share-{}", &email)),
+            get_peer_video_canvas_id: VcCallback::from(|session_id|session_id),
+            get_peer_screen_canvas_id: VcCallback::from(|session_id| format!("screen-share-{}", &session_id)),
             enable_diagnostics: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
@@ -300,12 +300,12 @@ pub fn AttendantsComponent(
     // --- Derived values ---
     let _ = peer_list_version(); // subscribe to trigger re-renders when peers change
     let display_peers = client.sorted_peer_keys();
-    let peers_for_display: Vec<String> = display_peers
+    let peers_for_display: Vec<(String, Option<String>)> = display_peers
         .iter()
         .map(|session_id| {
-            client
-                .get_peer_email(session_id)
-                .unwrap_or_else(|| session_id.clone())
+            let display_name = client.get_peer_email(session_id).unwrap_or_else(|| session_id.clone());
+            let user_email = client.get_peer_user_email(session_id);
+            (display_name, user_email)
         })
         .collect();
     let num_display_peers = display_peers.len();
@@ -411,7 +411,7 @@ pub fn AttendantsComponent(
                                     key: "tile-{i}-{peer_id}",
                                     peer_id: peer_id.clone(),
                                     full_bleed: full_bleed,
-                                    host_display_name: host_display_name.clone(),
+                                    host_email: host_email.clone(),
                                 }
                             }
                         }
@@ -694,7 +694,7 @@ pub fn AttendantsComponent(
                                     device_settings_open.set(false);
                                 }
                             },
-                            host_display_name: host_display_name.clone(),
+                            host_email: host_email.clone(),
                         }
                     }
                 }

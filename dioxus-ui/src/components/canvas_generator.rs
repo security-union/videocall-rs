@@ -29,16 +29,19 @@ use videocall_client::VideoCallClient;
 use web_sys::{window, HtmlCanvasElement};
 
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
-/// the video tile will occupy the full grid area. If `host_display_name` matches `key`, a crown
+/// the video tile will occupy the full grid area. If `host_email` matches the peer's email, a crown
 /// icon is displayed next to the name.
 pub fn generate_for_peer(
     client: &VideoCallClient,
     key: &String,
     full_bleed: bool,
-    host_display_name: Option<&str>,
+    host_email: Option<&str>,
 ) -> Element {
     let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
-    let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
+    let user_email = client
+        .get_peer_user_email(key)
+        .unwrap_or_else(|| key.clone());
+    let is_host = host_email.map(|h| h == user_email).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.contains(&peer_email) {
         return rsx! {};

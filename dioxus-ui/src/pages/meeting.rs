@@ -36,7 +36,7 @@ pub enum MeetingStatus {
     Waiting,
     Admitted {
         is_host: bool,
-        host_display_name: Option<String>,
+        host_email: String,
         room_token: String,
     },
     Rejected,
@@ -51,7 +51,7 @@ pub fn MeetingPage(id: String) -> Element {
     let mut user_profile = use_signal(|| None::<UserProfile>);
     let mut show_dropdown = use_signal(|| false);
     let mut meeting_status = use_signal(|| MeetingStatus::NotJoined);
-    let mut host_display_name = use_signal(|| None::<String>);
+    let mut host_email = use_signal(|| String::new());
     let mut current_user_email = use_signal(|| None::<String>);
     let mut came_from_waiting_room = use_signal(|| false);
     let mut error_state = use_signal(|| None::<String>);
@@ -127,13 +127,13 @@ pub fn MeetingPage(id: String) -> Element {
                             match join_meeting(&meeting_id, Some(&display_name)).await {
                                 Ok(response) => {
                                     current_user_email.set(Some(response.email.clone()));
-                                    host_display_name.set(info.host_display_name.clone());
+                                    host_email.set(info.host.clone());
                                     match response.status.as_str() {
                                         "admitted" => {
                                             if let Some(token) = response.room_token {
                                                 meeting_status.set(MeetingStatus::Admitted {
                                                     is_host: response.is_host,
-                                                    host_display_name: info.host_display_name,
+                                                    host_email: info.host,
                                                     room_token: token,
                                                 });
                                             } else {
@@ -196,20 +196,20 @@ pub fn MeetingPage(id: String) -> Element {
                     Ok(response) => {
                         current_user_email.set(Some(response.email.clone()));
                         let determined_host = if response.is_host {
-                            Some(display_name.clone())
+                            response.email.clone()
                         } else {
                             match crate::meeting_api::get_meeting_info(&meeting_id).await {
-                                Ok(info) => info.host_display_name,
-                                Err(_) => None,
+                                Ok(info) => info.host,
+                                Err(_) => String::new(),
                             }
                         };
-                        host_display_name.set(determined_host.clone());
+                        host_email.set(determined_host.clone());
                         match response.status.as_str() {
                             "admitted" => {
                                 if let Some(token) = response.room_token {
                                     meeting_status.set(MeetingStatus::Admitted {
                                         is_host: response.is_host,
-                                        host_display_name: determined_host,
+                                        host_email: determined_host,
                                         room_token: token,
                                     });
                                 } else {
@@ -244,15 +244,14 @@ pub fn MeetingPage(id: String) -> Element {
         move |room_token: String| {
             let meeting_id = meeting_id.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let determined_host = match crate::meeting_api::get_meeting_info(&meeting_id).await
-                {
-                    Ok(info) => info.host_display_name,
-                    Err(_) => None,
+                let determined_host = match crate::meeting_api::get_meeting_info(&meeting_id).await {
+                    Ok(info) => info.host,
+                    Err(_) => String::new(),
                 };
-                host_display_name.set(determined_host.clone());
+                host_email.set(determined_host.clone());
                 meeting_status.set(MeetingStatus::Admitted {
                     is_host: false,
-                    host_display_name: determined_host,
+                    host_email: determined_host,
                     room_token,
                 });
             });
@@ -315,7 +314,7 @@ pub fn MeetingPage(id: String) -> Element {
     rsx! {
         match (&maybe_username, &current_meeting_status) {
             // User is admitted - show the meeting
-            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, room_token }) => rsx! {
+            (Some(username), MeetingStatus::Admitted { is_host, host_email, room_token }) => rsx! {
                 AttendantsComponent {
                     email: username.clone(),
                     id: id.clone(),
@@ -324,7 +323,7 @@ pub fn MeetingPage(id: String) -> Element {
                     user_name: user_profile().as_ref().map(|p| p.name.clone()),
                     user_email: current_user_email().or_else(|| user_profile().as_ref().map(|p| p.email.clone())),
                     on_logout: Some(EventHandler::new(on_logout)),
-                    host_display_name: host_display_name.clone(),
+                    host_email: Some(host_email.clone()),
                     auto_join: should_auto_join,
                     is_owner: *is_host,
                     room_token: room_token.clone(),

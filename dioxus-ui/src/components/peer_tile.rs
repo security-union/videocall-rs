@@ -28,7 +28,7 @@ use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 pub fn PeerTile(
     peer_id: String,
     #[props(default = false)] full_bleed: bool,
-    #[props(default)] host_display_name: Option<String>,
+    #[props(default)] host_email: Option<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -75,14 +75,14 @@ pub fn PeerTile(
         });
     });
 
-    let host_dn = host_display_name.as_deref();
+    let host_email_ref = host_email.as_deref();
 
     // Re-read signals to trigger reactive re-renders
     let _ = audio_enabled();
     let _ = video_enabled();
     let _ = screen_enabled();
 
-    generate_for_peer(&client, &peer_id, full_bleed, host_dn)
+    generate_for_peer(&client, &peer_id, full_bleed, host_email_ref)
 }
 
 fn handle_diagnostics_event(

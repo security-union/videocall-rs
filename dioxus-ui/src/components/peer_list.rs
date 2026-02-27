@@ -23,21 +23,21 @@ use dioxus::prelude::*;
 
 #[component]
 pub fn PeerList(
-    peers: Vec<String>,
+    peers: Vec<(String, Option<String>)>,
     onclose: EventHandler<MouseEvent>,
     show_meeting_info: bool,
     room_id: String,
     num_participants: usize,
     is_active: bool,
     on_toggle_meeting_info: EventHandler<()>,
-    #[props(default)] host_display_name: Option<String>,
+    #[props(default)] host_email: Option<String>,
 ) -> Element {
     let mut search_query = use_signal(String::new);
     let mut show_context_menu = use_signal(|| false);
 
-    let filtered_peers: Vec<String> = peers
+    let filtered_peers: Vec<(String, Option<String>)> = peers
         .iter()
-        .filter(|peer| peer.to_lowercase().contains(&search_query().to_lowercase()))
+        .filter(|(display_name, _user_email)| display_name.to_lowercase().contains(&search_query().to_lowercase()))
         .cloned()
         .collect();
 
@@ -51,10 +51,8 @@ pub fn PeerList(
         .unwrap_or_else(|| "(You)".to_string());
 
     // Check if current user is host
-    let is_current_user_host = host_display_name
-        .as_ref()
-        .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
-        .unwrap_or(false);
+    let is_current_user_host = ctx.props().is_current_user_host;
+    let host_email = ctx.props().host_email.clone();
 
     rsx! {
         div {
@@ -146,12 +144,16 @@ pub fn PeerList(
                             // show self as the first item with actual username
                             li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host } }
 
-                            for peer in filtered_peers.iter() {
+                            for (peer_display_name, peer_user_email) in filtered_peers.iter() {
+                                let is_peer_host = match (&host_email, peer_user_email) {
+                                    (Some(h), Some(e)) => h == e,
+                                    _ => false,
+                                };
                                 li {
-                                    key: "{peer}",
+                                    key: "{peer_display_name}",
                                     PeerListItem {
-                                        name: peer.clone(),
-                                        is_host: host_display_name.as_ref().map(|h| h == peer).unwrap_or(false),
+                                        name: peer_display_name.clone(),
+                                        is_host: is_peer_host,
                                     }
                                 }
                             }

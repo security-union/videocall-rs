@@ -15,8 +15,7 @@ attempting any of the steps below.
 
 ### 1. SSH Access
 
-Each developer has a personal account on the remote machine. SSH access is via public key —
-your public key must be in `~/.ssh/authorized_keys` on the server.
+Each developer has a personal account on the remote machine and your SSH public key was persisted in your `~/.ssh/authorized_keys` on the server.
 
 | Developer | Login |
 |-----------|-------|

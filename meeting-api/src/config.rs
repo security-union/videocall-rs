@@ -34,6 +34,10 @@ pub struct Config {
     pub oauth: Option<OAuthConfig>,
     /// Cookie domain (optional, e.g. ".example.com").
     pub cookie_domain: Option<String>,
+    /// Name of the session cookie (default: "session").
+    /// Override in PR preview environments to avoid collisions with the
+    /// production cookie (which also uses `session` on a parent domain).
+    pub cookie_name: String,
     /// Whether to set the `Secure` flag on cookies (default: true).
     /// Set `COOKIE_SECURE=false` for local development over HTTP.
     pub cookie_secure: bool,
@@ -63,6 +67,10 @@ pub struct OAuthConfig {
     /// Space-separated OAuth scopes (default: "openid email profile").
     pub scopes: String,
     pub after_login_url: String,
+    /// Comma-separated list of allowed redirect URL origins (e.g.
+    /// "http://localhost:80,http://localhost:3001"). The origin of
+    /// `after_login_url` is implicitly allowed.
+    pub allowed_redirect_urls: Vec<String>,
 }
 
 impl Config {
@@ -76,6 +84,8 @@ impl Config {
     /// - `LISTEN_ADDR` (default: `"0.0.0.0:8081"`)
     /// - `TOKEN_TTL_SECS` (default: `"60"`)
     /// - `COOKIE_DOMAIN`
+    /// - `COOKIE_NAME` (default: `"session"`) — set to a unique value (e.g. `"pr-session"`)
+    ///   in PR preview environments to avoid collision with the production cookie
     /// - OAuth: `OAUTH_CLIENT_ID`, `OAUTH_SECRET` (optional), `OAUTH_REDIRECT_URL`,
     ///   `OAUTH_ISSUER`, `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_JWKS_URL`,
     ///   `OAUTH_USERINFO_URL`, `OAUTH_SCOPES` (default: `"openid email profile"`),
@@ -97,6 +107,10 @@ impl Config {
             .parse::<i64>()
             .map_err(|_| "SESSION_TTL_SECS must be a valid integer")?;
         let cookie_domain = env::var("COOKIE_DOMAIN").ok().filter(|s| !s.is_empty());
+        let cookie_name = env::var("COOKIE_NAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "session".to_string());
         let cookie_secure = env::var("COOKIE_SECURE")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
@@ -157,6 +171,20 @@ impl Config {
                     scopes,
                     after_login_url: env::var("AFTER_LOGIN_URL")
                         .unwrap_or_else(|_| "/".to_string()),
+                    allowed_redirect_urls: {
+                        let urls: Vec<String> = env::var("ALLOWED_REDIRECT_URLS")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
+                            .unwrap_or_default();
+                        // Validate at startup so malformed entries fail fast.
+                        for u in &urls {
+                            url::Url::parse(u).map_err(|e| {
+                                format!("ALLOWED_REDIRECT_URLS contains invalid URL {u:?}: {e}")
+                            })?;
+                        }
+                        urls
+                    },
                 })
             })
             .transpose()?;
@@ -169,6 +197,7 @@ impl Config {
             session_ttl_secs,
             oauth,
             cookie_domain,
+            cookie_name,
             cookie_secure,
             cors_allowed_origin,
         })

@@ -22,9 +22,9 @@ use leptos::*;
 pub fn CustomersSection() -> impl IntoView {
     view! {
         <section id="customers" class="relative">
-            <div class="text-center mb-20">
-                <h2 class="text-headline text-foreground mb-6">"Trusted By"</h2>
-                <p class="text-body-large text-foreground-secondary max-w-3xl mx-auto">"Growing community of developers and organizations"</p>
+            <div class="text-center mb-16">
+                <h2 class="text-4xl md:text-5xl font-semibold tracking-tight mb-4">"Trusted By"</h2>
+                <p class="text-lg md:text-xl text-white/50 max-w-2xl mx-auto">"Growing community of developers and organizations"</p>
             </div>
 
             // Stats Grid

@@ -17,6 +17,7 @@
  */
 
 use crate::components::icons::crop::CropIcon;
+use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
@@ -30,14 +31,19 @@ use yew::{html, Html};
 
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
 /// the video tile will occupy the full grid area. The `is_speaking` parameter indicates voice activity.
+/// If `host_display_name` matches `key`, a crown icon is displayed next to the name.
 pub fn generate_for_peer(
     client: &VideoCallClient,
     key: &String,
     full_bleed: bool,
     is_speaking: bool,
+    host_display_name: Option<&str>,
 ) -> Html {
+    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
+
+    let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
-    if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {
+    if !allowed.is_empty() && !allowed.contains(&peer_email) {
         return html! {};
     }
 
@@ -61,7 +67,10 @@ pub fn generate_for_peer(
                     })}
                 >
                     { if is_video_enabled_for_peer { html!{ <UserVideo id={key.clone()} hidden={false}/> } } else { html!{ <div class=""><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> } } }
-                    <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_email}") } else {peer_email.clone() }} dir={"auto"}>
+                        {peer_email.clone()}
+                        if is_host { <CrownIcon /> }
+                    </h4>
                     <div class="audio-indicator"><MicIcon muted={!is_audio_enabled_for_peer}/></div>
                     <button onclick={Callback::from({ let canvas_id = key.clone(); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon"><CropIcon/></button>
                     <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon"><PushPinIcon/></button>
@@ -89,7 +98,7 @@ pub fn generate_for_peer(
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
                     })}>
                         <ScreenCanvas peer_id={key.clone()} />
-                        <h4 class="floating-name" title={format!("{}-screen", &key)} dir={"auto"}>{format!("{}-screen", &key)}</h4>
+                        <h4 class="floating-name" title={format!("{}-screen", &peer_email)} dir={"auto"}>{format!("{}-screen", &peer_email)}</h4>
                         <button onclick={Callback::from({ let canvas_id = format!("screen-share-{}", key.clone()); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon">
                             <CropIcon/>
                         </button>
@@ -117,7 +126,10 @@ pub fn generate_for_peer(
                             <span class="placeholder-text">{"Video Disabled"}</span>
                         </div>
                     }
-                    <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_email}") } else { peer_email.clone() }} dir={"auto"}>
+                        {peer_email.clone()}
+                        if is_host { <CrownIcon /> }
+                    </h4>
                     <div class="audio-indicator">
                         <MicIcon muted={!is_audio_enabled_for_peer}/>
                     </div>

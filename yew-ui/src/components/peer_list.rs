@@ -51,6 +51,10 @@ pub struct PeerListProperties {
     pub num_participants: usize,
     pub is_active: bool,
     pub on_toggle_meeting_info: yew::Callback<()>,
+
+    /// Display name (username) of the meeting host (for displaying crown icon)
+    #[prop_or_default]
+    pub host_display_name: Option<String>,
 }
 
 pub enum PeerListMsg {
@@ -107,48 +111,42 @@ impl Component for PeerList {
             PeerListMsg::Diagnostics(evt) => {
                 match evt.subsystem {
                     "peer_status" => {
-                        // Parse peer_status metrics for audio enabled state
+                        // Parse peer_status metrics for audio enabled state AND speaking state
                         let mut to_peer: Option<String> = None;
                         let mut audio_enabled: Option<bool> = None;
+                        let mut is_speaking: Option<bool> = None;
                         for m in &evt.metrics {
                             match (m.name, &m.value) {
                                 ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
                                 ("audio_enabled", MetricValue::U64(v)) => {
                                     audio_enabled = Some(*v != 0)
                                 }
+                                ("is_speaking", MetricValue::U64(v)) => {
+                                    is_speaking = Some(*v != 0)
+                                }
                                 _ => {}
                             }
                         }
 
-                        if let (Some(peer), Some(audio)) = (to_peer, audio_enabled) {
-                            let current = self.peer_audio_states.get(&peer).copied();
+                        let mut updated = false;
+
+                        if let (Some(peer), Some(audio)) = (to_peer.as_ref(), audio_enabled) {
+                            let current = self.peer_audio_states.get(peer).copied();
                             if current != Some(audio) {
-                                self.peer_audio_states.insert(peer, audio);
-                                return true;
-                            }
-                        }
-                        false
-                    }
-                    "peer_speaking" => {
-                        // Parse peer_speaking metrics for voice activity
-                        let mut to_peer: Option<String> = None;
-                        let mut speaking: Option<bool> = None;
-                        for m in &evt.metrics {
-                            match (m.name, &m.value) {
-                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
-                                ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
-                                _ => {}
+                                self.peer_audio_states.insert(peer.clone(), audio);
+                                updated = true;
                             }
                         }
 
-                        if let (Some(peer), Some(is_speaking)) = (to_peer, speaking) {
+                        if let (Some(peer), Some(speaking)) = (to_peer, is_speaking) {
                             let current = self.peer_speaking_states.get(&peer).copied();
-                            if current != Some(is_speaking) {
-                                self.peer_speaking_states.insert(peer, is_speaking);
-                                return true;
+                            if current != Some(speaking) {
+                                self.peer_speaking_states.insert(peer, speaking);
+                                updated = true;
                             }
                         }
-                        false
+
+                        updated
                     }
                     _ => false,
                 }
@@ -195,12 +193,22 @@ impl Component for PeerList {
         });
 
         // Get username from context and append (You)
-        let display_name: String = ctx
+        let current_user_name: Option<String> = ctx
             .link()
             .context::<UsernameCtx>(Callback::noop())
-            .and_then(|(state, _handle)| state.as_ref().cloned())
+            .and_then(|(state, _handle)| state.as_ref().cloned());
+
+        let display_name = current_user_name
+            .clone()
             .map(|name| format!("{name} (You)"))
             .unwrap_or_else(|| "(You)".to_string());
+
+        // Check if current user is host by comparing display names
+        let host_display_name = ctx.props().host_display_name.clone();
+        let is_current_user_host = host_display_name
+            .as_ref()
+            .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
+            .unwrap_or(false);
 
         html! {
             <div>
@@ -282,13 +290,16 @@ impl Component for PeerList {
                         <div class="peer-list">
                             <ul>
                                 // show self as the first item with actual username
-                                <li><PeerListItem name={display_name.clone()} muted={ctx.props().self_muted} speaking={false} /></li>
+                                <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} muted={ctx.props().self_muted} speaking={false} /></li>
 
                                 { for filtered_peers.iter().map(|peer| {
+                                    let is_peer_host = host_display_name.as_ref()
+                                        .map(|h| h == peer)
+                                        .unwrap_or(false);
                                     let muted = !self.peer_audio_states.get(peer).copied().unwrap_or(false);
                                     let speaking = self.peer_speaking_states.get(peer).copied().unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={peer.clone()} muted={muted} speaking={speaking} /></li>
+                                        <li><PeerListItem name={peer.clone()} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
                                     }
                                 })}
                             </ul>

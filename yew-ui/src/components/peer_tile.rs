@@ -27,8 +27,9 @@ pub struct PeerTileProps {
     pub peer_id: String,
     #[prop_or(false)]
     pub full_bleed: bool,
-    #[prop_or(false)]
-    pub is_speaking: bool,
+    /// Display name (username) of the meeting host (for displaying crown icon)
+    #[prop_or_default]
+    pub host_display_name: Option<String>,
 }
 
 pub enum Msg {
@@ -150,30 +151,6 @@ impl Component for PeerTile {
                         }
                         changed
                     }
-                    "peer_speaking" => {
-                        // Parse peer_speaking metrics for voice activity
-                        let mut to_peer: Option<String> = None;
-                        let mut speaking: Option<bool> = None;
-                        for m in &evt.metrics {
-                            match (m.name, &m.value) {
-                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
-                                ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
-                                _ => {}
-                            }
-                        }
-
-                        if to_peer.as_deref() != Some(ctx.props().peer_id.as_str()) {
-                            return false;
-                        }
-
-                        if let Some(s) = speaking {
-                            if s != self.is_speaking {
-                                self.is_speaking = s;
-                                return true;
-                            }
-                        }
-                        false
-                    }
                     _ => false,
                 }
             }
@@ -181,11 +158,16 @@ impl Component for PeerTile {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        // Get host display name from props
+        let host_display_name = ctx.props().host_display_name.as_deref();
+
+        // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
         generate_for_peer(
             &self.client,
             &ctx.props().peer_id,
             ctx.props().full_bleed,
             self.is_speaking,
+            host_display_name,
         )
     }
 

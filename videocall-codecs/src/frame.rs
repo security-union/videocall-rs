@@ -29,6 +29,35 @@ pub enum FrameType {
     DeltaFrame,
 }
 
+/// The codec used to encode a video frame.
+/// Names include profile/level details for scalability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FrameCodec {
+    /// Unknown/unspecified codec - skip decoding.
+    #[default]
+    Unspecified,
+    /// VP8 codec - no profile variants.
+    Vp8,
+    /// VP9 Profile 0, Level 1.0, 8-bit (vp09.00.10.08).
+    Vp9Profile0Level10Bit8,
+}
+
+impl FrameCodec {
+    /// Returns the WebCodecs codec string for this codec, or None for Unspecified.
+    pub fn as_webcodecs_str(&self) -> Option<&'static str> {
+        match self {
+            FrameCodec::Unspecified => None,
+            FrameCodec::Vp8 => Some("vp8"),
+            FrameCodec::Vp9Profile0Level10Bit8 => Some("vp09.00.10.08"),
+        }
+    }
+
+    /// Returns true if this is a known, decodable codec.
+    pub fn is_known(&self) -> bool {
+        !matches!(self, FrameCodec::Unspecified)
+    }
+}
+
 /// Represents a raw, encoded video frame as it arrives from the network.
 /// In our simulation, this is the unit that comes from a QUIC stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +66,9 @@ pub struct VideoFrame {
     pub sequence_number: u64,
     /// The type of the frame (KeyFrame or DeltaFrame).
     pub frame_type: FrameType,
+    /// The codec used to encode this frame.
+    #[serde(default)]
+    pub codec: FrameCodec,
     /// The encoded video data.
     pub data: Vec<u8>,
     /// The timestamp of the frame.

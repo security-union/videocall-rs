@@ -2,7 +2,7 @@
 metricsApi:
   # Image configuration
   image:
-    repository: securityunion/rustlemania-api
+    repository: securityunion/videocall-media-server
     pullPolicy: Always
     tag: latest
   
@@ -68,7 +68,7 @@ metricsApi:
 serverStats:
   # Image configuration (same as metrics-api but different binary)
   image:
-    repository: securityunion/rustlemania-api
+    repository: securityunion/videocall-media-server
     pullPolicy: Always
     tag: latest
   

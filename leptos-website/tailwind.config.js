@@ -2,88 +2,49 @@
 module.exports = {
   content: ["*.html", "./src/**/*.rs"],
   darkMode: "class",
-
   theme: {
     extend: {
       screens: {
         "4xl": "1920px",
       },
       fontFamily: {
-        sans: ['-apple-system', 'BlinkMacSystemFont', '"SF Pro Display"', '"SF Pro Text"', 'Inter', 'system-ui', 'sans-serif'],
-        mono: ['SF Mono', '"Fira Code"', 'Menlo', 'Monaco', 'monospace'],
-      },
-      blur: {
-        'xs': '2px',
-      },
-      backdropBlur: {
-        'xs': '2px',
+        sans: ['-apple-system', 'BlinkMacSystemFont', '"SF Pro Display"', '"Helvetica Neue"', 'system-ui', 'sans-serif'],
+        mono: ['"SF Mono"', '"Fira Code"', 'Menlo', 'Monaco', 'monospace'],
       },
       colors: {
-        // Apple-inspired color palette
         primary: {
-          DEFAULT: "#007AFF", // Apple blue
-          dark: "#0A84FF",
+          DEFAULT: "#2997ff",
+          dark: "#0077ed",
         },
-        
-        // True Apple-style dark mode colors
         background: {
-          DEFAULT: "#000000",  // Pure black like Apple
-          secondary: "#1C1C1E", // Elevated surfaces
-          tertiary: "#2C2C2E",  // Cards and modals
+          DEFAULT: "#000000",
+          secondary: "#1d1d1f",
+          tertiary: "#2d2d2f",
         },
-        
         foreground: {
-          DEFAULT: "#FFFFFF",  // Pure white text
-          secondary: "#AEAEB2", // Secondary text
-          tertiary: "#8E8E93",  // Tertiary text
-          quaternary: "#636366", // Disabled text
+          DEFAULT: "#f5f5f7",
+          secondary: "rgba(255,255,255,0.5)",
+          tertiary: "rgba(255,255,255,0.3)",
+          quaternary: "rgba(255,255,255,0.16)",
         },
-        
         border: {
-          DEFAULT: "#38383A", // Subtle borders
-          secondary: "#48484A", // More visible borders
+          DEFAULT: "rgba(255,255,255,0.08)",
+          secondary: "rgba(255,255,255,0.14)",
         },
-        
-        // Semantic colors - Apple style
-        success: "#30D158",    // Apple green
-        warning: "#FF9F0A",    // Apple orange
-        error: "#FF453A",      // Apple red
-        info: "#007AFF",       // Apple blue
+        success: "#30d158",
+        warning: "#ff9f0a",
+        error:   "#ff453a",
+        info:    "#2997ff",
       },
-      
-      // Apple-inspired typography scale
-      fontSize: {
-        xs: ["0.75rem", { lineHeight: "1rem", fontWeight: "400" }],
-        sm: ["0.875rem", { lineHeight: "1.25rem", fontWeight: "400" }],
-        base: ["1rem", { lineHeight: "1.5rem", fontWeight: "400" }],
-        lg: ["1.125rem", { lineHeight: "1.75rem", fontWeight: "400" }],
-        xl: ["1.25rem", { lineHeight: "1.75rem", fontWeight: "400" }],
-        "2xl": ["1.5rem", { lineHeight: "2rem", fontWeight: "500" }],
-        "3xl": ["1.875rem", { lineHeight: "2.25rem", fontWeight: "600" }],
-        "4xl": ["2.25rem", { lineHeight: "2.5rem", fontWeight: "600" }],
-        "5xl": ["3rem", { lineHeight: "3.5rem", fontWeight: "700" }],
-        "6xl": ["3.75rem", { lineHeight: "4rem", fontWeight: "700" }],
-        "7xl": ["4.5rem", { lineHeight: "5rem", fontWeight: "700" }],
-        "8xl": ["6rem", { lineHeight: "6.5rem", fontWeight: "700" }],
-        "9xl": ["8rem", { lineHeight: "8.5rem", fontWeight: "700" }],
-      },
-      
-      spacing: {
-        '18': '4.5rem',
-        '88': '22rem',
-        '112': '28rem',
-        '128': '32rem',
-      },
-      
       borderRadius: {
         'none': '0',
         'sm': '0.25rem',
         'DEFAULT': '0.5rem',
         'md': '0.75rem',
         'lg': '1rem',
-        'xl': '1.5rem',
-        '2xl': '2rem',
-        '3xl': '3rem',
+        'xl': '1.25rem',
+        '2xl': '1.5rem',
+        '3xl': '2rem',
         'full': '9999px',
       },
     },

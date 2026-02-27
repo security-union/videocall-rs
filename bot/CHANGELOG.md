@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.3](https://github.com/security-union/videocall-rs/compare/bot-v1.1.2...bot-v1.1.3) - 2026-02-23
+
+### Other
+
+- updated the following local packages: videocall-types
+
+## [1.1.2](https://github.com/security-union/videocall-rs/compare/bot-v1.1.1...bot-v1.1.2) - 2026-02-19
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.1.1](https://github.com/security-union/videocall-rs/compare/bot-v1.1.0...bot-v1.1.1) - 2026-02-19
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.1.0](https://github.com/security-union/videocall-rs/compare/bot-v1.0.15...bot-v1.1.0) - 2026-02-04
+
+### Added
+
+- *(actix-api)* Consolidate WebTransport to use actor model ([#551](https://github.com/security-union/videocall-rs/pull/551))
+
+## [1.0.15](https://github.com/security-union/videocall-rs/compare/bot-v1.0.14...bot-v1.0.15) - 2026-01-27
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [1.0.14](https://github.com/security-union/videocall-rs/compare/bot-v1.0.13...bot-v1.0.14) - 2025-11-30
 
 ### Other

@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'videocall-cli/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
 
 jobs:
   build_and_package:

@@ -512,6 +512,8 @@ jobs:
             --set "env[11].value=info" \
             --set "env[12].name=COOKIE_NAME" \
             --set "env[12].value=pr${SLOT}-session" \
+            --set "env[13].name=ALLOWED_REDIRECT_URLS" \
+            --set "env[13].value=https://pr${SLOT}.sandbox.videocall.rs" \            
             --set "ingress.hosts[0].host=pr${SLOT}-api.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

@@ -51,8 +51,8 @@ pub fn PeerList(
         .unwrap_or_else(|| "(You)".to_string());
 
     // Check if current user is host
-    let is_current_user_host = ctx.props().is_current_user_host;
-    let host_email = ctx.props().host_email.clone();
+    let is_current_user_host = is_current_user_host;
+    let host_email = host_email.clone();
 
     rsx! {
         div {
@@ -145,15 +145,14 @@ pub fn PeerList(
                             li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host } }
 
                             for (peer_display_name, peer_user_email) in filtered_peers.iter() {
-                                let is_peer_host = match (&host_email, peer_user_email) {
-                                    (Some(h), Some(e)) => h == e,
-                                    _ => false,
-                                };
                                 li {
                                     key: "{peer_display_name}",
                                     PeerListItem {
                                         name: peer_display_name.clone(),
-                                        is_host: is_peer_host,
+                                        is_host: match (&host_email, peer_user_email) {
+                                            (Some(h), Some(e)) => h == e,
+                                            _ => false,
+                                        },
                                     }
                                 }
                             }

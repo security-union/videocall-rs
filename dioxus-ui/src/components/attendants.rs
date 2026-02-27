@@ -231,8 +231,8 @@ pub fn AttendantsComponent(
             on_encoder_settings_update: None,
             rtt_testing_period_ms: server_election_period_ms().unwrap_or(2000),
             rtt_probe_interval_ms: Some(200),
-            on_meeting_info: Some(VcCallback::from(move |start_time_ms: f64| {
-                log::info!("Meeting started at Unix timestamp: {start_time_ms}");
+            on_meeting_info: Some(VcCallback::from(move |(start_time_ms, creator_id): (f64, String)| {
+                log::info!("Meeting started at Unix timestamp: {start_time_ms}, creator: {creator_id}");
                 let mut meeting_start_time_server = meeting_start_time_server;
                 meeting_start_time_server.set(Some(start_time_ms));
             })),

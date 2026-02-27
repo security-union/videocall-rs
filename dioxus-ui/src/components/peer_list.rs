@@ -31,8 +31,8 @@ pub fn PeerList(
     is_active: bool,
     on_toggle_meeting_info: EventHandler<()>,
     /// If the current user is the meeting host
-    #[prop_or(false)]
-    is_current_user_host: bool,
+    #[props(default)]
+    is_current_user_host: bool = false,
     #[props(default)] host_email: Option<String>,
 ) -> Element {
     let mut search_query = use_signal(String::new);

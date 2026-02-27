@@ -196,6 +196,8 @@ kubectl get pods
 kubectl describe pod <pod-name> | grep Image
 ```
 
+The app is accessible at https://app.vc2.fnxlabs.com.  Remember you need Cato to access this.
+
 ---
 
 ## Quick Reference

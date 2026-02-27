@@ -41,8 +41,14 @@ use crate::token;
 // ---------------------------------------------------------------------------
 
 /// Build a `Set-Cookie` header value for the session JWT.
-fn build_session_cookie(jwt: &str, ttl_secs: i64, domain: Option<&str>, secure: bool) -> String {
-    let mut cookie = format!("session={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
+fn build_session_cookie(
+    name: &str,
+    jwt: &str,
+    ttl_secs: i64,
+    domain: Option<&str>,
+    secure: bool,
+) -> String {
+    let mut cookie = format!("{name}={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -52,9 +58,9 @@ fn build_session_cookie(jwt: &str, ttl_secs: i64, domain: Option<&str>, secure: 
     cookie
 }
 
-/// Build a `Set-Cookie` header that clears the `session` cookie.
-fn build_clear_session_cookie(domain: Option<&str>, secure: bool) -> String {
-    let mut cookie = "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
+/// Build a `Set-Cookie` header that clears the session cookie.
+fn build_clear_session_cookie(name: &str, domain: Option<&str>, secure: bool) -> String {
+    let mut cookie = format!("{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -239,6 +245,7 @@ pub async fn callback(
     };
 
     let session_cookie = build_session_cookie(
+        &state.cookie_name,
         &session_jwt,
         state.session_ttl_secs,
         state.cookie_domain.as_deref(),
@@ -280,7 +287,11 @@ pub async fn get_profile(AuthUser { email, name }: AuthUser) -> Json<APIResponse
 
 /// GET /logout -- clears the session cookie.
 pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError> {
-    let clear = build_clear_session_cookie(state.cookie_domain.as_deref(), state.cookie_secure);
+    let clear = build_clear_session_cookie(
+        &state.cookie_name,
+        state.cookie_domain.as_deref(),
+        state.cookie_secure,
+    );
     let mut response = StatusCode::OK.into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -458,5 +469,78 @@ mod tests {
             validate_return_to("  /meeting/1  ", AFTER_LOGIN, &allowed()),
             Some("/meeting/1".to_string())
         );
+    // --- build_session_cookie ---
+
+    #[test]
+    fn session_cookie_contains_name_and_jwt() {
+        let cookie = build_session_cookie("session", "my.jwt.token", 3600, None, false);
+        assert!(cookie.starts_with("session=my.jwt.token;"));
+    }
+
+    #[test]
+    fn session_cookie_custom_name() {
+        let cookie = build_session_cookie("pr1-session", "my.jwt.token", 3600, None, false);
+        assert!(cookie.starts_with("pr1-session=my.jwt.token;"));
+        // Must not accidentally also contain the old name.
+        assert!(!cookie.contains("session=my.jwt.token;") || cookie.starts_with("pr1-session="));
+    }
+
+    #[test]
+    fn session_cookie_includes_required_attributes() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=3600"));
+    }
+
+    #[test]
+    fn session_cookie_secure_flag_added_when_true() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, true);
+        assert!(cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn session_cookie_no_secure_flag_when_false() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(!cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn session_cookie_domain_appended() {
+        let cookie = build_session_cookie("session", "tok", 3600, Some(".sandbox.videocall.rs"), false);
+        assert!(cookie.contains("Domain=.sandbox.videocall.rs"));
+    }
+
+    #[test]
+    fn session_cookie_no_domain_when_none() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(!cookie.contains("Domain="));
+    }
+
+    // --- build_clear_session_cookie ---
+
+    #[test]
+    fn clear_cookie_uses_name() {
+        let cookie = build_clear_session_cookie("session", None, false);
+        assert!(cookie.starts_with("session=;"));
+    }
+
+    #[test]
+    fn clear_cookie_custom_name() {
+        let cookie = build_clear_session_cookie("pr1-session", None, false);
+        assert!(cookie.starts_with("pr1-session=;"));
+    }
+
+    #[test]
+    fn clear_cookie_sets_max_age_zero() {
+        let cookie = build_clear_session_cookie("session", None, false);
+        assert!(cookie.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn clear_cookie_domain_appended() {
+        let cookie = build_clear_session_cookie("session", Some(".videocall.rs"), false);
+        assert!(cookie.contains("Domain=.videocall.rs"));
     }
 }

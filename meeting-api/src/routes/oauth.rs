@@ -25,6 +25,7 @@ use axum::{
 };
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::Deserialize;
+use url::Url;
 
 use videocall_meeting_types::responses::{APIResponse, ProfileResponse};
 
@@ -104,11 +105,16 @@ pub async fn login(
     // Generate a nonce for OIDC ID token binding (reuse oauth2's crypto RNG).
     let nonce = CsrfToken::new_random();
 
-    // Sanitize return_to: only allow relative paths to prevent open redirect.
-    let return_to = query.return_to.as_deref().filter(|u| {
-        let u = u.trim();
-        u.starts_with('/') && !u.starts_with("//")
+    // Sanitize return_to: allow relative paths and absolute URLs whose origin
+    // is in the allowlist (after_login_url origin + ALLOWED_REDIRECT_URLS).
+    let return_to = query.return_to.as_deref().and_then(|u| {
+        validate_return_to(
+            u,
+            &oauth_cfg.after_login_url,
+            &oauth_cfg.allowed_redirect_urls,
+        )
     });
+    let return_to = return_to.as_deref();
 
     db_oauth::store_oauth_request(
         &state.db,
@@ -221,14 +227,20 @@ pub async fn callback(
         state.session_ttl_secs,
     )?;
 
-    let redirect_url = match oauth_req.return_to {
-        // return_to is a relative path (e.g. "/meeting/1") — prepend the
-        // frontend base URL so the redirect lands on the app, not the API.
-        Some(path) => format!(
-            "{}{}",
-            oauth_cfg.after_login_url.trim_end_matches('/'),
-            path
-        ),
+    let redirect_url = match &oauth_req.return_to {
+        Some(value) if value.starts_with("http://") || value.starts_with("https://") => {
+            // Absolute URL — re-validate as defense-in-depth.
+            validate_return_to(value, &oauth_cfg.after_login_url, &oauth_cfg.allowed_redirect_urls)
+                .unwrap_or_else(|| oauth_cfg.after_login_url.clone())
+        }
+        Some(path) => {
+            // Relative path (e.g. "/meeting/1") — prepend the frontend base URL.
+            format!(
+                "{}{}",
+                oauth_cfg.after_login_url.trim_end_matches('/'),
+                path
+            )
+        }
         None => oauth_cfg.after_login_url.clone(),
     };
 
@@ -293,9 +305,211 @@ pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError>
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Validate and sanitize a `returnTo` value.
+///
+/// Accepts:
+/// - Relative paths starting with `/` (but not `//`). Note: path-traversal
+///   sequences like `/../` are not stripped here because the browser resolves
+///   them before navigation and the redirect target is always an allowed origin.
+/// - Absolute `http(s)://` URLs whose origin matches `after_login_url` or
+///   any entry in `allowed_redirect_urls`.
+///
+/// Returns `Some(sanitized_value)` on success, `None` on rejection.
+fn validate_return_to(
+    raw: &str,
+    after_login_url: &str,
+    allowed_redirect_urls: &[String],
+) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Relative path: must start with "/" but not "//" (protocol-relative).
+    if trimmed.starts_with('/') {
+        if trimmed.starts_with("//") {
+            tracing::warn!(return_to = trimmed, "rejected protocol-relative returnTo");
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+
+    // Only allow http/https absolute URLs.
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        tracing::warn!(return_to = trimmed, "rejected returnTo with disallowed scheme");
+        return None;
+    }
+
+    let parsed = match Url::parse(trimmed) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(return_to = trimmed, error = %e, "rejected unparseable returnTo URL");
+            return None;
+        }
+    };
+    let candidate_origin = parsed.origin().unicode_serialization();
+
+    // Check against after_login_url origin.
+    if let Ok(base) = Url::parse(after_login_url) {
+        if base.origin().unicode_serialization() == candidate_origin {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // Check against the explicit allowlist.
+    for allowed in allowed_redirect_urls {
+        if let Ok(allowed_url) = Url::parse(allowed) {
+            if allowed_url.origin().unicode_serialization() == candidate_origin {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    tracing::warn!(
+        return_to = trimmed,
+        origin = candidate_origin,
+        "rejected returnTo: origin not in allowlist"
+    );
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const AFTER_LOGIN: &str = "http://localhost:80";
+    const ALLOWED: &[&str] = &["http://localhost:3001", "https://app.videocall.rs"];
+
+    fn allowed() -> Vec<String> {
+        ALLOWED.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn relative_path_accepted() {
+        assert_eq!(
+            validate_return_to("/meeting/123", AFTER_LOGIN, &allowed()),
+            Some("/meeting/123".to_string())
+        );
+    }
+
+    #[test]
+    fn relative_root_accepted() {
+        assert_eq!(
+            validate_return_to("/", AFTER_LOGIN, &allowed()),
+            Some("/".to_string())
+        );
+    }
+
+    #[test]
+    fn protocol_relative_rejected() {
+        assert_eq!(
+            validate_return_to("//evil.com/foo", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_url_matching_after_login_origin() {
+        assert_eq!(
+            validate_return_to("http://localhost:80/meeting/1", AFTER_LOGIN, &allowed()),
+            Some("http://localhost:80/meeting/1".to_string())
+        );
+    }
+
+    #[test]
+    fn absolute_url_matching_allowed_list() {
+        assert_eq!(
+            validate_return_to("http://localhost:3001/meeting/1", AFTER_LOGIN, &allowed()),
+            Some("http://localhost:3001/meeting/1".to_string())
+        );
+    }
+
+    #[test]
+    fn absolute_url_https_allowed() {
+        assert_eq!(
+            validate_return_to("https://app.videocall.rs/meeting/1", AFTER_LOGIN, &allowed()),
+            Some("https://app.videocall.rs/meeting/1".to_string())
+        );
+    }
+
+    #[test]
+    fn absolute_url_disallowed_origin() {
+        assert_eq!(
+            validate_return_to("http://evil.com/steal", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn javascript_scheme_rejected() {
+        assert_eq!(
+            validate_return_to("javascript:alert(1)", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_string_rejected() {
+        assert_eq!(validate_return_to("", AFTER_LOGIN, &allowed()), None);
+    }
+
+    #[test]
+    fn port_mismatch_rejected() {
+        assert_eq!(
+            validate_return_to("http://localhost:9999/foo", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn scheme_mismatch_rejected() {
+        // after_login_url is http, candidate is https on the same host.
+        assert_eq!(
+            validate_return_to("https://localhost:80/foo", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn data_scheme_rejected() {
+        assert_eq!(
+            validate_return_to("data:text/html,<h1>hi</h1>", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        assert_eq!(
+            validate_return_to("  /meeting/1  ", AFTER_LOGIN, &allowed()),
+            Some("/meeting/1".to_string())
+        );
+    }
+
+    #[test]
+    fn absolute_url_decoded_from_meeting_page() {
+        // Meeting pages send URL-encoded returnTo values. Axum's Query
+        // extractor decodes them before they reach validate_return_to,
+        // so the function sees the decoded form.
+        let decoded = "http://localhost:3001/meeting/my-room";
+        assert_eq!(
+            validate_return_to(decoded, AFTER_LOGIN, &allowed()),
+            Some(decoded.to_string())
+        );
+    }
+
+    #[test]
+    fn empty_allowed_list_still_checks_after_login() {
+        assert_eq!(
+            validate_return_to("http://localhost:80/meeting/1", AFTER_LOGIN, &[]),
+            Some("http://localhost:80/meeting/1".to_string())
+        );
+        // But a different origin is rejected.
+        assert_eq!(
+            validate_return_to("http://localhost:3001/meeting/1", AFTER_LOGIN, &[]),
+            None
+        );
+    }
 
     // --- build_session_cookie ---
 

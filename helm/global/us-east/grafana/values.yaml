@@ -58,6 +58,22 @@ grafana:
     auth.anonymous:
       enabled: false
   
+  # Dashboard providers — tells Grafana which directories to scan for JSON dashboard files.
+  # The 'default' path matches where the download-dashboards init container writes gnetId
+  # downloads, and where ConfigMap-based dashboards are mounted.
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: ""
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+
   # Datasources
   datasources:
     datasources.yaml:
@@ -74,6 +90,25 @@ grafana:
     default:
       videocall-health:
         file: dashboards/videocall-health.json
+      server-connections-analytics:
+        file: dashboards/server-connections-analytics.json
+      # Standard K8s monitoring dashboards (downloaded from grafana.com at startup)
+      node-exporter-full:
+        gnetId: 1860
+        revision: 37
+        datasource: Prometheus
+      kubernetes-cluster:
+        gnetId: 315
+        revision: 3
+        datasource: Prometheus
+      kubernetes-deployments:
+        gnetId: 8588
+        revision: 1
+        datasource: Prometheus
+      kubernetes-pod-resources:
+        gnetId: 6417
+        revision: 1
+        datasource: Prometheus
   
   # Security context
   securityContext:

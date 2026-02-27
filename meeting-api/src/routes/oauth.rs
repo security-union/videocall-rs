@@ -309,8 +309,8 @@ mod tests {
     fn session_cookie_custom_name() {
         let cookie = build_session_cookie("pr1-session", "my.jwt.token", 3600, None, false);
         assert!(cookie.starts_with("pr1-session=my.jwt.token;"));
-        // Must not accidentally also contain the old name.
-        assert!(!cookie.contains("session=my.jwt.token;") || cookie.starts_with("pr1-session="));
+        // Must not be mistakable for a plain "session=" cookie.
+        assert!(!cookie.starts_with("session="));
     }
 
     #[test]

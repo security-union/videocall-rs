@@ -59,4 +59,5 @@ message HeartbeatMetadata {
   bool video_enabled = 1;
   bool audio_enabled = 2;
   bool screen_enabled = 3;
+  string display_name = 4;
 }

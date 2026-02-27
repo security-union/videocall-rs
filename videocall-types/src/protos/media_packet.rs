@@ -46,10 +46,6 @@ pub struct MediaPacket {
     pub video_metadata: ::protobuf::MessageField<VideoMetadata>,
     // @@protoc_insertion_point(field:MediaPacket.heartbeat_metadata)
     pub heartbeat_metadata: ::protobuf::MessageField<HeartbeatMetadata>,
-    // @@protoc_insertion_point(field:MediaPacket.session_id)
-    pub session_id: ::std::string::String,
-    // @@protoc_insertion_point(field:MediaPacket.display_name)
-    pub display_name: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:MediaPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -67,7 +63,7 @@ impl MediaPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(11);
+        let mut fields = ::std::vec::Vec::with_capacity(9);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "media_type",
@@ -114,16 +110,6 @@ impl MediaPacket {
             |m: &MediaPacket| { &m.heartbeat_metadata },
             |m: &mut MediaPacket| { &mut m.heartbeat_metadata },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "session_id",
-            |m: &MediaPacket| { &m.session_id },
-            |m: &mut MediaPacket| { &mut m.session_id },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "display_name",
-            |m: &MediaPacket| { &m.display_name },
-            |m: &mut MediaPacket| { &mut m.display_name },
-        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MediaPacket>(
             "MediaPacket",
             fields,
@@ -169,12 +155,6 @@ impl ::protobuf::Message for MediaPacket {
                 74 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.heartbeat_metadata)?;
                 },
-                82 => {
-                    self.session_id = is.read_string()?;
-                },
-                90 => {
-                    self.display_name = is.read_string()?;
-                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -187,7 +167,7 @@ impl ::protobuf::Message for MediaPacket {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u64 {
         let mut my_size = 0;
-        if self.media_type != ::protobuf::EnumOrUnknown::new(media_packet::MediaType::MEDIA_TYPE_UNKNOWN) {
+        if self.media_type != ::protobuf::EnumOrUnknown::new(media_packet::MediaType::VIDEO) {
             my_size += ::protobuf::rt::int32_size(1, self.media_type.value());
         }
         if !self.email.is_empty() {
@@ -217,19 +197,13 @@ impl ::protobuf::Message for MediaPacket {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if !self.session_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(10, &self.session_id);
-        }
-        if !self.display_name.is_empty() {
-            my_size += ::protobuf::rt::string_size(11, &self.display_name);
-        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if self.media_type != ::protobuf::EnumOrUnknown::new(media_packet::MediaType::MEDIA_TYPE_UNKNOWN) {
+        if self.media_type != ::protobuf::EnumOrUnknown::new(media_packet::MediaType::VIDEO) {
             os.write_enum(1, ::protobuf::EnumOrUnknown::value(&self.media_type))?;
         }
         if !self.email.is_empty() {
@@ -256,12 +230,6 @@ impl ::protobuf::Message for MediaPacket {
         if let Some(v) = self.heartbeat_metadata.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(9, v, os)?;
         }
-        if !self.session_id.is_empty() {
-            os.write_string(10, &self.session_id)?;
-        }
-        if !self.display_name.is_empty() {
-            os.write_string(11, &self.display_name)?;
-        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -279,7 +247,7 @@ impl ::protobuf::Message for MediaPacket {
     }
 
     fn clear(&mut self) {
-        self.media_type = ::protobuf::EnumOrUnknown::new(media_packet::MediaType::MEDIA_TYPE_UNKNOWN);
+        self.media_type = ::protobuf::EnumOrUnknown::new(media_packet::MediaType::VIDEO);
         self.email.clear();
         self.data.clear();
         self.frame_type.clear();
@@ -288,8 +256,6 @@ impl ::protobuf::Message for MediaPacket {
         self.audio_metadata.clear();
         self.video_metadata.clear();
         self.heartbeat_metadata.clear();
-        self.session_id.clear();
-        self.display_name.clear();
         self.special_fields.clear();
     }
 
@@ -304,8 +270,6 @@ impl ::protobuf::Message for MediaPacket {
             audio_metadata: ::protobuf::MessageField::none(),
             video_metadata: ::protobuf::MessageField::none(),
             heartbeat_metadata: ::protobuf::MessageField::none(),
-            session_id: ::std::string::String::new(),
-            display_name: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -334,18 +298,16 @@ pub mod media_packet {
     #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
     // @@protoc_insertion_point(enum:MediaPacket.MediaType)
     pub enum MediaType {
-        // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.MEDIA_TYPE_UNKNOWN)
-        MEDIA_TYPE_UNKNOWN = 0,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.VIDEO)
-        VIDEO = 1,
+        VIDEO = 0,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.AUDIO)
-        AUDIO = 2,
+        AUDIO = 1,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.SCREEN)
-        SCREEN = 3,
+        SCREEN = 2,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.HEARTBEAT)
-        HEARTBEAT = 4,
+        HEARTBEAT = 3,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.RTT)
-        RTT = 5,
+        RTT = 4,
     }
 
     impl ::protobuf::Enum for MediaType {
@@ -357,19 +319,17 @@ pub mod media_packet {
 
         fn from_i32(value: i32) -> ::std::option::Option<MediaType> {
             match value {
-                0 => ::std::option::Option::Some(MediaType::MEDIA_TYPE_UNKNOWN),
-                1 => ::std::option::Option::Some(MediaType::VIDEO),
-                2 => ::std::option::Option::Some(MediaType::AUDIO),
-                3 => ::std::option::Option::Some(MediaType::SCREEN),
-                4 => ::std::option::Option::Some(MediaType::HEARTBEAT),
-                5 => ::std::option::Option::Some(MediaType::RTT),
+                0 => ::std::option::Option::Some(MediaType::VIDEO),
+                1 => ::std::option::Option::Some(MediaType::AUDIO),
+                2 => ::std::option::Option::Some(MediaType::SCREEN),
+                3 => ::std::option::Option::Some(MediaType::HEARTBEAT),
+                4 => ::std::option::Option::Some(MediaType::RTT),
                 _ => ::std::option::Option::None
             }
         }
 
         fn from_str(str: &str) -> ::std::option::Option<MediaType> {
             match str {
-                "MEDIA_TYPE_UNKNOWN" => ::std::option::Option::Some(MediaType::MEDIA_TYPE_UNKNOWN),
                 "VIDEO" => ::std::option::Option::Some(MediaType::VIDEO),
                 "AUDIO" => ::std::option::Option::Some(MediaType::AUDIO),
                 "SCREEN" => ::std::option::Option::Some(MediaType::SCREEN),
@@ -380,7 +340,6 @@ pub mod media_packet {
         }
 
         const VALUES: &'static [MediaType] = &[
-            MediaType::MEDIA_TYPE_UNKNOWN,
             MediaType::VIDEO,
             MediaType::AUDIO,
             MediaType::SCREEN,
@@ -403,7 +362,7 @@ pub mod media_packet {
 
     impl ::std::default::Default for MediaType {
         fn default() -> Self {
-            MediaType::MEDIA_TYPE_UNKNOWN
+            MediaType::VIDEO
         }
     }
 
@@ -614,8 +573,6 @@ pub struct VideoMetadata {
     // message fields
     // @@protoc_insertion_point(field:VideoMetadata.sequence)
     pub sequence: u64,
-    // @@protoc_insertion_point(field:VideoMetadata.codec)
-    pub codec: ::protobuf::EnumOrUnknown<VideoCodec>,
     // special fields
     // @@protoc_insertion_point(special_field:VideoMetadata.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -633,17 +590,12 @@ impl VideoMetadata {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut fields = ::std::vec::Vec::with_capacity(1);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "sequence",
             |m: &VideoMetadata| { &m.sequence },
             |m: &mut VideoMetadata| { &mut m.sequence },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "codec",
-            |m: &VideoMetadata| { &m.codec },
-            |m: &mut VideoMetadata| { &mut m.codec },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<VideoMetadata>(
             "VideoMetadata",
@@ -666,9 +618,6 @@ impl ::protobuf::Message for VideoMetadata {
                 8 => {
                     self.sequence = is.read_uint64()?;
                 },
-                16 => {
-                    self.codec = is.read_enum_or_unknown()?;
-                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -684,9 +633,6 @@ impl ::protobuf::Message for VideoMetadata {
         if self.sequence != 0 {
             my_size += ::protobuf::rt::uint64_size(1, self.sequence);
         }
-        if self.codec != ::protobuf::EnumOrUnknown::new(VideoCodec::VIDEO_CODEC_UNSPECIFIED) {
-            my_size += ::protobuf::rt::int32_size(2, self.codec.value());
-        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -695,9 +641,6 @@ impl ::protobuf::Message for VideoMetadata {
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
         if self.sequence != 0 {
             os.write_uint64(1, self.sequence)?;
-        }
-        if self.codec != ::protobuf::EnumOrUnknown::new(VideoCodec::VIDEO_CODEC_UNSPECIFIED) {
-            os.write_enum(2, ::protobuf::EnumOrUnknown::value(&self.codec))?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -717,14 +660,12 @@ impl ::protobuf::Message for VideoMetadata {
 
     fn clear(&mut self) {
         self.sequence = 0;
-        self.codec = ::protobuf::EnumOrUnknown::new(VideoCodec::VIDEO_CODEC_UNSPECIFIED);
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static VideoMetadata {
         static instance: VideoMetadata = VideoMetadata {
             sequence: 0,
-            codec: ::protobuf::EnumOrUnknown::from_i32(0),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -758,6 +699,8 @@ pub struct HeartbeatMetadata {
     pub audio_enabled: bool,
     // @@protoc_insertion_point(field:HeartbeatMetadata.screen_enabled)
     pub screen_enabled: bool,
+    // @@protoc_insertion_point(field:HeartbeatMetadata.display_name)
+    pub display_name: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:HeartbeatMetadata.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -775,7 +718,7 @@ impl HeartbeatMetadata {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut fields = ::std::vec::Vec::with_capacity(4);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "video_enabled",
@@ -791,6 +734,11 @@ impl HeartbeatMetadata {
             "screen_enabled",
             |m: &HeartbeatMetadata| { &m.screen_enabled },
             |m: &mut HeartbeatMetadata| { &mut m.screen_enabled },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "display_name",
+            |m: &HeartbeatMetadata| { &m.display_name },
+            |m: &mut HeartbeatMetadata| { &mut m.display_name },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HeartbeatMetadata>(
             "HeartbeatMetadata",
@@ -819,6 +767,9 @@ impl ::protobuf::Message for HeartbeatMetadata {
                 24 => {
                     self.screen_enabled = is.read_bool()?;
                 },
+                34 => {
+                    self.display_name = is.read_string()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -840,6 +791,9 @@ impl ::protobuf::Message for HeartbeatMetadata {
         if self.screen_enabled != false {
             my_size += 1 + 1;
         }
+        if !self.display_name.is_empty() {
+            my_size += ::protobuf::rt::string_size(4, &self.display_name);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -854,6 +808,9 @@ impl ::protobuf::Message for HeartbeatMetadata {
         }
         if self.screen_enabled != false {
             os.write_bool(3, self.screen_enabled)?;
+        }
+        if !self.display_name.is_empty() {
+            os.write_string(4, &self.display_name)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -875,6 +832,7 @@ impl ::protobuf::Message for HeartbeatMetadata {
         self.video_enabled = false;
         self.audio_enabled = false;
         self.screen_enabled = false;
+        self.display_name.clear();
         self.special_fields.clear();
     }
 
@@ -883,6 +841,7 @@ impl ::protobuf::Message for HeartbeatMetadata {
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
+            display_name: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -906,77 +865,8 @@ impl ::protobuf::reflect::ProtobufValue for HeartbeatMetadata {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
-///  Video codec enum with profile/level details for scalability.
-///  Format follows WebCodecs codec string conventions where applicable.
-#[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
-// @@protoc_insertion_point(enum:VideoCodec)
-pub enum VideoCodec {
-    // @@protoc_insertion_point(enum_value:VideoCodec.VIDEO_CODEC_UNSPECIFIED)
-    VIDEO_CODEC_UNSPECIFIED = 0,
-    // @@protoc_insertion_point(enum_value:VideoCodec.VP8)
-    VP8 = 1,
-    // @@protoc_insertion_point(enum_value:VideoCodec.VP9_PROFILE0_LEVEL10_8BIT)
-    VP9_PROFILE0_LEVEL10_8BIT = 2,
-}
-
-impl ::protobuf::Enum for VideoCodec {
-    const NAME: &'static str = "VideoCodec";
-
-    fn value(&self) -> i32 {
-        *self as i32
-    }
-
-    fn from_i32(value: i32) -> ::std::option::Option<VideoCodec> {
-        match value {
-            0 => ::std::option::Option::Some(VideoCodec::VIDEO_CODEC_UNSPECIFIED),
-            1 => ::std::option::Option::Some(VideoCodec::VP8),
-            2 => ::std::option::Option::Some(VideoCodec::VP9_PROFILE0_LEVEL10_8BIT),
-            _ => ::std::option::Option::None
-        }
-    }
-
-    fn from_str(str: &str) -> ::std::option::Option<VideoCodec> {
-        match str {
-            "VIDEO_CODEC_UNSPECIFIED" => ::std::option::Option::Some(VideoCodec::VIDEO_CODEC_UNSPECIFIED),
-            "VP8" => ::std::option::Option::Some(VideoCodec::VP8),
-            "VP9_PROFILE0_LEVEL10_8BIT" => ::std::option::Option::Some(VideoCodec::VP9_PROFILE0_LEVEL10_8BIT),
-            _ => ::std::option::Option::None
-        }
-    }
-
-    const VALUES: &'static [VideoCodec] = &[
-        VideoCodec::VIDEO_CODEC_UNSPECIFIED,
-        VideoCodec::VP8,
-        VideoCodec::VP9_PROFILE0_LEVEL10_8BIT,
-    ];
-}
-
-impl ::protobuf::EnumFull for VideoCodec {
-    fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
-        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
-        descriptor.get(|| file_descriptor().enum_by_package_relative_name("VideoCodec").unwrap()).clone()
-    }
-
-    fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
-        let index = *self as usize;
-        Self::enum_descriptor().value_by_index(index)
-    }
-}
-
-impl ::std::default::Default for VideoCodec {
-    fn default() -> Self {
-        VideoCodec::VIDEO_CODEC_UNSPECIFIED
-    }
-}
-
-impl VideoCodec {
-    fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
-        ::protobuf::reflect::GeneratedEnumDescriptorData::new::<VideoCodec>("VideoCodec")
-    }
-}
-
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x18types/media_packet.proto\"\xd7\x03\n\x0bMediaPacket\x125\n\nmedia_\
+    \n\x18types/media_packet.proto\"\xbf\x03\n\x0bMediaPacket\x125\n\nmedia_\
     type\x18\x01\x20\x01(\x0e2\x16.MediaPacket.MediaTypeR\tmediaType\x12\x14\
     \n\x05email\x18\x02\x20\x01(\tR\x05email\x12\x12\n\x04data\x18\x03\x20\
     \x01(\x0cR\x04data\x12\x1d\n\nframe_type\x18\x04\x20\x01(\tR\tframeType\
@@ -985,107 +875,85 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x20\x01(\x0b2\x0e.AudioMetadataR\raudioMetadata\x125\n\x0evideo_metadat\
     a\x18\x08\x20\x01(\x0b2\x0e.VideoMetadataR\rvideoMetadata\x12A\n\x12hear\
     tbeat_metadata\x18\t\x20\x01(\x0b2\x12.HeartbeatMetadataR\x11heartbeatMe\
-    tadata\"]\n\tMediaType\x12\x16\n\x12MEDIA_TYPE_UNKNOWN\x10\0\x12\t\n\x05\
-    VIDEO\x10\x01\x12\t\n\x05AUDIO\x10\x02\x12\n\n\x06SCREEN\x10\x03\x12\r\n\
-    \tHEARTBEAT\x10\x04\x12\x07\n\x03RTT\x10\x05\"\xe8\x01\n\rAudioMetadata\
-    \x12!\n\x0caudio_format\x18\x01\x20\x01(\tR\x0baudioFormat\x127\n\x18aud\
-    io_number_of_channels\x18\x02\x20\x01(\rR\x15audioNumberOfChannels\x123\
-    \n\x16audio_number_of_frames\x18\x03\x20\x01(\rR\x13audioNumberOfFrames\
-    \x12*\n\x11audio_sample_rate\x18\x04\x20\x01(\x02R\x0faudioSampleRate\
-    \x12\x1a\n\x08sequence\x18\x05\x20\x01(\x04R\x08sequence\"N\n\rVideoMeta\
-    data\x12\x1a\n\x08sequence\x18\x01\x20\x01(\x04R\x08sequence\x12!\n\x05c\
-    odec\x18\x02\x20\x01(\x0e2\x0b.VideoCodecR\x05codec\"\x84\x01\n\x11Heart\
-    beatMetadata\x12#\n\rvideo_enabled\x18\x01\x20\x01(\x08R\x0cvideoEnabled\
-    \x12#\n\raudio_enabled\x18\x02\x20\x01(\x08R\x0caudioEnabled\x12%\n\x0es\
-    creen_enabled\x18\x03\x20\x01(\x08R\rscreenEnabled*Q\n\nVideoCodec\x12\
-    \x1b\n\x17VIDEO_CODEC_UNSPECIFIED\x10\0\x12\x07\n\x03VP8\x10\x01\x12\x1d\
-    \n\x19VP9_PROFILE0_LEVEL10_8BIT\x10\x02J\xae\x0f\n\x06\x12\x04\0\0;\x01\
-    \n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x14\x01\n\
-    \n\n\x03\x04\0\x01\x12\x03\x02\x08\x13\n\x0c\n\x04\x04\0\x04\0\x12\x04\
-    \x03\x02\n\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x03\x07\x10\n\r\n\x06\
-    \x04\0\x04\0\x02\0\x12\x03\x04\x04\x1b\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\
-    \x12\x03\x04\x04\x16\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x04\x19\
-    \x1a\n\r\n\x06\x04\0\x04\0\x02\x01\x12\x03\x05\x04\x0e\n\x0e\n\x07\x04\0\
-    \x04\0\x02\x01\x01\x12\x03\x05\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\
-    \x12\x03\x05\x0c\r\n\r\n\x06\x04\0\x04\0\x02\x02\x12\x03\x06\x04\x0e\n\
-    \x0e\n\x07\x04\0\x04\0\x02\x02\x01\x12\x03\x06\x04\t\n\x0e\n\x07\x04\0\
-    \x04\0\x02\x02\x02\x12\x03\x06\x0c\r\n\r\n\x06\x04\0\x04\0\x02\x03\x12\
-    \x03\x07\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\x12\x03\x07\x04\n\n\
-    \x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\x03\x07\r\x0e\n\r\n\x06\x04\0\x04\
-    \0\x02\x04\x12\x03\x08\x04\x12\n\x0e\n\x07\x04\0\x04\0\x02\x04\x01\x12\
-    \x03\x08\x04\r\n\x0e\n\x07\x04\0\x04\0\x02\x04\x02\x12\x03\x08\x10\x11\n\
-    %\n\x06\x04\0\x04\0\x02\x05\x12\x03\t\x04\x0c\"\x16\x20Client\x20to\x20S\
-    erver\x20RTT\n\n\x0e\n\x07\x04\0\x04\0\x02\x05\x01\x12\x03\t\x04\x07\n\
-    \x0e\n\x07\x04\0\x04\0\x02\x05\x02\x12\x03\t\n\x0b\n\x0b\n\x04\x04\0\x02\
-    \0\x12\x03\x0b\x02\x1b\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03\x0b\x02\x0b\n\
-    \x0c\n\x05\x04\0\x02\0\x01\x12\x03\x0b\x0c\x16\n\x0c\n\x05\x04\0\x02\0\
-    \x03\x12\x03\x0b\x19\x1a\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x0c\x02\x13\n\
-    \x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x0c\x02\x08\n\x0c\n\x05\x04\0\x02\
-    \x01\x01\x12\x03\x0c\t\x0e\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x0c\x11\
-    \x12\n\x0b\n\x04\x04\0\x02\x02\x12\x03\r\x02\x11\n\x0c\n\x05\x04\0\x02\
-    \x02\x05\x12\x03\r\x02\x07\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\r\x08\
-    \x0c\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\r\x0f\x10\n\x0b\n\x04\x04\0\
-    \x02\x03\x12\x03\x0e\x02\x18\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x0e\
-    \x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x0e\t\x13\n\x0c\n\x05\x04\
-    \0\x02\x03\x03\x12\x03\x0e\x16\x17\n\x0b\n\x04\x04\0\x02\x04\x12\x03\x0f\
-    \x02\x17\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\x0f\x02\x08\n\x0c\n\x05\
-    \x04\0\x02\x04\x01\x12\x03\x0f\t\x12\n\x0c\n\x05\x04\0\x02\x04\x03\x12\
-    \x03\x0f\x15\x16\n\x0b\n\x04\x04\0\x02\x05\x12\x03\x10\x02\x16\n\x0c\n\
-    \x05\x04\0\x02\x05\x05\x12\x03\x10\x02\x08\n\x0c\n\x05\x04\0\x02\x05\x01\
-    \x12\x03\x10\t\x11\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\x10\x14\x15\n\
-    \x0b\n\x04\x04\0\x02\x06\x12\x03\x11\x02#\n\x0c\n\x05\x04\0\x02\x06\x06\
-    \x12\x03\x11\x02\x0f\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x11\x10\x1e\n\
-    \x0c\n\x05\x04\0\x02\x06\x03\x12\x03\x11!\"\n\x0b\n\x04\x04\0\x02\x07\
-    \x12\x03\x12\x02#\n\x0c\n\x05\x04\0\x02\x07\x06\x12\x03\x12\x02\x0f\n\
-    \x0c\n\x05\x04\0\x02\x07\x01\x12\x03\x12\x10\x1e\n\x0c\n\x05\x04\0\x02\
-    \x07\x03\x12\x03\x12!\"\n\x0b\n\x04\x04\0\x02\x08\x12\x03\x13\x02+\n\x0c\
-    \n\x05\x04\0\x02\x08\x06\x12\x03\x13\x02\x13\n\x0c\n\x05\x04\0\x02\x08\
-    \x01\x12\x03\x13\x14&\n\x0c\n\x05\x04\0\x02\x08\x03\x12\x03\x13)*\n\n\n\
-    \x02\x04\x01\x12\x04\x16\0\x1c\x01\n\n\n\x03\x04\x01\x01\x12\x03\x16\x08\
-    \x15\n\x0b\n\x04\x04\x01\x02\0\x12\x03\x17\x02\x1a\n\x0c\n\x05\x04\x01\
-    \x02\0\x05\x12\x03\x17\x02\x08\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03\x17\
-    \t\x15\n\x0c\n\x05\x04\x01\x02\0\x03\x12\x03\x17\x18\x19\n\x0b\n\x04\x04\
-    \x01\x02\x01\x12\x03\x18\x02&\n\x0c\n\x05\x04\x01\x02\x01\x05\x12\x03\
-    \x18\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\x01\x12\x03\x18\t!\n\x0c\n\x05\
-    \x04\x01\x02\x01\x03\x12\x03\x18$%\n\x0b\n\x04\x04\x01\x02\x02\x12\x03\
-    \x19\x02$\n\x0c\n\x05\x04\x01\x02\x02\x05\x12\x03\x19\x02\x08\n\x0c\n\
-    \x05\x04\x01\x02\x02\x01\x12\x03\x19\t\x1f\n\x0c\n\x05\x04\x01\x02\x02\
-    \x03\x12\x03\x19\"#\n\x0b\n\x04\x04\x01\x02\x03\x12\x03\x1a\x02\x1e\n\
-    \x0c\n\x05\x04\x01\x02\x03\x05\x12\x03\x1a\x02\x07\n\x0c\n\x05\x04\x01\
-    \x02\x03\x01\x12\x03\x1a\x08\x19\n\x0c\n\x05\x04\x01\x02\x03\x03\x12\x03\
-    \x1a\x1c\x1d\n\x0b\n\x04\x04\x01\x02\x04\x12\x03\x1b\x02\x16\n\x0c\n\x05\
-    \x04\x01\x02\x04\x05\x12\x03\x1b\x02\x08\n\x0c\n\x05\x04\x01\x02\x04\x01\
-    \x12\x03\x1b\t\x11\n\x0c\n\x05\x04\x01\x02\x04\x03\x12\x03\x1b\x14\x15\n\
-    \n\n\x02\x04\x02\x12\x04\x1e\0!\x01\n\n\n\x03\x04\x02\x01\x12\x03\x1e\
-    \x08\x15\n\x0b\n\x04\x04\x02\x02\0\x12\x03\x1f\x02\x16\n\x0c\n\x05\x04\
-    \x02\x02\0\x05\x12\x03\x1f\x02\x08\n\x0c\n\x05\x04\x02\x02\0\x01\x12\x03\
-    \x1f\t\x11\n\x0c\n\x05\x04\x02\x02\0\x03\x12\x03\x1f\x14\x15\n\x0b\n\x04\
-    \x04\x02\x02\x01\x12\x03\x20\x02\x17\n\x0c\n\x05\x04\x02\x02\x01\x06\x12\
-    \x03\x20\x02\x0c\n\x0c\n\x05\x04\x02\x02\x01\x01\x12\x03\x20\r\x12\n\x0c\
-    \n\x05\x04\x02\x02\x01\x03\x12\x03\x20\x15\x16\n\x90\x01\n\x02\x05\0\x12\
-    \x04%\05\x01\x1a\x83\x01\x20Video\x20codec\x20enum\x20with\x20profile/le\
-    vel\x20details\x20for\x20scalability.\n\x20Format\x20follows\x20WebCodec\
-    s\x20codec\x20string\x20conventions\x20where\x20applicable.\n\n\n\n\x03\
-    \x05\0\x01\x12\x03%\x05\x0f\n=\n\x04\x05\0\x02\0\x12\x03&\x02\x1e\"0\x20\
-    Default\x20-\x20skip\x20decoding\x20if\x20codec\x20not\x20specified\n\n\
-    \x0c\n\x05\x05\0\x02\0\x01\x12\x03&\x02\x19\n\x0c\n\x05\x05\0\x02\0\x02\
-    \x12\x03&\x1c\x1d\n.\n\x04\x05\0\x02\x01\x12\x03)\x02\n\x1a!\x20VP8\x20-\
-    \x20no\x20profile/level\x20variants\n\n\x0c\n\x05\x05\0\x02\x01\x01\x12\
-    \x03)\x02\x05\n\x0c\n\x05\x05\0\x02\x01\x02\x12\x03)\x08\t\nu\n\x04\x05\
-    \0\x02\x02\x12\x03,\x02\x20\x1a9\x20VP9\x20profiles:\x20vp09.PP.LL.DD\
-    \x20(Profile,\x20Level,\x20bit\x20Depth)\n\"-\x20vp09.00.10.08\x20-\x20P\
-    rofile\x200,\x20Level\x201.0,\x208-bit\n\n\x0c\n\x05\x05\0\x02\x02\x01\
-    \x12\x03,\x02\x1b\n\x0c\n\x05\x05\0\x02\x02\x02\x12\x03,\x1e\x1f\n\n\n\
-    \x02\x04\x03\x12\x047\0;\x01\n\n\n\x03\x04\x03\x01\x12\x037\x08\x19\n\
-    \x0b\n\x04\x04\x03\x02\0\x12\x038\x02\x19\n\x0c\n\x05\x04\x03\x02\0\x05\
-    \x12\x038\x02\x06\n\x0c\n\x05\x04\x03\x02\0\x01\x12\x038\x07\x14\n\x0c\n\
-    \x05\x04\x03\x02\0\x03\x12\x038\x17\x18\n\x0b\n\x04\x04\x03\x02\x01\x12\
-    \x039\x02\x19\n\x0c\n\x05\x04\x03\x02\x01\x05\x12\x039\x02\x06\n\x0c\n\
-    \x05\x04\x03\x02\x01\x01\x12\x039\x07\x14\n\x0c\n\x05\x04\x03\x02\x01\
-    \x03\x12\x039\x17\x18\n\x0b\n\x04\x04\x03\x02\x02\x12\x03:\x02\x1a\n\x0c\
-    \n\x05\x04\x03\x02\x02\x05\x12\x03:\x02\x06\n\x0c\n\x05\x04\x03\x02\x02\
-    \x01\x12\x03:\x07\x15\n\x0c\n\x05\x04\x03\x02\x02\x03\x12\x03:\x18\x19b\
-    \x06proto3\
+    tadata\"E\n\tMediaType\x12\t\n\x05VIDEO\x10\0\x12\t\n\x05AUDIO\x10\x01\
+    \x12\n\n\x06SCREEN\x10\x02\x12\r\n\tHEARTBEAT\x10\x03\x12\x07\n\x03RTT\
+    \x10\x04\"\xe8\x01\n\rAudioMetadata\x12!\n\x0caudio_format\x18\x01\x20\
+    \x01(\tR\x0baudioFormat\x127\n\x18audio_number_of_channels\x18\x02\x20\
+    \x01(\rR\x15audioNumberOfChannels\x123\n\x16audio_number_of_frames\x18\
+    \x03\x20\x01(\rR\x13audioNumberOfFrames\x12*\n\x11audio_sample_rate\x18\
+    \x04\x20\x01(\x02R\x0faudioSampleRate\x12\x1a\n\x08sequence\x18\x05\x20\
+    \x01(\x04R\x08sequence\"+\n\rVideoMetadata\x12\x1a\n\x08sequence\x18\x01\
+    \x20\x01(\x04R\x08sequence\"\x84\x01\n\x11HeartbeatMetadata\x12#\n\rvide\
+    o_enabled\x18\x01\x20\x01(\x08R\x0cvideoEnabled\x12#\n\raudio_enabled\
+    \x18\x02\x20\x01(\x08R\x0caudioEnabled\x12%\n\x0escreen_enabled\x18\x03\
+    \x20\x01(\x08R\rscreenEnabledJ\xef\n\n\x06\x12\x04\0\0%\x01\n\x08\n\x01\
+    \x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x13\x01\n\n\n\x03\x04\
+    \0\x01\x12\x03\x02\x08\x13\n\x0c\n\x04\x04\0\x04\0\x12\x04\x03\x02\t\x03\
+    \n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x03\x07\x10\n\r\n\x06\x04\0\x04\0\
+    \x02\0\x12\x03\x04\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x04\
+    \x04\t\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x04\x0c\r\n\r\n\x06\x04\
+    \0\x04\0\x02\x01\x12\x03\x05\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\x01\x01\
+    \x12\x03\x05\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\x05\x0c\r\
+    \n\r\n\x06\x04\0\x04\0\x02\x02\x12\x03\x06\x04\x0f\n\x0e\n\x07\x04\0\x04\
+    \0\x02\x02\x01\x12\x03\x06\x04\n\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\
+    \x03\x06\r\x0e\n\r\n\x06\x04\0\x04\0\x02\x03\x12\x03\x07\x04\x12\n\x0e\n\
+    \x07\x04\0\x04\0\x02\x03\x01\x12\x03\x07\x04\r\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x03\x02\x12\x03\x07\x10\x11\n%\n\x06\x04\0\x04\0\x02\x04\x12\x03\
+    \x08\x04\x0c\"\x16\x20Client\x20to\x20Server\x20RTT\n\n\x0e\n\x07\x04\0\
+    \x04\0\x02\x04\x01\x12\x03\x08\x04\x07\n\x0e\n\x07\x04\0\x04\0\x02\x04\
+    \x02\x12\x03\x08\n\x0b\n\x0b\n\x04\x04\0\x02\0\x12\x03\n\x02\x1b\n\x0c\n\
+    \x05\x04\0\x02\0\x06\x12\x03\n\x02\x0b\n\x0c\n\x05\x04\0\x02\0\x01\x12\
+    \x03\n\x0c\x16\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\n\x19\x1a\n\x0b\n\x04\
+    \x04\0\x02\x01\x12\x03\x0b\x02\x13\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\
+    \x0b\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x0b\t\x0e\n\x0c\n\x05\
+    \x04\0\x02\x01\x03\x12\x03\x0b\x11\x12\n\x0b\n\x04\x04\0\x02\x02\x12\x03\
+    \x0c\x02\x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x0c\x02\x07\n\x0c\n\
+    \x05\x04\0\x02\x02\x01\x12\x03\x0c\x08\x0c\n\x0c\n\x05\x04\0\x02\x02\x03\
+    \x12\x03\x0c\x0f\x10\n\x0b\n\x04\x04\0\x02\x03\x12\x03\r\x02\x18\n\x0c\n\
+    \x05\x04\0\x02\x03\x05\x12\x03\r\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\
+    \x12\x03\r\t\x13\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\r\x16\x17\n\x0b\n\
+    \x04\x04\0\x02\x04\x12\x03\x0e\x02\x17\n\x0c\n\x05\x04\0\x02\x04\x05\x12\
+    \x03\x0e\x02\x08\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\x0e\t\x12\n\x0c\n\
+    \x05\x04\0\x02\x04\x03\x12\x03\x0e\x15\x16\n\x0b\n\x04\x04\0\x02\x05\x12\
+    \x03\x0f\x02\x16\n\x0c\n\x05\x04\0\x02\x05\x05\x12\x03\x0f\x02\x08\n\x0c\
+    \n\x05\x04\0\x02\x05\x01\x12\x03\x0f\t\x11\n\x0c\n\x05\x04\0\x02\x05\x03\
+    \x12\x03\x0f\x14\x15\n\x0b\n\x04\x04\0\x02\x06\x12\x03\x10\x02#\n\x0c\n\
+    \x05\x04\0\x02\x06\x06\x12\x03\x10\x02\x0f\n\x0c\n\x05\x04\0\x02\x06\x01\
+    \x12\x03\x10\x10\x1e\n\x0c\n\x05\x04\0\x02\x06\x03\x12\x03\x10!\"\n\x0b\
+    \n\x04\x04\0\x02\x07\x12\x03\x11\x02#\n\x0c\n\x05\x04\0\x02\x07\x06\x12\
+    \x03\x11\x02\x0f\n\x0c\n\x05\x04\0\x02\x07\x01\x12\x03\x11\x10\x1e\n\x0c\
+    \n\x05\x04\0\x02\x07\x03\x12\x03\x11!\"\n\x0b\n\x04\x04\0\x02\x08\x12\
+    \x03\x12\x02+\n\x0c\n\x05\x04\0\x02\x08\x06\x12\x03\x12\x02\x13\n\x0c\n\
+    \x05\x04\0\x02\x08\x01\x12\x03\x12\x14&\n\x0c\n\x05\x04\0\x02\x08\x03\
+    \x12\x03\x12)*\n\n\n\x02\x04\x01\x12\x04\x15\0\x1b\x01\n\n\n\x03\x04\x01\
+    \x01\x12\x03\x15\x08\x15\n\x0b\n\x04\x04\x01\x02\0\x12\x03\x16\x02\x1a\n\
+    \x0c\n\x05\x04\x01\x02\0\x05\x12\x03\x16\x02\x08\n\x0c\n\x05\x04\x01\x02\
+    \0\x01\x12\x03\x16\t\x15\n\x0c\n\x05\x04\x01\x02\0\x03\x12\x03\x16\x18\
+    \x19\n\x0b\n\x04\x04\x01\x02\x01\x12\x03\x17\x02&\n\x0c\n\x05\x04\x01\
+    \x02\x01\x05\x12\x03\x17\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\x01\x12\x03\
+    \x17\t!\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03\x17$%\n\x0b\n\x04\x04\
+    \x01\x02\x02\x12\x03\x18\x02$\n\x0c\n\x05\x04\x01\x02\x02\x05\x12\x03\
+    \x18\x02\x08\n\x0c\n\x05\x04\x01\x02\x02\x01\x12\x03\x18\t\x1f\n\x0c\n\
+    \x05\x04\x01\x02\x02\x03\x12\x03\x18\"#\n\x0b\n\x04\x04\x01\x02\x03\x12\
+    \x03\x19\x02\x1e\n\x0c\n\x05\x04\x01\x02\x03\x05\x12\x03\x19\x02\x07\n\
+    \x0c\n\x05\x04\x01\x02\x03\x01\x12\x03\x19\x08\x19\n\x0c\n\x05\x04\x01\
+    \x02\x03\x03\x12\x03\x19\x1c\x1d\n\x0b\n\x04\x04\x01\x02\x04\x12\x03\x1a\
+    \x02\x16\n\x0c\n\x05\x04\x01\x02\x04\x05\x12\x03\x1a\x02\x08\n\x0c\n\x05\
+    \x04\x01\x02\x04\x01\x12\x03\x1a\t\x11\n\x0c\n\x05\x04\x01\x02\x04\x03\
+    \x12\x03\x1a\x14\x15\n\n\n\x02\x04\x02\x12\x04\x1d\0\x1f\x01\n\n\n\x03\
+    \x04\x02\x01\x12\x03\x1d\x08\x15\n\x0b\n\x04\x04\x02\x02\0\x12\x03\x1e\
+    \x02\x16\n\x0c\n\x05\x04\x02\x02\0\x05\x12\x03\x1e\x02\x08\n\x0c\n\x05\
+    \x04\x02\x02\0\x01\x12\x03\x1e\t\x11\n\x0c\n\x05\x04\x02\x02\0\x03\x12\
+    \x03\x1e\x14\x15\n\n\n\x02\x04\x03\x12\x04!\0%\x01\n\n\n\x03\x04\x03\x01\
+    \x12\x03!\x08\x19\n\x0b\n\x04\x04\x03\x02\0\x12\x03\"\x02\x19\n\x0c\n\
+    \x05\x04\x03\x02\0\x05\x12\x03\"\x02\x06\n\x0c\n\x05\x04\x03\x02\0\x01\
+    \x12\x03\"\x07\x14\n\x0c\n\x05\x04\x03\x02\0\x03\x12\x03\"\x17\x18\n\x0b\
+    \n\x04\x04\x03\x02\x01\x12\x03#\x02\x19\n\x0c\n\x05\x04\x03\x02\x01\x05\
+    \x12\x03#\x02\x06\n\x0c\n\x05\x04\x03\x02\x01\x01\x12\x03#\x07\x14\n\x0c\
+    \n\x05\x04\x03\x02\x01\x03\x12\x03#\x17\x18\n\x0b\n\x04\x04\x03\x02\x02\
+    \x12\x03$\x02\x1a\n\x0c\n\x05\x04\x03\x02\x02\x05\x12\x03$\x02\x06\n\x0c\
+    \n\x05\x04\x03\x02\x02\x01\x12\x03$\x07\x15\n\x0c\n\x05\x04\x03\x02\x02\
+    \x03\x12\x03$\x18\x19b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -1108,8 +976,7 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(AudioMetadata::generated_message_descriptor_data());
             messages.push(VideoMetadata::generated_message_descriptor_data());
             messages.push(HeartbeatMetadata::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(2);
-            enums.push(VideoCodec::generated_enum_descriptor_data());
+            let mut enums = ::std::vec::Vec::with_capacity(1);
             enums.push(media_packet::MediaType::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),

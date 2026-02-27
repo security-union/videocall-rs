@@ -464,6 +464,9 @@ impl VideoCallClient {
                 if let Some(cb) = &opts.on_peer_removed {
                     peer_decode_manager.on_peer_removed = cb.clone();
                 }
+                if let Some(cb) = &opts.on_peer_display_name_changed {
+                    peer_decode_manager.on_peer_display_name_changed = cb.clone();
+                }
                 peer_decode_manager
             }
             None => {
@@ -473,6 +476,9 @@ impl VideoCallClient {
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
                 if let Some(cb) = &opts.on_peer_removed {
                     peer_decode_manager.on_peer_removed = cb.clone();
+                }
+                if let Some(cb) = &opts.on_peer_display_name_changed {
+                    peer_decode_manager.on_peer_display_name_changed = cb.clone();
                 }
                 peer_decode_manager
             }
@@ -553,6 +559,16 @@ impl VideoCallClient {
             }
         }
         false
+    }
+
+    /// Returns the display name of a remote peer, or an empty string if unknown.
+    pub fn get_peer_display_name(&self, key: &String) -> String {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(key) {
+                return peer.display_name.clone();
+            }
+        }
+        String::new()
     }
 
     pub fn is_video_enabled_for_peer(&self, key: &String) -> bool {
@@ -881,14 +897,6 @@ impl VideoCallClient {
         }
 
         String::new()
-    }
-
-    /// Get the display name of a peer by their session ID
-    pub fn get_peer_display_name(&self, session_id: &str) -> Option<String> {
-        if let Ok(inner) = self.inner.try_borrow() {
-            return inner.peer_decode_manager.get_peer_display_name(session_id);
-        }
-        None
     }
 }
 

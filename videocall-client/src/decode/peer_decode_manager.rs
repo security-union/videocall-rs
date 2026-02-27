@@ -279,6 +279,10 @@ impl Peer {
             MediaType::HEARTBEAT => {
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
+                    // Update display name from heartbeat if non-empty
+                    if !metadata.display_name.is_empty() {
+                        self.display_name = metadata.display_name.clone();
+                    }
                     // Check if video is being turned off (on -> off transition)
                     let video_turned_off = self.video_enabled && !metadata.video_enabled;
                     // Check if audio is being turned off (on -> off transition)
@@ -419,6 +423,8 @@ pub struct PeerDecodeManager {
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Rc<DiagnosticManager>>,
     pub on_peer_removed: Callback<String>,
+    /// Called as `callback(peer_userid, new_display_name)` when a peer's display name changes
+    pub on_peer_display_name_changed: Callback<(String, String)>,
 }
 
 impl Default for PeerDecodeManager {
@@ -436,6 +442,7 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
             on_peer_removed: Callback::noop(),
+            on_peer_display_name_changed: Callback::noop(),
         }
     }
 
@@ -447,6 +454,7 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: Some(diagnostics),
             on_peer_removed: Callback::noop(),
+            on_peer_display_name_changed: Callback::noop(),
         }
     }
 
@@ -510,9 +518,15 @@ impl PeerDecodeManager {
                     .set_stream_context(userid.to_string(), session_id.clone());
                 peer.context_initialized = true;
             }
+
+            let old_display_name = peer.display_name.clone();
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
                     peer.on_heartbeat();
+                    if !peer.display_name.is_empty() && peer.display_name != old_display_name {
+                        self.on_peer_display_name_changed
+                            .emit((email.clone(), peer.display_name.clone()));
+                    }
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {

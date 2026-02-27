@@ -660,14 +660,8 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(session_id) => {
-                log::info!("New user joined: {session_id}");
-                // Get display name from client if available, otherwise use session_id
-                let display_name = self
-                    .client
-                    .get_peer_display_name(&session_id)
-                    .unwrap_or_else(|| session_id.clone());
-                self.peer_display_names.insert(session_id, display_name);
+            Msg::OnPeerAdded(email) => {
+                log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
 

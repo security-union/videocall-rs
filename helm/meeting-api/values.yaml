@@ -34,6 +34,12 @@ env:
     value: "true"
   - name: COOKIE_DOMAIN
     value: ".videocall.rs"
+  # Name of the session cookie (default: "session").
+  # Override in PR preview environments to avoid collision with the production
+  # cookie which is also named "session" on the parent domain.
+  # Example: set to "pr-session" for *.sandbox.videocall.rs previews.
+  - name: COOKIE_NAME
+    value: "session"
   - name: CORS_ALLOWED_ORIGIN
     value: "https://app.videocall.rs"
   # --- OAuth / OIDC ---

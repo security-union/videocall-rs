@@ -510,6 +510,8 @@ jobs:
             --set "env[10].value=0.0.0.0:8081" \
             --set "env[11].name=RUST_LOG" \
             --set "env[11].value=info" \
+            --set "env[12].name=COOKIE_NAME" \
+            --set "env[12].value=pr${SLOT}-session" \
             --set "ingress.hosts[0].host=pr${SLOT}-api.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

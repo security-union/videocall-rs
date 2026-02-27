@@ -17,4 +17,5 @@ message PacketWrapper {
   string email = 2;
   bytes data = 3;
   uint64 session_id = 4;
+  string user_email = 5;
 }

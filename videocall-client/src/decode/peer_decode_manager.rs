@@ -85,6 +85,7 @@ pub struct Peer {
     pub screen: VideoPeerDecoder,
     pub session_id: u64,
     pub email: String,
+    pub user_email: String,
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
@@ -113,6 +114,7 @@ impl Peer {
         screen_canvas_id: String,
         session_id: u64,
         email: String,
+        user_email: String,
         aes: Option<Aes128State>,
     ) -> Result<Self, JsValue> {
         let sid_str = session_id.to_string();
@@ -120,7 +122,7 @@ impl Peer {
             Self::new_decoders(&video_canvas_id, &screen_canvas_id, &sid_str)?;
 
         audio.set_muted(true);
-        debug!("Initialized peer {email} (session_id: {session_id}) with audio muted");
+        debug!("Initialized peer {email} (session_id: {session_id}, user_email: {user_email}) with audio muted");
 
         Ok(Self {
             audio,
@@ -128,6 +130,7 @@ impl Peer {
             screen,
             session_id,
             email,
+            user_email,
             video_canvas_id,
             screen_canvas_id,
             aes,
@@ -522,11 +525,12 @@ impl PeerDecodeManager {
     fn add_peer(
         &mut self,
         email: &str,
+        user_email: &str,
         session_id: u64,
         aes: Option<Aes128State>,
     ) -> Result<(), JsValue> {
         let sid_str = session_id.to_string();
-        debug!("Adding peer {email} with session_id {sid_str}");
+        debug!("Adding peer {email} (user_email: {user_email}) with session_id {sid_str}");
         self.connected_peers.insert(
             session_id,
             Peer::new(
@@ -534,6 +538,7 @@ impl PeerDecodeManager {
                 self.get_screen_canvas_id.emit(sid_str),
                 session_id,
                 email.to_owned(),
+                user_email.to_owned(),
                 aes,
             )?,
         );
@@ -545,10 +550,13 @@ impl PeerDecodeManager {
         self.on_peer_removed.emit(session_id.to_string());
     }
 
-    pub fn ensure_peer(&mut self, session_id: u64, email: &str) -> PeerStatus {
-        if self.connected_peers.contains_key(&session_id) {
+    pub fn ensure_peer(&mut self, session_id: u64, email: &str, user_email: &str) -> PeerStatus {
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            if peer.user_email.is_empty() && !user_email.is_empty() {
+                peer.user_email = user_email.to_owned();
+            }
             PeerStatus::NoChange
-        } else if let Err(e) = self.add_peer(email, session_id, None) {
+        } else if let Err(e) = self.add_peer(email, user_email, session_id, None) {
             log::error!("Error adding peer: {e:?}");
             PeerStatus::NoChange
         } else {

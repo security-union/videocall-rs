@@ -30,7 +30,8 @@ pub struct PeerList {
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct PeerListProperties {
-    pub peers: Vec<String>,
+    /// List of peers: (display_name, user_email)
+    pub peers: Vec<(String, Option<String>)>,
     pub onclose: yew::Callback<yew::MouseEvent>,
 
     // meeting info
@@ -40,9 +41,13 @@ pub struct PeerListProperties {
     pub is_active: bool,
     pub on_toggle_meeting_info: yew::Callback<()>,
 
-    /// Display name (username) of the meeting host (for displaying crown icon)
+    /// If the current user is the meeting host
+    #[prop_or(false)]
+    pub is_current_user_host: bool,
+
+    /// Host's email (from creator_id) for identification
     #[prop_or_default]
-    pub host_display_name: Option<String>,
+    pub host_email: Option<String>,
 }
 
 pub enum PeerListMsg {
@@ -80,8 +85,9 @@ impl Component for PeerList {
             .props()
             .peers
             .iter()
-            .filter(|peer| {
-                peer.to_lowercase()
+            .filter(|(display_name, _user_email)| {
+                display_name
+                    .to_lowercase()
                     .contains(&self.search_query.to_lowercase())
             })
             .cloned()
@@ -108,12 +114,8 @@ impl Component for PeerList {
             .map(|name| format!("{name} (You)"))
             .unwrap_or_else(|| "(You)".to_string());
 
-        // Check if current user is host by comparing display names
-        let host_display_name = ctx.props().host_display_name.clone();
-        let is_current_user_host = host_display_name
-            .as_ref()
-            .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
-            .unwrap_or(false);
+        let is_current_user_host = ctx.props().is_current_user_host;
+        let host_email = ctx.props().host_email.clone();
 
         html! {
             <div>
@@ -197,12 +199,14 @@ impl Component for PeerList {
                                 // show self as the first item with actual username
                                 <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} /></li>
 
-                                { for filtered_peers.iter().map(|peer| {
-                                    let is_peer_host = host_display_name.as_ref()
-                                        .map(|h| h == peer)
-                                        .unwrap_or(false);
+                                { for filtered_peers.iter().map(|(peer_display_name, peer_user_email)| {
+                                    // Compare peer's email with host's email for host identification
+                                    let is_peer_host = match (&host_email, peer_user_email) {
+                                        (Some(h), Some(e)) => h == e,
+                                        _ => false,
+                                    };
                                     html!{
-                                        <li><PeerListItem name={peer.clone()} is_host={is_peer_host} /></li>
+                                        <li><PeerListItem name={peer_display_name.clone()} is_host={is_peer_host} /></li>
                                     }
                                 })}
                             </ul>

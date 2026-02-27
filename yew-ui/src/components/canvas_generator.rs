@@ -36,11 +36,14 @@ pub fn generate_for_peer(
     client: &VideoCallClient,
     key: &String,
     full_bleed: bool,
-    host_display_name: Option<&str>,
+    host_email: Option<&str>,
 ) -> Html {
     let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
+    let user_email = client
+        .get_peer_user_email(key)
+        .unwrap_or_else(|| key.clone());
 
-    let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
+    let is_host = host_email.map(|h| h == user_email).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.contains(&peer_email) {
         return html! {};

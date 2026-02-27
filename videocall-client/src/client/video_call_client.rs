@@ -115,7 +115,7 @@ pub struct VideoCallClientOptions {
     pub rtt_probe_interval_ms: Option<u64>,
 
     /// Callback triggered when meeting info is received (optional)
-    pub on_meeting_info: Option<Callback<f64>>,
+    pub on_meeting_info: Option<Callback<(f64, String)>>,
 
     /// Callback triggered when the meeting ends (optional)
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
@@ -126,7 +126,7 @@ struct InnerOptions {
     enable_e2ee: bool,
     userid: String,
     on_peer_added: Callback<String>,
-    on_meeting_info: Option<Callback<f64>>,
+    on_meeting_info: Option<Callback<(f64, String)>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
 }
 
@@ -549,6 +549,26 @@ impl VideoCallClient {
         }
     }
 
+    pub fn get_peer_user_email(&self, session_id: &str) -> Option<String> {
+        let sid: u64 = session_id.parse().ok()?;
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get(&sid).and_then(|peer| {
+                if peer.user_email.is_empty() {
+                    None
+                } else {
+                    Some(peer.user_email.clone())
+                }
+            }),
+            Err(_) => {
+                warn!(
+                    "Failed to borrow inner in get_peer_user_email for session_id: {}",
+                    session_id
+                );
+                None
+            }
+        }
+    }
+
     /// Hacky function that returns true if the given peer has yet to send a frame of screen share.
     ///
     /// No reason for this function to exist, it should be deducible from the
@@ -862,18 +882,22 @@ impl VideoCallClient {
 impl Inner {
     fn on_inbound_media(&mut self, response: PacketWrapper) {
         debug!(
-            "<< Received {:?} from {} (session: {})",
+            "<< Received {:?} from {} (session: {}, user_email: {})",
             response.packet_type.enum_value(),
             response.email,
-            response.session_id
+            response.session_id,
+            response.user_email
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
         let peer_status = if response.email == SYSTEM_USER_EMAIL || response.session_id == 0 {
             PeerStatus::NoChange
         } else {
-            self.peer_decode_manager
-                .ensure_peer(response.session_id, &response.email)
+            self.peer_decode_manager.ensure_peer(
+                response.session_id,
+                &response.email,
+                &response.user_email,
+            )
         };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
@@ -1008,7 +1032,10 @@ impl Inner {
                         );
 
                         if let Some(callback) = &self.options.on_meeting_info {
-                            callback.emit(meeting_packet.start_time_ms as f64);
+                            callback.emit((
+                                meeting_packet.start_time_ms as f64,
+                                meeting_packet.creator_id.clone(),
+                            ));
                         }
                     }
                     Ok(MeetingEventType::MEETING_ENDED) => {

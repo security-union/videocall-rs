@@ -29,7 +29,8 @@ pub enum MeetingStatus {
     /// Admitted to the meeting
     Admitted {
         is_host: bool,
-        host_display_name: Option<String>,
+        /// Host's email address
+        host_email: String,
         /// Signed JWT room access token for connecting to the media server
         room_token: String,
     },
@@ -61,7 +62,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
 
     // Meeting status state
     let meeting_status = use_state(|| MeetingStatus::NotJoined);
-    let host_display_name = use_state(|| None::<String>);
     let current_user_email = use_state(|| None::<String>);
     // Track if user came from waiting room (should auto-join when admitted)
     let came_from_waiting_room = use_state(|| false);
@@ -141,7 +141,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     {
         let meeting_id = props.id.clone();
         let meeting_status = meeting_status.clone();
-        let host_display_name = host_display_name.clone();
         let current_user_email = current_user_email.clone();
         let came_from_waiting_room = came_from_waiting_room.clone();
         let input_value_state = input_value_state.clone();
@@ -151,7 +150,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
             let interval: Option<Interval> = if *status == MeetingStatus::WaitingForMeeting {
                 let meeting_id = meeting_id.clone();
                 let meeting_status = meeting_status.clone();
-                let host_display_name = host_display_name.clone();
                 let current_user_email = current_user_email.clone();
                 let came_from_waiting_room = came_from_waiting_room.clone();
                 let display_name = (*input_value_state).clone();
@@ -160,7 +158,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                 Some(Interval::new(2000, move || {
                     let meeting_id = meeting_id.clone();
                     let meeting_status = meeting_status.clone();
-                    let host_display_name = host_display_name.clone();
                     let current_user_email = current_user_email.clone();
                     let came_from_waiting_room = came_from_waiting_room.clone();
                     let display_name = display_name.clone();
@@ -183,19 +180,13 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                             );
                                             current_user_email.set(Some(response.email.clone()));
 
-                                            let determined_host_display_name =
-                                                info.host_display_name.clone();
-                                            host_display_name
-                                                .set(determined_host_display_name.clone());
-
                                             match response.status.as_str() {
                                                 "admitted" => {
                                                     if let Some(token) = response.room_token {
                                                         meeting_status.set(
                                                             MeetingStatus::Admitted {
                                                                 is_host: response.is_host,
-                                                                host_display_name:
-                                                                    determined_host_display_name,
+                                                                host_email: info.host.clone(),
                                                                 room_token: token,
                                                             },
                                                         );
@@ -284,7 +275,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     let on_join_meeting = {
         let meeting_id = props.id.clone();
         let meeting_status = meeting_status.clone();
-        let host_display_name = host_display_name.clone();
         let current_user_email = current_user_email.clone();
         let input_value_state = input_value_state.clone();
         let came_from_waiting_room = came_from_waiting_room.clone();
@@ -292,7 +282,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         Callback::from(move |_| {
             let meeting_id = meeting_id.clone();
             let meeting_status = meeting_status.clone();
-            let host_display_name = host_display_name.clone();
             let current_user_email = current_user_email.clone();
             let came_from_waiting_room = came_from_waiting_room.clone();
             // Get the username that the user entered
@@ -312,25 +301,25 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         // Store the current user's email from the response
                         current_user_email.set(Some(response.email.clone()));
 
-                        // Get the host's display name from meeting info
-                        let determined_host_display_name = if response.is_host {
-                            // If we're the host, our display_name is the host_display_name
-                            Some(display_name.clone())
-                        } else {
-                            // We need to get the meeting info to find the host's display name
+                        // Get meeting info to determine host's display name and email
+                        let determined_host_email =
                             match crate::meeting_api::get_meeting_info(&meeting_id).await {
-                                Ok(info) => info.host_display_name,
-                                Err(_) => None,
-                            }
-                        };
-                        host_display_name.set(determined_host_display_name.clone());
+                                Ok(info) => info.host,
+                                Err(_) => {
+                                    if response.is_host {
+                                        response.email.clone()
+                                    } else {
+                                        String::new()
+                                    }
+                                }
+                            };
 
                         match response.status.as_str() {
                             "admitted" => {
                                 if let Some(token) = response.room_token {
                                     meeting_status.set(MeetingStatus::Admitted {
                                         is_host: response.is_host,
-                                        host_display_name: determined_host_display_name,
+                                        host_email: determined_host_email,
                                         room_token: token,
                                     });
                                 } else {
@@ -372,26 +361,23 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     // Handle waiting room admission - receives the room_token from WaitingRoom
     let on_admitted = {
         let meeting_status = meeting_status.clone();
-        let host_display_name = host_display_name.clone();
         let meeting_id = props.id.clone();
 
         Callback::from(move |room_token: String| {
             let meeting_status = meeting_status.clone();
-            let host_display_name = host_display_name.clone();
             let meeting_id = meeting_id.clone();
 
             wasm_bindgen_futures::spawn_local(async move {
-                // Get the host display name
-                let determined_host_display_name =
+                // Get the host display name and email
+                let determined_host_email =
                     match crate::meeting_api::get_meeting_info(&meeting_id).await {
-                        Ok(info) => info.host_display_name,
-                        Err(_) => None,
+                        Ok(info) => info.host,
+                        Err(_) => String::new(),
                     };
-                host_display_name.set(determined_host_display_name.clone());
 
                 meeting_status.set(MeetingStatus::Admitted {
                     is_host: false,
-                    host_display_name: determined_host_display_name,
+                    host_email: determined_host_email,
                     room_token,
                 });
             });
@@ -521,7 +507,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     };
 
     let current_meeting_status = (*meeting_status).clone();
-    // let current_host_display_name = (*host_display_name).clone();
     let should_auto_join = *came_from_waiting_room;
 
     html! {
@@ -529,7 +514,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
             {
                 match (&maybe_username, &current_meeting_status) {
                     // User is admitted - show the meeting
-                    (Some(username), MeetingStatus::Admitted { is_host, host_display_name, room_token }) => {
+                    (Some(username), MeetingStatus::Admitted { is_host, host_email, room_token }) => {
                         html! {
                             <AttendantsComponent
                                 email={username.clone()}
@@ -539,7 +524,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 user_name={(*user_profile).as_ref().map(|p| p.name.clone())}
                                 user_email={(*current_user_email).clone().or_else(|| (*user_profile).as_ref().map(|p| p.email.clone()))}
                                 on_logout={Some(on_logout.clone())}
-                                host_display_name={host_display_name.clone()}
+                                host_email={Some(host_email.clone())}
                                 auto_join={should_auto_join}
                                 is_owner={*is_host}
                                 room_token={room_token.clone()}

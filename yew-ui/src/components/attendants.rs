@@ -76,7 +76,7 @@ pub enum WsAction {
     MediaPermissionsError(String),
     Log(String),
     EncoderSettingsUpdated(String),
-    MeetingInfoReceived(u64),
+    MeetingInfoReceived(u64, String),
     ToggleDropdown,
 }
 
@@ -162,9 +162,9 @@ pub struct AttendantsComponentProps {
     #[prop_or_default]
     pub on_logout: Option<Callback<()>>,
 
-    /// Display name (username) of the meeting host/owner (for displaying crown icon)
+    /// Host's email address (from meeting-api, reliable for identifying host in peer list)
     #[prop_or_default]
-    pub host_display_name: Option<String>,
+    pub host_email: Option<String>,
 
     /// If true, automatically join the meeting without showing the "Join Meeting" button.
     /// Used when user was admitted from the waiting room.
@@ -208,6 +208,8 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    /// Host's email from websocket MEETING_STARTED packet (creator_id)
+    pub host_creator_id: Option<String>,
 }
 
 impl AttendantsComponent {
@@ -332,10 +334,13 @@ impl AttendantsComponent {
             rtt_probe_interval_ms: Some(200),
             on_meeting_info: Some({
                 let link = ctx.link().clone();
-                VcCallback::from(move |start_time_ms: f64| {
-                    log::info!("Meeting started at Unix timestamp: {start_time_ms}");
+                VcCallback::from(move |(start_time_ms, creator_id): (f64, String)| {
+                    log::info!(
+                        "Meeting started at Unix timestamp: {start_time_ms}, creator: {creator_id}"
+                    );
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         start_time_ms as u64,
+                        creator_id,
                     )))
                 })
             }),
@@ -345,6 +350,7 @@ impl AttendantsComponent {
                     log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         end_time_ms as u64,
+                        String::new(),
                     )));
                     link.send_message(Msg::MeetingEnded(message));
                 })
@@ -499,6 +505,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
+            host_creator_id: None,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -594,9 +601,13 @@ impl Component for AttendantsComponent {
                     self.encoder_settings = Some(settings);
                     true
                 }
-                WsAction::MeetingInfoReceived(start_time) => {
-                    log::info!("Meeting info received, start_time: {start_time:?}");
+                WsAction::MeetingInfoReceived(start_time, creator_id) => {
+                    log::info!("Meeting info received, start_time: {start_time:?}, creator_id: {creator_id}");
                     self.meeting_start_time_server = Some(start_time as f64);
+                    if !creator_id.is_empty() && self.host_creator_id.is_none() {
+                        log::info!("Setting host_creator_id to: {}", creator_id);
+                        self.host_creator_id = Some(creator_id);
+                    }
                     true
                 }
                 WsAction::ToggleDropdown => {
@@ -840,16 +851,19 @@ impl Component for AttendantsComponent {
         let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
-        // Convert session_id to email for display in PeerList
-        let mut peers_for_display: Vec<String> = real_peers_vec
+        // Convert session_id to (display_name, user_email) for PeerList
+        let mut peers_for_display: Vec<(String, Option<String>)> = real_peers_vec
             .iter()
             .map(|session_id| {
-                self.client
+                let display_name = self
+                    .client
                     .get_peer_email(session_id)
-                    .unwrap_or_else(|| session_id.clone())
+                    .unwrap_or_else(|| session_id.clone());
+                let user_email = self.client.get_peer_user_email(session_id);
+                (display_name, user_email)
             })
             .collect();
-        peers_for_display.extend(self.fake_peer_ids.iter().cloned());
+        peers_for_display.extend(self.fake_peer_ids.iter().map(|id| (id.clone(), None)));
 
         // Keep session_id for PeerTile (needs session_id for identification)
         let mut display_peers_vec = real_peers_vec.clone();
@@ -862,7 +876,7 @@ impl Component for AttendantsComponent {
         // Determine if the "Add Fake Peer" button should be disabled
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
-        let host_display_name = ctx.props().host_display_name.clone();
+        let host_email = ctx.props().host_email.clone();
         let rows: Vec<Html> = display_peers_vec
             .iter()
             .take(CANVAS_LIMIT)
@@ -870,7 +884,7 @@ impl Component for AttendantsComponent {
             .map(|(i, peer_id)| {
                 let full_bleed = display_peers_vec.len() == 1
                     && !self.client.is_screen_share_enabled_for_peer(peer_id);
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_display_name={host_display_name.clone()} /> }
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_email={host_email.clone()} /> }
             })
             .collect();
 
@@ -1161,7 +1175,8 @@ impl Component for AttendantsComponent {
                                     num_participants={num_display_peers}
                                     is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
                                     on_toggle_meeting_info={toggle_meeting_info}
-                                    host_display_name={ctx.props().host_display_name.clone()}
+                                    is_current_user_host={ctx.props().is_owner}
+                                    host_email={ctx.props().host_email.clone()}
                                 />
                             }
                         } else {

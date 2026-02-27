@@ -201,7 +201,7 @@ impl Handler<ClientMessage> for ChatServer {
             session,
             room,
             msg,
-            user: _,
+            user,
         } = msg;
         trace!("got message in server room {room} session {session}");
 
@@ -229,6 +229,11 @@ impl Handler<ClientMessage> for ChatServer {
                 if packet_wrapper.session_id == 0 {
                     packet_wrapper.session_id = session;
                 }
+
+                if packet_wrapper.user_email.is_empty() {
+                    packet_wrapper.user_email = user;
+                }
+
                 match packet_wrapper.write_to_bytes() {
                     Ok(bytes) => bytes,
                     Err(e) => {

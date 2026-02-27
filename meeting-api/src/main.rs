@@ -47,18 +47,25 @@ async fn main() {
     tracing::info!("Connected to PostgreSQL");
 
     // CORS: In production set `CORS_ALLOWED_ORIGIN` to the exact frontend
-    // origin (e.g. "https://app.videocall.rs").  When unset, the server
-    // mirrors the request origin which is convenient for development but
-    // **insecure** in production (any site can make credentialed requests).
+    // origin (e.g. "https://app.videocall.rs").  Comma-separate for multiple
+    // origins. When unset, the server mirrors the request origin which is
+    // convenient for development but **insecure** in production (any site can
+    // make credentialed requests).
+    //
+    // `AllowOrigin::list` echoes back only the matched origin so the response
+    // header always contains a single value, which is required by the spec.
     //
     // `allow_credentials(true)` requires explicit methods and headers (not *).
     let cors = CorsLayer::new()
-        .allow_origin(match &config.cors_allowed_origin {
-            Some(origin) => {
-                let hv: http::HeaderValue = origin.parse().expect("invalid CORS_ALLOWED_ORIGIN");
-                AllowOrigin::exact(hv)
+        .allow_origin(match config.cors_allowed_origin.as_slice() {
+            [] => AllowOrigin::mirror_request(),
+            origins => {
+                let hvs: Vec<http::HeaderValue> = origins
+                    .iter()
+                    .map(|o| o.parse().expect("invalid CORS_ALLOWED_ORIGIN"))
+                    .collect();
+                AllowOrigin::list(hvs)
             }
-            None => AllowOrigin::mirror_request(),
         })
         .allow_methods([
             http::Method::GET,

@@ -227,8 +227,8 @@ pub async fn callback(
         state.session_ttl_secs,
     )?;
 
-    let redirect_url = match oauth_req.return_to {
-        Some(ref value) if value.starts_with("http://") || value.starts_with("https://") => {
+    let redirect_url = match &oauth_req.return_to {
+        Some(value) if value.starts_with("http://") || value.starts_with("https://") => {
             // Absolute URL — re-validate as defense-in-depth.
             validate_return_to(value, &oauth_cfg.after_login_url, &oauth_cfg.allowed_redirect_urls)
                 .unwrap_or_else(|| oauth_cfg.after_login_url.clone())
@@ -308,7 +308,9 @@ pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError>
 /// Validate and sanitize a `returnTo` value.
 ///
 /// Accepts:
-/// - Relative paths starting with `/` (but not `//`).
+/// - Relative paths starting with `/` (but not `//`). Note: path-traversal
+///   sequences like `/../` are not stripped here because the browser resolves
+///   them before navigation and the redirect target is always an allowed origin.
 /// - Absolute `http(s)://` URLs whose origin matches `after_login_url` or
 ///   any entry in `allowed_redirect_urls`.
 ///
@@ -326,6 +328,7 @@ fn validate_return_to(
     // Relative path: must start with "/" but not "//" (protocol-relative).
     if trimmed.starts_with('/') {
         if trimmed.starts_with("//") {
+            tracing::warn!(return_to = trimmed, "rejected protocol-relative returnTo");
             return None;
         }
         return Some(trimmed.to_string());
@@ -333,10 +336,17 @@ fn validate_return_to(
 
     // Only allow http/https absolute URLs.
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        tracing::warn!(return_to = trimmed, "rejected returnTo with disallowed scheme");
         return None;
     }
 
-    let parsed = Url::parse(trimmed).ok()?;
+    let parsed = match Url::parse(trimmed) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(return_to = trimmed, error = %e, "rejected unparseable returnTo URL");
+            return None;
+        }
+    };
     let candidate_origin = parsed.origin().unicode_serialization();
 
     // Check against after_login_url origin.
@@ -355,6 +365,11 @@ fn validate_return_to(
         }
     }
 
+    tracing::warn!(
+        return_to = trimmed,
+        origin = candidate_origin,
+        "rejected returnTo: origin not in allowlist"
+    );
     None
 }
 
@@ -469,6 +484,33 @@ mod tests {
             validate_return_to("  /meeting/1  ", AFTER_LOGIN, &allowed()),
             Some("/meeting/1".to_string())
         );
+    }
+
+    #[test]
+    fn absolute_url_decoded_from_meeting_page() {
+        // Meeting pages send URL-encoded returnTo values. Axum's Query
+        // extractor decodes them before they reach validate_return_to,
+        // so the function sees the decoded form.
+        let decoded = "http://localhost:3001/meeting/my-room";
+        assert_eq!(
+            validate_return_to(decoded, AFTER_LOGIN, &allowed()),
+            Some(decoded.to_string())
+        );
+    }
+
+    #[test]
+    fn empty_allowed_list_still_checks_after_login() {
+        assert_eq!(
+            validate_return_to("http://localhost:80/meeting/1", AFTER_LOGIN, &[]),
+            Some("http://localhost:80/meeting/1".to_string())
+        );
+        // But a different origin is rejected.
+        assert_eq!(
+            validate_return_to("http://localhost:3001/meeting/1", AFTER_LOGIN, &[]),
+            None
+        );
+    }
+
     // --- build_session_cookie ---
 
     #[test]

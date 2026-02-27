@@ -40,7 +40,10 @@ pub fn build_login_callback() -> Callback<MouseEvent> {
                     url = format!("{url}{search}");
                 } else if let Ok(origin) = window().location().origin() {
                     // No returnTo — tell the backend which frontend to return to.
-                    url = format!("{url}?returnTo={origin}/");
+                    // Encode the value for consistency with meeting pages.
+                    let value = format!("{origin}/");
+                    let encoded = urlencoding::encode(&value);
+                    url = format!("{url}?returnTo={encoded}");
                 }
             }
             let _ = window().location().set_href(&url);

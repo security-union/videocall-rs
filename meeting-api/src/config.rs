@@ -171,11 +171,20 @@ impl Config {
                     scopes,
                     after_login_url: env::var("AFTER_LOGIN_URL")
                         .unwrap_or_else(|_| "/".to_string()),
-                    allowed_redirect_urls: env::var("ALLOWED_REDIRECT_URLS")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
-                        .unwrap_or_default(),
+                    allowed_redirect_urls: {
+                        let urls: Vec<String> = env::var("ALLOWED_REDIRECT_URLS")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
+                            .unwrap_or_default();
+                        // Validate at startup so malformed entries fail fast.
+                        for u in &urls {
+                            url::Url::parse(u).map_err(|e| {
+                                format!("ALLOWED_REDIRECT_URLS contains invalid URL {u:?}: {e}")
+                            })?;
+                        }
+                        urls
+                    },
                 })
             })
             .transpose()?;

@@ -167,7 +167,7 @@ impl ::protobuf::Message for MediaPacket {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u64 {
         let mut my_size = 0;
-        if self.media_type != ::protobuf::EnumOrUnknown::new(media_packet::MediaType::VIDEO) {
+        if self.media_type != ::protobuf::EnumOrUnknown::new(media_packet::MediaType::MEDIA_TYPE_UNKNOWN) {
             my_size += ::protobuf::rt::int32_size(1, self.media_type.value());
         }
         if !self.email.is_empty() {
@@ -203,7 +203,7 @@ impl ::protobuf::Message for MediaPacket {
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if self.media_type != ::protobuf::EnumOrUnknown::new(media_packet::MediaType::VIDEO) {
+        if self.media_type != ::protobuf::EnumOrUnknown::new(media_packet::MediaType::MEDIA_TYPE_UNKNOWN) {
             os.write_enum(1, ::protobuf::EnumOrUnknown::value(&self.media_type))?;
         }
         if !self.email.is_empty() {
@@ -247,7 +247,7 @@ impl ::protobuf::Message for MediaPacket {
     }
 
     fn clear(&mut self) {
-        self.media_type = ::protobuf::EnumOrUnknown::new(media_packet::MediaType::VIDEO);
+        self.media_type = ::protobuf::EnumOrUnknown::new(media_packet::MediaType::MEDIA_TYPE_UNKNOWN);
         self.email.clear();
         self.data.clear();
         self.frame_type.clear();
@@ -298,16 +298,18 @@ pub mod media_packet {
     #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
     // @@protoc_insertion_point(enum:MediaPacket.MediaType)
     pub enum MediaType {
+        // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.MEDIA_TYPE_UNKNOWN)
+        MEDIA_TYPE_UNKNOWN = 0,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.VIDEO)
-        VIDEO = 0,
+        VIDEO = 1,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.AUDIO)
-        AUDIO = 1,
+        AUDIO = 2,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.SCREEN)
-        SCREEN = 2,
+        SCREEN = 3,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.HEARTBEAT)
-        HEARTBEAT = 3,
+        HEARTBEAT = 4,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.RTT)
-        RTT = 4,
+        RTT = 5,
     }
 
     impl ::protobuf::Enum for MediaType {
@@ -319,17 +321,19 @@ pub mod media_packet {
 
         fn from_i32(value: i32) -> ::std::option::Option<MediaType> {
             match value {
-                0 => ::std::option::Option::Some(MediaType::VIDEO),
-                1 => ::std::option::Option::Some(MediaType::AUDIO),
-                2 => ::std::option::Option::Some(MediaType::SCREEN),
-                3 => ::std::option::Option::Some(MediaType::HEARTBEAT),
-                4 => ::std::option::Option::Some(MediaType::RTT),
+                0 => ::std::option::Option::Some(MediaType::MEDIA_TYPE_UNKNOWN),
+                1 => ::std::option::Option::Some(MediaType::VIDEO),
+                2 => ::std::option::Option::Some(MediaType::AUDIO),
+                3 => ::std::option::Option::Some(MediaType::SCREEN),
+                4 => ::std::option::Option::Some(MediaType::HEARTBEAT),
+                5 => ::std::option::Option::Some(MediaType::RTT),
                 _ => ::std::option::Option::None
             }
         }
 
         fn from_str(str: &str) -> ::std::option::Option<MediaType> {
             match str {
+                "MEDIA_TYPE_UNKNOWN" => ::std::option::Option::Some(MediaType::MEDIA_TYPE_UNKNOWN),
                 "VIDEO" => ::std::option::Option::Some(MediaType::VIDEO),
                 "AUDIO" => ::std::option::Option::Some(MediaType::AUDIO),
                 "SCREEN" => ::std::option::Option::Some(MediaType::SCREEN),
@@ -340,6 +344,7 @@ pub mod media_packet {
         }
 
         const VALUES: &'static [MediaType] = &[
+            MediaType::MEDIA_TYPE_UNKNOWN,
             MediaType::VIDEO,
             MediaType::AUDIO,
             MediaType::SCREEN,
@@ -362,7 +367,7 @@ pub mod media_packet {
 
     impl ::std::default::Default for MediaType {
         fn default() -> Self {
-            MediaType::VIDEO
+            MediaType::MEDIA_TYPE_UNKNOWN
         }
     }
 
@@ -573,6 +578,8 @@ pub struct VideoMetadata {
     // message fields
     // @@protoc_insertion_point(field:VideoMetadata.sequence)
     pub sequence: u64,
+    // @@protoc_insertion_point(field:VideoMetadata.codec)
+    pub codec: ::protobuf::EnumOrUnknown<VideoCodec>,
     // special fields
     // @@protoc_insertion_point(special_field:VideoMetadata.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -590,12 +597,17 @@ impl VideoMetadata {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(1);
+        let mut fields = ::std::vec::Vec::with_capacity(2);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "sequence",
             |m: &VideoMetadata| { &m.sequence },
             |m: &mut VideoMetadata| { &mut m.sequence },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "codec",
+            |m: &VideoMetadata| { &m.codec },
+            |m: &mut VideoMetadata| { &mut m.codec },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<VideoMetadata>(
             "VideoMetadata",
@@ -618,6 +630,9 @@ impl ::protobuf::Message for VideoMetadata {
                 8 => {
                     self.sequence = is.read_uint64()?;
                 },
+                16 => {
+                    self.codec = is.read_enum_or_unknown()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -633,6 +648,9 @@ impl ::protobuf::Message for VideoMetadata {
         if self.sequence != 0 {
             my_size += ::protobuf::rt::uint64_size(1, self.sequence);
         }
+        if self.codec != ::protobuf::EnumOrUnknown::new(VideoCodec::VIDEO_CODEC_UNSPECIFIED) {
+            my_size += ::protobuf::rt::int32_size(2, self.codec.value());
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -641,6 +659,9 @@ impl ::protobuf::Message for VideoMetadata {
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
         if self.sequence != 0 {
             os.write_uint64(1, self.sequence)?;
+        }
+        if self.codec != ::protobuf::EnumOrUnknown::new(VideoCodec::VIDEO_CODEC_UNSPECIFIED) {
+            os.write_enum(2, ::protobuf::EnumOrUnknown::value(&self.codec))?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -660,12 +681,14 @@ impl ::protobuf::Message for VideoMetadata {
 
     fn clear(&mut self) {
         self.sequence = 0;
+        self.codec = ::protobuf::EnumOrUnknown::new(VideoCodec::VIDEO_CODEC_UNSPECIFIED);
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static VideoMetadata {
         static instance: VideoMetadata = VideoMetadata {
             sequence: 0,
+            codec: ::protobuf::EnumOrUnknown::from_i32(0),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -687,6 +710,73 @@ impl ::std::fmt::Display for VideoMetadata {
 
 impl ::protobuf::reflect::ProtobufValue for VideoMetadata {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+#[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+// @@protoc_insertion_point(enum:VideoCodec)
+pub enum VideoCodec {
+    // @@protoc_insertion_point(enum_value:VideoCodec.VIDEO_CODEC_UNSPECIFIED)
+    VIDEO_CODEC_UNSPECIFIED = 0,
+    // @@protoc_insertion_point(enum_value:VideoCodec.VP8)
+    VP8 = 1,
+    // @@protoc_insertion_point(enum_value:VideoCodec.VP9_PROFILE0_LEVEL10_8BIT)
+    VP9_PROFILE0_LEVEL10_8BIT = 2,
+}
+
+impl ::protobuf::Enum for VideoCodec {
+    const NAME: &'static str = "VideoCodec";
+
+    fn value(&self) -> i32 {
+        *self as i32
+    }
+
+    fn from_i32(value: i32) -> ::std::option::Option<VideoCodec> {
+        match value {
+            0 => ::std::option::Option::Some(VideoCodec::VIDEO_CODEC_UNSPECIFIED),
+            1 => ::std::option::Option::Some(VideoCodec::VP8),
+            2 => ::std::option::Option::Some(VideoCodec::VP9_PROFILE0_LEVEL10_8BIT),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    fn from_str(str: &str) -> ::std::option::Option<VideoCodec> {
+        match str {
+            "VIDEO_CODEC_UNSPECIFIED" => ::std::option::Option::Some(VideoCodec::VIDEO_CODEC_UNSPECIFIED),
+            "VP8" => ::std::option::Option::Some(VideoCodec::VP8),
+            "VP9_PROFILE0_LEVEL10_8BIT" => ::std::option::Option::Some(VideoCodec::VP9_PROFILE0_LEVEL10_8BIT),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    const VALUES: &'static [VideoCodec] = &[
+        VideoCodec::VIDEO_CODEC_UNSPECIFIED,
+        VideoCodec::VP8,
+        VideoCodec::VP9_PROFILE0_LEVEL10_8BIT,
+    ];
+}
+
+impl ::std::default::Default for VideoCodec {
+    fn default() -> Self {
+        VideoCodec::VIDEO_CODEC_UNSPECIFIED
+    }
+}
+
+impl ::protobuf::EnumFull for VideoCodec {
+    fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().enum_by_package_relative_name("VideoCodec").unwrap()).clone()
+    }
+
+    fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+        let index = *self as usize;
+        Self::enum_descriptor().value_by_index(index)
+    }
+}
+
+impl VideoCodec {
+    pub(in super) fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+        ::protobuf::reflect::GeneratedEnumDescriptorData::new::<VideoCodec>("VideoCodec")
+    }
 }
 
 // @@protoc_insertion_point(message:HeartbeatMetadata)
@@ -976,8 +1066,9 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(AudioMetadata::generated_message_descriptor_data());
             messages.push(VideoMetadata::generated_message_descriptor_data());
             messages.push(HeartbeatMetadata::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(1);
+            let mut enums = ::std::vec::Vec::with_capacity(2);
             enums.push(media_packet::MediaType::generated_enum_descriptor_data());
+            enums.push(VideoCodec::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),
                 deps,

@@ -43,18 +43,18 @@ pub enum PeerDecodeError {
     AudioDecodeError,
     ScreenDecodeError,
     VideoDecodeError,
-    NoSuchPeer(String),
+    NoSuchPeer(u64),
     NoMediaType,
     NoPacketType,
     PacketParseError,
-    SameUserPacket(String),
+    SameUserPacket(u64),
     UnknownMediaType,
     UnknownPacketType,
 }
 
 #[derive(Debug)]
 pub enum PeerStatus {
-    Added(String),
+    Added(u64),
     NoChange,
     NameChanged(String, String),
 }
@@ -103,8 +103,8 @@ impl Debug for Peer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Peer {{ display_name: {}, video_canvas_id: {}, screen_canvas_id: {} }}",
-            self.display_name, self.video_canvas_id, self.screen_canvas_id
+            "Peer {{ session_id: {}, video_canvas_id: {}, screen_canvas_id: {} }}",
+            self.session_id, self.video_canvas_id, self.screen_canvas_id
         )
     }
 }
@@ -114,23 +114,22 @@ impl Peer {
         video_canvas_id: String,
         screen_canvas_id: String,
         session_id: String,
-        display_name: String,
+        email: String,
         aes: Option<Aes128State>,
     ) -> Result<Self, JsValue> {
+        let sid_str = session_id.to_string();
         let (mut audio, video, screen) =
-            Self::new_decoders(&video_canvas_id, &screen_canvas_id, &session_id)?;
+            Self::new_decoders(&video_canvas_id, &screen_canvas_id, &sid_str)?;
 
-        // Initialize with explicit mute state (audio_enabled starts as false, so muted=true)
         audio.set_muted(true);
-        debug!("Initialized peer {session_id} with audio muted");
+        debug!("Initialized peer {email} (session_id: {session_id}) with audio muted");
 
         Ok(Self {
             audio,
             video,
             screen,
-            // email: session_id.clone(),
             session_id,
-            display_name,
+            display_name: email,
             video_canvas_id,
             screen_canvas_id,
             aes,
@@ -183,17 +182,15 @@ impl Peer {
     }
 
     fn reset(&mut self) -> Result<(), JsValue> {
-        let (mut audio, video, screen) = Self::new_decoders(
-            &self.video_canvas_id,
-            &self.screen_canvas_id,
-            &self.display_name,
-        )?;
+        let sid_str = self.session_id.to_string();
+        let (mut audio, video, screen) =
+            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &sid_str)?;
 
         // Preserve the current mute state after reset
         audio.set_muted(!self.audio_enabled);
         debug!(
             "Reset peer {} with audio muted: {}",
-            self.display_name, !self.audio_enabled
+            self.session_id, !self.audio_enabled
         );
 
         self.audio = audio;
@@ -246,7 +243,7 @@ impl Peer {
             MediaType::AUDIO => {
                 if !self.audio_enabled {
                     // Peer is muted, don't send packet to NetEq to avoid expand packets (hissing sound)
-                    debug!("Peer {} is muted, skipping audio packet", self.display_name);
+                    debug!("Peer {} is muted, skipping audio packet", self.session_id);
                     Ok((
                         media_type,
                         DecodeStatus {
@@ -293,15 +290,15 @@ impl Peer {
                     // Set mute state on audio decoder when audio state changes (before updating state)
                     if audio_state_changed {
                         log::info!("[MUTE DEBUG] Audio state changed for peer {} - audio_enabled: {} -> {}", 
-                                                         self.display_name, self.audio_enabled, metadata.audio_enabled);
+                                                         self.session_id, self.audio_enabled, metadata.audio_enabled);
                         self.audio.set_muted(!metadata.audio_enabled);
                         debug!(
                             "Set audio decoder muted state for peer {} to {}",
-                            self.display_name, !metadata.audio_enabled
+                            self.session_id, !metadata.audio_enabled
                         );
                         log::info!(
                             "🔇 Setting peer {} muted to {}",
-                            self.display_name,
+                            self.session_id,
                             !metadata.audio_enabled
                         );
                     }
@@ -315,7 +312,7 @@ impl Peer {
                         self.video.flush();
                         debug!(
                             "Flushed video decoder for peer {} (video turned off)",
-                            self.display_name
+                            self.session_id
                         );
                     }
 
@@ -325,7 +322,7 @@ impl Peer {
                         self.audio.flush();
                         debug!(
                             "Flushed audio decoder for peer {} (audio turned off)",
-                            self.display_name
+                            self.session_id
                         );
                     }
 
@@ -337,7 +334,7 @@ impl Peer {
                         ts_ms: now_ms(),
                         metrics: vec![
                             // from_peer will be attached by higher layer that knows the local user id
-                            metric!("to_peer", self.display_name.clone()),
+                            metric!("to_peer", self.session_id.to_string()),
                             metric!(
                                 "audio_enabled",
                                 if metadata.audio_enabled { 1u64 } else { 0u64 }
@@ -366,7 +363,7 @@ impl Peer {
                 // RTT packets are handled by ConnectionManager, not by peer decoders
                 debug!(
                     "Received RTT packet for peer {} - ignoring in peer decoder",
-                    self.display_name
+                    self.session_id
                 );
                 Ok((
                     media_type,
@@ -417,7 +414,7 @@ fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> 
 
 #[derive(Debug)]
 pub struct PeerDecodeManager {
-    connected_peers: HashMapWithOrderedKeys<String, Peer>,
+    connected_peers: HashMapWithOrderedKeys<u64, Peer>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -458,21 +455,21 @@ impl PeerDecodeManager {
         }
     }
 
-    pub fn sorted_keys(&self) -> &Vec<String> {
+    pub fn sorted_keys(&self) -> &Vec<u64> {
         self.connected_peers.ordered_keys()
     }
 
-    pub fn get(&self, key: &String) -> Option<&Peer> {
+    pub fn get(&self, key: &u64) -> Option<&Peer> {
         self.connected_peers.get(key)
     }
 
     /// Set the canvas element for a peer's video decoder
     pub fn set_peer_video_canvas(
         &self,
-        peer_id: &str,
+        peer_id: u64,
         canvas: web_sys::HtmlCanvasElement,
     ) -> Result<(), JsValue> {
-        if let Some(peer) = self.connected_peers.get(&peer_id.to_string()) {
+        if let Some(peer) = self.connected_peers.get(&peer_id) {
             peer.video.set_canvas(canvas)
         } else {
             Err(JsValue::from_str(&format!("Peer {peer_id} not found")))
@@ -482,10 +479,10 @@ impl PeerDecodeManager {
     /// Set the canvas element for a peer's screen share decoder
     pub fn set_peer_screen_canvas(
         &self,
-        peer_id: &str,
+        peer_id: u64,
         canvas: web_sys::HtmlCanvasElement,
     ) -> Result<(), JsValue> {
-        if let Some(peer) = self.connected_peers.get(&peer_id.to_string()) {
+        if let Some(peer) = self.connected_peers.get(&peer_id) {
             peer.screen.set_canvas(canvas)
         } else {
             Err(JsValue::from_str(&format!("Peer {peer_id} not found")))
@@ -497,25 +494,20 @@ impl PeerDecodeManager {
             .connected_peers
             .remove_if_and_return_keys(|peer| peer.check_heartbeat());
         for k in removed {
-            self.on_peer_removed.emit(k);
+            self.on_peer_removed.emit(k.to_string());
         }
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
-        let email = packet.email.clone();
-        let session_id = if !packet.session_id.is_empty() {
-            packet.session_id.clone()
-        } else {
-            packet.email.clone()
-        };
-        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
-            // Set worker diagnostics context once per peer
+        let peer_session_id = packet.session_id;
+
+        if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             if !peer.context_initialized {
+                let sid_str = peer_session_id.to_string();
                 peer.video
-                    .set_stream_context(userid.to_string(), session_id.clone());
-                peer.screen
-                    .set_stream_context(userid.to_string(), session_id.clone());
+                    .set_stream_context(userid.to_string(), sid_str.clone());
+                peer.screen.set_stream_context(userid.to_string(), sid_str);
                 peer.context_initialized = true;
             }
 
@@ -525,20 +517,22 @@ impl PeerDecodeManager {
                     peer.on_heartbeat();
                     if !peer.display_name.is_empty() && peer.display_name != old_display_name {
                         self.on_peer_display_name_changed
-                            .emit((email.clone(), peer.display_name.clone()));
+                            .emit((peer_session_id.to_string(), peer.display_name.clone()));
                     }
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {
-                    if media_type != MediaType::RTT && session_id == userid {
-                        return Err(PeerDecodeError::SameUserPacket(session_id.clone()));
-                    }
                     if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.track_frame(&session_id, media_type, packet.data.len() as u64);
+                        diagnostics.track_frame(
+                            &peer_session_id.to_string(),
+                            media_type,
+                            packet.data.len() as u64,
+                        );
                     }
 
                     if decode_status.first_frame {
-                        self.on_first_frame.emit((session_id.clone(), media_type));
+                        self.on_first_frame
+                            .emit((peer_session_id.to_string(), media_type));
                     }
 
                     Ok(())
@@ -546,70 +540,58 @@ impl PeerDecodeManager {
                 Err(e) => peer.reset().map_err(|_| e),
             }
         } else {
-            Err(PeerDecodeError::NoSuchPeer(email.clone()))
+            Err(PeerDecodeError::NoSuchPeer(peer_session_id))
         }
     }
 
     fn add_peer(
         &mut self,
-        session_id: &str,
-        display_name: &str,
+        email: &str,
+        session_id: u64,
         aes: Option<Aes128State>,
     ) -> Result<(), JsValue> {
-        debug!("Adding peer {display_name} ({session_id})");
+        let sid_str = session_id.to_string();
+        debug!("Adding peer {email} with session_id {sid_str}");
         self.connected_peers.insert(
-            session_id.to_owned(),
+            session_id,
             Peer::new(
-                self.get_video_canvas_id.emit(session_id.to_owned()),
-                self.get_screen_canvas_id.emit(session_id.to_owned()),
-                session_id.to_owned(),
-                display_name.to_owned(),
+                self.get_video_canvas_id.emit(sid_str.clone()),
+                self.get_screen_canvas_id.emit(sid_str.clone()),
+                sid_str.clone(),
+                email.to_owned(),
                 aes,
             )?,
         );
         Ok(())
     }
 
-    pub fn delete_peer(&mut self, session_id: &String) {
-        self.connected_peers.remove(session_id);
-        self.on_peer_removed.emit(session_id.clone());
+    pub fn delete_peer(&mut self, session_id: u64) {
+        self.connected_peers.remove(&session_id);
+        self.on_peer_removed.emit(session_id.to_string());
     }
 
-    pub fn ensure_peer(&mut self, session_id: &str, display_name: &String) -> PeerStatus {
-        if self.connected_peers.contains_key(&session_id.to_string()) {
-            if let Some(peer) = self.connected_peers.get_mut(&session_id.to_string()) {
-                if peer.display_name != *display_name {
-                    let old_name = peer.display_name.clone();
-                    peer.set_display_name(display_name.to_string());
-                    log::info!(
-                        "Peer {session_id} display name changed: '{old_name}' -> '{display_name}'"
-                    );
-                    return PeerStatus::NameChanged(
-                        session_id.to_string(),
-                        display_name.to_string(),
-                    );
-                }
-            }
+    pub fn ensure_peer(&mut self, session_id: u64, email: &str) -> PeerStatus {
+        if self.connected_peers.contains_key(&session_id) {
             PeerStatus::NoChange
-        } else if let Err(e) = self.add_peer(session_id, display_name, None) {
-            log::error!("Error adding peer {display_name} ({session_id}): {e:?}");
+        } else if let Err(e) = self.add_peer(email, session_id, None) {
+            log::error!("Error adding peer: {e:?}");
             PeerStatus::NoChange
         } else {
-            PeerStatus::Added(session_id.to_string())
+            PeerStatus::Added(session_id)
         }
     }
 
     pub fn set_peer_aes(
         &mut self,
-        session_id: &String,
+        session_id: u64,
         aes: Aes128State,
     ) -> Result<(), PeerDecodeError> {
-        match self.connected_peers.get_mut(session_id) {
+        match self.connected_peers.get_mut(&session_id) {
             Some(peer) => {
                 peer.aes = Some(aes);
                 Ok(())
             }
-            None => Err(PeerDecodeError::NoSuchPeer(session_id.clone())),
+            None => Err(PeerDecodeError::NoSuchPeer(session_id)),
         }
     }
 
@@ -637,14 +619,17 @@ impl PeerDecodeManager {
 
     /// Update peer display name by session ID
     pub fn update_peer_display_name(&mut self, session_id: &str, new_name: &str) {
-        if let Some(peer) = self.connected_peers.get_mut(session_id) {
-            peer.set_display_name(new_name.to_string());
+        if let Ok(sid) = session_id.parse::<u64>() {
+            if let Some(peer) = self.connected_peers.get_mut(&sid) {
+                peer.set_display_name(new_name.to_string());
+            }
         }
     }
 
     pub fn get_peer_display_name(&self, session_id: &str) -> Option<String> {
+        let sid: u64 = session_id.parse().ok()?;
         self.connected_peers
-            .get(session_id)
+            .get(&sid)
             .map(|peer| peer.display_name.clone())
     }
 }

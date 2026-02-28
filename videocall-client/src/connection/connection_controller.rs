@@ -150,13 +150,23 @@ impl ConnectionController {
         inner.connection_manager.set_screen_enabled(enabled)
     }
 
-    /// Set display name on active connection (for heartbeat packets)
-    pub fn set_display_name(&self, name: String) -> Result<()> {
+    /// Set own session_id for filtering self-packets
+    pub fn set_own_session_id(&self, session_id: u64) -> Result<()> {
         let inner = self
             .inner
             .try_borrow()
             .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
-        inner.connection_manager.set_display_name(name)
+        inner.connection_manager.set_own_session_id(session_id);
+        Ok(())
+    }
+
+    /// Set display name on the active connection (for heartbeat packets)
+    pub fn set_display_name(&self, name: String) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Err(e) = inner.connection_manager.set_display_name(name) {
+                log::warn!("Failed to set display_name in connection_manager: {e}");
+            }
+        }
     }
 
     /// Check if manager has an active connection

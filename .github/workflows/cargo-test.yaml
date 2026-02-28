@@ -7,6 +7,7 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'yew-ui/**'
+      - 'dioxus-ui/**'
       - 'docker/**'
       - 'neteq/**'
       - 'videocall-client/**'

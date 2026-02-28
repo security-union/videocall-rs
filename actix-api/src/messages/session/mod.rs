@@ -16,11 +16,12 @@
  * conditions.
  */
 
+use crate::actors::session_logic::SessionId;
 use actix::Message as ActixMessage;
 
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 pub struct Message {
-    pub session: String,
+    pub session: SessionId,
     pub msg: Vec<u8>,
 }

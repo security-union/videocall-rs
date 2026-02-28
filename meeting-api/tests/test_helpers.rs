@@ -61,6 +61,7 @@ pub fn build_app(pool: PgPool) -> Router {
         oauth: None,
         jwks_cache: None,
         cookie_domain: None,
+        cookie_name: "session".to_string(),
         cookie_secure: false,
     };
     routes::router().with_state(state)

@@ -4,10 +4,10 @@
 .mov
 .mp4
 .env
-.claude
 #for jet brains products
 .idea/
 target/
+dioxus-ui/dist/
 helm/digital-ocean-secret
 helm/global/us-east/grafana/secret.yaml
 helm-videocall-deployment/

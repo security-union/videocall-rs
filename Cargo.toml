@@ -10,6 +10,7 @@ members = [
     "videocall-client",
     "videocall-cli",
     "yew-ui",
+    "dioxus-ui",
     "videocall-sdk",
     "videocall-codecs",
     "neteq",

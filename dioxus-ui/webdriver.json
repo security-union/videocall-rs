@@ -2,7 +2,12 @@
   "goog:chromeOptions": {
     "args": [
       "--use-fake-device-for-media-stream",
-      "--use-fake-ui-for-media-stream"
+      "--use-fake-ui-for-media-stream",
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--disable-extensions"
     ]
   }
 }

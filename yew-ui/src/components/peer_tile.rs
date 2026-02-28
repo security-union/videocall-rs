@@ -31,6 +31,9 @@ pub struct PeerTileProps {
     /// Display name (username) of the meeting host (for displaying crown icon)
     #[prop_or_default]
     pub host_display_name: Option<String>,
+    /// Current display name of this peer (updated via heartbeat); drives re-render when changed
+    #[prop_or_default]
+    pub peer_display_name: Option<String>,
 }
 
 pub enum Msg {

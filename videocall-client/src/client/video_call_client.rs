@@ -567,6 +567,24 @@ impl VideoCallClient {
         }
     }
 
+    /// Returns the current display name for a peer (updated via heartbeat).
+    /// Falls back to the session_id string if no display name is set yet.
+    pub fn get_peer_display_name(&self, session_id: &str) -> Option<String> {
+        let sid: u64 = session_id.parse().ok()?;
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .peer_decode_manager
+                .get(&sid)
+                .map(|peer| peer.display_name.clone()),
+            Err(_) => {
+                warn!(
+                    "Failed to borrow inner in get_peer_display_name for session_id: {session_id}"
+                );
+                None
+            }
+        }
+    }
+
     /// Hacky function that returns true if the given peer has yet to send a frame of screen share.
     ///
     /// No reason for this function to exist, it should be deducible from the

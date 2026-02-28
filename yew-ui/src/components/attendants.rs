@@ -941,7 +941,8 @@ impl Component for AttendantsComponent {
             .map(|(i, peer_id)| {
                 let full_bleed = display_peers_vec.len() == 1
                     && !self.client.is_screen_share_enabled_for_peer(peer_id);
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_display_name={host_display_name.clone()} /> }
+                let peer_display_name = self.peer_display_names.get(peer_id).cloned();
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_display_name={host_display_name.clone()} peer_display_name={peer_display_name} /> }
             })
             .collect();
 

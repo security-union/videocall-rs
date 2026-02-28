@@ -38,9 +38,18 @@ pub fn generate_for_peer(
     full_bleed: bool,
     host_display_name: Option<&str>,
 ) -> Html {
-    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
+    // Use display_name (updated via heartbeat) for the floating label.
+    // Fall back to session_id only if nothing is set yet.
+    let peer_display_name = client
+        .get_peer_display_name(key)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| key.clone());
 
-    let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
+    // Keep email-based allow-list check using get_peer_email (unchanged behaviour).
+    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
+    let is_host = host_display_name
+        .map(|h| h == peer_display_name)
+        .unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.contains(&peer_email) {
         return html! {};
@@ -62,8 +71,8 @@ pub fn generate_for_peer(
                     })}
                 >
                     { if is_video_enabled_for_peer { html!{ <UserVideo id={key.clone()} hidden={false}/> } } else { html!{ <div class=""><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> } } }
-                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_email}") } else {peer_email.clone() }} dir={"auto"}>
-                        {peer_email.clone()}
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_display_name}") } else { peer_display_name.clone() }} dir={"auto"}>
+                        {peer_display_name.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>
                     <div class="audio-indicator"><MicIcon muted={!is_audio_enabled_for_peer}/></div>
@@ -92,7 +101,7 @@ pub fn generate_for_peer(
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
                     })}>
                         <ScreenCanvas peer_id={key.clone()} />
-                        <h4 class="floating-name" title={format!("{}-screen", &peer_email)} dir={"auto"}>{format!("{}-screen", &peer_email)}</h4>
+                        <h4 class="floating-name" title={format!("{}-screen", &peer_display_name)} dir={"auto"}>{format!("{}-screen", &peer_display_name)}</h4>
                         <button onclick={Callback::from({ let canvas_id = format!("screen-share-{}", key.clone()); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon">
                             <CropIcon/>
                         </button>
@@ -120,8 +129,8 @@ pub fn generate_for_peer(
                             <span class="placeholder-text">{"Video Disabled"}</span>
                         </div>
                     }
-                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_email}") } else { peer_email.clone() }} dir={"auto"}>
-                        {peer_email.clone()}
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_display_name}") } else { peer_display_name.clone() }} dir={"auto"}>
+                        {peer_display_name.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>
                     <div class="audio-indicator">

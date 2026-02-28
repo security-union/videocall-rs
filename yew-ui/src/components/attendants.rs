@@ -1227,6 +1227,7 @@ impl Component for AttendantsComponent {
                             html! {
                                 <PeerList
                                     peers={display_peers_vec.clone()}
+                                    peer_display_names={self.peer_display_names.clone()}
                                     onclose={toggle_peer_list}
                                     local_user_name={self.display_name.clone()}
                                     show_meeting_info={self.meeting_info_open}

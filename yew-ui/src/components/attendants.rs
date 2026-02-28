@@ -208,8 +208,6 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
-    /// Host's email from websocket MEETING_STARTED packet (creator_id)
-    pub host_creator_id: Option<String>,
 }
 
 impl AttendantsComponent {
@@ -505,7 +503,6 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
-            host_creator_id: None,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -604,10 +601,6 @@ impl Component for AttendantsComponent {
                 WsAction::MeetingInfoReceived(start_time, creator_id) => {
                     log::info!("Meeting info received, start_time: {start_time:?}, creator_id: {creator_id}");
                     self.meeting_start_time_server = Some(start_time as f64);
-                    if !creator_id.is_empty() && self.host_creator_id.is_none() {
-                        log::info!("Setting host_creator_id to: {}", creator_id);
-                        self.host_creator_id = Some(creator_id);
-                    }
                     true
                 }
                 WsAction::ToggleDropdown => {

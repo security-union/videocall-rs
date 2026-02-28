@@ -131,6 +131,7 @@ pub struct VideoCallClientOptions {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct InnerOptions {
     enable_e2ee: bool,
     userid: String,
@@ -560,10 +561,7 @@ impl VideoCallClient {
                 .get(&sid)
                 .map(|peer| peer.session_id.clone()),
             Err(_) => {
-                warn!(
-                    "Failed to borrow inner in get_peer_email for session_id: {}",
-                    session_id
-                );
+                warn!("Failed to borrow inner in get_peer_email for session_id: {session_id}");
                 None
             }
         }
@@ -888,22 +886,9 @@ impl VideoCallClient {
                 *inner.options.display_name.borrow_mut() = new_name.to_string();
 
                 if let Some(connection_controller) = &inner.connection_controller {
-                    // Update the connection's display_name for future heartbeat packets
+                    // Update the connection's display_name so future heartbeats carry the new name
                     connection_controller.set_display_name(new_name.to_string());
                     log::info!("Updated connection display_name to: {new_name}");
-
-                    let packet = PacketWrapper {
-                        packet_type: PacketType::MEETING.into(),
-                        email: inner.options.userid.clone(),
-                        data: vec![],
-                        ..Default::default()
-                    };
-
-                    let session_id = &inner.options.session_id;
-                    log::info!(
-                        ">>> Sending display name update packet: session_id={session_id}, display_name={new_name}"
-                    );
-                    connection_controller.send_packet(packet)?;
                 } else {
                     log::warn!("No connection_controller available!");
                 }
@@ -938,6 +923,8 @@ impl Inner {
             response.session_id
         );
 
+        // Save email before response is moved into the match below.
+        let peer_email = response.email.clone();
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
         let peer_status = if response.email == SYSTEM_USER_EMAIL || response.session_id == 0 {
@@ -1141,6 +1128,11 @@ impl Inner {
         }
         if let PeerStatus::Added(peer_session_id) = peer_status {
             self.options.on_peer_added.emit(peer_session_id.to_string());
+            // Pre-populate display name with email as a readable fallback
+            // until the first heartbeat arrives with the real display_name.
+            self.peer_decode_manager
+                .on_peer_display_name_changed
+                .emit((peer_session_id.to_string(), peer_email.clone()));
             self.send_public_key();
         }
     }

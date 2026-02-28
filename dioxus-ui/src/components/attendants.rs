@@ -147,11 +147,7 @@ pub fn AttendantsComponent(
 
         let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &email, &id);
 
-        log::info!(
-            "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
-            email,
-            id
-        );
+        log::info!("DIOXUS-UI: Creating VideoCallClient for {email} in meeting {id}");
 
         let opts = VideoCallClientOptions {
             userid: email.clone(),
@@ -321,7 +317,7 @@ pub fn AttendantsComponent(
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
-        format!("{}/meeting/{}", origin, id)
+        format!("{origin}/meeting/{id}")
     };
 
     let is_allowed = users_allowed_to_stream().unwrap_or_default();

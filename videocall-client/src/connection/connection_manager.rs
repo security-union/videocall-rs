@@ -283,10 +283,7 @@ impl ConnectionManager {
             // Intercept SESSION_ASSIGNED before anything else
             if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
                 let sid = packet.session_id;
-                info!(
-                    "SESSION_ASSIGNED received on connection {}: {}",
-                    connection_id, sid
-                );
+                info!("SESSION_ASSIGNED received on connection {connection_id}: {sid}");
 
                 let is_elected = active_connection_id
                     .borrow()
@@ -501,13 +498,11 @@ impl ConnectionManager {
                 {
                     if *self.own_session_id.borrow() == Some(sid) {
                         debug!(
-                            "Pending SESSION_ASSIGNED already processed for session {}, skipping",
-                            sid
+                            "Pending SESSION_ASSIGNED already processed for session {sid}, skipping"
                         );
                     } else {
                         info!(
-                            "Applying pending SESSION_ASSIGNED for elected connection {}: {}",
-                            connection_id, sid
+                            "Applying pending SESSION_ASSIGNED for elected connection {connection_id}: {sid}"
                         );
                         *self.own_session_id.borrow_mut() = Some(sid);
 
@@ -521,7 +516,7 @@ impl ConnectionManager {
                 // Start heartbeat only on the elected connection
                 if let Some(connection) = self.connections.get_mut(&connection_id) {
                     connection.start_heartbeat(self.options.userid.clone());
-                    info!("Started heartbeat on elected connection {}", connection_id);
+                    info!("Started heartbeat on elected connection {connection_id}");
                 }
 
                 // Close unused connections

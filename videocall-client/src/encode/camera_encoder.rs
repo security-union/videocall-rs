@@ -346,31 +346,24 @@ impl CameraEncoder {
                 Ok(promise) => {
                     if let Err(e) = JsFuture::from(promise).await {
                         log::warn!(
-                            "VIDEO PLAY promise rejected on '{}': {:?}  — retrying in 200ms",
-                            video_elem_id,
-                            e
+                            "VIDEO PLAY promise rejected on '{video_elem_id}': {e:?}  — retrying in 200ms"
                         );
                         sleep(Duration::from_millis(200)).await;
                         if let Ok(p2) = video_element.play() {
                             if let Err(e2) = JsFuture::from(p2).await {
                                 log::warn!(
-                                    "VIDEO PLAY retry also rejected on '{}': {:?}",
-                                    video_elem_id,
-                                    e2
+                                    "VIDEO PLAY retry also rejected on '{video_elem_id}': {e2:?}"
                                 );
                             } else {
-                                log::info!("VIDEO PLAY retry succeeded on {}", video_elem_id);
+                                log::info!("VIDEO PLAY retry succeeded on {video_elem_id}");
                             }
                         }
                     } else {
-                        log::info!(
-                            "VIDEO PLAY started successfully on element {}",
-                            video_elem_id
-                        );
+                        log::info!("VIDEO PLAY started successfully on element {video_elem_id}");
                     }
                 }
                 Err(e) => {
-                    error!("VIDEO PLAY method call failed: {:?}", e);
+                    error!("VIDEO PLAY method call failed: {e:?}");
                 }
             }
 

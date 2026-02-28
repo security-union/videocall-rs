@@ -52,6 +52,7 @@ pub struct Connection {
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
     url: String,
+    #[allow(dead_code)]
     session_id: String,
     display_name: Rc<RefCell<String>>,
 }

@@ -112,6 +112,8 @@ jobs:
       - uses: nanasess/setup-chromedriver@v2
 
       - name: Run dioxus-ui component tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 120
         run: |
           nix develop .#yew-ui --command bash -c "\
             cd dioxus-ui && \

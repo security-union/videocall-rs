@@ -37,6 +37,10 @@ pub struct AppState {
     pub jwks_cache: Option<Arc<JwksCache>>,
     /// Cookie domain (e.g. ".example.com"), or `None` for default.
     pub cookie_domain: Option<String>,
+    /// Name of the session cookie (default: "session").
+    /// Set to a unique value in PR preview environments to avoid collision
+    /// with the production cookie that shares the same parent domain.
+    pub cookie_name: String,
     /// Whether to set the `Secure` flag on cookies.
     pub cookie_secure: bool,
 }
@@ -57,6 +61,7 @@ impl AppState {
             oauth: config.oauth.clone(),
             jwks_cache,
             cookie_domain: config.cookie_domain.clone(),
+            cookie_name: config.cookie_name.clone(),
             cookie_secure: config.cookie_secure,
         }
     }

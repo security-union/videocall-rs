@@ -64,6 +64,8 @@ env:
     value: "openid email profile"
   - name: AFTER_LOGIN_URL
     value: "https://app.videocall.rs"
+  - name: ALLOWED_REDIRECT_URLS
+    value: "https://app.videocall.rs"
 ```
 
 **What happens at startup:**
@@ -107,6 +109,8 @@ env:
     value: "openid email profile"
   - name: AFTER_LOGIN_URL
     value: "https://app.videocall.rs"
+  - name: ALLOWED_REDIRECT_URLS
+    value: "https://app.videocall.rs"
 ```
 
 **Helm values (`values.yaml`) — confidential client:**
@@ -132,6 +136,8 @@ env:
   - name: OAUTH_SCOPES
     value: "openid email profile"
   - name: AFTER_LOGIN_URL
+    value: "https://app.videocall.rs"
+  - name: ALLOWED_REDIRECT_URLS
     value: "https://app.videocall.rs"
 ```
 
@@ -180,6 +186,8 @@ env:
     value: "openid email profile"
   - name: AFTER_LOGIN_URL
     value: "https://app.videocall.rs"
+  - name: ALLOWED_REDIRECT_URLS
+    value: "https://app.videocall.rs"
 ```
 
 The provider must serve a valid discovery document at `{OAUTH_ISSUER}/.well-known/openid-configuration`.
@@ -217,6 +225,8 @@ env:
     value: "openid email profile"
   - name: AFTER_LOGIN_URL
     value: "https://app.videocall.rs"
+  - name: ALLOWED_REDIRECT_URLS
+    value: "https://app.videocall.rs"
 ```
 
 > **Note:** When `OAUTH_ISSUER` is not set, `OAUTH_AUTH_URL` and `OAUTH_TOKEN_URL` are required. JWKS-based signature verification is only available when `OAUTH_JWKS_URL` is set (either manually or via discovery).
@@ -236,7 +246,8 @@ env:
 | `OAUTH_JWKS_URL` | No | — | JWKS endpoint. Overrides discovery. Enables ID token verification. |
 | `OAUTH_USERINFO_URL` | No | — | UserInfo endpoint. Fallback when ID token lacks `email`. |
 | `OAUTH_SCOPES` | No | `openid email profile` | Space-separated scopes. |
-| `AFTER_LOGIN_URL` | No | `/` | Redirect after login. |
+| `AFTER_LOGIN_URL` | No | `/` | Default redirect after login (primary frontend URL). |
+| `ALLOWED_REDIRECT_URLS` | No | — | Comma-separated list of additional allowed redirect origins (e.g. `https://app2.example.com`). The origin of `AFTER_LOGIN_URL` is implicitly allowed. |
 
 **Resolution order:**
 1. If `OAUTH_ISSUER` is set → discover endpoints, then apply manual overrides on top

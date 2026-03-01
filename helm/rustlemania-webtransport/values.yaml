@@ -29,6 +29,13 @@ env:
     value: "1"  # Default for WebTransport services - adjust per region as needed
   - name: TOKIO_BLOCKING_THREADS
     value: "2"  # Small pool for blocking crypto operations
+  # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.
+  # Create the secret with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
+  - name: JWT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: jwt-secret
+        key: secret
 resources:
   limits:
     cpu: "300m"

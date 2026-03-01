@@ -18,8 +18,14 @@ env:
   # in your deployment!
   - name: DATABASE_URL
     value: postgres://postgres:password@postgres-postgresql:5432/actix-api-db?sslmode=disable
+  # JWT_SECRET must be provided via a Kubernetes secret.
+  # Create with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
+  # The same secret must be deployed to the webtransport and websocket services.
   - name: JWT_SECRET
-    value: "change-me"
+    valueFrom:
+      secretKeyRef:
+        name: jwt-secret
+        key: secret
   - name: TOKEN_TTL_SECS
     value: "86400"
   - name: SESSION_TTL_SECS
@@ -28,6 +34,12 @@ env:
     value: "true"
   - name: COOKIE_DOMAIN
     value: ".videocall.rs"
+  # Name of the session cookie (default: "session").
+  # Override in PR preview environments to avoid collision with the production
+  # cookie which is also named "session" on the parent domain.
+  # Example: set to "pr-session" for *.sandbox.videocall.rs previews.
+  - name: COOKIE_NAME
+    value: "session"
   - name: CORS_ALLOWED_ORIGIN
     value: "https://app.videocall.rs"
   # --- OAuth / OIDC ---
@@ -63,6 +75,8 @@ env:
   - name: OAUTH_SCOPES
     value: "openid email profile"
   - name: AFTER_LOGIN_URL
+    value: "https://app.videocall.rs"
+  - name: ALLOWED_REDIRECT_URLS
     value: "https://app.videocall.rs"
 resources:
   limits:

@@ -310,7 +310,7 @@ impl Peer {
                         stream_id: None,
                         ts_ms: now_ms(),
                         metrics: vec![
-                            metric!("to_peer", self.email.clone()),
+                            metric!("to_peer", self.session_id.to_string()),
                             metric!("is_speaking", if metadata.is_speaking { 1u64 } else { 0u64 }),
                         ],
                     };

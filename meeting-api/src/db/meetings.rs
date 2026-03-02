@@ -44,10 +44,22 @@ pub async fn create(
     password_hash: Option<&str>,
     attendees: &JsonValue,
 ) -> Result<MeetingRow, sqlx::Error> {
+    create_with_options(pool, room_id, creator_id, password_hash, attendees, true).await
+}
+
+/// Create a new meeting with explicit waiting_room_enabled setting.
+pub async fn create_with_options(
+    pool: &PgPool,
+    room_id: &str,
+    creator_id: &str,
+    password_hash: Option<&str>,
+    attendees: &JsonValue,
+    waiting_room_enabled: bool,
+) -> Result<MeetingRow, sqlx::Error> {
     sqlx::query_as::<_, MeetingRow>(
         r#"
-        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees)
-        VALUES ($1, $2, NOW(), $3, 'idle', $4)
+        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled)
+        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5)
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
                   waiting_room_enabled
@@ -57,6 +69,7 @@ pub async fn create(
     .bind(creator_id)
     .bind(password_hash)
     .bind(attendees)
+    .bind(waiting_room_enabled)
     .fetch_one(pool)
     .await
 }

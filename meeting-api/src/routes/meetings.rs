@@ -99,12 +99,15 @@ pub async fn create_meeting(
     let attendees_json =
         serde_json::to_value(&body.attendees).map_err(|e| AppError::internal(&e.to_string()))?;
 
-    let row = db_meetings::create(
+    let waiting_room_enabled = body.waiting_room_enabled.unwrap_or(true);
+
+    let row = db_meetings::create_with_options(
         &state.db,
         &meeting_id,
         &email,
         password_hash.as_deref(),
         &attendees_json,
+        waiting_room_enabled,
     )
     .await
     .map_err(|e| match e {

@@ -70,11 +70,21 @@ pub fn MeetingPage(id: String) -> Element {
                     Err(_) => {
                         if let Some(win) = window() {
                             if let Ok(current_url) = win.location().href() {
-                                let login_url = format!(
-                                    "/login?returnTo={}",
-                                    urlencoding::encode(&current_url)
-                                );
-                                let _ = win.location().set_href(&login_url);
+                                // Store the return URL in sessionStorage before
+                                // navigating to /login. Dioxus 0.7's router strips
+                                // unrecognized query params via history.replaceState,
+                                // so we cannot rely on ?returnTo= surviving in the URL.
+                                match win.session_storage() {
+                                    Ok(Some(storage)) => {
+                                        if storage.set_item("vc_oauth_return_to", &current_url).is_err() {
+                                            log::warn!("Failed to write vc_oauth_return_to to sessionStorage — post-login redirect will fall back to app root");
+                                        }
+                                    }
+                                    _ => {
+                                        log::warn!("sessionStorage unavailable — post-login redirect will fall back to app root");
+                                    }
+                                }
+                                let _ = win.location().set_href("/login");
                             }
                         }
                     }

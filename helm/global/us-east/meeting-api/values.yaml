@@ -60,7 +60,7 @@ meeting-api:
     - name: AFTER_LOGIN_URL
       value: "https://app.videocall.rs"
     - name: ALLOWED_REDIRECT_URLS
-      value: "https://app.videocall.rs"
+      value: "https://app.videocall.rs,https://app-dx.videocall.rs"
 
   resources:
     limits:

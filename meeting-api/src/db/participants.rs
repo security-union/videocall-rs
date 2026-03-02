@@ -89,6 +89,31 @@ pub async fn upsert_attendee(
         .await
 }
 
+/// Insert a participant as auto-admitted attendee (waiting room disabled).
+pub async fn upsert_attendee_admitted(
+    pool: &PgPool,
+    meeting_id: i32,
+    email: &str,
+    display_name: Option<&str>,
+) -> Result<ParticipantRow, sqlx::Error> {
+    let query = format!(
+        r#"
+        INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name, admitted_at)
+        VALUES ($1, $2, 'admitted', FALSE, $3, NOW())
+        ON CONFLICT (meeting_id, email)
+        DO UPDATE SET status = 'admitted', admitted_at = NOW(),
+                      display_name = COALESCE($3, meeting_participants.display_name)
+        RETURNING {PARTICIPANT_COLUMNS}
+        "#
+    );
+    sqlx::query_as::<_, ParticipantRow>(&query)
+        .bind(meeting_id)
+        .bind(email)
+        .bind(display_name)
+        .fetch_one(pool)
+        .await
+}
+
 /// Get all participants in 'waiting' status for a meeting.
 pub async fn get_waiting(
     pool: &PgPool,

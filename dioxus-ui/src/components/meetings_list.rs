@@ -167,6 +167,11 @@ fn MeetingItem(
     let nav = use_navigator();
     let is_active = meeting.state == "active";
     let is_ended = meeting.state == "ended";
+    let mut editing = use_signal(|| false);
+    let mut waiting_room_toggle = use_signal({
+        let wr = meeting.waiting_room_enabled;
+        move || wr
+    });
 
     let state_class = match meeting.state.as_str() {
         "active" => "state-active",
@@ -206,8 +211,15 @@ fn MeetingItem(
         }
     };
 
+    let meeting_id_edit = meeting_id.clone();
+
+    let on_edit_click = move |e: MouseEvent| {
+        e.stop_propagation();
+        editing.set(!editing());
+    };
+
     rsx! {
-        li { class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" },
+        li { class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" }, style: "flex-wrap: wrap;",
             div { class: "meeting-item-content", onclick: on_click,
                 div { class: "meeting-info",
                     span { class: "meeting-id", "{meeting.meeting_id}" }
@@ -290,6 +302,18 @@ fn MeetingItem(
                 }
             }
             button {
+                class: "meeting-edit-btn",
+                onclick: on_edit_click,
+                title: "Meeting settings",
+                svg {
+                    xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
+                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                    path { d: "M12 20h9" }
+                    path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
+                }
+            }
+            button {
                 class: if is_ended { "meeting-delete-btn meeting-delete-btn-ended" } else { "meeting-delete-btn" },
                 onclick: on_delete_click,
                 title: "Delete meeting",
@@ -301,6 +325,49 @@ fn MeetingItem(
                     path { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }
                     line { x1: "10", y1: "11", x2: "10", y2: "17" }
                     line { x1: "14", y1: "11", x2: "14", y2: "17" }
+                }
+            }
+            if editing() {
+                {
+                    let meeting_id = meeting_id_edit.clone();
+                    rsx! {
+                        div {
+                            style: "width: 100%; padding: 0.75rem 1rem; border-top: 1px solid rgba(255,255,255,0.1); display: flex; align-items: center; gap: 0.75rem;",
+                            onclick: move |e: MouseEvent| e.stop_propagation(),
+                            span { style: "font-size: 0.85rem; color: rgba(255,255,255,0.8);", "Waiting Room" }
+                            button {
+                                r#type: "button",
+                                style: if waiting_room_toggle() {
+                                    "position: relative; width: 40px; height: 22px; border-radius: 11px; border: none; cursor: pointer; background: #34c759; transition: background 0.2s; flex-shrink: 0;"
+                                } else {
+                                    "position: relative; width: 40px; height: 22px; border-radius: 11px; border: none; cursor: pointer; background: #636366; transition: background 0.2s; flex-shrink: 0;"
+                                },
+                                onclick: {
+                                    let meeting_id = meeting_id.clone();
+                                    move |_| {
+                                        let new_val = !waiting_room_toggle();
+                                        waiting_room_toggle.set(new_val);
+                                        let meeting_id = meeting_id.clone();
+                                        wasm_bindgen_futures::spawn_local(async move {
+                                            if let Err(e) = crate::meeting_api::update_meeting(&meeting_id, new_val).await {
+                                                log::error!("Failed to update waiting room: {e}");
+                                            }
+                                        });
+                                    }
+                                },
+                                div {
+                                    style: if waiting_room_toggle() {
+                                        "position: absolute; top: 1px; left: 20px; width: 20px; height: 20px; border-radius: 50%; background: white; transition: left 0.2s;"
+                                    } else {
+                                        "position: absolute; top: 1px; left: 1px; width: 20px; height: 20px; border-radius: 50%; background: white; transition: left 0.2s;"
+                                    },
+                                }
+                            }
+                            span { style: "font-size: 0.75rem; color: rgba(255,255,255,0.5);",
+                                if waiting_room_toggle() { "ON" } else { "OFF" }
+                            }
+                        }
+                    }
                 }
             }
         }

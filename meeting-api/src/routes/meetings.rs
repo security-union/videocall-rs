@@ -21,7 +21,7 @@ use axum::{
 };
 use rand::Rng;
 use videocall_meeting_types::{
-    requests::{CreateMeetingRequest, ListMeetingsQuery},
+    requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
     responses::{
         APIResponse, CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
         MeetingInfoResponse, MeetingSummary,
@@ -121,6 +121,7 @@ pub async fn create_meeting(
         state: row.state.unwrap_or_else(|| "idle".to_string()),
         attendees: body.attendees,
         has_password: password_hash.is_some(),
+        waiting_room_enabled: row.waiting_room_enabled,
     };
 
     Ok((StatusCode::CREATED, Json(APIResponse::ok(response))))
@@ -153,6 +154,7 @@ pub async fn list_meetings(
             started_at: row.started_at.timestamp(),
             ended_at: row.ended_at.map(|t| t.timestamp()),
             waiting_count,
+            waiting_room_enabled: row.waiting_room_enabled,
         });
     }
 
@@ -183,6 +185,7 @@ pub async fn get_meeting(
         host: row.creator_id.unwrap_or_default(),
         host_display_name: row.host_display_name,
         has_password: row.password_hash.is_some(),
+        waiting_room_enabled: row.waiting_room_enabled,
         your_status,
     })))
 }
@@ -206,6 +209,50 @@ pub async fn delete_meeting(
 
     Ok(Json(APIResponse::ok(DeleteMeetingResponse {
         message: format!("Meeting '{meeting_id}' has been deleted"),
+    })))
+}
+
+/// PATCH /api/v1/meetings/{meeting_id}
+pub async fn update_meeting(
+    State(state): State<AppState>,
+    AuthUser { email, .. }: AuthUser,
+    Path(meeting_id): Path<String>,
+    Json(body): Json<UpdateMeetingRequest>,
+) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
+    let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    if row.creator_id.as_deref() != Some(email.as_str()) {
+        return Err(AppError::not_owner());
+    }
+
+    let row = if let Some(enabled) = body.waiting_room_enabled {
+        let updated = db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &email, enabled)
+            .await?
+            .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+        // When the waiting room is turned OFF, auto-admit everyone currently waiting.
+        if !enabled {
+            let _ = db_participants::admit_all(&state.db, updated.id).await;
+        }
+
+        updated
+    } else {
+        row
+    };
+
+    let your_status = db_participants::get_status(&state.db, row.id, &email).await?;
+    let your_status = your_status.map(|p| p.into_participant_status(None));
+
+    Ok(Json(APIResponse::ok(MeetingInfoResponse {
+        meeting_id: row.room_id,
+        state: row.state.unwrap_or_else(|| "idle".to_string()),
+        host: row.creator_id.unwrap_or_default(),
+        host_display_name: row.host_display_name,
+        has_password: row.password_hash.is_some(),
+        waiting_room_enabled: row.waiting_room_enabled,
+        your_status,
     })))
 }
 

@@ -1960,6 +1960,31 @@ select {
   color: #dc3545;
 }
 
+/* Edit/settings button - neutral color */
+.meeting-edit-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.5);
+  padding: 0.5rem;
+  border-radius: 0.375rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.meeting-edit-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.meeting-edit-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
 /* Ended meeting row styling */
 .meeting-item.meeting-ended {
   background: rgba(158, 158, 158, 0.05);

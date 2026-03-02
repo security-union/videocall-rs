@@ -33,6 +33,7 @@ pub struct MeetingRow {
     pub state: Option<String>,
     pub attendees: Option<JsonValue>,
     pub host_display_name: Option<String>,
+    pub waiting_room_enabled: bool,
 }
 
 /// Create a new meeting. Uses INSERT ... ON CONFLICT to handle the partial unique index.
@@ -48,7 +49,8 @@ pub async fn create(
         INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees)
         VALUES ($1, $2, NOW(), $3, 'idle', $4)
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
-                  deleted_at, creator_id, password_hash, state, attendees, host_display_name
+                  deleted_at, creator_id, password_hash, state, attendees, host_display_name,
+                  waiting_room_enabled
         "#,
     )
     .bind(room_id)
@@ -67,7 +69,8 @@ pub async fn get_by_room_id(
     sqlx::query_as::<_, MeetingRow>(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
-               deleted_at, creator_id, password_hash, state, attendees, host_display_name
+               deleted_at, creator_id, password_hash, state, attendees, host_display_name,
+               waiting_room_enabled
         FROM meetings
         WHERE room_id = $1 AND deleted_at IS NULL
         "#,
@@ -87,7 +90,8 @@ pub async fn list_by_owner(
     sqlx::query_as::<_, MeetingRow>(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
-               deleted_at, creator_id, password_hash, state, attendees, host_display_name
+               deleted_at, creator_id, password_hash, state, attendees, host_display_name,
+               waiting_room_enabled
         FROM meetings
         WHERE deleted_at IS NULL AND creator_id = $1
         ORDER BY created_at DESC
@@ -124,7 +128,8 @@ pub async fn soft_delete(
         SET deleted_at = NOW()
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
-                  deleted_at, creator_id, password_hash, state, attendees, host_display_name
+                  deleted_at, creator_id, password_hash, state, attendees, host_display_name,
+                  waiting_room_enabled
         "#,
     )
     .bind(room_id)
@@ -163,4 +168,28 @@ pub async fn set_host_display_name(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Update the waiting_room_enabled setting for a meeting.
+pub async fn update_waiting_room_enabled(
+    pool: &PgPool,
+    room_id: &str,
+    creator_id: &str,
+    enabled: bool,
+) -> Result<Option<MeetingRow>, sqlx::Error> {
+    sqlx::query_as::<_, MeetingRow>(
+        r#"
+        UPDATE meetings
+        SET waiting_room_enabled = $3
+        WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
+        RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
+                  deleted_at, creator_id, password_hash, state, attendees, host_display_name,
+                  waiting_room_enabled
+        "#,
+    )
+    .bind(room_id)
+    .bind(creator_id)
+    .bind(enabled)
+    .fetch_optional(pool)
+    .await
 }

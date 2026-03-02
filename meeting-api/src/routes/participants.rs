@@ -84,10 +84,29 @@ pub async fn join_meeting(
             return Err(AppError::meeting_not_active(&meeting_id));
         }
 
-        let row =
-            db_participants::upsert_attendee(&state.db, meeting.id, &email, display_name).await?;
-
-        Ok(Json(APIResponse::ok(row.into_participant_status(None))))
+        if meeting.waiting_room_enabled {
+            // Waiting room ON: attendee enters waiting status.
+            let row =
+                db_participants::upsert_attendee(&state.db, meeting.id, &email, display_name)
+                    .await?;
+            Ok(Json(APIResponse::ok(row.into_participant_status(None))))
+        } else {
+            // Waiting room OFF: auto-admit the attendee.
+            let row =
+                db_participants::upsert_attendee_admitted(&state.db, meeting.id, &email, display_name)
+                    .await?;
+            let token = generate_room_token(
+                &state.jwt_secret,
+                state.token_ttl_secs,
+                &email,
+                &meeting_id,
+                false,
+                display_name.unwrap_or(&email),
+            )?;
+            Ok(Json(APIResponse::ok(
+                row.into_participant_status(Some(token)),
+            )))
+        }
     }
 }
 

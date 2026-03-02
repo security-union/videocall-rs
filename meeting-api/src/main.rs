@@ -65,6 +65,7 @@ async fn main() {
             http::Method::POST,
             http::Method::PUT,
             http::Method::DELETE,
+            http::Method::PATCH,
             http::Method::OPTIONS,
         ])
         .allow_headers([

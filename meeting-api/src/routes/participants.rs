@@ -84,17 +84,12 @@ pub async fn join_meeting(
             return Err(AppError::meeting_not_active(&meeting_id));
         }
 
-        if meeting.waiting_room_enabled {
-            // Waiting room ON: attendee enters waiting status.
-            let row =
-                db_participants::upsert_attendee(&state.db, meeting.id, &email, display_name)
-                    .await?;
-            Ok(Json(APIResponse::ok(row.into_participant_status(None))))
-        } else {
-            // Waiting room OFF: auto-admit the attendee.
-            let row =
-                db_participants::upsert_attendee_admitted(&state.db, meeting.id, &email, display_name)
-                    .await?;
+        // Atomically check waiting_room_enabled and insert participant in one
+        // transaction, using FOR UPDATE to serialize against concurrent toggles.
+        let (auto_admitted, row) =
+            db_participants::join_attendee(&state.db, meeting.id, &email, display_name).await?;
+
+        if auto_admitted {
             let token = generate_room_token(
                 &state.jwt_secret,
                 state.token_ttl_secs,
@@ -106,6 +101,8 @@ pub async fn join_meeting(
             Ok(Json(APIResponse::ok(
                 row.into_participant_status(Some(token)),
             )))
+        } else {
+            Ok(Json(APIResponse::ok(row.into_participant_status(None))))
         }
     }
 }

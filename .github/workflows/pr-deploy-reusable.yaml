@@ -61,10 +61,10 @@ jobs:
               per_page: 10
             });
 
-            const hasRunning = runs.total_count > 0;
-            console.log(`Found ${runs.total_count} undeploy workflow(s) in progress`);
-            core.setOutput('has_running_undeploys', hasRunning ? 'true' : 'false');
-            core.setOutput('undeploy_count', runs.total_count);
+            const count = runs.workflow_runs.length;
+            console.log(`Found ${count} undeploy workflow(s) in progress (total_count=${runs.total_count})`);
+            core.setOutput('has_running_undeploys', count > 0 ? 'true' : 'false');
+            core.setOutput('undeploy_count', count);
 
       - name: Assign deployment slot
         id: assign-slot
@@ -134,8 +134,8 @@ jobs:
             echo "slot_info<<EOF" >> $GITHUB_OUTPUT
             kubectl get namespaces -l app=preview \
               -o custom-columns=SLOT:.metadata.labels.slot,PR:.metadata.labels.pr,AGE:.metadata.creationTimestamp \
-              --no-headers | while read slot pr age; do
-              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.sandbox.videocall.rs ([undeploy](https://github.com/${{ github.repository }}/pull/${pr}#issuecomment-new))"
+              --no-headers | while read -r slot pr age; do
+              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.sandbox.videocall.rs ([undeploy](https://github.com/${{ github.repository }}/pull/${pr}#issuecomment-new))" >> $GITHUB_OUTPUT
             done
             echo "EOF" >> $GITHUB_OUTPUT
           else
@@ -512,6 +512,8 @@ jobs:
             --set "env[11].value=info" \
             --set "env[12].name=COOKIE_NAME" \
             --set "env[12].value=pr${SLOT}-session" \
+            --set "env[13].name=ALLOWED_REDIRECT_URLS" \
+            --set "env[13].value=https://pr${SLOT}.sandbox.videocall.rs" \            
             --set "ingress.hosts[0].host=pr${SLOT}-api.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

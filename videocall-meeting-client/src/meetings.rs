@@ -72,6 +72,15 @@ impl MeetingApiClient {
         parse_api_response(response).await
     }
 
+    /// End a meeting (owner only).
+    ///
+    /// Calls `POST /api/v1/meetings/{meeting_id}/end`.
+    pub async fn end_meeting(&self, meeting_id: &str) -> Result<MeetingInfoResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/end");
+        let response = self.post(&path).send().await?;
+        parse_api_response(response).await
+    }
+
     /// Update meeting settings (owner only).
     ///
     /// Calls `PATCH /api/v1/meetings/{meeting_id}`.

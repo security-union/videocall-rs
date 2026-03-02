@@ -20,8 +20,10 @@ use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
 use dioxus::prelude::*;
+use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, MetricValue};
 
 // Serializable versions of DiagEvent structures
@@ -447,12 +449,18 @@ pub fn Diagnostics(
     let mut neteq_buffer_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut neteq_jitter_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut encoder_settings = use_signal(|| None::<String>);
+    let mut diag_task = use_signal(|| None::<Task>);
 
     // Subscribe to diagnostics events using Dioxus `spawn`.
     // `spawn` runs within the Dioxus runtime so signal mutations properly
-    // trigger re-renders, and the task is automatically cancelled when the
-    // component unmounts (panel closes).
+    // trigger re-renders.  We explicitly cancel the previous Task on each
+    // re-run to prevent double-subscriptions (open → close → open).
     use_effect(move || {
+        // Cancel any previous subscription task.
+        if let Some(task) = *diag_task.peek() {
+            task.cancel();
+        }
+
         if !is_open {
             diagnostics_data.set(None);
             sender_stats.set(None);
@@ -461,10 +469,11 @@ pub fn Diagnostics(
             neteq_stats_per_peer.set(HashMap::new());
             neteq_buffer_per_peer.set(HashMap::new());
             neteq_jitter_per_peer.set(HashMap::new());
+            diag_task.set(None);
             return;
         }
 
-        spawn(async move {
+        let task = spawn(async move {
             let mut rx = subscribe();
             let mut connection_events = Vec::<SerializableDiagEvent>::new();
             let mut neteq_stats = HashMap::<String, Vec<String>>::new();
@@ -535,20 +544,23 @@ pub fn Diagnostics(
                         }
                     }
                     "neteq" => {
+                        let stream_id = evt
+                            .stream_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown->unknown".to_string());
+                        let parts: Vec<&str> = stream_id.split("->").collect();
+                        let target_peer = if parts.len() == 2 {
+                            parts[1]
+                        } else {
+                            "unknown"
+                        };
+                        let mut stats_dirty = false;
+                        let mut buffer_dirty = false;
+                        let mut jitter_dirty = false;
                         for m in &evt.metrics {
                             match m.name {
                                 "stats_json" => {
                                     if let MetricValue::Text(json) = &m.value {
-                                        let stream_id = evt
-                                            .stream_id
-                                            .clone()
-                                            .unwrap_or_else(|| "unknown->unknown".to_string());
-                                        let parts: Vec<&str> = stream_id.split("->").collect();
-                                        let target_peer = if parts.len() == 2 {
-                                            parts[1]
-                                        } else {
-                                            "unknown"
-                                        };
                                         let entry = neteq_stats
                                             .entry(target_peer.to_string())
                                             .or_default();
@@ -556,21 +568,11 @@ pub fn Diagnostics(
                                         if entry.len() > 60 {
                                             entry.remove(0);
                                         }
-                                        neteq_stats_per_peer.set(neteq_stats.clone());
+                                        stats_dirty = true;
                                     }
                                 }
                                 "audio_buffer_ms" => {
                                     if let MetricValue::U64(v) = &m.value {
-                                        let stream_id = evt
-                                            .stream_id
-                                            .clone()
-                                            .unwrap_or_else(|| "unknown->unknown".to_string());
-                                        let parts: Vec<&str> = stream_id.split("->").collect();
-                                        let target_peer = if parts.len() == 2 {
-                                            parts[1]
-                                        } else {
-                                            "unknown"
-                                        };
                                         let entry = neteq_buffer
                                             .entry(target_peer.to_string())
                                             .or_default();
@@ -578,21 +580,11 @@ pub fn Diagnostics(
                                         if entry.len() > 50 {
                                             entry.remove(0);
                                         }
-                                        neteq_buffer_per_peer.set(neteq_buffer.clone());
+                                        buffer_dirty = true;
                                     }
                                 }
                                 "jitter_buffer_delay_ms" => {
                                     if let MetricValue::U64(v) = &m.value {
-                                        let stream_id = evt
-                                            .stream_id
-                                            .clone()
-                                            .unwrap_or_else(|| "unknown->unknown".to_string());
-                                        let parts: Vec<&str> = stream_id.split("->").collect();
-                                        let target_peer = if parts.len() == 2 {
-                                            parts[1]
-                                        } else {
-                                            "unknown"
-                                        };
                                         let entry = neteq_jitter
                                             .entry(target_peer.to_string())
                                             .or_default();
@@ -600,11 +592,21 @@ pub fn Diagnostics(
                                         if entry.len() > 50 {
                                             entry.remove(0);
                                         }
-                                        neteq_jitter_per_peer.set(neteq_jitter.clone());
+                                        jitter_dirty = true;
                                     }
                                 }
                                 _ => {}
                             }
+                        }
+                        // Batch: update signals once per event, not per-metric.
+                        if stats_dirty {
+                            neteq_stats_per_peer.set(neteq_stats.clone());
+                        }
+                        if buffer_dirty {
+                            neteq_buffer_per_peer.set(neteq_buffer.clone());
+                        }
+                        if jitter_dirty {
+                            neteq_jitter_per_peer.set(neteq_jitter.clone());
                         }
                     }
                     "connection_manager" => {
@@ -620,9 +622,18 @@ pub fn Diagnostics(
                 }
             }
         });
+        diag_task.set(Some(task));
     });
 
-    // Get list of available peers
+    // Resolve numeric session IDs to display names via VideoCallClient context.
+    let client = use_context::<VideoCallClient>();
+    let peer_display_name = move |session_id: &str| -> String {
+        client
+            .get_peer_email(session_id)
+            .unwrap_or_else(|| session_id.to_string())
+    };
+
+    // Get list of available peers (keys are raw session IDs).
     let available_peers: Vec<String> = {
         let mut peers = vec!["All Peers".to_string()];
         let stats = neteq_stats_per_peer();
@@ -684,7 +695,12 @@ pub fn Diagnostics(
         format!("Video: {video_str}\nAudio: {audio_str}\nScreen Share: {screen_str}");
     let version = env!("CARGO_PKG_VERSION");
     let version_str = format!("VideoCall UI: {version}");
-    let peer_info = format!("Showing statistics for: {current_peer}");
+    let current_peer_display = if current_peer == "All Peers" {
+        "All Peers".to_string()
+    } else {
+        peer_display_name(&current_peer)
+    };
+    let peer_info = format!("Showing statistics for: {current_peer_display}");
 
     rsx! {
         div {
@@ -713,10 +729,19 @@ pub fn Diagnostics(
                             },
                             value: "{current_peer}",
                             for peer in available_peers.iter() {
-                                option {
-                                    value: "{peer}",
-                                    selected: peer == &current_peer,
-                                    "{peer}"
+                                {
+                                    let label = if peer == "All Peers" {
+                                        "All Peers".to_string()
+                                    } else {
+                                        peer_display_name(peer)
+                                    };
+                                    rsx! {
+                                        option {
+                                            value: "{peer}",
+                                            selected: peer == &current_peer,
+                                            "{label}"
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -766,12 +791,13 @@ pub fn Diagnostics(
                         div { class: "peer-summary",
                             for (peer_id, _) in stats_map.iter() {
                                 {
+                                    let display = peer_display_name(peer_id);
                                     let latest_buffer = buffer_map.get(peer_id).and_then(|b| b.last()).unwrap_or(&0);
                                     let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
                                     let summary = format!("Buffer: {latest_buffer}ms, Jitter: {latest_jitter}ms");
                                     rsx! {
                                         div { class: "peer-summary-item",
-                                            strong { "{peer_id}" }
+                                            strong { "{display}" }
                                             span { "{summary}" }
                                         }
                                     }

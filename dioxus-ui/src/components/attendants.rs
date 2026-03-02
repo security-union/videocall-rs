@@ -659,6 +659,8 @@ pub fn AttendantsComponent(
                                                     meeting_joined.set(false);
                                                     mic_enabled.set(false);
                                                     video_enabled.set(false);
+                                                    pending_mic_enable.set(false);
+                                                    pending_video_enable.set(false);
                                                     call_start_time.set(None);
                                                     meeting_start_time_server.set(None);
 

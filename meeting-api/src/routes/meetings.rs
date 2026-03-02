@@ -231,16 +231,11 @@ pub async fn update_meeting(
     }
 
     let row = if let Some(enabled) = body.waiting_room_enabled {
-        let updated = db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &email, enabled)
+        // Atomically updates the setting and, when disabling, auto-admits
+        // all waiting participants within a single transaction.
+        db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &email, enabled)
             .await?
-            .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
-
-        // When the waiting room is turned OFF, auto-admit everyone currently waiting.
-        if !enabled {
-            let _ = db_participants::admit_all(&state.db, updated.id).await;
-        }
-
-        updated
+            .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?
     } else {
         row
     };

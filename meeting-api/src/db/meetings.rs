@@ -183,14 +183,18 @@ pub async fn set_host_display_name(
     Ok(())
 }
 
-/// Update the waiting_room_enabled setting for a meeting.
+/// Atomically update the waiting_room_enabled setting for a meeting.
+/// When disabling the waiting room, auto-admits all currently waiting participants
+/// within the same transaction to prevent race conditions.
 pub async fn update_waiting_room_enabled(
     pool: &PgPool,
     room_id: &str,
     creator_id: &str,
     enabled: bool,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
-    sqlx::query_as::<_, MeetingRow>(
+    let mut tx = pool.begin().await?;
+
+    let updated = sqlx::query_as::<_, MeetingRow>(
         r#"
         UPDATE meetings
         SET waiting_room_enabled = $3
@@ -203,6 +207,22 @@ pub async fn update_waiting_room_enabled(
     .bind(room_id)
     .bind(creator_id)
     .bind(enabled)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // When disabling the waiting room, admit everyone currently waiting.
+    if let Some(ref row) = updated {
+        if !enabled {
+            sqlx::query(
+                "UPDATE meeting_participants SET status = 'admitted', admitted_at = NOW() \
+                 WHERE meeting_id = $1 AND status = 'waiting'",
+            )
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
+    Ok(updated)
 }

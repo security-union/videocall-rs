@@ -5,8 +5,13 @@ _Please include a summary of the changes and related context._
 - [ ] New feature
 - [ ] Enhancement
 - [ ] Breaking change
-- [ ] Documentation updated
+- [ ] Project / Infra
 
 ## Testing
 - [ ] Tests written or updated
 - [ ] No tests needed
+
+## Other
+- [ ] Documentation updated
+- [ ] Before/After Images provided
+

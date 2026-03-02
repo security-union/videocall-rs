@@ -23,7 +23,14 @@ pub fn do_login() {
         Ok(mut url) => {
             if let Ok(search) = window().location().search() {
                 if !search.is_empty() {
+                    // Already has a returnTo (e.g. redirected from a meeting page).
                     url = format!("{url}{search}");
+                } else if let Ok(origin) = window().location().origin() {
+                    // No returnTo — tell the backend which frontend to return to.
+                    // Encode the value for consistency with meeting pages.
+                    let value = format!("{origin}/");
+                    let encoded = urlencoding::encode(&value);
+                    url = format!("{url}?returnTo={encoded}");
                 }
             }
             let _ = window().location().set_href(&url);

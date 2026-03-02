@@ -19,9 +19,7 @@ use crate::context::{
 };
 use crate::meeting_api::{get_meeting_info, join_meeting, JoinError};
 use dioxus::prelude::*;
-use gloo_timers::callback::Interval;
-use std::cell::RefCell;
-use std::rc::Rc;
+use gloo_timers::future::TimeoutFuture;
 use web_sys::window;
 
 use crate::auth::{check_session, get_user_profile, logout, UserProfile};
@@ -88,40 +86,33 @@ pub fn MeetingPage(id: String) -> Element {
     });
 
     // Fetch user profile
-    {
+    use_effect(move || {
         let auth_done = auth_checked();
-        use_effect(move || {
-            if auth_done && oauth_enabled().unwrap_or(false) {
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Ok(profile) = get_user_profile().await {
-                        user_profile.set(Some(profile));
-                    }
-                });
-            }
-        });
-    }
+        if auth_done && oauth_enabled().unwrap_or(false) {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(profile) = get_user_profile().await {
+                    user_profile.set(Some(profile));
+                }
+            });
+        }
+    });
 
-    // Poll for meeting activation when WaitingForMeeting
-    let _meeting_poll_interval: Rc<RefCell<Option<Interval>>> =
-        use_hook(|| Rc::new(RefCell::new(None)));
+    // Poll for meeting activation when WaitingForMeeting.
+    // Reading `meeting_status()` inside the closure lets Dioxus track the
+    // reactive dependency so the effect re-runs when the status changes.
+    // `spawn` returns a `Task` that Dioxus automatically cancels on re-run.
     {
         let meeting_id = id.clone();
-        let current_status = meeting_status();
-        let poll_interval = _meeting_poll_interval.clone();
         use_effect(move || {
-            // Drop previous interval
-            poll_interval.borrow_mut().take();
-
-            if current_status != MeetingStatus::WaitingForMeeting {
+            let status = meeting_status();
+            if status != MeetingStatus::WaitingForMeeting {
                 return;
             }
             let meeting_id = meeting_id.clone();
             let display_name = input_value_state();
 
-            let interval = Interval::new(2000, move || {
-                let meeting_id = meeting_id.clone();
-                let display_name = display_name.clone();
-                wasm_bindgen_futures::spawn_local(async move {
+            spawn(async move {
+                loop {
                     if let Ok(info) = get_meeting_info(&meeting_id).await {
                         if info.state == "active" {
                             match join_meeting(&meeting_id, Some(&display_name)).await {
@@ -146,22 +137,30 @@ pub fn MeetingPage(id: String) -> Element {
                                             came_from_waiting_room.set(true);
                                             meeting_status.set(MeetingStatus::Waiting);
                                         }
-                                        "rejected" => meeting_status.set(MeetingStatus::Rejected),
+                                        "rejected" => {
+                                            meeting_status.set(MeetingStatus::Rejected);
+                                        }
                                         _ => meeting_status.set(MeetingStatus::Error(format!(
                                             "Unknown status: {}",
                                             response.status
                                         ))),
                                     }
+                                    // Status changed — break out of the loop.
+                                    // The effect will re-run and decide whether
+                                    // to keep polling.
+                                    break;
                                 }
                                 Err(JoinError::MeetingNotActive) => {}
-                                Err(e) => meeting_status.set(MeetingStatus::Error(e.to_string())),
+                                Err(e) => {
+                                    meeting_status.set(MeetingStatus::Error(e.to_string()));
+                                    break;
+                                }
                             }
                         }
                     }
-                });
+                    TimeoutFuture::new(2_000).await;
+                }
             });
-
-            *poll_interval.borrow_mut() = Some(interval);
         });
     }
 

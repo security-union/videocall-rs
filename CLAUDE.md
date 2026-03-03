@@ -71,3 +71,22 @@ The `connection/` module was already properly separated before this refactoring.
 - Non-yew mode uses `CanvasIdProvider` trait instead of yew `Callback` for canvas IDs
 - Non-yew mode uses `emit_client_event()` / `ClientEvent` event bus for framework-agnostic eventin
 
+## Agent Usage Policy
+
+Always delegate work to the specialized roster agents instead of making changes directly. Use the appropriate agent for each task:
+
+- **frontend-rust-webtransport-and-websocket** — All Dioxus/Yew UI changes (components, pages, styling, state management)
+- **backend-rust-streaming** — All backend/API changes (Axum routes, DB queries, server logic)
+- **code-reviewer** — Review all code changes before committing
+- **web-security-auditor** — Review code touching auth, user input, API endpoints
+- **database-reviewer** — Review schema, migration, and query changes
+- **integration-test-writer** — Write integration tests for new or changed features
+- **deploy-sync-expert** — Update Docker/K8s configs when services or dependencies change
+- **e2e-test-sync** — Create/update E2E tests when user-facing behavior changes
+
+Run agents in parallel when tasks are independent. Always run `code-reviewer` after substantive code changes.
+
+## Source Code Rules
+
+- **No symlinks or hardlinks for source files.** Each crate/UI must own its files independently. Do not use symlinks between `dioxus-ui/` and `yew-ui/` static assets or any other source directories. If both UIs need shared CSS, copy the shared base and maintain framework-specific additions separately.
+

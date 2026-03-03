@@ -37,6 +37,27 @@ pub async fn refresh_room_token(meeting_id: &str) -> Result<String, JoinError> {
     client()?.refresh_room_token(meeting_id).await
 }
 
+pub async fn update_meeting(
+    meeting_id: &str,
+    waiting_room_enabled: bool,
+) -> Result<MeetingInfo, JoinError> {
+    let req = videocall_meeting_types::requests::UpdateMeetingRequest {
+        waiting_room_enabled: Some(waiting_room_enabled),
+    };
+    client()?.update_meeting(meeting_id, &req).await
+}
+
+pub async fn end_meeting(meeting_id: &str) -> Result<MeetingInfo, JoinError> {
+    log::info!("Ending meeting via API: {meeting_id}");
+    client()?.end_meeting(meeting_id).await
+}
+
+pub async fn delete_meeting(meeting_id: &str) -> Result<(), JoinError> {
+    log::info!("Deleting meeting via API: {meeting_id}");
+    client()?.delete_meeting(meeting_id).await?;
+    Ok(())
+}
+
 pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
     log::info!("Leaving meeting via API: {meeting_id}");
     match client()?.leave_meeting(meeting_id).await {

@@ -33,6 +33,19 @@ pub struct CreateMeetingRequest {
     /// Meeting password (hashed with Argon2 before storage).
     #[serde(default)]
     pub password: Option<String>,
+
+    /// Whether the waiting room is enabled. Defaults to `true` on the server
+    /// when omitted.
+    #[serde(default)]
+    pub waiting_room_enabled: Option<bool>,
+}
+
+/// Request body for `PATCH /api/v1/meetings/{meeting_id}`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpdateMeetingRequest {
+    /// Toggle the waiting room on or off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_room_enabled: Option<bool>,
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/join`.

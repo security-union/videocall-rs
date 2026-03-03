@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 use crate::components::login::Login;
 use crate::pages::home::Home;
 use crate::pages::meeting::MeetingPage;
+use crate::pages::meeting_settings::MeetingSettingsPage;
 
 #[derive(Clone, Routable, PartialEq, Debug)]
 pub enum Route {
@@ -14,6 +15,8 @@ pub enum Route {
     Home {},
     #[route("/login")]
     Login {},
+    #[route("/meeting/:id/settings")]
+    MeetingSettings { id: String },
     #[route("/meeting/:id", MeetingPage)]
     Meeting { id: String },
     #[route("/meeting/:id/:webtransport_enabled", MeetingPage2)]
@@ -23,6 +26,12 @@ pub enum Route {
     },
     #[route("/404")]
     NotFound {},
+}
+
+/// Wrapper component for MeetingSettings route.
+#[component]
+fn MeetingSettings(id: String) -> Element {
+    rsx! { MeetingSettingsPage { id } }
 }
 
 /// Wrapper component for Meeting2 route that passes only `id` to MeetingPage.

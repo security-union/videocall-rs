@@ -87,7 +87,7 @@ pub async fn join_meeting(
 
         // Atomically check waiting_room_enabled and insert participant in one
         // transaction, using FOR UPDATE to serialize against concurrent toggles.
-        let (auto_admitted, row) =
+        let (auto_admitted, row, waiting_room_enabled) =
             db_participants::join_attendee(&state.db, meeting.id, &email, display_name).await?;
 
         let token = if auto_admitted {
@@ -104,7 +104,7 @@ pub async fn join_meeting(
         };
 
         let mut resp = row.into_participant_status(token);
-        resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+        resp.waiting_room_enabled = Some(waiting_room_enabled);
         resp.host_display_name = meeting.host_display_name;
         Ok(Json(APIResponse::ok(resp)))
     }

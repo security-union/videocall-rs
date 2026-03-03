@@ -167,13 +167,6 @@ fn MeetingItem(
     let nav = use_navigator();
     let is_active = meeting.state == "active";
     let is_ended = meeting.state == "ended";
-    let mut editing = use_signal(|| false);
-    let mut waiting_room_toggle = use_signal({
-        let wr = meeting.waiting_room_enabled;
-        move || wr
-    });
-    let mut toggle_error = use_signal(|| None::<String>);
-
     let state_class = match meeting.state.as_str() {
         "active" => "state-active",
         "idle" => "state-idle",
@@ -216,7 +209,9 @@ fn MeetingItem(
 
     let on_edit_click = move |e: MouseEvent| {
         e.stop_propagation();
-        editing.set(!editing());
+        nav.push(Route::MeetingSettings {
+            id: meeting_id_edit.clone(),
+        });
     };
 
     rsx! {
@@ -326,46 +321,6 @@ fn MeetingItem(
                     path { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }
                     line { x1: "10", y1: "11", x2: "10", y2: "17" }
                     line { x1: "14", y1: "11", x2: "14", y2: "17" }
-                }
-            }
-            if editing() {
-                {
-                    let meeting_id = meeting_id_edit.clone();
-                    rsx! {
-                        div {
-                            style: "width: 100%; padding: 0.75rem 1rem; border-top: 1px solid rgba(255,255,255,0.1); display: flex; align-items: center; gap: 0.75rem;",
-                            onclick: move |e: MouseEvent| e.stop_propagation(),
-                            span { style: "font-size: 0.85rem; color: rgba(255,255,255,0.8);", "Waiting Room" }
-                            crate::components::toggle_switch::ToggleSwitch {
-                                enabled: waiting_room_toggle(),
-                                width: 40,
-                                height: 22,
-                                on_toggle: {
-                                    let meeting_id = meeting_id.clone();
-                                    move |new_val: bool| {
-                                        toggle_error.set(None);
-                                        waiting_room_toggle.set(new_val);
-                                        let meeting_id = meeting_id.clone();
-                                        wasm_bindgen_futures::spawn_local(async move {
-                                            if let Err(e) = crate::meeting_api::update_meeting(&meeting_id, new_val).await {
-                                                log::error!("Failed to update waiting room: {e}");
-                                                waiting_room_toggle.set(!new_val);
-                                                toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                                            }
-                                        });
-                                    }
-                                },
-                            }
-                            span { style: "font-size: 0.75rem; color: rgba(255,255,255,0.5);",
-                                if waiting_room_toggle() { "ON" } else { "OFF" }
-                            }
-                        }
-                        if let Some(err) = toggle_error() {
-                            p { style: "width: 100%; text-align: center; color: #ff6b6b; font-size: 0.75rem; margin: 0.25rem 0 0 0; padding: 0 1rem;",
-                                "{err}"
-                            }
-                        }
-                    }
                 }
             }
         }

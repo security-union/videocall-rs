@@ -51,7 +51,7 @@ pub async fn upsert_host(
         INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name, admitted_at)
         VALUES ($1, $2, 'admitted', TRUE, $3, NOW())
         ON CONFLICT (meeting_id, email)
-        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(),
+        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(), left_at = NULL,
                       display_name = COALESCE($3, meeting_participants.display_name)
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -68,14 +68,16 @@ pub async fn upsert_host(
 /// setting. Locks the meeting row with `FOR UPDATE` to serialize against concurrent
 /// waiting room toggles via `update_waiting_room_enabled`.
 ///
-/// Returns `(auto_admitted, ParticipantRow)` where `auto_admitted` is `true` when the
-/// participant was immediately admitted (waiting room disabled).
+/// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where `auto_admitted`
+/// is `true` when the participant was immediately admitted (waiting room disabled).
+/// The third element is the `waiting_room_enabled` value observed under the row lock,
+/// which avoids stale reads from a pre-transaction fetch.
 pub async fn join_attendee(
     pool: &PgPool,
     meeting_id: i32,
     email: &str,
     display_name: Option<&str>,
-) -> Result<(bool, ParticipantRow), sqlx::Error> {
+) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
     // Lock the meeting row to serialize against concurrent waiting room toggles.
@@ -109,7 +111,7 @@ pub async fn join_attendee(
             INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name, admitted_at)
             VALUES ($1, $2, 'admitted', FALSE, $3, NOW())
             ON CONFLICT (meeting_id, email)
-            DO UPDATE SET status = 'admitted', admitted_at = NOW(),
+            DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
                           display_name = COALESCE($3, meeting_participants.display_name)
             RETURNING {PARTICIPANT_COLUMNS}
             "#
@@ -123,7 +125,7 @@ pub async fn join_attendee(
     };
 
     tx.commit().await?;
-    Ok((!waiting_room_enabled, row))
+    Ok((!waiting_room_enabled, row, waiting_room_enabled))
 }
 
 /// Get all participants in 'waiting' status for a meeting.

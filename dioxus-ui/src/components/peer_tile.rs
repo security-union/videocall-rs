@@ -29,11 +29,11 @@ pub fn PeerTile(
     let client = use_context::<VideoCallClientCtx>();
     let peer_status_map = use_context::<PeerStatusMap>();
 
-    // Subscribe to peer_status_map changes so Dioxus re-renders this component
-    // when peer state updates. The actual state values are read by
-    // generate_for_peer via client.is_*_for_peer(), which reads the same Peer
-    // fields that were updated before the diagnostics event was broadcast.
-    let _ = peer_status_map.read().get(&peer_id);
+    // Subscribe only to this peer's individual signal so that state changes
+    // for other peers do not trigger a re-render of this tile.
+    if let Some(peer_signal) = peer_status_map.peek().get(&peer_id).copied() {
+        let _ = peer_signal.read();
+    }
 
     let host_dn = host_display_name.as_deref();
     generate_for_peer(&client, &peer_id, full_bleed, host_dn)

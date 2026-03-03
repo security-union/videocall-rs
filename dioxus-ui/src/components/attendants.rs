@@ -375,10 +375,17 @@ pub fn AttendantsComponent(
                     continue;
                 }
                 if let Some((peer_id, state)) = parse_peer_status_event(&evt) {
-                    let mut map = peer_status_map.write();
-                    let entry = map.entry(peer_id).or_default();
-                    if *entry != state {
-                        *entry = state;
+                    // Check if this peer already has a signal.
+                    let existing = peer_status_map.read().get(&peer_id).copied();
+                    if let Some(mut sig) = existing {
+                        // Update the per-peer signal only if the state changed.
+                        if *sig.peek() != state {
+                            sig.set(state);
+                        }
+                    } else {
+                        // First event for this peer — create a new signal.
+                        let sig = Signal::new(state);
+                        peer_status_map.write().insert(peer_id, sig);
                     }
                 }
             }

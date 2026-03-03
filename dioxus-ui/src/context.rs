@@ -32,12 +32,13 @@ pub struct PeerMediaState {
     pub screen_enabled: bool,
 }
 
-/// Shared map of peer media states, provided as a Dioxus context.
+/// Shared map of per-peer media state signals, provided as a Dioxus context.
 ///
 /// A single async task subscribes to the diagnostics broadcast channel and
-/// updates this map.  Individual `PeerTile` components read from it instead
-/// of each spawning their own subscriber.
-pub type PeerStatusMap = Signal<std::collections::HashMap<String, PeerMediaState>>;
+/// updates per-peer signals.  Each `PeerTile` reads only its own
+/// `Signal<PeerMediaState>`, so a state change for peer A does not cause
+/// peer B's tile to re-render.
+pub type PeerStatusMap = Signal<std::collections::HashMap<String, Signal<PeerMediaState>>>;
 
 /// Holds meeting host information shared via context.
 #[derive(Clone, PartialEq, Default)]

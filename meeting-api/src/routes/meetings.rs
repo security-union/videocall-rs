@@ -21,7 +21,7 @@ use axum::{
 };
 use rand::Rng;
 use videocall_meeting_types::{
-    requests::{CreateMeetingRequest, ListMeetingsQuery},
+    requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
     responses::{
         APIResponse, CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
         MeetingInfoResponse, MeetingSummary,
@@ -99,12 +99,15 @@ pub async fn create_meeting(
     let attendees_json =
         serde_json::to_value(&body.attendees).map_err(|e| AppError::internal(&e.to_string()))?;
 
-    let row = db_meetings::create(
+    let waiting_room_enabled = body.waiting_room_enabled.unwrap_or(true);
+
+    let row = db_meetings::create_with_options(
         &state.db,
         &meeting_id,
         &email,
         password_hash.as_deref(),
         &attendees_json,
+        waiting_room_enabled,
     )
     .await
     .map_err(|e| match e {
@@ -121,6 +124,7 @@ pub async fn create_meeting(
         state: row.state.unwrap_or_else(|| "idle".to_string()),
         attendees: body.attendees,
         has_password: password_hash.is_some(),
+        waiting_room_enabled: row.waiting_room_enabled,
     };
 
     Ok((StatusCode::CREATED, Json(APIResponse::ok(response))))
@@ -153,6 +157,7 @@ pub async fn list_meetings(
             started_at: row.started_at.timestamp(),
             ended_at: row.ended_at.map(|t| t.timestamp()),
             waiting_count,
+            waiting_room_enabled: row.waiting_room_enabled,
         });
     }
 
@@ -183,6 +188,7 @@ pub async fn get_meeting(
         host: row.creator_id.unwrap_or_default(),
         host_display_name: row.host_display_name,
         has_password: row.password_hash.is_some(),
+        waiting_room_enabled: row.waiting_room_enabled,
         your_status,
     })))
 }
@@ -206,6 +212,56 @@ pub async fn delete_meeting(
 
     Ok(Json(APIResponse::ok(DeleteMeetingResponse {
         message: format!("Meeting '{meeting_id}' has been deleted"),
+    })))
+}
+
+/// PATCH /api/v1/meetings/{meeting_id}
+pub async fn update_meeting(
+    State(state): State<AppState>,
+    AuthUser { email, .. }: AuthUser,
+    Path(meeting_id): Path<String>,
+    Json(body): Json<UpdateMeetingRequest>,
+) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
+    let row = if let Some(enabled) = body.waiting_room_enabled {
+        // Atomically updates the setting and, when disabling, auto-admits
+        // all waiting participants within a single transaction.
+        // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
+        // so we only fetch separately on failure to distinguish 404 vs 403.
+        match db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &email, enabled)
+            .await?
+        {
+            Some(row) => row,
+            None => {
+                return Err(
+                    match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
+                        Some(_) => AppError::not_owner(),
+                        None => AppError::meeting_not_found(&meeting_id),
+                    },
+                );
+            }
+        }
+    } else {
+        // No changes requested — fetch and verify ownership.
+        let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
+            .await?
+            .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+        if row.creator_id.as_deref() != Some(email.as_str()) {
+            return Err(AppError::not_owner());
+        }
+        row
+    };
+
+    let your_status = db_participants::get_status(&state.db, row.id, &email).await?;
+    let your_status = your_status.map(|p| p.into_participant_status(None));
+
+    Ok(Json(APIResponse::ok(MeetingInfoResponse {
+        meeting_id: row.room_id,
+        state: row.state.unwrap_or_else(|| "idle".to_string()),
+        host: row.creator_id.unwrap_or_default(),
+        host_display_name: row.host_display_name,
+        has_password: row.password_hash.is_some(),
+        waiting_room_enabled: row.waiting_room_enabled,
+        your_status,
     })))
 }
 

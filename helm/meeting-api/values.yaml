@@ -41,7 +41,7 @@ env:
   - name: COOKIE_NAME
     value: "session"
   - name: CORS_ALLOWED_ORIGIN
-    value: "https://app.videocall.rs"
+    value: "https://app.videocall.rs,https://app-dx.videocall.rs"
   # --- OAuth / OIDC ---
   # Set OAUTH_ISSUER for OIDC discovery (auto-populates auth/token/jwks URLs, see below).
   # OAUTH_ISSUER is base URI, e.g. https://accounts.google.com or https://acme.okta.com/oauth2/default
@@ -77,7 +77,7 @@ env:
   - name: AFTER_LOGIN_URL
     value: "https://app.videocall.rs"
   - name: ALLOWED_REDIRECT_URLS
-    value: "https://app.videocall.rs"
+    value: "https://app.videocall.rs,https://app-dx.videocall.rs"
 resources:
   limits:
     cpu: "200m"

@@ -14,22 +14,33 @@ pub fn ToggleSwitch(
     on_toggle: EventHandler<bool>,
     #[props(default = 44)] width: u32,
     #[props(default = 24)] height: u32,
+    #[props(default = false)] disabled: bool,
 ) -> Element {
     let knob_size = height.saturating_sub(4);
     let knob_left_on = width.saturating_sub(knob_size + 2);
     let border_radius = height / 2;
+
+    let disabled_style = if disabled {
+        " opacity: 0.5; cursor: not-allowed;"
+    } else {
+        ""
+    };
 
     rsx! {
         button {
             r#type: "button",
             role: "switch",
             aria_checked: "{enabled}",
+            disabled: disabled,
             style: format!(
                 "position: relative; width: {width}px; height: {height}px; border-radius: {border_radius}px; \
-                 border: none; cursor: pointer; background: {}; transition: background 0.2s; flex-shrink: 0;",
+                 border: none; cursor: pointer; background: {}; transition: background 0.2s; flex-shrink: 0;{disabled_style}",
                 if enabled { "#34c759" } else { "#636366" }
             ),
             onclick: move |_| {
+                if disabled {
+                    return;
+                }
                 on_toggle.call(!enabled);
             },
             div {

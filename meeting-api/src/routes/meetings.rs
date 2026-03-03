@@ -182,6 +182,9 @@ pub async fn get_meeting(
     let your_status = db_participants::get_status(&state.db, row.id, &email).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
+    let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
+    let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
+
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
         state: row.state.unwrap_or_else(|| "idle".to_string()),
@@ -189,6 +192,10 @@ pub async fn get_meeting(
         host_display_name: row.host_display_name,
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
+        participant_count,
+        waiting_count,
+        started_at: row.started_at.timestamp_millis(),
+        ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
     })))
 }
@@ -212,6 +219,70 @@ pub async fn delete_meeting(
 
     Ok(Json(APIResponse::ok(DeleteMeetingResponse {
         message: format!("Meeting '{meeting_id}' has been deleted"),
+    })))
+}
+
+/// POST /api/v1/meetings/{meeting_id}/end
+pub async fn end_meeting_handler(
+    State(state): State<AppState>,
+    AuthUser { email, .. }: AuthUser,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    if meeting.creator_id.as_deref() != Some(email.as_str()) {
+        return Err(AppError::not_owner());
+    }
+
+    // Idempotent: if already ended, return the current state.
+    if meeting.state.as_deref() == Some("ended") {
+        let your_status = db_participants::get_status(&state.db, meeting.id, &email).await?;
+        let your_status = your_status.map(|p| p.into_participant_status(None));
+
+        let participant_count = db_participants::count_admitted(&state.db, meeting.id).await?;
+        let waiting_count = db_participants::count_waiting(&state.db, meeting.id).await?;
+
+        return Ok(Json(APIResponse::ok(MeetingInfoResponse {
+            meeting_id: meeting.room_id,
+            state: "ended".to_string(),
+            host: meeting.creator_id.unwrap_or_default(),
+            host_display_name: meeting.host_display_name,
+            has_password: meeting.password_hash.is_some(),
+            waiting_room_enabled: meeting.waiting_room_enabled,
+            participant_count,
+            waiting_count,
+            started_at: meeting.started_at.timestamp_millis(),
+            ended_at: meeting.ended_at.map(|t| t.timestamp_millis()),
+            your_status,
+        })));
+    }
+
+    db_meetings::end_meeting(&state.db, meeting.id).await?;
+
+    let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    let your_status = db_participants::get_status(&state.db, row.id, &email).await?;
+    let your_status = your_status.map(|p| p.into_participant_status(None));
+
+    let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
+    let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
+
+    Ok(Json(APIResponse::ok(MeetingInfoResponse {
+        meeting_id: row.room_id,
+        state: row.state.unwrap_or_else(|| "idle".to_string()),
+        host: row.creator_id.unwrap_or_default(),
+        host_display_name: row.host_display_name,
+        has_password: row.password_hash.is_some(),
+        waiting_room_enabled: row.waiting_room_enabled,
+        participant_count,
+        waiting_count,
+        started_at: row.started_at.timestamp_millis(),
+        ended_at: row.ended_at.map(|t| t.timestamp_millis()),
+        your_status,
     })))
 }
 
@@ -254,6 +325,9 @@ pub async fn update_meeting(
     let your_status = db_participants::get_status(&state.db, row.id, &email).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
+    let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
+    let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
+
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
         state: row.state.unwrap_or_else(|| "idle".to_string()),
@@ -261,6 +335,10 @@ pub async fn update_meeting(
         host_display_name: row.host_display_name,
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
+        participant_count,
+        waiting_count,
+        started_at: row.started_at.timestamp_millis(),
+        ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
     })))
 }

@@ -181,6 +181,7 @@ pub fn AttendantsComponent(
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
 
     // Create VideoCallClient and MediaDeviceAccess once.
@@ -455,17 +456,29 @@ pub fn AttendantsComponent(
                                     span { style: "font-size: 0.9rem;", "Waiting Room" }
                                     crate::components::toggle_switch::ToggleSwitch {
                                         enabled: waiting_room_toggle(),
+                                        disabled: saving(),
                                         on_toggle: {
                                             let meeting_id = meeting_id_for_toggle.clone();
                                             move |new_val: bool| {
+                                                if saving() {
+                                                    return;
+                                                }
                                                 toggle_error.set(None);
                                                 waiting_room_toggle.set(new_val);
+                                                saving.set(true);
                                                 let meeting_id = meeting_id.clone();
                                                 wasm_bindgen_futures::spawn_local(async move {
-                                                    if let Err(e) = crate::meeting_api::update_meeting(&meeting_id, new_val).await {
-                                                        log::error!("Failed to update waiting room setting: {e}");
-                                                        waiting_room_toggle.set(!new_val);
-                                                        toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val).await {
+                                                        Ok(updated) => {
+                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                            saving.set(false);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("Failed to update waiting room setting: {e}");
+                                                            waiting_room_toggle.set(!new_val);
+                                                            saving.set(false);
+                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                        }
                                                     }
                                                 });
                                             }
@@ -473,7 +486,7 @@ pub fn AttendantsComponent(
                                     }
                                 }
                                 if let Some(err) = toggle_error() {
-                                    p { style: "text-align: center; color: #ff6b6b; font-size: 0.8rem; margin-bottom: 0.75rem; margin-top: -0.75rem;",
+                                    p { class: "toggle-error",
                                         "{err}"
                                     }
                                 }

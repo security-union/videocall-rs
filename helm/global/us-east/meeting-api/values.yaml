@@ -36,7 +36,7 @@ meeting-api:
     - name: COOKIE_DOMAIN
       value: ".videocall.rs"
     - name: CORS_ALLOWED_ORIGIN
-      value: "https://app.videocall.rs"
+      value: "https://app.videocall.rs,https://app-dx.videocall.rs"
     # --- OAuth / OIDC ---
     - name: OAUTH_CLIENT_ID
       valueFrom:

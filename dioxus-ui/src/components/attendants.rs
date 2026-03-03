@@ -177,6 +177,8 @@ pub fn AttendantsComponent(
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
+    let mut pending_mic_enable = use_signal(|| false);
+    let mut pending_video_enable = use_signal(|| false);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -306,7 +308,22 @@ pub fn AttendantsComponent(
         mda.on_granted = VcCallback::from(move |_| {
             let mut media_access_granted = media_access_granted;
             let mut meeting_joined = meeting_joined;
+            let mut mic_enabled = mic_enabled;
+            let mut video_enabled = video_enabled;
+            let mut pending_mic_enable = pending_mic_enable;
+            let mut pending_video_enable = pending_video_enable;
             media_access_granted.set(true);
+
+            // Fulfil any pending mic/camera enables that triggered the permission request.
+            if pending_mic_enable() {
+                mic_enabled.set(true);
+                pending_mic_enable.set(false);
+            }
+            if pending_video_enable() {
+                video_enabled.set(true);
+                pending_video_enable.set(false);
+            }
+
             // Connect after permissions granted
             if let Err(e) = client_cell.borrow_mut().connect() {
                 log::error!("Connection failed: {e:?}");
@@ -538,6 +555,7 @@ pub fn AttendantsComponent(
                                                         if media_access_granted() {
                                                             mic_enabled.set(true);
                                                         } else {
+                                                            pending_mic_enable.set(true);
                                                             mda_mic.borrow().request();
                                                         }
                                                     } else {
@@ -569,6 +587,7 @@ pub fn AttendantsComponent(
                                                                 }
                                                             }
                                                         } else {
+                                                            pending_video_enable.set(true);
                                                             mda_cam.borrow().request();
                                                         }
                                                     } else {
@@ -640,6 +659,8 @@ pub fn AttendantsComponent(
                                                     meeting_joined.set(false);
                                                     mic_enabled.set(false);
                                                     video_enabled.set(false);
+                                                    pending_mic_enable.set(false);
+                                                    pending_video_enable.set(false);
                                                     call_start_time.set(None);
                                                     meeting_start_time_server.set(None);
 

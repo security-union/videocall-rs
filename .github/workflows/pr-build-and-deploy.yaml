@@ -139,6 +139,9 @@ jobs:
           - name: web-ui
             dockerfile: Dockerfile.yew
             image: videocall-web-ui
+          - name: dioxus-ui
+            dockerfile: Dockerfile.dioxus
+            image: videocall-dioxus-ui
     steps:
       - name: Checkout PR code
         uses: actions/checkout@v4
@@ -185,6 +188,7 @@ jobs:
             - \`ghcr.io/${{ github.repository_owner }}/videocall-media-server:pr-${prNumber}\`
             - \`ghcr.io/${{ github.repository_owner }}/videocall-meeting-api:pr-${prNumber}\`
             - \`ghcr.io/${{ github.repository_owner }}/videocall-web-ui:pr-${prNumber}\`
+            - \`ghcr.io/${{ github.repository_owner }}/videocall-dioxus-ui:pr-${prNumber}\`
 
             🚀 **Starting deployment...**
 

@@ -14,7 +14,7 @@
 //! Meeting CRUD endpoints: create, list, get, delete.
 
 use videocall_meeting_types::{
-    requests::CreateMeetingRequest,
+    requests::{CreateMeetingRequest, UpdateMeetingRequest},
     responses::{
         CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse, MeetingInfoResponse,
     },
@@ -69,6 +69,19 @@ impl MeetingApiClient {
     ) -> Result<DeleteMeetingResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}");
         let response = self.delete(&path).send().await?;
+        parse_api_response(response).await
+    }
+
+    /// Update meeting settings (owner only).
+    ///
+    /// Calls `PATCH /api/v1/meetings/{meeting_id}`.
+    pub async fn update_meeting(
+        &self,
+        meeting_id: &str,
+        request: &UpdateMeetingRequest,
+    ) -> Result<MeetingInfoResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}");
+        let response = self.patch(&path).json(request).send().await?;
         parse_api_response(response).await
     }
 }

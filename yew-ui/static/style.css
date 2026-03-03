@@ -2802,60 +2802,6 @@ select {
   }
 }
 
-.toggle-switch {
-  position: relative;
-  width: 51px;
-  height: 31px;
-  border-radius: 15.5px;
-  border: none;
-  cursor: pointer;
-  transition: background-color 0.25s ease, opacity 0.2s ease;
-  flex-shrink: 0;
-  padding: 0;
-  -webkit-appearance: none;
-  appearance: none;
-  outline: none;
-}
-
-.toggle-switch:focus-visible {
-  outline: 2px solid var(--accent, #0A84FF);
-  outline-offset: 2px;
-  box-shadow: 0 0 0 4px rgba(10, 132, 255, 0.2);
-}
-
-.toggle-switch:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.toggle-on {
-  background-color: var(--success, #30D158);
-}
-
-.toggle-off {
-  background-color: rgba(120, 120, 128, 0.36);
-}
-
-.toggle-knob {
-  position: absolute;
-  top: 2px;
-  width: 27px;
-  height: 27px;
-  border-radius: 50%;
-  background: #FFFFFF;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 1px rgba(0, 0, 0, 0.15);
-  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-  pointer-events: none;
-}
-
-.toggle-knob-on {
-  transform: translateX(22px);
-}
-
-.toggle-knob-off {
-  transform: translateX(2px);
-}
-
 /* ── Action rows ── */
 .settings-action-row {
   margin-bottom: 0.75rem;

@@ -7,6 +7,7 @@ use crate::constants::oauth_enabled;
 use crate::meeting_api::{
     delete_meeting, end_meeting, get_meeting_info, update_meeting, MeetingInfo,
 };
+use crate::components::toggle_switch::ToggleSwitch;
 use crate::routing::Route;
 use dioxus::prelude::*;
 use web_sys::window;
@@ -34,6 +35,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut waiting_room_toggle = use_signal(|| false);
     let mut saving = use_signal(|| false);
+    let mut toggle_error = use_signal(|| None::<String>);
     let mut ending = use_signal(|| false);
     let mut deleting = use_signal(|| false);
 
@@ -158,11 +160,11 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let meeting_id_end = id.clone();
     let meeting_id_delete = id.clone();
 
-    let on_toggle_waiting_room = move |_| {
+    let on_toggle_waiting_room = move |new_val: bool| {
         if saving() {
             return;
         }
-        let new_val = !waiting_room_toggle();
+        toggle_error.set(None);
         waiting_room_toggle.set(new_val);
         saving.set(true);
         let meeting_id = meeting_id_toggle.clone();
@@ -176,6 +178,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     log::error!("Failed to update waiting room: {e}");
                     waiting_room_toggle.set(!new_val);
                     saving.set(false);
+                    toggle_error.set(Some(format!("Failed to update setting: {e}")));
                 }
             }
         });
@@ -377,16 +380,16 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                             line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
                         }
                     }
-                    button {
-                        r#type: "button",
-                        role: "switch",
-                        aria_checked: if waiting_room_toggle() { "true" } else { "false" },
-                        aria_label: "Toggle waiting room",
-                        class: if waiting_room_toggle() { "toggle-switch toggle-on" } else { "toggle-switch toggle-off" },
-                        disabled: saving(),
-                        onclick: on_toggle_waiting_room,
-                        div { class: if waiting_room_toggle() { "toggle-knob toggle-knob-on" } else { "toggle-knob toggle-knob-off" } }
+                    ToggleSwitch {
+                        enabled: waiting_room_toggle(),
+                        on_toggle: on_toggle_waiting_room,
                     }
+                }
+            }
+
+            if let Some(err) = toggle_error() {
+                p { style: "text-align: center; color: #ff6b6b; font-size: 0.8rem; margin-top: 0.5rem;",
+                    "{err}"
                 }
             }
         }

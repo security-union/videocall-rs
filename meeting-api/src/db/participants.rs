@@ -51,7 +51,7 @@ pub async fn upsert_host(
         INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name, admitted_at)
         VALUES ($1, $2, 'admitted', TRUE, $3, NOW())
         ON CONFLICT (meeting_id, email)
-        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(),
+        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(), left_at = NULL,
                       display_name = COALESCE($3, meeting_participants.display_name)
         RETURNING {PARTICIPANT_COLUMNS}
         "#

@@ -94,6 +94,7 @@ pub struct Peer {
     pub screen_enabled: bool,
     pub is_speaking: bool,
     context_initialized: bool,
+    vad_threshold: Option<f32>,
 }
 
 use std::fmt::Debug;
@@ -115,10 +116,11 @@ impl Peer {
         session_id: u64,
         email: String,
         aes: Option<Aes128State>,
+        vad_threshold: Option<f32>,
     ) -> Result<Self, JsValue> {
         let sid_str = session_id.to_string();
         let (mut audio, video, screen) =
-            Self::new_decoders(&video_canvas_id, &screen_canvas_id, &sid_str)?;
+            Self::new_decoders(&video_canvas_id, &screen_canvas_id, &sid_str, vad_threshold)?;
 
         audio.set_muted(true);
         debug!("Initialized peer {email} (session_id: {session_id}) with audio muted");
@@ -138,6 +140,7 @@ impl Peer {
             screen_enabled: false,
             is_speaking: false,
             context_initialized: false,
+            vad_threshold,
         })
     }
 
@@ -145,6 +148,7 @@ impl Peer {
         video_canvas_id: &str,
         screen_canvas_id: &str,
         peer_id: &str,
+        vad_threshold: Option<f32>,
     ) -> Result<
         (
             Box<dyn AudioPeerDecoderTrait>,
@@ -175,7 +179,7 @@ impl Peer {
     }
 
     Ok((
-    create_audio_peer_decoder(None, peer_id.to_string())?,
+    create_audio_peer_decoder(None, peer_id.to_string(), vad_threshold)?,
     video_decoder,
     screen_decoder,
     ))
@@ -184,7 +188,7 @@ impl Peer {
     fn reset(&mut self) -> Result<(), JsValue> {
         let sid_str = self.session_id.to_string();
         let (mut audio, video, screen) =
-            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &sid_str)?;
+            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &sid_str, self.vad_threshold)?;
 
         // Preserve the current mute state after reset
         audio.set_muted(!self.audio_enabled);
@@ -304,18 +308,6 @@ impl Peer {
                     self.screen_enabled = metadata.screen_enabled;
                     self.is_speaking = metadata.is_speaking;
 
-                    // Broadcast is_speaking change via diagnostics
-                    let speaking_evt = DiagEvent {
-                        subsystem: "peer_status",
-                        stream_id: None,
-                        ts_ms: now_ms(),
-                        metrics: vec![
-                            metric!("to_peer", self.session_id.to_string()),
-                            metric!("is_speaking", if metadata.is_speaking { 1u64 } else { 0u64 }),
-                        ],
-                    };
-                    let _ = global_sender().try_broadcast(speaking_evt);
-
                     // Flush video decoder when video is turned off
                     if video_turned_off {
                         self.video.flush();
@@ -421,6 +413,7 @@ pub struct PeerDecodeManager {
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Rc<DiagnosticManager>>,
     pub on_peer_removed: Callback<String>,
+    vad_threshold: Option<f32>,
 }
 
 impl Default for PeerDecodeManager {
@@ -438,6 +431,7 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
             on_peer_removed: Callback::noop(),
+            vad_threshold: None,
         }
     }
 
@@ -449,7 +443,12 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: Some(diagnostics),
             on_peer_removed: Callback::noop(),
+            vad_threshold: None,
         }
+    }
+
+    pub fn set_vad_threshold(&mut self, threshold: Option<f32>) {
+        self.vad_threshold = threshold;
     }
 
     pub fn sorted_keys(&self) -> &Vec<u64> {
@@ -551,6 +550,7 @@ impl PeerDecodeManager {
                 session_id,
                 email.to_owned(),
                 aes,
+                self.vad_threshold,
             )?,
         );
         Ok(())

@@ -82,11 +82,13 @@ pub fn create_microphone_encoder(
     bitrate_kbps: u32,
     on_encoder_settings_update: Callback<String>,
     on_error: Callback<String>,
+    vad_threshold: Option<f32>,
 ) -> Box<dyn MicrophoneEncoderTrait> {
     Box::new(MicrophoneEncoder::new(
         client,
         bitrate_kbps,
         on_encoder_settings_update,
         on_error,
+        vad_threshold,
     ))
 }

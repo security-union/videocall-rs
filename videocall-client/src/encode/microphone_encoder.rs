@@ -98,7 +98,10 @@ pub struct MicrophoneEncoder {
     on_error: Option<Callback<String>>,
     is_speaking: Rc<AtomicBool>,
     vad_interval: Rc<RefCell<Option<Interval>>>,
+    vad_threshold: f32,
 }
+
+const DEFAULT_VAD_THRESHOLD: f32 = 0.02;
 
 impl MicrophoneEncoder {
     pub fn new(
@@ -106,6 +109,7 @@ impl MicrophoneEncoder {
         _bitrate_kbps: u32,
         on_encoder_settings_update: Callback<String>,
         on_error: Callback<String>,
+        vad_threshold: Option<f32>,
     ) -> Self {
         Self {
             client,
@@ -115,6 +119,7 @@ impl MicrophoneEncoder {
             on_error: Some(on_error),
             is_speaking: Rc::new(AtomicBool::new(false)),
             vad_interval: Rc::new(RefCell::new(None)),
+            vad_threshold: vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD),
         }
     }
 
@@ -245,6 +250,7 @@ impl MicrophoneEncoder {
         let is_speaking_for_vad = self.is_speaking.clone();
         let client_for_vad = client.clone();
         let vad_interval_holder = self.vad_interval.clone();
+        let vad_threshold = self.vad_threshold;
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -459,9 +465,9 @@ impl MicrophoneEncoder {
                 }
                 let rms = (sum / array.len() as f32).sqrt();
 
-                let speaking = rms > 0.02;
+                let speaking = rms > vad_threshold;
 
-                log::info!("🔴 VAD: RMS={:.4}, speaking={}", rms, speaking);
+                log::trace!("VAD: RMS={:.4}, speaking={}", rms, speaking);
 
                 is_speaking_clone.store(speaking, Ordering::Relaxed);
                 client_clone.set_speaking(speaking);

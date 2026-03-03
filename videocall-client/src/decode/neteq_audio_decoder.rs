@@ -54,10 +54,10 @@ enum WorkerResponse {
     },
 }
 
-/// Threshold for voice activity detection (RMS level)
+/// Default threshold for voice activity detection (RMS level)
 /// Values typically range from 0.0 to 1.0 for normalized audio
 /// 0.01 is quite sensitive, 0.05 filters out most background noise
-const VAD_THRESHOLD: f32 = 0.02;
+const DEFAULT_VAD_THRESHOLD: f32 = 0.02;
 
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
 #[derive(Debug)]
@@ -169,10 +169,11 @@ impl NetEqAudioPeerDecoder {
         speaker_device_id: Option<String>,
         peer_id: String,
         speaking: Rc<RefCell<bool>>,
+        vad_threshold: f32,
     ) {
         // Calculate RMS for voice activity detection
         let rms = Self::calculate_rms(&pcm);
-        let is_speaking = rms > VAD_THRESHOLD;
+        let is_speaking = rms > vad_threshold;
 
         // Check if speaking state changed
         let prev_speaking = *speaking.borrow();
@@ -385,6 +386,7 @@ impl NetEqAudioPeerDecoder {
         pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
         worker: Worker,
         speaking: Rc<RefCell<bool>>,
+        vad_threshold: f32,
     ) -> Closure<dyn FnMut(MessageEvent)> {
         Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
@@ -399,6 +401,7 @@ impl NetEqAudioPeerDecoder {
                     speaker_device_id.clone(),
                     peer_id.clone(),
                     speaking.clone(),
+                    vad_threshold,
                 );
             } else if data.is_object() {
                 // Try to parse as WorkerResponse first
@@ -451,8 +454,9 @@ impl NetEqAudioPeerDecoder {
     pub fn new_with_muted_state(
         speaker_device_id: Option<String>,
         peer_id: String,
+        vad_threshold: Option<f32>,
     ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
-        Self::new_with_mute_state(speaker_device_id, peer_id, true) // Default to muted
+        Self::new_with_mute_state(speaker_device_id, peer_id, true, vad_threshold) // Default to muted
     }
 
     /// Create audio decoder with explicit initial mute state
@@ -460,6 +464,7 @@ impl NetEqAudioPeerDecoder {
         speaker_device_id: Option<String>,
         peer_id: String,
         initial_muted: bool,
+        vad_threshold: Option<f32>,
     ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
         // Create worker
         let worker = Self::create_neteq_worker()?;
@@ -469,6 +474,8 @@ impl NetEqAudioPeerDecoder {
         SharedAudioContext::ensure_pcm_worklet(WORKLET_CODE);
 
         let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
+
+        let threshold = vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD);
 
         // Create decoder with explicit mute state first
         let mut decoder = Self {
@@ -496,6 +503,7 @@ impl NetEqAudioPeerDecoder {
             decoder.pending_messages.clone(),
             worker.clone(),
             decoder.speaking.clone(),
+            threshold,
         );
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));

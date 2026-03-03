@@ -19,45 +19,52 @@ tests_build:
 tests_down:
 	docker compose -f $(COMPOSE_IT) down -v
 
-up:
-		docker compose -f docker/docker-compose.yaml up
+COMPOSE := docker compose --env-file .env -f docker/docker-compose.yaml
+
+# Auto-create .env from sample on first run so --env-file never fails
+.env:
+	@echo "No .env found — creating from docker/.env-sample. Edit it before running make up."
+	cp docker/.env-sample .env
+
+up: .env
+		$(COMPOSE) up
 down:
-		docker compose -f docker/docker-compose.yaml down
+		$(COMPOSE) down
 build:
-		docker compose -f docker/docker-compose.yaml build
+		$(COMPOSE) build
 
 connect_to_db:
-		docker compose -f docker/docker-compose.yaml run postgres bash -c "psql -h postgres -d actix-api-db -U postgres"
+		$(COMPOSE) run postgres bash -c "psql -h postgres -d actix-api-db -U postgres"
 
 connect_to_nats:
-	docker compose -f docker/docker-compose.yaml exec nats-box sh
+	$(COMPOSE) exec nats-box sh
 
 clippy-fix:
-		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app && cargo clippy --fix"
+		$(COMPOSE) run yew-ui bash -c "cd /app && cargo clippy --fix"
 
 fmt:
-		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app && cargo fmt"
+		$(COMPOSE) run yew-ui bash -c "cd /app && cargo fmt"
 
-check: 
-		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app && cargo clippy --all  -- --deny warnings && cargo fmt --check"
+check:
+		$(COMPOSE) run websocket-api bash -c "cd /app && cargo clippy --all  -- --deny warnings && cargo fmt --check"
 
 clean:
-		docker compose -f docker/docker-compose.yaml down --remove-orphans \
+		$(COMPOSE) down --remove-orphans \
 			--volumes --rmi all
 
 # Clean stale Docker resources (networks, containers)
 clean-docker:
-		docker compose -f docker/docker-compose.yaml down --remove-orphans
+		$(COMPOSE) down --remove-orphans
 		docker network prune -f
 
 # Rebuild all images from scratch (use after Dockerfile changes or for ARM64 migration)
 rebuild:
-		docker compose -f docker/docker-compose.yaml build --no-cache
+		$(COMPOSE) build --no-cache
 
 # Rebuild and start (fresh build + run)
 rebuild-up:
-		docker compose -f docker/docker-compose.yaml build --no-cache
-		docker compose -f docker/docker-compose.yaml up
+		$(COMPOSE) build --no-cache
+		$(COMPOSE) up
 
 # ---------------------------------------------------------------------------
 # Yew UI component tests

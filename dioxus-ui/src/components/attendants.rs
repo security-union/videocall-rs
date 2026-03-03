@@ -350,6 +350,29 @@ pub fn AttendantsComponent(
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
 
+    // Single diagnostics subscriber shared by all PeerTile components.
+    // Instead of each PeerTile spawning its own async task, one task
+    // dispatches peer_status events into a shared HashMap.
+    let mut peer_status_map: crate::context::PeerStatusMap =
+        use_context_provider(|| Signal::new(std::collections::HashMap::new()));
+    use_effect(move || {
+        spawn(async move {
+            let mut rx = videocall_diagnostics::subscribe();
+            while let Ok(evt) = rx.recv().await {
+                if evt.subsystem != "peer_status" {
+                    continue;
+                }
+                if let Some((peer_id, state)) = parse_peer_status_event(&evt) {
+                    let mut map = peer_status_map.write();
+                    let entry = map.entry(peer_id).or_default();
+                    if *entry != state {
+                        *entry = state;
+                    }
+                }
+            }
+        });
+    });
+
     // Check for config errors
     use_effect(move || {
         if let Err(e) = crate::constants::app_config() {
@@ -852,4 +875,35 @@ pub fn AttendantsComponent(
             }
         }
     }
+}
+
+/// Parse a `peer_status` diagnostics event into a `(peer_id, PeerMediaState)`.
+fn parse_peer_status_event(
+    evt: &videocall_diagnostics::DiagEvent,
+) -> Option<(String, crate::context::PeerMediaState)> {
+    use videocall_diagnostics::MetricValue;
+
+    let mut to_peer: Option<String> = None;
+    let mut audio = false;
+    let mut video = false;
+    let mut screen = false;
+    for m in &evt.metrics {
+        match (m.name, &m.value) {
+            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+            ("audio_enabled", MetricValue::U64(v)) => audio = *v != 0,
+            ("video_enabled", MetricValue::U64(v)) => video = *v != 0,
+            ("screen_enabled", MetricValue::U64(v)) => screen = *v != 0,
+            _ => {}
+        }
+    }
+    to_peer.map(|id| {
+        (
+            id,
+            crate::context::PeerMediaState {
+                audio_enabled: audio,
+                video_enabled: video,
+                screen_enabled: screen,
+            },
+        )
+    })
 }

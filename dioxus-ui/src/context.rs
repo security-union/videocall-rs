@@ -24,6 +24,21 @@ pub struct MeetingTime {
 
 pub type MeetingTimeCtx = Signal<MeetingTime>;
 
+/// Per-peer media state tracked by the shared diagnostics subscriber.
+#[derive(Clone, Default, PartialEq)]
+pub struct PeerMediaState {
+    pub audio_enabled: bool,
+    pub video_enabled: bool,
+    pub screen_enabled: bool,
+}
+
+/// Shared map of peer media states, provided as a Dioxus context.
+///
+/// A single async task subscribes to the diagnostics broadcast channel and
+/// updates this map.  Individual `PeerTile` components read from it instead
+/// of each spawning their own subscriber.
+pub type PeerStatusMap = Signal<std::collections::HashMap<String, PeerMediaState>>;
+
 /// Holds meeting host information shared via context.
 #[derive(Clone, PartialEq, Default)]
 #[allow(dead_code)]

@@ -181,6 +181,7 @@ pub fn AttendantsComponent(
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let mut toggle_error = use_signal(|| None::<String>);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -449,16 +450,23 @@ pub fn AttendantsComponent(
                                         on_toggle: {
                                             let meeting_id = meeting_id_for_toggle.clone();
                                             move |new_val: bool| {
+                                                toggle_error.set(None);
                                                 waiting_room_toggle.set(new_val);
                                                 let meeting_id = meeting_id.clone();
                                                 wasm_bindgen_futures::spawn_local(async move {
                                                     if let Err(e) = crate::meeting_api::update_meeting(&meeting_id, new_val).await {
                                                         log::error!("Failed to update waiting room setting: {e}");
                                                         waiting_room_toggle.set(!new_val);
+                                                        toggle_error.set(Some(format!("Failed to update setting: {e}")));
                                                     }
                                                 });
                                             }
                                         },
+                                    }
+                                }
+                                if let Some(err) = toggle_error() {
+                                    p { style: "text-align: center; color: #ff6b6b; font-size: 0.8rem; margin-bottom: 0.75rem; margin-top: -0.75rem;",
+                                        "{err}"
                                     }
                                 }
                                 p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-bottom: 1.5rem; margin-top: -0.75rem;",

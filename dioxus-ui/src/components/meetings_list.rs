@@ -172,6 +172,7 @@ fn MeetingItem(
         let wr = meeting.waiting_room_enabled;
         move || wr
     });
+    let mut toggle_error = use_signal(|| None::<String>);
 
     let state_class = match meeting.state.as_str() {
         "active" => "state-active",
@@ -342,12 +343,14 @@ fn MeetingItem(
                                 on_toggle: {
                                     let meeting_id = meeting_id.clone();
                                     move |new_val: bool| {
+                                        toggle_error.set(None);
                                         waiting_room_toggle.set(new_val);
                                         let meeting_id = meeting_id.clone();
                                         wasm_bindgen_futures::spawn_local(async move {
                                             if let Err(e) = crate::meeting_api::update_meeting(&meeting_id, new_val).await {
                                                 log::error!("Failed to update waiting room: {e}");
                                                 waiting_room_toggle.set(!new_val);
+                                                toggle_error.set(Some(format!("Failed to update setting: {e}")));
                                             }
                                         });
                                     }
@@ -355,6 +358,11 @@ fn MeetingItem(
                             }
                             span { style: "font-size: 0.75rem; color: rgba(255,255,255,0.5);",
                                 if waiting_room_toggle() { "ON" } else { "OFF" }
+                            }
+                        }
+                        if let Some(err) = toggle_error() {
+                            p { style: "width: 100%; text-align: center; color: #ff6b6b; font-size: 0.75rem; margin: 0.25rem 0 0 0; padding: 0 1rem;",
+                                "{err}"
                             }
                         }
                     }

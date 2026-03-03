@@ -1,0 +1,5 @@
+apiVersion: v2
+name: videocall-ui
+description: Helm chart for the videocall-rs Dioxus frontend
+type: application
+version: 0.1.0

@@ -1,0 +1,739 @@
+name: Deploy PR Preview (Reusable) - HCL
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: 'PR number'
+        required: true
+        type: string
+      pr_sha:
+        description: 'PR commit SHA'
+        required: true
+        type: string
+      comment_id:
+        description: 'Comment ID for reactions (optional)'
+        required: false
+        type: string
+    secrets:
+      HARBOR_USERNAME:
+        required: true
+      HARBOR_PASSWORD:
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: write
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  KUBECONFIG: /home/jenkins/.kube/k3s-config
+
+jobs:
+  deploy:
+    name: Deploy preview environment
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
+      - name: Validate kubectl and kubeconfig access
+        run: |
+          test -f "${KUBECONFIG}"
+          test -r "${KUBECONFIG}"
+          kubectl config current-context
+          CLUSTER_INFO=$(kubectl cluster-info)
+          echo "${CLUSTER_INFO}"
+          # Strip ANSI color codes before grep (kubectl outputs colors even when not a TTY)
+          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_sha }}
+
+      - name: Add NATS Helm repo
+        run: |
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+
+      - name: List Nodes and Namespaces (debug)
+        run: |
+          kubectl get nodes
+          kubectl get namespaces
+          kubectl config current-context
+
+      - name: Check for running undeploy workflows
+        id: check-undeploy
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'pr-undeploy-hcl.yaml',
+              status: 'in_progress',
+              per_page: 10
+            });
+
+            const hasRunning = runs.total_count > 0;
+            console.log(`Found ${runs.total_count} undeploy workflow(s) in progress`);
+            core.setOutput('has_running_undeploys', hasRunning ? 'true' : 'false');
+            core.setOutput('undeploy_count', runs.total_count);
+
+      - name: Assign deployment slot
+        id: assign-slot
+        run: |
+          set -e  # Exit on error
+          PR_NUM=${{ inputs.pr_number }}
+          MAX_SLOTS=${{ vars.PR_PREVIEW_MAX_SLOTS }}
+          MAX_SLOTS=${MAX_SLOTS:-3}  # Default to 3 if not set
+
+          echo "Maximum preview slots configured: ${MAX_SLOTS}"
+          echo "Looking for existing deployment of PR #${PR_NUM}..."
+
+          # Test kubectl connectivity
+          echo "Testing kubectl connectivity..."
+          kubectl version --client || { echo "kubectl not available"; exit 1; }
+
+          # Check if this PR already has a slot assigned
+          echo "Checking for existing slot assignment..."
+          EXISTING_SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>&1 || true)
+          echo "Existing slot query result: '${EXISTING_SLOT}'"
+
+          if [ -n "$EXISTING_SLOT" ] && [[ ! "$EXISTING_SLOT" =~ "Error" ]]; then
+            echo "✅ PR #${PR_NUM} already deployed in slot ${EXISTING_SLOT}"
+            echo "SLOT=$EXISTING_SLOT" >> $GITHUB_OUTPUT
+            echo "slot_assigned=true" >> $GITHUB_OUTPUT
+            echo "is_redeployment=true" >> $GITHUB_OUTPUT
+            echo "max_slots=${MAX_SLOTS}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Find first available slot
+          AVAILABLE_SLOT=""
+          echo "Checking slots 1-${MAX_SLOTS} for availability..."
+          for SLOT in $(seq 1 $MAX_SLOTS); do
+            echo "Checking slot ${SLOT}..."
+            if ! kubectl get namespace preview-slot-${SLOT} >/dev/null 2>&1; then
+              AVAILABLE_SLOT=$SLOT
+              echo "✅ Found available slot: ${SLOT}"
+              break
+            else
+              echo "  Slot ${SLOT} is occupied"
+            fi
+          done
+
+          # If capacity reached but undeploys are running, wait and re-check
+          if [ -z "$AVAILABLE_SLOT" ] && [ "${{ steps.check-undeploy.outputs.has_running_undeploys }}" = "true" ]; then
+            echo "⏳ All slots full but ${{ steps.check-undeploy.outputs.undeploy_count }} undeploy(s) in progress. Waiting 30 seconds..."
+            sleep 30
+
+            # Re-check for available slots
+            for SLOT in $(seq 1 $MAX_SLOTS); do
+              if ! kubectl get namespace preview-slot-${SLOT} >/dev/null 2>&1; then
+                AVAILABLE_SLOT=$SLOT
+                echo "✅ Found available slot after waiting: ${SLOT}"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$AVAILABLE_SLOT" ]; then
+            echo "❌ All ${MAX_SLOTS} preview slots are occupied"
+            echo "slot_assigned=false" >> $GITHUB_OUTPUT
+            echo "max_slots=${MAX_SLOTS}" >> $GITHUB_OUTPUT
+
+            # Get slot occupancy for error message
+            echo "slot_info<<EOF" >> $GITHUB_OUTPUT
+            kubectl get namespaces -l app=preview \
+              -o custom-columns=SLOT:.metadata.labels.slot,PR:.metadata.labels.pr,AGE:.metadata.creationTimestamp \
+              --no-headers | while read slot pr age; do
+              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.preview.videocall.fnxlabs.com ([undeploy](https://github01.hclpnp.com/${{ github.repository }}/pull/${pr}#issuecomment-new))"
+            done
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "SLOT=$AVAILABLE_SLOT" >> $GITHUB_OUTPUT
+            echo "slot_assigned=true" >> $GITHUB_OUTPUT
+            echo "is_redeployment=false" >> $GITHUB_OUTPUT
+            echo "max_slots=${MAX_SLOTS}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post capacity error comment
+        if: steps.assign-slot.outputs.slot_assigned == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const slotInfo = `${{ steps.assign-slot.outputs.slot_info }}`;
+            const maxSlots = ${{ steps.assign-slot.outputs.max_slots }};
+
+            github.rest.issues.createComment({
+              issue_number: ${{ inputs.pr_number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **All preview slots are in use (${maxSlots}/${maxSlots})**
+
+            Cannot deploy preview for PR #${{ inputs.pr_number }} because all deployment slots are occupied.
+
+            **Active deployments:**
+            ${slotInfo}
+
+            **Action required:** Comment \`/undeploy\` on one of the PRs above to free a slot, then try again.`
+            });
+
+      - name: React to comment (capacity exceeded)
+        if: steps.assign-slot.outputs.slot_assigned == 'false' && inputs.comment_id != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ inputs.comment_id }},
+              content: 'confused'
+            })
+
+      - name: Fail if capacity exceeded
+        if: steps.assign-slot.outputs.slot_assigned == 'false'
+        run: exit 1
+
+      - name: Login to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          echo "Attempting Harbor login as user: $HARBOR_USERNAME"
+          if echo "$HARBOR_PASSWORD" | docker login hclcr.io -u "$HARBOR_USERNAME" --password-stdin; then
+            echo "✅ Harbor login successful"
+          else
+            echo "❌ Harbor login failed"
+            exit 1
+          fi
+
+      - name: Verify Harbor images exist
+        id: verify-images
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Checking if Harbor images exist for pr-${PR_NUM}..."
+          echo "Registry: ${REGISTRY}"
+
+          # Harbor API endpoint (assumes hclcr.io Harbor instance)
+          HARBOR_API="https://hclcr.io/api/v2.0"
+          PROJECT="hcllabs"
+          TAG="pr-${PR_NUM}"
+
+          REPOS=(
+            "videocall-media-server"
+            "videocall-meeting-api"
+            "videocall-web-ui"
+          )
+
+          MISSING_IMAGES=()
+
+          for REPO in "${REPOS[@]}"; do
+            IMAGE="${REGISTRY}/${REPO}:${TAG}"
+            echo "Checking ${IMAGE}..."
+
+            # Use Harbor API to check if artifact exists
+            # URL encode the repository name (replace / with %2F)
+            ENCODED_REPO=$(echo "${REPO}" | sed 's/\//%2F/g')
+            API_URL="${HARBOR_API}/projects/${PROJECT}/repositories/${ENCODED_REPO}/artifacts/${TAG}"
+
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" "${API_URL}")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "  ✅ Found"
+            else
+              echo "  ❌ Not found (HTTP ${HTTP_CODE})"
+              MISSING_IMAGES+=("${IMAGE}")
+            fi
+          done
+
+          if [ ${#MISSING_IMAGES[@]} -gt 0 ]; then
+            echo "images_missing=true" >> $GITHUB_OUTPUT
+            echo "missing_list<<EOF" >> $GITHUB_OUTPUT
+            for IMG in "${MISSING_IMAGES[@]}"; do
+              echo "- **${IMG}**" >> $GITHUB_OUTPUT
+            done
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "images_missing=false" >> $GITHUB_OUTPUT
+            echo "✅ All images found"
+          fi
+
+      - name: Post images missing error comment
+        if: steps.verify-images.outputs.images_missing == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const missingList = `${{ steps.verify-images.outputs.missing_list }}`;
+            github.rest.issues.createComment({
+              issue_number: ${{ inputs.pr_number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Images not found**
+
+            Cannot deploy PR #${{ inputs.pr_number }} because required Docker images have not been built yet.
+
+            **Missing images:**
+            ${missingList}
+
+            **Action required:** Comment \`/build-images\` to build and push the required images, then try again.
+
+            ⏱️ Image builds typically take 10-15 minutes.`
+            });
+
+      - name: React to comment (images missing)
+        if: steps.verify-images.outputs.images_missing == 'true' && inputs.comment_id != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ inputs.comment_id }},
+              content: 'confused'
+            })
+
+      - name: Fail if images missing
+        if: steps.verify-images.outputs.images_missing == 'true'
+        run: exit 1
+
+      - name: Create namespace
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Creating namespace: ${NAMESPACE} for PR #${PR_NUM} in slot ${SLOT}"
+          kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "Labeling namespace with slot and PR metadata"
+          kubectl label namespace ${NAMESPACE} app=preview slot=${SLOT} pr=${PR_NUM} --overwrite
+
+      - name: Copy wildcard TLS certificate to preview namespace
+        run: |
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Copying wildcard TLS secret to slot ${SLOT} namespace..."
+          kubectl get secret preview-wildcard-tls -n preview-infra -o json \
+            | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.selfLink, .metadata.managedFields) | .metadata.namespace = "'${NAMESPACE}'"' \
+            | kubectl apply -f -
+
+          echo "✅ TLS secret copied"
+
+      - name: Copy Harbor registry pull secret to preview namespace
+        run: |
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Copying Harbor pull secret to slot ${SLOT} namespace..."
+          kubectl get secret harbor-pull-secret -n preview-infra -o json \
+            | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.selfLink, .metadata.managedFields) | .metadata.namespace = "'${NAMESPACE}'"' \
+            | kubectl apply -f -
+
+          echo "✅ Harbor pull secret copied"
+
+      - name: Create JWT secret for preview
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          # Check if JWT secret already exists
+          if kubectl get secret jwt-secret -n ${NAMESPACE} >/dev/null 2>&1; then
+            echo "✅ JWT secret already exists for slot ${SLOT}, reusing (keeps user sessions valid)"
+          else
+            echo "Creating new JWT secret for slot ${SLOT}..."
+
+            # Generate a unique JWT secret for this preview slot (256-bit entropy)
+            JWT_SECRET=$(openssl rand -hex 32)
+
+            kubectl create secret generic jwt-secret \
+              --from-literal=secret="${JWT_SECRET}" \
+              --namespace ${NAMESPACE}
+
+            echo "✅ JWT secret created for slot ${SLOT}"
+          fi
+
+      - name: Apply ResourceQuota
+        run: |
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: preview-quota
+            namespace: ${NAMESPACE}
+          spec:
+            hard:
+              requests.cpu: "500m"
+              requests.memory: "1Gi"
+              limits.cpu: "1000m"
+              limits.memory: "2Gi"
+              pods: "10"
+          EOF
+
+          echo "✅ ResourceQuota applied to slot ${SLOT}"
+
+      - name: Create postgres database
+        run: |
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          DB_NAME="preview_slot_${SLOT}"
+
+          echo "Creating database: ${DB_NAME} for slot ${SLOT}"
+
+          # Get postgres password from secret
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
+
+          # Create database (or reuse existing if slot being reassigned)
+          kubectl exec -n preview-infra postgres-postgresql-0 -- \
+            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "CREATE DATABASE ${DB_NAME};" || {
+              echo "⚠️  Database already exists (slot reuse), continuing..."
+            }
+
+          echo "✅ Database ready: ${DB_NAME}"
+
+      - name: Deploy NATS
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Deploying NATS instance for slot ${SLOT} (PR #${PR_NUM})..."
+
+          # Build helm dependencies for the NATS chart
+          helm dependency update helm/global/us-east/nats/
+
+          # Deploy using the production NATS chart with preview-specific overrides
+          helm upgrade --install nats-pr-${PR_NUM} helm/global/us-east/nats/ \
+            --namespace ${NAMESPACE} \
+            --set nats.natsbox.enabled=false \
+            --set nats.reloader.enabled=false \
+            --set nats.exporter.enabled=false \
+            --set nats.natsbox.resources.limits.cpu=5m \
+            --set nats.natsbox.resources.limits.memory=16Mi \
+            --set nats.natsbox.resources.requests.cpu=1m \
+            --set nats.natsbox.resources.requests.memory=8Mi \
+            --set nats.reloader.resources.limits.cpu=5m \
+            --set nats.reloader.resources.limits.memory=16Mi \
+            --set nats.reloader.resources.requests.cpu=1m \
+            --set nats.reloader.resources.requests.memory=8Mi \
+            --set nats.exporter.resources.limits.cpu=5m \
+            --set nats.exporter.resources.limits.memory=16Mi \
+            --set nats.exporter.resources.requests.cpu=1m \
+            --set nats.exporter.resources.requests.memory=8Mi \
+            --set nats.nats.resources.limits.cpu=50m \
+            --set nats.nats.resources.limits.memory=64Mi \
+            --set nats.nats.resources.requests.cpu=25m \
+            --set nats.nats.resources.requests.memory=32Mi \
+            --set gateway.enabled=false \
+            --wait --timeout 3m
+
+          echo "✅ NATS deployed to slot ${SLOT}"
+
+      - name: Deploy WebSocket Server
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Deploying WebSocket server to slot ${SLOT}..."
+
+          helm upgrade --install preview-${PR_NUM}-ws helm/rustlemania-websocket/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=${REGISTRY}/videocall-media-server \
+            --set image.tag=pr-${PR_NUM} \
+            --set imagePullSecrets[0].name=harbor-pull-secret \
+            --set fullnameOverride=websocket-pr-${PR_NUM} \
+            --set "env[0].name=NATS_URL" \
+            --set "env[0].value=nats://nats-pr-${PR_NUM}.${NAMESPACE}.svc.cluster.local:4222" \
+            --set "env[1].name=JWT_SECRET" \
+            --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
+            --set "env[1].valueFrom.secretKeyRef.key=secret" \
+            --set "env[2].name=ACTIX_PORT" \
+            --set-string "env[2].value=8080" \
+            --set "env[3].name=RUST_LOG" \
+            --set "env[3].value=info" \
+            --set "env[4].name=REGION" \
+            --set "env[4].value=preview-slot-${SLOT}" \
+            --set "env[5].name=SERVICE_TYPE" \
+            --set "env[5].value=websocket" \
+            --set "env[6].name=SERVER_STATS_INTERVAL_SECS" \
+            --set-string "env[6].value=5" \
+            --set "env[7].name=TOKIO_WORKER_THREADS" \
+            --set-string "env[7].value=1" \
+            --set "ingress.hosts[0].host=pr${SLOT}-ws.preview.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.hosts[0].paths[0].service.name=websocket-pr-${PR_NUM}" \
+            --set "ingress.hosts[0].paths[0].service.port.number=8080" \
+            --set "ingress.tls[0].secretName=preview-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}-ws.preview.videocall.fnxlabs.com" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --wait --timeout 5m
+
+          echo "✅ WebSocket server deployed to slot ${SLOT}"
+
+      - name: Deploy Meeting API
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          # Get postgres password
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
+
+          # Validate OAuth credentials secret exists
+          echo "Validating OAuth credentials..."
+          if ! kubectl get secret google-oauth-credentials -n preview-infra >/dev/null 2>&1; then
+            echo "::error::Secret google-oauth-credentials not found in preview-infra namespace"
+            echo "Create it with: kubectl create secret generic google-oauth-credentials -n preview-infra --from-literal=client-id=YOUR_ID --from-literal=client-secret=YOUR_SECRET"
+            exit 1
+          fi
+
+          # Get OAuth credentials
+          OAUTH_CLIENT_ID=$(kubectl get secret google-oauth-credentials -n preview-infra -o jsonpath='{.data.client-id}' | base64 -d)
+          OAUTH_CLIENT_SECRET=$(kubectl get secret google-oauth-credentials -n preview-infra -o jsonpath='{.data.client-secret}' | base64 -d)
+
+          # Validate OAuth credentials are not empty
+          if [ -z "$OAUTH_CLIENT_ID" ] || [ -z "$OAUTH_CLIENT_SECRET" ]; then
+            echo "::error::OAuth credentials are empty. Check google-oauth-credentials secret contains client-id and client-secret keys."
+            exit 1
+          fi
+
+          echo "✅ OAuth credentials validated"
+          echo "Deploying Meeting API to slot ${SLOT} with OAuth enabled..."
+
+          helm upgrade --install preview-${PR_NUM}-api helm/meeting-api/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=${REGISTRY}/videocall-meeting-api \
+            --set image.tag=pr-${PR_NUM} \
+            --set imagePullSecrets[0].name=harbor-pull-secret \
+            --set fullnameOverride=api-pr-${PR_NUM} \
+            --set "env[0].name=DATABASE_URL" \
+            --set "env[0].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.preview-infra.svc.cluster.local:5432/preview_slot_${SLOT}?sslmode=disable" \
+            --set "env[1].name=JWT_SECRET" \
+            --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
+            --set "env[1].valueFrom.secretKeyRef.key=secret" \
+            --set "env[2].name=CORS_ALLOWED_ORIGIN" \
+            --set "env[2].value=https://pr${SLOT}.preview.videocall.fnxlabs.com" \
+            --set "env[3].name=COOKIE_DOMAIN" \
+            --set "env[3].value=.preview.videocall.fnxlabs.com" \
+            --set "env[4].name=OAUTH_ISSUER" \
+            --set "env[4].value=https://accounts.google.com" \
+            --set "env[5].name=OAUTH_CLIENT_ID" \
+            --set "env[5].value=${OAUTH_CLIENT_ID}" \
+            --set "env[6].name=OAUTH_SECRET" \
+            --set "env[6].value=${OAUTH_CLIENT_SECRET}" \
+            --set "env[7].name=OAUTH_REDIRECT_URL" \
+            --set "env[7].value=https://pr${SLOT}-api.preview.videocall.fnxlabs.com/login/callback" \
+            --set "env[8].name=AFTER_LOGIN_URL" \
+            --set "env[8].value=https://pr${SLOT}.preview.videocall.fnxlabs.com" \
+            --set "env[9].name=OAUTH_SCOPES" \
+            --set "env[9].value=openid email profile" \
+            --set "env[10].name=LISTEN_ADDR" \
+            --set "env[10].value=0.0.0.0:8081" \
+            --set "env[11].name=RUST_LOG" \
+            --set "env[11].value=info" \
+            --set "ingress.hosts[0].host=pr${SLOT}-api.preview.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.hosts[0].paths[0].service.name=api-pr-${PR_NUM}" \
+            --set "ingress.hosts[0].paths[0].service.port.number=8081" \
+            --set "ingress.tls[0].secretName=preview-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}-api.preview.videocall.fnxlabs.com" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --wait --timeout 5m
+
+          echo "✅ Meeting API deployed to slot ${SLOT} with OAuth"
+
+      - name: Deploy UI
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Deploying UI to slot ${SLOT} with OAuth enabled..."
+
+          helm upgrade --install preview-${PR_NUM}-ui helm/rustlemania-ui/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=${REGISTRY}/videocall-web-ui \
+            --set image.tag=pr-${PR_NUM} \
+            --set imagePullSecrets[0].name=harbor-pull-secret \
+            --set fullnameOverride=ui-pr-${PR_NUM} \
+            --set ingress.redirect=false \
+            --set "runtimeConfig.apiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
+            --set "runtimeConfig.meetingApiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
+            --set "runtimeConfig.wsUrl=wss://pr${SLOT}-ws.preview.videocall.fnxlabs.com" \
+            --set "runtimeConfig.webTransportHost=" \
+            --set-string "runtimeConfig.webTransportEnabled=false" \
+            --set-string "runtimeConfig.oauthEnabled=true" \
+            --set-string "runtimeConfig.e2eeEnabled=false" \
+            --set-string "runtimeConfig.firefoxEnabled=false" \
+            --set "runtimeConfig.usersAllowedToStream=" \
+            --set "runtimeConfig.serverElectionPeriodMs=2000" \
+            --set "runtimeConfig.audioBitrateKbps=65" \
+            --set "runtimeConfig.videoBitrateKbps=1000" \
+            --set "runtimeConfig.screenBitrateKbps=1000" \
+            --set "ingress.hosts[0].host=pr${SLOT}.preview.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.hosts[0].paths[0].service.name=ui-pr-${PR_NUM}" \
+            --set "ingress.hosts[0].paths[0].service.port.number=80" \
+            --set "ingress.tls[0].secretName=preview-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}.preview.videocall.fnxlabs.com" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --wait --timeout 5m
+
+          echo "✅ UI deployed to slot ${SLOT} with OAuth"
+
+      - name: Wait for all pods to be ready
+        run: |
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Waiting for all pods to be ready in slot ${SLOT}..."
+          kubectl wait --for=condition=ready pod --all -n ${NAMESPACE} --timeout=180s
+
+          echo "✅ All pods ready in slot ${SLOT}"
+
+      - name: Get deployment status
+        id: deployment-status
+        run: |
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Deployment status for slot ${SLOT}:"
+          kubectl get pods -n ${NAMESPACE}
+
+          echo "Services:"
+          kubectl get services -n ${NAMESPACE}
+
+          echo "Ingresses:"
+          kubectl get ingress -n ${NAMESPACE}
+
+      - name: Post success comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            const slot = ${{ steps.assign-slot.outputs.SLOT }};
+            const maxSlots = ${{ steps.assign-slot.outputs.max_slots }};
+            const isRedeployment = '${{ steps.assign-slot.outputs.is_redeployment }}' === 'true';
+
+            const deploymentType = isRedeployment ? 'redeployed' : 'deployed';
+            const slotStatus = isRedeployment ? '(slot reused)' : '';
+
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **Preview ${deploymentType} to slot ${slot}** ${slotStatus}
+
+            🌐 **Preview URLs:**
+            - **UI:** https://pr${slot}.preview.videocall.fnxlabs.com
+            - **API:** https://pr${slot}-api.preview.videocall.fnxlabs.com
+            - **WebSocket:** wss://pr${slot}-ws.preview.videocall.fnxlabs.com
+
+            🔐 **Configuration:**
+            - **Authentication:** Google OAuth enabled (login required)
+            - WebTransport: Disabled (WebSocket fallback only)
+            - End-to-end encryption: Disabled
+
+            📊 **Slot occupancy:** Slot ${slot} of ${maxSlots} maximum slots
+
+            **Cleanup:** Comment \`/undeploy\` to free this slot.
+
+            **Redeploy:** Push new commits, then comment \`/build-and-deploy\` to update.
+
+            [View deployment logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            });
+
+  cleanup-on-failure:
+    name: Cleanup on deployment failure
+    needs: deploy
+    if: always() && needs.deploy.result == 'failure'
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Setup PATH
+        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+
+      - name: Cleanup failed deployment
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+
+          # Find slot assigned to this PR (if any)
+          SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null)
+
+          if [ -z "$SLOT" ]; then
+            echo "No slot was assigned, nothing to clean up"
+            exit 0
+          fi
+
+          NAMESPACE="preview-slot-${SLOT}"
+          DB_NAME="preview_slot_${SLOT}"
+
+          echo "Cleaning up failed deployment for PR ${PR_NUM} in slot ${SLOT}..."
+
+          # Delete namespace (cascades to all resources)
+          kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
+
+          # Drop database (ignore errors - database might not exist)
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
+          if kubectl exec -n preview-infra postgres-postgresql-0 -- \
+            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" 2>&1; then
+            echo "✅ Database dropped for slot ${SLOT}"
+          else
+            echo "⚠️ Failed to drop database (may not exist or already dropped)"
+          fi
+
+          echo "✅ Cleanup complete for slot ${SLOT}"
+
+      - name: Post failure comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Deployment failed**
+
+            Check the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            });

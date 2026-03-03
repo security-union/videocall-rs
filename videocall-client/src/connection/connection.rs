@@ -134,7 +134,7 @@ impl Connection {
                 ..Default::default()
             };
 
-            let Ok(data) = aes_encrypt_packet(&aes, &packet) else {
+            let Ok(data) = aes_encrypt_heartbeat(&aes, &packet) else {
                 return;
             };
             let mut packet_wrapper = PacketWrapper {
@@ -226,7 +226,7 @@ impl Connection {
             ..Default::default()
         };
 
-        let Ok(data) = aes_encrypt_packet(&self.aes, &packet) else {
+        let Ok(data) = aes_encrypt_heartbeat(&self.aes, &packet) else {
             return;
         };
 
@@ -256,7 +256,7 @@ impl Drop for Connection {
     }
 }
 
-fn aes_encrypt_packet(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, ()> {
+fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, ()> {
     let bytes = packet.write_to_bytes().map_err(|e| {
         log::error!("Failed to serialize heartbeat packet: {e}");
     })?;

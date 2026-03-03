@@ -272,6 +272,9 @@ impl Peer {
             }
             MediaType::AUDIO => {
                 // Infer audio_enabled from the actual media frame.
+                // Known limitation: a straggler audio packet arriving after a mute
+                // heartbeat will temporarily flip audio_enabled back to true until
+                // the next heartbeat corrects it.
                 if !self.audio_enabled {
                     self.audio_enabled = true;
                     self.audio.set_muted(false);

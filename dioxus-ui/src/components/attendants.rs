@@ -33,7 +33,8 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::MeetingTime;
+use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap};
+use std::collections::HashMap;
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
@@ -184,6 +185,10 @@ pub fn AttendantsComponent(
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
 
+    // Create the peer status map signal early so it can be captured by the
+    // on_peer_removed callback inside use_hook below.
+    let mut peer_status_map: PeerStatusMap = use_signal(|| HashMap::new());
+
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
     // callback can access the client for reconnection. The cell is populated
@@ -273,6 +278,10 @@ pub fn AttendantsComponent(
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: Some(VcCallback::from(move |peer_id: String| {
                 log::info!("Peer removed: {peer_id}");
+                // Use write_unchecked because VcCallback requires Fn (not FnMut)
+                // and write() takes &mut self. This is safe — Dioxus does runtime
+                // borrow checking via its internal RefCell.
+                peer_status_map.write_unchecked().remove(&peer_id);
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
@@ -350,11 +359,13 @@ pub fn AttendantsComponent(
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
 
+    // Provide the peer status map as context for child PeerTile components.
+    // The signal was created earlier so on_peer_removed can capture it.
+    use_context_provider(|| peer_status_map);
+
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
     // dispatches peer_status events into a shared HashMap.
-    let mut peer_status_map: crate::context::PeerStatusMap =
-        use_context_provider(|| Signal::new(std::collections::HashMap::new()));
     use_effect(move || {
         spawn(async move {
             let mut rx = videocall_diagnostics::subscribe();
@@ -880,7 +891,7 @@ pub fn AttendantsComponent(
 /// Parse a `peer_status` diagnostics event into a `(peer_id, PeerMediaState)`.
 fn parse_peer_status_event(
     evt: &videocall_diagnostics::DiagEvent,
-) -> Option<(String, crate::context::PeerMediaState)> {
+) -> Option<(String, PeerMediaState)> {
     use videocall_diagnostics::MetricValue;
 
     let mut to_peer: Option<String> = None;
@@ -899,7 +910,7 @@ fn parse_peer_status_event(
     to_peer.map(|id| {
         (
             id,
-            crate::context::PeerMediaState {
+            PeerMediaState {
                 audio_enabled: audio,
                 video_enabled: video,
                 screen_enabled: screen,

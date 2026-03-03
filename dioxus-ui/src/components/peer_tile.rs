@@ -31,8 +31,9 @@ pub fn PeerTile(
 
     // Read peer state from the shared map (populated by a single subscriber
     // in the parent AttendantsComponent). Falls back to client snapshot for
-    // peers that haven't sent a heartbeat yet.
-    let state = peer_status_map
+    // peers that haven't sent a heartbeat yet. The read subscribes this
+    // component to changes so Dioxus re-renders when the map is updated.
+    let _state = peer_status_map
         .read()
         .get(&peer_id)
         .cloned()
@@ -41,11 +42,6 @@ pub fn PeerTile(
             video_enabled: client.is_video_enabled_for_peer(&peer_id),
             screen_enabled: client.is_screen_share_enabled_for_peer(&peer_id),
         });
-
-    // Bind to locals so Dioxus tracks the reactive dependency on peer_status_map.
-    let _ = state.audio_enabled;
-    let _ = state.video_enabled;
-    let _ = state.screen_enabled;
 
     let host_dn = host_display_name.as_deref();
     generate_for_peer(&client, &peer_id, full_bleed, host_dn)

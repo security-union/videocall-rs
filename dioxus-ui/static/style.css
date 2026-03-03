@@ -3409,3 +3409,68 @@ select {
     margin-right: 0.75rem;
   }
 }
+
+/* ===== Speaking indicator styles ===== */
+
+/* Peer list mic icon container */
+.peer_item_mic {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: #888;
+  transition: all 0.2s ease;
+}
+
+.peer_item_mic svg {
+  width: 100%;
+  height: 100%;
+}
+
+.peer_item_mic.speaking {
+  color: #00ff41;
+  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+
+.peer_item_mic.speaking svg {
+  stroke: #00ff41;
+}
+
+/* Speaking tile animation - triggered by voice activity detection */
+.canvas-container.speaking-tile,
+.host.speaking-tile {
+  box-shadow: inset 0 0 12px 4px rgba(0, 255, 65, 0.25), 0 0 16px 2px rgba(0, 255, 65, 0.15);
+  animation: tile-glow 1.5s ease-in-out infinite;
+}
+
+/* Speaking glow on audio indicator (mic icon in tile) */
+.audio-indicator.speaking {
+  color: #00ff41;
+  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+
+.audio-indicator.speaking svg {
+  stroke: #00ff41;
+}
+
+@keyframes mic-pulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  }
+  50% {
+    filter: drop-shadow(0 0 10px rgba(0, 255, 65, 1));
+  }
+}
+
+@keyframes tile-glow {
+  0%, 100% {
+    box-shadow: inset 0 0 12px 4px rgba(0, 255, 65, 0.25), 0 0 16px 2px rgba(0, 255, 65, 0.15);
+  }
+  50% {
+    box-shadow: inset 0 0 18px 6px rgba(0, 255, 65, 0.35), 0 0 22px 4px rgba(0, 255, 65, 0.2);
+  }
+}

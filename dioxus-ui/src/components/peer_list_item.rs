@@ -17,15 +17,27 @@
  */
 
 use crate::components::icons::crown::CrownIcon;
+use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use dioxus::prelude::*;
 
 #[component]
-pub fn PeerListItem(name: String, #[props(default)] is_host: bool) -> Element {
+pub fn PeerListItem(
+    name: String,
+    #[props(default)] is_host: bool,
+    #[props(default = true)] muted: bool,
+    #[props(default = false)] speaking: bool,
+) -> Element {
     let title = if is_host {
         format!("Host: {name}")
     } else {
         name.clone()
+    };
+
+    let mic_class = if speaking {
+        "peer_item_mic speaking"
+    } else {
+        "peer_item_mic"
     };
 
     rsx! {
@@ -38,6 +50,9 @@ pub fn PeerListItem(name: String, #[props(default)] is_host: bool) -> Element {
                 if is_host {
                     CrownIcon {}
                 }
+            }
+            div { class: "{mic_class}",
+                MicIcon { muted: muted }
             }
         }
     }

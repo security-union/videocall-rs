@@ -278,9 +278,10 @@ pub fn AttendantsComponent(
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: Some(VcCallback::from(move |peer_id: String| {
                 log::info!("Peer removed: {peer_id}");
-                // Use write_unchecked because VcCallback requires Fn (not FnMut)
-                // and write() takes &mut self. This is safe — Dioxus does runtime
-                // borrow checking via its internal RefCell.
+                // write_unchecked is required here: VcCallback wraps Fn (not FnMut)
+                // but Signal::write() takes &mut self. write_unchecked only skips
+                // Dioxus scope-tracking; the underlying RefCell still enforces
+                // borrow rules at runtime, so no UB is possible.
                 peer_status_map.write_unchecked().remove(&peer_id);
                 let mut v = peer_list_version;
                 v.set(v() + 1);

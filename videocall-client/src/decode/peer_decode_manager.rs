@@ -84,6 +84,8 @@ pub struct Peer {
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
     pub session_id: u64,
+    /// Cached `session_id.to_string()` to avoid repeated allocations.
+    sid_str: String,
     pub email: String,
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
@@ -128,6 +130,7 @@ impl Peer {
             video,
             screen,
             session_id,
+            sid_str,
             email,
             video_canvas_id,
             screen_canvas_id,
@@ -207,7 +210,7 @@ impl Peer {
             stream_id: None,
             ts_ms: now_ms(),
             metrics: vec![
-                metric!("to_peer", self.session_id.to_string()),
+                metric!("to_peer", self.sid_str.clone()),
                 metric!(
                     "audio_enabled",
                     if self.audio_enabled { 1u64 } else { 0u64 }
@@ -521,12 +524,13 @@ impl PeerDecodeManager {
 
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             if !peer.context_initialized {
-                let sid_str = peer_session_id.to_string();
                 peer.video
-                    .set_stream_context(userid.to_string(), sid_str.clone());
-                peer.screen.set_stream_context(userid.to_string(), sid_str);
+                    .set_stream_context(userid.to_string(), peer.sid_str.clone());
+                peer.screen
+                    .set_stream_context(userid.to_string(), peer.sid_str.clone());
                 peer.context_initialized = true;
             }
+            let sid_str = peer.sid_str.clone();
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
                     peer.on_heartbeat();
@@ -534,16 +538,11 @@ impl PeerDecodeManager {
                 }
                 Ok((media_type, decode_status)) => {
                     if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.track_frame(
-                            &peer_session_id.to_string(),
-                            media_type,
-                            packet.data.len() as u64,
-                        );
+                        diagnostics.track_frame(&sid_str, media_type, packet.data.len() as u64);
                     }
 
                     if decode_status.first_frame {
-                        self.on_first_frame
-                            .emit((peer_session_id.to_string(), media_type));
+                        self.on_first_frame.emit((sid_str, media_type));
                     }
 
                     Ok(())
@@ -577,8 +576,9 @@ impl PeerDecodeManager {
     }
 
     pub fn delete_peer(&mut self, session_id: u64) {
-        self.connected_peers.remove(&session_id);
-        self.on_peer_removed.emit(session_id.to_string());
+        if let Some(peer) = self.connected_peers.remove(&session_id) {
+            self.on_peer_removed.emit(peer.sid_str);
+        }
     }
 
     pub fn ensure_peer(&mut self, session_id: u64, email: &str) -> PeerStatus {

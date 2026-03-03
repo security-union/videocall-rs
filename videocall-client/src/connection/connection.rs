@@ -119,37 +119,17 @@ impl Connection {
         let screen_enabled = Rc::clone(&self.screen_enabled);
         let session_id = Rc::clone(&self.session_id);
         self.heartbeat = Some(Interval::new(1000, move || {
-            let heartbeat_metadata = HeartbeatMetadata {
-                video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                ..Default::default()
-            };
-
-            let packet = MediaPacket {
-                media_type: MediaType::HEARTBEAT.into(),
-                email: userid.clone(),
-                timestamp: js_sys::Date::now(),
-                heartbeat_metadata: Some(heartbeat_metadata).into(),
-                ..Default::default()
-            };
-
-            let Ok(data) = aes_encrypt_heartbeat(&aes, &packet) else {
-                return;
-            };
-            let mut packet_wrapper = PacketWrapper {
-                data,
-                email: userid.clone(),
-                packet_type: PacketType::MEDIA.into(),
-                ..Default::default()
-            };
-
-            if let Some(sid) = session_id.borrow().as_ref() {
-                packet_wrapper.session_id = *sid;
-            }
-
-            if let Status::Connected = status.get() {
-                task.send_packet(packet_wrapper);
+            if let Some(packet_wrapper) = build_heartbeat_packet(
+                &userid,
+                &video_enabled,
+                &audio_enabled,
+                &screen_enabled,
+                &aes,
+                &session_id,
+            ) {
+                if let Status::Connected = status.get() {
+                    task.send_packet(packet_wrapper);
+                }
             }
         }));
     }
@@ -211,37 +191,16 @@ impl Connection {
             return;
         }
 
-        let heartbeat_metadata = HeartbeatMetadata {
-            video_enabled: self.video_enabled.load(std::sync::atomic::Ordering::Relaxed),
-            audio_enabled: self.audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
-            screen_enabled: self.screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
-            ..Default::default()
-        };
-
-        let packet = MediaPacket {
-            media_type: MediaType::HEARTBEAT.into(),
-            email: userid.clone(),
-            timestamp: js_sys::Date::now(),
-            heartbeat_metadata: Some(heartbeat_metadata).into(),
-            ..Default::default()
-        };
-
-        let Ok(data) = aes_encrypt_heartbeat(&self.aes, &packet) else {
-            return;
-        };
-
-        let mut packet_wrapper = PacketWrapper {
-            data,
-            email: userid,
-            packet_type: PacketType::MEDIA.into(),
-            ..Default::default()
-        };
-
-        if let Some(sid) = self.session_id.borrow().as_ref() {
-            packet_wrapper.session_id = *sid;
+        if let Some(packet_wrapper) = build_heartbeat_packet(
+            &userid,
+            &self.video_enabled,
+            &self.audio_enabled,
+            &self.screen_enabled,
+            &self.aes,
+            &self.session_id,
+        ) {
+            self.task.send_packet(packet_wrapper);
         }
-
-        self.task.send_packet(packet_wrapper);
     }
 
     pub fn set_session_id(&self, session_id: u64) {
@@ -254,6 +213,44 @@ impl Drop for Connection {
         log::debug!("Dropping Connection to {}", self.url);
         self.stop_heartbeat();
     }
+}
+
+fn build_heartbeat_packet(
+    userid: &str,
+    video_enabled: &AtomicBool,
+    audio_enabled: &AtomicBool,
+    screen_enabled: &AtomicBool,
+    aes: &Aes128State,
+    session_id: &RefCell<Option<u64>>,
+) -> Option<PacketWrapper> {
+    let heartbeat_metadata = HeartbeatMetadata {
+        video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        ..Default::default()
+    };
+
+    let packet = MediaPacket {
+        media_type: MediaType::HEARTBEAT.into(),
+        email: userid.to_owned(),
+        timestamp: js_sys::Date::now(),
+        heartbeat_metadata: Some(heartbeat_metadata).into(),
+        ..Default::default()
+    };
+
+    let data = aes_encrypt_heartbeat(aes, &packet).ok()?;
+    let mut packet_wrapper = PacketWrapper {
+        data,
+        email: userid.to_owned(),
+        packet_type: PacketType::MEDIA.into(),
+        ..Default::default()
+    };
+
+    if let Some(sid) = session_id.borrow().as_ref() {
+        packet_wrapper.session_id = *sid;
+    }
+
+    Some(packet_wrapper)
 }
 
 fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, ()> {

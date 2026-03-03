@@ -92,12 +92,15 @@ pub struct MeetingInfoResponse {
     pub host_display_name: Option<String>,
     pub has_password: bool,
     pub waiting_room_enabled: bool,
+    #[serde(default)]
     pub participant_count: i64,
+    #[serde(default)]
     pub waiting_count: i64,
     /// Unix timestamp in milliseconds.
+    #[serde(default)]
     pub started_at: i64,
     /// Unix timestamp in milliseconds, or `null` if still active/idle.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub your_status: Option<ParticipantStatusResponse>,

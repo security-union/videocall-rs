@@ -135,7 +135,12 @@ pub fn MeetingPage(id: String) -> Element {
                             } else {
                                 match crate::meeting_api::get_meeting_info(&meeting_id).await {
                                     Ok(info) => info.host,
-                                    Err(_) => String::new(),
+                                    Err(e) => {
+                                        log::error!(
+                                            "Failed to get meeting info for host detection: {e}"
+                                        );
+                                        String::new()
+                                    }
                                 }
                             };
                             host_email.set(determined_host.clone());
@@ -216,7 +221,12 @@ pub fn MeetingPage(id: String) -> Element {
                         } else {
                             match crate::meeting_api::get_meeting_info(&meeting_id).await {
                                 Ok(info) => info.host,
-                                Err(_) => String::new(),
+                                Err(e) => {
+                                    log::error!(
+                                        "Failed to get meeting info for host detection: {e}"
+                                    );
+                                    String::new()
+                                }
                             }
                         };
                         let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
@@ -265,7 +275,10 @@ pub fn MeetingPage(id: String) -> Element {
                 let determined_host = match crate::meeting_api::get_meeting_info(&meeting_id).await
                 {
                     Ok(info) => info.host,
-                    Err(_) => String::new(),
+                    Err(e) => {
+                        log::error!("Failed to get meeting info for host detection: {e}");
+                        String::new()
+                    }
                 };
                 host_email.set(determined_host.clone());
                 let wr_enabled = status.waiting_room_enabled.unwrap_or(true);

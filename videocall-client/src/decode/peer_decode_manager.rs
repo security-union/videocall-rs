@@ -314,17 +314,10 @@ impl Peer {
 
                     // Set mute state on audio decoder when audio state changes (before updating state)
                     if audio_state_changed {
-                        log::info!("[MUTE DEBUG] Audio state changed for peer {} - audio_enabled: {} -> {}", 
-                                                         self.session_id, self.audio_enabled, metadata.audio_enabled);
                         self.audio.set_muted(!metadata.audio_enabled);
                         debug!(
-                            "Set audio decoder muted state for peer {} to {}",
+                            "Audio state changed for peer {} - muted: {}",
                             self.session_id, !metadata.audio_enabled
-                        );
-                        log::info!(
-                            "🔇 Setting peer {} muted to {}",
-                            self.session_id,
-                            !metadata.audio_enabled
                         );
                     }
 

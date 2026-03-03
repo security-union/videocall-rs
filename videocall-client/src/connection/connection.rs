@@ -170,24 +170,33 @@ impl Connection {
     }
 
     pub fn set_video_enabled(&self, enabled: bool) {
-        log::debug!("Setting video enabled to {enabled}");
-        self.video_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-        self.send_immediate_heartbeat();
+        let prev = self
+            .video_enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if prev != enabled {
+            log::debug!("Video enabled changed: {prev} -> {enabled}");
+            self.send_immediate_heartbeat();
+        }
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) {
-        log::debug!("Setting audio enabled to {enabled}");
-        self.audio_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-        self.send_immediate_heartbeat();
+        let prev = self
+            .audio_enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if prev != enabled {
+            log::debug!("Audio enabled changed: {prev} -> {enabled}");
+            self.send_immediate_heartbeat();
+        }
     }
 
     pub fn set_screen_enabled(&self, enabled: bool) {
-        log::debug!("Setting screen enabled to {enabled}");
-        self.screen_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-        self.send_immediate_heartbeat();
+        let prev = self
+            .screen_enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if prev != enabled {
+            log::debug!("Screen enabled changed: {prev} -> {enabled}");
+            self.send_immediate_heartbeat();
+        }
     }
 
     /// Send a heartbeat packet immediately so peers learn about state changes

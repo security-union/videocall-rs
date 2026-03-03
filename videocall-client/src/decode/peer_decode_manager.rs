@@ -356,6 +356,7 @@ impl Peer {
                                 "screen_enabled",
                                 if metadata.screen_enabled { 1u64 } else { 0u64 }
                             ),
+                            metric!("is_speaking", if metadata.is_speaking { 1u64 } else { 0u64 }),
                         ],
                     };
                     let _ = global_sender().try_broadcast(evt);

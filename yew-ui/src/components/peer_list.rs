@@ -18,7 +18,7 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::UsernameCtx;
+use crate::context::{UsernameCtx, VideoCallClientCtx};
 use futures::future::{AbortHandle, Abortable};
 use std::collections::HashMap;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
@@ -32,6 +32,7 @@ pub struct PeerList {
     peer_audio_states: HashMap<String, bool>,
     peer_speaking_states: HashMap<String, bool>,
     abort_handle: Option<AbortHandle>,
+    local_speaking: bool,
 }
 
 #[derive(Properties, Clone, PartialEq)]
@@ -44,6 +45,10 @@ pub struct PeerListProperties {
     pub peer_audio_states: HashMap<String, bool>,
     #[prop_or(true)]
     pub self_muted: bool,
+
+    // speaking state for local user
+    #[prop_or(false)]
+    pub self_speaking: bool,
 
     // meeting info
     pub show_meeting_info: bool,
@@ -76,6 +81,7 @@ impl Component for PeerList {
             peer_audio_states: ctx.props().peer_audio_states.clone(),
             peer_speaking_states: HashMap::new(),
             abort_handle: None,
+            local_speaking: ctx.props().self_speaking,
         }
     }
 
@@ -161,6 +167,8 @@ impl Component for PeerList {
                 self.peer_audio_states.insert(peer.clone(), *audio);
             }
         }
+        // Update local speaking state
+        self.local_speaking = ctx.props().self_speaking;
         true
     }
 
@@ -209,6 +217,12 @@ impl Component for PeerList {
             .as_ref()
             .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
             .unwrap_or(false);
+
+        // Get VideoCallClient from context to convert session_id to email for display
+        let client_ctx = ctx
+            .link()
+            .context::<VideoCallClientCtx>(Callback::noop())
+            .map(|(client, _)| client);
 
         html! {
             <div>
@@ -290,16 +304,23 @@ impl Component for PeerList {
                         <div class="peer-list">
                             <ul>
                                 // show self as the first item with actual username
-                                <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} muted={ctx.props().self_muted} speaking={false} /></li>
+                                <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} muted={ctx.props().self_muted} speaking={self.local_speaking} /></li>
 
-                                { for filtered_peers.iter().map(|peer| {
+                                { for filtered_peers.iter().map(|peer_id| {
+                                    // peer_id is session_id, get email for display
+                                    let display_name = if let Some(ref client) = client_ctx {
+                                        client.get_peer_email(peer_id).unwrap_or_else(|| peer_id.clone())
+                                    } else {
+                                        peer_id.clone()
+                                    };
+
                                     let is_peer_host = host_display_name.as_ref()
-                                        .map(|h| h == peer)
+                                        .map(|h| h == &display_name)
                                         .unwrap_or(false);
-                                    let muted = !self.peer_audio_states.get(peer).copied().unwrap_or(false);
-                                    let speaking = self.peer_speaking_states.get(peer).copied().unwrap_or(false);
+                                    let muted = !self.peer_audio_states.get(peer_id).copied().unwrap_or(false);
+                                    let speaking = self.peer_speaking_states.get(peer_id).copied().unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={peer.clone()} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
+                                        <li><PeerListItem name={display_name} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
                                     }
                                 })}
                             </ul>

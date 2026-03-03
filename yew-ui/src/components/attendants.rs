@@ -856,18 +856,7 @@ impl Component for AttendantsComponent {
         let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
-        // Convert session_id to email for display in PeerList
-        let mut peers_for_display: Vec<String> = real_peers_vec
-            .iter()
-            .map(|session_id| {
-                self.client
-                    .get_peer_email(session_id)
-                    .unwrap_or_else(|| session_id.clone())
-            })
-            .collect();
-        peers_for_display.extend(self.fake_peer_ids.iter().cloned());
-
-        // Keep session_id for PeerTile (needs session_id for identification)
+        // Keep session_id for both PeerTile and PeerList (both need session_id for audio/speaking state matching)
         let mut display_peers_vec = real_peers_vec.clone();
         display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
 
@@ -1161,14 +1150,15 @@ impl Component for AttendantsComponent {
                             let toggle_meeting_info = ctx.link().callback(|_| UserScreenToggleAction::MeetingInfo);
                             let peer_audio_states: HashMap<String, bool> = display_peers_vec
                                 .iter()
-                                .map(|peer| (peer.clone(), self.client.is_audio_enabled_for_peer(peer)))
+                                .map(|peer_id| (peer_id.clone(), self.client.is_audio_enabled_for_peer(peer_id)))
                                 .collect();
                             html! {
                                 <PeerList
-                                    peers={peers_for_display.clone()}
+                                    peers={display_peers_vec.clone()}
                                     onclose={toggle_peer_list}
                                     peer_audio_states={peer_audio_states}
                                     self_muted={!self.mic_enabled}
+                                    self_speaking={self.local_speaking}
                                     show_meeting_info={self.meeting_info_open}
                                     room_id={ctx.props().id.clone()}
                                     num_participants={num_display_peers}

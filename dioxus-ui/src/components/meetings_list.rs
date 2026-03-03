@@ -167,7 +167,6 @@ fn MeetingItem(
     let nav = use_navigator();
     let is_active = meeting.state == "active";
     let is_ended = meeting.state == "ended";
-
     let state_class = match meeting.state.as_str() {
         "active" => "state-active",
         "idle" => "state-idle",
@@ -216,7 +215,7 @@ fn MeetingItem(
     };
 
     rsx! {
-        li { class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" },
+        li { class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" }, style: "flex-wrap: wrap;",
             div { class: "meeting-item-content", onclick: on_click,
                 div { class: "meeting-info",
                     span { class: "meeting-id", "{meeting.meeting_id}" }

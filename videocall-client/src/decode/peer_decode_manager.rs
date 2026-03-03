@@ -512,9 +512,9 @@ impl PeerDecodeManager {
     pub fn run_peer_monitor(&mut self) {
         let removed = self
             .connected_peers
-            .remove_if_and_return_keys(|peer| peer.check_heartbeat());
-        for k in removed {
-            self.on_peer_removed.emit(k.to_string());
+            .remove_if_and_return(|peer| peer.check_heartbeat());
+        for (_session_id, peer) in removed {
+            self.on_peer_removed.emit(peer.sid_str);
         }
     }
 
@@ -635,6 +635,7 @@ impl PeerDecodeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use protobuf::Message;
     use videocall_types::protos::media_packet::media_packet::MediaType;
     use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
@@ -647,15 +648,16 @@ mod tests {
     // -- mock audio decoder -----------------------------------------------
 
     /// No-op audio decoder for unit tests.
+    /// Muted state is stored in an `Rc<Cell<bool>>` so tests can inspect it
+    /// after handing ownership to `Peer`.
     struct MockAudioDecoder {
-        muted: std::cell::Cell<bool>,
+        muted: Rc<Cell<bool>>,
     }
 
     impl MockAudioDecoder {
-        fn new() -> Self {
-            Self {
-                muted: std::cell::Cell::new(true),
-            }
+        fn new() -> (Self, Rc<Cell<bool>>) {
+            let muted = Rc::new(Cell::new(true));
+            (Self { muted: muted.clone() }, muted)
         }
     }
 
@@ -738,10 +740,13 @@ mod tests {
     }
 
     /// Create a `Peer` with no-op decoders (no browser APIs required).
-    fn make_test_peer(session_id: u64) -> Peer {
+    /// Returns the peer and an `Rc<Cell<bool>>` handle to the mock audio
+    /// decoder's muted state for test assertions.
+    fn make_test_peer(session_id: u64) -> (Peer, Rc<Cell<bool>>) {
         let sid_str = session_id.to_string();
-        Peer {
-            audio: Box::new(MockAudioDecoder::new()),
+        let (mock_audio, muted_handle) = MockAudioDecoder::new();
+        let peer = Peer {
+            audio: Box::new(mock_audio),
             video: VideoPeerDecoder::noop(),
             screen: VideoPeerDecoder::noop(),
             session_id,
@@ -756,7 +761,8 @@ mod tests {
             screen_enabled: false,
             context_initialized: false,
             has_received_heartbeat: false,
-        }
+        };
+        (peer, muted_handle)
     }
 
     // -- straggler guard tests --------------------------------------------
@@ -764,7 +770,7 @@ mod tests {
     /// Before any heartbeat, a VIDEO frame should infer video_enabled = true.
     #[wasm_bindgen_test]
     fn video_frame_before_heartbeat_infers_enabled() {
-        let mut peer = make_test_peer(1);
+        let (mut peer, _muted) = make_test_peer(1);
         assert!(!peer.video_enabled);
         assert!(!peer.has_received_heartbeat);
 
@@ -776,10 +782,10 @@ mod tests {
     }
 
     /// After a heartbeat with video_enabled=false, a straggler VIDEO frame
-    /// must NOT flip video_enabled back to true.
+    /// must NOT flip video_enabled back to true and must return rendered=false.
     #[wasm_bindgen_test]
     fn video_straggler_after_heartbeat_is_dropped() {
-        let mut peer = make_test_peer(2);
+        let (mut peer, _muted) = make_test_peer(2);
 
         // Receive heartbeat: video off, audio off, screen off.
         let hb = heartbeat_packet(2, false, false, false);
@@ -792,29 +798,37 @@ mod tests {
         let packet = video_frame_packet(2);
         let result = peer.decode(&packet);
         assert!(result.is_ok());
-        // video_enabled must remain false — straggler was dropped.
+        let (_media_type, status) = result.unwrap();
+        assert!(!status.rendered, "straggler must not be rendered");
+        assert!(!status.first_frame, "straggler must not be a first frame");
         assert!(
             !peer.video_enabled,
             "straggler video frame must not re-enable video"
         );
     }
 
-    /// Before any heartbeat, an AUDIO frame should infer audio_enabled = true.
+    /// Before any heartbeat, an AUDIO frame should infer audio_enabled = true
+    /// and unmute the audio decoder.
     #[wasm_bindgen_test]
     fn audio_frame_before_heartbeat_infers_enabled() {
-        let mut peer = make_test_peer(3);
+        let (mut peer, muted_handle) = make_test_peer(3);
         assert!(!peer.audio_enabled);
+        assert!(muted_handle.get(), "audio should start muted");
 
         let packet = audio_frame_packet(3);
         let _ = peer.decode(&packet);
         assert!(peer.audio_enabled, "audio_enabled should be inferred true");
+        assert!(
+            !muted_handle.get(),
+            "audio decoder should be unmuted after inference"
+        );
     }
 
     /// After a heartbeat with audio_enabled=false, a straggler AUDIO frame
-    /// must NOT flip audio_enabled back to true.
+    /// must NOT flip audio_enabled back to true and must return rendered=false.
     #[wasm_bindgen_test]
     fn audio_straggler_after_heartbeat_is_dropped() {
-        let mut peer = make_test_peer(4);
+        let (mut peer, _muted) = make_test_peer(4);
 
         let hb = heartbeat_packet(4, false, false, false);
         let _ = peer.decode(&hb);
@@ -824,6 +838,9 @@ mod tests {
         let packet = audio_frame_packet(4);
         let result = peer.decode(&packet);
         assert!(result.is_ok());
+        let (_media_type, status) = result.unwrap();
+        assert!(!status.rendered, "straggler must not be rendered");
+        assert!(!status.first_frame, "straggler must not be a first frame");
         assert!(
             !peer.audio_enabled,
             "straggler audio frame must not re-enable audio"
@@ -833,7 +850,7 @@ mod tests {
     /// Before any heartbeat, a SCREEN frame should infer screen_enabled = true.
     #[wasm_bindgen_test]
     fn screen_frame_before_heartbeat_infers_enabled() {
-        let mut peer = make_test_peer(5);
+        let (mut peer, _muted) = make_test_peer(5);
         assert!(!peer.screen_enabled);
 
         let packet = screen_frame_packet(5);
@@ -845,10 +862,10 @@ mod tests {
     }
 
     /// After a heartbeat with screen_enabled=false, a straggler SCREEN frame
-    /// must NOT flip screen_enabled back to true.
+    /// must NOT flip screen_enabled back to true and must return rendered=false.
     #[wasm_bindgen_test]
     fn screen_straggler_after_heartbeat_is_dropped() {
-        let mut peer = make_test_peer(6);
+        let (mut peer, _muted) = make_test_peer(6);
 
         let hb = heartbeat_packet(6, false, false, false);
         let _ = peer.decode(&hb);
@@ -858,6 +875,9 @@ mod tests {
         let packet = screen_frame_packet(6);
         let result = peer.decode(&packet);
         assert!(result.is_ok());
+        let (_media_type, status) = result.unwrap();
+        assert!(!status.rendered, "straggler must not be rendered");
+        assert!(!status.first_frame, "straggler must not be a first frame");
         assert!(
             !peer.screen_enabled,
             "straggler screen frame must not re-enable screen"
@@ -868,7 +888,7 @@ mod tests {
     /// (Ensures the guard doesn't block legitimate frames.)
     #[wasm_bindgen_test]
     fn video_frame_after_enabling_heartbeat_is_accepted() {
-        let mut peer = make_test_peer(7);
+        let (mut peer, _muted) = make_test_peer(7);
 
         // Heartbeat enables video.
         let hb = heartbeat_packet(7, true, false, false);
@@ -882,10 +902,10 @@ mod tests {
         assert!(peer.video_enabled);
     }
 
-    /// Heartbeat toggles: enable then disable then straggler.
+    /// Heartbeat toggles: enable → disable → straggler.
     #[wasm_bindgen_test]
     fn video_enable_disable_straggler_sequence() {
-        let mut peer = make_test_peer(8);
+        let (mut peer, _muted) = make_test_peer(8);
 
         // Enable video via heartbeat.
         let hb_on = heartbeat_packet(8, true, false, false);
@@ -901,6 +921,41 @@ mod tests {
         let packet = video_frame_packet(8);
         let result = peer.decode(&packet);
         assert!(result.is_ok());
+        let (_media_type, status) = result.unwrap();
+        assert!(!status.rendered, "straggler must not be rendered");
+        assert!(
+            !peer.video_enabled,
+            "straggler after disable must not re-enable"
+        );
+    }
+
+    /// Full sequence: enable → legitimate frame → disable → straggler dropped.
+    #[wasm_bindgen_test]
+    fn video_enable_frame_disable_straggler_full_sequence() {
+        let (mut peer, _muted) = make_test_peer(9);
+
+        // 1. Enable video via heartbeat.
+        let hb_on = heartbeat_packet(9, true, false, false);
+        let _ = peer.decode(&hb_on);
+        assert!(peer.video_enabled);
+
+        // 2. Legitimate video frame while enabled — should pass through.
+        let frame = video_frame_packet(9);
+        let _ = peer.decode(&frame);
+        assert!(peer.video_enabled, "legitimate frame must not change state");
+
+        // 3. Disable video via heartbeat.
+        let hb_off = heartbeat_packet(9, false, false, false);
+        let _ = peer.decode(&hb_off);
+        assert!(!peer.video_enabled);
+
+        // 4. Straggler video frame after disable — must be dropped.
+        let straggler = video_frame_packet(9);
+        let result = peer.decode(&straggler);
+        assert!(result.is_ok());
+        let (_media_type, status) = result.unwrap();
+        assert!(!status.rendered, "straggler must not be rendered");
+        assert!(!status.first_frame, "straggler must not be a first frame");
         assert!(
             !peer.video_enabled,
             "straggler after disable must not re-enable"

@@ -52,6 +52,8 @@ pub struct Connection {
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
     session_id: Rc<RefCell<Option<u64>>>,
+    /// Not wrapped in `Rc` because it is only accessed via `&self` methods,
+    /// unlike `session_id` which is shared with the heartbeat `Interval` closure.
     userid: RefCell<Option<String>>,
     url: String,
 }

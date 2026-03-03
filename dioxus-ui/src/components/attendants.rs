@@ -367,7 +367,7 @@ pub fn AttendantsComponent(
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
     // dispatches peer_status events into a shared HashMap.
-    let diagnostics_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
+    let mut diagnostics_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
     use_effect(move || {
         let task = spawn(async move {
             let mut rx = videocall_diagnostics::subscribe();
@@ -391,7 +391,7 @@ pub fn AttendantsComponent(
                 }
             }
         });
-        diagnostics_task.write_unchecked().replace(task);
+        diagnostics_task.write().replace(task);
     });
     use_drop(move || {
         if let Some(task) = diagnostics_task.peek().as_ref() {

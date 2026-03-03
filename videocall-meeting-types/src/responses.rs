@@ -146,6 +146,12 @@ pub struct ParticipantStatusResponse {
     /// Signed JWT room access token. Present only when `status` is `"admitted"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room_token: Option<String>,
+    /// Meeting-level: whether the waiting room is enabled. Present in join/status responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_room_enabled: Option<bool>,
+    /// Meeting-level: the host's display name. Present in join/status responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_display_name: Option<String>,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}/waiting`.

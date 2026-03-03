@@ -125,10 +125,8 @@ h3 {
 
 .peer-list li {
   margin-top: 10px;
-  height: 40px;
   font-size: 16px;
   border-radius: 5px;
-  overflow: hidden;
 }
 
 .peer_item {
@@ -145,10 +143,14 @@ h3 {
 
 .peer_item_icon {
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
 }
 
 .peer_item_text {
   flex-grow: 1;
+  display: flex;
+  align-items: center;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;

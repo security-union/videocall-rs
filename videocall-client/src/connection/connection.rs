@@ -52,6 +52,7 @@ pub struct Connection {
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
     session_id: Rc<RefCell<Option<u64>>>,
+    userid: RefCell<Option<String>>,
     url: String,
 }
 
@@ -97,6 +98,7 @@ impl Connection {
             video_enabled: Rc::new(AtomicBool::new(false)),
             screen_enabled: Rc::new(AtomicBool::new(false)),
             session_id: Rc::new(RefCell::new(None)),
+            userid: RefCell::new(None),
             url,
         };
 
@@ -108,6 +110,7 @@ impl Connection {
     }
 
     pub fn start_heartbeat(&mut self, userid: String) {
+        *self.userid.borrow_mut() = Some(userid.clone());
         let task = Rc::clone(&self.task);
         let status = Rc::clone(&self.status);
         let aes = Rc::clone(&self.aes);
@@ -131,7 +134,9 @@ impl Connection {
                 ..Default::default()
             };
 
-            let data = aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap();
+            let Ok(data) = aes_encrypt_packet(&aes, &packet) else {
+                return;
+            };
             let mut packet_wrapper = PacketWrapper {
                 data,
                 email: userid.clone(),
@@ -168,18 +173,66 @@ impl Connection {
         log::debug!("Setting video enabled to {enabled}");
         self.video_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.send_immediate_heartbeat();
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) {
         log::debug!("Setting audio enabled to {enabled}");
         self.audio_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.send_immediate_heartbeat();
     }
 
     pub fn set_screen_enabled(&self, enabled: bool) {
         log::debug!("Setting screen enabled to {enabled}");
         self.screen_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.send_immediate_heartbeat();
+    }
+
+    /// Send a heartbeat packet immediately so peers learn about state changes
+    /// without waiting for the next 1-second heartbeat tick.
+    fn send_immediate_heartbeat(&self) {
+        let userid = match self.userid.borrow().as_ref() {
+            Some(id) => id.clone(),
+            None => return, // heartbeat not started yet
+        };
+
+        if !matches!(self.status.get(), Status::Connected) {
+            return;
+        }
+
+        let heartbeat_metadata = HeartbeatMetadata {
+            video_enabled: self.video_enabled.load(std::sync::atomic::Ordering::Relaxed),
+            audio_enabled: self.audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
+            screen_enabled: self.screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
+            ..Default::default()
+        };
+
+        let packet = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            email: userid.clone(),
+            timestamp: js_sys::Date::now(),
+            heartbeat_metadata: Some(heartbeat_metadata).into(),
+            ..Default::default()
+        };
+
+        let Ok(data) = aes_encrypt_packet(&self.aes, &packet) else {
+            return;
+        };
+
+        let mut packet_wrapper = PacketWrapper {
+            data,
+            email: userid,
+            packet_type: PacketType::MEDIA.into(),
+            ..Default::default()
+        };
+
+        if let Some(sid) = self.session_id.borrow().as_ref() {
+            packet_wrapper.session_id = *sid;
+        }
+
+        self.task.send_packet(packet_wrapper);
     }
 
     pub fn set_session_id(&self, session_id: u64) {
@@ -192,6 +245,15 @@ impl Drop for Connection {
         log::debug!("Dropping Connection to {}", self.url);
         self.stop_heartbeat();
     }
+}
+
+fn aes_encrypt_packet(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, ()> {
+    let bytes = packet.write_to_bytes().map_err(|e| {
+        log::error!("Failed to serialize heartbeat packet: {e}");
+    })?;
+    aes.encrypt(&bytes).map_err(|e| {
+        log::error!("Failed to encrypt heartbeat packet: {e:?}");
+    })
 }
 
 fn tap_callback<IN: 'static, OUT: 'static>(

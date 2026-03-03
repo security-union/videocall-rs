@@ -194,7 +194,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         if ending() {
             return;
         }
-        let confirmed = web_sys::window()
+        let confirmed = window()
             .and_then(|w| {
                 w.confirm_with_message("End this meeting for all participants?")
                     .ok()
@@ -224,7 +224,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         if deleting() {
             return;
         }
-        let confirmed = web_sys::window()
+        let confirmed = window()
             .and_then(|w| {
                 w.confirm_with_message(
                     "Are you sure you want to delete this meeting? This cannot be undone.",
@@ -383,12 +383,13 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     ToggleSwitch {
                         enabled: waiting_room_toggle(),
                         on_toggle: on_toggle_waiting_room,
+                        disabled: saving(),
                     }
                 }
             }
 
             if let Some(err) = toggle_error() {
-                p { style: "text-align: center; color: #ff6b6b; font-size: 0.8rem; margin-top: 0.5rem;",
+                p { class: "toggle-error",
                     "{err}"
                 }
             }

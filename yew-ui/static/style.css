@@ -2947,14 +2947,6 @@ select {
     border-radius: var(--radius-input, 12px);
   }
 
-  .settings-toggle-row {
-    gap: 0.75rem;
-  }
-
-  .settings-toggle-desc {
-    font-size: 0.75rem;
-  }
-
   .settings-field {
     padding: 0.75rem 0;
   }
@@ -2962,4 +2954,11 @@ select {
   .settings-field-label {
     margin-right: 0.75rem;
   }
+}
+
+.toggle-error {
+  text-align: center;
+  color: var(--error, #FF453A);
+  font-size: 0.8rem;
+  margin-top: 0.5rem;
 }

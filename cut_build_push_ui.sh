@@ -25,6 +25,3 @@ else
     docker push $DIOXUS_IMAGE_URL
     echo "New image uploaded to $DIOXUS_IMAGE_URL"
 fi
-
-docker push "$IMAGE_URL"
-echo "✓ Pushed ${IMAGE_URL}"

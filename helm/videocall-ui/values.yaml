@@ -8,6 +8,8 @@ image:
   pullPolicy: Always
   tag: latest
 
+imagePullSecrets: []
+
 resources:
   limits:
     cpu: "50m"

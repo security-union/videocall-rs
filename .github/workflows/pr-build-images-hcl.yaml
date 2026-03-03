@@ -153,6 +153,7 @@ jobs:
             - \`${registry}/videocall-media-server:pr-${prNumber}\`
             - \`${registry}/videocall-meeting-api:pr-${prNumber}\`
             - \`${registry}/videocall-web-ui:pr-${prNumber}\`
+            - \`${registry}/videocall-dioxus-ui:pr-${prNumber}\`
 
             Comment \`/deploy\` to create a preview environment.`
             });

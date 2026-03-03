@@ -241,6 +241,7 @@ jobs:
             "videocall-media-server"
             "videocall-meeting-api"
             "videocall-web-ui"
+            "videocall-dioxus-ui"
           )
 
           MISSING_IMAGES=()
@@ -391,7 +392,7 @@ jobs:
               requests.memory: "1Gi"
               limits.cpu: "1000m"
               limits.memory: "2Gi"
-              pods: "10"
+              pods: "12"
           EOF
 
           echo "✅ ResourceQuota applied to slot ${SLOT}"
@@ -544,7 +545,7 @@ jobs:
             --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[1].valueFrom.secretKeyRef.key=secret" \
             --set "env[2].name=CORS_ALLOWED_ORIGIN" \
-            --set "env[2].value=https://pr${SLOT}.preview.videocall.fnxlabs.com" \
+            --set "env[2].value=https://pr${SLOT}.preview.videocall.fnxlabs.com,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
             --set "env[3].name=COOKIE_DOMAIN" \
             --set "env[3].value=.preview.videocall.fnxlabs.com" \
             --set "env[4].name=OAUTH_ISSUER" \
@@ -559,10 +560,12 @@ jobs:
             --set "env[8].value=https://pr${SLOT}.preview.videocall.fnxlabs.com" \
             --set "env[9].name=OAUTH_SCOPES" \
             --set "env[9].value=openid email profile" \
-            --set "env[10].name=LISTEN_ADDR" \
-            --set "env[10].value=0.0.0.0:8081" \
-            --set "env[11].name=RUST_LOG" \
-            --set "env[11].value=info" \
+            --set "env[10].name=ALLOWED_REDIRECT_URLS" \
+            --set "env[10].value=https://pr${SLOT}.preview.videocall.fnxlabs.com,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "env[11].name=LISTEN_ADDR" \
+            --set "env[11].value=0.0.0.0:8081" \
+            --set "env[12].name=RUST_LOG" \
+            --set "env[12].value=info" \
             --set "ingress.hosts[0].host=pr${SLOT}-api.preview.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -619,6 +622,47 @@ jobs:
 
           echo "✅ UI deployed to slot ${SLOT} with OAuth"
 
+      - name: Deploy Dioxus UI
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Deploying Dioxus UI to slot ${SLOT}..."
+
+          helm upgrade --install preview-${PR_NUM}-dx helm/videocall-ui/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=${REGISTRY}/videocall-dioxus-ui \
+            --set image.tag=pr-${PR_NUM} \
+            --set "imagePullSecrets[0].name=harbor-pull-secret" \
+            --set fullnameOverride=dx-pr-${PR_NUM} \
+            --set "runtimeConfig.apiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
+            --set "runtimeConfig.meetingApiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
+            --set "runtimeConfig.wsUrl=wss://pr${SLOT}-ws.preview.videocall.fnxlabs.com" \
+            --set "runtimeConfig.webTransportHost=" \
+            --set-string "runtimeConfig.webTransportEnabled=false" \
+            --set-string "runtimeConfig.oauthEnabled=true" \
+            --set-string "runtimeConfig.oauthProvider=google" \
+            --set-string "runtimeConfig.e2eeEnabled=false" \
+            --set-string "runtimeConfig.firefoxEnabled=false" \
+            --set "runtimeConfig.usersAllowedToStream=" \
+            --set "runtimeConfig.serverElectionPeriodMs=2000" \
+            --set "runtimeConfig.audioBitrateKbps=65" \
+            --set "runtimeConfig.videoBitrateKbps=1000" \
+            --set "runtimeConfig.screenBitrateKbps=1000" \
+            --set "ingress.hosts[0].host=pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.tls[0].secretName=preview-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --wait --timeout 5m
+
+          echo "✅ Dioxus UI deployed to slot ${SLOT}"
+
       - name: Wait for all pods to be ready
         run: |
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
@@ -664,7 +708,8 @@ jobs:
               body: `✅ **Preview ${deploymentType} to slot ${slot}** ${slotStatus}
 
             🌐 **Preview URLs:**
-            - **UI:** https://pr${slot}.preview.videocall.fnxlabs.com
+            - **Yew UI:** https://pr${slot}.preview.videocall.fnxlabs.com
+            - **Dioxus UI:** https://pr${slot}-dx.preview.videocall.fnxlabs.com
             - **API:** https://pr${slot}-api.preview.videocall.fnxlabs.com
             - **WebSocket:** wss://pr${slot}-ws.preview.videocall.fnxlabs.com
 

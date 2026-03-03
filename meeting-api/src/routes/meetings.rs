@@ -293,21 +293,32 @@ pub async fn update_meeting(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
-    let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
-        .await?
-        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
-
-    if row.creator_id.as_deref() != Some(email.as_str()) {
-        return Err(AppError::not_owner());
-    }
-
     let row = if let Some(enabled) = body.waiting_room_enabled {
         // Atomically updates the setting and, when disabling, auto-admits
         // all waiting participants within a single transaction.
-        db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &email, enabled)
+        // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
+        // so we only fetch separately on failure to distinguish 404 vs 403.
+        match db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &email, enabled)
             .await?
-            .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?
+        {
+            Some(row) => row,
+            None => {
+                return Err(
+                    match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
+                        Some(_) => AppError::not_owner(),
+                        None => AppError::meeting_not_found(&meeting_id),
+                    },
+                );
+            }
+        }
     } else {
+        // No changes requested — fetch and verify ownership.
+        let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
+            .await?
+            .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+        if row.creator_id.as_deref() != Some(email.as_str()) {
+            return Err(AppError::not_owner());
+        }
         row
     };
 

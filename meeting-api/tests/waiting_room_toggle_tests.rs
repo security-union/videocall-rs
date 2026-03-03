@@ -636,3 +636,142 @@ async fn test_toggle_waiting_room_back_on_restores_waiting() {
 
     cleanup_test_data(&pool, room_id).await;
 }
+
+// ── Unauthenticated PATCH (no session cookie) ───────────────────────────
+
+#[tokio::test]
+#[serial]
+async fn test_update_meeting_unauthenticated() {
+    let pool = get_test_pool().await;
+    let room_id = "test-patch-no-auth";
+    cleanup_test_data(&pool, room_id).await;
+
+    // Create a meeting.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "meeting_id": room_id,
+                "attendees": []
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    // PATCH without session cookie.
+    let app = build_app(pool.clone());
+    let req = axum::http::Request::builder()
+        .method("PATCH")
+        .uri(&format!("/api/v1/meetings/{room_id}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"waiting_room_enabled":false}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Empty-body PATCH (no-op, returns current state) ─────────────────────
+
+#[tokio::test]
+#[serial]
+async fn test_update_meeting_empty_body_noop() {
+    let pool = get_test_pool().await;
+    let room_id = "test-patch-empty-body";
+    cleanup_test_data(&pool, room_id).await;
+
+    // Create a meeting with waiting room enabled (default).
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "meeting_id": room_id,
+                "attendees": []
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    // PATCH with empty body — should be a no-op returning current state.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "PATCH",
+        &format!("/api/v1/meetings/{room_id}"),
+        "host@example.com",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(r#"{}"#))
+    .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: APIResponse<MeetingInfoResponse> = response_json(resp).await;
+    assert!(body.success);
+    assert!(
+        body.result.waiting_room_enabled,
+        "Empty body PATCH should return current state without changes"
+    );
+    assert_eq!(body.result.meeting_id, room_id);
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── PATCH on soft-deleted meeting ───────────────────────────────────────
+
+#[tokio::test]
+#[serial]
+async fn test_update_meeting_soft_deleted_returns_404() {
+    let pool = get_test_pool().await;
+    let room_id = "test-patch-deleted";
+    cleanup_test_data(&pool, room_id).await;
+
+    // Create and delete a meeting.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "meeting_id": room_id,
+                "attendees": []
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "DELETE",
+        &format!("/api/v1/meetings/{room_id}"),
+        "host@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    // PATCH the deleted meeting — should 404.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "PATCH",
+        &format!("/api/v1/meetings/{room_id}"),
+        "host@example.com",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(r#"{"waiting_room_enabled":false}"#))
+    .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let body: APIResponse<APIError> = response_json(resp).await;
+    assert_eq!(body.result.code, "MEETING_NOT_FOUND");
+
+    cleanup_test_data(&pool, room_id).await;
+}

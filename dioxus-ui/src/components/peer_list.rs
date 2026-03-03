@@ -40,7 +40,11 @@ pub fn PeerList(
 
     let filtered_peers: Vec<(String, Option<String>)> = peers
         .iter()
-        .filter(|(display_name, _user_email)| display_name.to_lowercase().contains(&search_query().to_lowercase()))
+        .filter(|(display_name, _user_email)| {
+            display_name
+                .to_lowercase()
+                .contains(&search_query().to_lowercase())
+        })
         .cloned()
         .collect();
 

@@ -77,7 +77,10 @@ pub fn MeetingPage(id: String) -> Element {
                                 // so we cannot rely on ?returnTo= surviving in the URL.
                                 match win.session_storage() {
                                     Ok(Some(storage)) => {
-                                        if storage.set_item("vc_oauth_return_to", &current_url).is_err() {
+                                        if storage
+                                            .set_item("vc_oauth_return_to", &current_url)
+                                            .is_err()
+                                        {
                                             log::warn!("Failed to write vc_oauth_return_to to sessionStorage — post-login redirect will fall back to app root");
                                         }
                                     }
@@ -127,14 +130,22 @@ pub fn MeetingPage(id: String) -> Element {
                     match join_meeting(&meeting_id, Some(&display_name)).await {
                         Ok(response) => {
                             current_user_email.set(Some(response.email.clone()));
-                            host_email.set(info.host.clone());
+                            let determined_host = if response.is_host {
+                                response.email.clone()
+                            } else {
+                                match crate::meeting_api::get_meeting_info(&meeting_id).await {
+                                    Ok(info) => info.host,
+                                    Err(_) => String::new(),
+                                }
+                            };
+                            host_email.set(determined_host.clone());
                             let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                             match response.status.as_str() {
                                 "admitted" => {
                                     if let Some(token) = response.room_token {
                                         meeting_status.set(MeetingStatus::Admitted {
                                             is_host: response.is_host,
-                                            host_email: info.host,
+                                            host_email: determined_host,
                                             room_token: token,
                                             waiting_room_enabled: wr_enabled,
                                         });
@@ -193,6 +204,7 @@ pub fn MeetingPage(id: String) -> Element {
         let meeting_id = id.clone();
         move || {
             let meeting_id = meeting_id.clone();
+            let display_name = input_value_state();
             meeting_status.set(MeetingStatus::Joining);
 
             wasm_bindgen_futures::spawn_local(async move {
@@ -246,16 +258,24 @@ pub fn MeetingPage(id: String) -> Element {
 
     // Handle waiting room admission
     let on_admitted = {
+        let meeting_id = id.clone();
         move |status: JoinMeetingResponse| {
-            let determined_host = status.host_display_name.clone();
-            let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
-            let token = status.room_token.unwrap_or_default();
-            host_email.set(determined_host.clone());
-            meeting_status.set(MeetingStatus::Admitted {
-                is_host: false,
-                host_email: determined_host,
-                room_token: token,
-                waiting_room_enabled: wr_enabled,
+            let meeting_id = meeting_id.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let determined_host = match crate::meeting_api::get_meeting_info(&meeting_id).await
+                {
+                    Ok(info) => info.host,
+                    Err(_) => String::new(),
+                };
+                host_email.set(determined_host.clone());
+                let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
+                let token = status.room_token.unwrap_or_default();
+                meeting_status.set(MeetingStatus::Admitted {
+                    is_host: false,
+                    host_email: determined_host,
+                    room_token: token,
+                    waiting_room_enabled: wr_enabled,
+                });
             });
         }
     };

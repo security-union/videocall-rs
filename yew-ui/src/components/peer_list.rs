@@ -154,6 +154,27 @@ impl Component for PeerList {
 
                         updated
                     }
+                    "peer_speaking" => {
+                        // Fast-path speaking updates from decoded audio frames
+                        let mut to_peer: Option<String> = None;
+                        let mut speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                                _ => {}
+                            }
+                        }
+
+                        if let (Some(peer), Some(speaking_val)) = (to_peer, speaking) {
+                            let current = self.peer_speaking_states.get(&peer).copied();
+                            if current != Some(speaking_val) {
+                                self.peer_speaking_states.insert(peer, speaking_val);
+                                return true;
+                            }
+                        }
+                        false
+                    }
                     _ => false,
                 }
             }
@@ -179,12 +200,24 @@ impl Component for PeerList {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        // Get VideoCallClient from context to convert session_id to email for display
+        let client_ctx = ctx
+            .link()
+            .context::<VideoCallClientCtx>(Callback::noop())
+            .map(|(client, _)| client);
+
         let filtered_peers: Vec<_> = ctx
             .props()
             .peers
             .iter()
             .filter(|peer| {
-                peer.to_lowercase()
+                // Resolve session_id to display name for search filtering
+                let display_name = if let Some(ref client) = client_ctx {
+                    client.get_peer_email(peer).unwrap_or_else(|| (*peer).clone())
+                } else {
+                    (*peer).clone()
+                };
+                display_name.to_lowercase()
                     .contains(&self.search_query.to_lowercase())
             })
             .cloned()
@@ -217,12 +250,6 @@ impl Component for PeerList {
             .as_ref()
             .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
             .unwrap_or(false);
-
-        // Get VideoCallClient from context to convert session_id to email for display
-        let client_ctx = ctx
-            .link()
-            .context::<VideoCallClientCtx>(Callback::noop())
-            .map(|(client, _)| client);
 
         html! {
             <div>

@@ -109,7 +109,6 @@ pub enum Msg {
     OnCameraError(String),
     DismissUserError,
     UserScreenAction(UserScreenToggleAction),
-    ForceRerender,
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
     #[cfg(feature = "fake-peers")]
@@ -359,6 +358,7 @@ impl AttendantsComponent {
                     link.send_message(Msg::OnSpeakingChanged(speaking));
                 })
             }),
+            vad_threshold: crate::constants::vad_threshold().ok(),
         };
 
         VideoCallClient::new(opts)
@@ -530,11 +530,8 @@ impl Component for AttendantsComponent {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {
-            Msg::ForceRerender => {
-                true
-            }
             Msg::OnSpeakingChanged(speaking) => {
-                log::info!("🟢 LOCAL Speaking state changed to: {}", speaking);
+                log::trace!("LOCAL Speaking state changed to: {}", speaking);
                 self.local_speaking = speaking;
                 true
             }
@@ -1043,7 +1040,7 @@ impl Component for AttendantsComponent {
                     {
                         if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty() {
                             html! {
-                                <nav class="host">
+                                <nav class={classes!("host", if self.local_speaking { "speaking-tile" } else { "" })}>
                                     <div class="controls">
                                         <nav class="video-controls-container">
                                             <MicButton

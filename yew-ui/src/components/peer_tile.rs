@@ -151,6 +151,30 @@ impl Component for PeerTile {
                         }
                         changed
                     }
+                    "peer_speaking" => {
+                        // Fast-path speaking updates from decoded audio frames
+                        let mut to_peer: Option<String> = None;
+                        let mut speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                                _ => {}
+                            }
+                        }
+
+                        if to_peer.as_deref() != Some(ctx.props().peer_id.as_str()) {
+                            return false;
+                        }
+
+                        if let Some(s) = speaking {
+                            if s != self.is_speaking {
+                                self.is_speaking = s;
+                                return true;
+                            }
+                        }
+                        false
+                    }
                     _ => false,
                 }
             }

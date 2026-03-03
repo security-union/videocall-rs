@@ -184,6 +184,7 @@ impl Component for Host {
             audio_bitrate,
             microphone_callback,
             microphone_error_cb.clone(),
+            vad_threshold().ok(),
         );
 
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);

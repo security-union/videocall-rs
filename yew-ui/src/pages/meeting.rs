@@ -305,7 +305,10 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         let determined_host_email =
                             match crate::meeting_api::get_meeting_info(&meeting_id).await {
                                 Ok(info) => info.host,
-                                Err(_) => {
+                                Err(e) => {
+                                    log::error!(
+                                        "Failed to get meeting info for host detection: {e}"
+                                    );
                                     if response.is_host {
                                         response.email.clone()
                                     } else {
@@ -372,7 +375,10 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                 let determined_host_email =
                     match crate::meeting_api::get_meeting_info(&meeting_id).await {
                         Ok(info) => info.host,
-                        Err(_) => String::new(),
+                        Err(e) => {
+                            log::error!("Failed to get meeting info for host detection: {e}");
+                            String::new()
+                        }
                     };
 
                 meeting_status.set(MeetingStatus::Admitted {

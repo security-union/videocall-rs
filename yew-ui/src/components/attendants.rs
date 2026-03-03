@@ -1040,7 +1040,7 @@ impl Component for AttendantsComponent {
                     {
                         if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty() {
                             html! {
-                                <nav class={classes!("host", if self.local_speaking { "speaking-tile" } else { "" })}>
+                                <nav class="host">
                                     <div class="controls">
                                         <nav class="video-controls-container">
                                             <MicButton

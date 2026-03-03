@@ -556,19 +556,27 @@ h3 {
   transition: all 0.2s ease;
 }
 
+/* Host video wrapper needs border-radius so inset glow follows rounded corners */
+.host-video-wrapper {
+  border-radius: 0.75rem;
+  overflow: hidden;
+}
+
 /* Speaking tile animation - triggered by voice activity detection */
-.canvas-container.speaking-tile,
-.host.speaking-tile {
-  box-shadow: inset 0 0 12px 4px rgba(0, 255, 65, 0.25), 0 0 16px 2px rgba(0, 255, 65, 0.15);
+.speaking-tile {
+  border: 1.5px solid rgba(0, 255, 65, 0.5);
+  box-shadow: inset 0 0 18px 6px rgba(0, 255, 65, 0.4), 0 0 20px 4px rgba(0, 255, 65, 0.25);
   animation: tile-glow 1.5s ease-in-out infinite;
 }
 
 @keyframes tile-glow {
   0%, 100% {
-    box-shadow: inset 0 0 12px 4px rgba(0, 255, 65, 0.25), 0 0 16px 2px rgba(0, 255, 65, 0.15);
+    border-color: rgba(0, 255, 65, 0.5);
+    box-shadow: inset 0 0 18px 6px rgba(0, 255, 65, 0.4), 0 0 20px 4px rgba(0, 255, 65, 0.25);
   }
   50% {
-    box-shadow: inset 0 0 18px 6px rgba(0, 255, 65, 0.35), 0 0 22px 4px rgba(0, 255, 65, 0.2);
+    border-color: rgba(0, 255, 65, 0.7);
+    box-shadow: inset 0 0 25px 8px rgba(0, 255, 65, 0.55), 0 0 30px 6px rgba(0, 255, 65, 0.35);
   }
 }
 

@@ -604,7 +604,7 @@ pub fn AttendantsComponent(
 
                     // Controls nav
                     if can_stream {
-                        nav { class: if local_speaking() { "host speaking-tile" } else { "host" },
+                        nav { class: "host",
                             div { class: "controls",
                                 nav { class: "video-controls-container",
                                     {

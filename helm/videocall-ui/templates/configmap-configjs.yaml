@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "videocall-ui.fullname" . }}-config
+  labels:
+    {{- include "videocall-ui.labels" . | nindent 4 }}
+data:
+  config.js: |-
+    {{ $cfg := default dict .Values.runtimeConfig }}
+    window.__APP_CONFIG = Object.freeze({{ $cfg | toJson }});

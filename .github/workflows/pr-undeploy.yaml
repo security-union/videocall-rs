@@ -104,8 +104,10 @@ jobs:
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
 
           # Find which slot this PR is using
+          # || true: kubectl exits 1 when jsonpath hits an empty array (no match);
+          # suppress that so -e doesn't kill the script before the [ -z ] check.
           SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
-            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null)
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null || true)
 
           if [ -z "$SLOT" ]; then
             echo "PR #${PR_NUM} is not deployed"
@@ -138,15 +140,19 @@ jobs:
           echo "Dropping database: ${DB_NAME} (slot ${SLOT})"
 
           # Get postgres password from secret
-          PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
+          # || true: prevents -e from exiting if the secret doesn't exist
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra \
+            -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || true)
 
-          # Drop database
-          kubectl exec -n preview-infra postgres-postgresql-0 -- \
-            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" || {
-              echo "⚠️  Failed to drop database, may need manual cleanup"
-            }
-
-          echo "✅ Database dropped for slot ${SLOT}"
+          if [ -z "$PG_PASSWORD" ]; then
+            echo "⚠️  Failed to get postgres credentials, skipping database drop"
+          else
+            kubectl exec -n preview-infra postgres-postgresql-0 -- \
+              env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" || {
+                echo "⚠️  Failed to drop database, may need manual cleanup"
+              }
+            echo "✅ Database dropped for slot ${SLOT}"
+          fi
 
       - name: React to comment (success)
         uses: actions/github-script@v7

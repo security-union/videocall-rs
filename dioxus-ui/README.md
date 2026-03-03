@@ -132,6 +132,7 @@ window.__APP_CONFIG = Object.freeze({
     audioBitrateKbps: 65,
     videoBitrateKbps: 100,
     screenBitrateKbps: 100,
+    vadThreshold: 0.02,         // Voice activity detection sensitivity (0.01=high, 0.05=low)
 });
 ```
 

@@ -254,11 +254,21 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
-                // Infer video_enabled from the actual media frame so the UI
-                // doesn't wait for the next heartbeat to show the video tile.
                 if !self.video_enabled {
-                    self.video_enabled = true;
-                    self.broadcast_peer_status();
+                    if !self.has_received_heartbeat {
+                        // No heartbeat yet — infer video_enabled from the actual frame.
+                        self.video_enabled = true;
+                        self.broadcast_peer_status();
+                    } else {
+                        // Peer has video off per heartbeat; drop straggler frame.
+                        return Ok((
+                            media_type,
+                            DecodeStatus {
+                                rendered: false,
+                                first_frame: false,
+                            },
+                        ));
+                    }
                 }
                 let video_status = self
                     .video
@@ -298,10 +308,21 @@ impl Peer {
                 ))
             }
             MediaType::SCREEN => {
-                // Infer screen_enabled from the actual media frame.
                 if !self.screen_enabled {
-                    self.screen_enabled = true;
-                    self.broadcast_peer_status();
+                    if !self.has_received_heartbeat {
+                        // No heartbeat yet — infer screen_enabled from the actual frame.
+                        self.screen_enabled = true;
+                        self.broadcast_peer_status();
+                    } else {
+                        // Peer has screen off per heartbeat; drop straggler frame.
+                        return Ok((
+                            media_type,
+                            DecodeStatus {
+                                rendered: false,
+                                first_frame: false,
+                            },
+                        ));
+                    }
                 }
                 let screen_status = self
                     .screen

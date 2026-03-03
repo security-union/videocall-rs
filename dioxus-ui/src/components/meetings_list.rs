@@ -335,33 +335,23 @@ fn MeetingItem(
                             style: "width: 100%; padding: 0.75rem 1rem; border-top: 1px solid rgba(255,255,255,0.1); display: flex; align-items: center; gap: 0.75rem;",
                             onclick: move |e: MouseEvent| e.stop_propagation(),
                             span { style: "font-size: 0.85rem; color: rgba(255,255,255,0.8);", "Waiting Room" }
-                            button {
-                                r#type: "button",
-                                style: if waiting_room_toggle() {
-                                    "position: relative; width: 40px; height: 22px; border-radius: 11px; border: none; cursor: pointer; background: #34c759; transition: background 0.2s; flex-shrink: 0;"
-                                } else {
-                                    "position: relative; width: 40px; height: 22px; border-radius: 11px; border: none; cursor: pointer; background: #636366; transition: background 0.2s; flex-shrink: 0;"
-                                },
-                                onclick: {
+                            crate::components::toggle_switch::ToggleSwitch {
+                                enabled: waiting_room_toggle(),
+                                width: 40,
+                                height: 22,
+                                on_toggle: {
                                     let meeting_id = meeting_id.clone();
-                                    move |_| {
-                                        let new_val = !waiting_room_toggle();
+                                    move |new_val: bool| {
                                         waiting_room_toggle.set(new_val);
                                         let meeting_id = meeting_id.clone();
                                         wasm_bindgen_futures::spawn_local(async move {
                                             if let Err(e) = crate::meeting_api::update_meeting(&meeting_id, new_val).await {
                                                 log::error!("Failed to update waiting room: {e}");
+                                                waiting_room_toggle.set(!new_val);
                                             }
                                         });
                                     }
                                 },
-                                div {
-                                    style: if waiting_room_toggle() {
-                                        "position: absolute; top: 1px; left: 20px; width: 20px; height: 20px; border-radius: 50%; background: white; transition: left 0.2s;"
-                                    } else {
-                                        "position: absolute; top: 1px; left: 1px; width: 20px; height: 20px; border-radius: 50%; background: white; transition: left 0.2s;"
-                                    },
-                                }
                             }
                             span { style: "font-size: 0.75rem; color: rgba(255,255,255,0.5);",
                                 if waiting_room_toggle() { "ON" } else { "OFF" }

@@ -15,7 +15,7 @@ pub type ParticipantStatus = ParticipantStatusResponse;
 #[component]
 pub fn WaitingRoom(
     meeting_id: String,
-    on_admitted: EventHandler<String>,
+    on_admitted: EventHandler<ParticipantStatus>,
     on_rejected: EventHandler<()>,
     on_cancel: EventHandler<()>,
 ) -> Element {
@@ -75,7 +75,7 @@ pub fn WaitingRoom(
 
 async fn handle_status_check(
     meeting_id: &str,
-    on_admitted: &EventHandler<String>,
+    on_admitted: &EventHandler<ParticipantStatus>,
     on_rejected: &EventHandler<()>,
     error: &mut Signal<Option<String>>,
 ) {
@@ -83,8 +83,8 @@ async fn handle_status_check(
         Ok(status) => {
             match status.status.as_str() {
                 "admitted" => {
-                    if let Some(token) = status.room_token {
-                        on_admitted.call(token);
+                    if status.room_token.is_some() {
+                        on_admitted.call(status);
                     } else {
                         error.set(Some("Admitted but no room token received".to_string()));
                     }

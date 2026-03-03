@@ -17,7 +17,7 @@ use crate::constants::{e2ee_enabled, oauth_enabled, webtransport_enabled};
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
 };
-use crate::meeting_api::{get_meeting_info, join_meeting, JoinError};
+use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 use web_sys::window;
@@ -124,50 +124,45 @@ pub fn MeetingPage(id: String) -> Element {
 
             spawn(async move {
                 loop {
-                    if let Ok(info) = get_meeting_info(&meeting_id).await {
-                        if info.state == "active" {
-                            match join_meeting(&meeting_id, Some(&display_name)).await {
-                                Ok(response) => {
-                                    current_user_email.set(Some(response.email.clone()));
-                                    host_display_name.set(info.host_display_name.clone());
-                                    match response.status.as_str() {
-                                        "admitted" => {
-                                            if let Some(token) = response.room_token {
-                                                meeting_status.set(MeetingStatus::Admitted {
-                                                    is_host: response.is_host,
-                                                    host_display_name: info.host_display_name,
-                                                    room_token: token,
-                                                    waiting_room_enabled: info.waiting_room_enabled,
-                                                });
-                                            } else {
-                                                meeting_status.set(MeetingStatus::Error(
-                                                    "Admitted but no room token".to_string(),
-                                                ));
-                                            }
-                                        }
-                                        "waiting" => {
-                                            came_from_waiting_room.set(true);
-                                            meeting_status.set(MeetingStatus::Waiting);
-                                        }
-                                        "rejected" => {
-                                            meeting_status.set(MeetingStatus::Rejected);
-                                        }
-                                        _ => meeting_status.set(MeetingStatus::Error(format!(
-                                            "Unknown status: {}",
-                                            response.status
-                                        ))),
+                    match join_meeting(&meeting_id, Some(&display_name)).await {
+                        Ok(response) => {
+                            current_user_email.set(Some(response.email.clone()));
+                            let determined_host = response.host_display_name.clone();
+                            let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
+                            host_display_name.set(determined_host.clone());
+                            match response.status.as_str() {
+                                "admitted" => {
+                                    if let Some(token) = response.room_token {
+                                        meeting_status.set(MeetingStatus::Admitted {
+                                            is_host: response.is_host,
+                                            host_display_name: determined_host,
+                                            room_token: token,
+                                            waiting_room_enabled: wr_enabled,
+                                        });
+                                    } else {
+                                        meeting_status.set(MeetingStatus::Error(
+                                            "Admitted but no room token".to_string(),
+                                        ));
                                     }
-                                    // Status changed — break out of the loop.
-                                    // The effect will re-run and decide whether
-                                    // to keep polling.
-                                    break;
                                 }
-                                Err(JoinError::MeetingNotActive) => {}
-                                Err(e) => {
-                                    meeting_status.set(MeetingStatus::Error(e.to_string()));
-                                    break;
+                                "waiting" => {
+                                    came_from_waiting_room.set(true);
+                                    meeting_status.set(MeetingStatus::Waiting);
                                 }
+                                "rejected" => {
+                                    meeting_status.set(MeetingStatus::Rejected);
+                                }
+                                _ => meeting_status.set(MeetingStatus::Error(format!(
+                                    "Unknown status: {}",
+                                    response.status
+                                ))),
                             }
+                            break;
+                        }
+                        Err(JoinError::MeetingNotActive) => {}
+                        Err(e) => {
+                            meeting_status.set(MeetingStatus::Error(e.to_string()));
+                            break;
                         }
                     }
                     TimeoutFuture::new(2_000).await;
@@ -206,19 +201,12 @@ pub fn MeetingPage(id: String) -> Element {
                 match join_meeting(&meeting_id, Some(&display_name)).await {
                     Ok(response) => {
                         current_user_email.set(Some(response.email.clone()));
-                        let (determined_host, wr_enabled) = if response.is_host {
-                            // Host: fetch meeting info to get waiting_room_enabled
-                            let wr = match crate::meeting_api::get_meeting_info(&meeting_id).await {
-                                Ok(info) => info.waiting_room_enabled,
-                                Err(_) => true,
-                            };
-                            (Some(display_name.clone()), wr)
+                        let determined_host = if response.is_host {
+                            Some(display_name.clone())
                         } else {
-                            match crate::meeting_api::get_meeting_info(&meeting_id).await {
-                                Ok(info) => (info.host_display_name, info.waiting_room_enabled),
-                                Err(_) => (None, true),
-                            }
+                            response.host_display_name.clone()
                         };
+                        let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                         host_display_name.set(determined_host.clone());
                         match response.status.as_str() {
                             "admitted" => {
@@ -257,22 +245,16 @@ pub fn MeetingPage(id: String) -> Element {
 
     // Handle waiting room admission
     let on_admitted = {
-        let meeting_id = id.clone();
-        move |room_token: String| {
-            let meeting_id = meeting_id.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let (determined_host, wr_enabled) =
-                    match crate::meeting_api::get_meeting_info(&meeting_id).await {
-                        Ok(info) => (info.host_display_name, info.waiting_room_enabled),
-                        Err(_) => (None, true),
-                    };
-                host_display_name.set(determined_host.clone());
-                meeting_status.set(MeetingStatus::Admitted {
-                    is_host: false,
-                    host_display_name: determined_host,
-                    room_token,
-                    waiting_room_enabled: wr_enabled,
-                });
+        move |status: JoinMeetingResponse| {
+            let determined_host = status.host_display_name.clone();
+            let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
+            let token = status.room_token.unwrap_or_default();
+            host_display_name.set(determined_host.clone());
+            meeting_status.set(MeetingStatus::Admitted {
+                is_host: false,
+                host_display_name: determined_host,
+                room_token: token,
+                waiting_room_enabled: wr_enabled,
             });
         }
     };

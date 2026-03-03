@@ -197,6 +197,32 @@ impl Peer {
         Ok(())
     }
 
+    /// Broadcast current media-enabled state to the diagnostics bus so the UI
+    /// can update peer tiles.
+    fn broadcast_peer_status(&self) {
+        let evt = DiagEvent {
+            subsystem: "peer_status",
+            stream_id: None,
+            ts_ms: now_ms(),
+            metrics: vec![
+                metric!("to_peer", self.session_id.to_string()),
+                metric!(
+                    "audio_enabled",
+                    if self.audio_enabled { 1u64 } else { 0u64 }
+                ),
+                metric!(
+                    "video_enabled",
+                    if self.video_enabled { 1u64 } else { 0u64 }
+                ),
+                metric!(
+                    "screen_enabled",
+                    if self.screen_enabled { 1u64 } else { 0u64 }
+                ),
+            ],
+        };
+        let _ = global_sender().try_broadcast(evt);
+    }
+
     fn decode(
         &mut self,
         packet: &Arc<PacketWrapper>,
@@ -226,6 +252,12 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
+                // Infer video_enabled from the actual media frame so the UI
+                // doesn't wait for the next heartbeat to show the video tile.
+                if !self.video_enabled {
+                    self.video_enabled = true;
+                    self.broadcast_peer_status();
+                }
                 let video_status = self
                     .video
                     .decode(&packet)
@@ -239,26 +271,25 @@ impl Peer {
                 ))
             }
             MediaType::AUDIO => {
+                // Infer audio_enabled from the actual media frame.
                 if !self.audio_enabled {
-                    // Peer is muted, don't send packet to NetEq to avoid expand packets (hissing sound)
-                    debug!("Peer {} is muted, skipping audio packet", self.session_id);
-                    Ok((
-                        media_type,
-                        DecodeStatus {
-                            rendered: false,
-                            first_frame: false,
-                        },
-                    ))
-                } else {
-                    Ok((
-                        media_type,
-                        self.audio
-                            .decode(&packet)
-                            .map_err(|_| PeerDecodeError::AudioDecodeError)?,
-                    ))
+                    self.audio_enabled = true;
+                    self.audio.set_muted(false);
+                    self.broadcast_peer_status();
                 }
+                Ok((
+                    media_type,
+                    self.audio
+                        .decode(&packet)
+                        .map_err(|_| PeerDecodeError::AudioDecodeError)?,
+                ))
             }
             MediaType::SCREEN => {
+                // Infer screen_enabled from the actual media frame.
+                if !self.screen_enabled {
+                    self.screen_enabled = true;
+                    self.broadcast_peer_status();
+                }
                 let screen_status = self
                     .screen
                     .decode(&packet)
@@ -320,30 +351,7 @@ impl Peer {
                         );
                     }
 
-                    // Broadcast peer status to diagnostics with original IDs
-                    // We don't have local userid here; use reporting peer context via diagnostics elsewhere.
-                    let evt = DiagEvent {
-                        subsystem: "peer_status",
-                        stream_id: None,
-                        ts_ms: now_ms(),
-                        metrics: vec![
-                            // from_peer will be attached by higher layer that knows the local user id
-                            metric!("to_peer", self.session_id.to_string()),
-                            metric!(
-                                "audio_enabled",
-                                if metadata.audio_enabled { 1u64 } else { 0u64 }
-                            ),
-                            metric!(
-                                "video_enabled",
-                                if metadata.video_enabled { 1u64 } else { 0u64 }
-                            ),
-                            metric!(
-                                "screen_enabled",
-                                if metadata.screen_enabled { 1u64 } else { 0u64 }
-                            ),
-                        ],
-                    };
-                    let _ = global_sender().try_broadcast(evt);
+                    self.broadcast_peer_status();
                 }
                 Ok((
                     media_type,

@@ -93,6 +93,7 @@ pub struct Peer {
     pub audio_enabled: bool,
     pub screen_enabled: bool,
     context_initialized: bool,
+    has_received_heartbeat: bool,
 }
 
 use std::fmt::Debug;
@@ -136,6 +137,7 @@ impl Peer {
             audio_enabled: false,
             screen_enabled: false,
             context_initialized: false,
+            has_received_heartbeat: false,
         })
     }
 
@@ -271,14 +273,22 @@ impl Peer {
                 ))
             }
             MediaType::AUDIO => {
-                // Infer audio_enabled from the actual media frame.
-                // Known limitation: a straggler audio packet arriving after a mute
-                // heartbeat will temporarily flip audio_enabled back to true until
-                // the next heartbeat corrects it.
                 if !self.audio_enabled {
-                    self.audio_enabled = true;
-                    self.audio.set_muted(false);
-                    self.broadcast_peer_status();
+                    if !self.has_received_heartbeat {
+                        // No heartbeat yet — infer audio_enabled from the actual frame.
+                        self.audio_enabled = true;
+                        self.audio.set_muted(false);
+                        self.broadcast_peer_status();
+                    } else {
+                        // Peer is muted per heartbeat; drop straggler audio to avoid audible glitch.
+                        return Ok((
+                            media_type,
+                            DecodeStatus {
+                                rendered: false,
+                                first_frame: false,
+                            },
+                        ));
+                    }
                 }
                 Ok((
                     media_type,
@@ -306,6 +316,7 @@ impl Peer {
                 ))
             }
             MediaType::HEARTBEAT => {
+                self.has_received_heartbeat = true;
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
                     // Check if video is being turned off (on -> off transition)

@@ -17,7 +17,7 @@
  */
 
 use crate::components::canvas_generator::generate_for_peer;
-use crate::context::{PeerMediaState, PeerStatusMap, VideoCallClientCtx};
+use crate::context::{PeerStatusMap, VideoCallClientCtx};
 use dioxus::prelude::*;
 
 #[component]
@@ -29,19 +29,11 @@ pub fn PeerTile(
     let client = use_context::<VideoCallClientCtx>();
     let peer_status_map = use_context::<PeerStatusMap>();
 
-    // Read peer state from the shared map (populated by a single subscriber
-    // in the parent AttendantsComponent). Falls back to client snapshot for
-    // peers that haven't sent a heartbeat yet. The read subscribes this
-    // component to changes so Dioxus re-renders when the map is updated.
-    let _state = peer_status_map
-        .read()
-        .get(&peer_id)
-        .cloned()
-        .unwrap_or_else(|| PeerMediaState {
-            audio_enabled: client.is_audio_enabled_for_peer(&peer_id),
-            video_enabled: client.is_video_enabled_for_peer(&peer_id),
-            screen_enabled: client.is_screen_share_enabled_for_peer(&peer_id),
-        });
+    // Subscribe to peer_status_map changes so Dioxus re-renders this component
+    // when peer state updates. The actual state values are read by
+    // generate_for_peer via client.is_*_for_peer(), which reads the same Peer
+    // fields that were updated before the diagnostics event was broadcast.
+    let _ = peer_status_map.read().get(&peer_id);
 
     let host_dn = host_display_name.as_deref();
     generate_for_peer(&client, &peer_id, full_bleed, host_dn)

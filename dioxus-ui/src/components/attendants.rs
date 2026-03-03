@@ -34,13 +34,13 @@ use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap};
-use std::collections::HashMap;
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::error;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;

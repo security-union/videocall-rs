@@ -677,6 +677,39 @@ impl AttendantsComponent {
             },
         }
     }
+
+    fn render_device_error(&self) -> Html {
+        let mut messages = vec![];
+
+        if let Some(err) = &self.mic_error {
+            messages.push(self.render_single_error("Microphone", err));
+        }
+
+        if let Some(err) = &self.video_error {
+            messages.push(self.render_single_error("Camera", err));
+        }
+
+        html!{ for messages}
+    }
+
+    fn render_single_error(&self, device: &str, error:&MediaErrorState) -> Html {
+        match error {
+            MediaErrorState::NoDevice => html! {
+                <p>{ format!(" {} not found on this device.",device)}</p>
+            },
+            MediaErrorState::Other => html! {
+                <p>{ format!(" {} has an unexpected problem.",device)}</p>
+            },
+            MediaErrorState::PermissionDenied => html! {
+                <>
+                   <p>{ format!(" {} is blocked in your browser.",device)}</p>
+                   <p style="front-size: 0.9rem; opacity: 0.8;">
+                      {"Please click the lock icon in your browser's address bar and allow access if you want to use it."}
+                   </p>
+                </>
+            },
+        }
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -687,7 +720,7 @@ impl Component for AttendantsComponent {
         let link = ctx.link().clone();
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
-       
+
         let window = web_sys::window().expect("no global window exist");
         let closure = Closure::wrap(Box::new(move |_event: Event| {
             link.send_message(WsAction::WindowFocused);
@@ -1195,6 +1228,7 @@ impl Component for AttendantsComponent {
         let is_allowed = users_allowed_to_stream().unwrap_or_default();
         let can_stream =
             is_allowed.is_empty() || is_allowed.iter().any(|host| host == &effective_user_id);
+
         let media_access_granted = self.media_device_access.is_granted(MediaAccessKind::BothCheck);
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);

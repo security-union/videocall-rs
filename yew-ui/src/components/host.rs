@@ -259,6 +259,7 @@ impl Component for Host {
             self.media_devices.load();
             self.last_reload_counter = ctx.props().reload_devices_counter;
         }
+
         if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
             self.share_screen = ctx.props().share_screen;
             let link = ctx.link().clone();
@@ -496,7 +497,7 @@ impl Component for Host {
                     false
                 }
             }
-            Msg::DevicesLoaded => {
+            Msg::DevicesLoaded => {        
                 let audio_id_str = self.media_devices.audio_inputs.selected();
                 let video_id_str = self.media_devices.video_inputs.selected();
 
@@ -514,7 +515,7 @@ impl Component for Host {
                         let link = ctx.link().clone();
                         move |s: String| link.send_message(Msg::MicrophoneError(s))
                     });
-        
+
                     let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
                     self.microphone = create_microphone_encoder(
                         client.clone(),

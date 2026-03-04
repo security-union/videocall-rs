@@ -283,7 +283,7 @@ impl MicrophoneEncoder {
                 media_info.set_device_id(&exact.into());
                 constraints.set_audio(&media_info.into());
             }
-            
+
             constraints.set_video(&Boolean::from(false));
             let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
                 Ok(p) => p,

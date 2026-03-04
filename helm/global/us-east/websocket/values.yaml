@@ -17,15 +17,6 @@ rustlemania-websocket:
       value: "8080"
     - name: NATS_URL
       value: nats-us-east:4222  # Connect to US East NATS cluster
-    - name: DATABASE_ENABLED
-      value: "true"
-    - name: PG_PASSWORD
-      valueFrom:
-        secretKeyRef:
-          name: postgres-credentials
-          key: password
-    - name: DATABASE_URL
-      value: postgres://postgres:$(PG_PASSWORD)@postgres-postgresql:5432/actix-api-db?sslmode=disable
     - name: REGION
       value: "us-east"
     - name: HOSTNAME

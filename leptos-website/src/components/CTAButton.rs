@@ -43,18 +43,18 @@ pub fn CTAButton(
     #[prop(default = None)] href: Option<String>,
     #[prop(default = false)] disabled: bool,
 ) -> impl IntoView {
-    let base_classes = "inline-flex items-center justify-center font-medium transition-all duration-200 ease-out focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50 disabled:cursor-not-allowed";
+    let base_classes = "inline-flex items-center justify-center font-medium transition-all duration-200 ease-out focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed";
 
     let variant_classes = match variant {
-        ButtonVariant::Primary => "bg-primary text-white hover:bg-primary-dark focus:ring-primary/20 shadow-sm hover:shadow-md",
-        ButtonVariant::Secondary => "bg-background-secondary text-foreground border border-border hover:bg-background-tertiary hover:border-border-secondary focus:ring-primary/20",
-        ButtonVariant::Tertiary => "text-primary hover:text-primary-dark hover:bg-primary/5 focus:ring-primary/20",
+        ButtonVariant::Primary => "btn-primary",
+        ButtonVariant::Secondary => "btn-secondary",
+        ButtonVariant::Tertiary => "text-primary hover:opacity-70",
     };
 
     let size_classes = match size {
-        ButtonSize::Small => "px-4 py-2 text-sm rounded-md",
-        ButtonSize::Medium => "px-6 py-3 text-base rounded-lg",
-        ButtonSize::Large => "px-8 py-4 text-lg rounded-xl",
+        ButtonSize::Small => "px-4 py-2 text-sm",
+        ButtonSize::Medium => "px-6 py-3 text-[15px]",
+        ButtonSize::Large => "px-8 py-4 text-base",
     };
 
     let combined_class = format!(

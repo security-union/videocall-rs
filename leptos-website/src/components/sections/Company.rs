@@ -23,9 +23,9 @@ use leptos::*;
 pub fn CompanySection() -> impl IntoView {
     view! {
         <section id="company" class="relative">
-            <div class="text-center mb-20">
-                <h2 class="text-headline text-foreground mb-6">"Company"</h2>
-                <p class="text-body-large text-foreground-secondary max-w-3xl mx-auto">"Building the future of real-time communication"</p>
+            <div class="text-center mb-16">
+                <h2 class="text-4xl md:text-5xl font-semibold tracking-tight mb-4">"Company"</h2>
+                <p class="text-lg md:text-xl text-white/50 max-w-2xl mx-auto">"Building the future of real-time communication"</p>
             </div>
 
             <div class="grid md:grid-cols-2 gap-8 lg:gap-12">

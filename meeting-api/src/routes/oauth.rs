@@ -25,6 +25,9 @@ use axum::{
 };
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::Deserialize;
+use url::Url;
+
+use videocall_meeting_types::responses::{APIResponse, ProfileResponse};
 
 use crate::auth::AuthUser;
 use crate::db::oauth as db_oauth;
@@ -38,8 +41,14 @@ use crate::token;
 // ---------------------------------------------------------------------------
 
 /// Build a `Set-Cookie` header value for the session JWT.
-fn build_session_cookie(jwt: &str, ttl_secs: i64, domain: Option<&str>, secure: bool) -> String {
-    let mut cookie = format!("session={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
+fn build_session_cookie(
+    name: &str,
+    jwt: &str,
+    ttl_secs: i64,
+    domain: Option<&str>,
+    secure: bool,
+) -> String {
+    let mut cookie = format!("{name}={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -49,9 +58,9 @@ fn build_session_cookie(jwt: &str, ttl_secs: i64, domain: Option<&str>, secure: 
     cookie
 }
 
-/// Build a `Set-Cookie` header that clears the `session` cookie.
-fn build_clear_session_cookie(domain: Option<&str>, secure: bool) -> String {
-    let mut cookie = "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
+/// Build a `Set-Cookie` header that clears the session cookie.
+fn build_clear_session_cookie(name: &str, domain: Option<&str>, secure: bool) -> String {
+    let mut cookie = format!("{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -79,8 +88,8 @@ pub struct CallbackQuery {
 
 /// GET /login?returnTo=<url>
 ///
-/// Initiates the OAuth flow: generates PKCE + CSRF, stores in DB, redirects to
-/// the identity provider.
+/// Initiates the OAuth flow: generates PKCE + CSRF + nonce, stores in DB,
+/// redirects to the identity provider.
 pub async fn login(
     State(state): State<AppState>,
     Query(query): Query<LoginQuery>,
@@ -93,12 +102,27 @@ pub async fn login(
     let csrf_token = CsrfToken::new_random();
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
+    // Generate a nonce for OIDC ID token binding (reuse oauth2's crypto RNG).
+    let nonce = CsrfToken::new_random();
+
+    // Sanitize return_to: allow relative paths and absolute URLs whose origin
+    // is in the allowlist (after_login_url origin + ALLOWED_REDIRECT_URLS).
+    let return_to = query.return_to.as_deref().and_then(|u| {
+        validate_return_to(
+            u,
+            &oauth_cfg.after_login_url,
+            &oauth_cfg.allowed_redirect_urls,
+        )
+    });
+    let return_to = return_to.as_deref();
+
     db_oauth::store_oauth_request(
         &state.db,
         pkce_challenge.as_str(),
         pkce_verifier.secret(),
         csrf_token.secret(),
-        query.return_to.as_deref(),
+        return_to,
+        Some(nonce.secret()),
     )
     .await?;
 
@@ -106,8 +130,10 @@ pub async fn login(
         &oauth_cfg.auth_url,
         &oauth_cfg.client_id,
         &oauth_cfg.redirect_url,
+        &oauth_cfg.scopes,
         pkce_challenge.as_str(),
         csrf_token.secret(),
+        Some(nonce.secret()),
     );
 
     Ok(Redirect::to(&auth_url).into_response())
@@ -116,6 +142,7 @@ pub async fn login(
 /// GET /login/callback?state=...&code=...
 ///
 /// Handles the OAuth callback: exchanges the authorization code for tokens,
+/// verifies the ID token (signature, nonce, audience, issuer when configured),
 /// creates a signed session JWT, and sets it as an `HttpOnly` cookie.
 pub async fn callback(
     State(state): State<AppState>,
@@ -139,20 +166,54 @@ pub async fn callback(
         .pkce_verifier
         .ok_or_else(|| AppError::internal("missing PKCE verifier"))?;
 
-    let (token_response, claims) = oauth::exchange_code_for_claims(
+    let (token_response, mut claims) = oauth::exchange_code_for_claims(
         &oauth_cfg.redirect_url,
         &oauth_cfg.client_id,
-        &oauth_cfg.client_secret,
+        oauth_cfg.client_secret.as_deref(),
         &pkce_verifier,
         &oauth_cfg.token_url,
         &query.code,
+        state.jwks_cache.as_deref(),
+        oauth_cfg.issuer.as_deref(),
+        oauth_req.nonce.as_deref(),
     )
     .await?;
 
+    // If the ID token lacks an email claim, fall back to the UserInfo endpoint.
+    if claims.email.as_ref().is_none_or(|e| e.is_empty()) {
+        if let Some(userinfo_url) = &oauth_cfg.userinfo_url {
+            let user_info =
+                oauth::fetch_userinfo(userinfo_url, &token_response.access_token).await?;
+            if claims.email.as_ref().is_none_or(|e| e.is_empty()) {
+                claims.email = user_info.email;
+            }
+            if claims.name.is_empty() {
+                if let Some(name) = user_info.name {
+                    claims.name = name;
+                }
+            }
+            if claims.given_name.is_none() {
+                claims.given_name = user_info.given_name;
+            }
+            if claims.family_name.is_none() {
+                claims.family_name = user_info.family_name;
+            }
+        }
+    }
+
+    let email = claims
+        .email
+        .as_ref()
+        .filter(|e| !e.is_empty())
+        .ok_or_else(|| AppError::internal("Email not available from ID token or UserInfo"))?
+        .clone();
+
+    let display_name = claims.display_name();
+
     db_oauth::upsert_user(
         &state.db,
-        &claims.email,
-        &claims.name,
+        &email,
+        &display_name,
         &token_response.access_token,
         token_response.refresh_token.as_deref(),
     )
@@ -161,16 +222,30 @@ pub async fn callback(
     // --- Issue signed session JWT inside an HttpOnly cookie ---
     let session_jwt = token::generate_session_token(
         &state.jwt_secret,
-        &claims.email,
-        &claims.name,
+        &email,
+        &display_name,
         state.session_ttl_secs,
     )?;
 
-    let redirect_url = oauth_req
-        .return_to
-        .unwrap_or_else(|| oauth_cfg.after_login_url.clone());
+    let redirect_url = match &oauth_req.return_to {
+        Some(value) if value.starts_with("http://") || value.starts_with("https://") => {
+            // Absolute URL — re-validate as defense-in-depth.
+            validate_return_to(value, &oauth_cfg.after_login_url, &oauth_cfg.allowed_redirect_urls)
+                .unwrap_or_else(|| oauth_cfg.after_login_url.clone())
+        }
+        Some(path) => {
+            // Relative path (e.g. "/meeting/1") — prepend the frontend base URL.
+            format!(
+                "{}{}",
+                oauth_cfg.after_login_url.trim_end_matches('/'),
+                path
+            )
+        }
+        None => oauth_cfg.after_login_url.clone(),
+    };
 
     let session_cookie = build_session_cookie(
+        &state.cookie_name,
         &session_jwt,
         state.session_ttl_secs,
         state.cookie_domain.as_deref(),
@@ -179,15 +254,16 @@ pub async fn callback(
 
     tracing::info!(
         "OAuth login successful for {} ({}), redirecting to {}",
-        claims.name,
-        claims.email,
+        display_name,
+        email,
         redirect_url
     );
 
     let mut response = Redirect::to(&redirect_url).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
-        HeaderValue::from_str(&session_cookie).unwrap(),
+        HeaderValue::from_str(&session_cookie)
+            .map_err(|_| AppError::internal("failed to build session cookie header"))?,
     );
     Ok(response)
 }
@@ -196,67 +272,317 @@ pub async fn callback(
 ///
 /// The `AuthUser` extractor validates the session JWT from the `session`
 /// cookie (or `Authorization: Bearer` header).
-pub async fn check_session(AuthUser(_email): AuthUser) -> StatusCode {
+pub async fn check_session(AuthUser { .. }: AuthUser) -> StatusCode {
     StatusCode::OK
 }
 
-/// GET /profile -- returns `{ "email": "...", "name": "..." }` from the
-/// session JWT claims.
+/// GET /profile -- returns the authenticated user's profile from the session
+/// JWT claims.
 ///
 /// Because the session JWT embeds both email and display name, this endpoint
 /// does not need a database query.
-pub async fn get_profile(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let token = extract_session_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    let claims = token::decode_session_token(&state.jwt_secret, &token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    Ok(Json(
-        serde_json::json!({ "email": claims.sub, "name": claims.name }),
-    ))
+pub async fn get_profile(AuthUser { email, name }: AuthUser) -> Json<APIResponse<ProfileResponse>> {
+    Json(APIResponse::ok(ProfileResponse { email, name }))
 }
 
 /// GET /logout -- clears the session cookie.
-pub async fn logout(State(state): State<AppState>) -> Response {
-    let clear = build_clear_session_cookie(state.cookie_domain.as_deref(), state.cookie_secure);
+pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError> {
+    let clear = build_clear_session_cookie(
+        &state.cookie_name,
+        state.cookie_domain.as_deref(),
+        state.cookie_secure,
+    );
     let mut response = StatusCode::OK.into_response();
-    response
-        .headers_mut()
-        .append(header::SET_COOKIE, HeaderValue::from_str(&clear).unwrap());
-    response
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear)
+            .map_err(|_| AppError::internal("failed to build clear cookie header"))?,
+    );
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the raw session JWT from either the `session` cookie or the
-/// `Authorization: Bearer` header.
-fn extract_session_token(headers: &axum::http::HeaderMap) -> Option<String> {
-    // 1. Try the `session` cookie.
-    if let Some(cookie_header) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
-        for pair in cookie_header.split(';') {
-            let pair = pair.trim();
-            if let Some(value) = pair.strip_prefix("session=") {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
+/// Validate and sanitize a `returnTo` value.
+///
+/// Accepts:
+/// - Relative paths starting with `/` (but not `//`). Note: path-traversal
+///   sequences like `/../` are not stripped here because the browser resolves
+///   them before navigation and the redirect target is always an allowed origin.
+/// - Absolute `http(s)://` URLs whose origin matches `after_login_url` or
+///   any entry in `allowed_redirect_urls`.
+///
+/// Returns `Some(sanitized_value)` on success, `None` on rejection.
+fn validate_return_to(
+    raw: &str,
+    after_login_url: &str,
+    allowed_redirect_urls: &[String],
+) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Relative path: must start with "/" but not "//" (protocol-relative).
+    if trimmed.starts_with('/') {
+        if trimmed.starts_with("//") {
+            tracing::warn!(return_to = trimmed, "rejected protocol-relative returnTo");
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+
+    // Only allow http/https absolute URLs.
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        tracing::warn!(return_to = trimmed, "rejected returnTo with disallowed scheme");
+        return None;
+    }
+
+    let parsed = match Url::parse(trimmed) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(return_to = trimmed, error = %e, "rejected unparseable returnTo URL");
+            return None;
+        }
+    };
+    let candidate_origin = parsed.origin().unicode_serialization();
+
+    // Check against after_login_url origin.
+    if let Ok(base) = Url::parse(after_login_url) {
+        if base.origin().unicode_serialization() == candidate_origin {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // Check against the explicit allowlist.
+    for allowed in allowed_redirect_urls {
+        if let Ok(allowed_url) = Url::parse(allowed) {
+            if allowed_url.origin().unicode_serialization() == candidate_origin {
+                return Some(trimmed.to_string());
             }
         }
     }
-    // 2. Fall back to `Authorization: Bearer <token>`.
-    if let Some(auth) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(token) = auth.strip_prefix("Bearer ") {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
-    }
+
+    tracing::warn!(
+        return_to = trimmed,
+        origin = candidate_origin,
+        "rejected returnTo: origin not in allowlist"
+    );
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AFTER_LOGIN: &str = "http://localhost:80";
+    const ALLOWED: &[&str] = &["http://localhost:3001", "https://app.videocall.rs"];
+
+    fn allowed() -> Vec<String> {
+        ALLOWED.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn relative_path_accepted() {
+        assert_eq!(
+            validate_return_to("/meeting/123", AFTER_LOGIN, &allowed()),
+            Some("/meeting/123".to_string())
+        );
+    }
+
+    #[test]
+    fn relative_root_accepted() {
+        assert_eq!(
+            validate_return_to("/", AFTER_LOGIN, &allowed()),
+            Some("/".to_string())
+        );
+    }
+
+    #[test]
+    fn protocol_relative_rejected() {
+        assert_eq!(
+            validate_return_to("//evil.com/foo", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_url_matching_after_login_origin() {
+        assert_eq!(
+            validate_return_to("http://localhost:80/meeting/1", AFTER_LOGIN, &allowed()),
+            Some("http://localhost:80/meeting/1".to_string())
+        );
+    }
+
+    #[test]
+    fn absolute_url_matching_allowed_list() {
+        assert_eq!(
+            validate_return_to("http://localhost:3001/meeting/1", AFTER_LOGIN, &allowed()),
+            Some("http://localhost:3001/meeting/1".to_string())
+        );
+    }
+
+    #[test]
+    fn absolute_url_https_allowed() {
+        assert_eq!(
+            validate_return_to("https://app.videocall.rs/meeting/1", AFTER_LOGIN, &allowed()),
+            Some("https://app.videocall.rs/meeting/1".to_string())
+        );
+    }
+
+    #[test]
+    fn absolute_url_disallowed_origin() {
+        assert_eq!(
+            validate_return_to("http://evil.com/steal", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn javascript_scheme_rejected() {
+        assert_eq!(
+            validate_return_to("javascript:alert(1)", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_string_rejected() {
+        assert_eq!(validate_return_to("", AFTER_LOGIN, &allowed()), None);
+    }
+
+    #[test]
+    fn port_mismatch_rejected() {
+        assert_eq!(
+            validate_return_to("http://localhost:9999/foo", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn scheme_mismatch_rejected() {
+        // after_login_url is http, candidate is https on the same host.
+        assert_eq!(
+            validate_return_to("https://localhost:80/foo", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn data_scheme_rejected() {
+        assert_eq!(
+            validate_return_to("data:text/html,<h1>hi</h1>", AFTER_LOGIN, &allowed()),
+            None
+        );
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        assert_eq!(
+            validate_return_to("  /meeting/1  ", AFTER_LOGIN, &allowed()),
+            Some("/meeting/1".to_string())
+        );
+    }
+
+    #[test]
+    fn absolute_url_decoded_from_meeting_page() {
+        // Meeting pages send URL-encoded returnTo values. Axum's Query
+        // extractor decodes them before they reach validate_return_to,
+        // so the function sees the decoded form.
+        let decoded = "http://localhost:3001/meeting/my-room";
+        assert_eq!(
+            validate_return_to(decoded, AFTER_LOGIN, &allowed()),
+            Some(decoded.to_string())
+        );
+    }
+
+    #[test]
+    fn empty_allowed_list_still_checks_after_login() {
+        assert_eq!(
+            validate_return_to("http://localhost:80/meeting/1", AFTER_LOGIN, &[]),
+            Some("http://localhost:80/meeting/1".to_string())
+        );
+        // But a different origin is rejected.
+        assert_eq!(
+            validate_return_to("http://localhost:3001/meeting/1", AFTER_LOGIN, &[]),
+            None
+        );
+    }
+
+    // --- build_session_cookie ---
+
+    #[test]
+    fn session_cookie_contains_name_and_jwt() {
+        let cookie = build_session_cookie("session", "my.jwt.token", 3600, None, false);
+        assert!(cookie.starts_with("session=my.jwt.token;"));
+    }
+
+    #[test]
+    fn session_cookie_custom_name() {
+        let cookie = build_session_cookie("pr1-session", "my.jwt.token", 3600, None, false);
+        assert!(cookie.starts_with("pr1-session=my.jwt.token;"));
+        // Must not be mistakable for a plain "session=" cookie.
+        assert!(!cookie.starts_with("session="));
+    }
+
+    #[test]
+    fn session_cookie_includes_required_attributes() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=3600"));
+    }
+
+    #[test]
+    fn session_cookie_secure_flag_added_when_true() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, true);
+        assert!(cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn session_cookie_no_secure_flag_when_false() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(!cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn session_cookie_domain_appended() {
+        let cookie = build_session_cookie("session", "tok", 3600, Some(".sandbox.videocall.rs"), false);
+        assert!(cookie.contains("Domain=.sandbox.videocall.rs"));
+    }
+
+    #[test]
+    fn session_cookie_no_domain_when_none() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(!cookie.contains("Domain="));
+    }
+
+    // --- build_clear_session_cookie ---
+
+    #[test]
+    fn clear_cookie_uses_name() {
+        let cookie = build_clear_session_cookie("session", None, false);
+        assert!(cookie.starts_with("session=;"));
+    }
+
+    #[test]
+    fn clear_cookie_custom_name() {
+        let cookie = build_clear_session_cookie("pr1-session", None, false);
+        assert!(cookie.starts_with("pr1-session=;"));
+    }
+
+    #[test]
+    fn clear_cookie_sets_max_age_zero() {
+        let cookie = build_clear_session_cookie("session", None, false);
+        assert!(cookie.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn clear_cookie_domain_appended() {
+        let cookie = build_clear_session_cookie("session", Some(".videocall.rs"), false);
+        assert!(cookie.contains("Domain=.videocall.rs"));
+    }
 }

@@ -31,7 +31,7 @@ use actix_http::ws::{Codec, Message, ProtocolError};
 use actix_web::web::Bytes;
 use actix_web::{get, web, Error, HttpRequest, HttpResponse};
 use actix_web_actors::ws::{handshake, WebsocketContext};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 use videocall_types::FeatureFlags;
 
 use crate::actors::transports::ws_chat_session::WsChatSession;
@@ -88,8 +88,13 @@ pub async fn ws_connect_authenticated(
     let claims = match token_validator::decode_room_token(&jwt_secret, &query.token) {
         Ok(c) => c,
         Err(e) => {
-            info!("WS connection rejected (token-based): {e}");
-            return Ok(HttpResponse::Unauthorized().body(e.to_string()));
+            e.log("WS");
+            let body = e.client_message().to_string();
+            return if e.is_retryable() {
+                Ok(HttpResponse::Unauthorized().body(body))
+            } else {
+                Ok(HttpResponse::Forbidden().body(body))
+            };
         }
     };
 

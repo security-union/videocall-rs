@@ -40,7 +40,7 @@ use tokio_tungstenite::tungstenite::Message;
 use videocall_types::FeatureFlags;
 
 const JWT_SECRET: &str = "test-secret-for-integration-tests";
-const TOKEN_TTL_SECS: i64 = 600;
+const TOKEN_TTL_SECS: i64 = 60;
 const JWT_PORT: u16 = 18090;
 
 // =========================================================================
@@ -140,7 +140,7 @@ async fn try_connect_deprecated(
     }
 }
 
-/// Wait for the MEETING_STARTED protobuf packet from the real server.
+/// Wait for SESSION_ASSIGNED then MEETING_STARTED from the real server.
 async fn wait_for_meeting_started(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -151,15 +151,21 @@ async fn wait_for_meeting_started(
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
     use videocall_types::protos::packet_wrapper::PacketWrapper;
 
+    let mut saw_session_assigned = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
     while tokio::time::Instant::now() < deadline {
         tokio::select! {
             msg = ws.next() => {
                 if let Some(Ok(Message::Binary(data))) = msg {
                     if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&data) {
-                        if wrapper.packet_type == PacketType::MEETING.into() {
+                        if wrapper.packet_type == PacketType::SESSION_ASSIGNED.into() {
+                            assert!(wrapper.session_id != 0, "SESSION_ASSIGNED must carry session_id");
+                            saw_session_assigned = true;
+                        } else if wrapper.packet_type == PacketType::MEETING.into() {
                             if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
                                 if meeting.event_type == MeetingEventType::MEETING_STARTED.into() {
+                                    assert!(saw_session_assigned, "SESSION_ASSIGNED must precede MEETING_STARTED");
                                     return Ok(());
                                 }
                             }
@@ -170,7 +176,7 @@ async fn wait_for_meeting_started(
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
-    anyhow::bail!("Timeout waiting for MEETING_STARTED")
+    anyhow::bail!("Timeout waiting for SESSION_ASSIGNED + MEETING_STARTED")
 }
 
 // =========================================================================
@@ -245,7 +251,7 @@ async fn test_wrong_secret_token_rejected() {
 
     let result = try_connect_with_token(port, &token).await;
     assert!(result.is_err(), "wrong-secret token should be rejected");
-    assert_eq!(result.unwrap_err(), 401);
+    assert_eq!(result.unwrap_err(), 403);
 }
 
 #[actix_rt::test]
@@ -256,7 +262,7 @@ async fn test_garbage_token_rejected() {
 
     let result = try_connect_with_token(port, "not.a.real.jwt").await;
     assert!(result.is_err(), "garbage token should be rejected");
-    assert_eq!(result.unwrap_err(), 401);
+    assert_eq!(result.unwrap_err(), 403);
 }
 
 #[actix_rt::test]

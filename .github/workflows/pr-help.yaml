@@ -1,0 +1,60 @@
+name: PR Preview Help
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  help:
+    name: Post help message
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'self-hosted' }}
+    if: |
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/help')
+    steps:
+      - name: React to comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      - name: Post help comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🤖 PR Preview Commands
+
+            | Command | Description | Time |
+            |---------|-------------|------|
+            | \`/build-images\` | Build and push Docker images for this PR | ~10-15 min |
+            | \`/deploy\` | Deploy preview environment (images must exist) | ~3-5 min |
+            | \`/build-and-deploy\` | Build images and deploy in one step | ~15-20 min |
+            | \`/undeploy\` | Tear down the preview environment | ~1-2 min |
+            | \`/help\` | Show this help message | — |
+
+            ### Typical workflow
+
+            1. Comment \`/build-and-deploy\` to get a full preview environment
+            2. When done, comment \`/undeploy\` to free the slot
+            3. After pushing new commits, comment \`/build-and-deploy\` again to update
+
+            > **Note:** Commands are available to repository owners, members, and collaborators only.`
+            });

@@ -10,5 +10,6 @@ window.__APP_CONFIG = Object.freeze({
   serverElectionPeriodMs: 2000,
   audioBitrateKbps: 65,
   videoBitrateKbps: 100,
-  screenBitrateKbps: 100
+  screenBitrateKbps: 100,
+  oauthProvider: "google"
 });

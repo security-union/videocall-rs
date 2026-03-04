@@ -41,6 +41,7 @@ videocall.rs is composed of two independent services that communicate through a 
 ┌──────────────────────────────────┐   ┌──────────────────────────────────┐
 │       Meeting Backend            │   │         Media Server             │
 │       (Port 8081)                │   │         (Port 8080)              │
+│   (Standalone deployment)        │   │   (  Pure stream transport)      │
 │                                  │   │                                  │
 │  ┌────────────┐  ┌────────────┐  │   │  ┌────────────┐  ┌───────────┐  │
 │  │ OAuth      │  │ REST API   │  │   │  │ WebSocket  │  │ WebTrans- │  │
@@ -100,6 +101,18 @@ JWT validation on the Media Server is gated behind the `FEATURE_MEETING_MANAGEME
 
 This allows the meeting management system to be deployed incrementally. Once the UI is updated to obtain and present tokens, the feature flag can be flipped to `true` to enforce token-based access.
 
+### Local Development Setup
+
+For local development, `docker-compose.yaml` spins up two separate services:
+
+- **meeting-api (port 8081)**: Handles OAuth login, session JWTs, and all Meeting REST API routes (`/api/v1/meetings/*`)
+- **websocket-api (port 8080)**: Handles WebSocket media connections (`/lobby`)
+- **webtransport-api (port 4433)**: Handles WebTransport media connections (`/lobby`)
+
+The UI's `apiBaseUrl` defaults to `http://localhost:8081` (the meeting-api). The media server URLs (`wsUrl`, `webTransportHost`) point to the websocket-api and webtransport-api respectively.
+
+> **Important**: The `COOKIE_DOMAIN` environment variable should be set to `localhost` to ensure session cookies are sent correctly across ports during local development.
+
 ### Why Two Services?
 
 Separating the Meeting Backend from the Media Server provides:
@@ -136,7 +149,7 @@ The system uses two separate JWTs with different purposes and delivery mechanism
 
 ### Session Token Flow
 
-1. User completes OAuth login with Google
+1. User completes OAuth login with the configured identity provider (Google, Okta, or any OIDC-compliant provider)
 2. Meeting Backend issues a signed session JWT and sets it as an `HttpOnly; Secure; SameSite=Lax` cookie
 3. The browser sends the cookie automatically with every request to the Meeting Backend
 4. JavaScript cannot read the cookie (XSS protection)
@@ -175,11 +188,15 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `COOKIE_DOMAIN` | No | -- | Cookie `Domain` attribute (e.g. `.videocall.rs`) |
 | `COOKIE_SECURE` | No | `true` | Set `false` for local HTTP development |
 | `CORS_ALLOWED_ORIGIN` | No | -- | Production: exact frontend origin. Unset for dev. |
-| `OAUTH_CLIENT_ID` | No | -- | Google OAuth client ID (disables OAuth if unset) |
-| `OAUTH_SECRET` | Cond. | -- | Google OAuth client secret (required if `OAUTH_CLIENT_ID` set) |
+| `OAUTH_CLIENT_ID` | No | -- | OAuth client ID (disables OAuth if unset) |
+| `OAUTH_SECRET` | No | -- | OAuth client secret (omit for public clients using PKCE only) |
 | `OAUTH_REDIRECT_URL` | Cond. | -- | OAuth callback URL (required if `OAUTH_CLIENT_ID` set) |
-| `OAUTH_AUTH_URL` | No | Google default | OAuth authorization endpoint |
-| `OAUTH_TOKEN_URL` | No | Google default | OAuth token endpoint |
+| `OAUTH_ISSUER` | No | -- | OIDC issuer URL; enables discovery and JWT `iss` validation |
+| `OAUTH_AUTH_URL` | Cond. | -- | Authorization endpoint (required when `OAUTH_ISSUER` is not set) |
+| `OAUTH_TOKEN_URL` | Cond. | -- | Token endpoint (required when `OAUTH_ISSUER` is not set) |
+| `OAUTH_JWKS_URL` | No | -- | JWKS endpoint for ID token signature verification |
+| `OAUTH_USERINFO_URL` | No | -- | UserInfo endpoint fallback when ID token lacks email |
+| `OAUTH_SCOPES` | No | `openid email profile` | Space-separated OAuth scopes |
 | `AFTER_LOGIN_URL` | No | `/` | Redirect target after successful OAuth login |
 
 ---

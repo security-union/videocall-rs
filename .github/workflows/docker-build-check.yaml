@@ -17,14 +17,19 @@ on:
       - 'neteq/**'
       - 'Dockerfile.yew'
       - 'nginx.conf'
+      - 'flake.nix'
+      - 'flake.lock'
       # Meeting API dependencies
       - 'meeting-api/**'
       - 'videocall-meeting-types/**'
       - 'Dockerfile.meeting-api'
       # Docker directory changes
-      - 'docker/Dockerfile.actix'
-      - 'docker/Dockerfile.yew'
+      - 'docker/Dockerfile.actix.dev'
+      - 'docker/Dockerfile.yew.dev'
       - 'docker/start-yew.sh'
+      # Website image dependencies
+      - 'leptos-website/**'
+      - 'docker/Dockerfile.website'
 
 jobs:
   build-api:
@@ -80,6 +85,25 @@ jobs:
         with:
           context: .
           file: Dockerfile.yew
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-website:
+    name: Build Website Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Website Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.website
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max

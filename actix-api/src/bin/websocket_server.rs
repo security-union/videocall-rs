@@ -28,7 +28,6 @@ use actix_web::{
 use reqwest::header::LOCATION;
 use sec_api::{
     actors::chat_server::ChatServer,
-    api,
     auth::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
@@ -328,7 +327,6 @@ async fn main() -> std::io::Result<()> {
                 .service(logout)
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
-                .configure(api::configure_api_routes)
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
@@ -356,7 +354,6 @@ async fn main() -> std::io::Result<()> {
                 .service(logout)
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
-                .configure(api::configure_api_routes)
         } else {
             // OAuth configured but database disabled - skip OAuth routes
             error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");

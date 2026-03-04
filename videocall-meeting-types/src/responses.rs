@@ -79,6 +79,7 @@ pub struct CreateMeetingResponse {
     pub state: String,
     pub attendees: Vec<String>,
     pub has_password: bool,
+    pub waiting_room_enabled: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}`.
@@ -90,6 +91,14 @@ pub struct MeetingInfoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_display_name: Option<String>,
     pub has_password: bool,
+    pub waiting_room_enabled: bool,
+    pub participant_count: i64,
+    pub waiting_count: i64,
+    /// Unix timestamp in milliseconds.
+    pub started_at: i64,
+    /// Unix timestamp in milliseconds, or `null` if still active/idle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub your_status: Option<ParticipantStatusResponse>,
 }
@@ -104,7 +113,7 @@ pub struct ListMeetingsResponse {
 }
 
 /// Single meeting entry inside [`ListMeetingsResponse`].
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct MeetingSummary {
     pub meeting_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +131,7 @@ pub struct MeetingSummary {
     pub ended_at: Option<i64>,
     /// Number of participants currently in the waiting room.
     pub waiting_count: i64,
+    pub waiting_room_enabled: bool,
 }
 
 /// Participant status returned by join, status, admit, reject, and leave endpoints.
@@ -143,6 +153,12 @@ pub struct ParticipantStatusResponse {
     /// Signed JWT room access token. Present only when `status` is `"admitted"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room_token: Option<String>,
+    /// Meeting-level: whether the waiting room is enabled. Present in join/status responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_room_enabled: Option<bool>,
+    /// Meeting-level: the host's display name. Present in join/status responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_display_name: Option<String>,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}/waiting`.
@@ -163,4 +179,11 @@ pub struct AdmitAllResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeleteMeetingResponse {
     pub message: String,
+}
+
+/// Response payload for `GET /profile`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProfileResponse {
+    pub email: String,
+    pub name: String,
 }

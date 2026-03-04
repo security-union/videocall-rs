@@ -35,7 +35,7 @@ use crate::token::generate_room_token;
 /// Attendees enter the waiting room.
 pub async fn join_meeting(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
@@ -74,9 +74,10 @@ pub async fn join_meeting(
             display_name.unwrap_or(&email),
         )?;
 
-        Ok(Json(APIResponse::ok(
-            row.into_participant_status(Some(token)),
-        )))
+        let mut resp = row.into_participant_status(Some(token));
+        resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+        resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
+        Ok(Json(APIResponse::ok(resp)))
     } else {
         // Attendee: must wait for admission if meeting is active.
         let current_state = meeting.state.as_deref().unwrap_or("idle");
@@ -84,10 +85,28 @@ pub async fn join_meeting(
             return Err(AppError::meeting_not_active(&meeting_id));
         }
 
-        let row =
-            db_participants::upsert_attendee(&state.db, meeting.id, &email, display_name).await?;
+        // Atomically check waiting_room_enabled and insert participant in one
+        // transaction, using FOR UPDATE to serialize against concurrent toggles.
+        let (auto_admitted, row, waiting_room_enabled) =
+            db_participants::join_attendee(&state.db, meeting.id, &email, display_name).await?;
 
-        Ok(Json(APIResponse::ok(row.into_participant_status(None))))
+        let token = if auto_admitted {
+            Some(generate_room_token(
+                &state.jwt_secret,
+                state.token_ttl_secs,
+                &email,
+                &meeting_id,
+                false,
+                display_name.unwrap_or(&email),
+            )?)
+        } else {
+            None
+        };
+
+        let mut resp = row.into_participant_status(token);
+        resp.waiting_room_enabled = Some(waiting_room_enabled);
+        resp.host_display_name = meeting.host_display_name;
+        Ok(Json(APIResponse::ok(resp)))
     }
 }
 
@@ -96,12 +115,17 @@ pub async fn join_meeting(
 /// Polling endpoint. When status is 'admitted', the response includes the room_token.
 pub async fn get_my_status(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    // Refuse to issue tokens for ended meetings.
+    if meeting.state.as_deref() == Some("ended") {
+        return Err(AppError::meeting_not_active(&meeting_id));
+    }
 
     let row = db_participants::get_status(&state.db, meeting.id, &email)
         .await?
@@ -120,13 +144,16 @@ pub async fn get_my_status(
         None
     };
 
-    Ok(Json(APIResponse::ok(row.into_participant_status(token))))
+    let mut resp = row.into_participant_status(token);
+    resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+    resp.host_display_name = meeting.host_display_name;
+    Ok(Json(APIResponse::ok(resp)))
 }
 
 /// POST /api/v1/meetings/{meeting_id}/leave
 pub async fn leave_meeting(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -152,14 +179,21 @@ pub async fn leave_meeting(
 }
 
 /// GET /api/v1/meetings/{meeting_id}/participants
+///
+/// Only participants who are themselves in the meeting can list other participants.
 pub async fn get_participants(
     State(state): State<AppState>,
-    AuthUser(_email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<Vec<ParticipantStatusResponse>>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    // Verify the requester is actually a participant in this meeting.
+    db_participants::get_status(&state.db, meeting.id, &email)
+        .await?
+        .ok_or_else(AppError::not_in_meeting)?;
 
     let rows = db_participants::get_admitted(&state.db, meeting.id).await?;
     let participants: Vec<ParticipantStatusResponse> = rows

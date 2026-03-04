@@ -72,6 +72,49 @@ impl fmt::Display for TokenError {
 
 impl std::error::Error for TokenError {}
 
+impl TokenError {
+    /// Whether this error represents a potentially tampered or forged token
+    /// (as opposed to a benign expiration or missing token).
+    pub fn is_suspicious(&self) -> bool {
+        matches!(self, TokenError::Invalid(_))
+    }
+
+    /// Whether the client should receive a 401 (retry with a fresh token) or
+    /// 403 (do not retry, access denied).
+    ///
+    /// Only `Expired` is retryable; everything else is a hard denial.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, TokenError::Expired)
+    }
+
+    /// The message that should be returned to the client.
+    ///
+    /// Suspicious errors (invalid signature, tampered tokens) get a generic
+    /// security warning instead of leaking internal details.
+    pub fn client_message(&self) -> &str {
+        if self.is_suspicious() {
+            "We detected unusual activity from your browser. This incident has been logged."
+        } else {
+            match self {
+                TokenError::Expired => "token has expired",
+                _ => "access denied",
+            }
+        }
+    }
+
+    /// Log this error at the appropriate severity level.
+    ///
+    /// Suspicious errors are logged at `warn!` (potential attack);
+    /// everything else is `info!` (normal operational event).
+    pub fn log(&self, transport: &str) {
+        if self.is_suspicious() {
+            tracing::warn!("{transport} connection rejected: {self}");
+        } else {
+            tracing::info!("{transport} connection rejected: {self}");
+        }
+    }
+}
+
 /// Decode and validate a JWT room access token, extracting claims.
 ///
 /// This is the primary validation function for the **token-based** connection
@@ -242,5 +285,87 @@ mod tests {
         let token = make_token("alice@test.com", "room-1", true, 600);
         let result = validate_room_token(TEST_SECRET, &token, "room-1", "bob@test.com");
         assert!(matches!(result, Err(TokenError::IdentityMismatch { .. })));
+    }
+
+    // -- TokenError classification tests --
+
+    #[test]
+    fn expired_is_retryable_and_not_suspicious() {
+        let err = TokenError::Expired;
+        assert!(err.is_retryable());
+        assert!(!err.is_suspicious());
+        assert_eq!(err.client_message(), "token has expired");
+    }
+
+    #[test]
+    fn invalid_signature_is_suspicious_and_not_retryable() {
+        let err = TokenError::Invalid("InvalidSignature".to_string());
+        assert!(err.is_suspicious());
+        assert!(!err.is_retryable());
+        assert_eq!(
+            err.client_message(),
+            "We detected unusual activity from your browser. This incident has been logged."
+        );
+    }
+
+    #[test]
+    fn room_join_denied_is_not_retryable_and_not_suspicious() {
+        let err = TokenError::RoomJoinDenied;
+        assert!(!err.is_retryable());
+        assert!(!err.is_suspicious());
+        assert_eq!(err.client_message(), "access denied");
+    }
+
+    #[test]
+    fn missing_is_not_retryable_and_not_suspicious() {
+        let err = TokenError::Missing;
+        assert!(!err.is_retryable());
+        assert!(!err.is_suspicious());
+        assert_eq!(err.client_message(), "access denied");
+    }
+
+    #[test]
+    fn room_mismatch_is_not_retryable_and_not_suspicious() {
+        let err = TokenError::RoomMismatch {
+            token_room: "a".to_string(),
+            requested_room: "b".to_string(),
+        };
+        assert!(!err.is_retryable());
+        assert!(!err.is_suspicious());
+    }
+
+    #[test]
+    fn identity_mismatch_is_not_retryable_and_not_suspicious() {
+        let err = TokenError::IdentityMismatch {
+            token_identity: "a@test.com".to_string(),
+            requested_identity: "b@test.com".to_string(),
+        };
+        assert!(!err.is_retryable());
+        assert!(!err.is_suspicious());
+    }
+
+    // -- End-to-end: decode produces correct classification --
+
+    #[test]
+    fn expired_token_error_is_retryable() {
+        let token = make_token("alice@test.com", "room-1", true, -120);
+        let err = decode_room_token(TEST_SECRET, &token).unwrap_err();
+        assert!(err.is_retryable());
+        assert!(!err.is_suspicious());
+    }
+
+    #[test]
+    fn wrong_secret_error_is_suspicious() {
+        let token = make_token("alice@test.com", "room-1", true, 600);
+        let err = decode_room_token("wrong-secret", &token).unwrap_err();
+        assert!(err.is_suspicious());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn garbage_token_error_is_suspicious() {
+        let err = decode_room_token(TEST_SECRET, "not.a.jwt").unwrap_err();
+        assert!(err.is_suspicious());
+        assert!(!err.is_retryable());
     }
 }

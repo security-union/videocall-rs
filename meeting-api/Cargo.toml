@@ -18,7 +18,7 @@ name = "meeting-api"
 path = "src/main.rs"
 
 [dependencies]
-videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.0" }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.2" }
 
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
@@ -33,9 +33,10 @@ jsonwebtoken = "9"
 argon2 = "0.5"
 regex = "1"
 rand = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 base64 = "0.22"
 oauth2 = "4"
+url = "2"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -44,3 +45,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 serial_test = "3"
+rsa = "0.9"

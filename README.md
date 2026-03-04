@@ -1,12 +1,29 @@
 # videocall.rs
 
+<a href="https://crates.io/crates/videocall-cli"><img src="https://img.shields.io/crates/v/videocall-cli.svg" alt="Crates.io (videocall-cli)" height="28"></a>
 <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" height="28"></a>
 <a href="https://discord.gg/JP38NRe4CJ"><img src="https://img.shields.io/badge/Discord-Join%20Chat-7289DA?logo=discord&logoColor=white" alt="Discord" height="28"></a> 
 <a href="https://www.digitalocean.com/?refcode=6de4e19c5193&utm_campaign=Referral_Invite&utm_medium=Referral_Program&utm_source=badge"><img src="https://web-platforms.sfo2.cdn.digitaloceanspaces.com/WWW/Badge%201.svg" alt="DigitalOcean Referral Badge" height="28"></a>
 
-An open-source, high-performance video conferencing platform built with Rust, providing real-time communication with low latency.
+An open-source, ultra-low-latency video conferencing platform and API built with Rust. Designed for software professionals, robotics, and embedded systems, it supports WebTransport with WebSocket fallback for high-performance real-time communication.
 
 **[Website](https://videocall.rs)** | **[Discord Community](https://discord.gg/JP38NRe4CJ)**
+
+## ⚡ Quick Links
+
+- **[Documentation](https://docs.videocall.rs)** - Comprehensive guides and API reference.
+- **[Crates.io](https://crates.io/crates/videocall-cli)** - Download the CLI tool.
+- **[Report a Bug](https://github.com/security-union/videocall-rs/issues)** - Help us improve.
+
+## 🌟 Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=security-union/videocall-rs&type=Date)](https://star-history.com/#security-union/videocall-rs&Date)
+
+## Who is this for?
+
+- **Software Professionals:** Build custom video applications with a modern, type-safe Rust API.
+- **Robotics & IoT Engineers:** Stream ultra-low-latency video from drones, robots, and embedded devices (Raspberry Pi, Jetson Nano) using our lightweight CLI and SDKs.
+- **Privacy Advocates:** Self-host your own video conferencing infrastructure with secure JWT authentication and SSO support.
 
 ## Table of Contents
 
@@ -18,12 +35,14 @@ An open-source, high-performance video conferencing platform built with Rust, pr
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Docker Setup](#docker-setup)
+  - [Nix Build System (WIP)](#nix-build-system-wip)
   - [Manual Setup](#manual-setup)
 - [Runtime Configuration](#runtime-configuration-frontend-configjs)
   - [Local (no Docker)](#local-no-docker-create-yew-uiscriptsconfigjs)
   - [Local/Docker](#localdocker-start-yewsh)
   - [Kubernetes/Helm](#kuberneteshelm-configmap-configjsyaml)
 - [Usage](#usage)
+- [Meeting Management](#meeting-management)
 - [Performance](#performance)
 - [Security](#security)
 - [Feature Flags](#feature-flags)
@@ -39,19 +58,19 @@ An open-source, high-performance video conferencing platform built with Rust, pr
 
 ## Overview
 
-videocall.rs is a modern, open-source video conferencing system written entirely in Rust, designed for developers who need reliable, scalable, and secure real-time communication capabilities. It provides a foundation for building custom video communication solutions, with support for both browser-based and native clients.
+videocall.rs is a modern, open-source video conferencing system written entirely in Rust. It is designed for software professionals and robotics engineers who need reliable, scalable, and secure real-time communication capabilities. It provides a robust foundation for building custom video communication solutions, from web apps to autonomous vehicle feeds, with support for both browser-based and native clients.
 
 **Project Status:** Beta - Actively developed and suitable for non-critical production use
 
 ## Features
 
-- **High Performance:** Built with Rust for optimal resource utilization and low latency
-- **Multiple Transport Protocols:** Support for WebSockets and WebTransport 
-- **End-to-End Encryption (E2EE):** Optional secure communications between peers
-- **Scalable Architecture:** Designed with a pub/sub model using NATS for horizontal scaling
-- **Cross-Platform Support:** Chromium-based browsers and Safari supported
-- **Native Client Support:** CLI tool for headless video streaming from devices like Raspberry Pi
-- **Open Source:** MIT licensed for maximum flexibility
+- **Ultra-Low Latency:** Built with Rust for sub-100ms latency, ideal for robotics and real-time control.
+- **Multiple Transport Protocols:** WebTransport with automatic WebSocket fallback for maximum compatibility.
+- **Secure Authentication:** JWT-based access control with SSO/OAuth support.
+- **Scalable Architecture:** Designed with a pub/sub model using NATS for horizontal scaling (Mesh/SFU hybrid).
+- **Cross-Platform Support:** Chromium-based browsers and Safari supported.
+- **Robotics & Embedded:** High-performance CLI and SDK for headless streaming from Raspberry Pi, Jetson Nano, and other embedded Linux devices.
+- **Open Source:** MIT licensed for maximum flexibility.
 
 ## Compatibility
 
@@ -138,20 +157,62 @@ The quickest way to get started is with our Docker-based setup:
    cd videocall-rs
    ```
 
-2. Start the server (replace `<server-ip>` with your machine's IP address):
+2. Create a `.env` file from the sample and fill in your OAuth credentials:
+   ```
+   cp docker/.env-sample .env
+   ```
+   Edit `.env` and set `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`.
+
+   **Getting Google OAuth credentials:**
+   - Go to [Google Cloud Console → APIs & Credentials](https://console.cloud.google.com/apis/credentials)
+   - Create an OAuth 2.0 Client ID (Web application type)
+   - Add `http://localhost:8081/login/callback` as an Authorized redirect URI
+   - Copy the Client ID and Secret into your `.env`
+
+   > **Note:** `make up` will auto-create `.env` from the sample if it does not exist, but you must still edit it to add your credentials before the app will work.
+
+3. Start the stack:
    ```
    make up
    ```
-
-3. Open Chrome using the provided script for local WebTransport:
-   ```
-   ./launch_chrome.sh
-   ```
+   The first run compiles Rust/WASM inside the containers — this takes several minutes. Watch the `yew-ui` logs; it's ready when Trunk prints `server listening on http://0.0.0.0:<port>`.
 
 4. Access the application at:
    ```
-   http://<server-ip>/meeting/<username>/<meeting-id>
+   http://localhost
    ```
+   Then navigate to a meeting: `http://localhost/meeting/<username>/<meeting-id>`
+
+**Platform notes:**
+
+- **Rancher Desktop (Windows/WSL2) with Traefik Ingress on port 80:** Rancher Desktop runs Traefik on port 80 by default, which conflicts with the yew-ui frontend. Override the port in your local `.env` (not `.env-sample`):
+  ```
+  TRUNK_SERVE_PORT=8088
+  AFTER_LOGIN_URL=http://localhost:8088
+  ALLOWED_REDIRECT_URLS=http://localhost:8088,http://localhost:3001
+  ```
+  Then access the app at `http://localhost:8088`.
+- **Shell environment variables:** If you have `API_BASE_URL`, `OAUTH_REDIRECT_URL`, or similar variables exported in your shell profile (`~/.bashrc`, `~/.zshrc`), they will override `.env` values. Remove them from your profile before running `make up`.
+- **Slow first run:** WASM compilation inside Docker can take 5–15 minutes on a cold cache. Subsequent runs reuse the build cache and start in seconds.
+
+### Nix Build System (WIP)
+
+We are migrating the build infrastructure to [Nix](https://nixos.org/) for reproducible, fast builds. Currently the `leptos-website` is the first component being nixified.
+
+**Status:** Work in progress — see the `nixify-docker-build` branch.
+
+**What Nix replaces:** Previously, Docker builds spent 15-20 minutes compiling tools like `cargo-leptos` and `wasm-bindgen-cli` from source on every build. Nix provides these as pre-built binaries from the binary cache, reducing tool setup from minutes to seconds.
+
+**What's done so far:**
+- `flake.nix` at the repo root provides dev shells with pinned versions of the Rust nightly toolchain, `cargo-leptos`, `wasm-bindgen-cli`, `binaryen`, Node.js, and system dependencies
+- `docker/Dockerfile.website` and `docker/Dockerfile.website.dev` use `nixos/nix` as a builder image
+- `.github/workflows/leptos-website-build.yaml` uses `DeterminateSystems/nix-installer-action` with `magic-nix-cache-action` for cached CI builds
+
+**Quick start (requires [Nix](https://install.determinate.systems/nix)):**
+
+The integration is transparent to the user, and the development experience is the same as with Docker.
+
+**What's next:** Nixifying additional components (actix-api, yew-ui) and evaluating [crane](https://github.com/ipetkov/crane) for full Nix-managed Rust dependency caching.
 
 ### Manual Setup (Experimental)
 
@@ -243,6 +304,45 @@ videocall-cli stream \
 
 For detailed information about the CLI tool and all available options, see the [videocall-cli README](videocall-cli/README.md).
 
+## Meeting Management
+
+videocall.rs includes a comprehensive meeting management system with ownership, waiting rooms, and host controls.
+
+### Key Features
+
+- **Meeting Ownership**: Each meeting has an owner (the creator) identified by their email
+- **My Meetings**: Users can view and manage all meetings they own from the home page
+- **Waiting Room**: Non-owners enter a waiting room and must be admitted by an existing participant
+- **Host Identification**: The meeting owner is visually identified with "(Host)" in the UI
+- **Soft Delete**: Owners can delete their meetings; deleted meeting IDs can be reused
+
+### Meeting Workflow
+
+1. **Create/Join**: Navigate to `/meeting/{meeting-id}` - if the meeting doesn't exist, you become the owner
+2. **Start/Join Button**: Owners see "Start Meeting", others see "Join Meeting"
+3. **Waiting Room**: Non-owners wait for admission; admitted participants can manage the waiting room
+4. **Auto-Join**: When admitted from the waiting room, participants automatically enter the meeting
+
+### Documentation
+
+For detailed information about the meeting system:
+
+- **[Meeting Ownership & Workflow](docs/MEETING_OWNERSHIP.md)** - Ownership model, lifecycle, and user workflows
+- **[Meeting API Reference](docs/MEETING_API.md)** - Complete API endpoint documentation
+
+### Enabling Meeting Management
+
+Meeting management requires the `FEATURE_MEETING_MANAGEMENT` flag:
+
+```bash
+export FEATURE_MEETING_MANAGEMENT=true
+```
+
+Or in Docker:
+```bash
+docker run -e FEATURE_MEETING_MANAGEMENT=true ...
+```
+
 ## Performance
 
 videocall.rs has been benchmarked and optimized for the following scenarios:
@@ -275,8 +375,7 @@ Performance metrics and tuning guidelines will be available in our [performance 
 Security is a core focus of videocall.rs:
 
 - **Transport Security:** All communications use TLS/HTTPS.
-- **End-to-End Encryption:** Optional E2EE between peers with no server access to content.
-- **Authentication:** Flexible integration with identity providers.
+- **Authentication:** Flexible integration with identity providers (SSO/OAuth).
 - **Access Controls:** Fine-grained permission system for meeting rooms.
 
 For details on our security model and best practices, see our [security documentation](https://docs.videocall.rs/security).
@@ -382,9 +481,9 @@ and how to write new tests — see **[actix-api/TESTING.md](actix-api/TESTING.md
 
 | Version | Target Date | Key Features |
 |---------|------------|--------------|
-| 0.5.0   | Q2 2023    | ✅ End-to-End Encryption |
 | 0.6.0   | Q3 2023    | ✅ Safari Browser Support |
 | 0.7.0   | Q4 2023    | ✅ Native Mobile SDKs |
+| 0.5.0   | Q2 2023    | ✅ JWT Authentication & SSO |
 | 0.8.0   | Q1 2024    | 🔄 Screen Sharing Improvements |
 | 1.0.0   | Q2 2024    | 🔄 Production Release with Full API Stability |
 
@@ -409,7 +508,7 @@ See our [Contributing Guidelines](CONTRIBUTING.md) for more detailed information
 - **Backend**: Rust + Actix Web + PostgreSQL + NATS
 - **Frontend**: Rust + Yew + WebAssembly + Tailwind CSS
 - **Transport**: WebTransport (QUIC/HTTP3) + WebSockets (fallback)
-- **Build System**: Cargo + Trunk + Docker + Helm
+- **Build System**: Cargo + Trunk + Nix (WIP) + Docker + Helm
 - **Testing**: `cargo test` + `wasm-bindgen-test` (browser-based UI tests) + Docker Compose (backend integration)
 
 ### Key Technical Features
@@ -499,6 +598,12 @@ These hooks help maintain code quality by ensuring proper formatting and checkin
 <td align="center"><a href="https://github.com/JasterV"><img src="https://avatars3.githubusercontent.com/u/49537445?v=4" width="100" alt=""/><br /><sub><b>Victor Martínez</b></sub></a></td>
 </tr>
 </table>
+
+## Ready to Build?
+
+Start your journey with videocall.rs today. Whether you're building a robot, a drone, or a next-gen video app, we have the tools you need.
+
+[**Get Started with Docker**](#docker-setup) or [**Download the CLI**](https://crates.io/crates/videocall-cli)
 
 ## License
 

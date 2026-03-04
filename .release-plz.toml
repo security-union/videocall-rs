@@ -33,6 +33,12 @@ changelog_update = true
 git_release_enable = true
 
 [[package]]
+name = "videocall-meeting-client"
+publish = true
+changelog_update = true
+git_release_enable = true
+
+[[package]]
 name = "bot"
 publish = true
 changelog_update = true
@@ -78,7 +84,11 @@ changelog_update = true
 git_release_enable = true
 
 
-
+[[package]]
+name = "videocall-ui-dioxus"
+publish = false
+changelog_update = false
+git_release_enable = false
 
 [changelog]
 protect_breaking_commits = true

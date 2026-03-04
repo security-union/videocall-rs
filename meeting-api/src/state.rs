@@ -13,7 +13,10 @@
 
 //! Shared application state passed to every Axum handler via `State`.
 
+use std::sync::Arc;
+
 use crate::config::{Config, OAuthConfig};
+use crate::oauth::JwksCache;
 use sqlx::PgPool;
 
 /// Application state shared across all request handlers.
@@ -29,21 +32,36 @@ pub struct AppState {
     pub session_ttl_secs: i64,
     /// OAuth configuration. `None` disables OAuth endpoints.
     pub oauth: Option<OAuthConfig>,
+    /// JWKS key cache for ID token signature verification. `None` when JWKS is
+    /// not configured (falls back to unverified decode).
+    pub jwks_cache: Option<Arc<JwksCache>>,
     /// Cookie domain (e.g. ".example.com"), or `None` for default.
     pub cookie_domain: Option<String>,
+    /// Name of the session cookie (default: "session").
+    /// Set to a unique value in PR preview environments to avoid collision
+    /// with the production cookie that shares the same parent domain.
+    pub cookie_name: String,
     /// Whether to set the `Secure` flag on cookies.
     pub cookie_secure: bool,
 }
 
 impl AppState {
     pub fn new(db: PgPool, config: &Config) -> Self {
+        let jwks_cache = config
+            .oauth
+            .as_ref()
+            .and_then(|o| o.jwks_url.as_ref())
+            .map(|url| JwksCache::new(url.clone()));
+
         Self {
             db,
             jwt_secret: config.jwt_secret.clone(),
             token_ttl_secs: config.token_ttl_secs,
             session_ttl_secs: config.session_ttl_secs,
             oauth: config.oauth.clone(),
+            jwks_cache,
             cookie_domain: config.cookie_domain.clone(),
+            cookie_name: config.cookie_name.clone(),
             cookie_secure: config.cookie_secure,
         }
     }

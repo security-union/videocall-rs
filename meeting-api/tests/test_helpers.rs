@@ -59,7 +59,9 @@ pub fn build_app(pool: PgPool) -> Router {
         token_ttl_secs: TEST_TOKEN_TTL,
         session_ttl_secs: TEST_SESSION_TTL,
         oauth: None,
+        jwks_cache: None,
         cookie_domain: None,
+        cookie_name: "session".to_string(),
         cookie_secure: false,
     };
     routes::router().with_state(state)

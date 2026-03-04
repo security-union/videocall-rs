@@ -30,15 +30,17 @@ use log::debug;
 use log::error;
 use log::info;
 use protobuf::Message;
+use videocall_transport::webtransport::{
+    WebTransportService, WebTransportStatus, WebTransportTask,
+};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::Callback;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::ReadableStreamDefaultReader;
 use web_sys::WebTransportBidirectionalStream;
 use web_sys::WebTransportCloseInfo;
 use web_sys::WebTransportReceiveStream;
-use yew::prelude::Callback;
-use yew_webtransport::webtransport::{WebTransportService, WebTransportStatus, WebTransportTask};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MessageType {

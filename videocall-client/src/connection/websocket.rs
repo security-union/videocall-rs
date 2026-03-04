@@ -21,9 +21,9 @@
 //
 use super::webmedia::{ConnectOptions, WebMedia};
 use log::debug;
+use videocall_transport::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
+use videocall_types::Callback;
 use wasm_bindgen::JsValue;
-use yew::prelude::Callback;
-use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
 
 impl WebMedia<WebSocketTask> for WebSocketTask {
     fn connect(options: ConnectOptions) -> anyhow::Result<WebSocketTask> {

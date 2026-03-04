@@ -566,6 +566,8 @@ jobs:
             --set "env[11].value=0.0.0.0:8081" \
             --set "env[12].name=RUST_LOG" \
             --set "env[12].value=info" \
+            --set "env[13].name=COOKIE_NAME" \
+            --set "env[13].value=pr${SLOT}-session" \
             --set "ingress.hosts[0].host=pr${SLOT}-api.preview.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

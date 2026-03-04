@@ -96,11 +96,11 @@ fn play_user_joined() {
     }
 }
 
-/// Schedule a reconnection attempt after 1 second (JWT auth path).
+/// Schedule a reconnection attempt with exponential backoff and jitter.
 ///
 /// Refreshes the room token, rebuilds lobby URLs, updates the client, and
-/// reconnects.  On failure it retries by scheduling itself again — matching
-/// yew-ui's `schedule_token_refresh` retry behaviour.
+/// reconnects.  On failure it retries with increasing delay (1s → 2s → 4s →
+/// 8s → 16s cap) plus ±25% random jitter.  Gives up after 10 attempts.
 #[cfg(feature = "media-server-jwt-auth")]
 fn schedule_reconnect(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
@@ -108,8 +108,23 @@ fn schedule_reconnect(
     email: String,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
+    attempt: u32,
 ) {
-    Timeout::new(1_000, move || {
+    const MAX_ATTEMPTS: u32 = 10;
+    const MAX_DELAY_MS: u32 = 16_000;
+
+    if attempt >= MAX_ATTEMPTS {
+        connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+        return;
+    }
+
+    let base_delay = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
+    let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base_delay as f64;
+    let delay_ms = (base_delay as f64 + jitter).max(500.0) as u32;
+
+    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_ATTEMPTS, delay_ms);
+
+    Timeout::new(delay_ms, move || {
         wasm_bindgen_futures::spawn_local(async move {
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
@@ -128,17 +143,61 @@ fn schedule_reconnect(
                 }
                 Err(e) => {
                     connection_error.set(Some(format!("Connection lost, retrying... ({e})")));
-                    // Retry after another second
                     schedule_reconnect(
                         client_cell,
                         meeting_id,
                         email,
                         connection_error,
                         meeting_ended_message,
+                        attempt + 1,
                     );
                 }
             }
         });
+    })
+    .forget();
+}
+
+/// Schedule a reconnection attempt with exponential backoff (non-JWT path).
+///
+/// Retries with increasing delay (1s → 2s → 4s → 8s → 16s cap) plus ±25%
+/// random jitter.  Gives up after 10 attempts.
+#[cfg(not(feature = "media-server-jwt-auth"))]
+fn schedule_reconnect_no_jwt(
+    client_cell: Rc<RefCell<Option<VideoCallClient>>>,
+    mut connection_error: Signal<Option<String>>,
+    attempt: u32,
+) {
+    const MAX_ATTEMPTS: u32 = 10;
+    const MAX_DELAY_MS: u32 = 16_000;
+
+    if attempt >= MAX_ATTEMPTS {
+        connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+        return;
+    }
+
+    let base_delay = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
+    let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base_delay as f64;
+    let delay_ms = (base_delay as f64 + jitter).max(500.0) as u32;
+
+    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_ATTEMPTS, delay_ms);
+
+    Timeout::new(delay_ms, move || {
+        let reconnect_needed = {
+            if let Some(client) = client_cell.borrow_mut().as_mut() {
+                if let Err(e) = client.connect() {
+                    log::error!("Reconnection failed: {e:?}");
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        };
+        if reconnect_needed {
+            schedule_reconnect_no_jwt(client_cell, connection_error, attempt + 1);
+        }
     })
     .forget();
 }
@@ -252,20 +311,14 @@ pub fn AttendantsComponent(
                             email,
                             connection_error,
                             meeting_ended_message,
+                            0,
                         );
                     }
 
                     #[cfg(not(feature = "media-server-jwt-auth"))]
                     {
                         let client_cell = client_cell.clone();
-                        Timeout::new(1_000, move || {
-                            if let Some(client) = client_cell.borrow_mut().as_mut() {
-                                if let Err(e) = client.connect() {
-                                    log::error!("Reconnection failed: {e:?}");
-                                }
-                            }
-                        })
-                        .forget();
+                        schedule_reconnect_no_jwt(client_cell, connection_error, 0);
                     }
                 })
             },

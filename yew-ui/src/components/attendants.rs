@@ -208,6 +208,7 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    reconnect_attempt: u32,
 }
 
 impl AttendantsComponent {
@@ -430,13 +431,30 @@ impl AttendantsComponent {
         html! {} // Empty html when feature is not enabled
     }
 
-    /// Schedule a token refresh attempt after 1 second.
+    /// Schedule a token refresh attempt with exponential backoff and jitter.
     ///
-    /// If the meeting has ended (`MeetingNotActive`), sends `MeetingEnded`
-    /// instead of retrying, so the user sees a clear "meeting ended" overlay.
+    /// Retries with increasing delay (1s -> 2s -> 4s -> 8s -> 16s cap) plus +/-25%
+    /// random jitter.  Gives up after 10 attempts.  If the meeting has ended
+    /// (`MeetingNotActive`), sends `MeetingEnded` instead of retrying.
     #[cfg(feature = "media-server-jwt-auth")]
-    fn schedule_token_refresh(link: yew::html::Scope<Self>, meeting_id: String) {
-        Timeout::new(1_000, move || {
+    fn schedule_token_refresh(link: yew::html::Scope<Self>, meeting_id: String, attempt: u32) {
+        const MAX_ATTEMPTS: u32 = 10;
+        const MAX_DELAY_MS: u32 = 16_000;
+
+        if attempt >= MAX_ATTEMPTS {
+            link.send_message(Msg::TokenRefreshFailed(
+                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+            ));
+            return;
+        }
+
+        let base_delay = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
+        let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base_delay as f64;
+        let delay_ms = (base_delay as f64 + jitter).max(500.0) as u32;
+
+        log::info!("Scheduling token refresh attempt {}/{} in {}ms", attempt + 1, MAX_ATTEMPTS, delay_ms);
+
+        Timeout::new(delay_ms, move || {
             wasm_bindgen_futures::spawn_local(async move {
                 match crate::meeting_api::refresh_room_token(&meeting_id).await {
                     Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
@@ -448,6 +466,34 @@ impl AttendantsComponent {
                     }
                 }
             });
+        })
+        .forget();
+    }
+
+    /// Schedule a reconnection attempt with exponential backoff (non-JWT path).
+    ///
+    /// Retries with increasing delay (1s -> 2s -> 4s -> 8s -> 16s cap) plus +/-25%
+    /// random jitter.  Gives up after 10 attempts.
+    #[cfg(not(feature = "media-server-jwt-auth"))]
+    fn schedule_reconnect_no_jwt(link: yew::html::Scope<Self>, attempt: u32) {
+        const MAX_ATTEMPTS: u32 = 10;
+        const MAX_DELAY_MS: u32 = 16_000;
+
+        if attempt >= MAX_ATTEMPTS {
+            link.send_message(WsAction::Log(
+                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+            ));
+            return;
+        }
+
+        let base_delay = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
+        let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base_delay as f64;
+        let delay_ms = (base_delay as f64 + jitter).max(500.0) as u32;
+
+        log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_ATTEMPTS, delay_ms);
+
+        Timeout::new(delay_ms, move || {
+            link.send_message(WsAction::Connect);
         })
         .forget();
     }
@@ -499,6 +545,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
+            reconnect_attempt: 0,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -535,6 +582,7 @@ impl Component for AttendantsComponent {
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
                     self.error = None;
+                    self.reconnect_attempt = 0;
                     self.call_start_time = Some(js_sys::Date::now());
                     true
                 }
@@ -549,18 +597,17 @@ impl Component for AttendantsComponent {
 
                     #[cfg(feature = "media-server-jwt-auth")]
                     {
+                        self.reconnect_attempt = 0;
                         let link = ctx.link().clone();
                         let meeting_id = ctx.props().id.clone();
-                        Self::schedule_token_refresh(link, meeting_id);
+                        Self::schedule_token_refresh(link, meeting_id, 0);
                     }
 
                     #[cfg(not(feature = "media-server-jwt-auth"))]
                     {
+                        self.reconnect_attempt = 0;
                         let link = ctx.link().clone();
-                        Timeout::new(1_000, move || {
-                            link.send_message(WsAction::Connect);
-                        })
-                        .forget();
+                        Self::schedule_reconnect_no_jwt(link, 0);
                     }
 
                     true
@@ -807,6 +854,7 @@ impl Component for AttendantsComponent {
             Msg::TokenRefreshed(new_token) => {
                 log::info!("Room token refreshed, reconnecting with new token");
                 self.error = None;
+                self.reconnect_attempt = 0;
                 let (ws_urls, wt_urls) =
                     Self::build_lobby_urls(&new_token, &ctx.props().email, &ctx.props().id);
                 self.client.update_server_urls(ws_urls, wt_urls);
@@ -821,10 +869,13 @@ impl Component for AttendantsComponent {
                 warn!("Token refresh failed: {err}");
                 self.error = Some(format!("Connection lost, retrying... ({err})"));
 
-                // Schedule another attempt after 1 second.
-                let link = ctx.link().clone();
-                let meeting_id = ctx.props().id.clone();
-                Self::schedule_token_refresh(link, meeting_id);
+                #[cfg(feature = "media-server-jwt-auth")]
+                {
+                    self.reconnect_attempt += 1;
+                    let link = ctx.link().clone();
+                    let meeting_id = ctx.props().id.clone();
+                    Self::schedule_token_refresh(link, meeting_id, self.reconnect_attempt);
+                }
 
                 true
             }

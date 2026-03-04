@@ -545,7 +545,7 @@ jobs:
             --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[1].valueFrom.secretKeyRef.key=secret" \
             --set "env[2].name=CORS_ALLOWED_ORIGIN" \
-            --set "env[2].value=https://pr${SLOT}.preview.videocall.fnxlabs.com,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "env[2].value=https://pr${SLOT}.preview.videocall.fnxlabs.com\,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
             --set "env[3].name=COOKIE_DOMAIN" \
             --set "env[3].value=.preview.videocall.fnxlabs.com" \
             --set "env[4].name=OAUTH_ISSUER" \
@@ -561,7 +561,7 @@ jobs:
             --set "env[9].name=OAUTH_SCOPES" \
             --set "env[9].value=openid email profile" \
             --set "env[10].name=ALLOWED_REDIRECT_URLS" \
-            --set "env[10].value=https://pr${SLOT}.preview.videocall.fnxlabs.com,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "env[10].value=https://pr${SLOT}.preview.videocall.fnxlabs.com\,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
             --set "env[11].name=LISTEN_ADDR" \
             --set "env[11].value=0.0.0.0:8081" \
             --set "env[12].name=RUST_LOG" \

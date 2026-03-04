@@ -530,7 +530,6 @@ impl PeerDecodeManager {
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
                 peer.context_initialized = true;
             }
-            let sid_str = peer.sid_str.clone();
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
                     peer.on_heartbeat();
@@ -538,10 +537,15 @@ impl PeerDecodeManager {
                 }
                 Ok((media_type, decode_status)) => {
                     if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.track_frame(&sid_str, media_type, packet.data.len() as u64);
+                        diagnostics.track_frame(
+                            &peer.sid_str,
+                            media_type,
+                            packet.data.len() as u64,
+                        );
                     }
 
                     if decode_status.first_frame {
+                        let sid_str = peer.sid_str.clone();
                         self.on_first_frame.emit((sid_str, media_type));
                     }
 

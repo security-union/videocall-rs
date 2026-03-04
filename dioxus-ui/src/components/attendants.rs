@@ -278,13 +278,14 @@ pub fn AttendantsComponent(
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: Some(VcCallback::from(move |peer_id: String| {
                 log::info!("Peer removed: {peer_id}");
-                // write_unchecked is required here: VcCallback wraps Fn (not FnMut)
-                // but Signal::write() takes &mut self. write_unchecked only skips
-                // Dioxus scope-tracking; the underlying RefCell still enforces
-                // borrow rules at runtime, so no UB is possible.
-                peer_status_map.write_unchecked().remove(&peer_id);
-                let mut v = peer_list_version;
-                v.set(v() + 1);
+                // Defer the write to avoid re-entrant borrows: the diagnostics
+                // subscriber task may hold a .read() on peer_status_map when
+                // on_peer_removed fires, since both run on the WASM event loop.
+                spawn(async move {
+                    peer_status_map.write().remove(&peer_id);
+                    let mut v = peer_list_version;
+                    v.set(v() + 1);
+                });
             })),
             get_peer_video_canvas_id: VcCallback::from(|email| email),
             get_peer_screen_canvas_id: VcCallback::from(|email| format!("screen-share-{}", &email)),

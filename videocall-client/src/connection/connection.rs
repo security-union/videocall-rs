@@ -241,7 +241,20 @@ fn build_heartbeat_packet(
     };
 
     let data = aes_encrypt_heartbeat(aes, &packet)
-        .map_err(|e| log::error!("{e}"))
+        .map_err(|e| {
+            log::error!("{e}");
+            let _ = videocall_diagnostics::global_sender().try_broadcast(
+                videocall_diagnostics::DiagEvent {
+                    subsystem: "heartbeat",
+                    stream_id: None,
+                    ts_ms: videocall_diagnostics::now_ms(),
+                    metrics: vec![videocall_diagnostics::metric!(
+                        "encryption_failure",
+                        1u64
+                    )],
+                },
+            );
+        })
         .ok()?;
     let mut packet_wrapper = PacketWrapper {
         data,

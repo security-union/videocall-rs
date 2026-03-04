@@ -29,13 +29,13 @@ pub fn PeerTile(
     let client = use_context::<VideoCallClientCtx>();
     let peer_status_map = use_context::<PeerStatusMap>();
 
-    // Subscribe to map-level changes (so we pick up newly-inserted peer signals)
-    // and to this peer's individual signal (so we re-render on state changes).
-    // The map-level read causes a re-render when a new peer is added, but that
-    // is necessary: a PeerTile may render before the diagnostics task creates
-    // the per-peer signal, and without this subscription it would never learn
-    // about the signal's creation.
-    if let Some(peer_signal) = peer_status_map.read().get(&peer_id).copied() {
+    // Use peek() for the outer map lookup to avoid subscribing this tile to
+    // the HashMap signal. This prevents O(N²) re-renders during peer join
+    // bursts. We only subscribe to the per-peer signal for fine-grained
+    // updates. If the per-peer signal doesn't exist yet (peer joined but
+    // diagnostics task hasn't created it), this tile will re-render when
+    // the parent re-renders from the peer_list_version bump.
+    if let Some(peer_signal) = peer_status_map.peek().get(&peer_id).copied() {
         let _ = peer_signal.read();
     }
 

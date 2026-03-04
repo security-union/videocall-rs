@@ -66,7 +66,7 @@
 //!     on_peer_removed: None,
 //!     on_meeting_info: None,
 //!     on_meeting_ended: None,
-//!    
+//!     on_speaking_changed: None,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -90,7 +90,7 @@
 //! #     on_peer_removed: None,
 //! #     on_meeting_info: None,
 //! #     on_meeting_ended: None,
-//! #
+//! #     on_speaking_changed: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(

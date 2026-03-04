@@ -295,18 +295,23 @@ impl CameraEncoder {
             let media_info = web_sys::MediaTrackConstraints::new();
 
             // Force exact deviceId match (avoids partial/ideal matching surprises).
-            let exact = js_sys::Object::new();
-            js_sys::Reflect::set(
-                &exact,
-                &JsValue::from_str("exact"),
-                &JsValue::from_str(&device_id),
-            )
-            .unwrap();
+            if device_id.is_empty() {
+                log::warn!("Camera device_id is empty, using default constraint");
+                constraints.set_video(&JsValue::TRUE);
+            } else {
+                let exact = js_sys::Object::new();
+                js_sys::Reflect::set(
+                    &exact,
+                    &JsValue::from_str("exact"),
+                    &JsValue::from_str(&device_id),
+                )
+                .unwrap();
 
-            log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
-            media_info.set_device_id(&exact.into());
+                log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
+                media_info.set_device_id(&exact.into());
+                constraints.set_video(&media_info.into());
+            }
 
-            constraints.set_video(&media_info.into());
             constraints.set_audio(&Boolean::from(false));
 
             let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {

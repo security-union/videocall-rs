@@ -2,3 +2,4 @@
 
 pub mod home;
 pub mod meeting;
+pub mod meeting_settings;

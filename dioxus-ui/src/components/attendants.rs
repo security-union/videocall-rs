@@ -155,6 +155,7 @@ pub fn AttendantsComponent(
     #[props(default)] auto_join: bool,
     #[props(default)] is_owner: bool,
     #[props(default)] room_token: String,
+    #[props(default = true)] waiting_room_enabled: bool,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -177,6 +178,11 @@ pub fn AttendantsComponent(
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
+    let mut pending_mic_enable = use_signal(|| false);
+    let mut pending_video_enable = use_signal(|| false);
+    let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let mut saving = use_signal(|| false);
+    let mut toggle_error = use_signal(|| None::<String>);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -306,7 +312,22 @@ pub fn AttendantsComponent(
         mda.on_granted = VcCallback::from(move |_| {
             let mut media_access_granted = media_access_granted;
             let mut meeting_joined = meeting_joined;
+            let mut mic_enabled = mic_enabled;
+            let mut video_enabled = video_enabled;
+            let mut pending_mic_enable = pending_mic_enable;
+            let mut pending_video_enable = pending_video_enable;
             media_access_granted.set(true);
+
+            // Fulfil any pending mic/camera enables that triggered the permission request.
+            if pending_mic_enable() {
+                mic_enabled.set(true);
+                pending_mic_enable.set(false);
+            }
+            if pending_video_enable() {
+                video_enabled.set(true);
+                pending_video_enable.set(false);
+            }
+
             // Connect after permissions granted
             if let Err(e) = client_cell.borrow_mut().connect() {
                 log::error!("Connection failed: {e:?}");
@@ -417,6 +438,58 @@ pub fn AttendantsComponent(
                         p { "Click the button below to join and start listening to others." }
                         if let Some(err) = connection_error() {
                             p { style: "color: #ff6b6b; margin-top: 1rem;", "{err}" }
+                        }
+                    }
+                    if is_owner {
+                        {
+                            let meeting_id_for_toggle = id.clone();
+                            rsx! {
+                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
+                                    span { style: "font-size: 0.9rem;", "Waiting Room" }
+                                    crate::components::toggle_switch::ToggleSwitch {
+                                        enabled: waiting_room_toggle(),
+                                        disabled: saving(),
+                                        on_toggle: {
+                                            let meeting_id = meeting_id_for_toggle.clone();
+                                            move |new_val: bool| {
+                                                if saving() {
+                                                    return;
+                                                }
+                                                toggle_error.set(None);
+                                                waiting_room_toggle.set(new_val);
+                                                saving.set(true);
+                                                let meeting_id = meeting_id.clone();
+                                                wasm_bindgen_futures::spawn_local(async move {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val).await {
+                                                        Ok(updated) => {
+                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                            saving.set(false);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("Failed to update waiting room setting: {e}");
+                                                            waiting_room_toggle.set(!new_val);
+                                                            saving.set(false);
+                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        },
+                                    }
+                                }
+                                if let Some(err) = toggle_error() {
+                                    p { class: "toggle-error",
+                                        "{err}"
+                                    }
+                                }
+                                p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-bottom: 1.5rem; margin-top: -0.75rem;",
+                                    if waiting_room_toggle() {
+                                        "Participants will wait for your approval before joining"
+                                    } else {
+                                        "Participants will join the meeting directly"
+                                    }
+                                }
+                            }
                         }
                     }
                     button {
@@ -538,6 +611,7 @@ pub fn AttendantsComponent(
                                                         if media_access_granted() {
                                                             mic_enabled.set(true);
                                                         } else {
+                                                            pending_mic_enable.set(true);
                                                             mda_mic.borrow().request();
                                                         }
                                                     } else {
@@ -569,6 +643,7 @@ pub fn AttendantsComponent(
                                                                 }
                                                             }
                                                         } else {
+                                                            pending_video_enable.set(true);
                                                             mda_cam.borrow().request();
                                                         }
                                                     } else {
@@ -640,6 +715,8 @@ pub fn AttendantsComponent(
                                                     meeting_joined.set(false);
                                                     mic_enabled.set(false);
                                                     video_enabled.set(false);
+                                                    pending_mic_enable.set(false);
+                                                    pending_video_enable.set(false);
                                                     call_start_time.set(None);
                                                     meeting_start_time_server.set(None);
 

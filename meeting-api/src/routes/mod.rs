@@ -19,7 +19,7 @@ pub mod participants;
 pub mod waiting_room;
 
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 
@@ -41,6 +41,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}",
             delete(meetings::delete_meeting),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}",
+            patch(meetings::update_meeting),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/end",
+            post(meetings::end_meeting_handler),
         )
         // Participant actions
         .route(

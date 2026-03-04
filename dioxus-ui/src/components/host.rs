@@ -449,7 +449,7 @@ pub fn Host(
         div {
             class: if is_speaking && video_enabled { "host-video-wrapper speaking-tile" } else { "host-video-wrapper" },
             style: if video_enabled {
-                "position:relative; width:auto; height:auto; opacity:1; overflow:visible; pointer-events:auto;"
+                "position:relative; width:auto; height:auto; opacity:1; overflow:hidden; pointer-events:auto;"
             } else {
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
@@ -471,7 +471,7 @@ pub fn Host(
         if !video_enabled {
             div {
                 class: if is_speaking { "speaking-tile" } else { "" },
-                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 1rem; position:relative;",
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }

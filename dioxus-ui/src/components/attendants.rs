@@ -96,6 +96,21 @@ fn play_user_joined() {
     }
 }
 
+/// Maximum number of reconnection attempts before giving up.
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+/// Compute the reconnect delay for the given attempt using exponential backoff
+/// with ±25% random jitter.  Returns `None` when `attempt >= MAX_RECONNECT_ATTEMPTS`.
+fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
+    const MAX_DELAY_MS: u32 = 16_000;
+    if attempt >= MAX_RECONNECT_ATTEMPTS {
+        return None;
+    }
+    let base = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
+    let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base as f64;
+    Some((base as f64 + jitter).max(500.0) as u32)
+}
+
 /// Schedule a reconnection attempt with exponential backoff and jitter.
 ///
 /// Refreshes the room token, rebuilds lobby URLs, updates the client, and
@@ -110,19 +125,15 @@ fn schedule_reconnect(
     mut meeting_ended_message: Signal<Option<String>>,
     attempt: u32,
 ) {
-    const MAX_ATTEMPTS: u32 = 10;
-    const MAX_DELAY_MS: u32 = 16_000;
+    let delay_ms = match reconnect_delay_ms(attempt) {
+        Some(d) => d,
+        None => {
+            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            return;
+        }
+    };
 
-    if attempt >= MAX_ATTEMPTS {
-        connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
-        return;
-    }
-
-    let base_delay = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
-    let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base_delay as f64;
-    let delay_ms = (base_delay as f64 + jitter).max(500.0) as u32;
-
-    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_ATTEMPTS, delay_ms);
+    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
 
     Timeout::new(delay_ms, move || {
         wasm_bindgen_futures::spawn_local(async move {
@@ -168,19 +179,15 @@ fn schedule_reconnect_no_jwt(
     mut connection_error: Signal<Option<String>>,
     attempt: u32,
 ) {
-    const MAX_ATTEMPTS: u32 = 10;
-    const MAX_DELAY_MS: u32 = 16_000;
+    let delay_ms = match reconnect_delay_ms(attempt) {
+        Some(d) => d,
+        None => {
+            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            return;
+        }
+    };
 
-    if attempt >= MAX_ATTEMPTS {
-        connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
-        return;
-    }
-
-    let base_delay = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
-    let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base_delay as f64;
-    let delay_ms = (base_delay as f64 + jitter).max(500.0) as u32;
-
-    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_ATTEMPTS, delay_ms);
+    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
 
     Timeout::new(delay_ms, move || {
         let reconnect_needed = {
@@ -335,6 +342,11 @@ pub fn AttendantsComponent(
                 // Defer the write to avoid re-entrant borrows: the diagnostics
                 // subscriber task may hold a .read() on peer_status_map when
                 // on_peer_removed fires, since both run on the WASM event loop.
+                //
+                // Safety: this deferred removal cannot race with a re-added peer
+                // of the same ID because session IDs are server-assigned numeric
+                // values unique per connection — a reconnecting peer always gets
+                // a fresh session ID.
                 spawn(async move {
                     peer_status_map.write().remove(&peer_id);
                     let mut v = peer_list_version;

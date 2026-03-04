@@ -199,6 +199,10 @@ impl Peer {
         self.audio = audio;
         self.video = video;
         self.screen = screen;
+        // Intentionally keep `has_received_heartbeat` and `*_enabled` flags:
+        // the peer's last-known media state is still the best information we
+        // have.  Resetting the flag would let straggler frames through until
+        // the next heartbeat, which is the opposite of what we want.
         Ok(())
     }
 
@@ -264,13 +268,7 @@ impl Peer {
                         self.broadcast_peer_status();
                     } else {
                         // Peer has video off per heartbeat; drop straggler frame.
-                        return Ok((
-                            media_type,
-                            DecodeStatus {
-                                rendered: false,
-                                first_frame: false,
-                            },
-                        ));
+                        return Ok((media_type, DecodeStatus::SKIPPED));
                     }
                 }
                 let video_status = self
@@ -294,13 +292,7 @@ impl Peer {
                         self.broadcast_peer_status();
                     } else {
                         // Peer is muted per heartbeat; drop straggler audio to avoid audible glitch.
-                        return Ok((
-                            media_type,
-                            DecodeStatus {
-                                rendered: false,
-                                first_frame: false,
-                            },
-                        ));
+                        return Ok((media_type, DecodeStatus::SKIPPED));
                     }
                 }
                 Ok((
@@ -318,13 +310,7 @@ impl Peer {
                         self.broadcast_peer_status();
                     } else {
                         // Peer has screen off per heartbeat; drop straggler frame.
-                        return Ok((
-                            media_type,
-                            DecodeStatus {
-                                rendered: false,
-                                first_frame: false,
-                            },
-                        ));
+                        return Ok((media_type, DecodeStatus::SKIPPED));
                     }
                 }
                 let screen_status = self
@@ -384,13 +370,7 @@ impl Peer {
 
                     self.broadcast_peer_status();
                 }
-                Ok((
-                    media_type,
-                    DecodeStatus {
-                        rendered: false,
-                        first_frame: false,
-                    },
-                ))
+                Ok((media_type, DecodeStatus::SKIPPED))
             }
             MediaType::RTT => {
                 // RTT packets are handled by ConnectionManager, not by peer decoders
@@ -398,13 +378,7 @@ impl Peer {
                     "Received RTT packet for peer {} - ignoring in peer decoder",
                     self.session_id
                 );
-                Ok((
-                    media_type,
-                    DecodeStatus {
-                        rendered: false,
-                        first_frame: false,
-                    },
-                ))
+                Ok((media_type, DecodeStatus::SKIPPED))
             }
             MediaType::MEDIA_TYPE_UNKNOWN => {
                 log::error!(
@@ -679,10 +653,7 @@ mod tests {
 
     impl AudioPeerDecoderTrait for MockAudioDecoder {
         fn decode(&mut self, _packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
-            Ok(DecodeStatus {
-                rendered: false,
-                first_frame: false,
-            })
+            Ok(DecodeStatus::SKIPPED)
         }
         fn flush(&mut self) {}
         fn set_muted(&mut self, muted: bool) {

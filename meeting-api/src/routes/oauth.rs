@@ -230,8 +230,12 @@ pub async fn callback(
     let redirect_url = match &oauth_req.return_to {
         Some(value) if value.starts_with("http://") || value.starts_with("https://") => {
             // Absolute URL — re-validate as defense-in-depth.
-            validate_return_to(value, &oauth_cfg.after_login_url, &oauth_cfg.allowed_redirect_urls)
-                .unwrap_or_else(|| oauth_cfg.after_login_url.clone())
+            validate_return_to(
+                value,
+                &oauth_cfg.after_login_url,
+                &oauth_cfg.allowed_redirect_urls,
+            )
+            .unwrap_or_else(|| oauth_cfg.after_login_url.clone())
         }
         Some(path) => {
             // Relative path (e.g. "/meeting/1") — prepend the frontend base URL.
@@ -336,7 +340,10 @@ fn validate_return_to(
 
     // Only allow http/https absolute URLs.
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-        tracing::warn!(return_to = trimmed, "rejected returnTo with disallowed scheme");
+        tracing::warn!(
+            return_to = trimmed,
+            "rejected returnTo with disallowed scheme"
+        );
         return None;
     }
 
@@ -427,7 +434,11 @@ mod tests {
     #[test]
     fn absolute_url_https_allowed() {
         assert_eq!(
-            validate_return_to("https://app.videocall.rs/meeting/1", AFTER_LOGIN, &allowed()),
+            validate_return_to(
+                "https://app.videocall.rs/meeting/1",
+                AFTER_LOGIN,
+                &allowed()
+            ),
             Some("https://app.videocall.rs/meeting/1".to_string())
         );
     }
@@ -550,7 +561,8 @@ mod tests {
 
     #[test]
     fn session_cookie_domain_appended() {
-        let cookie = build_session_cookie("session", "tok", 3600, Some(".sandbox.videocall.rs"), false);
+        let cookie =
+            build_session_cookie("session", "tok", 3600, Some(".sandbox.videocall.rs"), false);
         assert!(cookie.contains("Domain=.sandbox.videocall.rs"));
     }
 

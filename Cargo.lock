@@ -352,6 +352,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anes"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
+
+[[package]]
 name = "anstream"
 version = "0.6.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1129,6 +1135,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "capnp"
+version = "0.20.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "053b81915c2ce1629b8fb964f578b18cb39b23ef9d5b24120d0dfc959569a1d9"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
+name = "capnpc"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa3d5f01e69ed11656d2c7c47bf34327ea9bfb5c85c7de787fcd7b6c5e45b61"
+dependencies = [
+ "capnp",
+]
+
+[[package]]
 name = "cargo-platform"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1794,6 +1818,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if 1.0.4",
+]
+
+[[package]]
+name = "criterion"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2b12d017a929603d80db1831cd3a24082f8137ce19c69e6447f54f5fc8d692f"
+dependencies = [
+ "anes",
+ "cast",
+ "ciborium",
+ "clap",
+ "criterion-plot",
+ "is-terminal",
+ "itertools 0.10.5",
+ "num-traits",
+ "once_cell",
+ "oorandom",
+ "plotters",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tinytemplate",
+ "walkdir",
+]
+
+[[package]]
+name = "criterion-plot"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
+dependencies = [
+ "cast",
+ "itertools 0.10.5",
 ]
 
 [[package]]
@@ -2550,6 +2610,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-io"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2778,6 +2844,16 @@ name = "find-msvc-tools"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a3076410a55c90011c298b04d0cfa770b00fa04e1e3c97d3f6c9de105a03844"
+
+[[package]]
+name = "flatbuffers"
+version = "24.12.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f1baf0dbf96932ec9a3038d57900329c015b0bfb7b63d904f3bc27e2b02a096"
+dependencies = [
+ "bitflags 1.3.2",
+ "rustc_version",
+]
 
 [[package]]
 name = "flate2"
@@ -5511,6 +5587,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plotters"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aeb6f403d7a4911efb1e33402027fc44f29b5bf6def3effcc22d7bb75f2b747"
+dependencies = [
+ "num-traits",
+ "plotters-backend",
+ "plotters-svg",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "plotters-backend"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df42e13c12958a16b3f7f4386b9ab1f3e7933914ecea48da7139435263a4172a"
+
+[[package]]
+name = "plotters-svg"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
+dependencies = [
+ "plotters-backend",
+]
+
+[[package]]
 name = "png"
 version = "0.17.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7483,6 +7587,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytemplate"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be4d6b5f19ff7664e8c98d03e2139cb510db9b0a60b55f8e8709b689d939b6bc"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tinyvec"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8278,6 +8392,19 @@ dependencies = [
  "videocall-meeting-types",
  "videocall-types",
  "web-transport-quinn 0.8.1",
+]
+
+[[package]]
+name = "videocall-bench"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnpc",
+ "criterion",
+ "flatbuffers",
+ "protobuf 3.7.1",
+ "rand 0.8.5",
+ "videocall-types",
 ]
 
 [[package]]

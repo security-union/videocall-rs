@@ -1,0 +1,22 @@
+namespace videocall.bench;
+
+enum PacketType : byte {
+  Unknown = 0,
+  RsaPubKey = 1,
+  AesKey = 2,
+  Media = 3,
+  Connection = 4,
+  Diagnostics = 5,
+  Health = 6,
+  Meeting = 7,
+  SessionAssigned = 8,
+}
+
+table PacketWrapper {
+  packet_type: PacketType;
+  email: string;
+  data: [ubyte];
+  session_id: uint64;
+}
+
+root_type PacketWrapper;

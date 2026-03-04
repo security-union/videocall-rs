@@ -109,7 +109,6 @@ pub enum Msg {
     OnCameraError(String),
     DismissUserError,
     UserScreenAction(UserScreenToggleAction),
-    ForceRerender,
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
     #[cfg(feature = "fake-peers")]
@@ -359,6 +358,7 @@ impl AttendantsComponent {
                     link.send_message(Msg::OnSpeakingChanged(speaking));
                 })
             }),
+            vad_threshold: crate::constants::vad_threshold().ok(),
         };
 
         VideoCallClient::new(opts)
@@ -530,11 +530,8 @@ impl Component for AttendantsComponent {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {
-            Msg::ForceRerender => {
-                true
-            }
             Msg::OnSpeakingChanged(speaking) => {
-                log::info!("🟢 LOCAL Speaking state changed to: {}", speaking);
+                log::trace!("LOCAL Speaking state changed to: {}", speaking);
                 self.local_speaking = speaking;
                 true
             }

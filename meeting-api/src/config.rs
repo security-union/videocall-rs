@@ -41,9 +41,9 @@ pub struct Config {
     /// Whether to set the `Secure` flag on cookies (default: true).
     /// Set `COOKIE_SECURE=false` for local development over HTTP.
     pub cookie_secure: bool,
-    /// Explicit CORS allowed origin for production (e.g. "https://app.videocall.rs").
-    /// When `None`, the server mirrors the request origin (development only).
-    pub cors_allowed_origin: Option<String>,
+    /// Explicit CORS allowed origins for production (e.g. "https://app.videocall.rs").
+    /// Comma-separated for multiple origins. Empty list mirrors the request origin (development only).
+    pub cors_allowed_origin: Vec<String>,
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -90,7 +90,7 @@ impl Config {
     ///   `OAUTH_ISSUER`, `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_JWKS_URL`,
     ///   `OAUTH_USERINFO_URL`, `OAUTH_SCOPES` (default: `"openid email profile"`),
     ///   `AFTER_LOGIN_URL`
-    /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"`)
+    /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"` or comma-separated for multiple origins)
     pub fn from_env() -> Result<Self, String> {
         let database_url = env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -116,7 +116,9 @@ impl Config {
             .unwrap_or(true);
         let cors_allowed_origin = env::var("CORS_ALLOWED_ORIGIN")
             .ok()
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
+            .unwrap_or_default();
 
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()

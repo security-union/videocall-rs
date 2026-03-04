@@ -9,6 +9,7 @@ use crate::constants::meeting_api_client;
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
+use web_sys::HtmlAudioElement;
 
 pub type WaitingParticipant = ParticipantStatusResponse;
 
@@ -17,6 +18,7 @@ pub fn HostControls(meeting_id: String, is_admitted: bool) -> Element {
     let mut waiting = use_signal(Vec::<WaitingParticipant>::new);
     let mut error = use_signal(|| None::<String>);
     let mut expanded = use_signal(|| true);
+    let mut prev_waiting_count = use_signal(|| 0usize);
 
     let fetch_waiting_list = {
         let meeting_id = meeting_id.clone();
@@ -54,6 +56,12 @@ pub fn HostControls(meeting_id: String, is_admitted: bool) -> Element {
                 loop {
                     match fetch_waiting(&meeting_id).await {
                         Ok(w) => {
+                            let new_count = w.len();
+                            let old_count = *prev_waiting_count.peek();
+                            if new_count > old_count {
+                                play_knock_sound();
+                            }
+                            prev_waiting_count.set(new_count);
                             waiting.set(w);
                             error.set(None);
                         }
@@ -195,6 +203,15 @@ pub fn HostControls(meeting_id: String, is_admitted: bool) -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+fn play_knock_sound() {
+    if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/knock.wav") {
+        audio.set_volume(0.5);
+        if let Err(e) = audio.play() {
+            log::warn!("Failed to play knock sound: {e:?}");
         }
     }
 }

@@ -17,11 +17,12 @@ pub mod meeting_info;
 pub mod meetings_list;
 pub mod neteq_chart;
 pub mod okta_sign_in_button;
+pub mod toggle_switch;
 pub mod top_bar;
 pub mod video_control_buttons;
 pub mod waiting_room;
 
 mod canvas_generator;
 mod peer_list;
-mod peer_list_item;
+pub mod peer_list_item;
 mod peer_tile;

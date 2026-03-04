@@ -71,7 +71,7 @@ pub fn generate_for_peer(
                         {peer_email.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>
-                    <div class="audio-indicator"><MicIcon muted={!is_audio_enabled_for_peer}/></div>
+                    <div class={classes!("audio-indicator", if is_speaking { "speaking" } else { "" })}><MicIcon muted={!is_audio_enabled_for_peer}/></div>
                     <button onclick={Callback::from({ let canvas_id = key.clone(); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon"><CropIcon/></button>
                     <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon"><PushPinIcon/></button>
                 </div>
@@ -130,7 +130,7 @@ pub fn generate_for_peer(
                         {peer_email.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>
-                    <div class="audio-indicator">
+                    <div class={classes!("audio-indicator", if is_speaking { "speaking" } else { "" })}>
                         <MicIcon muted={!is_audio_enabled_for_peer}/>
                     </div>
                     <button onclick={Callback::from({ let canvas_id = key.clone(); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon">

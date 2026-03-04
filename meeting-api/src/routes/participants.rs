@@ -74,9 +74,10 @@ pub async fn join_meeting(
             display_name.unwrap_or(&email),
         )?;
 
-        Ok(Json(APIResponse::ok(
-            row.into_participant_status(Some(token)),
-        )))
+        let mut resp = row.into_participant_status(Some(token));
+        resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+        resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
+        Ok(Json(APIResponse::ok(resp)))
     } else {
         // Attendee: must wait for admission if meeting is active.
         let current_state = meeting.state.as_deref().unwrap_or("idle");
@@ -84,10 +85,28 @@ pub async fn join_meeting(
             return Err(AppError::meeting_not_active(&meeting_id));
         }
 
-        let row =
-            db_participants::upsert_attendee(&state.db, meeting.id, &email, display_name).await?;
+        // Atomically check waiting_room_enabled and insert participant in one
+        // transaction, using FOR UPDATE to serialize against concurrent toggles.
+        let (auto_admitted, row, waiting_room_enabled) =
+            db_participants::join_attendee(&state.db, meeting.id, &email, display_name).await?;
 
-        Ok(Json(APIResponse::ok(row.into_participant_status(None))))
+        let token = if auto_admitted {
+            Some(generate_room_token(
+                &state.jwt_secret,
+                state.token_ttl_secs,
+                &email,
+                &meeting_id,
+                false,
+                display_name.unwrap_or(&email),
+            )?)
+        } else {
+            None
+        };
+
+        let mut resp = row.into_participant_status(token);
+        resp.waiting_room_enabled = Some(waiting_room_enabled);
+        resp.host_display_name = meeting.host_display_name;
+        Ok(Json(APIResponse::ok(resp)))
     }
 }
 
@@ -125,7 +144,10 @@ pub async fn get_my_status(
         None
     };
 
-    Ok(Json(APIResponse::ok(row.into_participant_status(token))))
+    let mut resp = row.into_participant_status(token);
+    resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+    resp.host_display_name = meeting.host_display_name;
+    Ok(Json(APIResponse::ok(resp)))
 }
 
 /// POST /api/v1/meetings/{meeting_id}/leave

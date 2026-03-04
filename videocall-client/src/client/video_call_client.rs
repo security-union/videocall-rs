@@ -73,6 +73,7 @@ pub struct VideoCallClientOptions {
     pub on_meeting_info: Option<Callback<f64>>,
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
     pub on_speaking_changed: Option<Callback<bool>>,
+    pub vad_threshold: Option<f32>,
 }
 
 #[derive(Debug)]
@@ -345,28 +346,18 @@ impl VideoCallClient {
         opts: &VideoCallClientOptions,
         diagnostics: Option<Rc<DiagnosticManager>>,
     ) -> PeerDecodeManager {
-        match diagnostics {
-            Some(diagnostics) => {
-                let mut peer_decode_manager = PeerDecodeManager::new_with_diagnostics(diagnostics);
-                peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
-                peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
-                peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
-                if let Some(cb) = opts.on_peer_removed.as_ref() {
-                    peer_decode_manager.on_peer_removed = cb.clone();
-                }
-                peer_decode_manager
-            }
-            None => {
-                let mut peer_decode_manager = PeerDecodeManager::new();
-                peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
-                peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
-                peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
-                if let Some(cb) = opts.on_peer_removed.as_ref() {
-                    peer_decode_manager.on_peer_removed = cb.clone();
-                }
-                peer_decode_manager
-            }
+        let mut peer_decode_manager = match diagnostics {
+            Some(diagnostics) => PeerDecodeManager::new_with_diagnostics(diagnostics),
+            None => PeerDecodeManager::new(),
+        };
+        peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
+        peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
+        peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
+        if let Some(cb) = opts.on_peer_removed.as_ref() {
+            peer_decode_manager.on_peer_removed = cb.clone();
         }
+        peer_decode_manager.set_vad_threshold(opts.vad_threshold);
+        peer_decode_manager
     }
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {

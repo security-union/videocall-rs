@@ -16,16 +16,35 @@
  * conditions.
  */
 
-use crate::components::icons::crown::CrownIcon;
+use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use dioxus::prelude::*;
 
 #[component]
-pub fn PeerListItem(name: String, #[props(default)] is_host: bool) -> Element {
+pub fn PeerListItem(
+    name: String,
+    #[props(default)] is_host: bool,
+    #[props(default)] is_self: bool,
+    #[props(default = true)] muted: bool,
+    #[props(default = false)] speaking: bool,
+) -> Element {
     let title = if is_host {
         format!("Host: {name}")
     } else {
         name.clone()
+    };
+
+    let mic_class = if speaking {
+        "peer_item_mic speaking"
+    } else {
+        "peer_item_mic"
+    };
+
+    let indicator = match (is_self, is_host) {
+        (true, true) => Some("(You/Host)"),
+        (true, false) => Some("(You)"),
+        (false, true) => Some("(Host)"),
+        (false, false) => None,
     };
 
     rsx! {
@@ -35,9 +54,12 @@ pub fn PeerListItem(name: String, #[props(default)] is_host: bool) -> Element {
             }
             div { class: "peer_item_text",
                 "{name}"
-                if is_host {
-                    CrownIcon {}
+                if let Some(label) = indicator {
+                    span { class: "peer-indicator", "{label}" }
                 }
+            }
+            div { class: "{mic_class}",
+                MicIcon { muted: muted }
             }
         }
     }

@@ -189,6 +189,7 @@ fn schedule_reconnect_no_jwt(
                     log::error!("Reconnection failed: {e:?}");
                     true
                 } else {
+                    connection_error.set(None);
                     false
                 }
             } else {

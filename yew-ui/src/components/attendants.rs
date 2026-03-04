@@ -480,7 +480,7 @@ impl AttendantsComponent {
         const MAX_DELAY_MS: u32 = 16_000;
 
         if attempt >= MAX_ATTEMPTS {
-            link.send_message(WsAction::Log(
+            link.send_message(Msg::TokenRefreshFailed(
                 "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
             ));
             return;

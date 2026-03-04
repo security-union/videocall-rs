@@ -77,7 +77,10 @@ pub fn MeetingPage(id: String) -> Element {
                                 // so we cannot rely on ?returnTo= surviving in the URL.
                                 match win.session_storage() {
                                     Ok(Some(storage)) => {
-                                        if storage.set_item("vc_oauth_return_to", &current_url).is_err() {
+                                        if storage
+                                            .set_item("vc_oauth_return_to", &current_url)
+                                            .is_err()
+                                        {
                                             log::warn!("Failed to write vc_oauth_return_to to sessionStorage — post-login redirect will fall back to app root");
                                         }
                                     }

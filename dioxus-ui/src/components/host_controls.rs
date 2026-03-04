@@ -207,6 +207,15 @@ pub fn HostControls(meeting_id: String, is_admitted: bool) -> Element {
     }
 }
 
+fn play_knock_sound() {
+    if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/knock.wav") {
+        audio.set_volume(0.5);
+        if let Err(e) = audio.play() {
+            log::warn!("Failed to play knock sound: {e:?}");
+        }
+    }
+}
+
 async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     match client.get_waiting_room(meeting_id).await {

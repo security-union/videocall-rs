@@ -240,7 +240,9 @@ fn build_heartbeat_packet(
         ..Default::default()
     };
 
-    let data = aes_encrypt_heartbeat(aes, &packet).ok()?;
+    let data = aes_encrypt_heartbeat(aes, &packet)
+        .map_err(|e| log::error!("{e}"))
+        .ok()?;
     let mut packet_wrapper = PacketWrapper {
         data,
         email: userid.to_owned(),
@@ -255,12 +257,12 @@ fn build_heartbeat_packet(
     Some(packet_wrapper)
 }
 
-fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, ()> {
+fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, String> {
     let bytes = packet.write_to_bytes().map_err(|e| {
-        log::error!("Failed to serialize heartbeat packet: {e}");
+        format!("Failed to serialize heartbeat packet: {e}")
     })?;
     aes.encrypt(&bytes).map_err(|e| {
-        log::error!("Failed to encrypt heartbeat packet: {e:?}");
+        format!("Failed to encrypt heartbeat packet: {e:?}")
     })
 }
 

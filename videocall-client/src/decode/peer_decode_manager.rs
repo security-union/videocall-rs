@@ -585,6 +585,18 @@ impl PeerDecodeManager {
         }
     }
 
+    /// Remove all peers and terminate their decoder workers immediately.
+    ///
+    /// Called when the connection drops so stale workers don't linger and
+    /// consume WASM memory while the client reconnects.
+    pub fn clear_all_peers(&mut self) {
+        let removed = self.connected_peers.drain_all();
+        for (_session_id, peer) in removed {
+            self.on_peer_removed.emit(peer.sid_str);
+        }
+        // Peers are dropped here, triggering Worker::terminate() via Drop impl
+    }
+
     pub fn ensure_peer(&mut self, session_id: u64, email: &str) -> PeerStatus {
         if self.connected_peers.contains_key(&session_id) {
             PeerStatus::NoChange

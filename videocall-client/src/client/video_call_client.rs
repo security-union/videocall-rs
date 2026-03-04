@@ -354,6 +354,13 @@ impl VideoCallClient {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
                             inner.connection_state = state.clone();
+
+                            // On connection failure, immediately terminate all
+                            // decoder workers so stale WASM instances don't
+                            // accumulate memory during reconnection.
+                            if matches!(state, ConnectionState::Failed { .. }) {
+                                inner.peer_decode_manager.clear_all_peers();
+                            }
                         }
                     }
                     info!("Connection state changed: {state:?} in video call client");

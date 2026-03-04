@@ -91,6 +91,15 @@ impl<K: Ord + Hash + Clone, V> HashMapWithOrderedKeys<K, V> {
         self.map.remove(k)
     }
 
+    /// Remove all entries, returning them as a vector of key-value pairs.
+    /// Dropping the returned values triggers their `Drop` impls (e.g. worker
+    /// termination for `Peer`).
+    pub fn drain_all(&mut self) -> Vec<(K, V)> {
+        let entries: Vec<(K, V)> = self.map.drain().collect();
+        self.keys.clear();
+        entries
+    }
+
     //
     // New methods
     //

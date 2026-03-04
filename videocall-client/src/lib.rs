@@ -67,6 +67,7 @@
 //!     on_meeting_info: None,
 //!     on_meeting_ended: None,
 //!     on_speaking_changed: None,
+//!     vad_threshold: None,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -91,6 +92,7 @@
 //! #     on_meeting_info: None,
 //! #     on_meeting_ended: None,
 //! #     on_speaking_changed: None,
+//! #     vad_threshold: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(
@@ -105,6 +107,7 @@
 //!     128, // 128 kbps bitrate
 //!     Callback::noop(),
 //!     Callback::noop(),
+//!     None, // vad_threshold
 //! );
 //! let mut screen = ScreenEncoder::new(
 //!     client,

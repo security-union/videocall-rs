@@ -3,8 +3,6 @@ import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
-const UI_URL = process.env.UI_URL || "http://localhost:80";
-const MEETING_ID = `e2e_two_user_${Date.now()}`;
 
 const BROWSER_ARGS = [
   "--ignore-certificate-errors",
@@ -18,13 +16,14 @@ async function createAuthenticatedContext(
   browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
   email: string,
   name: string,
+  uiURL: string,
 ) {
   const context = await browser.newContext({
-    baseURL: UI_URL,
+    baseURL: uiURL,
     ignoreHTTPSErrors: true,
   });
   const token = generateSessionToken(email, name);
-  const url = new URL(UI_URL);
+  const url = new URL(uiURL);
   await context.addCookies([
     {
       name: COOKIE_NAME,
@@ -90,16 +89,25 @@ test.describe("Two users in a meeting", () => {
     await waitForServices();
   });
 
-  test("host starts meeting, guest joins, both see each other", async () => {
+  test("host starts meeting, guest joins, both see each other", async (_fixtures, testInfo) => {
+    const uiURL = testInfo.project.use.baseURL || "http://localhost:80";
+    const meetingId = `e2e_two_user_${Date.now()}`;
+
     const browser1 = await chromium.launch({ args: BROWSER_ARGS });
     const browser2 = await chromium.launch({ args: BROWSER_ARGS });
 
     try {
-      const hostCtx = await createAuthenticatedContext(browser1, "host@videocall.rs", "HostUser");
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
       const guestCtx = await createAuthenticatedContext(
         browser2,
         "guest@videocall.rs",
         "GuestUser",
+        uiURL,
       );
 
       const hostPage = await hostCtx.newPage();
@@ -110,12 +118,12 @@ test.describe("Two users in a meeting", () => {
       await hostPage.waitForTimeout(1500);
 
       await hostPage.locator("#meeting-id").click();
-      await hostPage.locator("#meeting-id").pressSequentially(MEETING_ID, { delay: 50 });
+      await hostPage.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
       await hostPage.locator("#username").click();
       await hostPage.locator("#username").pressSequentially("HostUser", { delay: 50 });
       await hostPage.waitForTimeout(500);
       await hostPage.locator("#username").press("Enter");
-      await expect(hostPage).toHaveURL(new RegExp(`/meeting/${MEETING_ID}`), {
+      await expect(hostPage).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
         timeout: 10_000,
       });
       await hostPage.waitForTimeout(1500);
@@ -125,7 +133,7 @@ test.describe("Two users in a meeting", () => {
       expect(hostResult).toBe("in-meeting");
 
       // ---- GUEST: go directly to the meeting ----
-      await guestPage.goto(`/meeting/${MEETING_ID}`);
+      await guestPage.goto(`/meeting/${meetingId}`);
       await guestPage.waitForTimeout(1500);
 
       const guestResult = await joinMeetingFromPage(guestPage, "GuestUser");

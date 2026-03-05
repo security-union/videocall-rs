@@ -19,14 +19,22 @@ export function generateSessionToken(email: string, name: string, ttlSecs: numbe
   );
 }
 
+interface SessionCookieOptions {
+  email?: string;
+  name?: string;
+  baseURL?: string;
+}
+
 export async function injectSessionCookie(
   context: BrowserContext,
-  email: string = "e2e-test@videocall.rs",
-  name: string = "E2ETestUser",
+  opts: SessionCookieOptions = {},
 ): Promise<void> {
+  const email = opts.email || "e2e-test@videocall.rs";
+  const name = opts.name || "E2ETestUser";
+  const resolvedURL = opts.baseURL || "http://localhost:80";
+
   const token = generateSessionToken(email, name);
-  const baseURL = process.env.UI_URL || "http://localhost:80";
-  const url = new URL(baseURL);
+  const url = new URL(resolvedURL);
 
   await context.addCookies([
     {

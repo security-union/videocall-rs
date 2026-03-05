@@ -7,8 +7,8 @@ test.describe("Meetings", () => {
     await waitForServices();
   });
 
-  test.beforeEach(async ({ context }) => {
-    await injectSessionCookie(context);
+  test.beforeEach(async ({ context, baseURL }) => {
+    await injectSessionCookie(context, { baseURL });
   });
 
   test("home page loads with meeting form", async ({ page }) => {

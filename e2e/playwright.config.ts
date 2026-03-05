@@ -1,5 +1,13 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const CHROME_ARGS = [
+  "--ignore-certificate-errors",
+  "--origin-to-force-quic-on=127.0.0.1:4433",
+  "--use-fake-device-for-media-stream",
+  "--use-fake-ui-for-media-stream",
+  "--disable-gpu",
+];
+
 export default defineConfig({
   globalSetup: "./global-setup.ts",
   testDir: "./tests",
@@ -9,23 +17,23 @@ export default defineConfig({
   expect: { timeout: 10_000 },
   reporter: [["html", { open: "never" }]],
   use: {
-    baseURL: process.env.UI_URL || "http://localhost:80",
     ignoreHTTPSErrors: true,
   },
   projects: [
     {
-      name: "chromium",
+      name: "dioxus",
       use: {
+        baseURL: "http://localhost:3001",
         ...devices["Desktop Chrome"],
-        launchOptions: {
-          args: [
-            "--ignore-certificate-errors",
-            "--origin-to-force-quic-on=127.0.0.1:4433",
-            "--use-fake-device-for-media-stream",
-            "--use-fake-ui-for-media-stream",
-            "--disable-gpu",
-          ],
-        },
+        launchOptions: { args: CHROME_ARGS },
+      },
+    },
+    {
+      name: "yew",
+      use: {
+        baseURL: "http://localhost:80",
+        ...devices["Desktop Chrome"],
+        launchOptions: { args: CHROME_ARGS },
       },
     },
   ],

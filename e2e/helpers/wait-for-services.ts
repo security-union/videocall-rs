@@ -1,4 +1,5 @@
-const UI_URL = process.env.UI_URL || "http://localhost:80";
+const YEW_UI_URL = process.env.UI_URL || "http://localhost:80";
+const DIOXUS_UI_URL = process.env.DIOXUS_UI_URL || "http://localhost:3001";
 const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
 const WS_URL = process.env.WS_CHECK_URL || "http://localhost:8080";
 
@@ -17,7 +18,8 @@ async function probe(url: string): Promise<boolean> {
 
 export async function waitForServices(): Promise<void> {
   const services = [
-    { name: "UI", url: UI_URL },
+    { name: "Yew UI", url: YEW_UI_URL },
+    { name: "Dioxus UI", url: DIOXUS_UI_URL },
     { name: "Meeting API", url: `${API_URL}/session` },
     { name: "WebSocket API", url: WS_URL },
   ];

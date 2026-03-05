@@ -1,11 +1,12 @@
 ##
 ## E2E test stack — reuses the same dev Dockerfiles as CI.
 ## Starts the minimum services needed for Playwright E2E tests.
+## Both dioxus-ui (port 3001) and yew-ui (port 80) run simultaneously.
 ##
 ## Usage:
-##   docker compose -f docker/docker-compose.e2e.yaml up --build -d
+##   docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
 ##   cd e2e && npx playwright test
-##   docker compose -f docker/docker-compose.e2e.yaml down -v
+##   docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down -v
 ##
 
 services:
@@ -32,7 +33,7 @@ services:
     working_dir: /app/meeting-api
     command: >
       nix develop /app#backend-dev --command bash -c
-      "/app/dbmate/startup.sh && cargo run --release --bin meeting-api"
+      "/app/dbmate/startup.sh && cargo run --bin meeting-api"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
       - LISTEN_ADDR=0.0.0.0:8081
@@ -52,7 +53,7 @@ services:
       - OAUTH_JWKS_URL=
       - OAUTH_USERINFO_URL=
       - AFTER_LOGIN_URL=http://localhost:80
-      - ALLOWED_REDIRECT_URLS=http://localhost:80
+      - ALLOWED_REDIRECT_URLS=http://localhost:80,http://localhost:3001
       - RUST_LOG=info
       - CARGO_TARGET_DIR=/app/meeting-api/target
       - CARGO_INCREMENTAL=1
@@ -79,7 +80,7 @@ services:
     working_dir: /app/actix-api
     command: >
       nix develop /app#backend-dev --command bash -c
-      "cargo run --release --bin websocket_server"
+      "cargo run --bin websocket_server"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
       - ACTIX_PORT=8080
@@ -109,6 +110,43 @@ services:
       - e2e-websocket-api-target:/app/actix-api/target
     depends_on:
       - nats
+
+  dioxus-ui:
+    build:
+      dockerfile: docker/Dockerfile.dioxus.dev
+      context: ../
+    working_dir: /app/dioxus-ui
+    command: >
+      nix develop /app#yew-ui --command bash -c
+      "/app/docker/start-dioxus.sh"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - ACTIX_UI_BACKEND_URL=ws://localhost:8080
+      - WEBTRANSPORT_HOST=https://127.0.0.1:4433
+      - TRUNK_SERVE_PORT=3001
+      - ENABLE_OAUTH=false
+      - API_BASE_URL=http://localhost:8081
+      - LOGIN_URL=http://localhost:8081/login
+      - RUSTFLAGS=--cfg=web_sys_unstable_apis
+      - WEBTRANSPORT_ENABLED=false
+      - E2EE_ENABLED=false
+      - FIREFOX_ENABLED=false
+      - USERS_ALLOWED_TO_STREAM=
+      - CARGO_TARGET_DIR=/app/dioxus-ui/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+      - OAUTH_PROVIDER=google
+      - UI_URL=http://localhost:3001
+    ports:
+      - "3001:3001"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - nix-store-e2e-dioxus-ui:/nix
+      - e2e-dioxus-ui-registry:/root/.cargo/registry
+      - e2e-dioxus-ui-git:/root/.cargo/git
+      - e2e-dioxus-ui-target:/app/dioxus-ui/target
 
   yew-ui:
     build:
@@ -156,6 +194,10 @@ volumes:
   e2e-websocket-api-registry:
   e2e-websocket-api-git:
   e2e-websocket-api-target:
+  nix-store-e2e-dioxus-ui:
+  e2e-dioxus-ui-registry:
+  e2e-dioxus-ui-git:
+  e2e-dioxus-ui-target:
   nix-store-e2e-yew-ui:
   e2e-yew-ui-registry:
   e2e-yew-ui-git:

@@ -67,3 +67,6 @@ deployment-**.log
 # Nix
 result
 result-*
+
+# e2e
+e2e/node_modules	

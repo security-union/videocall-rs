@@ -44,7 +44,8 @@
       "Bash(cat:*)",
       "Bash(git checkout:*)",
       "Bash(npx playwright:*)",
-      "Bash(node:*)"
+      "Bash(node:*)",
+      "Bash(make e2e-lint:*)"
     ]
   }
 }

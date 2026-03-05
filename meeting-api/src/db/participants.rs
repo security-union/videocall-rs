@@ -81,12 +81,11 @@ pub async fn join_attendee(
     let mut tx = pool.begin().await?;
 
     // Lock the meeting row to serialize against concurrent waiting room toggles.
-    let (waiting_room_enabled,): (bool,) = sqlx::query_as(
-        "SELECT waiting_room_enabled FROM meetings WHERE id = $1 FOR UPDATE",
-    )
-    .bind(meeting_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let (waiting_room_enabled,): (bool,) =
+        sqlx::query_as("SELECT waiting_room_enabled FROM meetings WHERE id = $1 FOR UPDATE")
+            .bind(meeting_id)
+            .fetch_one(&mut *tx)
+            .await?;
 
     let row = if waiting_room_enabled {
         let query = format!(
@@ -290,6 +289,7 @@ impl ParticipantRow {
             joined_at: self.joined_at.timestamp(),
             admitted_at: self.admitted_at.map(|t| t.timestamp()),
             room_token,
+            observer_token: None,
             waiting_room_enabled: None,
             host_display_name: None,
         }

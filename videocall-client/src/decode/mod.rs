@@ -44,6 +44,15 @@ pub struct DecodeStatus {
     pub first_frame: bool,
 }
 
+impl DecodeStatus {
+    /// A no-op status for packets that were intentionally skipped (stragglers,
+    /// heartbeats, RTT, etc.).
+    pub const SKIPPED: Self = Self {
+        rendered: false,
+        first_frame: false,
+    };
+}
+
 impl From<StandardDecodeStatus> for DecodeStatus {
     fn from(status: StandardDecodeStatus) -> Self {
         DecodeStatus {

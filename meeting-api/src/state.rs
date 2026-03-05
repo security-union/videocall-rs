@@ -43,10 +43,12 @@ pub struct AppState {
     pub cookie_name: String,
     /// Whether to set the `Secure` flag on cookies.
     pub cookie_secure: bool,
+    /// NATS client for publishing meeting events. `None` when `NATS_URL` is not configured.
+    pub nats: Option<async_nats::Client>,
 }
 
 impl AppState {
-    pub fn new(db: PgPool, config: &Config) -> Self {
+    pub fn new(db: PgPool, config: &Config, nats: Option<async_nats::Client>) -> Self {
         let jwks_cache = config
             .oauth
             .as_ref()
@@ -63,6 +65,7 @@ impl AppState {
             cookie_domain: config.cookie_domain.clone(),
             cookie_name: config.cookie_name.clone(),
             cookie_secure: config.cookie_secure,
+            nats,
         }
     }
 }

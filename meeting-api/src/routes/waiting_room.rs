@@ -104,16 +104,12 @@ pub async fn admit_all(
     let rows = db_participants::admit_all(&state.db, meeting.id).await?;
     let admitted_count = rows.len();
 
-    // Notify each admitted participant via NATS. Clients will fetch their room
-    // tokens via HTTP after receiving the notification.
-    for row in &rows {
-        nats_events::publish_participant_admitted(
-            state.nats.as_ref(),
-            &meeting_id,
-            &row.email,
-        )
-        .await;
-    }
+    // Notify all admitted participants via NATS in parallel. Clients will fetch
+    // their room tokens via HTTP after receiving the notification.
+    futures::future::join_all(rows.iter().map(|row| {
+        nats_events::publish_participant_admitted(state.nats.as_ref(), &meeting_id, &row.email)
+    }))
+    .await;
 
     let admitted: Vec<ParticipantStatusResponse> = rows
         .into_iter()

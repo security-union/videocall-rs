@@ -1288,3 +1288,91 @@ impl Component for AttendantsComponent {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests for reconnect_delay_ms
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// attempt=0 should return Some(d) where d is in the base range.
+    /// base = 1000, jitter in [-25%, +25%), so delay in [750, 1250).
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_0_returns_value_in_expected_range() {
+        for _ in 0..50 {
+            let delay = AttendantsComponent::reconnect_delay_ms(0);
+            assert!(delay.is_some(), "attempt 0 should return Some");
+            let d = delay.unwrap();
+            assert!(d >= 750, "attempt 0 delay {d} should be >= 750");
+            assert!(d <= 1250, "attempt 0 delay {d} should be <= 1250");
+        }
+    }
+
+    /// attempt=9 should return Some(d) with base capped at MAX_DELAY_MS (16000).
+    /// jitter in [-25%, +25%), so delay in [12000, 20000).
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_9_returns_capped_value() {
+        for _ in 0..50 {
+            let delay = AttendantsComponent::reconnect_delay_ms(9);
+            assert!(delay.is_some(), "attempt 9 should return Some");
+            let d = delay.unwrap();
+            assert!(d >= 12000, "attempt 9 delay {d} should be >= 12000");
+            assert!(d <= 20000, "attempt 9 delay {d} should be <= 20000");
+        }
+    }
+
+    /// attempt=10 exceeds MAX_RECONNECT_ATTEMPTS and should return None.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_10_returns_none() {
+        assert!(
+            AttendantsComponent::reconnect_delay_ms(10).is_none(),
+            "attempt 10 should return None"
+        );
+    }
+
+    /// Attempts beyond 10 should also return None.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_beyond_max_returns_none() {
+        assert!(AttendantsComponent::reconnect_delay_ms(11).is_none());
+        assert!(AttendantsComponent::reconnect_delay_ms(100).is_none());
+        assert!(AttendantsComponent::reconnect_delay_ms(u32::MAX).is_none());
+    }
+
+    /// Backoff should roughly double each attempt (accounting for jitter).
+    /// We compare the averages of many samples to the expected base values.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_backoff_roughly_doubles() {
+        let samples = 200;
+        for attempt in 0..4u32 {
+            let expected_base =
+                (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
+            let sum: f64 = (0..samples)
+                .map(|_| AttendantsComponent::reconnect_delay_ms(attempt).unwrap() as f64)
+                .sum();
+            let avg = sum / samples as f64;
+            // Average should be close to the base (jitter is symmetric around 0).
+            // Allow 15% tolerance for randomness.
+            let tolerance = expected_base * 0.15;
+            assert!(
+                (avg - expected_base).abs() < tolerance,
+                "attempt {attempt}: avg {avg:.0} should be near expected base {expected_base:.0} (tolerance {tolerance:.0})"
+            );
+        }
+    }
+
+    /// The minimum possible return value is 500 (enforced by .max(500.0)).
+    /// Verify no value goes below 500 for any valid attempt.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_never_below_500() {
+        for attempt in 0..10u32 {
+            for _ in 0..20 {
+                let d = AttendantsComponent::reconnect_delay_ms(attempt).unwrap();
+                assert!(d >= 500, "attempt {attempt}: delay {d} must be >= 500");
+            }
+        }
+    }
+}

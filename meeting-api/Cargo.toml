@@ -42,6 +42,7 @@ base64 = "0.22"
 oauth2 = "4"
 url = "2"
 
+futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

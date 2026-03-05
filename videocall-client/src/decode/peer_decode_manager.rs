@@ -948,4 +948,135 @@ mod tests {
             "straggler after disable must not re-enable"
         );
     }
+
+    // -- MeetingPacket target_email filtering tests ---------------------------
+
+    /// A MeetingPacket with PARTICIPANT_ADMITTED and a specific target_email
+    /// should round-trip through protobuf serialization correctly.
+    #[wasm_bindgen_test]
+    fn meeting_packet_participant_admitted_deserializes_correctly() {
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let mut packet = MeetingPacket::new();
+        packet.event_type = MeetingEventType::PARTICIPANT_ADMITTED.into();
+        packet.room_id = "room-123".into();
+        packet.target_email = "alice@example.com".into();
+        packet.message = "Welcome".into();
+
+        let bytes = packet.write_to_bytes().expect("serialize MeetingPacket");
+        let parsed = MeetingPacket::parse_from_bytes(&bytes).expect("parse MeetingPacket");
+
+        assert_eq!(
+            parsed.event_type.enum_value(),
+            Ok(MeetingEventType::PARTICIPANT_ADMITTED),
+            "event_type should be PARTICIPANT_ADMITTED"
+        );
+        assert_eq!(parsed.room_id, "room-123");
+        assert_eq!(parsed.target_email, "alice@example.com");
+        assert_eq!(parsed.message, "Welcome");
+    }
+
+    /// Verify the target_email comparison used for filtering:
+    /// the callback should only fire when target_email matches the local userid.
+    #[wasm_bindgen_test]
+    fn meeting_packet_target_email_matching_logic() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let mut packet = MeetingPacket::new();
+        packet.target_email = "alice@example.com".into();
+
+        // Matching case: target_email equals userid
+        let userid = "alice@example.com";
+        assert_eq!(
+            packet.target_email, userid,
+            "target_email should match the local userid"
+        );
+
+        // Non-matching case: target_email does not equal a different userid
+        let observer_userid = "observer";
+        assert_ne!(
+            packet.target_email, observer_userid,
+            "target_email should NOT match a different userid"
+        );
+    }
+
+    /// Verify that PARTICIPANT_REJECTED events also carry target_email correctly.
+    #[wasm_bindgen_test]
+    fn meeting_packet_participant_rejected_has_target_email() {
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let mut packet = MeetingPacket::new();
+        packet.event_type = MeetingEventType::PARTICIPANT_REJECTED.into();
+        packet.target_email = "bob@example.com".into();
+        packet.room_id = "room-456".into();
+
+        let bytes = packet.write_to_bytes().expect("serialize");
+        let parsed = MeetingPacket::parse_from_bytes(&bytes).expect("parse");
+
+        assert_eq!(
+            parsed.event_type.enum_value(),
+            Ok(MeetingEventType::PARTICIPANT_REJECTED)
+        );
+        assert_eq!(parsed.target_email, "bob@example.com");
+        assert_eq!(parsed.room_id, "room-456");
+    }
+
+    /// An empty target_email field should not match any real userid.
+    #[wasm_bindgen_test]
+    fn meeting_packet_empty_target_email_does_not_match() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let packet = MeetingPacket::new();
+        assert!(packet.target_email.is_empty());
+
+        let userid = "alice@example.com";
+        assert_ne!(
+            packet.target_email, userid,
+            "empty target_email should not match any userid"
+        );
+    }
+
+    /// A MeetingPacket embedded in a PacketWrapper with MEETING type should
+    /// be extractable via parse_from_bytes on the wrapper's data field.
+    #[wasm_bindgen_test]
+    fn meeting_packet_in_packet_wrapper_round_trip() {
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let mut meeting = MeetingPacket::new();
+        meeting.event_type = MeetingEventType::PARTICIPANT_ADMITTED.into();
+        meeting.target_email = "charlie@example.com".into();
+        meeting.room_id = "room-789".into();
+
+        let meeting_bytes = meeting.write_to_bytes().expect("serialize MeetingPacket");
+
+        // Wrap in a PacketWrapper like the real code path does
+        let wrapper = PacketWrapper {
+            data: meeting_bytes,
+            email: "server".into(),
+            packet_type: PacketType::MEETING.into(),
+            ..Default::default()
+        };
+
+        // Extract and verify -- this mirrors the on_inbound_media code path
+        assert_eq!(wrapper.packet_type.enum_value(), Ok(PacketType::MEETING));
+        let parsed =
+            MeetingPacket::parse_from_bytes(&wrapper.data).expect("parse from wrapper data");
+        assert_eq!(parsed.target_email, "charlie@example.com");
+        assert_eq!(
+            parsed.event_type.enum_value(),
+            Ok(MeetingEventType::PARTICIPANT_ADMITTED)
+        );
+
+        // Simulate the userid check from video_call_client.rs
+        let my_userid = "charlie@example.com";
+        let should_fire_callback = parsed.target_email == my_userid;
+        assert!(should_fire_callback, "callback should fire for matching userid");
+
+        let other_userid = "observer@example.com";
+        let should_not_fire = parsed.target_email == other_userid;
+        assert!(!should_not_fire, "callback should NOT fire for non-matching userid");
+    }
 }

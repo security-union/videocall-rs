@@ -241,7 +241,8 @@ impl SessionLogic {
                 if self.observer {
                     trace!(
                         "Observer session {} dropping media packet from {}",
-                        self.id, self.email
+                        self.id,
+                        self.email
                     );
                     InboundAction::Processed
                 } else {

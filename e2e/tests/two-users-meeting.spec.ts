@@ -89,8 +89,8 @@ test.describe("Two users in a meeting", () => {
     await waitForServices();
   });
 
-  test("host starts meeting, guest joins, both see each other", async (_fixtures, testInfo) => {
-    const uiURL = testInfo.project.use.baseURL || "http://localhost:80";
+  test("host starts meeting, guest joins, both see each other", async ({ baseURL }) => {
+    const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_two_user_${Date.now()}`;
 
     const browser1 = await chromium.launch({ args: BROWSER_ARGS });

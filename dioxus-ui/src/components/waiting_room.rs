@@ -3,36 +3,247 @@
  * Licensed under MIT OR Apache-2.0
  */
 
-//! Waiting Room component - shown to non-host users while waiting for admission
+//! Waiting Room component - shown to non-host users while waiting for admission.
+//!
+//! Primarily uses an observer WebSocket connection for push notifications.
+//! Falls back to lightweight polling (every 5s) when the observer WebSocket
+//! is not connected -- e.g. empty observer token, connection failure, or
+//! disconnect due to token expiry.
 
-use crate::constants::meeting_api_client;
+use std::cell::Cell;
+use std::rc::Rc;
+
+use crate::constants::{actix_websocket_base, webtransport_enabled, webtransport_host_base};
+use crate::meeting_api::{check_status, join_meeting, JoinMeetingResponse};
 use dioxus::prelude::*;
-use gloo_timers::future::TimeoutFuture;
-use videocall_meeting_types::responses::ParticipantStatusResponse;
+use videocall_client::Callback as VcCallback;
+use videocall_client::{VideoCallClient, VideoCallClientOptions};
+use wasm_bindgen::JsCast;
 
-pub type ParticipantStatus = ParticipantStatusResponse;
+pub type ParticipantStatus = JoinMeetingResponse;
+
+/// Polling interval in milliseconds when observer WebSocket is not connected.
+const POLL_INTERVAL_MS: i32 = 5000;
 
 #[component]
 pub fn WaitingRoom(
     meeting_id: String,
+    email: String,
+    observer_token: String,
     on_admitted: EventHandler<ParticipantStatus>,
     on_rejected: EventHandler<()>,
     on_cancel: EventHandler<()>,
 ) -> Element {
     let mut error = use_signal(|| None::<String>);
 
-    // Poll for status updates using a spawned async loop (not Interval callback,
-    // which runs outside the Dioxus scope and causes spawn() to panic).
+    // Track whether the observer WebSocket is currently connected.
+    // Uses Rc<Cell<bool>> instead of Signal because VcCallback::from()
+    // requires Fn (not FnMut), and Dioxus Signal::set() makes closures
+    // FnMut. Rc<Cell<bool>> provides interior mutability compatible with Fn.
+    let observer_connected = use_hook(|| Rc::new(Cell::new(false)));
+
+    // Create an observer WebSocket client to receive push notifications
+    // when the host admits or rejects this participant.
+    let mut observer_client = use_signal(|| None::<VideoCallClient>);
+    {
+        let observer_token = observer_token.clone();
+        let meeting_id = meeting_id.clone();
+        let email = email.clone();
+        let observer_connected = observer_connected.clone();
+        use_effect(move || {
+            if observer_token.is_empty() {
+                log::warn!("WaitingRoom: no observer token, push notifications unavailable; polling fallback will activate");
+                observer_client.set(None);
+                observer_connected.set(false);
+                return;
+            }
+
+            let lobby_url =
+                |base: &str| format!("{base}/lobby?token={observer_token}");
+            let websocket_urls: Vec<String> = actix_websocket_base()
+                .unwrap_or_default()
+                .split(',')
+                .map(&lobby_url)
+                .collect();
+            let webtransport_urls: Vec<String> = webtransport_host_base()
+                .unwrap_or_default()
+                .split(',')
+                .map(&lobby_url)
+                .collect();
+
+            let meeting_id_for_fetch = meeting_id.clone();
+            let obs_conn_on_connect = observer_connected.clone();
+            let obs_conn_on_lost = observer_connected.clone();
+
+            let opts = VideoCallClientOptions {
+                userid: email.clone(),
+                meeting_id: meeting_id.clone(),
+                websocket_urls,
+                webtransport_urls,
+                enable_e2ee: false,
+                enable_webtransport: webtransport_enabled().unwrap_or(false),
+                on_connected: VcCallback::from(move |_| {
+                    log::info!("Observer connection established (waiting room)");
+                    obs_conn_on_connect.set(true);
+                }),
+                on_connection_lost: VcCallback::from(move |_| {
+                    log::warn!("Observer connection lost (waiting room); polling fallback will activate");
+                    obs_conn_on_lost.set(false);
+                }),
+                on_peer_added: VcCallback::noop(),
+                on_peer_first_frame: VcCallback::noop(),
+                on_peer_removed: None,
+                get_peer_video_canvas_id: VcCallback::from(|id| id),
+                get_peer_screen_canvas_id: VcCallback::from(|id| id),
+                enable_diagnostics: false,
+                diagnostics_update_interval_ms: None,
+                enable_health_reporting: false,
+                health_reporting_interval_ms: None,
+                on_encoder_settings_update: None,
+                rtt_testing_period_ms: 3000,
+                rtt_probe_interval_ms: None,
+                on_meeting_info: None,
+                on_meeting_ended: None,
+                on_meeting_activated: None,
+                on_participant_admitted: Some(VcCallback::from(
+                    move |_: ()| {
+                        log::info!("Participant admitted push received, fetching room token via HTTP");
+                        let mid = meeting_id_for_fetch.clone();
+                        // Use spawn_local instead of dioxus::spawn because
+                        // this callback fires from a WebSocket message
+                        // handler which runs outside any Dioxus runtime
+                        // context. Calling dioxus::spawn() here would panic.
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match join_meeting(&mid, None).await {
+                                Ok(status) => {
+                                    if status.room_token.is_some() {
+                                        on_admitted.call(status);
+                                    } else {
+                                        log::error!("Admitted but join_meeting returned no room_token");
+                                        error.set(Some(
+                                            "Admitted but failed to obtain room token".to_string(),
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to fetch room token after admission: {e}");
+                                    error.set(Some(format!(
+                                        "Failed to fetch room token: {e}"
+                                    )));
+                                }
+                            }
+                        });
+                    },
+                )),
+                on_participant_rejected: Some(VcCallback::from(move |_| {
+                    log::info!("Participant rejected push received");
+                    on_rejected.call(());
+                })),
+                on_waiting_room_updated: None,
+                on_speaking_changed: None,
+                vad_threshold: None,
+            };
+
+            let mut client = VideoCallClient::new(opts);
+            if let Err(e) = client.connect() {
+                log::error!("Failed to connect observer client for waiting room: {e}");
+                error.set(Some(format!("Failed to connect for push updates: {e}")));
+                observer_client.set(None);
+                observer_connected.set(false);
+                return;
+            }
+            observer_client.set(Some(client));
+        });
+    }
+
+    // Polling fallback: always start a setInterval timer that checks
+    // participant status every POLL_INTERVAL_MS. On each tick, if the
+    // observer WebSocket is connected (checked via Rc<Cell<bool>>), the
+    // tick is a no-op. This avoids the complexity of reactively
+    // starting/stopping the timer and covers three failure modes:
+    //   1. Empty observer token (old server, no push support)
+    //   2. WebSocket connection failed or was rejected
+    //   3. WebSocket disconnected (e.g. token expired after 30 min)
+    //
+    // The interval_id is stored in an Rc<Cell<i32>> so use_drop can
+    // clear it when the component unmounts, preventing leaked timers.
+    let poll_interval_id: Rc<Cell<i32>> = use_hook(|| Rc::new(Cell::new(-1)));
     {
         let meeting_id = meeting_id.clone();
+        let observer_connected = observer_connected.clone();
+        let poll_interval_id = poll_interval_id.clone();
         use_effect(move || {
+            let window = match web_sys::window() {
+                Some(w) => w,
+                None => return,
+            };
+
+            log::info!("WaitingRoom: starting polling fallback timer (every {POLL_INTERVAL_MS}ms, skips when observer connected)");
+
             let meeting_id = meeting_id.clone();
-            spawn(async move {
-                loop {
-                    handle_status_check(&meeting_id, &on_admitted, &on_rejected, &mut error).await;
-                    TimeoutFuture::new(2_000).await;
+            let observer_connected = observer_connected.clone();
+            let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                if observer_connected.get() {
+                    // Observer WebSocket is connected; push notifications
+                    // are handling admission/rejection. Skip this poll.
+                    return;
                 }
+
+                let meeting_id = meeting_id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match check_status(&meeting_id).await {
+                        Ok(status) => match status.status.as_str() {
+                            "admitted" => {
+                                if status.room_token.is_some() {
+                                    log::info!("Polling fallback: participant admitted");
+                                    on_admitted.call(status);
+                                } else {
+                                    // Admitted but no token yet -- keep polling.
+                                    log::warn!("Polling fallback: admitted but no room_token, will retry");
+                                }
+                            }
+                            "rejected" => {
+                                log::info!("Polling fallback: participant rejected");
+                                on_rejected.call(());
+                            }
+                            // "waiting" | "waiting_for_meeting" | _ => continue polling
+                            other => {
+                                log::debug!("Polling fallback: status={other}, continuing to poll");
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("Polling fallback: status check failed: {e}");
+                        }
+                    }
+                });
             });
+
+            let interval_id = window
+                .set_interval_with_callback_and_timeout_and_arguments_0(
+                    poll_closure.as_ref().unchecked_ref(),
+                    POLL_INTERVAL_MS,
+                )
+                .unwrap_or(-1);
+
+            // Prevent the closure from being dropped while the interval is active.
+            poll_closure.forget();
+
+            // Store the interval ID so use_drop can clear it on unmount.
+            poll_interval_id.set(interval_id);
+        });
+    }
+
+    // Clean up the polling interval when the component unmounts.
+    {
+        let poll_interval_id = poll_interval_id.clone();
+        use_drop(move || {
+            let id = poll_interval_id.get();
+            if id >= 0 {
+                if let Some(window) = web_sys::window() {
+                    window.clear_interval_with_handle(id);
+                    log::debug!("WaitingRoom: cleared polling interval {id} on unmount");
+                }
+            }
         });
     }
 
@@ -71,41 +282,4 @@ pub fn WaitingRoom(
             }
         }
     }
-}
-
-async fn handle_status_check(
-    meeting_id: &str,
-    on_admitted: &EventHandler<ParticipantStatus>,
-    on_rejected: &EventHandler<()>,
-    error: &mut Signal<Option<String>>,
-) {
-    match check_status(meeting_id).await {
-        Ok(status) => {
-            match status.status.as_str() {
-                "admitted" => {
-                    if status.room_token.is_some() {
-                        on_admitted.call(status);
-                    } else {
-                        error.set(Some("Admitted but no room token received".to_string()));
-                    }
-                }
-                "rejected" => {
-                    on_rejected.call(());
-                }
-                _ => {}
-            }
-            error.set(None);
-        }
-        Err(e) => {
-            error.set(Some(e));
-        }
-    }
-}
-
-async fn check_status(meeting_id: &str) -> Result<ParticipantStatus, String> {
-    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
-    client
-        .get_status(meeting_id)
-        .await
-        .map_err(|e| format!("{e}"))
 }

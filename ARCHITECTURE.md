@@ -117,10 +117,15 @@ All communication in videocall.rs follows a consistent message format defined by
 // From protobuf definitions
 message PacketWrapper {
   enum PacketType {
-    RSA_PUB_KEY = 0;
-    AES_KEY = 1;
-    MEDIA = 2;
-    CONNECTION = 3;
+    PACKET_TYPE_UNKNOWN = 0;
+    RSA_PUB_KEY = 1;
+    AES_KEY = 2;
+    MEDIA = 3;
+    CONNECTION = 4;
+    DIAGNOSTICS = 5;
+    HEALTH = 6;
+    MEETING = 7;
+    SESSION_ASSIGNED = 8;
   }
   PacketType packet_type = 1;
   string email = 2;
@@ -132,6 +137,7 @@ Inside the `data` field, different packet types are serialized based on the `pac
 
 - **MEDIA**: Contains media data (audio/video frames)
 - **CONNECTION**: Contains information about the meeting being joined
+- **MEETING**: Contains meeting lifecycle events (participant admitted, rejected, waiting room updated, meeting activated)
 
 For media packets specifically, the structure is:
 

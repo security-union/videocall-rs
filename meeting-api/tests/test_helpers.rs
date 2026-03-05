@@ -63,6 +63,7 @@ pub fn build_app(pool: PgPool) -> Router {
         cookie_domain: None,
         cookie_name: "session".to_string(),
         cookie_secure: false,
+        nats: None,
     };
     routes::router().with_state(state)
 }

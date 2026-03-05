@@ -53,6 +53,9 @@ pub struct Connection {
     screen_enabled: Rc<AtomicBool>,
     is_speaking: Rc<AtomicBool>,
     session_id: Rc<RefCell<Option<u64>>>,
+    /// Not wrapped in `Rc` because it is only accessed via `&self` methods,
+    /// unlike `session_id` which is shared with the heartbeat `Interval` closure.
+    userid: RefCell<Option<String>>,
     url: String,
 }
 
@@ -99,6 +102,7 @@ impl Connection {
             screen_enabled: Rc::new(AtomicBool::new(false)),
             is_speaking: Rc::new(AtomicBool::new(false)),
             session_id: Rc::new(RefCell::new(None)),
+            userid: RefCell::new(None),
             url,
         };
 
@@ -110,6 +114,7 @@ impl Connection {
     }
 
     pub fn start_heartbeat(&mut self, userid: String) {
+        *self.userid.borrow_mut() = Some(userid.clone());
         let task = Rc::clone(&self.task);
         let status = Rc::clone(&self.status);
         let aes = Rc::clone(&self.aes);
@@ -120,36 +125,18 @@ impl Connection {
         let session_id = Rc::clone(&self.session_id);
 
         self.heartbeat = Some(Interval::new(1000, move || {
-            let heartbeat_metadata = HeartbeatMetadata {
-                video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
-                ..Default::default()
-            };
-
-            let packet = MediaPacket {
-                media_type: MediaType::HEARTBEAT.into(),
-                email: userid.clone(),
-                timestamp: js_sys::Date::now(),
-                heartbeat_metadata: Some(heartbeat_metadata).into(),
-                ..Default::default()
-            };
-
-            let data = aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap();
-            let mut packet_wrapper = PacketWrapper {
-                data,
-                email: userid.clone(),
-                packet_type: PacketType::MEDIA.into(),
-                ..Default::default()
-            };
-
-            if let Some(sid) = session_id.borrow().as_ref() {
-                packet_wrapper.session_id = *sid;
-            }
-
-            if let Status::Connected = status.get() {
-                task.send_packet(packet_wrapper);
+            if let Some(packet_wrapper) = build_heartbeat_packet(
+                &userid,
+                &video_enabled,
+                &audio_enabled,
+                &screen_enabled,
+                &is_speaking,
+                &aes,
+                &session_id,
+            ) {
+                if let Status::Connected = status.get() {
+                    task.send_packet(packet_wrapper);
+                }
             }
         }));
     }
@@ -170,21 +157,58 @@ impl Connection {
     }
 
     pub fn set_video_enabled(&self, enabled: bool) {
-        log::debug!("Setting video enabled to {enabled}");
-        self.video_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .video_enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if prev != enabled {
+            log::debug!("Video enabled changed: {prev} -> {enabled}");
+            self.send_immediate_heartbeat();
+        }
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) {
-        log::debug!("Setting audio enabled to {enabled}");
-        self.audio_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .audio_enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if prev != enabled {
+            log::debug!("Audio enabled changed: {prev} -> {enabled}");
+            self.send_immediate_heartbeat();
+        }
     }
 
     pub fn set_screen_enabled(&self, enabled: bool) {
-        log::debug!("Setting screen enabled to {enabled}");
-        self.screen_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .screen_enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if prev != enabled {
+            log::debug!("Screen enabled changed: {prev} -> {enabled}");
+            self.send_immediate_heartbeat();
+        }
+    }
+
+    /// Send a heartbeat packet immediately so peers learn about state changes
+    /// without waiting for the next 1-second heartbeat tick.
+    fn send_immediate_heartbeat(&self) {
+        let userid = match self.userid.borrow().as_ref() {
+            Some(id) => id.clone(),
+            None => return, // heartbeat not started yet
+        };
+
+        if !matches!(self.status.get(), Status::Connected) {
+            return;
+        }
+
+        if let Some(packet_wrapper) = build_heartbeat_packet(
+            &userid,
+            &self.video_enabled,
+            &self.audio_enabled,
+            &self.screen_enabled,
+            &self.is_speaking,
+            &self.aes,
+            &self.session_id,
+        ) {
+            self.task.send_packet(packet_wrapper);
+        }
     }
 
     pub fn set_speaking(&self, speaking: bool) {
@@ -202,6 +226,70 @@ impl Drop for Connection {
         log::debug!("Dropping Connection to {}", self.url);
         self.stop_heartbeat();
     }
+}
+
+fn build_heartbeat_packet(
+    userid: &str,
+    video_enabled: &AtomicBool,
+    audio_enabled: &AtomicBool,
+    screen_enabled: &AtomicBool,
+    is_speaking: &AtomicBool,
+    aes: &Aes128State,
+    session_id: &RefCell<Option<u64>>,
+) -> Option<PacketWrapper> {
+    let heartbeat_metadata = HeartbeatMetadata {
+        video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
+        ..Default::default()
+    };
+
+    let packet = MediaPacket {
+        media_type: MediaType::HEARTBEAT.into(),
+        email: userid.to_owned(),
+        timestamp: js_sys::Date::now(),
+        heartbeat_metadata: Some(heartbeat_metadata).into(),
+        ..Default::default()
+    };
+
+    let data = aes_encrypt_heartbeat(aes, &packet)
+        .map_err(|e| {
+            log::error!("{e}");
+            let _ = videocall_diagnostics::global_sender().try_broadcast(
+                videocall_diagnostics::DiagEvent {
+                    subsystem: "heartbeat",
+                    stream_id: None,
+                    ts_ms: videocall_diagnostics::now_ms(),
+                    metrics: vec![videocall_diagnostics::metric!(
+                        "encryption_failure",
+                        1u64
+                    )],
+                },
+            );
+        })
+        .ok()?;
+    let mut packet_wrapper = PacketWrapper {
+        data,
+        email: userid.to_owned(),
+        packet_type: PacketType::MEDIA.into(),
+        ..Default::default()
+    };
+
+    if let Some(sid) = session_id.borrow().as_ref() {
+        packet_wrapper.session_id = *sid;
+    }
+
+    Some(packet_wrapper)
+}
+
+fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, String> {
+    let bytes = packet.write_to_bytes().map_err(|e| {
+        format!("Failed to serialize heartbeat packet: {e}")
+    })?;
+    aes.encrypt(&bytes).map_err(|e| {
+        format!("Failed to encrypt heartbeat packet: {e:?}")
+    })
 }
 
 fn tap_callback<IN: 'static, OUT: 'static>(

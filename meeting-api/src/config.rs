@@ -44,6 +44,9 @@ pub struct Config {
     /// Explicit CORS allowed origins for production (e.g. "https://app.videocall.rs").
     /// Comma-separated for multiple origins. Empty list mirrors the request origin (development only).
     pub cors_allowed_origin: Vec<String>,
+    /// NATS server URL (e.g. "nats://localhost:4222"). `None` if `NATS_URL` is unset.
+    /// When not configured, NATS event publishing is silently skipped (graceful degradation).
+    pub nats_url: Option<String>,
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -119,6 +122,7 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
             .unwrap_or_default();
+        let nats_url = env::var("NATS_URL").ok().filter(|s| !s.is_empty());
 
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
@@ -202,6 +206,7 @@ impl Config {
             cookie_name,
             cookie_secure,
             cors_allowed_origin,
+            nats_url,
         })
     }
 

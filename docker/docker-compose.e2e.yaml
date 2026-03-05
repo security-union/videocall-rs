@@ -54,6 +54,7 @@ services:
       - OAUTH_USERINFO_URL=
       - AFTER_LOGIN_URL=http://localhost:80
       - ALLOWED_REDIRECT_URLS=http://localhost:80,http://localhost:3001
+      - NATS_URL=nats:4222
       - RUST_LOG=info
       - CARGO_TARGET_DIR=/app/meeting-api/target
       - CARGO_INCREMENTAL=1

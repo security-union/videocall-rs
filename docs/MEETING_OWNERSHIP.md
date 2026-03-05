@@ -58,7 +58,15 @@ videocall.rs is composed of two independent services that communicate through a 
 │  ┌─────────────┴──────────────┐  │   │  ┌────────────────────────────┐  │
 │  │ JWT Token Generator        │  │   │  │ NATS Pub/Sub               │  │
 │  │ - Signs room access tokens │  │   │  │ - Media relay              │  │
+│  │ - Signs observer tokens    │  │   │  │ - Meeting event delivery   │  │
 │  └────────────────────────────┘  │   │  └────────────────────────────┘  │
+│                                  │   │                                  │
+│  ┌────────────────────────────┐  │   │                                  │
+│  │ NATS Event Publisher       │  │   │                                  │
+│  │ - Meeting activated        │  │   │                                  │
+│  │ - Participant admitted     │  │   │                                  │
+│  │ - Waiting room updated     │  │   │                                  │
+│  └────────────────────────────┘  │   │                                  │
 │                                  │   │                                  │
 │  ┌────────────────────────────┐  │   │                                  │
 │  │ PostgreSQL                 │  │   │                                  │
@@ -78,6 +86,7 @@ videocall.rs is composed of two independent services that communicate through a 
 - Manages all meeting CRUD operations (create, list, get, delete)
 - Manages the waiting room, admission, and participant state
 - Issues signed **room access tokens** (JWTs) when a participant is admitted
+- Publishes real-time meeting events (participant admitted/rejected, waiting room updates) to NATS for push notification delivery
 - Owns the `meetings` and `meeting_participants` database tables
 - Is the **single source of truth** for meeting state and participant status
 
@@ -188,6 +197,7 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `COOKIE_DOMAIN` | No | -- | Cookie `Domain` attribute (e.g. `.videocall.rs`) |
 | `COOKIE_SECURE` | No | `true` | Set `false` for local HTTP development |
 | `CORS_ALLOWED_ORIGIN` | No | -- | Production: exact frontend origin. Unset for dev. |
+| `NATS_URL` | No | -- | NATS server URL (e.g. `nats://localhost:4222`). When not set, event publishing is disabled (graceful degradation). |
 | `OAUTH_CLIENT_ID` | No | -- | OAuth client ID (disables OAuth if unset) |
 | `OAUTH_SECRET` | No | -- | OAuth client secret (omit for public clients using PKCE only) |
 | `OAUTH_REDIRECT_URL` | Cond. | -- | OAuth callback URL (required if `OAUTH_CLIENT_ID` set) |
@@ -490,7 +500,7 @@ The host is identified in the UI with:
 The waiting room provides controlled access to meetings:
 - Non-owners enter the waiting room when joining an active meeting
 - The host (or any admitted participant) can manage the waiting room
-- Participants poll for status changes while waiting
+- Participants receive push notifications via their media server connection (using an observer token) when their status changes
 - **No room access token is issued until a participant is admitted**, so there is no way to bypass the waiting room and connect to the Media Server directly
 
 ### Participant Management
@@ -506,8 +516,8 @@ Any admitted participant can:
 When a participant is admitted from the waiting room:
 1. Their status changes to `admitted` in the database
 2. A room access token (`RoomAccessTokenClaims`) is generated and signed for them
-3. The UI detects the status change via polling (`GET /status`)
-4. The poll response is an `APIResponse<ParticipantStatusResponse>` with `room_token` populated
+3. The UI receives a `PARTICIPANT_ADMITTED` push notification via the media server WebSocket connection
+4. The subsequent `GET /status` response is an `APIResponse<ParticipantStatusResponse>` with `room_token` populated
 5. The client connects to the Media Server using the token
 6. The participant enters the meeting automatically
 

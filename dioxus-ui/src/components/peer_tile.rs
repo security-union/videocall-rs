@@ -16,12 +16,14 @@
  * conditions.
  */
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::components::canvas_generator::generate_for_peer;
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
-use futures::future::{AbortHandle, Abortable};
-use std::cell::RefCell;
-use std::rc::Rc;
+use futures::future::Abortable;
+use futures::future::AbortHandle;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 
 #[component]

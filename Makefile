@@ -106,7 +106,7 @@ e2e-debug:
 # Full CI pipeline: build stack, start it, run tests, tear down
 e2e-ci: e2e-build e2e-install
 	$(COMPOSE_E2E) up -d
-	cd e2e && npx playwright test; E2E_EXIT=$$?; \
+	cd e2e && npx playwright test; E2E_EXIT=$$?; cd .. && \
 	$(COMPOSE_E2E) down -v; \
 	exit $$E2E_EXIT
 

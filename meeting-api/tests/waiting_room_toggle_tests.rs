@@ -460,13 +460,9 @@ async fn test_toggle_waiting_room_off_admits_waiting_participants() {
     for i in 1..=3 {
         let app = build_app(pool.clone());
         let email = format!("attendee{i}@example.com");
-        let req = request_with_cookie(
-            "POST",
-            &format!("/api/v1/meetings/{room_id}/join"),
-            &email,
-        )
-        .body(Body::empty())
-        .unwrap();
+        let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/join"), &email)
+            .body(Body::empty())
+            .unwrap();
         let _ = app.oneshot(req).await.unwrap();
     }
 

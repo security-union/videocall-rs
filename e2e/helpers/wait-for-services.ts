@@ -2,7 +2,7 @@ const UI_URL = process.env.UI_URL || "http://localhost:80";
 const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
 const WS_URL = process.env.WS_CHECK_URL || "http://localhost:8080";
 
-const MAX_WAIT_MS = 300_000;
+const MAX_WAIT_MS = 600_000;
 const POLL_INTERVAL_MS = 2_000;
 
 async function probe(url: string): Promise<boolean> {

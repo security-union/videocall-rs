@@ -233,6 +233,7 @@ impl Peer {
                     "screen_enabled",
                     if self.screen_enabled { 1u64 } else { 0u64 }
                 ),
+                metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -774,6 +775,8 @@ mod tests {
             screen_enabled: false,
             context_initialized: false,
             has_received_heartbeat: false,
+            is_speaking: false,
+            vad_threshold: None,
         };
         (peer, muted_handle)
     }

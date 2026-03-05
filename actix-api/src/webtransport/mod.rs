@@ -258,8 +258,8 @@ async fn run_webtransport_connection_from_request(
         .find(|(key, _)| key == "token")
         .map(|(_, val)| val.into_owned());
 
-    // Determine username and room from either the JWT or URL path params.
-    let (username, lobby_id) = if let Some(ref tok) = token {
+    // Determine username, room, and observer flag from either the JWT or URL path params.
+    let (username, lobby_id, observer) = if let Some(ref tok) = token {
         // Token-based flow: identity and room come from the JWT claims.
         let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
         if jwt_secret.is_empty() {
@@ -270,10 +270,10 @@ async fn run_webtransport_connection_from_request(
             anyhow!("token validation failed: {}", e.client_message())
         })?;
         info!(
-            "WT token-based connection: email={}, room={}",
-            claims.sub, claims.room
+            "WT token-based connection: email={}, room={}, observer={}",
+            claims.sub, claims.room, claims.observer
         );
-        (claims.sub, claims.room)
+        (claims.sub, claims.room, claims.observer)
     } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
         // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
         if parts.len() != 3 {
@@ -291,7 +291,7 @@ async fn run_webtransport_connection_from_request(
             "WT deprecated path-based connection: email={}, room={}",
             username, lobby_id
         );
-        (username, lobby_id)
+        (username, lobby_id, false) // deprecated path-based endpoint: never observer
     } else {
         // FF=on but no token provided
         info!("WT connection rejected: no token provided and meeting management is enabled");
@@ -313,6 +313,7 @@ async fn run_webtransport_connection_from_request(
         nats_client,
         tracker_sender,
         session_manager,
+        observer,
     )
     .await
     {
@@ -334,6 +335,7 @@ async fn handle_webtransport_session(
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
+    observer: bool,
 ) -> anyhow::Result<()> {
     // Create channel for actor → WebTransport I/O
     let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
@@ -347,6 +349,7 @@ async fn handle_webtransport_session(
         nats_client,
         tracker_sender,
         session_manager,
+        observer,
     );
     let actor_addr = actor.start();
 

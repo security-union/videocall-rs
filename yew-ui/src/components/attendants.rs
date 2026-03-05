@@ -121,6 +121,8 @@ pub enum Msg {
     TokenRefreshed(String),
     /// Token refresh failed (session expired, kicked from meeting, network error).
     TokenRefreshFailed(String),
+    /// The waiting room participant list changed (push notification from server).
+    WaitingRoomUpdated,
 }
 
 impl From<WsAction> for Msg {
@@ -208,6 +210,10 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    /// Monotonically increasing counter bumped when a `WaitingRoomUpdated`
+    /// push notification arrives. Passed as a prop to `HostControls` so it
+    /// knows to re-fetch the waiting list.
+    waiting_room_version: u32,
     /// Tracks the current reconnection attempt number for exponential backoff.
     /// Only meaningful in the JWT auth path (`media-server-jwt-auth` feature);
     /// the non-JWT path manages its own attempt counter inside the recursive
@@ -352,6 +358,16 @@ impl AttendantsComponent {
                         end_time_ms as u64,
                     )));
                     link.send_message(Msg::MeetingEnded(message));
+                })
+            }),
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |_| {
+                    log::info!("Waiting room updated via push notification");
+                    link.send_message(Msg::WaitingRoomUpdated);
                 })
             }),
         };
@@ -557,6 +573,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
+            waiting_room_version: 0,
             reconnect_attempt: 0,
         };
         if let Err(e) = crate::constants::app_config() {
@@ -889,6 +906,10 @@ impl Component for AttendantsComponent {
                     Self::schedule_token_refresh(link, meeting_id, self.reconnect_attempt);
                 }
 
+                true
+            }
+            Msg::WaitingRoomUpdated => {
+                self.waiting_room_version = self.waiting_room_version.wrapping_add(1);
                 true
             }
         }
@@ -1237,6 +1258,7 @@ impl Component for AttendantsComponent {
                 <HostControls
                     meeting_id={ctx.props().id.clone()}
                     is_admitted={true}
+                    waiting_room_version={self.waiting_room_version}
                 />
 
                 {

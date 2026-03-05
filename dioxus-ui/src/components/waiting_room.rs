@@ -3,36 +3,127 @@
  * Licensed under MIT OR Apache-2.0
  */
 
-//! Waiting Room component - shown to non-host users while waiting for admission
+//! Waiting Room component - shown to non-host users while waiting for admission.
+//!
+//! Instead of polling, this component connects a lightweight observer
+//! `VideoCallClient` using the `observer_token` and listens for
+//! `on_participant_admitted` / `on_participant_rejected` push events.
 
-use crate::constants::meeting_api_client;
+use crate::constants::{actix_websocket_base, webtransport_enabled, webtransport_host_base};
+use crate::meeting_api::{join_meeting, JoinMeetingResponse};
 use dioxus::prelude::*;
-use gloo_timers::future::TimeoutFuture;
-use videocall_meeting_types::responses::ParticipantStatusResponse;
+use videocall_client::Callback as VcCallback;
+use videocall_client::{VideoCallClient, VideoCallClientOptions};
 
-pub type ParticipantStatus = ParticipantStatusResponse;
+pub type ParticipantStatus = JoinMeetingResponse;
 
 #[component]
 pub fn WaitingRoom(
     meeting_id: String,
+    observer_token: String,
     on_admitted: EventHandler<ParticipantStatus>,
     on_rejected: EventHandler<()>,
     on_cancel: EventHandler<()>,
 ) -> Element {
     let mut error = use_signal(|| None::<String>);
 
-    // Poll for status updates using a spawned async loop (not Interval callback,
-    // which runs outside the Dioxus scope and causes spawn() to panic).
+    // Create an observer WebSocket client to receive push notifications
+    // when the host admits or rejects this participant.
+    let mut observer_client = use_signal(|| None::<VideoCallClient>);
     {
+        let observer_token = observer_token.clone();
         let meeting_id = meeting_id.clone();
         use_effect(move || {
-            let meeting_id = meeting_id.clone();
-            spawn(async move {
-                loop {
-                    handle_status_check(&meeting_id, &on_admitted, &on_rejected, &mut error).await;
-                    TimeoutFuture::new(2_000).await;
-                }
-            });
+            if observer_token.is_empty() {
+                log::warn!("WaitingRoom: no observer token, push notifications unavailable");
+                observer_client.set(None);
+                return;
+            }
+
+            let lobby_url =
+                |base: &str| format!("{base}/lobby?token={observer_token}");
+            let websocket_urls: Vec<String> = actix_websocket_base()
+                .unwrap_or_default()
+                .split(',')
+                .map(&lobby_url)
+                .collect();
+            let webtransport_urls: Vec<String> = webtransport_host_base()
+                .unwrap_or_default()
+                .split(',')
+                .map(&lobby_url)
+                .collect();
+
+            let meeting_id_for_fetch = meeting_id.clone();
+
+            let opts = VideoCallClientOptions {
+                userid: format!("observer-{meeting_id}"),
+                meeting_id: meeting_id.clone(),
+                websocket_urls,
+                webtransport_urls,
+                enable_e2ee: false,
+                enable_webtransport: webtransport_enabled().unwrap_or(false),
+                on_connected: VcCallback::from(move |_| {
+                    log::info!("Observer connection established (waiting room)");
+                }),
+                on_connection_lost: VcCallback::from(move |_| {
+                    log::warn!("Observer connection lost (waiting room)");
+                }),
+                on_peer_added: VcCallback::noop(),
+                on_peer_first_frame: VcCallback::noop(),
+                on_peer_removed: None,
+                get_peer_video_canvas_id: VcCallback::from(|id| id),
+                get_peer_screen_canvas_id: VcCallback::from(|id| id),
+                enable_diagnostics: false,
+                diagnostics_update_interval_ms: None,
+                enable_health_reporting: false,
+                health_reporting_interval_ms: None,
+                on_encoder_settings_update: None,
+                rtt_testing_period_ms: 3000,
+                rtt_probe_interval_ms: None,
+                on_meeting_info: None,
+                on_meeting_ended: None,
+                on_meeting_activated: None,
+                on_participant_admitted: Some(VcCallback::from(
+                    move |_: ()| {
+                        log::info!("Participant admitted push received, fetching room token via HTTP");
+                        let mid = meeting_id_for_fetch.clone();
+                        spawn(async move {
+                            match join_meeting(&mid, None).await {
+                                Ok(status) => {
+                                    if status.room_token.is_some() {
+                                        on_admitted.call(status);
+                                    } else {
+                                        log::error!("Admitted but join_meeting returned no room_token");
+                                        error.set(Some(
+                                            "Admitted but failed to obtain room token".to_string(),
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to fetch room token after admission: {e}");
+                                    error.set(Some(format!(
+                                        "Failed to fetch room token: {e}"
+                                    )));
+                                }
+                            }
+                        });
+                    },
+                )),
+                on_participant_rejected: Some(VcCallback::from(move |_| {
+                    log::info!("Participant rejected push received");
+                    on_rejected.call(());
+                })),
+                on_waiting_room_updated: None,
+            };
+
+            let mut client = VideoCallClient::new(opts);
+            if let Err(e) = client.connect() {
+                log::error!("Failed to connect observer client for waiting room: {e}");
+                error.set(Some(format!("Failed to connect for push updates: {e}")));
+                observer_client.set(None);
+                return;
+            }
+            observer_client.set(Some(client));
         });
     }
 
@@ -71,41 +162,4 @@ pub fn WaitingRoom(
             }
         }
     }
-}
-
-async fn handle_status_check(
-    meeting_id: &str,
-    on_admitted: &EventHandler<ParticipantStatus>,
-    on_rejected: &EventHandler<()>,
-    error: &mut Signal<Option<String>>,
-) {
-    match check_status(meeting_id).await {
-        Ok(status) => {
-            match status.status.as_str() {
-                "admitted" => {
-                    if status.room_token.is_some() {
-                        on_admitted.call(status);
-                    } else {
-                        error.set(Some("Admitted but no room token received".to_string()));
-                    }
-                }
-                "rejected" => {
-                    on_rejected.call(());
-                }
-                _ => {}
-            }
-            error.set(None);
-        }
-        Err(e) => {
-            error.set(Some(e));
-        }
-    }
-}
-
-async fn check_status(meeting_id: &str) -> Result<ParticipantStatus, String> {
-    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
-    client
-        .get_status(meeting_id)
-        .await
-        .map_err(|e| format!("{e}"))
 }

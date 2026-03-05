@@ -25,6 +25,7 @@ use videocall_meeting_types::{
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
+use crate::nats_events;
 use crate::state::AppState;
 
 /// Verify that the requester is an admitted participant (authorization check).
@@ -80,7 +81,11 @@ pub async fn admit_participant(
         .await?
         .ok_or_else(|| AppError::participant_not_found(&body.email))?;
 
-    // Token is null in the admit response -- the participant picks it up via GET /status.
+    // Notify the admitted participant via NATS. The client will fetch its room
+    // token via HTTP after receiving this notification.
+    nats_events::publish_participant_admitted(state.nats.as_ref(), &meeting_id, &body.email)
+        .await;
+
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }
 
@@ -98,6 +103,18 @@ pub async fn admit_all(
 
     let rows = db_participants::admit_all(&state.db, meeting.id).await?;
     let admitted_count = rows.len();
+
+    // Notify each admitted participant via NATS. Clients will fetch their room
+    // tokens via HTTP after receiving the notification.
+    for row in &rows {
+        nats_events::publish_participant_admitted(
+            state.nats.as_ref(),
+            &meeting_id,
+            &row.email,
+        )
+        .await;
+    }
+
     let admitted: Vec<ParticipantStatusResponse> = rows
         .into_iter()
         .map(|r| r.into_participant_status(None))
@@ -125,6 +142,8 @@ pub async fn reject_participant(
     let row = db_participants::reject(&state.db, meeting.id, &body.email)
         .await?
         .ok_or_else(|| AppError::participant_not_found(&body.email))?;
+
+    nats_events::publish_participant_rejected(state.nats.as_ref(), &meeting_id, &body.email).await;
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }

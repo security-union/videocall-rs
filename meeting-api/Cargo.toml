@@ -19,6 +19,10 @@ path = "src/main.rs"
 
 [dependencies]
 videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.2" }
+videocall-types = { path = "../videocall-types", version = "5.0.0" }
+
+async-nats = "0.42.0"
+protobuf = "3.3.0"
 
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }

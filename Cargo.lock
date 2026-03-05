@@ -4639,12 +4639,14 @@ name = "meeting-api"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-nats",
  "axum 0.8.8",
  "base64 0.22.1",
  "chrono",
  "http-body-util",
  "jsonwebtoken",
  "oauth2",
+ "protobuf 3.7.1",
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.26",
@@ -4660,6 +4662,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "videocall-meeting-types",
+ "videocall-types",
 ]
 
 [[package]]

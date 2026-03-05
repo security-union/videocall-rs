@@ -251,6 +251,7 @@ pub fn AttendantsComponent(
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
+    let waiting_room_version = use_signal(|| 0u64);
 
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
@@ -376,6 +377,14 @@ pub fn AttendantsComponent(
                     meeting_ended_message.set(Some(message));
                 },
             )),
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: Some(VcCallback::from(move |_| {
+                log::info!("Waiting room updated push received");
+                let mut v = waiting_room_version;
+                v.set(v() + 1);
+            })),
         };
 
         let client = VideoCallClient::new(opts);
@@ -947,6 +956,7 @@ pub fn AttendantsComponent(
                     HostControls {
                         meeting_id: id.clone(),
                         is_admitted: true,
+                        waiting_room_version: waiting_room_version(),
                     }
                 }
 

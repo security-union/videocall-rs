@@ -87,7 +87,11 @@ pub fn WaitingRoom(
                     move |_: ()| {
                         log::info!("Participant admitted push received, fetching room token via HTTP");
                         let mid = meeting_id_for_fetch.clone();
-                        spawn(async move {
+                        // Use spawn_local instead of dioxus::spawn because
+                        // this callback fires from a WebSocket message
+                        // handler which runs outside any Dioxus runtime
+                        // context. Calling dioxus::spawn() here would panic.
+                        wasm_bindgen_futures::spawn_local(async move {
                             match join_meeting(&mid, None).await {
                                 Ok(status) => {
                                     if status.room_token.is_some() {

@@ -63,6 +63,13 @@ pub fn MeetingPage(id: String) -> Element {
     let mut came_from_waiting_room = use_signal(|| false);
     let mut error_state = use_signal(|| None::<String>);
 
+    // Separate signal that tracks only the observer token for the WaitingForMeeting
+    // state. The observer `use_effect` subscribes to THIS signal instead of
+    // `meeting_status`, breaking the circular dependency that caused a
+    // `RefCell already borrowed` panic in dioxus-core when `on_meeting_activated`
+    // set `meeting_status` and the effect tried to re-run synchronously.
+    let mut observer_token_signal = use_signal(|| None::<String>);
+
     let initial_username: String = if let Some(name) = (username_ctx.0)() {
         name
     } else {
@@ -122,13 +129,19 @@ pub fn MeetingPage(id: String) -> Element {
     // When WaitingForMeeting, create an observer WebSocket client that receives
     // a push notification when the host activates the meeting, replacing the
     // old 2-second polling loop.
+    //
+    // IMPORTANT: This effect subscribes to `observer_token_signal` (NOT
+    // `meeting_status`) to avoid a circular reactive dependency. The
+    // `on_meeting_activated` callback sets `meeting_status` to Admitted (or
+    // another variant) and clears `observer_token_signal` to None. Because the
+    // effect only watches `observer_token_signal`, writing to `meeting_status`
+    // does not cause re-entrant execution of this effect.
     let mut observer_client = use_signal(|| None::<VideoCallClient>);
     {
         let meeting_id = id.clone();
         use_effect(move || {
-            let status = meeting_status();
-            let observer_token = match &status {
-                MeetingStatus::WaitingForMeeting { observer_token } => observer_token.clone(),
+            let observer_token = match observer_token_signal() {
+                Some(t) if !t.is_empty() => t,
                 _ => {
                     // Clean up observer client when leaving WaitingForMeeting
                     if let Some(client) = observer_client.write().take() {
@@ -188,7 +201,16 @@ pub fn MeetingPage(id: String) -> Element {
                         log::info!("Meeting activated push received, re-joining...");
                         let meeting_id = meeting_id.clone();
                         let display_name = display_name.clone();
-                        spawn(async move {
+                        // Use spawn_local instead of dioxus::spawn because
+                        // this callback fires from a WebSocket message
+                        // handler (Inner::on_inbound_media) which runs
+                        // outside any Dioxus runtime context. Calling
+                        // dioxus::spawn() here would panic.
+                        wasm_bindgen_futures::spawn_local(async move {
+                            // Clear the observer token FIRST so the observer
+                            // effect tears down the client without re-entering.
+                            observer_token_signal.set(None);
+
                             match join_meeting(&meeting_id, Some(&display_name)).await {
                                 Ok(response) => {
                                     current_user_email.set(Some(response.email.clone()));
@@ -216,6 +238,10 @@ pub fn MeetingPage(id: String) -> Element {
                                                 .observer_token
                                                 .unwrap_or_default();
                                             came_from_waiting_room.set(true);
+                                            // Also set observer_token_signal for
+                                            // the Waiting state (observer stays alive).
+                                            observer_token_signal
+                                                .set(Some(obs_token.clone()));
                                             meeting_status.set(MeetingStatus::Waiting {
                                                 observer_token: obs_token,
                                             });
@@ -291,6 +317,7 @@ pub fn MeetingPage(id: String) -> Element {
                         host_display_name.set(determined_host.clone());
                         match response.status.as_str() {
                             "admitted" => {
+                                observer_token_signal.set(None);
                                 if let Some(token) = response.room_token {
                                     meeting_status.set(MeetingStatus::Admitted {
                                         is_host: response.is_host,
@@ -307,6 +334,8 @@ pub fn MeetingPage(id: String) -> Element {
                             "waiting_for_meeting" => {
                                 let obs_token =
                                     response.observer_token.unwrap_or_default();
+                                observer_token_signal
+                                    .set(Some(obs_token.clone()));
                                 meeting_status.set(MeetingStatus::WaitingForMeeting {
                                     observer_token: obs_token,
                                 });
@@ -314,25 +343,37 @@ pub fn MeetingPage(id: String) -> Element {
                             "waiting" => {
                                 let obs_token =
                                     response.observer_token.unwrap_or_default();
+                                observer_token_signal
+                                    .set(Some(obs_token.clone()));
                                 came_from_waiting_room.set(true);
                                 meeting_status.set(MeetingStatus::Waiting {
                                     observer_token: obs_token,
                                 });
                             }
-                            "rejected" => meeting_status.set(MeetingStatus::Rejected),
-                            _ => meeting_status.set(MeetingStatus::Error(format!(
-                                "Unknown status: {}",
-                                response.status
-                            ))),
+                            "rejected" => {
+                                observer_token_signal.set(None);
+                                meeting_status.set(MeetingStatus::Rejected);
+                            }
+                            _ => {
+                                observer_token_signal.set(None);
+                                meeting_status.set(MeetingStatus::Error(format!(
+                                    "Unknown status: {}",
+                                    response.status
+                                )));
+                            }
                         }
                     }
                     Err(JoinError::MeetingNotActive) => {
                         // Fallback for older server versions that still return 400
+                        observer_token_signal.set(Some(String::new()));
                         meeting_status.set(MeetingStatus::WaitingForMeeting {
                             observer_token: String::new(),
                         });
                     }
-                    Err(e) => meeting_status.set(MeetingStatus::Error(e.to_string())),
+                    Err(e) => {
+                        observer_token_signal.set(None);
+                        meeting_status.set(MeetingStatus::Error(e.to_string()));
+                    }
                 }
             });
         }
@@ -345,6 +386,7 @@ pub fn MeetingPage(id: String) -> Element {
             let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
+            observer_token_signal.set(None);
             meeting_status.set(MeetingStatus::Admitted {
                 is_host: false,
                 host_display_name: determined_host,
@@ -355,6 +397,7 @@ pub fn MeetingPage(id: String) -> Element {
     };
 
     let on_rejected = move |_| {
+        observer_token_signal.set(None);
         meeting_status.set(MeetingStatus::Rejected);
     };
 

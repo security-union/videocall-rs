@@ -93,6 +93,7 @@ pub struct WtChatSession {
 }
 
 impl WtChatSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: Addr<ChatServer>,
         room: String,

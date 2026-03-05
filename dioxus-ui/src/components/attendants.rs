@@ -340,19 +340,19 @@ pub fn AttendantsComponent(
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: Some(VcCallback::from(move |peer_id: String| {
                 log::info!("Peer removed: {peer_id}");
-                // Defer the write to avoid re-entrant borrows: the diagnostics
-                // subscriber task may hold a .read() on peer_status_map when
-                // on_peer_removed fires, since both run on the WASM event loop.
+                // Write to signals directly. In single-threaded WASM, timer
+                // callbacks (where PeerDecodeManager::run_peer_monitor fires
+                // this) cannot overlap with async tasks, so there is no
+                // re-entrant borrow risk. Using dioxus::spawn() here would
+                // panic because the callback runs outside any Dioxus runtime
+                // scope (from a setInterval timer).
                 //
-                // Safety: this deferred removal cannot race with a re-added peer
-                // of the same ID because session IDs are server-assigned numeric
-                // values unique per connection — a reconnecting peer always gets
-                // a fresh session ID.
-                spawn(async move {
-                    peer_status_map.write().remove(&peer_id);
-                    let mut v = peer_list_version;
-                    v.set(v() + 1);
-                });
+                // Note: we rebind to a local `mut` copy so the closure stays
+                // `Fn` (Signal is Copy; only the local is mutated each call).
+                let mut map = peer_status_map;
+                map.write().remove(&peer_id);
+                let mut v = peer_list_version;
+                v.set(v() + 1);
             })),
             get_peer_video_canvas_id: VcCallback::from(|email| email),
             get_peer_screen_canvas_id: VcCallback::from(|email| format!("screen-share-{}", &email)),

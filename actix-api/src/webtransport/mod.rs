@@ -323,6 +323,7 @@ async fn run_webtransport_connection_from_request(
 }
 
 /// Handle a WebTransport session using the WtChatSession actor
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     level = "trace",
     skip(session, chat_server, nats_client, tracker_sender, session_manager)

@@ -120,12 +120,12 @@ test.describe("Waiting for meeting (push notifications)", () => {
       const guestResult = await joinMeetingFromPage(guestPage, "EarlyGuest");
       expect(guestResult).toBe("waiting-for-meeting");
 
-      await expect(
-        guestPage.getByText("Waiting for meeting to start"),
-      ).toBeVisible({ timeout: 10_000 });
-      await expect(
-        guestPage.getByText("The host hasn't started this meeting yet"),
-      ).toBeVisible({ timeout: 5_000 });
+      await expect(guestPage.getByText("Waiting for meeting to start")).toBeVisible({
+        timeout: 10_000,
+      });
+      await expect(guestPage.getByText("The host hasn't started this meeting yet")).toBeVisible({
+        timeout: 5_000,
+      });
 
       await expect(guestPage.getByText("Leave")).toBeVisible({ timeout: 5_000 });
     } finally {
@@ -164,9 +164,9 @@ test.describe("Waiting for meeting (push notifications)", () => {
       const guestResult = await joinMeetingFromPage(guestPage, "GuestEarly");
       expect(guestResult).toBe("waiting-for-meeting");
 
-      await expect(
-        guestPage.getByText("Waiting for meeting to start"),
-      ).toBeVisible({ timeout: 10_000 });
+      await expect(guestPage.getByText("Waiting for meeting to start")).toBeVisible({
+        timeout: 10_000,
+      });
 
       // Host joins and starts the meeting
       await navigateToMeeting(hostPage, meetingId, "HostLate");
@@ -260,9 +260,7 @@ test.describe("Waiting for meeting (push notifications)", () => {
         return;
       }
 
-      await expect(
-        guestPage.getByText("Waiting to be admitted"),
-      ).toBeVisible({ timeout: 10_000 });
+      await expect(guestPage.getByText("Waiting to be admitted")).toBeVisible({ timeout: 10_000 });
 
       // Host rejects the guest
       const rejectButton = hostPage.getByTitle("Reject").first();

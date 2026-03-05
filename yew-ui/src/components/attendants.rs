@@ -121,6 +121,8 @@ pub enum Msg {
     TokenRefreshed(String),
     /// Token refresh failed (session expired, kicked from meeting, network error).
     TokenRefreshFailed(String),
+    /// The waiting room participant list changed (push notification from server).
+    WaitingRoomUpdated,
 }
 
 impl From<WsAction> for Msg {
@@ -208,6 +210,15 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    /// Monotonically increasing counter bumped when a `WaitingRoomUpdated`
+    /// push notification arrives. Passed as a prop to `HostControls` so it
+    /// knows to re-fetch the waiting list.
+    waiting_room_version: u32,
+    /// Tracks the current reconnection attempt number for exponential backoff.
+    /// Only meaningful in the JWT auth path (`media-server-jwt-auth` feature);
+    /// the non-JWT path manages its own attempt counter inside the recursive
+    /// `schedule_reconnect_no_jwt` closure chain.
+    reconnect_attempt: u32,
 }
 
 impl AttendantsComponent {
@@ -349,6 +360,16 @@ impl AttendantsComponent {
                     link.send_message(Msg::MeetingEnded(message));
                 })
             }),
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |_| {
+                    log::info!("Waiting room updated via push notification");
+                    link.send_message(Msg::WaitingRoomUpdated);
+                })
+            }),
         };
 
         VideoCallClient::new(opts)
@@ -430,13 +451,42 @@ impl AttendantsComponent {
         html! {} // Empty html when feature is not enabled
     }
 
-    /// Schedule a token refresh attempt after 1 second.
+    /// Maximum number of reconnection attempts before giving up.
+    const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+    /// Compute the reconnect delay for the given attempt using exponential
+    /// backoff with ±25% random jitter.  Returns `None` when all attempts are
+    /// exhausted.
+    fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
+        const MAX_DELAY_MS: u32 = 16_000;
+        if attempt >= Self::MAX_RECONNECT_ATTEMPTS {
+            return None;
+        }
+        let base = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
+        let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base as f64;
+        Some((base as f64 + jitter).max(500.0) as u32)
+    }
+
+    /// Schedule a token refresh attempt with exponential backoff and jitter.
     ///
-    /// If the meeting has ended (`MeetingNotActive`), sends `MeetingEnded`
-    /// instead of retrying, so the user sees a clear "meeting ended" overlay.
+    /// Retries with increasing delay (1s -> 2s -> 4s -> 8s -> 16s cap) plus +/-25%
+    /// random jitter.  Gives up after 10 attempts.  If the meeting has ended
+    /// (`MeetingNotActive`), sends `MeetingEnded` instead of retrying.
     #[cfg(feature = "media-server-jwt-auth")]
-    fn schedule_token_refresh(link: yew::html::Scope<Self>, meeting_id: String) {
-        Timeout::new(1_000, move || {
+    fn schedule_token_refresh(link: yew::html::Scope<Self>, meeting_id: String, attempt: u32) {
+        let delay_ms = match Self::reconnect_delay_ms(attempt) {
+            Some(d) => d,
+            None => {
+                link.send_message(Msg::TokenRefreshFailed(
+                    "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+                ));
+                return;
+            }
+        };
+
+        log::info!("Scheduling token refresh attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+
+        Timeout::new(delay_ms, move || {
             wasm_bindgen_futures::spawn_local(async move {
                 match crate::meeting_api::refresh_room_token(&meeting_id).await {
                     Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
@@ -448,6 +498,30 @@ impl AttendantsComponent {
                     }
                 }
             });
+        })
+        .forget();
+    }
+
+    /// Schedule a reconnection attempt with exponential backoff (non-JWT path).
+    ///
+    /// Retries with increasing delay (1s -> 2s -> 4s -> 8s -> 16s cap) plus +/-25%
+    /// random jitter.  Gives up after 10 attempts.
+    #[cfg(not(feature = "media-server-jwt-auth"))]
+    fn schedule_reconnect_no_jwt(link: yew::html::Scope<Self>, attempt: u32) {
+        let delay_ms = match Self::reconnect_delay_ms(attempt) {
+            Some(d) => d,
+            None => {
+                link.send_message(Msg::TokenRefreshFailed(
+                    "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+                ));
+                return;
+            }
+        };
+
+        log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+
+        Timeout::new(delay_ms, move || {
+            link.send_message(WsAction::Connect);
         })
         .forget();
     }
@@ -499,6 +573,8 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
+            waiting_room_version: 0,
+            reconnect_attempt: 0,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -535,6 +611,7 @@ impl Component for AttendantsComponent {
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
                     self.error = None;
+                    self.reconnect_attempt = 0;
                     self.call_start_time = Some(js_sys::Date::now());
                     true
                 }
@@ -549,18 +626,17 @@ impl Component for AttendantsComponent {
 
                     #[cfg(feature = "media-server-jwt-auth")]
                     {
+                        self.reconnect_attempt = 0;
                         let link = ctx.link().clone();
                         let meeting_id = ctx.props().id.clone();
-                        Self::schedule_token_refresh(link, meeting_id);
+                        Self::schedule_token_refresh(link, meeting_id, 0);
                     }
 
                     #[cfg(not(feature = "media-server-jwt-auth"))]
                     {
+                        self.reconnect_attempt = 0;
                         let link = ctx.link().clone();
-                        Timeout::new(1_000, move || {
-                            link.send_message(WsAction::Connect);
-                        })
-                        .forget();
+                        Self::schedule_reconnect_no_jwt(link, 0);
                     }
 
                     true
@@ -807,6 +883,7 @@ impl Component for AttendantsComponent {
             Msg::TokenRefreshed(new_token) => {
                 log::info!("Room token refreshed, reconnecting with new token");
                 self.error = None;
+                self.reconnect_attempt = 0;
                 let (ws_urls, wt_urls) =
                     Self::build_lobby_urls(&new_token, &ctx.props().email, &ctx.props().id);
                 self.client.update_server_urls(ws_urls, wt_urls);
@@ -821,11 +898,18 @@ impl Component for AttendantsComponent {
                 warn!("Token refresh failed: {err}");
                 self.error = Some(format!("Connection lost, retrying... ({err})"));
 
-                // Schedule another attempt after 1 second.
-                let link = ctx.link().clone();
-                let meeting_id = ctx.props().id.clone();
-                Self::schedule_token_refresh(link, meeting_id);
+                #[cfg(feature = "media-server-jwt-auth")]
+                {
+                    self.reconnect_attempt += 1;
+                    let link = ctx.link().clone();
+                    let meeting_id = ctx.props().id.clone();
+                    Self::schedule_token_refresh(link, meeting_id, self.reconnect_attempt);
+                }
 
+                true
+            }
+            Msg::WaitingRoomUpdated => {
+                self.waiting_room_version = self.waiting_room_version.wrapping_add(1);
                 true
             }
         }
@@ -1174,6 +1258,7 @@ impl Component for AttendantsComponent {
                 <HostControls
                     meeting_id={ctx.props().id.clone()}
                     is_admitted={true}
+                    waiting_room_version={self.waiting_room_version}
                 />
 
                 {
@@ -1200,6 +1285,94 @@ impl Component for AttendantsComponent {
                 </div>
             </ContextProvider<VideoCallClientCtx>>
             </ContextProvider<MeetingTimeCtx>>
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for reconnect_delay_ms
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// attempt=0 should return Some(d) where d is in the base range.
+    /// base = 1000, jitter in [-25%, +25%), so delay in [750, 1250).
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_0_returns_value_in_expected_range() {
+        for _ in 0..50 {
+            let delay = AttendantsComponent::reconnect_delay_ms(0);
+            assert!(delay.is_some(), "attempt 0 should return Some");
+            let d = delay.unwrap();
+            assert!(d >= 750, "attempt 0 delay {d} should be >= 750");
+            assert!(d <= 1250, "attempt 0 delay {d} should be <= 1250");
+        }
+    }
+
+    /// attempt=9 should return Some(d) with base capped at MAX_DELAY_MS (16000).
+    /// jitter in [-25%, +25%), so delay in [12000, 20000).
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_9_returns_capped_value() {
+        for _ in 0..50 {
+            let delay = AttendantsComponent::reconnect_delay_ms(9);
+            assert!(delay.is_some(), "attempt 9 should return Some");
+            let d = delay.unwrap();
+            assert!(d >= 12000, "attempt 9 delay {d} should be >= 12000");
+            assert!(d <= 20000, "attempt 9 delay {d} should be <= 20000");
+        }
+    }
+
+    /// attempt=10 exceeds MAX_RECONNECT_ATTEMPTS and should return None.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_10_returns_none() {
+        assert!(
+            AttendantsComponent::reconnect_delay_ms(10).is_none(),
+            "attempt 10 should return None"
+        );
+    }
+
+    /// Attempts beyond 10 should also return None.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_beyond_max_returns_none() {
+        assert!(AttendantsComponent::reconnect_delay_ms(11).is_none());
+        assert!(AttendantsComponent::reconnect_delay_ms(100).is_none());
+        assert!(AttendantsComponent::reconnect_delay_ms(u32::MAX).is_none());
+    }
+
+    /// Backoff should roughly double each attempt (accounting for jitter).
+    /// We compare the averages of many samples to the expected base values.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_backoff_roughly_doubles() {
+        let samples = 200;
+        for attempt in 0..4u32 {
+            let expected_base =
+                (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
+            let sum: f64 = (0..samples)
+                .map(|_| AttendantsComponent::reconnect_delay_ms(attempt).unwrap() as f64)
+                .sum();
+            let avg = sum / samples as f64;
+            // Average should be close to the base (jitter is symmetric around 0).
+            // Allow 15% tolerance for randomness.
+            let tolerance = expected_base * 0.15;
+            assert!(
+                (avg - expected_base).abs() < tolerance,
+                "attempt {attempt}: avg {avg:.0} should be near expected base {expected_base:.0} (tolerance {tolerance:.0})"
+            );
+        }
+    }
+
+    /// The minimum possible return value is 500 (enforced by .max(500.0)).
+    /// Verify no value goes below 500 for any valid attempt.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_never_below_500() {
+        for attempt in 0..10u32 {
+            for _ in 0..20 {
+                let d = AttendantsComponent::reconnect_delay_ms(attempt).unwrap();
+                assert!(d >= 500, "attempt {attempt}: delay {d} must be >= 500");
+            }
         }
     }
 }

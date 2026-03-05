@@ -16,10 +16,12 @@
  * conditions.
  */
 
-//! Host Controls component - allows admitted participants to admit/reject waiting participants
+//! Host Controls component - allows admitted participants to admit/reject waiting participants.
+//!
+//! Instead of polling, the component reacts to `waiting_room_version` prop changes
+//! triggered by push notifications from the server via the observer WebSocket.
 
 use crate::constants::meeting_api_client;
-use gloo_timers::callback::Interval;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
 use yew::prelude::*;
 
@@ -31,6 +33,11 @@ pub struct HostControlsProps {
     pub meeting_id: String,
     /// Whether the current user is admitted to the meeting (all admitted users can manage waiting room)
     pub is_admitted: bool,
+    /// Monotonically increasing version counter that triggers a re-fetch of the
+    /// waiting room list. Bumped by the parent when an `on_waiting_room_updated`
+    /// push notification arrives.
+    #[prop_or_default]
+    pub waiting_room_version: u32,
 }
 
 pub enum HostControlsMsg {
@@ -49,7 +56,8 @@ pub struct HostControls {
     waiting: Vec<WaitingParticipant>,
     error: Option<String>,
     expanded: bool,
-    _poll_interval: Option<Interval>,
+    /// Track the last version we fetched for, so we re-fetch when it changes.
+    last_fetched_version: u32,
 }
 
 impl Component for HostControls {
@@ -57,16 +65,8 @@ impl Component for HostControls {
     type Properties = HostControlsProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let mut poll_interval = None;
-
+        // Fetch immediately on mount if admitted
         if ctx.props().is_admitted {
-            // Start polling for waiting users
-            let link = ctx.link().clone();
-            poll_interval = Some(Interval::new(3000, move || {
-                link.send_message(HostControlsMsg::FetchWaiting);
-            }));
-
-            // Fetch immediately
             ctx.link().send_message(HostControlsMsg::FetchWaiting);
         }
 
@@ -74,19 +74,24 @@ impl Component for HostControls {
             waiting: Vec::new(),
             error: None,
             expanded: true,
-            _poll_interval: poll_interval,
+            last_fetched_version: ctx.props().waiting_room_version,
         }
     }
 
-    fn changed(&mut self, ctx: &Context<Self>, _old_props: &Self::Properties) -> bool {
-        // If we became host, start polling
-        if ctx.props().is_admitted && self._poll_interval.is_none() {
-            let link = ctx.link().clone();
-            self._poll_interval = Some(Interval::new(3000, move || {
-                link.send_message(HostControlsMsg::FetchWaiting);
-            }));
+    fn changed(&mut self, ctx: &Context<Self>, old_props: &Self::Properties) -> bool {
+        // If we became admitted, fetch immediately
+        if ctx.props().is_admitted && !old_props.is_admitted {
             ctx.link().send_message(HostControlsMsg::FetchWaiting);
         }
+
+        // If waiting_room_version changed, re-fetch the waiting list
+        if ctx.props().waiting_room_version != self.last_fetched_version
+            && ctx.props().is_admitted
+        {
+            self.last_fetched_version = ctx.props().waiting_room_version;
+            ctx.link().send_message(HostControlsMsg::FetchWaiting);
+        }
+
         true
     }
 

@@ -4,8 +4,7 @@ use crate::constants::{e2ee_enabled, webtransport_enabled};
 use crate::context::{
     load_username_from_storage, save_username_to_storage, UsernameCtx, validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
-use crate::meeting_api::{get_meeting_info, join_meeting, JoinError};
-use gloo_timers::callback::Interval;
+use crate::meeting_api::{join_meeting, JoinError};
 use web_sys::window;
 use web_sys::{HtmlInputElement, KeyboardEvent};
 use yew::prelude::*;
@@ -24,10 +23,16 @@ pub enum MeetingStatus {
     NotJoined,
     /// Joining in progress
     Joining,
-    /// Waiting for the host to start the meeting
-    WaitingForMeeting,
-    /// In the waiting room, pending host admission
-    Waiting,
+    /// Waiting for the host to start the meeting.
+    /// Contains the observer token for receiving push notifications.
+    WaitingForMeeting {
+        observer_token: Option<String>,
+    },
+    /// In the waiting room, pending host admission.
+    /// Contains the observer token for receiving push notifications.
+    Waiting {
+        observer_token: Option<String>,
+    },
     /// Admitted to the meeting
     Admitted {
         is_host: bool,
@@ -183,7 +188,10 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         });
     }
 
-    // Poll for meeting activation when in WaitingForMeeting state
+    // Observer WebSocket for meeting activation push notifications.
+    // When in WaitingForMeeting state with an observer_token, create an
+    // observer VideoCallClient that listens for meeting activation events
+    // instead of polling.
     {
         let meeting_id = props.id.clone();
         let meeting_status = meeting_status.clone();
@@ -194,105 +202,141 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         let current_status = (*meeting_status).clone();
 
         use_effect_with(current_status.clone(), move |status| {
-            let interval: Option<Interval> = if *status == MeetingStatus::WaitingForMeeting {
-                let meeting_id = meeting_id.clone();
-                let meeting_status = meeting_status.clone();
-                let host_display_name = host_display_name.clone();
-                let current_user_email = current_user_email.clone();
-                let came_from_waiting_room = came_from_waiting_room.clone();
+            use videocall_client::Callback as VcCallback;
+            use videocall_client::{VideoCallClient, VideoCallClientOptions};
+
+            let observer_token = match status {
+                MeetingStatus::WaitingForMeeting { observer_token } => observer_token.clone(),
+                _ => None,
+            };
+
+            let observer_client: Option<VideoCallClient> = observer_token.map(|token| {
+                let meeting_id_for_rejoin = meeting_id.clone();
+                let meeting_status_for_rejoin = meeting_status.clone();
+                let host_display_name_for_rejoin = host_display_name.clone();
+                let current_user_email_for_rejoin = current_user_email.clone();
+                let came_from_waiting_room_for_rejoin = came_from_waiting_room.clone();
                 let display_name = (*input_value_state).clone();
 
-                // Poll every 2 seconds to check if meeting becomes active
-                Some(Interval::new(2000, move || {
-                    let meeting_id = meeting_id.clone();
-                    let meeting_status = meeting_status.clone();
-                    let host_display_name = host_display_name.clone();
-                    let current_user_email = current_user_email.clone();
-                    let came_from_waiting_room = came_from_waiting_room.clone();
-                    let display_name = display_name.clone();
+                // Build observer WebSocket URLs using the observer token
+                let ws_base = crate::constants::actix_websocket_base().unwrap_or_default();
+                let observer_ws_urls: Vec<String> = ws_base
+                    .split(',')
+                    .map(|base| format!("{base}/lobby?token={token}"))
+                    .collect();
+                let wt_base = crate::constants::webtransport_host_base().unwrap_or_default();
+                let observer_wt_urls: Vec<String> = wt_base
+                    .split(',')
+                    .map(|base| format!("{base}/lobby?token={token}"))
+                    .collect();
 
-                    wasm_bindgen_futures::spawn_local(async move {
-                        // Check if meeting is now active
-                        match get_meeting_info(&meeting_id).await {
-                            Ok(info) => {
-                                log::info!("Meeting state check: {}", info.state);
-                                // Meeting is active when state is "active" (not "idle" or "ended")
-                                if info.state == "active" {
-                                    log::info!("Meeting is now active! Attempting to join...");
-                                    // Try to join again
-                                    match join_meeting(&meeting_id, Some(&display_name)).await {
-                                        Ok(response) => {
-                                            log::info!(
-                                                "Join after meeting active: status={}, is_host={}",
-                                                response.status,
-                                                response.is_host
-                                            );
-                                            current_user_email.set(Some(response.email.clone()));
+                // Use the user's email as userid so the server can match
+                // push-notification `target_email` to this observer client.
+                let email_for_userid = (*current_user_email).clone()
+                    .unwrap_or_else(|| display_name.clone());
 
-                                            let determined_host_display_name =
-                                                info.host_display_name.clone();
-                                            host_display_name
-                                                .set(determined_host_display_name.clone());
+                let opts = VideoCallClientOptions {
+                    userid: email_for_userid,
+                    meeting_id: meeting_id.clone(),
+                    websocket_urls: observer_ws_urls,
+                    webtransport_urls: observer_wt_urls,
+                    enable_e2ee: false,
+                    enable_webtransport: false, // observer uses WebSocket only
+                    on_connected: VcCallback::from(|_| {
+                        log::info!("Observer WebSocket connected for meeting activation");
+                    }),
+                    on_connection_lost: VcCallback::from(|_| {
+                        log::warn!("Observer WebSocket connection lost");
+                    }),
+                    on_peer_added: VcCallback::from(|_| {}),
+                    on_peer_first_frame: VcCallback::from(|_| {}),
+                    on_peer_removed: None,
+                    get_peer_video_canvas_id: VcCallback::from(|id| id),
+                    get_peer_screen_canvas_id: VcCallback::from(|id| id),
+                    enable_diagnostics: false,
+                    diagnostics_update_interval_ms: None,
+                    enable_health_reporting: false,
+                    health_reporting_interval_ms: None,
+                    on_encoder_settings_update: None,
+                    rtt_testing_period_ms: 2000,
+                    rtt_probe_interval_ms: None,
+                    on_meeting_info: None,
+                    on_meeting_ended: None,
+                    on_meeting_activated: Some(VcCallback::from(move |_| {
+                        log::info!("Meeting activated via push notification, re-joining...");
+                        let meeting_id = meeting_id_for_rejoin.clone();
+                        let meeting_status = meeting_status_for_rejoin.clone();
+                        let host_display_name = host_display_name_for_rejoin.clone();
+                        let current_user_email = current_user_email_for_rejoin.clone();
+                        let came_from_waiting_room = came_from_waiting_room_for_rejoin.clone();
+                        let display_name = display_name.clone();
 
-                                            match response.status.as_str() {
-                                                "admitted" => {
-                                                    if let Some(token) = response.room_token {
-                                                        meeting_status.set(
-                                                            MeetingStatus::Admitted {
-                                                                is_host: response.is_host,
-                                                                host_display_name:
-                                                                    determined_host_display_name,
-                                                                room_token: token,
-                                                            },
-                                                        );
-                                                    } else {
-                                                        meeting_status.set(MeetingStatus::Error(
-                                                            "Admitted but no room token received from server".to_string(),
-                                                        ));
-                                                    }
-                                                }
-                                                "waiting" => {
-                                                    came_from_waiting_room.set(true);
-                                                    meeting_status.set(MeetingStatus::Waiting);
-                                                }
-                                                "rejected" => {
-                                                    meeting_status.set(MeetingStatus::Rejected);
-                                                }
-                                                _ => {
-                                                    meeting_status.set(MeetingStatus::Error(
-                                                        format!(
-                                                            "Unknown status: {}",
-                                                            response.status
-                                                        ),
-                                                    ));
-                                                }
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match join_meeting(&meeting_id, Some(&display_name)).await {
+                                Ok(response) => {
+                                    log::info!(
+                                        "Re-join after activation: status={}, is_host={}",
+                                        response.status,
+                                        response.is_host
+                                    );
+                                    current_user_email.set(Some(response.email.clone()));
+                                    let determined_host = response.host_display_name.clone();
+                                    host_display_name.set(determined_host.clone());
+
+                                    match response.status.as_str() {
+                                        "admitted" => {
+                                            if let Some(token) = response.room_token {
+                                                meeting_status.set(MeetingStatus::Admitted {
+                                                    is_host: response.is_host,
+                                                    host_display_name: determined_host,
+                                                    room_token: token,
+                                                });
+                                            } else {
+                                                meeting_status.set(MeetingStatus::Error(
+                                                    "Admitted but no room token received from server"
+                                                        .to_string(),
+                                                ));
                                             }
                                         }
-                                        Err(JoinError::MeetingNotActive) => {
-                                            // Still not active, keep waiting
-                                            log::info!("Meeting still not accepting joins, continuing to wait");
+                                        "waiting" => {
+                                            came_from_waiting_room.set(true);
+                                            meeting_status.set(MeetingStatus::Waiting {
+                                                observer_token: response.observer_token.clone(),
+                                            });
                                         }
-                                        Err(e) => {
-                                            log::error!("Error joining meeting: {e}");
-                                            meeting_status.set(MeetingStatus::Error(e.to_string()));
+                                        "rejected" => {
+                                            meeting_status.set(MeetingStatus::Rejected);
+                                        }
+                                        _ => {
+                                            meeting_status.set(MeetingStatus::Error(format!(
+                                                "Unknown status: {}",
+                                                response.status
+                                            )));
                                         }
                                     }
                                 }
+                                Err(e) => {
+                                    log::error!("Error re-joining after activation: {e}");
+                                    meeting_status.set(MeetingStatus::Error(e.to_string()));
+                                }
                             }
-                            Err(e) => {
-                                log::warn!("Error checking meeting status: {e}");
-                                // Don't transition to error state, just keep polling
-                            }
-                        }
-                    });
-                }))
-            } else {
-                None
-            };
+                        });
+                    })),
+                    on_participant_admitted: None,
+                    on_participant_rejected: None,
+                    on_waiting_room_updated: None,
+                };
 
-            // Return cleanup function
+                let mut client = VideoCallClient::new(opts);
+                if let Err(e) = client.connect() {
+                    log::error!("Failed to connect observer client: {e}");
+                }
+                client
+            });
+
+            // Keep the observer client alive until cleanup
             move || {
-                drop(interval);
+                drop(observer_client);
             }
         });
     }
@@ -381,7 +425,15 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                             "waiting" => {
                                 // Mark that user is going through waiting room
                                 came_from_waiting_room.set(true);
-                                meeting_status.set(MeetingStatus::Waiting);
+                                meeting_status.set(MeetingStatus::Waiting {
+                                    observer_token: response.observer_token.clone(),
+                                });
+                            }
+                            "waiting_for_meeting" => {
+                                log::info!("Meeting not active yet, using observer for push notifications");
+                                meeting_status.set(MeetingStatus::WaitingForMeeting {
+                                    observer_token: response.observer_token.clone(),
+                                });
                             }
                             "rejected" => {
                                 meeting_status.set(MeetingStatus::Rejected);
@@ -395,8 +447,11 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         }
                     }
                     Err(JoinError::MeetingNotActive) => {
-                        log::info!("Meeting not active yet, waiting for host to start");
-                        meeting_status.set(MeetingStatus::WaitingForMeeting);
+                        // Legacy fallback: server returned 400 instead of the new status
+                        log::info!("Meeting not active (legacy path), waiting for host to start");
+                        meeting_status.set(MeetingStatus::WaitingForMeeting {
+                            observer_token: None,
+                        });
                     }
                     Err(e) => {
                         log::error!("Join meeting error: {e}");
@@ -407,31 +462,19 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         })
     };
 
-    // Handle waiting room admission - receives the room_token from WaitingRoom
+    // Handle waiting room admission - receives the full join response from WaitingRoom
     let on_admitted = {
         let meeting_status = meeting_status.clone();
         let host_display_name = host_display_name.clone();
-        let meeting_id = props.id.clone();
 
-        Callback::from(move |room_token: String| {
-            let meeting_status = meeting_status.clone();
-            let host_display_name = host_display_name.clone();
-            let meeting_id = meeting_id.clone();
-
-            wasm_bindgen_futures::spawn_local(async move {
-                // Get the host display name
-                let determined_host_display_name =
-                    match crate::meeting_api::get_meeting_info(&meeting_id).await {
-                        Ok(info) => info.host_display_name,
-                        Err(_) => None,
-                    };
-                host_display_name.set(determined_host_display_name.clone());
-
-                meeting_status.set(MeetingStatus::Admitted {
-                    is_host: false,
-                    host_display_name: determined_host_display_name,
-                    room_token,
-                });
+        Callback::from(move |response: crate::meeting_api::JoinMeetingResponse| {
+            let determined_host = response.host_display_name.clone();
+            let token = response.room_token.unwrap_or_default();
+            host_display_name.set(determined_host.clone());
+            meeting_status.set(MeetingStatus::Admitted {
+                is_host: false,
+                host_display_name: determined_host,
+                room_token: token,
             });
         })
     };
@@ -577,10 +620,12 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     }
 
                     // User is waiting in the waiting room
-                    (Some(_), MeetingStatus::Waiting) => {
+                    (Some(_), MeetingStatus::Waiting { observer_token }) => {
                         html! {
                             <WaitingRoom
                                 meeting_id={props.id.clone()}
+                                email={(*current_user_email).clone().unwrap_or_default()}
+                                observer_token={observer_token.clone()}
                                 on_admitted={on_admitted}
                                 on_rejected={on_rejected}
                                 on_cancel={on_cancel_waiting}
@@ -589,7 +634,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     }
 
                     // Waiting for host to start the meeting
-                    (Some(_), MeetingStatus::WaitingForMeeting) => {
+                    (Some(_), MeetingStatus::WaitingForMeeting { .. }) => {
                         html! {
                             <div class="waiting-room-container">
                                 <div class="waiting-room-card card-apple">

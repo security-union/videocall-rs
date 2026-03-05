@@ -61,6 +61,7 @@ impl WsChatSession {
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
+        observer: bool,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -69,6 +70,7 @@ impl WsChatSession {
             nats_client,
             tracker_sender,
             session_manager,
+            observer,
         );
 
         WsChatSession {
@@ -356,6 +358,7 @@ mod tests {
                                     nats_client,
                                     tracker_sender,
                                     session_manager,
+                                    false, // tests use non-observer sessions
                                 );
                                 ws::start(actor, &req, stream)
                                     .map_err(actix_web::error::ErrorInternalServerError)

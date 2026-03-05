@@ -48,7 +48,7 @@ async function createAuthenticatedContext(
 async function joinMeetingFromPage(
   page: Page,
   displayName: string,
-): Promise<"in-meeting" | "waiting"> {
+): Promise<"in-meeting" | "waiting" | "waiting-for-meeting"> {
   // Step 1: display name prompt (may or may not appear)
   const displayInput = page.locator(".username-input");
   if (await displayInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
@@ -71,8 +71,12 @@ async function joinMeetingFromPage(
     waitingForMeeting.waitFor({ timeout: 20_000 }).then(() => "waiting-for-meeting" as const),
   ]);
 
-  if (result === "waiting" || result === "waiting-for-meeting") {
+  if (result === "waiting") {
     return "waiting";
+  }
+
+  if (result === "waiting-for-meeting") {
+    return "waiting-for-meeting";
   }
 
   // Step 3: click Join/Start Meeting
@@ -140,7 +144,7 @@ test.describe("Two users in a meeting", () => {
 
       if (guestResult === "waiting") {
         // Host needs to admit guest from the waiting room.
-        // Wait for the admit button to appear (list starts expanded, polls every 2s)
+        // Wait for the admit button to appear (pushed via WebSocket/NATS notification)
         const admitButton = hostPage.getByTitle("Admit").first();
         await expect(admitButton).toBeVisible({ timeout: 20_000 });
         await hostPage.waitForTimeout(1000);

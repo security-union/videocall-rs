@@ -41,6 +41,10 @@ pub struct MeetingPacket {
     pub creator_id: ::std::string::String,
     // @@protoc_insertion_point(field:MeetingPacket.participant_count)
     pub participant_count: i64,
+    // @@protoc_insertion_point(field:MeetingPacket.target_email)
+    pub target_email: ::std::string::String,
+    // @@protoc_insertion_point(field:MeetingPacket.room_token)
+    pub room_token: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:MeetingPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -58,7 +62,7 @@ impl MeetingPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(6);
+        let mut fields = ::std::vec::Vec::with_capacity(8);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "event_type",
@@ -89,6 +93,16 @@ impl MeetingPacket {
             "participant_count",
             |m: &MeetingPacket| { &m.participant_count },
             |m: &mut MeetingPacket| { &mut m.participant_count },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "target_email",
+            |m: &MeetingPacket| { &m.target_email },
+            |m: &mut MeetingPacket| { &mut m.target_email },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "room_token",
+            |m: &MeetingPacket| { &m.room_token },
+            |m: &mut MeetingPacket| { &mut m.room_token },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MeetingPacket>(
             "MeetingPacket",
@@ -126,6 +140,12 @@ impl ::protobuf::Message for MeetingPacket {
                 48 => {
                     self.participant_count = is.read_int64()?;
                 },
+                58 => {
+                    self.target_email = is.read_string()?;
+                },
+                66 => {
+                    self.room_token = is.read_string()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -156,6 +176,12 @@ impl ::protobuf::Message for MeetingPacket {
         if self.participant_count != 0 {
             my_size += ::protobuf::rt::int64_size(6, self.participant_count);
         }
+        if !self.target_email.is_empty() {
+            my_size += ::protobuf::rt::string_size(7, &self.target_email);
+        }
+        if !self.room_token.is_empty() {
+            my_size += ::protobuf::rt::string_size(8, &self.room_token);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -180,6 +206,12 @@ impl ::protobuf::Message for MeetingPacket {
         if self.participant_count != 0 {
             os.write_int64(6, self.participant_count)?;
         }
+        if !self.target_email.is_empty() {
+            os.write_string(7, &self.target_email)?;
+        }
+        if !self.room_token.is_empty() {
+            os.write_string(8, &self.room_token)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -203,6 +235,8 @@ impl ::protobuf::Message for MeetingPacket {
         self.message.clear();
         self.creator_id.clear();
         self.participant_count = 0;
+        self.target_email.clear();
+        self.room_token.clear();
         self.special_fields.clear();
     }
 
@@ -214,6 +248,8 @@ impl ::protobuf::Message for MeetingPacket {
             message: ::std::string::String::new(),
             creator_id: ::std::string::String::new(),
             participant_count: 0,
+            target_email: ::std::string::String::new(),
+            room_token: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -252,6 +288,14 @@ pub mod meeting_packet {
         PARTICIPANT_JOINED = 3,
         // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.PARTICIPANT_LEFT)
         PARTICIPANT_LEFT = 4,
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.MEETING_ACTIVATED)
+        MEETING_ACTIVATED = 5,
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.PARTICIPANT_ADMITTED)
+        PARTICIPANT_ADMITTED = 6,
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.PARTICIPANT_REJECTED)
+        PARTICIPANT_REJECTED = 7,
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.WAITING_ROOM_UPDATED)
+        WAITING_ROOM_UPDATED = 8,
     }
 
     impl ::protobuf::Enum for MeetingEventType {
@@ -268,6 +312,10 @@ pub mod meeting_packet {
                 2 => ::std::option::Option::Some(MeetingEventType::MEETING_ENDED),
                 3 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_JOINED),
                 4 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_LEFT),
+                5 => ::std::option::Option::Some(MeetingEventType::MEETING_ACTIVATED),
+                6 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_ADMITTED),
+                7 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_REJECTED),
+                8 => ::std::option::Option::Some(MeetingEventType::WAITING_ROOM_UPDATED),
                 _ => ::std::option::Option::None
             }
         }
@@ -279,6 +327,10 @@ pub mod meeting_packet {
                 "MEETING_ENDED" => ::std::option::Option::Some(MeetingEventType::MEETING_ENDED),
                 "PARTICIPANT_JOINED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_JOINED),
                 "PARTICIPANT_LEFT" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_LEFT),
+                "MEETING_ACTIVATED" => ::std::option::Option::Some(MeetingEventType::MEETING_ACTIVATED),
+                "PARTICIPANT_ADMITTED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_ADMITTED),
+                "PARTICIPANT_REJECTED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_REJECTED),
+                "WAITING_ROOM_UPDATED" => ::std::option::Option::Some(MeetingEventType::WAITING_ROOM_UPDATED),
                 _ => ::std::option::Option::None
             }
         }
@@ -289,6 +341,10 @@ pub mod meeting_packet {
             MeetingEventType::MEETING_ENDED,
             MeetingEventType::PARTICIPANT_JOINED,
             MeetingEventType::PARTICIPANT_LEFT,
+            MeetingEventType::MEETING_ACTIVATED,
+            MeetingEventType::PARTICIPANT_ADMITTED,
+            MeetingEventType::PARTICIPANT_REJECTED,
+            MeetingEventType::WAITING_ROOM_UPDATED,
         ];
     }
 
@@ -318,52 +374,20 @@ pub mod meeting_packet {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1atypes/meeting_packet.proto\"\xfd\x02\n\rMeetingPacket\x12>\n\neven\
+    \n\x1atypes/meeting_packet.proto\"\xc0\x03\n\rMeetingPacket\x12>\n\neven\
     t_type\x18\x01\x20\x01(\x0e2\x1f.MeetingPacket.MeetingEventTypeR\teventT\
     ype\x12\x17\n\x07room_id\x18\x02\x20\x01(\tR\x06roomId\x12\"\n\rstart_ti\
     me_ms\x18\x03\x20\x01(\x04R\x0bstartTimeMs\x12\x18\n\x07message\x18\x04\
     \x20\x01(\tR\x07message\x12\x1d\n\ncreator_id\x18\x05\x20\x01(\tR\tcreat\
     orId\x12+\n\x11participant_count\x18\x06\x20\x01(\x03R\x10participantCou\
-    nt\"\x88\x01\n\x10MeetingEventType\x12\x1e\n\x1aMEETING_EVENT_TYPE_UNKNO\
-    WN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\x01\x12\x11\n\rMEETING_ENDED\
-    \x10\x02\x12\x16\n\x12PARTICIPANT_JOINED\x10\x03\x12\x14\n\x10PARTICIPAN\
-    T_LEFT\x10\x04J\xf8\x06\n\x06\x12\x04\0\0\x16\x01\n\x08\n\x01\x0c\x12\
-    \x03\0\0\x12\nH\n\x02\x04\0\x12\x04\x03\0\x16\x01\x1a<\x20Meeting\x20lif\
-    ecycle\x20messages\x20sent\x20between\x20server\x20and\x20clients\n\n\n\
-    \n\x03\x04\0\x01\x12\x03\x03\x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x04\
-    \x02\x0e\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x04\x07\x17\n\r\n\x06\
-    \x04\0\x04\0\x02\0\x12\x03\x05\x04#\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\
-    \x12\x03\x05\x04\x1e\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x05!\"\nF\
-    \n\x06\x04\0\x04\0\x02\x01\x12\x03\x07\x04\x18\x1a7\x20Meeting\x20starte\
-    d\x20-\x20sent\x20to\x20participants\x20when\x20they\x20join\n\n\x0e\n\
-    \x07\x04\0\x04\0\x02\x01\x01\x12\x03\x07\x04\x13\n\x0e\n\x07\x04\0\x04\0\
-    \x02\x01\x02\x12\x03\x07\x16\x17\nQ\n\x06\x04\0\x04\0\x02\x02\x12\x03\t\
-    \x04\x16\x1aB\x20Meeting\x20ended\x20-\x20sent\x20when\x20host\x20leaves\
-    \x20or\x20last\x20participant\x20leaves\n\n\x0e\n\x07\x04\0\x04\0\x02\
-    \x02\x01\x12\x03\t\x04\x11\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\x03\t\
-    \x14\x15\n/\n\x06\x04\0\x04\0\x02\x03\x12\x03\x0b\x04\x1b\x1a\x20\x20Par\
-    ticipant\x20joined\x20the\x20meeting\n\n\x0e\n\x07\x04\0\x04\0\x02\x03\
-    \x01\x12\x03\x0b\x04\x16\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\x03\x0b\
-    \x19\x1a\n-\n\x06\x04\0\x04\0\x02\x04\x12\x03\r\x04\x19\x1a\x1e\x20Parti\
-    cipant\x20left\x20the\x20meeting\n\n\x0e\n\x07\x04\0\x04\0\x02\x04\x01\
-    \x12\x03\r\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x04\x02\x12\x03\r\x17\x18\
-    \n\x0b\n\x04\x04\0\x02\0\x12\x03\x10\x02\"\n\x0c\n\x05\x04\0\x02\0\x06\
-    \x12\x03\x10\x02\x12\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x10\x13\x1d\n\
-    \x0c\n\x05\x04\0\x02\0\x03\x12\x03\x10\x20!\n\x0b\n\x04\x04\0\x02\x01\
-    \x12\x03\x11\x02\x15\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x11\x02\x08\n\
-    \x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x11\t\x10\n\x0c\n\x05\x04\0\x02\x01\
-    \x03\x12\x03\x11\x13\x14\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x12\x02\x1b\n\
-    \x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x12\x02\x08\n\x0c\n\x05\x04\0\x02\
-    \x02\x01\x12\x03\x12\t\x16\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x12\x19\
-    \x1a\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x13\x02\x15\n\x0c\n\x05\x04\0\x02\
-    \x03\x05\x12\x03\x13\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x13\t\
-    \x10\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x13\x13\x14\n\x0b\n\x04\x04\0\
-    \x02\x04\x12\x03\x14\x02\x18\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\x14\
-    \x02\x08\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\x14\t\x13\n\x0c\n\x05\x04\
-    \0\x02\x04\x03\x12\x03\x14\x16\x17\n\x0b\n\x04\x04\0\x02\x05\x12\x03\x15\
-    \x02\x1e\n\x0c\n\x05\x04\0\x02\x05\x05\x12\x03\x15\x02\x07\n\x0c\n\x05\
-    \x04\0\x02\x05\x01\x12\x03\x15\x08\x19\n\x0c\n\x05\x04\0\x02\x05\x03\x12\
-    \x03\x15\x1c\x1db\x06proto3\
+    nt\x12!\n\x0ctarget_email\x18\x07\x20\x01(\tR\x0btargetEmail\x12\x1d\n\n\
+    room_token\x18\x08\x20\x01(\tR\troomToken\"\xd8\x01\n\x10MeetingEventTyp\
+    e\x12\x1e\n\x1aMEETING_EVENT_TYPE_UNKNOWN\x10\0\x12\x13\n\x0fMEETING_ST\
+    ARTED\x10\x01\x12\x11\n\rMEETING_ENDED\x10\x02\x12\x16\n\x12PARTICIPANT\
+    _JOINED\x10\x03\x12\x14\n\x10PARTICIPANT_LEFT\x10\x04\x12\x15\n\x11MEET\
+    ING_ACTIVATED\x10\x05\x12\x18\n\x14PARTICIPANT_ADMITTED\x10\x06\x12\x18\n\
+    \x14PARTICIPANT_REJECTED\x10\x07\x12\x19\n\x15WAITING_ROOM_UPDATED\x10\
+    \x08b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

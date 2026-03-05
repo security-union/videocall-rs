@@ -683,6 +683,7 @@ mod tests {
             nats_client.clone(),
             tracker_sender.clone(),
             session_manager.clone(),
+            false,
         );
 
         let session2 = SessionLogic::new(
@@ -692,6 +693,7 @@ mod tests {
             nats_client.clone(),
             tracker_sender.clone(),
             session_manager.clone(),
+            false,
         );
 
         // Verify they have different session IDs

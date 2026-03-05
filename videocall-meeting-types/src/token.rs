@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 ///   "room_join": true,
 ///   "is_host": true,
 ///   "display_name": "Alice",
+///   "observer": false,
 ///   "exp": 1707004800,
 ///   "iss": "videocall-meeting-backend"
 /// }
@@ -53,6 +54,12 @@ pub struct RoomAccessTokenClaims {
 
     /// Participant's chosen display name for this meeting.
     pub display_name: String,
+
+    /// Whether this token grants observer-only access (no media publishing).
+    /// Observer tokens are issued to participants waiting for meeting activation
+    /// or waiting-room admission so they can receive push notifications.
+    #[serde(default)]
+    pub observer: bool,
 
     /// Expiration timestamp (Unix seconds).
     /// Token is rejected after this time.

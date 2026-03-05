@@ -119,15 +119,28 @@ pub struct VideoCallClientOptions {
 
     /// Callback triggered when the meeting ends (optional)
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
+
+    // Session ID for the meeting
+    pub session_id: String,
+
+    // Display name for the user
+    pub display_name: String,
+
+    /// Callback triggered when a peer's display name changes (optional)
+    pub on_peer_display_name_changed: Option<Callback<(String, String)>>,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct InnerOptions {
     enable_e2ee: bool,
     userid: String,
+    session_id: String,
+    display_name: RefCell<String>,
     on_peer_added: Callback<String>,
     on_meeting_info: Option<Callback<f64>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
+    on_peer_display_name_changed: Option<Callback<(String, String)>>,
 }
 
 #[derive(Debug)]
@@ -239,9 +252,12 @@ impl VideoCallClient {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
                     userid: options.userid.clone(),
+                    session_id: options.session_id.clone(),
+                    display_name: RefCell::new(options.display_name.clone()),
                     on_peer_added: options.on_peer_added.clone(),
                     on_meeting_ended: options.on_meeting_ended.clone(),
                     on_meeting_info: options.on_meeting_info.clone(),
+                    on_peer_display_name_changed: options.on_peer_display_name_changed.clone(),
                 },
                 connection_controller: None,
                 connection_state: ConnectionState::Failed {
@@ -335,6 +351,8 @@ impl VideoCallClient {
                 Vec::new() // Empty if WebTransport is disabled
             },
             userid: self.options.userid.clone(),
+            session_id: self.options.session_id.clone(),
+            display_name: self.options.display_name.clone(),
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {
@@ -431,10 +449,7 @@ impl VideoCallClient {
         websocket_urls: Vec<String>,
         webtransport_urls: Vec<String>,
     ) {
-        info!(
-            "Updating server URLs: ws={:?}, wt={:?}",
-            websocket_urls, webtransport_urls
-        );
+        info!("Updating server URLs: ws={websocket_urls:?}, wt={webtransport_urls:?}");
         self.options.websocket_urls = websocket_urls;
         self.options.webtransport_urls = webtransport_urls;
     }
@@ -452,6 +467,9 @@ impl VideoCallClient {
                 if let Some(cb) = opts.on_peer_removed.as_ref() {
                     peer_decode_manager.on_peer_removed = cb.clone();
                 }
+                if let Some(cb) = &opts.on_peer_display_name_changed {
+                    peer_decode_manager.on_peer_display_name_changed = cb.clone();
+                }
                 peer_decode_manager
             }
             None => {
@@ -461,6 +479,9 @@ impl VideoCallClient {
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
                 if let Some(cb) = opts.on_peer_removed.as_ref() {
                     peer_decode_manager.on_peer_removed = cb.clone();
+                }
+                if let Some(cb) = &opts.on_peer_display_name_changed {
+                    peer_decode_manager.on_peer_display_name_changed = cb.clone();
                 }
                 peer_decode_manager
             }
@@ -538,11 +559,26 @@ impl VideoCallClient {
             Ok(inner) => inner
                 .peer_decode_manager
                 .get(&sid)
-                .map(|peer| peer.email.clone()),
+                .map(|peer| peer.session_id.clone()),
+            Err(_) => {
+                warn!("Failed to borrow inner in get_peer_email for session_id: {session_id}");
+                None
+            }
+        }
+    }
+
+    /// Returns the current display name for a peer (updated via heartbeat).
+    /// Falls back to the session_id string if no display name is set yet.
+    pub fn get_peer_display_name(&self, session_id: &str) -> Option<String> {
+        let sid: u64 = session_id.parse().ok()?;
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .peer_decode_manager
+                .get(&sid)
+                .map(|peer| peer.display_name.clone()),
             Err(_) => {
                 warn!(
-                    "Failed to borrow inner in get_peer_email for session_id: {}",
-                    session_id
+                    "Failed to borrow inner in get_peer_display_name for session_id: {session_id}"
                 );
                 None
             }
@@ -857,6 +893,43 @@ impl VideoCallClient {
             }
         }
     }
+
+    /// Update the display name and broadcast to all peers
+    pub fn update_display_name(&self, new_name: &str) -> Result<()> {
+        log::info!("update_display_name called with: {new_name}");
+
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                log::info!("Successfully borrowed inner");
+                *inner.options.display_name.borrow_mut() = new_name.to_string();
+
+                if let Some(connection_controller) = &inner.connection_controller {
+                    // Update the connection's display_name so future heartbeats carry the new name
+                    connection_controller.set_display_name(new_name.to_string());
+                    log::info!("Updated connection display_name to: {new_name}");
+                } else {
+                    log::warn!("No connection_controller available!");
+                }
+
+                info!("Sent display name update: {new_name}");
+            }
+            Err(e) => {
+                log::error!("Failed to borrow inner: {e:?}");
+                return Err(anyhow::anyhow!("Failed to borrow inner"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the current display name
+    pub fn display_name(&self) -> String {
+        if let Ok(inner) = self.inner.try_borrow() {
+            return inner.options.display_name.borrow().clone();
+        }
+
+        String::new()
+    }
 }
 
 impl Inner {
@@ -867,6 +940,9 @@ impl Inner {
             response.email,
             response.session_id
         );
+
+        // Save email before response is moved into the match below.
+        let peer_email = response.email.clone();
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
         let peer_status = if response.email == SYSTEM_USER_EMAIL || response.session_id == 0 {
@@ -881,7 +957,7 @@ impl Inner {
                     return;
                 }
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                    debug!("Decrypted AES_KEY from {}", response.email);
+                    debug!("Decrypted AES_KEY from {}", response.session_id);
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
                             if let Err(e) = self.peer_decode_manager.set_peer_aes(
@@ -941,19 +1017,21 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEDIA) => {
-                let peer_session_id = response.session_id;
+                let session_id_u64 = response.session_id;
 
+                // RTT responses are now handled directly by the ConnectionManager via individual connection callbacks
+                // No need to process them here anymore
                 if let Err(e) = self
                     .peer_decode_manager
                     .decode(response, &self.options.userid)
                 {
                     error!("error decoding packet: {e}");
                     match e {
-                        PeerDecodeError::SameUserPacket(session_id) => {
-                            debug!("Rejecting packet from same user: {session_id}");
+                        PeerDecodeError::SameUserPacket(sid) => {
+                            debug!("Rejecting packet from same user: {sid}");
                         }
                         _ => {
-                            self.peer_decode_manager.delete_peer(peer_session_id);
+                            self.peer_decode_manager.delete_peer(session_id_u64);
                         }
                     }
                 }
@@ -1036,6 +1114,12 @@ impl Inner {
                             meeting_packet.room_id, meeting_packet.participant_count
                         );
                     }
+                    Ok(MeetingEventType::NAME_UPDATED) => {
+                        debug!(
+                            "Received NAME_UPDATED meeting event: room={}",
+                            meeting_packet.room_id
+                        );
+                    }
                     Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
                         error!(
                             "Received meeting packet with unknown event type: room={}",
@@ -1057,11 +1141,16 @@ impl Inner {
                 );
             }
             Err(e) => {
-                error!("Failed to parse packet type: {e}");
+                error!("Failed to parse packet: {e}");
             }
         }
         if let PeerStatus::Added(peer_session_id) = peer_status {
             self.options.on_peer_added.emit(peer_session_id.to_string());
+            // Pre-populate display name with email as a readable fallback
+            // until the first heartbeat arrives with the real display_name.
+            self.peer_decode_manager
+                .on_peer_display_name_changed
+                .emit((peer_session_id.to_string(), peer_email.clone()));
             self.send_public_key();
         }
     }

@@ -1,6 +1,6 @@
 -- migrate:up
--- Drop the existing unique constraint on room_id
-ALTER TABLE meetings DROP CONSTRAINT IF EXISTS meetings_room_id_key;
+-- Drop the existing unique constraint on room_id (CASCADE to drop dependent objects)
+ALTER TABLE meetings DROP CONSTRAINT IF EXISTS meetings_room_id_key CASCADE;
 
 -- Create a partial unique index that only applies to non-deleted meetings
 -- This allows the same room_id to be reused after a meeting is deleted

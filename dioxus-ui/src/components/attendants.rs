@@ -203,11 +203,7 @@ pub fn AttendantsComponent(
 
         let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &email, &id);
 
-        log::info!(
-            "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
-            email,
-            id
-        );
+        log::info!("DIOXUS-UI: Creating VideoCallClient for {email} in meeting {id}");
 
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
@@ -299,6 +295,9 @@ pub fn AttendantsComponent(
                     meeting_ended_message.set(Some(message));
                 },
             )),
+            session_id: String::new(),
+            display_name: String::new(),
+            on_peer_display_name_changed: None,
         };
 
         let client = VideoCallClient::new(opts);
@@ -389,7 +388,7 @@ pub fn AttendantsComponent(
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
-        format!("{}/meeting/{}", origin, id)
+        format!("{origin}/meeting/{id}")
     };
 
     let is_allowed = users_allowed_to_stream().unwrap_or_default();

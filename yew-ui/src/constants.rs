@@ -106,7 +106,7 @@ pub fn split_users(s: Option<&str>) -> Vec<String> {
 // Removed lazy statics for runtime config. Use function accessors below.
 
 pub fn login_url() -> Result<String, String> {
-    meeting_api_base_url().map(|url| format!("{}/login", url))
+    meeting_api_base_url().map(|url| format!("{url}/login"))
 }
 pub fn actix_websocket_base() -> Result<String, String> {
     app_config().map(|c| c.ws_url)
@@ -134,6 +134,9 @@ pub fn users_allowed_to_stream() -> Result<Vec<String>, String> {
 pub fn server_election_period_ms() -> Result<u64, String> {
     app_config().map(|c| c.server_election_period_ms)
 }
+
+/// Local storage key for session ID
+pub const SESSION_ID_KEY: &str = "vc_session_id";
 
 /// Returns the configured OAuth provider hint (e.g. "google", "okta").
 /// Returns `None` when unset — the login screen shows a generic "Sign in" button.

@@ -122,8 +122,8 @@ pub fn generate_for_peer(
 
     let ss_div_mobile = (*screen_share_div_id).clone();
     let ss_div_pin = (*screen_share_div_id).clone();
-    let ss_canvas_crop = format!("screen-share-{}", key);
-    let ss_name = format!("{}-screen", peer_email);
+    let ss_canvas_crop = format!("screen-share-{key}");
+    let ss_name = format!("{peer_email}-screen");
 
     let pv_div_mobile = (*peer_video_div_id).clone();
     let pv_div_pin = (*peer_video_div_id).clone();
@@ -245,7 +245,7 @@ fn UserVideo(id: String, hidden: bool) -> Element {
 #[component]
 fn ScreenCanvas(peer_id: String) -> Element {
     let client = use_context::<VideoCallClientCtx>();
-    let canvas_id = format!("screen-share-{}", peer_id);
+    let canvas_id = format!("screen-share-{peer_id}");
     let canvas_id_for_effect = canvas_id.clone();
     let peer_id_for_effect = peer_id.clone();
 

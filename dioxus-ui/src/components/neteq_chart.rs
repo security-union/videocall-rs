@@ -161,7 +161,7 @@ fn BaseChart(config: ChartConfig, data_len: usize, width: u32, height: u32) -> E
     let half_max = format!("{:.1}", config.max_value / 2.0);
     let max_str = format!("{:.1}", config.max_value);
     let mid_time = format!("{}s", data_len / 2);
-    let max_time = format!("{}s", data_len);
+    let max_time = format!("{data_len}s");
     let rotate_transform = format!("rotate(-90, 5, {})", margin_top + plot_height / 2.0);
     let view_box = format!("0 0 {width} {height}");
     let cx2 = (chart_width / 2.0).to_string();
@@ -287,7 +287,7 @@ pub fn NetEqChart(data: Vec<u64>, chart_type: ChartType, width: u32, height: u32
     let ch1 = (chart_height - 1.0).to_string();
     let cw20 = (chart_width - 20.0).to_string();
     let view_box = format!("0 0 {width} {height}");
-    let time_label = format!("{}s", time_span);
+    let time_label = format!("{time_span}s");
 
     rsx! {
         div { class: "neteq-chart",

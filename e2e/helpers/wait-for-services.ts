@@ -25,14 +25,19 @@ export async function waitForServices(): Promise<void> {
   const deadline = Date.now() + MAX_WAIT_MS;
 
   for (const svc of services) {
-    process.stdout.write(`Waiting for ${svc.name} at ${svc.url}...`);
+    console.log(`Waiting for ${svc.name} at ${svc.url}...`);
+    let attempts = 0;
     while (Date.now() < deadline) {
       if (await probe(svc.url)) {
-        process.stdout.write(" ready\n");
+        console.log(`${svc.name} ready after ${attempts} attempts`);
         break;
       }
+      attempts++;
+      if (attempts % 5 === 0) {
+        const elapsed = Math.round((MAX_WAIT_MS - (deadline - Date.now())) / 1000);
+        console.log(`  still waiting for ${svc.name}... (${elapsed}s elapsed)`);
+      }
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-      process.stdout.write(".");
     }
     if (Date.now() >= deadline) {
       throw new Error(

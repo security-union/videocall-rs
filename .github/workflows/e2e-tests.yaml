@@ -28,32 +28,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clean up Docker resources
-        run: docker system prune -f --volumes
-
-      - name: Build E2E stack
-        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
-
-      - name: Start E2E stack
-        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: e2e/package-lock.json
 
-      - name: Install E2E dependencies
-        working-directory: e2e
-        run: npm ci
-
-      - name: Install Playwright browsers
+      - name: Install Playwright system deps
         working-directory: e2e
         run: npx playwright install --with-deps chromium
 
-      - name: Run E2E tests
-        working-directory: e2e
-        run: npx playwright test
+      - name: Run E2E pipeline
+        run: make e2e-ci
 
       - name: Upload test report
         uses: actions/upload-artifact@v4
@@ -67,6 +53,6 @@ jobs:
         if: failure()
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml logs
 
-      - name: Teardown
+      - name: Teardown (safety net)
         if: always()
-        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down -v
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down -v || true

@@ -20,6 +20,7 @@ pub type ParticipantStatus = JoinMeetingResponse;
 #[component]
 pub fn WaitingRoom(
     meeting_id: String,
+    email: String,
     observer_token: String,
     on_admitted: EventHandler<ParticipantStatus>,
     on_rejected: EventHandler<()>,
@@ -33,6 +34,7 @@ pub fn WaitingRoom(
     {
         let observer_token = observer_token.clone();
         let meeting_id = meeting_id.clone();
+        let email = email.clone();
         use_effect(move || {
             if observer_token.is_empty() {
                 log::warn!("WaitingRoom: no observer token, push notifications unavailable");
@@ -56,7 +58,7 @@ pub fn WaitingRoom(
             let meeting_id_for_fetch = meeting_id.clone();
 
             let opts = VideoCallClientOptions {
-                userid: format!("observer-{meeting_id}"),
+                userid: email.clone(),
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,

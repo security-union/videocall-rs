@@ -31,6 +31,9 @@ pub type JoinMeetingResponse = ParticipantStatusResponse;
 #[derive(Properties, Clone, PartialEq)]
 pub struct WaitingRoomProps {
     pub meeting_id: String,
+    /// The authenticated user's email, used as the observer `userid` so
+    /// the server can match push-notification `target_email` to this client.
+    pub email: String,
     /// Observer JWT token for receiving push notifications.
     #[prop_or_default]
     pub observer_token: Option<String>,
@@ -48,6 +51,7 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
     {
         let observer_token = props.observer_token.clone();
         let meeting_id = props.meeting_id.clone();
+        let email = props.email.clone();
         let on_admitted = props.on_admitted.clone();
         let on_rejected = props.on_rejected.clone();
 
@@ -68,7 +72,7 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                 let meeting_id_for_fetch = meeting_id.clone();
 
                 let opts = VideoCallClientOptions {
-                    userid: "observer".to_string(),
+                    userid: email.clone(),
                     meeting_id: meeting_id.clone(),
                     websocket_urls: observer_ws_urls,
                     webtransport_urls: observer_wt_urls,

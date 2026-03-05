@@ -168,8 +168,13 @@ pub fn MeetingPage(id: String) -> Element {
                 .map(&lobby_url)
                 .collect();
 
+            // Use the user's email as userid so the server can match
+            // push-notification `target_email` to this observer client.
+            let email_for_userid = current_user_email()
+                .unwrap_or_else(|| display_name.clone());
+
             let opts = VideoCallClientOptions {
-                userid: display_name.clone(),
+                userid: email_for_userid,
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,
@@ -474,6 +479,7 @@ pub fn MeetingPage(id: String) -> Element {
             (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {
                 WaitingRoom {
                     meeting_id: id.clone(),
+                    email: current_user_email().unwrap_or_default(),
                     observer_token: observer_token.clone(),
                     on_admitted: on_admitted,
                     on_rejected: on_rejected,

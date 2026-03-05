@@ -184,8 +184,13 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     .map(|base| format!("{base}/lobby?token={token}"))
                     .collect();
 
+                // Use the user's email as userid so the server can match
+                // push-notification `target_email` to this observer client.
+                let email_for_userid = (*current_user_email).clone()
+                    .unwrap_or_else(|| display_name.clone());
+
                 let opts = VideoCallClientOptions {
-                    userid: "observer".to_string(),
+                    userid: email_for_userid,
                     meeting_id: meeting_id.clone(),
                     websocket_urls: observer_ws_urls,
                     webtransport_urls: observer_wt_urls,
@@ -590,6 +595,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         html! {
                             <WaitingRoom
                                 meeting_id={props.id.clone()}
+                                email={(*current_user_email).clone().unwrap_or_default()}
                                 observer_token={observer_token.clone()}
                                 on_admitted={on_admitted}
                                 on_rejected={on_rejected}

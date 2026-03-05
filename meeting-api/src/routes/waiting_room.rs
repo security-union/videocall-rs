@@ -28,13 +28,13 @@ use crate::error::AppError;
 use crate::nats_events;
 use crate::state::AppState;
 
-/// Verify that the requester is an admitted participant (authorization check).
-async fn require_admitted(state: &AppState, meeting_id: i32, email: &str) -> Result<(), AppError> {
+/// Verify that the requester is the meeting host (authorization check).
+async fn require_host(state: &AppState, meeting_id: i32, email: &str) -> Result<(), AppError> {
     let row = db_participants::get_status(&state.db, meeting_id, email)
         .await?
         .ok_or_else(AppError::not_host)?;
 
-    if row.status != "admitted" {
+    if row.status != "admitted" || !row.is_host {
         return Err(AppError::not_host());
     }
     Ok(())
@@ -50,7 +50,7 @@ pub async fn get_waiting_room(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_admitted(&state, meeting.id, &email).await?;
+    require_host(&state, meeting.id, &email).await?;
 
     let rows = db_participants::get_waiting(&state.db, meeting.id).await?;
     let waiting: Vec<ParticipantStatusResponse> = rows
@@ -75,7 +75,7 @@ pub async fn admit_participant(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_admitted(&state, meeting.id, &email).await?;
+    require_host(&state, meeting.id, &email).await?;
 
     let row = db_participants::admit(&state.db, meeting.id, &body.email)
         .await?
@@ -99,7 +99,7 @@ pub async fn admit_all(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_admitted(&state, meeting.id, &email).await?;
+    require_host(&state, meeting.id, &email).await?;
 
     let rows = db_participants::admit_all(&state.db, meeting.id).await?;
     let admitted_count = rows.len();
@@ -137,7 +137,7 @@ pub async fn reject_participant(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_admitted(&state, meeting.id, &email).await?;
+    require_host(&state, meeting.id, &email).await?;
 
     let row = db_participants::reject(&state.db, meeting.id, &body.email)
         .await?

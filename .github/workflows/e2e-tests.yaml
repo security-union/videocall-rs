@@ -1,24 +1,9 @@
 name: E2E Tests
 
 on:
-  pull_request:
-    paths:
-      - "e2e/**"
-      - "yew-ui/**"
-      - "actix-api/**"
-      - "meeting-api/**"
-      - "videocall-client/**"
-      - "videocall-types/**"
-      - "videocall-meeting-types/**"
-      - "docker/docker-compose.e2e.yaml"
-      - "docker/Dockerfile.actix.dev"
-      - "docker/Dockerfile.yew.dev"
-      - "flake.nix"
-      - "flake.lock"
   push:
     branches: [main]
-    paths:
-      - "e2e/**"
+  workflow_dispatch:
 
 jobs:
   e2e:

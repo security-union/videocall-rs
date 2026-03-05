@@ -49,6 +49,7 @@ An open-source, ultra-low-latency video conferencing platform and API built with
 - [Testing](#testing)
   - [UI Testing (yew-ui)](#ui-testing-yew-ui)
   - [Backend Testing (actix-api)](#backend-testing-actix-api)
+  - [E2E Testing (Playwright)](#e2e-testing-playwright)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [Project Structure](#project-structure)
@@ -496,6 +497,19 @@ CI runs these tests automatically via `.github/workflows/cargo-test.yaml`,
 triggered on PRs that touch `actix-api/`, `videocall-types/`, or `protobuf/`.
 For the full backend testing guide — including test patterns, database cleanup,
 and how to write new tests — see **[actix-api/TESTING.md](actix-api/TESTING.md)**.
+
+### E2E Testing (Playwright)
+
+Full browser-based end-to-end tests using [Playwright](https://playwright.dev/).
+Tests run against both the **Dioxus UI** and **Yew UI** simultaneously, verifying
+meeting flows with real browsers. Authentication is bypassed via JWT cookie
+injection — no OAuth setup needed.
+
+The E2E stack is defined in `docker/docker-compose.e2e.yaml` and uses the same
+Nix-based dev Dockerfiles as CI. Tests run automatically on pushes to `main` and
+can be triggered manually from the GitHub Actions page.
+
+See the `e2e-*` targets in the `Makefile` for available commands.
 
 ## Roadmap
 

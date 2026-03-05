@@ -308,10 +308,9 @@ mod tests {
         let production_jwt =
             generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
         // Even with a valid JWT, the wrong cookie name must be rejected.
-        let err =
-            extract_with_cookie_and_state(Some(&format!("session={production_jwt}")), &state)
-                .await
-                .unwrap_err();
+        let err = extract_with_cookie_and_state(Some(&format!("session={production_jwt}")), &state)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
@@ -335,7 +334,9 @@ mod tests {
         // "session" appears as a prefix of "pr1-session" in the cookie header —
         // verify we match the full name and don't accidentally split on it.
         let auth = extract_with_cookie_and_state(
-            Some(&format!("lang=en; session=garbage; pr1-session={jwt}; theme=dark")),
+            Some(&format!(
+                "lang=en; session=garbage; pr1-session={jwt}; theme=dark"
+            )),
             &state,
         )
         .await

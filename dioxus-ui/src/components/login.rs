@@ -24,17 +24,13 @@ pub fn do_login() {
             // Prefer sessionStorage — the meeting page stores the return URL there
             // before navigating to /login, because Dioxus 0.7's router strips
             // unrecognized query params via history.replaceState on boot.
-            let stored_return_to = window()
-                .session_storage()
-                .ok()
-                .flatten()
-                .and_then(|s| {
-                    let val = s.get_item("vc_oauth_return_to").ok().flatten();
-                    if val.is_some() {
-                        let _ = s.remove_item("vc_oauth_return_to");
-                    }
-                    val
-                });
+            let stored_return_to = window().session_storage().ok().flatten().and_then(|s| {
+                let val = s.get_item("vc_oauth_return_to").ok().flatten();
+                if val.is_some() {
+                    let _ = s.remove_item("vc_oauth_return_to");
+                }
+                val
+            });
 
             if let Some(return_to) = stored_return_to {
                 url = format!("{url}?returnTo={}", urlencoding::encode(&return_to));

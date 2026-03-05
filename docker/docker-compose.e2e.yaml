@@ -1,0 +1,204 @@
+##
+## E2E test stack — reuses the same dev Dockerfiles as CI.
+## Starts the minimum services needed for Playwright E2E tests.
+## Both dioxus-ui (port 3001) and yew-ui (port 80) run simultaneously.
+##
+## Usage:
+##   docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
+##   cd e2e && npx playwright test
+##   docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down -v
+##
+
+services:
+  postgres:
+    image: postgres:12
+    environment:
+      POSTGRES_PASSWORD: "docker"
+      PGPASSWORD: "docker"
+      POSTGRES_DB: "actix-api-db"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "--http_port", "8222"]
+
+  meeting-api:
+    build:
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
+    working_dir: /app/meeting-api
+    command: >
+      nix develop /app#backend-dev --command bash -c
+      "/app/dbmate/startup.sh && cargo run --bin meeting-api"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - LISTEN_ADDR=0.0.0.0:8081
+      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - JWT_SECRET=dev-jwt-secret-change-me
+      - TOKEN_TTL_SECS=60
+      - SESSION_TTL_SECS=315360000
+      - COOKIE_SECURE=false
+      - COOKIE_DOMAIN=
+      - CORS_ALLOWED_ORIGIN=
+      - OAUTH_CLIENT_ID=
+      - OAUTH_SECRET=
+      - OAUTH_REDIRECT_URL=
+      - OAUTH_ISSUER=
+      - OAUTH_AUTH_URL=
+      - OAUTH_TOKEN_URL=
+      - OAUTH_JWKS_URL=
+      - OAUTH_USERINFO_URL=
+      - AFTER_LOGIN_URL=http://localhost:80
+      - ALLOWED_REDIRECT_URLS=http://localhost:80,http://localhost:3001
+      - RUST_LOG=info
+      - CARGO_TARGET_DIR=/app/meeting-api/target
+      - CARGO_INCREMENTAL=1
+    ports:
+      - "8081:8081"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - nix-store-e2e-meeting-api:/nix
+      - e2e-meeting-api-registry:/root/.cargo/registry
+      - e2e-meeting-api-git:/root/.cargo/git
+      - e2e-meeting-api-target:/app/meeting-api/target
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+
+  websocket-api:
+    build:
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
+    working_dir: /app/actix-api
+    command: >
+      nix develop /app#backend-dev --command bash -c
+      "cargo run --bin websocket_server"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - ACTIX_PORT=8080
+      - UI_ENDPOINT=http://localhost:80
+      - DATABASE_ENABLED=false
+      - RUST_LOG=info
+      - NATS_URL=nats:4222
+      - REGION=us-east
+      - SERVER_ID=server-1
+      - SERVICE_TYPE=websocket
+      - FEATURE_MEETING_MANAGEMENT=false
+      - JWT_SECRET=dev-jwt-secret-change-me
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+      - LOGIN_URL=
+      - ACTIX_UI_BACKEND_URL=
+      - WEBTRANSPORT_HOST=
+    ports:
+      - "8080:8080"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - nix-store-e2e-websocket-api:/nix
+      - e2e-websocket-api-registry:/root/.cargo/registry
+      - e2e-websocket-api-git:/root/.cargo/git
+      - e2e-websocket-api-target:/app/actix-api/target
+    depends_on:
+      - nats
+
+  dioxus-ui:
+    build:
+      dockerfile: docker/Dockerfile.dioxus.dev
+      context: ../
+    working_dir: /app/dioxus-ui
+    command: >
+      nix develop /app#yew-ui --command bash -c
+      "/app/docker/start-dioxus.sh"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - ACTIX_UI_BACKEND_URL=ws://localhost:8080
+      - WEBTRANSPORT_HOST=https://127.0.0.1:4433
+      - TRUNK_SERVE_PORT=3001
+      - ENABLE_OAUTH=false
+      - API_BASE_URL=http://localhost:8081
+      - LOGIN_URL=http://localhost:8081/login
+      - RUSTFLAGS=--cfg=web_sys_unstable_apis
+      - WEBTRANSPORT_ENABLED=false
+      - E2EE_ENABLED=false
+      - FIREFOX_ENABLED=false
+      - USERS_ALLOWED_TO_STREAM=
+      - CARGO_TARGET_DIR=/app/dioxus-ui/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+      - OAUTH_PROVIDER=google
+      - UI_URL=http://localhost:3001
+    ports:
+      - "3001:3001"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - nix-store-e2e-dioxus-ui:/nix
+      - e2e-dioxus-ui-registry:/root/.cargo/registry
+      - e2e-dioxus-ui-git:/root/.cargo/git
+      - e2e-dioxus-ui-target:/app/dioxus-ui/target
+
+  yew-ui:
+    build:
+      dockerfile: docker/Dockerfile.yew.dev
+      context: ../
+    working_dir: /app/yew-ui
+    command: >
+      nix develop /app#yew-ui --command bash -c
+      "/app/docker/start-yew.sh"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - ACTIX_UI_BACKEND_URL=ws://localhost:8080
+      - WEBTRANSPORT_HOST=https://127.0.0.1:4433
+      - TRUNK_SERVE_PORT=80
+      - ENABLE_OAUTH=false
+      - API_BASE_URL=http://localhost:8081
+      - LOGIN_URL=http://localhost:8081/login
+      - RUSTFLAGS=--cfg=web_sys_unstable_apis
+      - WEBTRANSPORT_ENABLED=false
+      - E2EE_ENABLED=false
+      - FIREFOX_ENABLED=false
+      - USERS_ALLOWED_TO_STREAM=
+      - CARGO_TARGET_DIR=/app/yew-ui/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+      - OAUTH_PROVIDER=google
+      - UI_URL=http://localhost:80
+    ports:
+      - "80:80"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - nix-store-e2e-yew-ui:/nix
+      - e2e-yew-ui-registry:/root/.cargo/registry
+      - e2e-yew-ui-git:/root/.cargo/git
+      - e2e-yew-ui-target:/app/yew-ui/target
+
+volumes:
+  nix-store-e2e-meeting-api:
+  e2e-meeting-api-registry:
+  e2e-meeting-api-git:
+  e2e-meeting-api-target:
+  nix-store-e2e-websocket-api:
+  e2e-websocket-api-registry:
+  e2e-websocket-api-git:
+  e2e-websocket-api-target:
+  nix-store-e2e-dioxus-ui:
+  e2e-dioxus-ui-registry:
+  e2e-dioxus-ui-git:
+  e2e-dioxus-ui-target:
+  nix-store-e2e-yew-ui:
+  e2e-yew-ui-registry:
+  e2e-yew-ui-git:
+  e2e-yew-ui-target:

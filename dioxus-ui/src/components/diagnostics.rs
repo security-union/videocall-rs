@@ -561,9 +561,8 @@ pub fn Diagnostics(
                             match m.name {
                                 "stats_json" => {
                                     if let MetricValue::Text(json) = &m.value {
-                                        let entry = neteq_stats
-                                            .entry(target_peer.to_string())
-                                            .or_default();
+                                        let entry =
+                                            neteq_stats.entry(target_peer.to_string()).or_default();
                                         entry.push(json.clone());
                                         if entry.len() > 60 {
                                             entry.remove(0);

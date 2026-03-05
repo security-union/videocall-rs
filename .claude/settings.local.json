@@ -42,7 +42,9 @@
       "Bash(gh pr:*)",
       "Bash(git diff:*)",
       "Bash(cat:*)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(npx playwright:*)",
+      "Bash(node:*)"
     ]
   }
 }

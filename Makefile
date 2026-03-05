@@ -1,6 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
+COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -65,6 +66,55 @@ rebuild:
 rebuild-up:
 		$(COMPOSE) build --no-cache
 		$(COMPOSE) up
+
+# ---------------------------------------------------------------------------
+# E2E tests (Playwright)
+# ---------------------------------------------------------------------------
+
+# Install e2e dependencies and Playwright browsers
+e2e-install:
+	cd e2e && npm ci && npx playwright install chromium
+
+# Build E2E stack images (same dev Dockerfiles as CI)
+e2e-build:
+	$(COMPOSE_E2E) build
+
+# Start the E2E stack (postgres, nats, meeting-api, websocket-api, yew-ui)
+e2e-up:
+	$(COMPOSE_E2E) up -d
+
+# Tear down the E2E stack and remove volumes
+e2e-down:
+	$(COMPOSE_E2E) down -v
+
+# Run e2e tests headless (assumes stack is already up)
+#   make e2e                        — all tests
+#   make e2e SPEC=two-users-meeting — single spec (without .spec.ts)
+e2e:
+	cd e2e && npx playwright test $(if $(SPEC),tests/$(SPEC).spec.ts,)
+
+# Run e2e tests with visible browsers (assumes stack is already up)
+#   make e2e-headed                        — all tests
+#   make e2e-headed SPEC=two-users-meeting — single spec
+e2e-headed:
+	cd e2e && npx playwright test --headed $(if $(SPEC),tests/$(SPEC).spec.ts,)
+
+# Run e2e tests in debug mode (step through in Playwright Inspector)
+e2e-debug:
+	cd e2e && npx playwright test --debug $(if $(SPEC),tests/$(SPEC).spec.ts,)
+
+# Full CI pipeline: build stack, start it, run tests, tear down
+e2e-ci: e2e-build e2e-install
+	$(COMPOSE_E2E) up -d
+	cd e2e && npx playwright test; E2E_EXIT=$$?; cd .. && $(COMPOSE_E2E) down -v; exit $$E2E_EXIT
+
+# Lint + format check + typecheck (same as CI)
+e2e-lint:
+	cd e2e && npm run ci:lint
+
+# Auto-fix lint and formatting issues
+e2e-fmt:
+	cd e2e && npm run lint:fix && npm run format:fix
 
 # ---------------------------------------------------------------------------
 # Yew UI component tests

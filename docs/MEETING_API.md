@@ -14,7 +14,7 @@ The meeting flow:
 2. **Host** joins the meeting, activating it and receiving a **room access token**
 3. **Attendees** request to join and enter the waiting room
 4. **Host** admits or rejects attendees
-5. **Admitted attendees** receive a **room access token** via status polling
+5. **Admitted attendees** receive a push notification via the media server connection, then fetch their **room access token** via `GET /status`
 6. **Clients connect** to the Media Server using their room access token
 7. The Media Server **rejects** any connection without a valid, signed token (when `FEATURE_MEETING_MANAGEMENT=true`)
 
@@ -159,7 +159,8 @@ sequenceDiagram
 
 | Status | Description |
 |--------|-------------|
-| `waiting` | In waiting room, pending approval. No room token issued. |
+| `waiting_for_meeting` | Meeting exists but is not yet active (host hasn't joined). Observer token provided for push notifications. |
+| `waiting` | In waiting room, pending approval. No room token issued. Observer token provided for push notifications. |
 | `admitted` | Approved by host. Room access token available. |
 | `rejected` | Denied entry by host. |
 | `left` | Previously in meeting, now left. |
@@ -412,7 +413,7 @@ POST /api/v1/meetings/{meeting_id}/join
 }
 ```
 
-**Response for attendees (200 OK):**
+**Response for attendees in waiting room (200 OK):**
 ```json
 {
   "success": true,
@@ -423,21 +424,42 @@ POST /api/v1/meetings/{meeting_id}/join
     "is_host": false,
     "joined_at": 1706918500,
     "admitted_at": null,
-    "room_token": null
+    "room_token": null,
+    "observer_token": "eyJhbGciOiJIUzI1NiIs..."
+  }
+}
+```
+
+**Response when meeting is not yet active (200 OK):**
+```json
+{
+  "success": true,
+  "result": {
+    "email": "attendee@example.com",
+    "display_name": "Bob",
+    "status": "waiting_for_meeting",
+    "is_host": false,
+    "joined_at": 1706918500,
+    "admitted_at": null,
+    "room_token": null,
+    "observer_token": "eyJhbGciOiJIUzI1NiIs...",
+    "waiting_room_enabled": true,
+    "host_display_name": null
   }
 }
 ```
 
 > **Rust type**: `APIResponse<ParticipantStatusResponse>`
 
-The `room_token` is only present when `status` is `"admitted"`. Attendees in the waiting room must poll `GET /status` until they receive their token.
+The `room_token` is only present when `status` is `"admitted"`. Attendees receive push notifications via their media server connection (using the `observer_token`) when their status changes. The `observer_token` allows waiting participants to connect to the media server in observer mode to receive these notifications.
+
+> **Note:** When the meeting exists but the host hasn't joined yet, a `waiting_for_meeting` status is returned instead of an error. The client can use the `observer_token` to listen for a `MEETING_ACTIVATED` push notification.
 
 **Errors:**
 
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
-| 400 | `MEETING_NOT_ACTIVE` | Meeting exists but host hasn't joined yet |
 
 > **Note:** If the meeting doesn't exist, it is created automatically with the joining user as the host.
 
@@ -526,7 +548,7 @@ POST /api/v1/meetings/{meeting_id}/admit
 
 > **Rust type**: `APIResponse<ParticipantStatusResponse>`
 
-The admitted participant picks up their `room_token` on their next `GET /status` poll. The `room_token` is `null` in the admit response because the token is delivered to the participant, not to the admitter.
+The admitted participant receives a `PARTICIPANT_ADMITTED` push notification via their media server connection and then fetches their `room_token` via `GET /status`. The `room_token` is `null` in the admit response because the token is delivered to the participant, not to the admitter.
 
 **Errors:**
 
@@ -634,7 +656,7 @@ POST /api/v1/meetings/{meeting_id}/reject
 
 ### Get My Status
 
-Check your current status in a meeting. This is the primary polling endpoint for attendees in the waiting room. When status becomes `admitted`, the response includes the `room_token` needed to connect to the Media Server.
+Check your current status in a meeting. While clients can poll this endpoint, the primary notification mechanism is push via NATS events through the media server connection. When status becomes `admitted`, the response includes the `room_token` needed to connect to the Media Server.
 
 ```
 GET /api/v1/meetings/{meeting_id}/status
@@ -845,20 +867,20 @@ sequenceDiagram
     MS-->>H: Connection established
 
     A->>MB: POST /api/v1/meetings/{id}/join
-    MB-->>A: success: true, result.status: waiting, result.room_token: null
+    MB-->>A: success: true, result.status: waiting, result.observer_token: "ey..."
 
-    loop Poll until admitted
-        A->>MB: GET /api/v1/meetings/{id}/status
-        MB-->>A: success: true, result.status: waiting
-    end
+    A->>MS: GET /lobby?token=observer_token (observer mode)
+    Note over A,MS: Waiting for push notification...
 
     H->>MB: POST /api/v1/meetings/{id}/admit
-    Note over MB: Generate room token for attendee
+    Note over MB: Generate room token, publish NATS event
+    MB->>MS: NATS: PARTICIPANT_ADMITTED
+    MS-->>A: Push notification: admitted
 
     A->>MB: GET /api/v1/meetings/{id}/status
     MB-->>A: success: true, result.status: admitted, result.room_token: "ey..."
 
-    A->>MS: GET /lobby?token=ey...
+    A->>MS: GET /lobby?token=room_token
     MS-->>A: Connection established
 ```
 
@@ -941,7 +963,7 @@ curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/admit \
   -H "Authorization: Bearer $HOST_TOKEN" \
   -d '{"email": "alice@example.com"}'
 
-# 7. Alice polls and receives her room token
+# 7. Alice receives a push notification and fetches her room token
 curl http://localhost:8081/api/v1/meetings/standup-2024/status \
   -H "Authorization: Bearer $ATTENDEE_TOKEN"
 

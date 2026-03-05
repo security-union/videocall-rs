@@ -119,6 +119,19 @@ pub struct VideoCallClientOptions {
 
     /// Callback triggered when the meeting ends (optional)
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
+
+    /// Callback triggered when the meeting is activated by the host (optional)
+    pub on_meeting_activated: Option<Callback<()>>,
+
+    /// Callback triggered when this participant is admitted from the waiting room (optional).
+    /// The client should fetch the room_token via HTTP after receiving this notification.
+    pub on_participant_admitted: Option<Callback<()>>,
+
+    /// Callback triggered when this participant is rejected from the waiting room (optional)
+    pub on_participant_rejected: Option<Callback<()>>,
+
+    /// Callback triggered when the waiting room participant list changes (optional)
+    pub on_waiting_room_updated: Option<Callback<()>>,
 }
 
 #[derive(Debug)]
@@ -128,12 +141,16 @@ struct InnerOptions {
     on_peer_added: Callback<String>,
     on_meeting_info: Option<Callback<f64>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
+    on_meeting_activated: Option<Callback<()>>,
+    on_participant_admitted: Option<Callback<()>>,
+    on_participant_rejected: Option<Callback<()>>,
+    on_waiting_room_updated: Option<Callback<()>>,
 }
 
 #[derive(Debug)]
 struct Inner {
     options: InnerOptions,
-    connection_controller: Option<ConnectionController>,
+    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
     connection_state: ConnectionState,
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
@@ -154,13 +171,16 @@ struct Inner {
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
+    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
 }
 
 impl PartialEq for VideoCallClient {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner) && self.options == other.options
+        Rc::ptr_eq(&self.inner, &other.inner)
+            && Rc::ptr_eq(&self.connection_controller, &other.connection_controller)
+            && self.options == other.options
     }
 }
 
@@ -233,6 +253,9 @@ impl VideoCallClient {
             None
         };
 
+        let connection_controller: Rc<RefCell<Option<ConnectionController>>> =
+            Rc::new(RefCell::new(None));
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -242,8 +265,12 @@ impl VideoCallClient {
                     on_peer_added: options.on_peer_added.clone(),
                     on_meeting_ended: options.on_meeting_ended.clone(),
                     on_meeting_info: options.on_meeting_info.clone(),
+                    on_meeting_activated: options.on_meeting_activated.clone(),
+                    on_participant_admitted: options.on_participant_admitted.clone(),
+                    on_participant_rejected: options.on_participant_rejected.clone(),
+                    on_waiting_room_updated: options.on_waiting_room_updated.clone(),
                 },
-                connection_controller: None,
+                connection_controller: connection_controller.clone(),
                 connection_state: ConnectionState::Failed {
                     error: "Not connected".to_string(),
                     last_known_server: None,
@@ -259,6 +286,7 @@ impl VideoCallClient {
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
             })),
+            connection_controller,
             aes,
             _diagnostics: diagnostics.clone(),
         };
@@ -354,6 +382,13 @@ impl VideoCallClient {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
                             inner.connection_state = state.clone();
+
+                            // On connection failure, immediately terminate all
+                            // decoder workers so stale WASM instances don't
+                            // accumulate memory during reconnection.
+                            if matches!(state, ConnectionState::Failed { .. }) {
+                                inner.peer_decode_manager.clear_all_peers();
+                            }
                         }
                     }
                     info!("Connection state changed: {state:?} in video call client");
@@ -394,8 +429,7 @@ impl VideoCallClient {
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
 
-        let mut borrowed = self.inner.try_borrow_mut()?;
-        borrowed.connection_controller = Some(connection_controller);
+        *self.connection_controller.try_borrow_mut()? = Some(connection_controller);
 
         info!("ConnectionManager created with RTT testing and 1Hz diagnostics reporting");
         Ok(())
@@ -469,10 +503,10 @@ impl VideoCallClient {
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
         let packet_type = media.packet_type.enum_value();
-        match self.inner.try_borrow() {
-            Ok(inner) => {
-                if let Some(connection_controller) = &inner.connection_controller {
-                    if let Err(e) = connection_controller.send_packet(media) {
+        match self.connection_controller.try_borrow() {
+            Ok(cc) => {
+                if let Some(controller) = cc.as_ref() {
+                    if let Err(e) = controller.send_packet(media) {
                         debug!("Failed to send {packet_type:?} packet: {e}");
                     }
                 } else {
@@ -480,43 +514,46 @@ impl VideoCallClient {
                 }
             }
             Err(_) => {
-                error!("Unable to borrow inner -- dropping {packet_type:?} packet {media:?}")
+                error!(
+                    "Unable to borrow connection_controller -- dropping {packet_type:?} packet"
+                )
             }
         }
     }
 
     /// Returns `true` if the client is currently connected to a server.
     pub fn is_connected(&self) -> bool {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_controller) = &inner.connection_controller {
-                return connection_controller.is_connected();
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                return controller.is_connected();
             }
-        };
+        }
         false
     }
 
     /// Disconnect from the current server.
     pub fn disconnect(&self) -> anyhow::Result<()> {
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            // if let Some(health_reporter) = &inner.health_reporter {
-            //     if let Ok(reporter) = health_reporter.try_borrow_mut() {
-            //         reporter.stop_health_reporting();
-            //     }
-            // }
-
-            if let Some(connection_controller) = &mut inner.connection_controller {
-                let _ = connection_controller.disconnect();
+        // Disconnect and clear the connection controller via its own RefCell
+        if let Ok(mut cc) = self.connection_controller.try_borrow_mut() {
+            if let Some(controller) = cc.as_mut() {
+                let _ = controller.disconnect();
             }
+            *cc = None;
+        } else {
+            return Err(anyhow::anyhow!(
+                "Unable to borrow connection_controller for disconnect"
+            ));
+        }
 
-            inner.connection_controller = None;
+        // Update connection state via inner
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
             inner.connection_state = ConnectionState::Failed {
                 error: "Disconnected".to_string(),
                 last_known_server: None,
             };
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Unable to borrow inner"))
         }
+
+        Ok(())
     }
 
     /// Returns a vector of the userids of the currently connected remote peers, sorted alphabetically.
@@ -619,9 +656,9 @@ impl VideoCallClient {
 
     /// Get current connection state from ConnectionController
     pub fn get_connection_state(&self) -> Option<ConnectionState> {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_controller) = &inner.connection_controller {
-                return Some(connection_controller.get_connection_state());
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                return Some(controller.get_connection_state());
             }
         }
         None
@@ -629,9 +666,9 @@ impl VideoCallClient {
 
     /// Get RTT measurements from ConnectionController (for debugging)
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_controller) = &inner.connection_controller {
-                let measurements = connection_controller.get_rtt_measurements_clone();
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                let measurements = controller.get_rtt_measurements_clone();
                 let mut result = HashMap::new();
                 for (connection_id, measurement) in measurements {
                     if let Some(avg_rtt) = measurement.average_rtt {
@@ -646,8 +683,8 @@ impl VideoCallClient {
 
     /// Send RTT probes manually (for testing)
     pub fn send_rtt_probes(&self) -> anyhow::Result<()> {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(_connection_controller) = &inner.connection_controller {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if cc.is_some() {
                 // RTT probes are now handled automatically by ConnectionController timers
                 return Ok(());
             }
@@ -657,8 +694,8 @@ impl VideoCallClient {
 
     /// Check and complete election if testing period is over
     pub fn check_election_completion(&self) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(_connection_controller) = &inner.connection_controller {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if cc.is_some() {
                 // Election completion is now handled automatically by ConnectionController timers
             }
         }
@@ -783,15 +820,17 @@ impl VideoCallClient {
     }
 
     pub fn set_video_enabled(&self, enabled: bool) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_controller) = &inner.connection_controller {
-                if let Err(e) = connection_controller.set_video_enabled(enabled) {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                if let Err(e) = controller.set_video_enabled(enabled) {
                     debug!("Failed to set video enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set video enabled: {enabled}");
-                    if let Some(hr) = &inner.health_reporter {
-                        if let Ok(hrb) = hr.try_borrow() {
-                            hrb.set_reporting_video_enabled(enabled);
+                    if let Ok(inner) = self.inner.try_borrow() {
+                        if let Some(hr) = &inner.health_reporter {
+                            if let Ok(hrb) = hr.try_borrow() {
+                                hrb.set_reporting_video_enabled(enabled);
+                            }
                         }
                     }
                 }
@@ -799,20 +838,22 @@ impl VideoCallClient {
                 debug!("No connection controller available for set_video_enabled({enabled})");
             }
         } else {
-            error!("Unable to borrow inner for set_video_enabled({enabled})");
+            error!("Unable to borrow connection_controller for set_video_enabled({enabled})");
         }
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_controller) = &inner.connection_controller {
-                if let Err(e) = connection_controller.set_audio_enabled(enabled) {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                if let Err(e) = controller.set_audio_enabled(enabled) {
                     debug!("Failed to set audio enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set audio enabled: {enabled}");
-                    if let Some(hr) = &inner.health_reporter {
-                        if let Ok(hrb) = hr.try_borrow() {
-                            hrb.set_reporting_audio_enabled(enabled);
+                    if let Ok(inner) = self.inner.try_borrow() {
+                        if let Some(hr) = &inner.health_reporter {
+                            if let Ok(hrb) = hr.try_borrow() {
+                                hrb.set_reporting_audio_enabled(enabled);
+                            }
                         }
                     }
                 }
@@ -820,14 +861,14 @@ impl VideoCallClient {
                 debug!("No connection controller available for set_audio_enabled({enabled})");
             }
         } else {
-            error!("Unable to borrow inner for set_audio_enabled({enabled})");
+            error!("Unable to borrow connection_controller for set_audio_enabled({enabled})");
         }
     }
 
     pub fn set_screen_enabled(&self, enabled: bool) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_controller) = &inner.connection_controller {
-                if let Err(e) = connection_controller.set_screen_enabled(enabled) {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                if let Err(e) = controller.set_screen_enabled(enabled) {
                     debug!("Failed to set screen enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set screen enabled: {enabled}");
@@ -836,7 +877,7 @@ impl VideoCallClient {
                 debug!("No connection controller available for set_screen_enabled({enabled})");
             }
         } else {
-            error!("Unable to borrow inner for set_screen_enabled({enabled})");
+            error!("Unable to borrow connection_controller for set_screen_enabled({enabled})");
         }
     }
 
@@ -920,19 +961,21 @@ impl Inner {
                         debug!(">> {} sending AES key", self.options.userid);
 
                         // Send AES key packet via ConnectionController
-                        if let Some(connection_controller) = &self.connection_controller {
-                            let packet = PacketWrapper {
-                                packet_type: PacketType::AES_KEY.into(),
-                                email: self.options.userid.clone(),
-                                data,
-                                ..Default::default()
-                            };
+                        if let Ok(cc) = self.connection_controller.try_borrow() {
+                            if let Some(controller) = cc.as_ref() {
+                                let packet = PacketWrapper {
+                                    packet_type: PacketType::AES_KEY.into(),
+                                    email: self.options.userid.clone(),
+                                    data,
+                                    ..Default::default()
+                                };
 
-                            if let Err(e) = connection_controller.send_packet(packet) {
-                                error!("Failed to send AES key packet: {e}");
+                                if let Err(e) = controller.send_packet(packet) {
+                                    error!("Failed to send AES key packet: {e}");
+                                }
+                            } else {
+                                error!("No connection controller available for AES key");
                             }
-                        } else {
-                            error!("No connection controller available for AES key");
                         }
                     }
                     Err(e) => {
@@ -991,9 +1034,11 @@ impl Inner {
                 );
                 self.own_session_id = Some(response.session_id);
 
-                if let Some(connection_controller) = &self.connection_controller {
-                    if let Err(e) = connection_controller.set_own_session_id(response.session_id) {
-                        warn!("Failed to set own_session_id in ConnectionManager: {e}");
+                if let Ok(cc) = self.connection_controller.try_borrow() {
+                    if let Some(controller) = cc.as_ref() {
+                        if let Err(e) = controller.set_own_session_id(response.session_id) {
+                            warn!("Failed to set own_session_id in ConnectionManager: {e}");
+                        }
                     }
                 }
             }
@@ -1035,6 +1080,48 @@ impl Inner {
                             "Received PARTICIPANT_LEFT: room={}, count={}",
                             meeting_packet.room_id, meeting_packet.participant_count
                         );
+                    }
+                    Ok(MeetingEventType::MEETING_ACTIVATED) => {
+                        info!(
+                            "Received MEETING_ACTIVATED: room={}",
+                            meeting_packet.room_id
+                        );
+                        if let Some(callback) = &self.options.on_meeting_activated {
+                            callback.emit(());
+                        }
+                    }
+                    Ok(MeetingEventType::PARTICIPANT_ADMITTED) => {
+                        info!(
+                            "Received PARTICIPANT_ADMITTED: room={}, target={}",
+                            meeting_packet.room_id, meeting_packet.target_email
+                        );
+                        // Only fire callback if this event is targeted at us
+                        if meeting_packet.target_email == self.options.userid {
+                            if let Some(callback) = &self.options.on_participant_admitted {
+                                callback.emit(());
+                            }
+                        }
+                    }
+                    Ok(MeetingEventType::PARTICIPANT_REJECTED) => {
+                        info!(
+                            "Received PARTICIPANT_REJECTED: room={}, target={}",
+                            meeting_packet.room_id, meeting_packet.target_email
+                        );
+                        // Only fire callback if this event is targeted at us
+                        if meeting_packet.target_email == self.options.userid {
+                            if let Some(callback) = &self.options.on_participant_rejected {
+                                callback.emit(());
+                            }
+                        }
+                    }
+                    Ok(MeetingEventType::WAITING_ROOM_UPDATED) => {
+                        info!(
+                            "Received WAITING_ROOM_UPDATED: room={}",
+                            meeting_packet.room_id
+                        );
+                        if let Some(callback) = &self.options.on_waiting_room_updated {
+                            callback.emit(());
+                        }
                     }
                     Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
                         error!(
@@ -1084,19 +1171,21 @@ impl Inner {
                         debug!(">> {userid} sending public key");
 
                         // Send RSA public key packet via ConnectionController
-                        if let Some(connection_controller) = &self.connection_controller {
-                            let packet = PacketWrapper {
-                                packet_type: PacketType::RSA_PUB_KEY.into(),
-                                email: userid,
-                                data,
-                                ..Default::default()
-                            };
+                        if let Ok(cc) = self.connection_controller.try_borrow() {
+                            if let Some(controller) = cc.as_ref() {
+                                let packet = PacketWrapper {
+                                    packet_type: PacketType::RSA_PUB_KEY.into(),
+                                    email: userid,
+                                    data,
+                                    ..Default::default()
+                                };
 
-                            if let Err(e) = connection_controller.send_packet(packet) {
-                                error!("Failed to send RSA public key packet: {e}");
+                                if let Err(e) = controller.send_packet(packet) {
+                                    error!("Failed to send RSA public key packet: {e}");
+                                }
+                            } else {
+                                error!("No connection controller available for RSA public key");
                             }
-                        } else {
-                            error!("No connection controller available for RSA public key");
                         }
                     }
                     Err(e) => {

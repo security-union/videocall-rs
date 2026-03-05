@@ -289,6 +289,7 @@ impl ParticipantRow {
             joined_at: self.joined_at.timestamp(),
             admitted_at: self.admitted_at.map(|t| t.timestamp()),
             room_token,
+            observer_token: None,
             waiting_room_enabled: None,
             host_display_name: None,
         }

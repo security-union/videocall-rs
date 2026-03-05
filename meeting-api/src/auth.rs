@@ -133,6 +133,7 @@ mod tests {
             cookie_domain: None,
             cookie_name: name.to_string(),
             cookie_secure: false,
+            nats: None,
         }
     }
 

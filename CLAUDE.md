@@ -95,6 +95,8 @@ Always delegate work to the specialized roster agents instead of making changes 
 
 Run agents in parallel when tasks are independent. Always run `code-reviewer` after substantive code changes.
 
+**Never generate your own general-purpose agents.** Only use the agents listed on this roster. If no roster agent fits the task, stop everything and ask the user for direction.
+
 ## Source Code Rules
 
 - **No symlinks or hardlinks for source files.** Each crate/UI must own its files independently. Do not use symlinks between `dioxus-ui/` and `yew-ui/` static assets or any other source directories. If both UIs need shared CSS, copy the shared base and maintain framework-specific additions separately.

@@ -1,0 +1,72 @@
+name: E2E Tests
+
+on:
+  pull_request:
+    paths:
+      - "e2e/**"
+      - "yew-ui/**"
+      - "actix-api/**"
+      - "meeting-api/**"
+      - "videocall-client/**"
+      - "videocall-types/**"
+      - "videocall-meeting-types/**"
+      - "docker/docker-compose.e2e.yaml"
+      - "docker/Dockerfile.actix.dev"
+      - "docker/Dockerfile.yew.dev"
+      - "flake.nix"
+      - "flake.lock"
+  push:
+    branches: [main]
+    paths:
+      - "e2e/**"
+
+jobs:
+  e2e:
+    name: Playwright E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clean up Docker resources
+        run: docker system prune -f --volumes
+
+      - name: Build E2E stack
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
+
+      - name: Start E2E stack
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install E2E dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E tests
+        working-directory: e2e
+        run: npx playwright test
+
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 14
+
+      - name: Dump docker logs on failure
+        if: failure()
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml logs
+
+      - name: Teardown
+        if: always()
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down -v

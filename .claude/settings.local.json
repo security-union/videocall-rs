@@ -45,7 +45,9 @@
       "Bash(git checkout:*)",
       "Bash(npx playwright:*)",
       "Bash(node:*)",
-      "Bash(make e2e-lint:*)"
+      "Bash(make e2e-lint:*)",
+      "Bash(make:*)",
+      "Bash(docker system:*)"
     ]
   }
 }

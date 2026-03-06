@@ -3,14 +3,14 @@
 //
 // Unit tests for context helpers: display-name validation & local storage.
 //
-// These don't need a full Dioxus render — they test pure functions
+// These don't need a full Yew render -- they test pure functions
 // and `window.localStorage` interactions.
 
 #![cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 
 use wasm_bindgen_test::*;
 
-use dioxus_ui::context::{
+use videocall_ui::context::{
     email_to_display_name, load_username_from_storage, normalize_spaces, save_username_to_storage,
     validate_display_name, DISPLAY_NAME_MAX_LEN,
 };

@@ -39,26 +39,26 @@ async function createAuthenticatedContext(
 }
 
 /**
- * From the meeting page, handle the display name prompt if it appears,
- * then click through "Start Meeting" / "Join Meeting" to enter the grid.
+ * From the meeting page, wait for the meeting UI to load and click through
+ * "Start Meeting" / "Join Meeting" to enter the grid.
  *
- * If the user lands in a waiting room, this function returns "waiting"
- * so the caller can handle host admission.
+ * The meeting page auto-joins the API when navigated to with a username
+ * already set (from the home page). There is no display name prompt on the
+ * meeting page -- users who lack a username are redirected back to "/".
+ *
+ * The auto-join shows a brief "Joining meeting..." spinner while the API
+ * call is in flight. Once the API responds the UI transitions to one of:
+ *   - "Ready to join?" with Start/Join Meeting button (admitted)
+ *   - "Waiting to be admitted" (waiting room)
+ *   - "Waiting for meeting to start" (host hasn't started yet)
+ *
+ * Auth dropdown (user name/email, sign-out) is only shown on the home
+ * page -- it no longer appears on this pre-meeting screen.
  */
 async function joinMeetingFromPage(
   page: Page,
-  displayName: string,
 ): Promise<"in-meeting" | "waiting" | "waiting-for-meeting"> {
-  // Step 1: display name prompt (may or may not appear)
-  const displayInput = page.locator(".username-input");
-  if (await displayInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
-    await displayInput.fill(displayName);
-    await page.waitForTimeout(500);
-    await page.locator("button.cta-button").click();
-    await page.waitForTimeout(2000);
-  }
-
-  // Step 2: we could be on "Ready to join?", "Waiting to be admitted", or "Waiting for meeting"
+  // We could be on "Ready to join?", "Waiting to be admitted", or "Waiting for meeting"
   // Race between the possible states
   const joinButton = page.getByText(/Start Meeting|Join Meeting/);
   const waitingRoom = page.getByText("Waiting to be admitted");
@@ -79,7 +79,7 @@ async function joinMeetingFromPage(
     return "waiting-for-meeting";
   }
 
-  // Step 3: click Join/Start Meeting
+  // Click Join/Start Meeting
   await page.waitForTimeout(1000);
   await joinButton.click();
   await page.waitForTimeout(3000);
@@ -133,14 +133,25 @@ test.describe("Two users in a meeting", () => {
       await hostPage.waitForTimeout(1500);
 
       // Host joins the meeting
-      const hostResult = await joinMeetingFromPage(hostPage, "HostUser");
+      const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
 
-      // ---- GUEST: go directly to the meeting ----
-      await guestPage.goto(`/meeting/${meetingId}`);
+      // ---- GUEST: go to home page, enter meeting ----
+      await guestPage.goto("/");
       await guestPage.waitForTimeout(1500);
 
-      const guestResult = await joinMeetingFromPage(guestPage, "GuestUser");
+      await guestPage.locator("#meeting-id").click();
+      await guestPage.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+      await guestPage.locator("#username").click();
+      await guestPage.locator("#username").pressSequentially("GuestUser", { delay: 50 });
+      await guestPage.waitForTimeout(500);
+      await guestPage.locator("#username").press("Enter");
+      await expect(guestPage).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
+        timeout: 10_000,
+      });
+      await guestPage.waitForTimeout(1500);
+
+      const guestResult = await joinMeetingFromPage(guestPage);
 
       if (guestResult === "waiting") {
         // Host needs to admit guest from the waiting room.

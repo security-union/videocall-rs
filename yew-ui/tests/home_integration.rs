@@ -32,7 +32,7 @@ use videocall_ui::pages::home::Home;
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 use wasm_bindgen::JsCast;
-use web_sys::{Event, HtmlInputElement};
+use web_sys::{Event, HtmlButtonElement, HtmlInputElement};
 
 // ---------------------------------------------------------------------------
 // Wrapper component — mirrors AppRoot's context without the route switch,
@@ -82,8 +82,11 @@ async fn home_page_renders_with_oauth_disabled() {
         text.contains("Start or Join a Meeting"),
         "form heading missing"
     );
-    // Note: "Start or Join Meeting" button only appears when meeting ID is entered,
-    // so we check for the always-visible "Create a New Meeting ID" button instead
+    // Both buttons are always visible (join button is disabled when no meeting ID).
+    assert!(
+        text.contains("Start or Join Meeting"),
+        "join button missing"
+    );
     assert!(
         text.contains("Create a New Meeting ID"),
         "create button missing"
@@ -390,5 +393,77 @@ async fn home_accepts_display_name_with_special_characters() {
 
     cleanup(&mount);
     restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_join_button_disabled_when_no_meeting_id() {
+    inject_app_config();
+
+    let mount = create_mount_point();
+    yew::Renderer::<HomeTestWrapper>::with_root(mount.clone()).render();
+    sleep(Duration::ZERO).await;
+
+    // Find the submit button (type="submit") — "Start or Join Meeting".
+    let btn = mount
+        .query_selector("button[type='submit']")
+        .unwrap()
+        .expect("submit button should exist")
+        .dyn_into::<HtmlButtonElement>()
+        .unwrap();
+
+    // With no meeting ID entered, the join button should be disabled.
+    assert!(
+        btn.disabled(),
+        "Join button should be disabled when meeting ID is empty"
+    );
+
+    // The "Create a New Meeting ID" button should also be present.
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Create a New Meeting ID"),
+        "Create button should always be visible"
+    );
+
+    cleanup(&mount);
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_join_button_enabled_when_meeting_id_entered() {
+    inject_app_config();
+
+    let mount = create_mount_point();
+    yew::Renderer::<HomeTestWrapper>::with_root(mount.clone()).render();
+    sleep(Duration::ZERO).await;
+
+    // Enter a meeting ID.
+    let meeting_input = mount
+        .query_selector("#meeting-id")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
+    meeting_input.set_value("test_meeting");
+    meeting_input
+        .dispatch_event(&Event::new("input").unwrap())
+        .unwrap();
+
+    sleep(Duration::ZERO).await;
+
+    // The submit button should now be enabled.
+    let btn = mount
+        .query_selector("button[type='submit']")
+        .unwrap()
+        .expect("submit button should exist")
+        .dyn_into::<HtmlButtonElement>()
+        .unwrap();
+
+    assert!(
+        !btn.disabled(),
+        "Join button should be enabled when meeting ID is entered"
+    );
+
+    cleanup(&mount);
     remove_app_config();
 }

@@ -18,7 +18,7 @@ use support::{
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
-use web_sys::{Event, HtmlInputElement};
+use web_sys::{Event, HtmlButtonElement, HtmlInputElement};
 
 use dioxus::prelude::*;
 use dioxus_ui::components::config_error::ConfigError;
@@ -79,6 +79,11 @@ async fn home_page_renders_with_oauth_disabled() {
     assert!(
         text.contains("Start or Join a Meeting"),
         "form heading missing"
+    );
+    // Both buttons are always visible (join button is disabled when no meeting ID).
+    assert!(
+        text.contains("Start or Join Meeting"),
+        "join button missing"
     );
     assert!(
         text.contains("Create a New Meeting ID"),
@@ -408,5 +413,79 @@ async fn home_accepts_display_name_with_special_characters() {
 
     cleanup(&mount);
     restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_join_button_disabled_when_no_meeting_id() {
+    ensure_root_url();
+    inject_app_config();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Find the submit button (type="submit") — "Start or Join Meeting".
+    let btn = mount
+        .query_selector("button[type='submit']")
+        .unwrap()
+        .expect("submit button should exist")
+        .dyn_into::<HtmlButtonElement>()
+        .unwrap();
+
+    // With no meeting ID entered, the join button should be disabled.
+    assert!(
+        btn.disabled(),
+        "Join button should be disabled when meeting ID is empty"
+    );
+
+    // The "Create a New Meeting ID" button should also be present.
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Create a New Meeting ID"),
+        "Create button should always be visible"
+    );
+
+    cleanup(&mount);
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_join_button_enabled_when_meeting_id_entered() {
+    ensure_root_url();
+    inject_app_config();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Enter a meeting ID.
+    let meeting_input = mount
+        .query_selector("#meeting-id")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
+    meeting_input.set_value("test_meeting");
+    meeting_input
+        .dispatch_event(&Event::new("input").unwrap())
+        .unwrap();
+
+    yield_now().await;
+
+    // The submit button should now be enabled.
+    let btn = mount
+        .query_selector("button[type='submit']")
+        .unwrap()
+        .expect("submit button should exist")
+        .dyn_into::<HtmlButtonElement>()
+        .unwrap();
+
+    assert!(
+        !btn.disabled(),
+        "Join button should be enabled when meeting ID is entered"
+    );
+
+    cleanup(&mount);
     remove_app_config();
 }

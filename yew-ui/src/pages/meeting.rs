@@ -1,22 +1,15 @@
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{e2ee_enabled, webtransport_enabled};
-use crate::context::{
-    email_to_display_name, load_username_from_storage, normalize_spaces, save_username_to_storage,
-    UsernameCtx, validate_display_name, DISPLAY_NAME_MAX_LEN,
-};
+use crate::context::{load_username_from_storage, UsernameCtx};
 use crate::meeting_api::{join_meeting, JoinError};
 use web_sys::window;
-use web_sys::{HtmlInputElement, KeyboardEvent};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::auth::{check_session, get_user_profile, logout, UserProfile};
 use crate::constants::oauth_enabled;
 use crate::routing::Route;
-
-use std::collections::BTreeSet;
-use std::rc::Rc;
 
 /// Meeting participant status from the API
 #[derive(Clone, PartialEq, Debug)]
@@ -74,11 +67,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     let current_user_email = use_state(|| None::<String>);
     // Track if user came from waiting room (should auto-join when admitted)
     let came_from_waiting_room = use_state(|| false);
-
-    // Local state to track the current value inside the username input. We
-    // initialise it from whatever is already stored (if any) so the field
-    // is pre-filled instead of blanking out each time we reach this page.
-    let error_state = use_state(|| None as Option<String>);
 
     // Retrieve previously cached username (if any) either from the context
     // or from localStorage and use it as the initial value for the input.
@@ -301,28 +289,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         });
     }
 
-    // Logout handler
-    let on_logout = {
-        let navigator = navigator.clone();
-        Callback::from(move |_| {
-            let navigator = navigator.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = logout().await;
-                navigator.push(&Route::Login);
-            });
-        })
-    };
-
-    // Early return for auth check (AFTER all hooks are declared)
-    if !*auth_checked && oauth_enabled().unwrap_or(false) {
-        return html! {
-            <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;">
-                <p style="color: white; font-size: 1rem;">{"Checking authentication..."}</p>
-            </div>
-        };
-    }
-
-    // Join meeting API call
+    // Join meeting API call — defined before the auto-join effect and early
+    // return so that it is available to both.
     let on_join_meeting = {
         let meeting_id = props.id.clone();
         let meeting_status = meeting_status.clone();
@@ -422,6 +390,42 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         })
     };
 
+    // Auto-join: when the username is already set and the meeting status is
+    // NotJoined, trigger the join flow automatically so the user does not
+    // have to interact with a redundant form.
+    {
+        let on_join_meeting = on_join_meeting.clone();
+        let has_username = (*username_state).is_some();
+        let is_not_joined = matches!(*meeting_status, MeetingStatus::NotJoined);
+        use_effect_with((has_username, is_not_joined), move |(has_username, is_not_joined)| {
+            if *has_username && *is_not_joined {
+                on_join_meeting.emit(());
+            }
+            || ()
+        });
+    }
+
+    // Logout handler
+    let on_logout = {
+        let navigator = navigator.clone();
+        Callback::from(move |_| {
+            let navigator = navigator.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = logout().await;
+                navigator.push(&Route::Login);
+            });
+        })
+    };
+
+    // Early return for auth check (AFTER all hooks are declared)
+    if !*auth_checked && oauth_enabled().unwrap_or(false) {
+        return html! {
+            <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;">
+                <p style="color: white; font-size: 1rem;">{"Checking authentication..."}</p>
+            </div>
+        };
+    }
+
     // Handle waiting room admission - receives the full join response from WaitingRoom
     let on_admitted = {
         let meeting_status = meeting_status.clone();
@@ -462,90 +466,11 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         })
     };
 
-    // Shared validation-and-save logic used by both on_submit and on_keydown.
-    let do_save_display_name: Rc<dyn Fn()> = {
-        let username_state = username_state.clone();
-        let input_value_state = input_value_state.clone();
-        let error_state = error_state.clone();
-        let on_join_meeting = on_join_meeting.clone();
-        Rc::new(move || {
-            let value = (*input_value_state).clone();
-            match validate_display_name(&value) {
-                Ok(valid_name) => {
-                    input_value_state.set(valid_name.clone());
-                    save_username_to_storage(&valid_name);
-                    username_state.set(Some(valid_name));
-                    error_state.set(None);
-                    on_join_meeting.emit(());
-                }
-                Err(message) => {
-                    error_state.set(Some(message));
-                }
-            }
-        })
-    };
-
-    // Memoised submit handler (depends on username_state, input_value_state, error_state)
-    let on_submit = {
-        let do_save = do_save_display_name.clone();
-        Callback::from(move |e: SubmitEvent| {
-            e.prevent_default();
-            do_save();
-        })
-    };
-
-    // Keep the local input value in sync with what the user types.
-    let on_input = {
-        let input_value_state = input_value_state.clone();
-        Callback::from(move |e: InputEvent| {
-            let input: HtmlInputElement = e.target_unchecked_into();
-            input_value_state.set(input.value());
-        })
-    };
-
-    // Handle the "Enter" key directly by triggering the form submission when
-    // valid (so users can simply press Enter instead of clicking the button).
-    let on_keydown = {
-        let do_save = do_save_display_name.clone();
-        Callback::from(move |e: KeyboardEvent| {
-            if e.key() == "Enter" {
-                do_save();
-                e.prevent_default();
-            }
-        })
-    };
-
     // Clone values for use inside html! macro
     let maybe_username = (*username_state).clone();
-    let error_html = if let Some(err) = &*error_state {
-        html! { <p class="error">{ err }</p> }
-    } else {
-        html! {}
-    };
 
     let current_meeting_status = (*meeting_status).clone();
     let should_auto_join = *came_from_waiting_room;
-    let display_name_options: Vec<String> = {
-        let mut set = BTreeSet::<String>::new();
-
-        if let Some(profile) = (*user_profile).as_ref() {
-
-            let name = normalize_spaces(profile.name.trim());
-            if validate_display_name(&name).is_ok() {
-                set.insert(name);
-            }
-
-            let email = profile.email.trim();
-            if !email.is_empty() {
-                let candidate = email_to_display_name(email);
-                if !candidate.is_empty() && validate_display_name(&candidate).is_ok() {
-                    set.insert(candidate);
-                }
-            }
-        }
-
-        set.into_iter().collect()
-    };
     html! {
         <>
             {
@@ -674,52 +599,22 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         }
                     }
 
-                    // Username prompt view (not joined yet or no username)
+                    // No username set, or waiting for auto-join to fire
                     _ => {
-                        html! {
-                            <div id="username-prompt" class="username-prompt-container relative">
-
-                                <form onsubmit={on_submit} class="username-form">
-                                    <h1>{"Choose a display name"}</h1>
-                                    <input
-                                        class="username-input"
-                                        placeholder="Your name"
-                                        required=true
-                                        autofocus=true
-                                        maxlength={DISPLAY_NAME_MAX_LEN.to_string()}
-                                        list="display-name-options"
-                                        onkeydown={on_keydown}
-                                        oninput={on_input}
-                                        value={(*input_value_state).clone()}
-                                    />
-                                    <datalist id="display-name-options">
-                                    {
-                                        display_name_options
-                                            .iter()
-                                            .cloned()
-                                            .map(|opt| html! { <option value={opt} /> })
-                                            .collect::<Html>()
-                                    }
-                                    </datalist>
-                                    { error_html }
-                                    <button class="cta-button" type="submit">{"Continue"}</button>
-                                </form>
-                                {
-                                    if oauth_enabled().unwrap_or(false) {
-                                        html! {
-                                            <button
-                                                class="sign-out-link"
-                                                style="background: none; border: none; color: rgba(255,255,255,0.5); cursor: pointer; font-size: 0.85rem; margin-top: 1rem; text-decoration: underline;"
-                                                onclick={on_logout.reform(|_: web_sys::MouseEvent| ())}
-                                            >
-                                                {"Sign out"}
-                                            </button>
-                                        }
-                                    } else {
-                                        html! {}
-                                    }
-                                }
-                            </div>
+                        if maybe_username.is_none() {
+                            // Redirect to home page so the user can set a display name
+                            if let Some(window) = web_sys::window() {
+                                let _ = window.location().set_href("/");
+                            }
+                            html! {}
+                        } else {
+                            // Username is set; the auto-join effect will fire momentarily
+                            html! {
+                                <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;">
+                                    <div class="loading-spinner" style="width: 40px; height: 40px; margin-bottom: 1rem;"></div>
+                                    <p style="color: white; font-size: 1rem;">{"Joining meeting..."}</p>
+                                </div>
+                            }
                         }
                     }
                 }

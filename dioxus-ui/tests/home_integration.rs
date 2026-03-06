@@ -311,11 +311,15 @@ async fn home_normalizes_spaces_in_display_name() {
 
     yield_now().await;
 
-    let username_after = mount
-        .query_selector("#username").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
-
-    assert_eq!(username_after.value(), "John Doe");
+    // Navigation now succeeds, removing the Home component from the DOM,
+    // so verify the normalized username via localStorage instead.
+    let storage = web_sys::window()
+        .unwrap()
+        .local_storage()
+        .unwrap()
+        .unwrap();
+    let saved = storage.get_item("vc_username").unwrap().unwrap();
+    assert_eq!(saved, "John Doe");
 
     cleanup(&mount);
     restore_fetch();

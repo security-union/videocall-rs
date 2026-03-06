@@ -57,6 +57,7 @@ pub fn Home() -> Element {
     };
 
     let mut username_value = use_signal(|| existing_username.clone());
+    let mut username_error = use_signal(|| None::<String>);
 
     // User profile state (for displaying auth info when OAuth is enabled)
     let mut user_profile = use_signal(|| None::<UserProfile>);
@@ -207,16 +208,15 @@ pub fn Home() -> Element {
                 form {
                     onsubmit: move |e| {
                         e.prevent_default();
+                        username_error.set(None);
                         let username = username_value();
                         let meeting_id = get_meeting_id();
                         if meeting_id.is_empty() {
-                            let _ = web_sys::window().unwrap().alert_with_message(
-                                "Please provide a meeting ID.",
-                            );
                             return;
                         }
                         match validate_display_name(&username) {
                             Ok(valid_name) => {
+                                username_value.set(valid_name.clone());
                                 save_username_to_storage(&valid_name);
                                 (username_ctx.0).set(Some(valid_name));
                                 if let Some(name) = (username_ctx.0)() {
@@ -225,7 +225,7 @@ pub fn Home() -> Element {
                                 navigator.push(Route::Meeting { id: meeting_id });
                             }
                             Err(message) => {
-                                let _ = web_sys::window().unwrap().alert_with_message(&message);
+                                username_error.set(Some(message));
                             }
                         }
                     },
@@ -244,7 +244,11 @@ pub fn Home() -> Element {
                                 value: "{username_value}",
                                 oninput: move |e: Event<FormData>| {
                                     username_value.set(e.value());
+                                    username_error.set(None);
                                 },
+                            }
+                            if let Some(err) = username_error() {
+                                p { class: "text-sm mt-2 ml-1", style: "color:#ff6b6b;", "{err}" }
                             }
                         }
                         div {
@@ -297,6 +301,7 @@ pub fn Home() -> Element {
                                     }
                                 },
                                 onclick: move |_| {
+                                    username_error.set(None);
                                     let username = username_value();
                                     match validate_display_name(&username) {
                                         Ok(valid_name) => {
@@ -309,7 +314,7 @@ pub fn Home() -> Element {
                                             navigator.push(Route::Meeting { id: meeting_id });
                                         }
                                         Err(message) => {
-                                            let _ = web_sys::window().unwrap().alert_with_message(&message);
+                                            username_error.set(Some(message));
                                         }
                                     }
                                 },

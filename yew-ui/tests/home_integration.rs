@@ -31,8 +31,21 @@ use videocall_ui::pages::home::Home;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
+fn bubbling_input_event() -> Event {
+    let mut init = EventInit::new();
+    init.bubbles(true);
+    Event::new_with_event_init_dict("input", &init).unwrap()
+}
+
+fn bubbling_submit_event() -> Event {
+    let mut init = EventInit::new();
+    init.bubbles(true);
+    init.cancelable(true);
+    Event::new_with_event_init_dict("submit", &init).unwrap()
+}
+
 use wasm_bindgen::JsCast;
-use web_sys::{Event, HtmlButtonElement, HtmlInputElement};
+use web_sys::{Event, EventInit, HtmlButtonElement, HtmlInputElement};
 
 // ---------------------------------------------------------------------------
 // Wrapper component — mirrors AppRoot's context without the route switch,
@@ -221,16 +234,16 @@ async fn home_rejects_invalid_display_name() {
         .query_selector("#username").unwrap().unwrap()
         .dyn_into::<HtmlInputElement>().unwrap();
     username.set_value("John&Doe");
-    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+    username.dispatch_event(&bubbling_input_event()).unwrap();
 
     let meeting_id = mount
         .query_selector("#meeting-id").unwrap().unwrap()
         .dyn_into::<HtmlInputElement>().unwrap();
     meeting_id.set_value("abc_123");
-    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
     let form = mount.query_selector("form").unwrap().unwrap();
-    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
 
     sleep(Duration::ZERO).await;
 
@@ -258,16 +271,16 @@ async fn home_normalizes_spaces_in_display_name() {
         .query_selector("#username").unwrap().unwrap()
         .dyn_into::<HtmlInputElement>().unwrap();
     username.set_value("  John    Doe   ");
-    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+    username.dispatch_event(&bubbling_input_event()).unwrap();
 
     let meeting_id = mount
         .query_selector("#meeting-id").unwrap().unwrap()
         .dyn_into::<HtmlInputElement>().unwrap();
     meeting_id.set_value("abc_123");
-    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
     let form = mount.query_selector("form").unwrap().unwrap();
-    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
 
     sleep(Duration::ZERO).await;
 
@@ -296,10 +309,10 @@ async fn home_rejects_empty_display_name() {
         .query_selector("#meeting-id").unwrap().unwrap()
         .dyn_into::<HtmlInputElement>().unwrap();
     meeting_id.set_value("abc_123");
-    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
     let form = mount.query_selector("form").unwrap().unwrap();
-    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
 
     sleep(Duration::ZERO).await;
 
@@ -329,16 +342,16 @@ async fn home_rejects_display_name_exceeding_max_length() {
         .query_selector("#username").unwrap().unwrap()
         .dyn_into::<HtmlInputElement>().unwrap();
     username.set_value(&long_name);
-    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+    username.dispatch_event(&bubbling_input_event()).unwrap();
 
     let meeting_id = mount
         .query_selector("#meeting-id").unwrap().unwrap()
         .dyn_into::<HtmlInputElement>().unwrap();
     meeting_id.set_value("abc_123");
-    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
     let form = mount.query_selector("form").unwrap().unwrap();
-    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
 
     sleep(Duration::ZERO).await;
 
@@ -367,16 +380,16 @@ async fn home_accepts_display_name_with_special_characters() {
         .query_selector("#username").unwrap().unwrap()
         .dyn_into::<HtmlInputElement>().unwrap();
     username.set_value("O'Brien-Smith");
-    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+    username.dispatch_event(&bubbling_input_event()).unwrap();
 
     let meeting_id = mount
         .query_selector("#meeting-id").unwrap().unwrap()
         .dyn_into::<HtmlInputElement>().unwrap();
     meeting_id.set_value("abc_123");
-    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
     let form = mount.query_selector("form").unwrap().unwrap();
-    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
 
     sleep(Duration::ZERO).await;
 
@@ -446,7 +459,7 @@ async fn home_join_button_enabled_when_meeting_id_entered() {
         .unwrap();
     meeting_input.set_value("test_meeting");
     meeting_input
-        .dispatch_event(&Event::new("input").unwrap())
+        .dispatch_event(&bubbling_input_event())
         .unwrap();
 
     sleep(Duration::ZERO).await;

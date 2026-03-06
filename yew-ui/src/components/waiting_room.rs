@@ -144,6 +144,8 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                         on_rejected.emit(());
                     })),
                     on_waiting_room_updated: None,
+                    on_speaking_changed: None,
+                    vad_threshold: None,
                 };
 
                 let mut client = VideoCallClient::new(opts);

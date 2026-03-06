@@ -140,6 +140,8 @@ pub fn WaitingRoom(
                     on_rejected.call(());
                 })),
                 on_waiting_room_updated: None,
+                on_speaking_changed: None,
+                vad_threshold: None,
             };
 
             let mut client = VideoCallClient::new(opts);

@@ -246,6 +246,7 @@ pub fn AttendantsComponent(
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
+    let local_speaking = use_signal(|| false);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
@@ -377,6 +378,11 @@ pub fn AttendantsComponent(
                     meeting_ended_message.set(Some(message));
                 },
             )),
+            on_speaking_changed: Some(VcCallback::from(move |speaking: bool| {
+                let mut s = local_speaking;
+                s.set(speaking);
+            })),
+            vad_threshold: crate::constants::vad_threshold().ok(),
             on_meeting_activated: None,
             on_participant_admitted: None,
             on_participant_rejected: None,
@@ -885,6 +891,7 @@ pub fn AttendantsComponent(
                                     share_screen: screen_share_state().is_sharing(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
+                                    is_speaking: local_speaking(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {
@@ -935,6 +942,8 @@ pub fn AttendantsComponent(
                         PeerList {
                             peers: peers_for_display.clone(),
                             onclose: move |_| peer_list_open.set(false),
+                            self_muted: !mic_enabled(),
+                            self_speaking: local_speaking(),
                             show_meeting_info: meeting_info_open(),
                             room_id: id_for_peer_list.clone(),
                             num_participants: num_display_peers,

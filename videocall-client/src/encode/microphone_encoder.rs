@@ -449,6 +449,12 @@ impl MicrophoneEncoder {
             let is_speaking_clone = is_speaking_for_vad.clone();
             let client_clone = client_for_vad.clone();
 
+            // LOCAL user Voice Activity Detection (VAD) via AnalyserNode.
+            //
+            // This runs every 100ms and computes the RMS energy of the
+            // microphone's time-domain signal.  The resulting `is_speaking`
+            // flag is included in the 1Hz heartbeat so that *remote* peers
+            // can show a speaking indicator for this user.
             let vad_interval = Interval::new(100, move || {
                 if !enabled_check.load(Ordering::Acquire)
                     || switching_check.load(Ordering::Acquire)
@@ -469,8 +475,13 @@ impl MicrophoneEncoder {
 
                 log::trace!("VAD: RMS={:.4}, speaking={}", rms, speaking);
 
-                is_speaking_clone.store(speaking, Ordering::Relaxed);
-                client_clone.set_speaking(speaking);
+                // Only propagate when the speaking state actually changes to
+                // avoid unnecessary callback emissions every 100ms.
+                let prev = is_speaking_clone.load(Ordering::Relaxed);
+                if speaking != prev {
+                    is_speaking_clone.store(speaking, Ordering::Relaxed);
+                    client_clone.set_speaking(speaking);
+                }
             });
 
             *vad_interval_holder.borrow_mut() = Some(vad_interval);

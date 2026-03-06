@@ -97,6 +97,13 @@ pub fn PeerList(
     let audio_states = peer_audio_states();
     let speaking_states = peer_speaking_states();
 
+    // Build reverse lookup (email -> session_id) once, to avoid O(N^2) scanning inside the loop.
+    let email_to_sid: HashMap<String, String> = client_ctx
+        .sorted_peer_keys()
+        .into_iter()
+        .filter_map(|sid| client_ctx.get_peer_email(&sid).map(|email| (email, sid)))
+        .collect();
+
     rsx! {
         div {
             // Show meeting information at the top when enabled
@@ -189,17 +196,14 @@ pub fn PeerList(
 
                             for peer in filtered_peers.iter() {
                                 {
-                                    // peer is the display email; we need the session_id to look up states
-                                    // The peers vec already contains display names (emails), and the
-                                    // diagnostics map uses session_ids. We look up by session_id via the client.
-                                    let peer_session_id = client_ctx.sorted_peer_keys().into_iter().find(|sid| {
-                                        client_ctx.get_peer_email(sid).as_deref() == Some(peer.as_str())
-                                    });
-                                    let muted = peer_session_id.as_ref()
+                                    // peer is the display email; we need the session_id to look up states.
+                                    // Use the pre-built reverse map for O(1) lookup instead of scanning all peers.
+                                    let peer_session_id = email_to_sid.get(peer.as_str());
+                                    let muted = peer_session_id
                                         .and_then(|sid| audio_states.get(sid).copied())
                                         .map(|enabled| !enabled)
                                         .unwrap_or(true);
-                                    let speaking = peer_session_id.as_ref()
+                                    let speaking = peer_session_id
                                         .and_then(|sid| speaking_states.get(sid).copied())
                                         .unwrap_or(false);
                                     rsx! {

@@ -145,7 +145,13 @@ impl NetEqAudioPeerDecoder {
         Ok((audio_context, pcm_player))
     }
 
-    /// Calculate RMS (Root Mean Square) of audio samples for voice activity detection
+    /// Calculate RMS (Root Mean Square) of audio samples for voice activity detection.
+    ///
+    /// This is part of the **decoder-side (remote peer) VAD**.  We run a
+    /// fast-path RMS check on every decoded PCM frame so the UI can show a
+    /// speaking indicator for remote peers with sub-second latency, rather
+    /// than waiting for the 1Hz heartbeat update that carries the remote
+    /// user's own (encoder-side) `is_speaking` flag.
     fn calculate_rms(pcm: &Float32Array) -> f32 {
         let length = pcm.length() as usize;
         if length == 0 {
@@ -161,7 +167,13 @@ impl NetEqAudioPeerDecoder {
         (sum_squares / length as f32).sqrt()
     }
 
-    /// Handle PCM audio data from NetEq worker
+    /// Handle PCM audio data from NetEq worker.
+    ///
+    /// Includes decoder-side VAD: computes RMS on the decoded PCM and emits
+    /// a `peer_speaking` diagnostics event when the speaking state changes.
+    /// This gives the UI a faster speaking indicator for remote peers than
+    /// the 1Hz heartbeat, which only reflects the remote user's own
+    /// encoder-side VAD result.
     fn handle_pcm_data(
         pcm: Float32Array,
         pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
@@ -507,6 +519,11 @@ impl NetEqAudioPeerDecoder {
         );
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
+        // Intentionally leaked: the closure must live as long as the Worker,
+        // which has no mechanism for preventing the closure from being GC'd
+        // other than calling `.forget()`.  All captured `Rc`s (including
+        // `speaking`, `pcm_player`, `worker_ready`, `pending_messages`) are
+        // therefore permanently held until the Worker is terminated via Drop.
         on_message_closure.forget();
 
         // Initialize worker

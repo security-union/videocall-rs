@@ -162,32 +162,32 @@ impl Peer {
         ),
         JsValue,
     > {
-    // Create decoders without canvas (will be set later via set_canvas)
-    // We still keep the canvas IDs for backward compatibility with existing code
-    let video_decoder = VideoPeerDecoder::new(None)?;
-    let screen_decoder = VideoPeerDecoder::new(None)?;
+        // Create decoders without canvas (will be set later via set_canvas)
+        // We still keep the canvas IDs for backward compatibility with existing code
+        let video_decoder = VideoPeerDecoder::new(None)?;
+        let screen_decoder = VideoPeerDecoder::new(None)?;
 
-    // Attempt to set canvas immediately if available in DOM
-    if let Some(window) = web_sys::window() {
-    if let Some(document) = window.document() {
-    if let Some(canvas_element) = document.get_element_by_id(video_canvas_id) {
-    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-    let _ = video_decoder.set_canvas(canvas);
-    }
-    }
-    if let Some(canvas_element) = document.get_element_by_id(screen_canvas_id) {
-    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-    let _ = screen_decoder.set_canvas(canvas);
-    }
-    }
-    }
-    }
+        // Attempt to set canvas immediately if available in DOM
+        if let Some(window) = web_sys::window() {
+            if let Some(document) = window.document() {
+                if let Some(canvas_element) = document.get_element_by_id(video_canvas_id) {
+                    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+                        let _ = video_decoder.set_canvas(canvas);
+                    }
+                }
+                if let Some(canvas_element) = document.get_element_by_id(screen_canvas_id) {
+                    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+                        let _ = screen_decoder.set_canvas(canvas);
+                    }
+                }
+            }
+        }
 
-    Ok((
-    create_audio_peer_decoder(None, peer_id.to_string(), vad_threshold)?,
-    video_decoder,
-    screen_decoder,
-    ))
+        Ok((
+            create_audio_peer_decoder(None, peer_id.to_string(), vad_threshold)?,
+            video_decoder,
+            screen_decoder,
+        ))
     }
 
     fn reset(&mut self) -> Result<(), JsValue> {

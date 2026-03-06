@@ -48,6 +48,11 @@ use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
 
+/// Configuration options for creating a [`VideoCallClient`].
+///
+/// Contains all the callbacks, server URLs, and feature flags needed to
+/// initialise the client.  Pass an instance of this struct to
+/// [`VideoCallClient::new()`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoCallClientOptions {
     pub enable_e2ee: bool,
@@ -72,7 +77,15 @@ pub struct VideoCallClientOptions {
     pub rtt_probe_interval_ms: Option<u64>,
     pub on_meeting_info: Option<Callback<f64>>,
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
+
+    /// Callback fired when the local user's speaking state changes (from
+    /// encoder-side VAD).  The UI can use this to highlight the local
+    /// participant's tile.
     pub on_speaking_changed: Option<Callback<bool>>,
+
+    /// RMS threshold for voice activity detection.  Values typically range
+    /// from 0.0 to 1.0; the default is 0.02.  Lower values are more
+    /// sensitive; higher values filter out more background noise.
     pub vad_threshold: Option<f32>,
 
     /// Callback triggered when the meeting is activated by the host (optional)
@@ -116,6 +129,11 @@ struct Inner {
     own_session_id: Option<u64>,
 }
 
+/// The main client handle for a video call session.
+///
+/// `VideoCallClient` is cheaply cloneable (`Rc`-based interior mutability)
+/// and is passed to encoders and other subsystems so they can send packets
+/// and query connection state.
 #[derive(Clone, Debug)]
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
@@ -134,6 +152,10 @@ impl PartialEq for VideoCallClient {
 }
 
 impl VideoCallClient {
+    /// Create a new `VideoCallClient` from the given options.
+    ///
+    /// This does **not** establish a connection; call [`connect()`](Self::connect)
+    /// afterwards to begin the RTT election and connect to a server.
     pub fn new(options: VideoCallClientOptions) -> Self {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
 
@@ -352,6 +374,8 @@ impl VideoCallClient {
         Ok(())
     }
 
+    /// Open connections to all configured servers, run RTT-based election,
+    /// and start media flow on the winner.
     pub fn connect(&mut self) -> anyhow::Result<()> {
         info!("Connecting with RTT testing");
         self.connect_with_rtt_testing()
@@ -414,6 +438,7 @@ impl VideoCallClient {
         }
     }
 
+    /// Returns `true` if the client has an active, elected connection.
     pub fn is_connected(&self) -> bool {
         if let Ok(cc) = self.connection_controller.try_borrow() {
             if let Some(controller) = cc.as_ref() {
@@ -423,6 +448,8 @@ impl VideoCallClient {
         false
     }
 
+    /// Disconnect from the current session, tearing down the connection
+    /// controller and clearing peer state.
     pub fn disconnect(&self) -> anyhow::Result<()> {
         // Disconnect and clear the connection controller via its own RefCell
         if let Ok(mut cc) = self.connection_controller.try_borrow_mut() {

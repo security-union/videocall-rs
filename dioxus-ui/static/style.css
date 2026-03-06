@@ -3487,7 +3487,7 @@ select {
     filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
   }
   50% {
-    filter: drop-shadow(0 0 10px rgba(0, 255, 65, 1));
+    filter: drop-shadow(0 0 12px rgba(0, 255, 65, 1));
   }
 }
 

@@ -55,7 +55,6 @@ use web_time::SystemTime;
 
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,
-    email: &str,
     sequence: u64,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
@@ -66,7 +65,6 @@ pub fn transform_audio_chunk(
     // chunk length in bytes
 
     let media_packet: MediaPacket = MediaPacket {
-        email: email.to_owned(),
         media_type: MediaType::AUDIO.into(),
         frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
         data: chunk.to_vec(),
@@ -82,7 +80,6 @@ pub fn transform_audio_chunk(
     let data = aes.encrypt(&data).unwrap();
     PacketWrapper {
         data,
-        email: media_packet.email,
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }
@@ -156,7 +153,6 @@ impl MicrophoneEncoder {
     }
 
     pub fn start(&mut self) {
-        let user_id = self.client.userid().clone();
         let client = self.client.clone();
         let device_id = if let Some(mic) = &self.state.selected {
             mic.to_string()
@@ -213,7 +209,7 @@ impl MicrophoneEncoder {
                 let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
                     let packet: PacketWrapper =
-                        transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
+                        transform_audio_chunk(&data, sequence_number, aes.clone());
                     client.send_packet(packet);
                     sequence_number += 1;
                     log::debug!("Sent audio frame with sequence: {sequence_number}");

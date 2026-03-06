@@ -16,7 +16,9 @@ use support::{
     cleanup, create_mount_point, inject_app_config, mock_fetch_401, mock_fetch_meetings_empty,
     remove_app_config, render_into, restore_fetch, yield_now,
 };
+use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
+use web_sys::{Event, HtmlInputElement};
 
 use dioxus::prelude::*;
 use dioxus_ui::components::config_error::ConfigError;
@@ -214,4 +216,197 @@ async fn missing_config_shows_error_not_home() {
     );
 
     cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn home_rejects_invalid_display_name() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value("John&Doe");
+    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+
+    yield_now().await;
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Invalid character"),
+        "Expected invalid character error, got page text: {text}"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_normalizes_spaces_in_display_name() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value("  John    Doe   ");
+    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+
+    yield_now().await;
+
+    let username_after = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+
+    assert_eq!(username_after.value(), "John Doe");
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_rejects_empty_display_name() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Leave username empty, set a meeting ID, and submit.
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+
+    yield_now().await;
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Name cannot be empty"),
+        "Expected empty-name error, got page text: {text}"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_rejects_display_name_exceeding_max_length() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Create a name that exceeds 50 characters.
+    let long_name = "A".repeat(51);
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value(&long_name);
+    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+
+    yield_now().await;
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("too long"),
+        "Expected max-length error, got page text: {text}"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_accepts_display_name_with_special_characters() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Apostrophes and hyphens are allowed special characters.
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value("O'Brien-Smith");
+    username.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&Event::new("input").unwrap()).unwrap();
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&Event::new("submit").unwrap()).unwrap();
+
+    yield_now().await;
+
+    // No error should be shown -- the name is valid.
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        !text.contains("Invalid character"),
+        "Should not show invalid character error for apostrophes and hyphens, got: {text}"
+    );
+    assert!(
+        !text.contains("Name cannot be empty"),
+        "Should not show empty name error, got: {text}"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
 }

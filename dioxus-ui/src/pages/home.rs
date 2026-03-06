@@ -222,10 +222,9 @@ pub fn Home() -> Element {
                                 (username_ctx.0).set(Some(valid_name.clone()));
                                 matomo_logger::set_user_id(&valid_name);
 
-                                let nav = navigator.clone();
-                                wasm_bindgen_futures::spawn_local(async move {
+                                spawn(async move {
                                     gloo_timers::future::TimeoutFuture::new(0).await;
-                                    nav.push(Route::Meeting { id: meeting_id });
+                                    navigator.push(Route::Meeting { id: meeting_id });
                                 });
                             }
                             Err(message) => {
@@ -316,10 +315,9 @@ pub fn Home() -> Element {
                                             (username_ctx.0).set(Some(valid_name.clone()));
                                             matomo_logger::set_user_id(&valid_name);
 
-                                            let nav = navigator.clone();
-                                            wasm_bindgen_futures::spawn_local(async move {
+                                            spawn(async move {
                                                 gloo_timers::future::TimeoutFuture::new(0).await;
-                                                nav.push(Route::Meeting { id: meeting_id });
+                                                navigator.push(Route::Meeting { id: meeting_id });
                                             });
                                         }
                                         Err(message) => {

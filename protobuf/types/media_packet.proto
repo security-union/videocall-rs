@@ -18,6 +18,8 @@ message MediaPacket {
   AudioMetadata audio_metadata = 7;
   VideoMetadata video_metadata = 8;
   HeartbeatMetadata heartbeat_metadata = 9;
+  string session_id = 10;  
+  string display_name = 11;
 }
 
 message AudioMetadata {
@@ -57,4 +59,5 @@ message HeartbeatMetadata {
   bool video_enabled = 1;
   bool audio_enabled = 2;
   bool screen_enabled = 3;
+  string display_name = 4;
 }

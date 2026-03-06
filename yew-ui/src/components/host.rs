@@ -130,6 +130,11 @@ pub struct MeetingProps {
     /// Called when screen share state changes (started, cancelled, stopped).
     /// This allows the parent component to react to screen share lifecycle events.
     pub on_screen_share_state: Callback<ScreenShareEvent>,
+
+    /// Called when the user changes their display name.
+    /// This allows the parent component to update the UsernameCtx.
+    #[prop_or_default]
+    pub on_name_changed: Option<Callback<String>>,
 }
 
 impl Component for Host {
@@ -373,15 +378,37 @@ impl Component for Host {
             }
             Msg::SaveChangeName => {
                 let new_name = self.pending_name.trim().to_string();
+
+                log::info!(
+                    ">>> SaveChangeName triggered, new_name='{}', valid={}, empty={}",
+                    new_name,
+                    is_valid_username(&new_name),
+                    new_name.is_empty()
+                );
+
                 if is_valid_username(&new_name) && !new_name.is_empty() {
                     save_username_to_storage(&new_name);
-                    // Force a soft reload so meeting picks up new name
-                    if let Some(win) = web_sys::window() {
-                        let _ = win.location().reload();
+
+                    log::info!(">>> Calling client.update_display_name");
+
+                    // Don't reload, change the username in the client and still maintain connection
+                    if let Err(error) = self.client.update_display_name(&new_name) {
+                        log::error!("Failed to update display name: {error}");
+                        self.change_name_error =
+                            Some("Failed to update name. Try again.".to_string());
+                        return true;
                     }
+
+                    // Notify parent to update UsernameCtx so the UI reflects the change
+                    if let Some(callback) = &ctx.props().on_name_changed {
+                        callback.emit(new_name.clone());
+                    }
+
+                    log::info!(">>> Display name updated to: {new_name}");
                     self.show_change_name = false;
                     self.change_name_error = None;
-                    false
+
+                    true
                 } else {
                     self.change_name_error =
                         Some("Use letters, numbers, and underscore only.".to_string());

@@ -160,6 +160,15 @@ impl ConnectionController {
         Ok(())
     }
 
+    /// Set display name on the active connection (for heartbeat packets)
+    pub fn set_display_name(&self, name: String) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Err(e) = inner.connection_manager.set_display_name(name) {
+                log::warn!("Failed to set display_name in connection_manager: {e}");
+            }
+        }
+    }
+
     /// Check if manager has an active connection
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
@@ -252,6 +261,8 @@ mod tests {
             websocket_urls: vec!["ws://localhost:8080".to_string()],
             webtransport_urls: vec!["https://localhost:8443".to_string()],
             userid: "test_user".to_string(),
+            session_id: "test_session_id".to_string(),
+            display_name: "Test User".to_string(),
             on_inbound_media: Callback::from(|_| {}),
             on_state_changed: state_capture.callback(),
             peer_monitor: Callback::from(|_| {}),

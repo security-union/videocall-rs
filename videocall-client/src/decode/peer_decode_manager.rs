@@ -56,6 +56,7 @@ pub enum PeerDecodeError {
 pub enum PeerStatus {
     Added(u64),
     NoChange,
+    NameChanged(String, String),
 }
 
 impl Display for PeerDecodeError {
@@ -83,8 +84,9 @@ pub struct Peer {
     pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
-    pub session_id: u64,
-    pub email: String,
+    // pub email: String,
+    pub session_id: String,
+    pub display_name: String,
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
@@ -111,7 +113,7 @@ impl Peer {
     fn new(
         video_canvas_id: String,
         screen_canvas_id: String,
-        session_id: u64,
+        session_id: String,
         email: String,
         aes: Option<Aes128State>,
     ) -> Result<Self, JsValue> {
@@ -127,7 +129,7 @@ impl Peer {
             video,
             screen,
             session_id,
-            email,
+            display_name: email,
             video_canvas_id,
             screen_canvas_id,
             aes,
@@ -274,6 +276,10 @@ impl Peer {
             MediaType::HEARTBEAT => {
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
+                    // Update display name from heartbeat if non-empty
+                    if !metadata.display_name.is_empty() {
+                        self.display_name = metadata.display_name.clone();
+                    }
                     // Check if video is being turned off (on -> off transition)
                     let video_turned_off = self.video_enabled && !metadata.video_enabled;
                     // Check if audio is being turned off (on -> off transition)
@@ -377,6 +383,15 @@ impl Peer {
         }
     }
 
+    /// We need to change the display name without re-creating decoders for such operation
+    pub fn set_display_name(&mut self, name: String) {
+        debug!(
+            "Peer {} display name changed from: {} to {}",
+            self.session_id, self.display_name, name
+        );
+        self.display_name = name;
+    }
+
     fn on_heartbeat(&mut self) {
         self.heartbeat_count += 1;
     }
@@ -405,6 +420,8 @@ pub struct PeerDecodeManager {
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Rc<DiagnosticManager>>,
     pub on_peer_removed: Callback<String>,
+    /// Called as `callback(peer_userid, new_display_name)` when a peer's display name changes
+    pub on_peer_display_name_changed: Callback<(String, String)>,
 }
 
 impl Default for PeerDecodeManager {
@@ -422,6 +439,7 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
             on_peer_removed: Callback::noop(),
+            on_peer_display_name_changed: Callback::noop(),
         }
     }
 
@@ -433,6 +451,7 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: Some(diagnostics),
             on_peer_removed: Callback::noop(),
+            on_peer_display_name_changed: Callback::noop(),
         }
     }
 
@@ -491,9 +510,15 @@ impl PeerDecodeManager {
                 peer.screen.set_stream_context(userid.to_string(), sid_str);
                 peer.context_initialized = true;
             }
+
+            let old_display_name = peer.display_name.clone();
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
                     peer.on_heartbeat();
+                    if !peer.display_name.is_empty() && peer.display_name != old_display_name {
+                        self.on_peer_display_name_changed
+                            .emit((peer_session_id.to_string(), peer.display_name.clone()));
+                    }
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {
@@ -531,8 +556,8 @@ impl PeerDecodeManager {
             session_id,
             Peer::new(
                 self.get_video_canvas_id.emit(sid_str.clone()),
-                self.get_screen_canvas_id.emit(sid_str),
-                session_id,
+                self.get_screen_canvas_id.emit(sid_str.clone()),
+                sid_str.clone(),
                 email.to_owned(),
                 aes,
             )?,
@@ -590,5 +615,21 @@ impl PeerDecodeManager {
         );
         SharedAudioContext::update_speaker_device(speaker_device_id)?;
         Ok(())
+    }
+
+    /// Update peer display name by session ID
+    pub fn update_peer_display_name(&mut self, session_id: &str, new_name: &str) {
+        if let Ok(sid) = session_id.parse::<u64>() {
+            if let Some(peer) = self.connected_peers.get_mut(&sid) {
+                peer.set_display_name(new_name.to_string());
+            }
+        }
+    }
+
+    pub fn get_peer_display_name(&self, session_id: &str) -> Option<String> {
+        let sid: u64 = session_id.parse().ok()?;
+        self.connected_peers
+            .get(&sid)
+            .map(|peer| peer.display_name.clone())
     }
 }

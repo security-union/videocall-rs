@@ -397,12 +397,20 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         let on_join_meeting = on_join_meeting.clone();
         let has_username = (*username_state).is_some();
         let is_not_joined = matches!(*meeting_status, MeetingStatus::NotJoined);
-        use_effect_with((has_username, is_not_joined), move |(has_username, is_not_joined)| {
-            if *has_username && *is_not_joined {
-                on_join_meeting.emit(());
-            }
-            || ()
-        });
+        let auto_join_attempted = use_ref(|| false);
+        use_effect_with(
+            (has_username, is_not_joined),
+            {
+                let auto_join_attempted = auto_join_attempted.clone();
+                move |(has_username, is_not_joined)| {
+                    if *has_username && *is_not_joined && !*auto_join_attempted.borrow() {
+                        *auto_join_attempted.borrow_mut() = true;
+                        on_join_meeting.emit(());
+                    }
+                    || ()
+                }
+            },
+        );
     }
 
     // Logout handler

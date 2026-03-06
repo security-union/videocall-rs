@@ -422,10 +422,12 @@ pub fn MeetingPage(id: String) -> Element {
     // have to interact with a redundant form.
     {
         let mut on_join = on_join_meeting.clone();
+        let mut auto_join_attempted = use_signal(|| false);
         use_effect(move || {
             let has_username = (username_ctx.0)().is_some();
             let is_not_joined = matches!(meeting_status(), MeetingStatus::NotJoined);
-            if has_username && is_not_joined {
+            if has_username && is_not_joined && !auto_join_attempted() {
+                auto_join_attempted.set(true);
                 on_join();
             }
         });

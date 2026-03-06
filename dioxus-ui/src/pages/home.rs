@@ -22,8 +22,9 @@ use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
 use crate::constants::oauth_enabled;
 use crate::context::{
-    clear_username_from_storage, email_to_display_name, load_username_from_storage,
-    save_username_to_storage, validate_display_name, UsernameCtx, DISPLAY_NAME_MAX_LEN,
+    clear_username_from_storage, email_to_display_name, is_valid_meeting_id,
+    load_username_from_storage, save_username_to_storage, validate_display_name, UsernameCtx,
+    DISPLAY_NAME_MAX_LEN,
 };
 use crate::routing::Route;
 use dioxus::prelude::*;
@@ -211,7 +212,7 @@ pub fn Home() -> Element {
                         username_error.set(None);
                         let username = username_value();
                         let meeting_id = get_meeting_id();
-                        if meeting_id.is_empty() {
+                        if meeting_id.is_empty() || !is_valid_meeting_id(&meeting_id) {
                             return;
                         }
                         match validate_display_name(&username) {

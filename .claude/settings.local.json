@@ -47,14 +47,7 @@
       "Bash(node:*)",
       "Bash(make e2e-lint:*)",
       "Bash(make:*)",
-      "Bash(docker system:*)",
-      "Bash(git commit:*)",
-      "Bash(gh run:*)",
-      "Bash(git push:*)",
-      "Bash(cargo test:*)",
-      "Bash(tail:*)",
-      "Bash(test:*)",
-      "Bash(grep \"\"type\"\":\"\"result\"\":*)"
+      "Bash(docker system:*)"
     ]
   }
 }

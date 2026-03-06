@@ -53,7 +53,8 @@
       "Bash(git push:*)",
       "Bash(cargo test:*)",
       "Bash(tail:*)",
-      "Bash(test:*)"
+      "Bash(test:*)",
+      "Bash(grep \"\"type\"\":\"\"result\"\":*)"
     ]
   }
 }

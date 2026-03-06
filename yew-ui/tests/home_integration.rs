@@ -242,6 +242,9 @@ async fn home_rejects_invalid_display_name() {
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
+    // Yield so Yew processes the oninput state updates before submit reads them.
+    sleep(Duration::ZERO).await;
+
     let form = mount.query_selector("form").unwrap().unwrap();
     form.dispatch_event(&bubbling_submit_event()).unwrap();
 
@@ -279,6 +282,9 @@ async fn home_normalizes_spaces_in_display_name() {
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
+    // Yield so Yew processes the oninput state updates before submit reads them.
+    sleep(Duration::ZERO).await;
+
     let form = mount.query_selector("form").unwrap().unwrap();
     form.dispatch_event(&bubbling_submit_event()).unwrap();
 
@@ -310,6 +316,9 @@ async fn home_rejects_empty_display_name() {
         .dyn_into::<HtmlInputElement>().unwrap();
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
+
+    // Yield so Yew processes the oninput state updates before submit reads them.
+    sleep(Duration::ZERO).await;
 
     let form = mount.query_selector("form").unwrap().unwrap();
     form.dispatch_event(&bubbling_submit_event()).unwrap();
@@ -350,6 +359,9 @@ async fn home_rejects_display_name_exceeding_max_length() {
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
+    // Yield so Yew processes the oninput state updates before submit reads them.
+    sleep(Duration::ZERO).await;
+
     let form = mount.query_selector("form").unwrap().unwrap();
     form.dispatch_event(&bubbling_submit_event()).unwrap();
 
@@ -387,6 +399,9 @@ async fn home_accepts_display_name_with_special_characters() {
         .dyn_into::<HtmlInputElement>().unwrap();
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
+
+    // Yield so Yew processes the oninput state updates before submit reads them.
+    sleep(Duration::ZERO).await;
 
     let form = mount.query_selector("form").unwrap().unwrap();
     form.dispatch_event(&bubbling_submit_event()).unwrap();

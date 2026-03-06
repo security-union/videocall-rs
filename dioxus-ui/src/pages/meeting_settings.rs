@@ -3,11 +3,11 @@
 //! Dedicated meeting settings page — the full management hub for a meeting.
 
 use crate::auth::check_session;
+use crate::components::toggle_switch::ToggleSwitch;
 use crate::constants::oauth_enabled;
 use crate::meeting_api::{
     delete_meeting, end_meeting, get_meeting_info, update_meeting, MeetingInfo,
 };
-use crate::components::toggle_switch::ToggleSwitch;
 use crate::routing::Route;
 use dioxus::prelude::*;
 use web_sys::window;

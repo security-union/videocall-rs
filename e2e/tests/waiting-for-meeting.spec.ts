@@ -61,10 +61,10 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
  * "Start Meeting" / "Join Meeting" to enter the grid.
  *
  * The meeting page auto-joins the API when navigated to with a username
- * already set (from the home page). There is no display name prompt on the
- * meeting page -- users who lack a username are redirected back to "/".
+ * already set (from the home page). Users who lack a username see an inline
+ * display name prompt on the meeting page itself.
  *
- * The auto-join shows a brief "Joining meeting..." spinner while the API
+ * The auto-join shows a brief "Joining as [name]..." spinner while the API
  * call is in flight. Once the API responds the UI transitions to one of:
  *   - "Ready to join?" with Start/Join Meeting button (admitted)
  *   - "Waiting to be admitted" (waiting room)

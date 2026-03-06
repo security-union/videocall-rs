@@ -50,7 +50,7 @@ pub enum MeetingStatus {
 
 #[component]
 pub fn MeetingPage(id: String) -> Element {
-    let username_ctx = use_context::<UsernameCtx>();
+    let mut username_ctx = use_context::<UsernameCtx>();
     let mut auth_checked = use_signal(|| false);
     let navigator = use_navigator();
     let mut user_profile = use_signal(|| None::<UserProfile>);
@@ -71,7 +71,7 @@ pub fn MeetingPage(id: String) -> Element {
     } else {
         load_username_from_storage().unwrap_or_default()
     };
-    let input_value_state = use_signal(|| initial_username);
+    let mut input_value_state = use_signal(|| initial_username);
 
     // Auth check effect
     use_effect(move || {
@@ -536,27 +536,86 @@ pub fn MeetingPage(id: String) -> Element {
             },
 
             // Joining in progress
-            (Some(_), MeetingStatus::Joining) => rsx! {
-                div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
-                    div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                    p { style: "color: white; font-size: 1rem;", "Joining meeting..." }
+            (Some(_), MeetingStatus::Joining) => {
+                let display_name = maybe_username.as_deref().unwrap_or("...");
+                rsx! {
+                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                        div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
+                        p { style: "color: white; font-size: 1rem;",
+                            "Joining as "
+                            strong { "{display_name}" }
+                            "..."
+                        }
+                    }
                 }
             },
 
             // No username set, or waiting for auto-join to fire
             _ => {
                 if maybe_username.is_none() {
-                    // Redirect to home page so the user can set a display name
-                    if let Some(w) = web_sys::window() {
-                        let _ = w.location().set_href("/");
+                    // Show inline display name prompt instead of redirecting
+                    rsx! {
+                        div {
+                            style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                            div {
+                                class: "card-apple p-8",
+                                style: "max-width: 400px; width: 90%;",
+                                h2 {
+                                    style: "color: white; text-align: center; margin-bottom: 0.5rem;",
+                                    "Enter your display name"
+                                }
+                                p {
+                                    style: "color: rgba(255,255,255,0.6); text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;",
+                                    "Choose a name to join the meeting"
+                                }
+                                form {
+                                    onsubmit: move |e| {
+                                        e.prevent_default();
+                                        let raw = input_value_state();
+                                        match crate::context::validate_display_name(&raw) {
+                                            Ok(valid_name) => {
+                                                crate::context::save_username_to_storage(&valid_name);
+                                                (username_ctx.0).set(Some(valid_name));
+                                            }
+                                            Err(msg) => {
+                                                if let Some(w) = web_sys::window() {
+                                                    let _ = w.alert_with_message(&msg);
+                                                }
+                                            }
+                                        }
+                                    },
+                                    input {
+                                        class: "input-apple",
+                                        r#type: "text",
+                                        placeholder: "Enter your display name",
+                                        required: true,
+                                        autofocus: true,
+                                        value: "{input_value_state}",
+                                        oninput: move |e: Event<FormData>| {
+                                            input_value_state.set(e.value());
+                                        },
+                                    }
+                                    button {
+                                        r#type: "submit",
+                                        class: "btn-apple btn-primary w-full",
+                                        style: "margin-top: 1rem;",
+                                        "Join Meeting"
+                                    }
+                                }
+                            }
+                        }
                     }
-                    rsx! {}
                 } else {
                     // Username is set; the auto-join effect will fire momentarily
+                    let display_name = maybe_username.as_deref().unwrap_or("Unknown");
                     rsx! {
                         div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
                             div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                            p { style: "color: white; font-size: 1rem;", "Joining meeting..." }
+                            p { style: "color: white; font-size: 1rem;",
+                                "Joining as "
+                                strong { "{display_name}" }
+                                "..."
+                            }
                         }
                     }
                 }

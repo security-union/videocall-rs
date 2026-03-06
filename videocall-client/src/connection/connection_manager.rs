@@ -94,7 +94,6 @@ pub struct ConnectionManagerOptions {
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
     pub election_period_ms: u64,
-    pub on_speaking_changed: Option<Callback<bool>>,
 }
 
 #[derive(Debug)]

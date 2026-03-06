@@ -591,10 +591,15 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
 
                     // Joining in progress
                     (Some(_), MeetingStatus::Joining) => {
+                        let display_name = maybe_username.as_deref().unwrap_or("...");
                         html! {
                             <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;">
                                 <div class="loading-spinner" style="width: 40px; height: 40px; margin-bottom: 1rem;"></div>
-                                <p style="color: white; font-size: 1rem;">{"Joining meeting..."}</p>
+                                <p style="color: white; font-size: 1rem;">
+                                    {"Joining as "}
+                                    <strong>{display_name}</strong>
+                                    {"..."}
+                                </p>
                             </div>
                         }
                     }
@@ -602,17 +607,74 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     // No username set, or waiting for auto-join to fire
                     _ => {
                         if maybe_username.is_none() {
-                            // Redirect to home page so the user can set a display name
-                            if let Some(window) = web_sys::window() {
-                                let _ = window.location().set_href("/");
+                            // Show inline display name prompt instead of redirecting
+                            let on_display_name_submit = {
+                                let input_value_state = input_value_state.clone();
+                                let username_state = username_state.clone();
+                                Callback::from(move |e: SubmitEvent| {
+                                    e.prevent_default();
+                                    let raw = (*input_value_state).clone();
+                                    match crate::context::validate_display_name(&raw) {
+                                        Ok(valid_name) => {
+                                            crate::context::save_username_to_storage(&valid_name);
+                                            username_state.set(Some(valid_name));
+                                        }
+                                        Err(msg) => {
+                                            if let Some(w) = web_sys::window() {
+                                                let _ = w.alert_with_message(&msg);
+                                            }
+                                        }
+                                    }
+                                })
+                            };
+                            let on_display_name_input = {
+                                let input_value_state = input_value_state.clone();
+                                Callback::from(move |e: InputEvent| {
+                                    let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                    input_value_state.set(input.value());
+                                })
+                            };
+                            html! {
+                                <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;">
+                                    <div class="card-apple p-8" style="max-width: 400px; width: 90%;">
+                                        <h2 style="color: white; text-align: center; margin-bottom: 0.5rem;">
+                                            {"Enter your display name"}
+                                        </h2>
+                                        <p style="color: rgba(255,255,255,0.6); text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;">
+                                            {"Choose a name to join the meeting"}
+                                        </p>
+                                        <form onsubmit={on_display_name_submit}>
+                                            <input
+                                                class="input-apple"
+                                                type="text"
+                                                placeholder="Enter your display name"
+                                                required={true}
+                                                autofocus={true}
+                                                value={(*input_value_state).clone()}
+                                                oninput={on_display_name_input}
+                                            />
+                                            <button
+                                                type="submit"
+                                                class="btn-apple btn-primary w-full"
+                                                style="margin-top: 1rem;"
+                                            >
+                                                {"Join Meeting"}
+                                            </button>
+                                        </form>
+                                    </div>
+                                </div>
                             }
-                            html! {}
                         } else {
                             // Username is set; the auto-join effect will fire momentarily
+                            let display_name = maybe_username.as_deref().unwrap_or("Unknown");
                             html! {
                                 <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;">
                                     <div class="loading-spinner" style="width: 40px; height: 40px; margin-bottom: 1rem;"></div>
-                                    <p style="color: white; font-size: 1rem;">{"Joining meeting..."}</p>
+                                    <p style="color: white; font-size: 1rem;">
+                                        {"Joining as "}
+                                        <strong>{display_name}</strong>
+                                        {"..."}
+                                    </p>
                                 </div>
                             }
                         }

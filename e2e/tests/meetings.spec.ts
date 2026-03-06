@@ -88,6 +88,21 @@ test.describe("Meetings", () => {
     await expect(page.locator("#username")).toHaveValue("PersistUser", { timeout: 5_000 });
   });
 
+  test("navigating directly to a meeting URL without a display name shows inline prompt", async ({
+    page,
+  }) => {
+    // When no display name is stored, the meeting page shows an inline
+    // display name prompt instead of redirecting to the home page.
+    await page.goto("/meeting/no_username_test");
+    await page.waitForTimeout(2000);
+    // Should stay on the meeting page, NOT redirect to "/"
+    await expect(page).toHaveURL(/\/meeting\/no_username_test/);
+    // The inline prompt should be visible with input and join button
+    await expect(page.getByText("Enter your display name")).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator("input.input-apple")).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByText("Join Meeting")).toBeVisible({ timeout: 5_000 });
+  });
+
   test("display name is saved to localStorage on create new meeting", async ({ page }) => {
     // Same persistence check, but using the "Create a New Meeting ID" button.
     await page.goto("/");

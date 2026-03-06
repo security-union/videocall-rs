@@ -112,14 +112,17 @@ pub fn home() -> Html {
     let on_logout = {
         let user_profile = user_profile.clone();
         let username_ctx = username_ctx.clone();
+        let username_value = username_value.clone();
         Callback::from(move |_: web_sys::MouseEvent| {
             let user_profile = user_profile.clone();
             let username_ctx = username_ctx.clone();
+            let username_value = username_value.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = logout().await;
                 user_profile.set(None);
                 clear_username_from_storage();
                 username_ctx.set(None);
+                username_value.set(String::new());
             });
         })
     };

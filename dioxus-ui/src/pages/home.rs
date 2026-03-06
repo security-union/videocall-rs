@@ -23,7 +23,7 @@ use crate::components::meetings_list::MeetingsList;
 use crate::constants::oauth_enabled;
 use crate::context::{
     clear_username_from_storage, email_to_display_name, load_username_from_storage,
-    save_username_to_storage, validate_display_name, UsernameCtx,
+    save_username_to_storage, validate_display_name, UsernameCtx, DISPLAY_NAME_MAX_LEN,
 };
 use crate::routing::Route;
 use dioxus::prelude::*;
@@ -46,7 +46,6 @@ fn generate_meeting_id() -> String {
 pub fn Home() -> Element {
     let navigator = use_navigator();
 
-    let mut username_ref = use_signal(|| None::<web_sys::Element>);
     let mut meeting_id_ref = use_signal(|| None::<web_sys::Element>);
     let mut meeting_id_value = use_signal(String::new);
     let mut username_ctx = use_context::<UsernameCtx>();
@@ -241,14 +240,10 @@ pub fn Home() -> Element {
                                 placeholder: "Enter your display name",
                                 required: true,
                                 autofocus: true,
+                                maxlength: DISPLAY_NAME_MAX_LEN as i64,
                                 value: "{username_value}",
                                 oninput: move |e: Event<FormData>| {
                                     username_value.set(e.value());
-                                },
-                                onmounted: move |evt| {
-                                    if let Some(elem) = evt.try_as_web_event() {
-                                        username_ref.set(Some(elem));
-                                    }
                                 },
                             }
                         }

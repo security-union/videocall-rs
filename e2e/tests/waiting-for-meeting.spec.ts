@@ -44,7 +44,9 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
 
   await page.locator("#meeting-id").click();
   await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+  // Display name is a controlled input -- clear before typing to handle any pre-fill
   await page.locator("#username").click();
+  await page.locator("#username").fill("");
   await page.locator("#username").pressSequentially(username, { delay: 50 });
   await page.waitForTimeout(500);
   await page.locator("#username").press("Enter");

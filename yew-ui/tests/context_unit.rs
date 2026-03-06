@@ -11,8 +11,8 @@
 use wasm_bindgen_test::*;
 
 use videocall_ui::context::{
-    email_to_display_name, load_username_from_storage, normalize_spaces, save_username_to_storage,
-    validate_display_name, DISPLAY_NAME_MAX_LEN,
+    clear_username_from_storage, email_to_display_name, load_username_from_storage,
+    normalize_spaces, save_username_to_storage, validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -169,4 +169,70 @@ fn storage_round_trip() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item("vc_username");
     }
+}
+
+#[wasm_bindgen_test]
+fn clear_username_from_storage_removes_key() {
+    // Ensure there is a value first.
+    save_username_to_storage("to_be_cleared");
+    assert_eq!(
+        load_username_from_storage(),
+        Some("to_be_cleared".to_string())
+    );
+
+    // Clear and verify it is gone.
+    clear_username_from_storage();
+    assert_eq!(load_username_from_storage(), None);
+}
+
+#[wasm_bindgen_test]
+fn clear_username_from_storage_is_idempotent() {
+    // Clearing when there is nothing stored should not panic or error.
+    clear_username_from_storage();
+    assert_eq!(load_username_from_storage(), None);
+
+    // Clearing twice in a row should also be fine.
+    save_username_to_storage("temp");
+    clear_username_from_storage();
+    clear_username_from_storage();
+    assert_eq!(load_username_from_storage(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-set display name from profile (non-email used directly)
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn profile_name_without_at_sign_used_directly() {
+    // When the profile name does NOT contain '@', it should be usable
+    // as a display name without transformation through email_to_display_name.
+    // The auto-set logic in the UI checks: if name.contains('@') then
+    // email_to_display_name(), otherwise use the name as-is.
+    let profile_name = "Alice Johnson";
+    assert!(!profile_name.contains('@'));
+    // The name should pass validation unchanged (after normalization).
+    let validated = validate_display_name(profile_name).unwrap();
+    assert_eq!(validated, "Alice Johnson");
+}
+
+#[wasm_bindgen_test]
+fn profile_name_with_at_sign_goes_through_email_conversion() {
+    // When the profile name contains '@', it gets converted via
+    // email_to_display_name which title-cases the local part.
+    let profile_name = "alice.johnson@example.com";
+    assert!(profile_name.contains('@'));
+    let display = email_to_display_name(profile_name);
+    assert_eq!(display, "Alice Johnson");
+    // And the result passes validation.
+    assert!(validate_display_name(&display).is_ok());
+}
+
+#[wasm_bindgen_test]
+fn profile_name_preserves_casing_when_not_email() {
+    // A non-email profile name like "McDowell" should NOT be title-cased
+    // or otherwise transformed -- it should be kept exactly as provided
+    // (modulo whitespace normalization).
+    let profile_name = "McDowell";
+    let validated = validate_display_name(profile_name).unwrap();
+    assert_eq!(validated, "McDowell");
 }

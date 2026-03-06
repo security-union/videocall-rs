@@ -123,7 +123,9 @@ test.describe("Two users in a meeting", () => {
 
       await hostPage.locator("#meeting-id").click();
       await hostPage.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+      // Display name is a controlled input -- clear before typing to handle any pre-fill
       await hostPage.locator("#username").click();
+      await hostPage.locator("#username").fill("");
       await hostPage.locator("#username").pressSequentially("HostUser", { delay: 50 });
       await hostPage.waitForTimeout(500);
       await hostPage.locator("#username").press("Enter");

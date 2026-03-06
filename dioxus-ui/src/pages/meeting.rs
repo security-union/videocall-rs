@@ -18,7 +18,8 @@ use crate::constants::{
     webtransport_host_base,
 };
 use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
+    email_to_display_name, load_username_from_storage, normalize_spaces, save_username_to_storage,
+    validate_display_name, UsernameCtx, DISPLAY_NAME_MAX_LEN,
 };
 use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
@@ -425,28 +426,17 @@ pub fn MeetingPage(id: String) -> Element {
         move |e: FormEvent| {
             e.prevent_default();
             let value = input_value_state();
-            if is_valid_username(&value) {
-                save_username_to_storage(&value);
-
-                if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-                    if let Ok(Some(flag)) = storage.get_item("vc_username_reset") {
-                        if flag == "1" {
-                            let _ = storage.remove_item("vc_username_reset");
-                            if let Some(win) = window() {
-                                let _ = win.location().reload();
-                            }
-                            return;
-                        }
-                    }
+            match validate_display_name(&value) {
+                Ok(valid_name) => {
+                    input_value_state.set(valid_name.clone());
+                    save_username_to_storage(&valid_name);
+                    (username_ctx.0).set(Some(valid_name));
+                    error_state.set(None);
+                    on_join();
                 }
-
-                (username_ctx.0).set(Some(value));
-                error_state.set(None);
-                on_join();
-            } else {
-                error_state.set(Some(
-                    "Please enter a valid username (letters, numbers, underscore).".to_string(),
-                ));
+                Err(message) => {
+                    error_state.set(Some(message));
+                }
             }
         }
     };
@@ -566,6 +556,27 @@ pub fn MeetingPage(id: String) -> Element {
             // Username prompt (not joined or no username)
             _ => {
                 let mut on_join = on_join_meeting.clone();
+
+                // Build datalist suggestions from the user profile
+                let display_name_options: Vec<String> = {
+                    let mut set = std::collections::BTreeSet::<String>::new();
+                    if let Some(profile) = user_profile().as_ref() {
+                        let name = normalize_spaces(profile.name.trim());
+                        if validate_display_name(&name).is_ok() {
+                            set.insert(name);
+                        }
+
+                        let email = profile.email.trim();
+                        if !email.is_empty() {
+                            let candidate = email_to_display_name(email);
+                            if !candidate.is_empty() && validate_display_name(&candidate).is_ok() {
+                                set.insert(candidate);
+                            }
+                        }
+                    }
+                    set.into_iter().collect()
+                };
+
                 rsx! {
                     div { id: "username-prompt", class: "username-prompt-container relative",
                         // User profile dropdown (OAuth)
@@ -605,7 +616,8 @@ pub fn MeetingPage(id: String) -> Element {
                             input {
                                 class: "username-input",
                                 placeholder: "Your name",
-                                pattern: "^[a-zA-Z0-9_]*$",
+                                list: "display-name-options",
+                                maxlength: "{DISPLAY_NAME_MAX_LEN}",
                                 required: true,
                                 autofocus: true,
                                 oninput: move |e: Event<FormData>| {
@@ -614,28 +626,27 @@ pub fn MeetingPage(id: String) -> Element {
                                 onkeydown: move |e: Event<KeyboardData>| {
                                     if e.key() == Key::Enter {
                                         let value = input_value_state();
-                                        if is_valid_username(&value) {
-                                            save_username_to_storage(&value);
-                                            if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-                                                if let Ok(Some(flag)) = storage.get_item("vc_username_reset") {
-                                                    if flag == "1" {
-                                                        let _ = storage.remove_item("vc_username_reset");
-                                                        if let Some(win) = window() { let _ = win.location().reload(); }
-                                                        e.prevent_default();
-                                                        return;
-                                                    }
-                                                }
+                                        match validate_display_name(&value) {
+                                            Ok(valid_name) => {
+                                                input_value_state.set(valid_name.clone());
+                                                save_username_to_storage(&valid_name);
+                                                (username_ctx.0).set(Some(valid_name));
+                                                error_state.set(None);
+                                                on_join();
                                             }
-                                            (username_ctx.0).set(Some(value));
-                                            error_state.set(None);
-                                            on_join();
-                                        } else {
-                                            error_state.set(Some("Please enter a valid username (letters, numbers, underscore).".to_string()));
+                                            Err(message) => {
+                                                error_state.set(Some(message));
+                                            }
                                         }
                                         e.prevent_default();
                                     }
                                 },
                                 value: "{input_value_state}",
+                            }
+                            datalist { id: "display-name-options",
+                                for opt in display_name_options.iter() {
+                                    option { value: "{opt}" }
+                                }
                             }
                             if let Some(err) = error_state() {
                                 p { class: "error", "{err}" }

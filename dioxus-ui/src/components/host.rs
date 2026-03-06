@@ -30,7 +30,8 @@ use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
+    load_username_from_storage, save_username_to_storage, validate_display_name,
+    VideoCallClientCtx,
 };
 
 use std::cell::RefCell;
@@ -558,13 +559,16 @@ pub fn Host(
                         change_name_error.set(None);
                     } else if key == Key::Enter {
                         let new_name = pending_name().trim().to_string();
-                        if is_valid_username(&new_name) && !new_name.is_empty() {
-                            save_username_to_storage(&new_name);
-                            if let Some(win) = web_sys::window() {
-                                let _ = win.location().reload();
+                        match validate_display_name(&new_name) {
+                            Ok(valid_name) => {
+                                save_username_to_storage(&valid_name);
+                                if let Some(win) = web_sys::window() {
+                                    let _ = win.location().reload();
+                                }
                             }
-                        } else {
-                            change_name_error.set(Some("Use letters, numbers, and underscore only.".to_string()));
+                            Err(message) => {
+                                change_name_error.set(Some(message));
+                            }
                         }
                     }
                 },
@@ -578,7 +582,6 @@ pub fn Host(
                             pending_name.set(e.value());
                         },
                         placeholder: "Enter new name",
-                        pattern: "^[a-zA-Z0-9_]*$",
                         autofocus: true,
                     }
                     if let Some(err) = change_name_error() {
@@ -597,13 +600,16 @@ pub fn Host(
                             class: "btn-apple btn-primary btn-sm",
                             onclick: move |_| {
                                 let new_name = pending_name().trim().to_string();
-                                if is_valid_username(&new_name) && !new_name.is_empty() {
-                                    save_username_to_storage(&new_name);
-                                    if let Some(win) = web_sys::window() {
-                                        let _ = win.location().reload();
+                                match validate_display_name(&new_name) {
+                                    Ok(valid_name) => {
+                                        save_username_to_storage(&valid_name);
+                                        if let Some(win) = web_sys::window() {
+                                            let _ = win.location().reload();
+                                        }
                                     }
-                                } else {
-                                    change_name_error.set(Some("Use letters, numbers, and underscore only.".to_string()));
+                                    Err(message) => {
+                                        change_name_error.set(Some(message));
+                                    }
                                 }
                             },
                             "Save"

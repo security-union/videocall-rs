@@ -134,18 +134,49 @@ pub fn normalize_spaces(s: &str) -> String {
     out
 }
 
-/// Allowed characters for display names
+/// Allowed characters for display names.
+/// Only ASCII alphanumerics are permitted (not full Unicode) to prevent
+/// homoglyph / spoofing attacks.
 pub fn is_allowed_display_name_char(ch: char) -> bool {
-    ch.is_alphanumeric()
+    ch.is_ascii_alphanumeric()
         || ch == ' '
         || ch == '_'
         || ch == '-'
         || ch == '\''
-        || ch == '"'
 }
 
-/// Validate and normalize a display name
-/// Returns normalized value on success, otherwise a clear error message
+/// Convert an email address (or its local-part) into a title-cased display name.
+///
+/// Splits on `.`, `_`, and `-`, title-cases each word, and joins with spaces.
+/// For example `"john.doe"` becomes `"John Doe"`.
+pub fn email_to_display_name(email_or_local: &str) -> String {
+    let local = email_or_local.split('@').next().unwrap_or(email_or_local);
+
+    let words: Vec<String> = local
+        .split(|c: char| c == '.' || c == '_' || c == '-')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let mut chars = part.trim().chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => {
+                    let mut word = String::new();
+                    word.extend(first.to_uppercase());
+                    word.push_str(&chars.as_str().to_lowercase());
+                    word
+                }
+            }
+        })
+        .collect();
+
+    normalize_spaces(&words.join(" "))
+}
+
+/// Validate and normalize a display name.
+/// Returns normalized value on success, otherwise a clear error message.
+///
+/// NOTE: Server-side validation should mirror these rules. Client-side
+/// validation is a UX convenience; the backend is the authoritative boundary.
 pub fn validate_display_name(raw: &str) -> Result<String, String> {
     let value = normalize_spaces(raw);
 
@@ -160,16 +191,16 @@ pub fn validate_display_name(raw: &str) -> Result<String, String> {
         ));
     }
 
-    let mut invalid_chars: Vec<char> = Vec::new();
-    for ch in value.chars() {
-        if !is_allowed_display_name_char(ch) {
-            invalid_chars.push(ch);
-        }
-    }
+    let mut invalid_chars: Vec<char> = value
+        .chars()
+        .filter(|ch| !is_allowed_display_name_char(*ch))
+        .collect();
+    invalid_chars.sort();
+    invalid_chars.dedup();
 
     if !invalid_chars.is_empty() {
         return Err(format!(
-            "Invalid character(s): {:?}. Allowed: letters, numbers, spaces, '_', '-', apostrophe (') and double quote (\").",
+            "Invalid character(s): {:?}. Allowed: ASCII letters, numbers, spaces, '_', '-', and apostrophe (').",
             invalid_chars
         ));
     }

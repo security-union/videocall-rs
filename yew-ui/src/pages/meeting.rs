@@ -2,7 +2,8 @@ use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{e2ee_enabled, webtransport_enabled};
 use crate::context::{
-    load_username_from_storage, save_username_to_storage, UsernameCtx, validate_display_name, DISPLAY_NAME_MAX_LEN,
+    email_to_display_name, load_username_from_storage, normalize_spaces, save_username_to_storage,
+    UsernameCtx, validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
 use crate::meeting_api::{join_meeting, JoinError};
 use web_sys::window;
@@ -15,6 +16,7 @@ use crate::constants::oauth_enabled;
 use crate::routing::Route;
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 /// Meeting participant status from the API
 #[derive(Clone, PartialEq, Debug)]
@@ -54,50 +56,6 @@ pub struct MeetingPageProps {
 #[function_component(MeetingPage)]
 pub fn meeting_page(props: &MeetingPageProps) -> Html {
     
-    // Display name validation rules
-
-    fn normalize_spaces(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut prev_space = false;
-
-        for ch in s.trim().chars() {
-            if ch.is_whitespace() {
-                if !prev_space {
-                    out.push(' ');
-                    prev_space = true;
-                }
-            } else {
-                out.push(ch);
-                prev_space = false;
-            }
-        }
-
-        out
-    }
-
-    fn email_to_display_name(email_or_local: &str) -> String {
-        let local = email_or_local.split('@').next().unwrap_or(email_or_local);
-
-        let words: Vec<String> = local
-            .split(|c: char| c == '.' || c == '_' || c == '-')
-            .filter(|part| !part.trim().is_empty())
-            .map(|part| {
-                let mut chars = part.trim().chars();
-                match chars.next() {
-                    None => String::new(),
-                    Some(first) => {
-                        let mut word = String::new();
-                        word.extend(first.to_uppercase());
-                        word.push_str(&chars.as_str().to_lowercase());
-                        word
-                    }
-                }
-            })
-            .collect();
-
-        normalize_spaces(&words.join(" "))
-    }
-
     // --- ALL Hooks MUST be declared first (unconditionally) ---
     // Retrieve the username context (may be None on first load)
     let username_state =
@@ -502,20 +460,18 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         })
     };
 
-    // Memoised submit handler (depends on username_state, input_value_state, error_state)
-    let on_submit = {
+    // Shared validation-and-save logic used by both on_submit and on_keydown.
+    let do_save_display_name: Rc<dyn Fn()> = {
         let username_state = username_state.clone();
         let input_value_state = input_value_state.clone();
         let error_state = error_state.clone();
         let on_join_meeting = on_join_meeting.clone();
-        Callback::from(move |e: SubmitEvent| {
-            e.prevent_default();
+        Rc::new(move || {
             let value = (*input_value_state).clone();
             match validate_display_name(&value) {
                 Ok(valid_name) => {
                     input_value_state.set(valid_name.clone());
                     save_username_to_storage(&valid_name);
-
                     username_state.set(Some(valid_name));
                     error_state.set(None);
                     on_join_meeting.emit(());
@@ -524,6 +480,15 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     error_state.set(Some(message));
                 }
             }
+        })
+    };
+
+    // Memoised submit handler (depends on username_state, input_value_state, error_state)
+    let on_submit = {
+        let do_save = do_save_display_name.clone();
+        Callback::from(move |e: SubmitEvent| {
+            e.prevent_default();
+            do_save();
         })
     };
 
@@ -539,26 +504,10 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     // Handle the "Enter" key directly by triggering the form submission when
     // valid (so users can simply press Enter instead of clicking the button).
     let on_keydown = {
-        let username_state = username_state.clone();
-        let input_value_state = input_value_state.clone();
-        let error_state = error_state.clone();
-        let on_join_meeting = on_join_meeting.clone();
+        let do_save = do_save_display_name.clone();
         Callback::from(move |e: KeyboardEvent| {
             if e.key() == "Enter" {
-                let value = (*input_value_state).clone();
-                match validate_display_name(&value) {
-                    Ok(valid_name) => {
-                        input_value_state.set(valid_name.clone());
-                        save_username_to_storage(&valid_name);
-
-                        username_state.set(Some(valid_name));
-                        error_state.set(None);
-                        on_join_meeting.emit(());
-                    }
-                    Err(message) => {
-                        error_state.set(Some(message));
-                    }
-                }
+                do_save();
                 e.prevent_default();
             }
         })
@@ -573,7 +522,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     };
 
     let current_meeting_status = (*meeting_status).clone();
-    // let current_host_display_name = (*host_display_name).clone();
     let should_auto_join = *came_from_waiting_room;
     let display_name_options: Vec<String> = {
         let mut set = BTreeSet::<String>::new();
@@ -581,14 +529,14 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         if let Some(profile) = (*user_profile).as_ref() {
 
             let name = normalize_spaces(profile.name.trim());
-            if !name.is_empty() {
+            if validate_display_name(&name).is_ok() {
                 set.insert(name);
             }
 
             let email = profile.email.trim();
-            if let Some(local) = email.split('@').next() {
-                let candidate = email_to_display_name(local);
-                if !candidate.is_empty() {
+            if !email.is_empty() {
+                let candidate = email_to_display_name(email);
+                if !candidate.is_empty() && validate_display_name(&candidate).is_ok() {
                     set.insert(candidate);
                 }
             }
@@ -754,6 +702,21 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                     { error_html }
                                     <button class="cta-button" type="submit">{"Continue"}</button>
                                 </form>
+                                {
+                                    if oauth_enabled().unwrap_or(false) {
+                                        html! {
+                                            <button
+                                                class="sign-out-link"
+                                                style="background: none; border: none; color: rgba(255,255,255,0.5); cursor: pointer; font-size: 0.85rem; margin-top: 1rem; text-decoration: underline;"
+                                                onclick={on_logout.reform(|_: web_sys::MouseEvent| ())}
+                                            >
+                                                {"Sign out"}
+                                            </button>
+                                        }
+                                    } else {
+                                        html! {}
+                                    }
+                                }
                             </div>
                         }
                     }

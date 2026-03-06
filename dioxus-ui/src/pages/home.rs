@@ -19,7 +19,7 @@
 use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::components::meetings_list::MeetingsList;
 use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
+    load_username_from_storage, save_username_to_storage, validate_display_name, UsernameCtx,
 };
 use crate::routing::Route;
 use dioxus::prelude::*;
@@ -121,18 +121,25 @@ pub fn Home() -> Element {
                         e.prevent_default();
                         let username = get_username();
                         let meeting_id = get_meeting_id();
-                        if !is_valid_username(&username) || meeting_id.is_empty() {
+                        if meeting_id.is_empty() {
                             let _ = web_sys::window().unwrap().alert_with_message(
-                                "Please provide a valid username and meeting id (a-z, A-Z, 0-9, _).",
+                                "Please provide a meeting ID.",
                             );
                             return;
                         }
-                        save_username_to_storage(&username);
-                        (username_ctx.0).set(Some(username));
-                        if let Some(name) = (username_ctx.0)() {
-                            matomo_logger::set_user_id(&name);
+                        match validate_display_name(&username) {
+                            Ok(valid_name) => {
+                                save_username_to_storage(&valid_name);
+                                (username_ctx.0).set(Some(valid_name));
+                                if let Some(name) = (username_ctx.0)() {
+                                    matomo_logger::set_user_id(&name);
+                                }
+                                navigator.push(Route::Meeting { id: meeting_id });
+                            }
+                            Err(message) => {
+                                let _ = web_sys::window().unwrap().alert_with_message(&message);
+                            }
                         }
-                        navigator.push(Route::Meeting { id: meeting_id });
                     },
                     h3 { class: "text-center text-xl font-semibold mb-6 text-white/90", "Start or Join a Meeting" }
                     div { class: "space-y-6",
@@ -144,7 +151,6 @@ pub fn Home() -> Element {
                                 r#type: "text",
                                 placeholder: "Enter your name",
                                 required: true,
-                                pattern: "^[a-zA-Z0-9_]*$",
                                 autofocus: true,
                                 value: "{existing_username}",
                                 onmounted: move |evt| {
@@ -172,7 +178,7 @@ pub fn Home() -> Element {
                                     }
                                 },
                             }
-                            p { class: "text-sm text-foreground-subtle mt-2 ml-1", "Characters allowed: a-z, A-Z, 0-9, and _" }
+                            p { class: "text-sm text-foreground-subtle mt-2 ml-1", "Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes" }
                         }
                         if !meeting_id_value().is_empty() {
                             div { class: "mt-4",
@@ -189,17 +195,20 @@ pub fn Home() -> Element {
                                 class: "btn-apple btn-secondary w-full flex items-center justify-center gap-2",
                                 onclick: move |_| {
                                     let username = get_username();
-                                    if !is_valid_username(&username) {
-                                        let _ = web_sys::window().unwrap().alert_with_message("Please enter a valid username before creating a meeting.");
-                                        return;
+                                    match validate_display_name(&username) {
+                                        Ok(valid_name) => {
+                                            let meeting_id = generate_meeting_id();
+                                            save_username_to_storage(&valid_name);
+                                            (username_ctx.0).set(Some(valid_name));
+                                            if let Some(name) = (username_ctx.0)() {
+                                                matomo_logger::set_user_id(&name);
+                                            }
+                                            navigator.push(Route::Meeting { id: meeting_id });
+                                        }
+                                        Err(message) => {
+                                            let _ = web_sys::window().unwrap().alert_with_message(&message);
+                                        }
                                     }
-                                    let meeting_id = generate_meeting_id();
-                                    save_username_to_storage(&username);
-                                    (username_ctx.0).set(Some(username));
-                                    if let Some(name) = (username_ctx.0)() {
-                                        matomo_logger::set_user_id(&name);
-                                    }
-                                    navigator.push(Route::Meeting { id: meeting_id });
                                 },
                                 span { class: "text-lg", "Create a New Meeting ID" }
                             }

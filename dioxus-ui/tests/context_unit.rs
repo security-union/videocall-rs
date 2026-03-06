@@ -1,7 +1,7 @@
 // Copyright 2025 Security Union LLC
 // Licensed under MIT OR Apache-2.0
 //
-// Unit tests for context helpers: username validation & local storage.
+// Unit tests for context helpers: display-name validation & local storage.
 //
 // These don't need a full Dioxus render — they test pure functions
 // and `window.localStorage` interactions.
@@ -10,40 +10,73 @@
 
 use wasm_bindgen_test::*;
 
-use dioxus_ui::context::{is_valid_username, load_username_from_storage, save_username_to_storage};
+use dioxus_ui::context::{
+    email_to_display_name, load_username_from_storage, normalize_spaces, save_username_to_storage,
+    validate_display_name, DISPLAY_NAME_MAX_LEN,
+};
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 // ---------------------------------------------------------------------------
-// Username validation
+// Display-name validation
 // ---------------------------------------------------------------------------
 
 #[wasm_bindgen_test]
-fn valid_usernames_accepted() {
-    assert!(is_valid_username("alice"));
-    assert!(is_valid_username("Bob123"));
-    assert!(is_valid_username("user_name"));
-    assert!(is_valid_username("A"));
+fn valid_display_names_accepted() {
+    assert!(validate_display_name("alice").is_ok());
+    assert!(validate_display_name("Bob 123").is_ok());
+    assert!(validate_display_name("user_name").is_ok());
+    assert!(validate_display_name("A").is_ok());
+    assert!(validate_display_name("O'Brien").is_ok());
+    assert!(validate_display_name("Mary-Jane").is_ok());
 }
 
 #[wasm_bindgen_test]
-fn empty_username_rejected() {
-    assert!(!is_valid_username(""));
+fn empty_display_name_rejected() {
+    assert!(validate_display_name("").is_err());
+    assert!(validate_display_name("   ").is_err());
 }
 
 #[wasm_bindgen_test]
-fn usernames_with_spaces_rejected() {
-    assert!(!is_valid_username("hello world"));
-    assert!(!is_valid_username(" leading"));
-    assert!(!is_valid_username("trailing "));
+fn too_long_display_name_rejected() {
+    let long_name = "a".repeat(DISPLAY_NAME_MAX_LEN + 1);
+    assert!(validate_display_name(&long_name).is_err());
 }
 
 #[wasm_bindgen_test]
-fn usernames_with_special_chars_rejected() {
-    assert!(!is_valid_username("user@name"));
-    assert!(!is_valid_username("user.name"));
-    assert!(!is_valid_username("user-name"));
-    assert!(!is_valid_username("user!"));
+fn display_names_with_special_chars_rejected() {
+    assert!(validate_display_name("user@name").is_err());
+    assert!(validate_display_name("user.name").is_err());
+    assert!(validate_display_name("user!").is_err());
+}
+
+#[wasm_bindgen_test]
+fn display_name_normalizes_spaces() {
+    let result = validate_display_name("  hello   world  ").unwrap();
+    assert_eq!(result, "hello world");
+}
+
+// ---------------------------------------------------------------------------
+// normalize_spaces
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn normalize_spaces_collapses_whitespace() {
+    assert_eq!(normalize_spaces("  a   b  "), "a b");
+    assert_eq!(normalize_spaces("hello"), "hello");
+    assert_eq!(normalize_spaces("   "), "");
+}
+
+// ---------------------------------------------------------------------------
+// email_to_display_name
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn email_to_display_name_works() {
+    assert_eq!(email_to_display_name("john.doe"), "John Doe");
+    assert_eq!(email_to_display_name("john.doe@example.com"), "John Doe");
+    assert_eq!(email_to_display_name("jane_smith"), "Jane Smith");
+    assert_eq!(email_to_display_name("bob-jones"), "Bob Jones");
 }
 
 // ---------------------------------------------------------------------------

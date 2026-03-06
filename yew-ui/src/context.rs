@@ -104,15 +104,10 @@ pub fn clear_username_from_storage() {
 // Validation helpers
 // -----------------------------------------------------------------------------
 
-use once_cell::sync::Lazy;
-
-static USERNAME_RE: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r"^[A-Za-z0-9_]+$").unwrap());
-
-/// Returns `true` iff the supplied username is non-empty and matches the
-/// allowed pattern.
+/// Returns `true` iff the supplied string is non-empty and contains only
+/// ASCII alphanumerics and underscores (used for meeting ID validation).
 pub fn is_valid_username(name: &str) -> bool {
-    !name.is_empty() && USERNAME_RE.is_match(name)
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 // -----------------------------------------------------------------------------

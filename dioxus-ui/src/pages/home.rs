@@ -247,6 +247,7 @@ pub fn Home() -> Element {
                                     username_error.set(None);
                                 },
                             }
+                            p { class: "text-sm text-foreground-subtle mt-2 ml-1", "Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes" }
                             if let Some(err) = username_error() {
                                 p { class: "text-sm mt-2 ml-1", style: "color:#ff6b6b;", "{err}" }
                             }
@@ -269,7 +270,7 @@ pub fn Home() -> Element {
                                     }
                                 },
                             }
-                            p { class: "text-sm text-foreground-subtle mt-2 ml-1", "Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes" }
+                            p { class: "text-sm text-foreground-subtle mt-2 ml-1", "Characters allowed: a-z, A-Z, 0-9, and _" }
                         }
                         {
                             let has_meeting_id = !meeting_id_value().is_empty();

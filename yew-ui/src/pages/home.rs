@@ -335,7 +335,7 @@ pub fn home() -> Html {
                                 }}
                             />
                             <p class="text-sm text-foreground-subtle mt-2 ml-1">
-                                {"Allowed: letters, numbers, spaces, _ - ' \""}
+                                {"Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes"}
                             </p>
                             {
                                 if let Some(err) = &*username_error {

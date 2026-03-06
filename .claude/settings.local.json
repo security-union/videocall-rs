@@ -52,7 +52,8 @@
       "Bash(gh run:*)",
       "Bash(git push:*)",
       "Bash(cargo test:*)",
-      "Bash(tail:*)"
+      "Bash(tail:*)",
+      "Bash(test:*)"
     ]
   }
 }

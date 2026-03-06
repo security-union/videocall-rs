@@ -17,7 +17,7 @@ use crate::constants::{
     actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled,
     webtransport_host_base,
 };
-use crate::context::{load_username_from_storage, UsernameCtx};
+use crate::context::{load_username_from_storage, save_username_to_storage, validate_display_name, UsernameCtx};
 use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
@@ -572,9 +572,9 @@ pub fn MeetingPage(id: String) -> Element {
                                     onsubmit: move |e| {
                                         e.prevent_default();
                                         let raw = input_value_state();
-                                        match crate::context::validate_display_name(&raw) {
+                                        match validate_display_name(&raw) {
                                             Ok(valid_name) => {
-                                                crate::context::save_username_to_storage(&valid_name);
+                                                save_username_to_storage(&valid_name);
                                                 (username_ctx.0).set(Some(valid_name));
                                             }
                                             Err(msg) => {

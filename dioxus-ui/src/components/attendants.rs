@@ -937,7 +937,7 @@ pub fn AttendantsComponent(
                     HostControls {
                         meeting_id: id.clone(),
                         is_admitted: true,
-                        waiting_room_version: waiting_room_version(),
+                        waiting_room_version: waiting_room_version,
                     }
                 }
 

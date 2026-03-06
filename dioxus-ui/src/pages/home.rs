@@ -219,11 +219,14 @@ pub fn Home() -> Element {
                             Ok(valid_name) => {
                                 username_value.set(valid_name.clone());
                                 save_username_to_storage(&valid_name);
-                                (username_ctx.0).set(Some(valid_name));
-                                if let Some(name) = (username_ctx.0)() {
-                                    matomo_logger::set_user_id(&name);
-                                }
-                                navigator.push(Route::Meeting { id: meeting_id });
+                                (username_ctx.0).set(Some(valid_name.clone()));
+                                matomo_logger::set_user_id(&valid_name);
+
+                                let nav = navigator.clone();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    gloo_timers::future::TimeoutFuture::new(0).await;
+                                    nav.push(Route::Meeting { id: meeting_id });
+                                });
                             }
                             Err(message) => {
                                 username_error.set(Some(message));
@@ -308,12 +311,16 @@ pub fn Home() -> Element {
                                     match validate_display_name(&username) {
                                         Ok(valid_name) => {
                                             let meeting_id = generate_meeting_id();
+                                            username_value.set(valid_name.clone());
                                             save_username_to_storage(&valid_name);
-                                            (username_ctx.0).set(Some(valid_name));
-                                            if let Some(name) = (username_ctx.0)() {
-                                                matomo_logger::set_user_id(&name);
-                                            }
-                                            navigator.push(Route::Meeting { id: meeting_id });
+                                            (username_ctx.0).set(Some(valid_name.clone()));
+                                            matomo_logger::set_user_id(&valid_name);
+
+                                            let nav = navigator.clone();
+                                            wasm_bindgen_futures::spawn_local(async move {
+                                                gloo_timers::future::TimeoutFuture::new(0).await;
+                                                nav.push(Route::Meeting { id: meeting_id });
+                                            });
                                         }
                                         Err(message) => {
                                             username_error.set(Some(message));

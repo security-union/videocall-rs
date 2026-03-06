@@ -125,12 +125,12 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                         let mid = meeting_id_for_fetch.clone();
                         let on_admitted = on_admitted.clone();
                         wasm_bindgen_futures::spawn_local(async move {
-                            match crate::meeting_api::join_meeting(&mid, None).await {
+                            match crate::meeting_api::check_status(&mid).await {
                                 Ok(status) => {
                                     if status.room_token.is_some() {
                                         on_admitted.emit(status);
                                     } else {
-                                        log::error!("Admitted but join_meeting returned no room_token");
+                                        log::error!("Admitted but check_status returned no room_token");
                                     }
                                 }
                                 Err(e) => {
@@ -144,6 +144,8 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                         on_rejected.emit(());
                     })),
                     on_waiting_room_updated: None,
+                    on_speaking_changed: None,
+                    vad_threshold: None,
                 };
 
                 let mut client = VideoCallClient::new(opts);

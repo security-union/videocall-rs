@@ -66,6 +66,8 @@
 //!     on_peer_removed: None,
 //!     on_meeting_info: None,
 //!     on_meeting_ended: None,
+//!     on_speaking_changed: None,
+//!     vad_threshold: None,
 //!     on_meeting_activated: None,
 //!     on_participant_admitted: None,
 //!     on_participant_rejected: None,
@@ -93,6 +95,8 @@
 //! #     on_peer_removed: None,
 //! #     on_meeting_info: None,
 //! #     on_meeting_ended: None,
+//! #     on_speaking_changed: None,
+//! #     vad_threshold: None,
 //! #     on_meeting_activated: None,
 //! #     on_participant_admitted: None,
 //! #     on_participant_rejected: None,
@@ -111,6 +115,7 @@
 //!     128, // 128 kbps bitrate
 //!     Callback::noop(),
 //!     Callback::noop(),
+//!     None, // vad_threshold
 //! );
 //! let mut screen = ScreenEncoder::new(
 //!     client,

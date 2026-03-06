@@ -261,6 +261,26 @@ The Yew UI is configured at runtime via a `window.__APP_CONFIG` object provided 
 
 Authoritative keys and defaults: see `docker/start-yew.sh` and the Helm template referenced below.
 
+### Voice Activity Detection (VAD) Threshold
+
+The `vadThreshold` config parameter controls how sensitive the speaking detection is. It sets the minimum RMS audio level that counts as "speaking" — used for tile border glow, peer list mic glow, and self-video glow indicators.
+
+```javascript
+window.__APP_CONFIG = Object.freeze({
+    // ... other config ...
+    vadThreshold: 0.02   // default
+});
+```
+
+| Value | Sensitivity | Use case |
+|-------|-------------|----------|
+| `0.01` | High — picks up quiet speech and background noise | Quiet environments, soft speakers |
+| `0.02` | Medium (default) — good balance for most setups | General use |
+| `0.05` | Low — only triggers on louder speech | Noisy environments, reduces false positives |
+| `0.10` | Very low — requires loud/close speech | Very noisy environments |
+
+The threshold can also be set via the `VAD_THRESHOLD` environment variable when running in Docker (see `docker/start-yew.sh` and `docker/start-dioxus.sh`), or via `runtimeConfig.vadThreshold` in Helm values.
+
 ### Local/Docker: start-yew.sh
 
 `docker/start-yew.sh` generates `/app/yew-ui/scripts/config.js` from environment variables at container startup. For the current list of supported variables and defaults, refer directly to `docker/start-yew.sh`. Restart the container to apply changes.

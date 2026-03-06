@@ -157,9 +157,11 @@ async fn peer_list_item_host_with_speaking_shows_crown_and_speaking() {
     yew::Renderer::<Wrapper>::with_root(mount.clone()).render();
     sleep(Duration::ZERO).await;
 
-    // Crown icon should be rendered for host
-    let crown = mount.query_selector(".peer_item_text svg").unwrap();
-    assert!(crown.is_some(), "host should have crown icon");
+    // Host indicator label should be rendered for host
+    let indicator = mount.query_selector(".host-indicator").unwrap();
+    assert!(indicator.is_some(), "host should have indicator label");
+    let text = indicator.unwrap().text_content().unwrap_or_default();
+    assert!(text.contains("Host"), "indicator should contain 'Host'");
 
     // Speaking class should still work
     let mic_div = mount.query_selector(".peer_item_mic").unwrap().unwrap();

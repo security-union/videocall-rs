@@ -51,6 +51,7 @@ pub struct Connection {
     video_enabled: Rc<AtomicBool>,
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
+    is_speaking: Rc<AtomicBool>,
     session_id: Rc<RefCell<Option<u64>>>,
     /// Not wrapped in `Rc` because it is only accessed via `&self` methods,
     /// unlike `session_id` which is shared with the heartbeat `Interval` closure.
@@ -99,6 +100,7 @@ impl Connection {
             audio_enabled: Rc::new(AtomicBool::new(false)),
             video_enabled: Rc::new(AtomicBool::new(false)),
             screen_enabled: Rc::new(AtomicBool::new(false)),
+            is_speaking: Rc::new(AtomicBool::new(false)),
             session_id: Rc::new(RefCell::new(None)),
             userid: RefCell::new(None),
             url,
@@ -119,13 +121,16 @@ impl Connection {
         let video_enabled = Rc::clone(&self.video_enabled);
         let audio_enabled = Rc::clone(&self.audio_enabled);
         let screen_enabled = Rc::clone(&self.screen_enabled);
+        let is_speaking = Rc::clone(&self.is_speaking);
         let session_id = Rc::clone(&self.session_id);
+
         self.heartbeat = Some(Interval::new(1000, move || {
             if let Some(packet_wrapper) = build_heartbeat_packet(
                 &userid,
                 &video_enabled,
                 &audio_enabled,
                 &screen_enabled,
+                &is_speaking,
                 &aes,
                 &session_id,
             ) {
@@ -198,11 +203,17 @@ impl Connection {
             &self.video_enabled,
             &self.audio_enabled,
             &self.screen_enabled,
+            &self.is_speaking,
             &self.aes,
             &self.session_id,
         ) {
             self.task.send_packet(packet_wrapper);
         }
+    }
+
+    pub fn set_speaking(&self, speaking: bool) {
+        self.is_speaking
+            .store(speaking, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_session_id(&self, session_id: u64) {
@@ -222,6 +233,7 @@ fn build_heartbeat_packet(
     video_enabled: &AtomicBool,
     audio_enabled: &AtomicBool,
     screen_enabled: &AtomicBool,
+    is_speaking: &AtomicBool,
     aes: &Aes128State,
     session_id: &RefCell<Option<u64>>,
 ) -> Option<PacketWrapper> {
@@ -229,6 +241,7 @@ fn build_heartbeat_packet(
         video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
         audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
         screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
 

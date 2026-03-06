@@ -283,6 +283,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     on_participant_admitted: None,
                     on_participant_rejected: None,
                     on_waiting_room_updated: None,
+                    on_speaking_changed: None,
+                    vad_threshold: None,
                 };
 
                 let mut client = VideoCallClient::new(opts);

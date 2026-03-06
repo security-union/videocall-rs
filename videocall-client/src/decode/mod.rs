@@ -92,7 +92,8 @@ impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
 pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
     peer_id: String,
+    vad_threshold: Option<f32>,
 ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
     // NetEq decoders should start muted by default (peers start with audio_enabled=false)
-    NetEqAudioPeerDecoder::new_with_mute_state(speaker_device_id, peer_id, true)
+    NetEqAudioPeerDecoder::new_with_mute_state(speaker_device_id, peer_id, true, vad_threshold)
 }

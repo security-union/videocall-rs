@@ -33,13 +33,14 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::MeetingTime;
+use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::error;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
@@ -95,11 +96,26 @@ fn play_user_joined() {
     }
 }
 
-/// Schedule a reconnection attempt after 1 second (JWT auth path).
+/// Maximum number of reconnection attempts before giving up.
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+/// Compute the reconnect delay for the given attempt using exponential backoff
+/// with ±25% random jitter.  Returns `None` when `attempt >= MAX_RECONNECT_ATTEMPTS`.
+fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
+    const MAX_DELAY_MS: u32 = 16_000;
+    if attempt >= MAX_RECONNECT_ATTEMPTS {
+        return None;
+    }
+    let base = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
+    let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base as f64;
+    Some((base as f64 + jitter).max(500.0) as u32)
+}
+
+/// Schedule a reconnection attempt with exponential backoff and jitter.
 ///
 /// Refreshes the room token, rebuilds lobby URLs, updates the client, and
-/// reconnects.  On failure it retries by scheduling itself again — matching
-/// yew-ui's `schedule_token_refresh` retry behaviour.
+/// reconnects.  On failure it retries with increasing delay (1s → 2s → 4s →
+/// 8s → 16s cap) plus ±25% random jitter.  Gives up after 10 attempts.
 #[cfg(feature = "media-server-jwt-auth")]
 fn schedule_reconnect(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
@@ -107,8 +123,19 @@ fn schedule_reconnect(
     email: String,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
+    attempt: u32,
 ) {
-    Timeout::new(1_000, move || {
+    let delay_ms = match reconnect_delay_ms(attempt) {
+        Some(d) => d,
+        None => {
+            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            return;
+        }
+    };
+
+    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
+
+    Timeout::new(delay_ms, move || {
         wasm_bindgen_futures::spawn_local(async move {
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
@@ -127,17 +154,58 @@ fn schedule_reconnect(
                 }
                 Err(e) => {
                     connection_error.set(Some(format!("Connection lost, retrying... ({e})")));
-                    // Retry after another second
                     schedule_reconnect(
                         client_cell,
                         meeting_id,
                         email,
                         connection_error,
                         meeting_ended_message,
+                        attempt + 1,
                     );
                 }
             }
         });
+    })
+    .forget();
+}
+
+/// Schedule a reconnection attempt with exponential backoff (non-JWT path).
+///
+/// Retries with increasing delay (1s → 2s → 4s → 8s → 16s cap) plus ±25%
+/// random jitter.  Gives up after 10 attempts.
+#[cfg(not(feature = "media-server-jwt-auth"))]
+fn schedule_reconnect_no_jwt(
+    client_cell: Rc<RefCell<Option<VideoCallClient>>>,
+    mut connection_error: Signal<Option<String>>,
+    attempt: u32,
+) {
+    let delay_ms = match reconnect_delay_ms(attempt) {
+        Some(d) => d,
+        None => {
+            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            return;
+        }
+    };
+
+    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
+
+    Timeout::new(delay_ms, move || {
+        let reconnect_needed = {
+            if let Some(client) = client_cell.borrow_mut().as_mut() {
+                if let Err(e) = client.connect() {
+                    log::error!("Reconnection failed: {e:?}");
+                    true
+                } else {
+                    connection_error.set(None);
+                    false
+                }
+            } else {
+                true
+            }
+        };
+        if reconnect_needed {
+            schedule_reconnect_no_jwt(client_cell, connection_error, attempt + 1);
+        }
     })
     .forget();
 }
@@ -155,6 +223,7 @@ pub fn AttendantsComponent(
     #[props(default)] auto_join: bool,
     #[props(default)] is_owner: bool,
     #[props(default)] room_token: String,
+    #[props(default = true)] waiting_room_enabled: bool,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -177,6 +246,16 @@ pub fn AttendantsComponent(
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
+    let mut pending_mic_enable = use_signal(|| false);
+    let mut pending_video_enable = use_signal(|| false);
+    let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let mut saving = use_signal(|| false);
+    let mut toggle_error = use_signal(|| None::<String>);
+    let waiting_room_version = use_signal(|| 0u64);
+
+    // Create the peer status map signal early so it can be captured by the
+    // on_peer_removed callback inside use_hook below.
+    let mut peer_status_map: PeerStatusMap = use_signal(|| HashMap::new());
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -241,20 +320,14 @@ pub fn AttendantsComponent(
                             email,
                             connection_error,
                             meeting_ended_message,
+                            0,
                         );
                     }
 
                     #[cfg(not(feature = "media-server-jwt-auth"))]
                     {
                         let client_cell = client_cell.clone();
-                        Timeout::new(1_000, move || {
-                            if let Some(client) = client_cell.borrow_mut().as_mut() {
-                                if let Err(e) = client.connect() {
-                                    log::error!("Reconnection failed: {e:?}");
-                                }
-                            }
-                        })
-                        .forget();
+                        schedule_reconnect_no_jwt(client_cell, connection_error, 0);
                     }
                 })
             },
@@ -267,6 +340,17 @@ pub fn AttendantsComponent(
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: Some(VcCallback::from(move |peer_id: String| {
                 log::info!("Peer removed: {peer_id}");
+                // Write to signals directly. In single-threaded WASM, timer
+                // callbacks (where PeerDecodeManager::run_peer_monitor fires
+                // this) cannot overlap with async tasks, so there is no
+                // re-entrant borrow risk. Using dioxus::spawn() here would
+                // panic because the callback runs outside any Dioxus runtime
+                // scope (from a setInterval timer).
+                //
+                // Note: we rebind to a local `mut` copy so the closure stays
+                // `Fn` (Signal is Copy; only the local is mutated each call).
+                let mut map = peer_status_map;
+                map.write().remove(&peer_id);
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
@@ -293,6 +377,14 @@ pub fn AttendantsComponent(
                     meeting_ended_message.set(Some(message));
                 },
             )),
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: Some(VcCallback::from(move |_| {
+                log::info!("Waiting room updated push received");
+                let mut v = waiting_room_version;
+                v.set(v() + 1);
+            })),
         };
 
         let client = VideoCallClient::new(opts);
@@ -306,7 +398,22 @@ pub fn AttendantsComponent(
         mda.on_granted = VcCallback::from(move |_| {
             let mut media_access_granted = media_access_granted;
             let mut meeting_joined = meeting_joined;
+            let mut mic_enabled = mic_enabled;
+            let mut video_enabled = video_enabled;
+            let mut pending_mic_enable = pending_mic_enable;
+            let mut pending_video_enable = pending_video_enable;
             media_access_granted.set(true);
+
+            // Fulfil any pending mic/camera enables that triggered the permission request.
+            if pending_mic_enable() {
+                mic_enabled.set(true);
+                pending_mic_enable.set(false);
+            }
+            if pending_video_enable() {
+                video_enabled.set(true);
+                pending_video_enable.set(false);
+            }
+
             // Connect after permissions granted
             if let Err(e) = client_cell.borrow_mut().connect() {
                 log::error!("Connection failed: {e:?}");
@@ -328,6 +435,45 @@ pub fn AttendantsComponent(
     use_context_provider(|| client.clone());
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
+
+    // Provide the peer status map as context for child PeerTile components.
+    // The signal was created earlier so on_peer_removed can capture it.
+    use_context_provider(|| peer_status_map);
+
+    // Single diagnostics subscriber shared by all PeerTile components.
+    // Instead of each PeerTile spawning its own async task, one task
+    // dispatches peer_status events into a shared HashMap.
+    let mut diagnostics_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
+    use_effect(move || {
+        let task = spawn(async move {
+            let mut rx = videocall_diagnostics::subscribe();
+            while let Ok(evt) = rx.recv().await {
+                if evt.subsystem != "peer_status" {
+                    continue;
+                }
+                if let Some((peer_id, state)) = parse_peer_status_event(&evt) {
+                    // Check if this peer already has a signal.
+                    let existing = peer_status_map.read().get(&peer_id).copied();
+                    if let Some(mut sig) = existing {
+                        // Update the per-peer signal only if the state changed.
+                        if *sig.peek() != state {
+                            sig.set(state);
+                        }
+                    } else {
+                        // First event for this peer — create a new signal.
+                        let sig = Signal::new(state);
+                        peer_status_map.write().insert(peer_id, sig);
+                    }
+                }
+            }
+        });
+        diagnostics_task.write().replace(task);
+    });
+    use_drop(move || {
+        if let Some(task) = diagnostics_task.peek().as_ref() {
+            task.cancel();
+        }
+    });
 
     // Check for config errors
     use_effect(move || {
@@ -417,6 +563,58 @@ pub fn AttendantsComponent(
                         p { "Click the button below to join and start listening to others." }
                         if let Some(err) = connection_error() {
                             p { style: "color: #ff6b6b; margin-top: 1rem;", "{err}" }
+                        }
+                    }
+                    if is_owner {
+                        {
+                            let meeting_id_for_toggle = id.clone();
+                            rsx! {
+                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
+                                    span { style: "font-size: 0.9rem;", "Waiting Room" }
+                                    crate::components::toggle_switch::ToggleSwitch {
+                                        enabled: waiting_room_toggle(),
+                                        disabled: saving(),
+                                        on_toggle: {
+                                            let meeting_id = meeting_id_for_toggle.clone();
+                                            move |new_val: bool| {
+                                                if saving() {
+                                                    return;
+                                                }
+                                                toggle_error.set(None);
+                                                waiting_room_toggle.set(new_val);
+                                                saving.set(true);
+                                                let meeting_id = meeting_id.clone();
+                                                wasm_bindgen_futures::spawn_local(async move {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val).await {
+                                                        Ok(updated) => {
+                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                            saving.set(false);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("Failed to update waiting room setting: {e}");
+                                                            waiting_room_toggle.set(!new_val);
+                                                            saving.set(false);
+                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        },
+                                    }
+                                }
+                                if let Some(err) = toggle_error() {
+                                    p { class: "toggle-error",
+                                        "{err}"
+                                    }
+                                }
+                                p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-bottom: 1.5rem; margin-top: -0.75rem;",
+                                    if waiting_room_toggle() {
+                                        "Participants will wait for your approval before joining"
+                                    } else {
+                                        "Participants will join the meeting directly"
+                                    }
+                                }
+                            }
                         }
                     }
                     button {
@@ -538,6 +736,7 @@ pub fn AttendantsComponent(
                                                         if media_access_granted() {
                                                             mic_enabled.set(true);
                                                         } else {
+                                                            pending_mic_enable.set(true);
                                                             mda_mic.borrow().request();
                                                         }
                                                     } else {
@@ -569,6 +768,7 @@ pub fn AttendantsComponent(
                                                                 }
                                                             }
                                                         } else {
+                                                            pending_video_enable.set(true);
                                                             mda_cam.borrow().request();
                                                         }
                                                     } else {
@@ -640,6 +840,8 @@ pub fn AttendantsComponent(
                                                     meeting_joined.set(false);
                                                     mic_enabled.set(false);
                                                     video_enabled.set(false);
+                                                    pending_mic_enable.set(false);
+                                                    pending_video_enable.set(false);
                                                     call_start_time.set(None);
                                                     meeting_start_time_server.set(None);
 
@@ -754,6 +956,7 @@ pub fn AttendantsComponent(
                     HostControls {
                         meeting_id: id.clone(),
                         is_admitted: true,
+                        waiting_room_version: waiting_room_version(),
                     }
                 }
 
@@ -772,6 +975,125 @@ pub fn AttendantsComponent(
                         share_screen: screen_share_state().is_sharing(),
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Parse a `peer_status` diagnostics event into a `(peer_id, PeerMediaState)`.
+fn parse_peer_status_event(
+    evt: &videocall_diagnostics::DiagEvent,
+) -> Option<(String, PeerMediaState)> {
+    use videocall_diagnostics::MetricValue;
+
+    let mut to_peer: Option<String> = None;
+    let mut audio = false;
+    let mut video = false;
+    let mut screen = false;
+    for m in &evt.metrics {
+        match (m.name, &m.value) {
+            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+            ("audio_enabled", MetricValue::U64(v)) => audio = *v != 0,
+            ("video_enabled", MetricValue::U64(v)) => video = *v != 0,
+            ("screen_enabled", MetricValue::U64(v)) => screen = *v != 0,
+            _ => {}
+        }
+    }
+    to_peer.map(|id| {
+        (
+            id,
+            PeerMediaState {
+                audio_enabled: audio,
+                video_enabled: video,
+                screen_enabled: screen,
+            },
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests for reconnect_delay_ms
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// attempt=0 should return Some(d) where d is in the base range.
+    /// base = 1000, jitter in [-25%, +25%), so delay in [750, 1250).
+    /// The .max(500) clamp does not bind here.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_0_returns_value_in_expected_range() {
+        for _ in 0..50 {
+            let delay = reconnect_delay_ms(0);
+            assert!(delay.is_some(), "attempt 0 should return Some");
+            let d = delay.unwrap();
+            assert!(d >= 750, "attempt 0 delay {d} should be >= 750");
+            assert!(d <= 1250, "attempt 0 delay {d} should be <= 1250");
+        }
+    }
+
+    /// attempt=9 should return Some(d) with base capped at MAX_DELAY_MS (16000).
+    /// jitter in [-25%, +25%), so delay in [12000, 20000).
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_9_returns_capped_value() {
+        for _ in 0..50 {
+            let delay = reconnect_delay_ms(9);
+            assert!(delay.is_some(), "attempt 9 should return Some");
+            let d = delay.unwrap();
+            assert!(d >= 12000, "attempt 9 delay {d} should be >= 12000");
+            assert!(d <= 20000, "attempt 9 delay {d} should be <= 20000");
+        }
+    }
+
+    /// attempt=10 exceeds MAX_RECONNECT_ATTEMPTS and should return None.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_10_returns_none() {
+        assert!(reconnect_delay_ms(10).is_none(), "attempt 10 should return None");
+    }
+
+    /// Attempts beyond 10 should also return None.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_beyond_max_returns_none() {
+        assert!(reconnect_delay_ms(11).is_none());
+        assert!(reconnect_delay_ms(100).is_none());
+        assert!(reconnect_delay_ms(u32::MAX).is_none());
+    }
+
+    /// Backoff should roughly double each attempt (accounting for jitter).
+    /// We compare the midpoints of the expected ranges for successive attempts.
+    /// attempt 0: base=1000, attempt 1: base=2000, attempt 2: base=4000, etc.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_backoff_roughly_doubles() {
+        // Collect many samples per attempt and check the average is near the expected base.
+        let samples = 200;
+        for attempt in 0..4u32 {
+            let expected_base = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
+            let sum: f64 = (0..samples)
+                .map(|_| reconnect_delay_ms(attempt).unwrap() as f64)
+                .sum();
+            let avg = sum / samples as f64;
+            // Average should be close to the base (jitter is symmetric around 0,
+            // mean multiplier is ~0). Allow 15% tolerance for randomness.
+            let tolerance = expected_base * 0.15;
+            assert!(
+                (avg - expected_base).abs() < tolerance,
+                "attempt {attempt}: avg {avg:.0} should be near expected base {expected_base:.0} (tolerance {tolerance:.0})"
+            );
+        }
+    }
+
+    /// The minimum possible return value is 500 (enforced by .max(500.0)).
+    /// For attempt 0 with base=1000, the lowest jitter gives 750, so the
+    /// .max(500) clamp should never bind. Verify no value goes below 500.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_never_below_500() {
+        for attempt in 0..10u32 {
+            for _ in 0..20 {
+                let d = reconnect_delay_ms(attempt).unwrap();
+                assert!(d >= 500, "attempt {attempt}: delay {d} must be >= 500");
             }
         }
     }

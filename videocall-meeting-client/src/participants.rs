@@ -26,6 +26,9 @@ impl MeetingApiClient {
     ///
     /// - **Hosts** are auto-admitted and receive a `room_token` immediately.
     /// - **Attendees** enter the waiting room (`room_token` is `None`).
+    /// - If the meeting is not yet active, `status` will be
+    ///   `"waiting_for_meeting"` and `observer_token` will contain a JWT for
+    ///   receiving push notifications.
     pub async fn join_meeting(
         &self,
         meeting_id: &str,

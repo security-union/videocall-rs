@@ -57,7 +57,12 @@ pub enum MetricValue {
 use async_broadcast::{broadcast, Receiver, Sender};
 
 static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
-    let (s, r) = broadcast(256); // Capacity of 256 messages.
+    let (mut s, r) = broadcast(1024);
+
+    // When the buffer is full, drop the oldest message instead of rejecting
+    // the newest. For real-time state (peer mute/video status), the latest
+    // event is always more relevant than stale ones.
+    s.set_overflow(true);
 
     // Create a background task that keeps a receiver active
     // This prevents the channel from closing when there are no active receivers

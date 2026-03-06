@@ -49,6 +49,7 @@ An open-source, ultra-low-latency video conferencing platform and API built with
 - [Testing](#testing)
   - [UI Testing (yew-ui)](#ui-testing-yew-ui)
   - [Backend Testing (actix-api)](#backend-testing-actix-api)
+  - [E2E Testing (Playwright)](#e2e-testing-playwright)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [Project Structure](#project-structure)
@@ -157,20 +158,43 @@ The quickest way to get started is with our Docker-based setup:
    cd videocall-rs
    ```
 
-2. Start the server (replace `<server-ip>` with your machine's IP address):
+2. Create a `.env` file from the sample and fill in your OAuth credentials:
+   ```
+   cp docker/.env-sample .env
+   ```
+   Edit `.env` and set `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`.
+
+   **Getting Google OAuth credentials:**
+   - Go to [Google Cloud Console → APIs & Credentials](https://console.cloud.google.com/apis/credentials)
+   - Create an OAuth 2.0 Client ID (Web application type)
+   - Add `http://localhost:8081/login/callback` as an Authorized redirect URI
+   - Copy the Client ID and Secret into your `.env`
+
+   > **Note:** `make up` will auto-create `.env` from the sample if it does not exist, but you must still edit it to add your credentials before the app will work.
+
+3. Start the stack:
    ```
    make up
    ```
-
-3. Open Chrome using the provided script for local WebTransport:
-   ```
-   ./launch_chrome.sh
-   ```
+   The first run compiles Rust/WASM inside the containers — this takes several minutes. Watch the `yew-ui` logs; it's ready when Trunk prints `server listening on http://0.0.0.0:<port>`.
 
 4. Access the application at:
    ```
-   http://<server-ip>/meeting/<username>/<meeting-id>
+   http://localhost
    ```
+   Then navigate to a meeting: `http://localhost/meeting/<username>/<meeting-id>`
+
+**Platform notes:**
+
+- **Rancher Desktop (Windows/WSL2) with Traefik Ingress on port 80:** Rancher Desktop runs Traefik on port 80 by default, which conflicts with the yew-ui frontend. Override the port in your local `.env` (not `.env-sample`):
+  ```
+  TRUNK_SERVE_PORT=8088
+  AFTER_LOGIN_URL=http://localhost:8088
+  ALLOWED_REDIRECT_URLS=http://localhost:8088,http://localhost:3001
+  ```
+  Then access the app at `http://localhost:8088`.
+- **Shell environment variables:** If you have `API_BASE_URL`, `OAUTH_REDIRECT_URL`, or similar variables exported in your shell profile (`~/.bashrc`, `~/.zshrc`), they will override `.env` values. Remove them from your profile before running `make up`.
+- **Slow first run:** WASM compilation inside Docker can take 5–15 minutes on a cold cache. Subsequent runs reuse the build cache and start in seconds.
 
 ### Nix Build System (WIP)
 
@@ -453,6 +477,19 @@ CI runs these tests automatically via `.github/workflows/cargo-test.yaml`,
 triggered on PRs that touch `actix-api/`, `videocall-types/`, or `protobuf/`.
 For the full backend testing guide — including test patterns, database cleanup,
 and how to write new tests — see **[actix-api/TESTING.md](actix-api/TESTING.md)**.
+
+### E2E Testing (Playwright)
+
+Full browser-based end-to-end tests using [Playwright](https://playwright.dev/).
+Tests run against both the **Dioxus UI** and **Yew UI** simultaneously, verifying
+meeting flows with real browsers. Authentication is bypassed via JWT cookie
+injection — no OAuth setup needed.
+
+The E2E stack is defined in `docker/docker-compose.e2e.yaml` and uses the same
+Nix-based dev Dockerfiles as CI. Tests run automatically on pushes to `main` and
+can be triggered manually from the GitHub Actions page.
+
+See the `e2e-*` targets in the `Makefile` for available commands.
 
 ## Roadmap
 

@@ -117,6 +117,7 @@ pub fn generate_room_token(
         room_join: true,
         is_host,
         display_name: display_name.to_string(),
+        observer: false,
         exp: now + ttl_secs,
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
     };
@@ -129,6 +130,43 @@ pub fn generate_room_token(
     .map_err(|e| {
         tracing::error!("Failed to sign JWT: {e}");
         AppError::internal("failed to generate room token")
+    })
+}
+
+/// Observer token TTL: 30 minutes. Users may wait a long time in the lobby
+/// for the host to start the meeting or admit them.
+const OBSERVER_TOKEN_TTL_SECS: i64 = 1800;
+
+/// Sign an observer token for a participant who is waiting for meeting
+/// activation or waiting-room admission. The token grants read-only access
+/// to the media server so the client can receive push notifications
+/// (e.g. MEETING_ACTIVATED, PARTICIPANT_ADMITTED) without polling.
+pub fn generate_observer_token(
+    secret: &str,
+    email: &str,
+    room: &str,
+    display_name: &str,
+) -> Result<String, AppError> {
+    let now = Utc::now().timestamp();
+    let claims = RoomAccessTokenClaims {
+        sub: email.to_string(),
+        room: room.to_string(),
+        room_join: false,
+        is_host: false,
+        display_name: display_name.to_string(),
+        observer: true,
+        exp: now + OBSERVER_TOKEN_TTL_SECS,
+        iss: RoomAccessTokenClaims::ISSUER.to_string(),
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to sign observer JWT: {e}");
+        AppError::internal("failed to generate observer token")
     })
 }
 

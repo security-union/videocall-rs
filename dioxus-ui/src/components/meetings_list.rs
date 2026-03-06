@@ -167,7 +167,6 @@ fn MeetingItem(
     let nav = use_navigator();
     let is_active = meeting.state == "active";
     let is_ended = meeting.state == "ended";
-
     let state_class = match meeting.state.as_str() {
         "active" => "state-active",
         "idle" => "state-idle",
@@ -206,8 +205,17 @@ fn MeetingItem(
         }
     };
 
+    let meeting_id_edit = meeting_id.clone();
+
+    let on_edit_click = move |e: MouseEvent| {
+        e.stop_propagation();
+        nav.push(Route::MeetingSettings {
+            id: meeting_id_edit.clone(),
+        });
+    };
+
     rsx! {
-        li { class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" },
+        li { class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" }, style: "flex-wrap: wrap;",
             div { class: "meeting-item-content", onclick: on_click,
                 div { class: "meeting-info",
                     span { class: "meeting-id", "{meeting.meeting_id}" }
@@ -287,6 +295,18 @@ fn MeetingItem(
                             }
                         }
                     }
+                }
+            }
+            button {
+                class: "meeting-edit-btn",
+                onclick: on_edit_click,
+                title: "Meeting settings",
+                svg {
+                    xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
+                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                    path { d: "M12 20h9" }
+                    path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
                 }
             }
             button {

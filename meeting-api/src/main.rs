@@ -46,25 +46,51 @@ async fn main() {
 
     tracing::info!("Connected to PostgreSQL");
 
+    // Connect to NATS if configured. The server works without NATS (graceful degradation).
+    let nats = match &config.nats_url {
+        Some(url) => match async_nats::connect(url).await {
+            Ok(client) => {
+                tracing::info!("Connected to NATS at {url}");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to NATS at {url}: {e}. Continuing without NATS.");
+                None
+            }
+        },
+        None => {
+            tracing::info!("NATS_URL not set — meeting event push notifications disabled");
+            None
+        }
+    };
+
     // CORS: In production set `CORS_ALLOWED_ORIGIN` to the exact frontend
-    // origin (e.g. "https://app.videocall.rs").  When unset, the server
-    // mirrors the request origin which is convenient for development but
-    // **insecure** in production (any site can make credentialed requests).
+    // origin (e.g. "https://app.videocall.rs").  Comma-separate for multiple
+    // origins. When unset, the server mirrors the request origin which is
+    // convenient for development but **insecure** in production (any site can
+    // make credentialed requests).
+    //
+    // `AllowOrigin::list` echoes back only the matched origin so the response
+    // header always contains a single value, which is required by the spec.
     //
     // `allow_credentials(true)` requires explicit methods and headers (not *).
     let cors = CorsLayer::new()
-        .allow_origin(match &config.cors_allowed_origin {
-            Some(origin) => {
-                let hv: http::HeaderValue = origin.parse().expect("invalid CORS_ALLOWED_ORIGIN");
-                AllowOrigin::exact(hv)
+        .allow_origin(match config.cors_allowed_origin.as_slice() {
+            [] => AllowOrigin::mirror_request(),
+            origins => {
+                let hvs: Vec<http::HeaderValue> = origins
+                    .iter()
+                    .map(|o| o.parse().expect("invalid CORS_ALLOWED_ORIGIN"))
+                    .collect();
+                AllowOrigin::list(hvs)
             }
-            None => AllowOrigin::mirror_request(),
         })
         .allow_methods([
             http::Method::GET,
             http::Method::POST,
             http::Method::PUT,
             http::Method::DELETE,
+            http::Method::PATCH,
             http::Method::OPTIONS,
         ])
         .allow_headers([
@@ -75,7 +101,7 @@ async fn main() {
         ])
         .allow_credentials(true);
 
-    let state = AppState::new(pool, &config);
+    let state = AppState::new(pool, &config, nats);
     let app = routes::router().layer(cors).with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)

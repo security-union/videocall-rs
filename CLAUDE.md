@@ -23,6 +23,15 @@ cargo check --target wasm32-unknown-unknown -p videocall-client
 make yew-tests-docker
 ```
 
+## E2E Tests (Playwright)
+
+Browser-based end-to-end tests in `e2e/` using Playwright. Tests run against both the Dioxus UI (port 3001) and Yew UI (port 80) via two Playwright projects. Auth is bypassed via JWT cookie injection. See the `e2e-*` targets in the `Makefile` for available commands.
+
+Key files:
+- `docker/docker-compose.e2e.yaml` — Stack definition (both UIs + shared backend)
+- `e2e/playwright.config.ts` — Project configuration (dioxus + yew)
+- `e2e/helpers/auth.ts` — JWT session cookie injection
+
 ## Architecture: Yew Separation Pattern
 
 The `videocall-client` crate uses a companion file pattern to separate yew-specific code from framework-agnostic code. All yew code is gated behind the `yew-compat` cargo feature.
@@ -70,4 +79,25 @@ The `connection/` module was already properly separated before this refactoring.
 - Non-yew mode uses `Rc<dyn Fn(T)>` or `Box<dyn Fn(T)>` closures
 - Non-yew mode uses `CanvasIdProvider` trait instead of yew `Callback` for canvas IDs
 - Non-yew mode uses `emit_client_event()` / `ClientEvent` event bus for framework-agnostic eventin
+
+## Agent Usage Policy
+
+Always delegate work to the specialized roster agents instead of making changes directly. Use the appropriate agent for each task:
+
+- **frontend-rust-webtransport-and-websocket** — All Dioxus/Yew UI changes (components, pages, styling, state management)
+- **backend-rust-streaming** — All backend/API changes (Axum routes, DB queries, server logic)
+- **code-reviewer** — Review all code changes before committing
+- **web-security-auditor** — Review code touching auth, user input, API endpoints
+- **database-reviewer** — Review schema, migration, and query changes
+- **integration-test-writer** — Write integration tests for new or changed features
+- **deploy-sync-expert** — Update Docker/K8s configs when services or dependencies change
+- **e2e-test-sync** — Create/update E2E tests when user-facing behavior changes
+
+Run agents in parallel when tasks are independent. Always run `code-reviewer` after substantive code changes.
+
+**Never generate your own general-purpose agents.** Only use the agents listed on this roster. If no roster agent fits the task, stop everything and ask the user for direction.
+
+## Source Code Rules
+
+- **No symlinks or hardlinks for source files.** Each crate/UI must own its files independently. Do not use symlinks between `dioxus-ui/` and `yew-ui/` static assets or any other source directories. If both UIs need shared CSS, copy the shared base and maintain framework-specific additions separately.
 

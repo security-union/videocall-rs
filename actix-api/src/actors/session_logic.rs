@@ -75,6 +75,9 @@ pub struct SessionLogic {
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
     pub session_manager: SessionManager,
+    /// When true, this session is observer-only: it can receive messages
+    /// but cannot publish media to the room.
+    pub observer: bool,
 }
 
 impl SessionLogic {
@@ -86,11 +89,12 @@ impl SessionLogic {
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
+        observer: bool,
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
-            "new session: room={} email={} session_id={}",
-            room, email, id
+            "new session: room={} email={} session_id={} observer={}",
+            room, email, id, observer
         );
 
         SessionLogic {
@@ -101,6 +105,7 @@ impl SessionLogic {
             nats_client,
             tracker_sender,
             session_manager,
+            observer,
         }
     }
 
@@ -212,6 +217,8 @@ impl SessionLogic {
     /// Handle an inbound packet from the client.
     ///
     /// Returns the action the transport should take.
+    /// Observer sessions can still send RTT and health packets but all media
+    /// data packets are silently dropped.
     pub fn handle_inbound(&self, data: &[u8]) -> InboundAction {
         // Track received data
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
@@ -230,7 +237,18 @@ impl SessionLogic {
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
                 InboundAction::Processed
             }
-            PacketKind::Data => InboundAction::Forward(Arc::new(data.to_vec())),
+            PacketKind::Data => {
+                if self.observer {
+                    trace!(
+                        "Observer session {} dropping media packet from {}",
+                        self.id,
+                        self.email
+                    );
+                    InboundAction::Processed
+                } else {
+                    InboundAction::Forward(Arc::new(data.to_vec()))
+                }
+            }
         }
     }
 

@@ -38,7 +38,16 @@
       "Bash(xattr:*)",
       "Bash(/opt/homebrew/bin/chromedriver:*)",
       "Bash(brew reinstall:*)",
-      "Bash(git rm:*)"
+      "Bash(git checkout main)",
+      "Bash(gh pr:*)",
+      "Bash(git diff:*)",
+      "Bash(cat:*)",
+      "Bash(git checkout:*)",
+      "Bash(npx playwright:*)",
+      "Bash(node:*)",
+      "Bash(make e2e-lint:*)",
+      "Bash(make:*)",
+      "Bash(docker system:*)"
     ]
   }
 }

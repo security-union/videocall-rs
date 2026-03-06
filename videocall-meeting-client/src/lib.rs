@@ -105,6 +105,11 @@ impl MeetingApiClient {
         self.apply_auth(self.http.delete(self.url(path)))
     }
 
+    /// Build a PATCH request with auth applied.
+    pub(crate) fn patch(&self, path: &str) -> reqwest::RequestBuilder {
+        self.apply_auth(self.http.patch(self.url(path)))
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }

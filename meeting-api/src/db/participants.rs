@@ -51,7 +51,7 @@ pub async fn upsert_host(
         INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name, admitted_at)
         VALUES ($1, $2, 'admitted', TRUE, $3, NOW())
         ON CONFLICT (meeting_id, email)
-        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(),
+        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(), left_at = NULL,
                       display_name = COALESCE($3, meeting_participants.display_name)
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -64,29 +64,67 @@ pub async fn upsert_host(
         .await
 }
 
-/// Insert a participant in 'waiting' status (or update if re-joining).
-pub async fn upsert_attendee(
+/// Atomically join a meeting as an attendee, respecting the current `waiting_room_enabled`
+/// setting. Locks the meeting row with `FOR UPDATE` to serialize against concurrent
+/// waiting room toggles via `update_waiting_room_enabled`.
+///
+/// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where `auto_admitted`
+/// is `true` when the participant was immediately admitted (waiting room disabled).
+/// The third element is the `waiting_room_enabled` value observed under the row lock,
+/// which avoids stale reads from a pre-transaction fetch.
+pub async fn join_attendee(
     pool: &PgPool,
     meeting_id: i32,
     email: &str,
     display_name: Option<&str>,
-) -> Result<ParticipantRow, sqlx::Error> {
-    let query = format!(
-        r#"
-        INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name)
-        VALUES ($1, $2, 'waiting', FALSE, $3)
-        ON CONFLICT (meeting_id, email)
-        DO UPDATE SET status = 'waiting', left_at = NULL,
-                      display_name = COALESCE($3, meeting_participants.display_name)
-        RETURNING {PARTICIPANT_COLUMNS}
-        "#
-    );
-    sqlx::query_as::<_, ParticipantRow>(&query)
-        .bind(meeting_id)
-        .bind(email)
-        .bind(display_name)
-        .fetch_one(pool)
-        .await
+) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // Lock the meeting row to serialize against concurrent waiting room toggles.
+    let (waiting_room_enabled,): (bool,) =
+        sqlx::query_as("SELECT waiting_room_enabled FROM meetings WHERE id = $1 FOR UPDATE")
+            .bind(meeting_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    let row = if waiting_room_enabled {
+        let query = format!(
+            r#"
+            INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name)
+            VALUES ($1, $2, 'waiting', FALSE, $3)
+            ON CONFLICT (meeting_id, email)
+            DO UPDATE SET status = 'waiting', left_at = NULL,
+                          display_name = COALESCE($3, meeting_participants.display_name)
+            RETURNING {PARTICIPANT_COLUMNS}
+            "#
+        );
+        sqlx::query_as::<_, ParticipantRow>(&query)
+            .bind(meeting_id)
+            .bind(email)
+            .bind(display_name)
+            .fetch_one(&mut *tx)
+            .await?
+    } else {
+        let query = format!(
+            r#"
+            INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name, admitted_at)
+            VALUES ($1, $2, 'admitted', FALSE, $3, NOW())
+            ON CONFLICT (meeting_id, email)
+            DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
+                          display_name = COALESCE($3, meeting_participants.display_name)
+            RETURNING {PARTICIPANT_COLUMNS}
+            "#
+        );
+        sqlx::query_as::<_, ParticipantRow>(&query)
+            .bind(meeting_id)
+            .bind(email)
+            .bind(display_name)
+            .fetch_one(&mut *tx)
+            .await?
+    };
+
+    tx.commit().await?;
+    Ok((!waiting_room_enabled, row, waiting_room_enabled))
 }
 
 /// Get all participants in 'waiting' status for a meeting.
@@ -251,6 +289,9 @@ impl ParticipantRow {
             joined_at: self.joined_at.timestamp(),
             admitted_at: self.admitted_at.map(|t| t.timestamp()),
             room_token,
+            observer_token: None,
+            waiting_room_enabled: None,
+            host_display_name: None,
         }
     }
 }

@@ -48,7 +48,7 @@ pub fn email_to_display_name(email_or_local: &str) -> String {
     let local = email_or_local.split('@').next().unwrap_or(email_or_local);
 
     let words: Vec<String> = local
-        .split(|c: char| c == '.' || c == '_' || c == '-')
+        .split(['.', '_', '-'])
         .filter(|part| !part.trim().is_empty())
         .map(|part| {
             let mut chars = part.trim().chars();

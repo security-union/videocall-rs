@@ -397,7 +397,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         let on_join_meeting = on_join_meeting.clone();
         let has_username = (*username_state).is_some();
         let is_not_joined = matches!(*meeting_status, MeetingStatus::NotJoined);
-        let auto_join_attempted = use_ref(|| false);
+        let auto_join_attempted = use_mut_ref(|| false);
         use_effect_with(
             (has_username, is_not_joined),
             {

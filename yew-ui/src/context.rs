@@ -105,8 +105,7 @@ pub fn clear_username_from_storage() {
 // -----------------------------------------------------------------------------
 
 pub use videocall_types::validation::{
-    email_to_display_name, is_allowed_display_name_char, is_valid_meeting_id, normalize_spaces,
-    validate_display_name, DISPLAY_NAME_MAX_LEN,
+    email_to_display_name, validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
 
 /// Backward-compatible alias -- prefer `is_valid_meeting_id` for new code.

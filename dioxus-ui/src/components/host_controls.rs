@@ -25,7 +25,7 @@ pub fn HostControls(
     /// Counter incremented by the parent whenever a `on_waiting_room_updated`
     /// push event is received. The component fetches the waiting list each
     /// time this value changes.
-    waiting_room_version: u64,
+    waiting_room_version: Signal<u64>,
 ) -> Element {
     let mut waiting = use_signal(Vec::<WaitingParticipant>::new);
     let mut error = use_signal(|| None::<String>);
@@ -59,7 +59,7 @@ pub fn HostControls(
         let meeting_id = meeting_id.clone();
         use_effect(move || {
             // Read the version so Dioxus tracks it as a reactive dependency.
-            let _version = waiting_room_version;
+            let _version = waiting_room_version();
             if !is_admitted {
                 return;
             }

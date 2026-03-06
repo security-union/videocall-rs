@@ -17,9 +17,7 @@ use crate::constants::{
     actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled,
     webtransport_host_base,
 };
-use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
-};
+use crate::context::{load_username_from_storage, save_username_to_storage, validate_display_name, UsernameCtx};
 use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
@@ -56,12 +54,10 @@ pub fn MeetingPage(id: String) -> Element {
     let mut auth_checked = use_signal(|| false);
     let navigator = use_navigator();
     let mut user_profile = use_signal(|| None::<UserProfile>);
-    let mut show_dropdown = use_signal(|| false);
     let mut meeting_status = use_signal(|| MeetingStatus::NotJoined);
     let mut host_display_name = use_signal(|| None::<String>);
     let mut current_user_email = use_signal(|| None::<String>);
     let mut came_from_waiting_room = use_signal(|| false);
-    let mut error_state = use_signal(|| None::<String>);
 
     // Separate signal that tracks only the observer token for the WaitingForMeeting
     // state. The observer `use_effect` subscribes to THIS signal instead of
@@ -421,37 +417,21 @@ pub fn MeetingPage(id: String) -> Element {
         }
     };
 
-    // Submit handler
-    let on_submit = {
+    // Auto-join: when the username is already set and the meeting status is
+    // NotJoined, trigger the join flow automatically so the user does not
+    // have to interact with a redundant form.
+    {
         let mut on_join = on_join_meeting.clone();
-        move |e: FormEvent| {
-            e.prevent_default();
-            let value = input_value_state();
-            if is_valid_username(&value) {
-                save_username_to_storage(&value);
-
-                if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-                    if let Ok(Some(flag)) = storage.get_item("vc_username_reset") {
-                        if flag == "1" {
-                            let _ = storage.remove_item("vc_username_reset");
-                            if let Some(win) = window() {
-                                let _ = win.location().reload();
-                            }
-                            return;
-                        }
-                    }
-                }
-
-                (username_ctx.0).set(Some(value));
-                error_state.set(None);
+        let mut auto_join_attempted = use_signal(|| false);
+        use_effect(move || {
+            let has_username = (username_ctx.0)().is_some();
+            let is_not_joined = matches!(meeting_status(), MeetingStatus::NotJoined);
+            if has_username && is_not_joined && !auto_join_attempted() {
+                auto_join_attempted.set(true);
                 on_join();
-            } else {
-                error_state.set(Some(
-                    "Please enter a valid username (letters, numbers, underscore).".to_string(),
-                ));
             }
-        }
-    };
+        });
+    }
 
     let maybe_username = (username_ctx.0)();
     let current_meeting_status = meeting_status();
@@ -558,91 +538,86 @@ pub fn MeetingPage(id: String) -> Element {
             },
 
             // Joining in progress
-            (Some(_), MeetingStatus::Joining) => rsx! {
-                div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
-                    div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                    p { style: "color: white; font-size: 1rem;", "Joining meeting..." }
+            (Some(_), MeetingStatus::Joining) => {
+                let display_name = maybe_username.as_deref().unwrap_or("...");
+                rsx! {
+                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                        div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
+                        p { style: "color: white; font-size: 1rem;",
+                            "Joining as "
+                            strong { "{display_name}" }
+                            "..."
+                        }
+                    }
                 }
             },
 
-            // Username prompt (not joined or no username)
+            // No username set, or waiting for auto-join to fire
             _ => {
-                let mut on_join = on_join_meeting.clone();
-                rsx! {
-                    div { id: "username-prompt", class: "username-prompt-container relative",
-                        // User profile dropdown (OAuth)
-                        if oauth_enabled().unwrap_or(false) {
-                            if let Some(profile) = user_profile() {
-                                div { class: "fixed top-4 right-4 z-50",
-                                    button {
-                                        r#type: "button",
-                                        onclick: move |_| show_dropdown.set(!show_dropdown()),
-                                        class: "flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-white text-sm transition-colors",
-                                        span { "{profile.name}" }
-                                        svg { class: "w-4 h-4", fill: "none", stroke: "currentColor", view_box: "0 0 24 24",
-                                            path { stroke_linecap: "round", stroke_linejoin: "round", stroke_width: "2", d: "M19 9l-7 7-7-7" }
+                if maybe_username.is_none() {
+                    // Show inline display name prompt instead of redirecting
+                    rsx! {
+                        div {
+                            style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                            div {
+                                class: "card-apple p-8",
+                                style: "max-width: 400px; width: 90%;",
+                                h2 {
+                                    style: "color: white; text-align: center; margin-bottom: 0.5rem;",
+                                    "Enter your display name"
+                                }
+                                p {
+                                    style: "color: rgba(255,255,255,0.6); text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;",
+                                    "Choose a name to join the meeting"
+                                }
+                                form {
+                                    onsubmit: move |e| {
+                                        e.prevent_default();
+                                        let raw = input_value_state();
+                                        match validate_display_name(&raw) {
+                                            Ok(valid_name) => {
+                                                save_username_to_storage(&valid_name);
+                                                (username_ctx.0).set(Some(valid_name));
+                                            }
+                                            Err(msg) => {
+                                                if let Some(w) = web_sys::window() {
+                                                    let _ = w.alert_with_message(&msg);
+                                                }
+                                            }
                                         }
+                                    },
+                                    input {
+                                        class: "input-apple",
+                                        r#type: "text",
+                                        placeholder: "Enter your display name",
+                                        required: true,
+                                        autofocus: true,
+                                        value: "{input_value_state}",
+                                        oninput: move |e: Event<FormData>| {
+                                            input_value_state.set(e.value());
+                                        },
                                     }
-                                    if show_dropdown() {
-                                        div { class: "absolute right-0 mt-2 w-56 bg-white rounded-lg shadow-lg border border-gray-200 py-1",
-                                            div { class: "px-4 py-3 border-b border-gray-200",
-                                                p { class: "text-sm font-medium text-gray-900", "{profile.name}" }
-                                                p { class: "text-xs text-gray-500 truncate", "{profile.email}" }
-                                            }
-                                            button {
-                                                onclick: move |_| on_logout(()),
-                                                class: "w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors",
-                                                "Sign out"
-                                            }
-                                        }
+                                    button {
+                                        r#type: "submit",
+                                        class: "btn-apple btn-primary w-full",
+                                        style: "margin-top: 1rem;",
+                                        "Join Meeting"
                                     }
                                 }
                             }
                         }
-
-                        form {
-                            class: "username-form",
-                            onsubmit: on_submit,
-                            h1 { "Choose a display name" }
-                            input {
-                                class: "username-input",
-                                placeholder: "Your name",
-                                pattern: "^[a-zA-Z0-9_]*$",
-                                required: true,
-                                autofocus: true,
-                                oninput: move |e: Event<FormData>| {
-                                    input_value_state.set(e.value());
-                                },
-                                onkeydown: move |e: Event<KeyboardData>| {
-                                    if e.key() == Key::Enter {
-                                        let value = input_value_state();
-                                        if is_valid_username(&value) {
-                                            save_username_to_storage(&value);
-                                            if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-                                                if let Ok(Some(flag)) = storage.get_item("vc_username_reset") {
-                                                    if flag == "1" {
-                                                        let _ = storage.remove_item("vc_username_reset");
-                                                        if let Some(win) = window() { let _ = win.location().reload(); }
-                                                        e.prevent_default();
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            (username_ctx.0).set(Some(value));
-                                            error_state.set(None);
-                                            on_join();
-                                        } else {
-                                            error_state.set(Some("Please enter a valid username (letters, numbers, underscore).".to_string()));
-                                        }
-                                        e.prevent_default();
-                                    }
-                                },
-                                value: "{input_value_state}",
+                    }
+                } else {
+                    // Username is set; the auto-join effect will fire momentarily
+                    let display_name = maybe_username.as_deref().unwrap_or("Unknown");
+                    rsx! {
+                        div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                            div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
+                            p { style: "color: white; font-size: 1rem;",
+                                "Joining as "
+                                strong { "{display_name}" }
+                                "..."
                             }
-                            if let Some(err) = error_state() {
-                                p { class: "error", "{err}" }
-                            }
-                            button { class: "cta-button", r#type: "submit", "Continue" }
                         }
                     }
                 }

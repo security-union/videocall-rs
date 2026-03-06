@@ -8570,8 +8570,6 @@ dependencies = [
  "log",
  "matomo-logger",
  "neteq",
- "once_cell",
- "regex",
  "reqwest 0.12.26",
  "serde",
  "serde-wasm-bindgen 0.6.5",

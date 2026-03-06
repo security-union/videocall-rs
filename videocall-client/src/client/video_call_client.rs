@@ -363,7 +363,6 @@ impl VideoCallClient {
                 })
             },
             election_period_ms,
-            on_speaking_changed: self.options.on_speaking_changed.clone(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;

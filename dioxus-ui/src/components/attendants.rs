@@ -241,7 +241,6 @@ pub fn AttendantsComponent(
     let mut show_copy_toast = use_signal(|| false);
     let mut meeting_start_time_server = use_signal(|| None::<f64>);
     let mut call_start_time = use_signal(|| None::<f64>);
-    let mut show_dropdown = use_signal(|| false);
     let meeting_ended_message = use_signal(|| None::<String>);
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
@@ -536,33 +535,6 @@ pub fn AttendantsComponent(
                 div {
                     id: "join-meeting-container",
                     style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;",
-
-                    // Logout dropdown
-                    if let (Some(name), Some(u_email), Some(on_logout_handler)) = (user_name.as_deref(), user_email.as_deref(), on_logout) {
-                        div { style: "position: absolute; top: 1rem; right: 1rem; z-index: 1001;",
-                            button {
-                                onclick: move |_| show_dropdown.set(!show_dropdown()),
-                                style: "display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; background: #1f2937; border-radius: 0.5rem; color: white; font-size: 0.875rem; border: none; cursor: pointer;",
-                                span { "{name}" }
-                                svg { style: "width: 1rem; height: 1rem;", fill: "none", stroke: "currentColor", view_box: "0 0 24 24",
-                                    path { stroke_linecap: "round", stroke_linejoin: "round", stroke_width: "2", d: "M19 9l-7 7-7-7" }
-                                }
-                            }
-                            if show_dropdown() {
-                                div { style: "position: absolute; right: 0; margin-top: 0.5rem; width: 14rem; background: white; border-radius: 0.5rem; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); border: 1px solid #e5e7eb; padding: 0.25rem 0;",
-                                    div { style: "padding: 0.75rem 1rem; border-bottom: 1px solid #e5e7eb;",
-                                        p { style: "font-size: 0.875rem; font-weight: 500; color: #111827; margin: 0;", "{name}" }
-                                        p { style: "font-size: 0.75rem; color: #6b7280; margin: 0; overflow: hidden; text-overflow: ellipsis;", "{u_email}" }
-                                    }
-                                    button {
-                                        onclick: move |_| on_logout_handler.call(()),
-                                        style: "width: 100%; text-align: left; padding: 0.5rem 1rem; font-size: 0.875rem; color: #dc2626; background: transparent; border: none; cursor: pointer;",
-                                        "Sign out"
-                                    }
-                                }
-                            }
-                        }
-                    }
 
                     div { style: "text-align: center; color: white; margin-bottom: 2rem;",
                         h2 { "Ready to join the meeting?" }
@@ -965,7 +937,7 @@ pub fn AttendantsComponent(
                     HostControls {
                         meeting_id: id.clone(),
                         is_admitted: true,
-                        waiting_room_version: waiting_room_version(),
+                        waiting_room_version: waiting_room_version,
                     }
                 }
 

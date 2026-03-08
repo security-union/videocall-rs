@@ -1045,7 +1045,7 @@ impl Inner {
         match rsa.pub_key.to_public_key_der() {
             Ok(public_key_der) => {
                 let packet = RsaPacket {
-                    username: userid.clone(),
+                    user_id: userid.clone(),
                     public_key_der: public_key_der.to_vec(),
                     ..Default::default()
                 };

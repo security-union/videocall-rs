@@ -156,9 +156,9 @@ impl AudioWorkletCodec {
     }
 
     pub fn destroy(&self) {
-        let _ = self.send_message(EncoderMessages::Close);
         let _ = self.send_message(EncoderMessages::Flush);
         let _ = self.send_message(EncoderMessages::Done);
+        let _ = self.send_message(EncoderMessages::Close);
         let _ = self.inner.borrow_mut().take();
     }
 

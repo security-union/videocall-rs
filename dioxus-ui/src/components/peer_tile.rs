@@ -75,7 +75,7 @@ pub fn PeerTile(
             }
         };
         let abortable = Abortable::new(fut, abort_reg);
-        wasm_bindgen_futures::spawn_local(async move {
+        spawn(async move {
             let _ = abortable.await;
         });
     });

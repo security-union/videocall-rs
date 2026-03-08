@@ -30,8 +30,8 @@ pub struct RsaPacket {
     // message fields
     // @@protoc_insertion_point(field:RsaPacket.public_key_der)
     pub public_key_der: ::std::vec::Vec<u8>,
-    // @@protoc_insertion_point(field:RsaPacket.username)
-    pub username: ::std::string::String,
+    // @@protoc_insertion_point(field:RsaPacket.user_id)
+    pub user_id: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:RsaPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -57,9 +57,9 @@ impl RsaPacket {
             |m: &mut RsaPacket| { &mut m.public_key_der },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "username",
-            |m: &RsaPacket| { &m.username },
-            |m: &mut RsaPacket| { &mut m.username },
+            "user_id",
+            |m: &RsaPacket| { &m.user_id },
+            |m: &mut RsaPacket| { &mut m.user_id },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<RsaPacket>(
             "RsaPacket",
@@ -83,7 +83,7 @@ impl ::protobuf::Message for RsaPacket {
                     self.public_key_der = is.read_bytes()?;
                 },
                 18 => {
-                    self.username = is.read_string()?;
+                    self.user_id = is.read_string()?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -100,8 +100,8 @@ impl ::protobuf::Message for RsaPacket {
         if !self.public_key_der.is_empty() {
             my_size += ::protobuf::rt::bytes_size(1, &self.public_key_der);
         }
-        if !self.username.is_empty() {
-            my_size += ::protobuf::rt::string_size(2, &self.username);
+        if !self.user_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(2, &self.user_id);
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -112,8 +112,8 @@ impl ::protobuf::Message for RsaPacket {
         if !self.public_key_der.is_empty() {
             os.write_bytes(1, &self.public_key_der)?;
         }
-        if !self.username.is_empty() {
-            os.write_string(2, &self.username)?;
+        if !self.user_id.is_empty() {
+            os.write_string(2, &self.user_id)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -133,14 +133,14 @@ impl ::protobuf::Message for RsaPacket {
 
     fn clear(&mut self) {
         self.public_key_der.clear();
-        self.username.clear();
+        self.user_id.clear();
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static RsaPacket {
         static instance: RsaPacket = RsaPacket {
             public_key_der: ::std::vec::Vec::new(),
-            username: ::std::string::String::new(),
+            user_id: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -166,8 +166,8 @@ impl ::protobuf::reflect::ProtobufValue for RsaPacket {
 
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x16types/rsa_packet.proto\"M\n\tRsaPacket\x12$\n\x0epublic_key_der\
-    \x18\x01\x20\x01(\x0cR\x0cpublicKeyDer\x12\x1a\n\x08username\x18\x02\x20\
-    \x01(\tR\x08usernameJ\x98\x01\n\x06\x12\x04\0\0\x05\x01\n\x08\n\x01\x0c\
+    \x18\x01\x20\x01(\x0cR\x0cpublicKeyDer\x12\x1a\n\x08user_id\x18\x02\x20\
+    \x01(\tR\x08user_idJ\x98\x01\n\x06\x12\x04\0\0\x05\x01\n\x08\n\x01\x0c\
     \x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x05\x01\n\n\n\x03\x04\0\
     \x01\x12\x03\x02\x08\x11\n\x0b\n\x04\x04\0\x02\0\x12\x03\x03\x02\x1b\n\
     \x0c\n\x05\x04\0\x02\0\x05\x12\x03\x03\x02\x07\n\x0c\n\x05\x04\0\x02\0\

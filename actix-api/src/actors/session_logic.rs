@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 pub type SessionId = u64;
 pub type RoomId = String;
-pub type Email = String;
+pub type UserId = String;
 
 /// Connection state for session management during election
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +70,7 @@ pub enum InboundAction {
 pub struct SessionLogic {
     pub id: u64,
     pub room: RoomId,
-    pub email: Email,
+    pub user_id: UserId,
     pub addr: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
@@ -85,7 +85,7 @@ impl SessionLogic {
     pub fn new(
         addr: Addr<ChatServer>,
         room: String,
-        email: String,
+        user_id: String,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -93,14 +93,14 @@ impl SessionLogic {
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
-            "new session: room={} email={} session_id={} observer={}",
-            room, email, id, observer
+            "new session: room={} user_id={} session_id={} observer={}",
+            room, user_id, id, observer
         );
 
         SessionLogic {
             id,
             room,
-            email,
+            user_id,
             addr,
             nats_client,
             tracker_sender,
@@ -118,7 +118,7 @@ impl SessionLogic {
         send_connection_started(
             &self.tracker_sender,
             self.id,
-            self.email.clone(),
+            self.user_id.clone(),
             self.room.clone(),
             transport.to_string(),
         );
@@ -155,7 +155,7 @@ impl SessionLogic {
         JoinRoom {
             room: self.room.clone(),
             session: self.id,
-            user_id: self.email.clone(),
+            user_id: self.user_id.clone(),
         }
     }
 
@@ -163,7 +163,7 @@ impl SessionLogic {
     pub fn create_client_message(&self, msg: Packet) -> ClientMessage {
         ClientMessage {
             session: self.id,
-            user: self.email.clone(),
+            user: self.user_id.clone(),
             room: self.room.clone(),
             msg,
         }
@@ -200,7 +200,7 @@ impl SessionLogic {
         self.addr.do_send(Disconnect {
             session: self.id,
             room: self.room.clone(),
-            user_id: self.email.clone(),
+            user_id: self.user_id.clone(),
         });
     }
 
@@ -227,13 +227,13 @@ impl SessionLogic {
         // Classify and handle
         match classify_packet(data) {
             PacketKind::Rtt => {
-                trace!("RTT packet from {}, echoing back", self.email);
+                trace!("RTT packet from {}, echoing back", self.user_id);
                 let data_tracker = DataTracker::new(self.tracker_sender.clone());
                 data_tracker.track_sent(self.id, data.len() as u64);
                 InboundAction::Echo(Arc::new(data.to_vec()))
             }
             PacketKind::Health => {
-                trace!("Health packet from {}", self.email);
+                trace!("Health packet from {}", self.user_id);
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
                 InboundAction::Processed
             }
@@ -242,7 +242,7 @@ impl SessionLogic {
                     trace!(
                         "Observer session {} dropping media packet from {}",
                         self.id,
-                        self.email
+                        self.user_id
                     );
                     InboundAction::Processed
                 } else {

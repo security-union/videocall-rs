@@ -86,7 +86,7 @@ pub struct Peer {
     pub session_id: u64,
     /// Cached `session_id.to_string()` to avoid repeated allocations.
     sid_str: String,
-    pub email: String,
+    pub user_id: String,
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
@@ -117,7 +117,7 @@ impl Peer {
         video_canvas_id: String,
         screen_canvas_id: String,
         session_id: u64,
-        email: String,
+        user_id: String,
         aes: Option<Aes128State>,
         vad_threshold: Option<f32>,
     ) -> Result<Self, JsValue> {
@@ -126,7 +126,7 @@ impl Peer {
             Self::new_decoders(&video_canvas_id, &screen_canvas_id, &sid_str, vad_threshold)?;
 
         audio.set_muted(true);
-        debug!("Initialized peer {email} (session_id: {session_id}) with audio muted");
+        debug!("Initialized peer {user_id} (session_id: {session_id}) with audio muted");
 
         Ok(Self {
             audio,
@@ -134,7 +134,7 @@ impl Peer {
             screen,
             session_id,
             sid_str,
-            email,
+            user_id,
             video_canvas_id,
             screen_canvas_id,
             aes,
@@ -549,19 +549,19 @@ impl PeerDecodeManager {
 
     fn add_peer(
         &mut self,
-        email: &str,
+        user_id: &str,
         session_id: u64,
         aes: Option<Aes128State>,
     ) -> Result<(), JsValue> {
         let sid_str = session_id.to_string();
-        debug!("Adding peer {email} with session_id {sid_str}");
+        debug!("Adding peer {user_id} with session_id {sid_str}");
         self.connected_peers.insert(
             session_id,
             Peer::new(
                 self.get_video_canvas_id.emit(sid_str.clone()),
                 self.get_screen_canvas_id.emit(sid_str),
                 session_id,
-                email.to_owned(),
+                user_id.to_owned(),
                 aes,
                 self.vad_threshold,
             )?,
@@ -587,10 +587,10 @@ impl PeerDecodeManager {
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
-    pub fn ensure_peer(&mut self, session_id: u64, email: &str) -> PeerStatus {
+    pub fn ensure_peer(&mut self, session_id: u64, user_id: &str) -> PeerStatus {
         if self.connected_peers.contains_key(&session_id) {
             PeerStatus::NoChange
-        } else if let Err(e) = self.add_peer(email, session_id, None) {
+        } else if let Err(e) = self.add_peer(user_id, session_id, None) {
             log::error!("Error adding peer: {e:?}");
             PeerStatus::NoChange
         } else {
@@ -695,7 +695,7 @@ mod tests {
         let data = media.write_to_bytes().expect("serialize MediaPacket");
         Arc::new(PacketWrapper {
             data,
-            email: "test@test.com".into(),
+            user_id: "test@test.com".into(),
             packet_type: PacketType::MEDIA.into(),
             session_id,
             ..Default::default()
@@ -710,7 +710,7 @@ mod tests {
     ) -> Arc<PacketWrapper> {
         let media = MediaPacket {
             media_type: MediaType::HEARTBEAT.into(),
-            email: "test@test.com".into(),
+            user_id: "test@test.com".into(),
             heartbeat_metadata: Some(HeartbeatMetadata {
                 video_enabled: video,
                 audio_enabled: audio,
@@ -726,7 +726,7 @@ mod tests {
     fn video_frame_packet(session_id: u64) -> Arc<PacketWrapper> {
         let media = MediaPacket {
             media_type: MediaType::VIDEO.into(),
-            email: "test@test.com".into(),
+            user_id: "test@test.com".into(),
             data: vec![0u8; 10], // dummy payload
             ..Default::default()
         };
@@ -736,7 +736,7 @@ mod tests {
     fn audio_frame_packet(session_id: u64) -> Arc<PacketWrapper> {
         let media = MediaPacket {
             media_type: MediaType::AUDIO.into(),
-            email: "test@test.com".into(),
+            user_id: "test@test.com".into(),
             data: vec![0u8; 10],
             ..Default::default()
         };
@@ -746,7 +746,7 @@ mod tests {
     fn screen_frame_packet(session_id: u64) -> Arc<PacketWrapper> {
         let media = MediaPacket {
             media_type: MediaType::SCREEN.into(),
-            email: "test@test.com".into(),
+            user_id: "test@test.com".into(),
             data: vec![0u8; 10],
             ..Default::default()
         };
@@ -765,7 +765,7 @@ mod tests {
             screen: VideoPeerDecoder::noop(),
             session_id,
             sid_str,
-            email: "test@test.com".into(),
+            user_id: "test@test.com".into(),
             video_canvas_id: format!("video-{session_id}"),
             screen_canvas_id: format!("screen-{session_id}"),
             aes: None,
@@ -978,9 +978,9 @@ mod tests {
         );
     }
 
-    // -- MeetingPacket target_email filtering tests ---------------------------
+    // -- MeetingPacket target_user_id filtering tests ---------------------------
 
-    /// A MeetingPacket with PARTICIPANT_ADMITTED and a specific target_email
+    /// A MeetingPacket with PARTICIPANT_ADMITTED and a specific target_user_id
     /// should round-trip through protobuf serialization correctly.
     #[wasm_bindgen_test]
     fn meeting_packet_participant_admitted_deserializes_correctly() {
@@ -990,7 +990,7 @@ mod tests {
         let mut packet = MeetingPacket::new();
         packet.event_type = MeetingEventType::PARTICIPANT_ADMITTED.into();
         packet.room_id = "room-123".into();
-        packet.target_email = "alice@example.com".into();
+        packet.target_user_id = "alice@example.com".into();
         packet.message = "Welcome".into();
 
         let bytes = packet.write_to_bytes().expect("serialize MeetingPacket");
@@ -1002,43 +1002,43 @@ mod tests {
             "event_type should be PARTICIPANT_ADMITTED"
         );
         assert_eq!(parsed.room_id, "room-123");
-        assert_eq!(parsed.target_email, "alice@example.com");
+        assert_eq!(parsed.target_user_id, "alice@example.com");
         assert_eq!(parsed.message, "Welcome");
     }
 
-    /// Verify the target_email comparison used for filtering:
-    /// the callback should only fire when target_email matches the local userid.
+    /// Verify the target_user_id comparison used for filtering:
+    /// the callback should only fire when target_user_id matches the local userid.
     #[wasm_bindgen_test]
-    fn meeting_packet_target_email_matching_logic() {
+    fn meeting_packet_target_user_id_matching_logic() {
         use videocall_types::protos::meeting_packet::MeetingPacket;
 
         let mut packet = MeetingPacket::new();
-        packet.target_email = "alice@example.com".into();
+        packet.target_user_id = "alice@example.com".into();
 
-        // Matching case: target_email equals userid
+        // Matching case: target_user_id equals userid
         let userid = "alice@example.com";
         assert_eq!(
-            packet.target_email, userid,
-            "target_email should match the local userid"
+            packet.target_user_id, userid,
+            "target_user_id should match the local userid"
         );
 
-        // Non-matching case: target_email does not equal a different userid
+        // Non-matching case: target_user_id does not equal a different userid
         let observer_userid = "observer";
         assert_ne!(
-            packet.target_email, observer_userid,
-            "target_email should NOT match a different userid"
+            packet.target_user_id, observer_userid,
+            "target_user_id should NOT match a different userid"
         );
     }
 
-    /// Verify that PARTICIPANT_REJECTED events also carry target_email correctly.
+    /// Verify that PARTICIPANT_REJECTED events also carry target_user_id correctly.
     #[wasm_bindgen_test]
-    fn meeting_packet_participant_rejected_has_target_email() {
+    fn meeting_packet_participant_rejected_has_target_user_id() {
         use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
         use videocall_types::protos::meeting_packet::MeetingPacket;
 
         let mut packet = MeetingPacket::new();
         packet.event_type = MeetingEventType::PARTICIPANT_REJECTED.into();
-        packet.target_email = "bob@example.com".into();
+        packet.target_user_id = "bob@example.com".into();
         packet.room_id = "room-456".into();
 
         let bytes = packet.write_to_bytes().expect("serialize");
@@ -1048,22 +1048,22 @@ mod tests {
             parsed.event_type.enum_value(),
             Ok(MeetingEventType::PARTICIPANT_REJECTED)
         );
-        assert_eq!(parsed.target_email, "bob@example.com");
+        assert_eq!(parsed.target_user_id, "bob@example.com");
         assert_eq!(parsed.room_id, "room-456");
     }
 
-    /// An empty target_email field should not match any real userid.
+    /// An empty target_user_id field should not match any real userid.
     #[wasm_bindgen_test]
-    fn meeting_packet_empty_target_email_does_not_match() {
+    fn meeting_packet_empty_target_user_id_does_not_match() {
         use videocall_types::protos::meeting_packet::MeetingPacket;
 
         let packet = MeetingPacket::new();
-        assert!(packet.target_email.is_empty());
+        assert!(packet.target_user_id.is_empty());
 
         let userid = "alice@example.com";
         assert_ne!(
-            packet.target_email, userid,
-            "empty target_email should not match any userid"
+            packet.target_user_id, userid,
+            "empty target_user_id should not match any userid"
         );
     }
 
@@ -1076,7 +1076,7 @@ mod tests {
 
         let mut meeting = MeetingPacket::new();
         meeting.event_type = MeetingEventType::PARTICIPANT_ADMITTED.into();
-        meeting.target_email = "charlie@example.com".into();
+        meeting.target_user_id = "charlie@example.com".into();
         meeting.room_id = "room-789".into();
 
         let meeting_bytes = meeting.write_to_bytes().expect("serialize MeetingPacket");
@@ -1084,7 +1084,7 @@ mod tests {
         // Wrap in a PacketWrapper like the real code path does
         let wrapper = PacketWrapper {
             data: meeting_bytes,
-            email: "server".into(),
+            user_id: "server".into(),
             packet_type: PacketType::MEETING.into(),
             ..Default::default()
         };
@@ -1093,7 +1093,7 @@ mod tests {
         assert_eq!(wrapper.packet_type.enum_value(), Ok(PacketType::MEETING));
         let parsed =
             MeetingPacket::parse_from_bytes(&wrapper.data).expect("parse from wrapper data");
-        assert_eq!(parsed.target_email, "charlie@example.com");
+        assert_eq!(parsed.target_user_id, "charlie@example.com");
         assert_eq!(
             parsed.event_type.enum_value(),
             Ok(MeetingEventType::PARTICIPANT_ADMITTED)
@@ -1101,11 +1101,11 @@ mod tests {
 
         // Simulate the userid check from video_call_client.rs
         let my_userid = "charlie@example.com";
-        let should_fire_callback = parsed.target_email == my_userid;
+        let should_fire_callback = parsed.target_user_id == my_userid;
         assert!(should_fire_callback, "callback should fire for matching userid");
 
         let other_userid = "observer@example.com";
-        let should_not_fire = parsed.target_email == other_userid;
+        let should_not_fire = parsed.target_user_id == other_userid;
         assert!(!should_not_fire, "callback should NOT fire for non-matching userid");
     }
 }

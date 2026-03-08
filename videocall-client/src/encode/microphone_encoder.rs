@@ -57,7 +57,7 @@ use web_time::SystemTime;
 
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,
-    email: &str,
+    user_id: &str,
     sequence: u64,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
@@ -68,7 +68,7 @@ pub fn transform_audio_chunk(
     // chunk length in bytes
 
     let media_packet: MediaPacket = MediaPacket {
-        email: email.to_owned(),
+        user_id: String::new(),
         media_type: MediaType::AUDIO.into(),
         frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
         data: chunk.to_vec(),
@@ -84,7 +84,7 @@ pub fn transform_audio_chunk(
     let data = aes.encrypt(&data).unwrap();
     PacketWrapper {
         data,
-        email: media_packet.email,
+        user_id: user_id.to_owned(),
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }
@@ -179,7 +179,7 @@ impl MicrophoneEncoder {
     }
 
     pub fn start(&mut self) {
-        let user_id = self.client.userid().clone();
+        let user_id = self.client.user_id().clone();
         let client = self.client.clone();
         let device_id = if let Some(mic) = &self.state.selected {
             mic.to_string()

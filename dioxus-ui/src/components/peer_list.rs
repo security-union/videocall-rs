@@ -18,7 +18,7 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::{UsernameCtx, VideoCallClientCtx};
+use crate::context::{DisplayNameCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
 use futures::future::{AbortHandle, Abortable};
 use std::cell::RefCell;
@@ -79,8 +79,8 @@ pub fn PeerList(
         .collect();
 
     // Get username from context and append (You)
-    let username_ctx = use_context::<UsernameCtx>();
-    let current_user_name: Option<String> = (username_ctx.0)().clone();
+    let display_name_ctx = use_context::<DisplayNameCtx>();
+    let current_user_name: Option<String> = (display_name_ctx.0)().clone();
 
     let display_name = current_user_name
         .clone()
@@ -92,16 +92,16 @@ pub fn PeerList(
         .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
         .unwrap_or(false);
 
-    // Get client from context to convert session_id to email for display
+    // Get client from context to convert session_id to user_id for display
     let client_ctx = use_context::<VideoCallClientCtx>();
     let audio_states = peer_audio_states();
     let speaking_states = peer_speaking_states();
 
-    // Build reverse lookup (email -> session_id) once, to avoid O(N^2) scanning inside the loop.
-    let email_to_sid: HashMap<String, String> = client_ctx
+    // Build reverse lookup (user_id -> session_id) once, to avoid O(N^2) scanning inside the loop.
+    let user_id_to_sid: HashMap<String, String> = client_ctx
         .sorted_peer_keys()
         .into_iter()
-        .filter_map(|sid| client_ctx.get_peer_email(&sid).map(|email| (email, sid)))
+        .filter_map(|sid| client_ctx.get_peer_user_id(&sid).map(|uid| (uid, sid)))
         .collect();
 
     rsx! {
@@ -196,9 +196,9 @@ pub fn PeerList(
 
                             for peer in filtered_peers.iter() {
                                 {
-                                    // peer is the display email; we need the session_id to look up states.
+                                    // peer is the display user_id; we need the session_id to look up states.
                                     // Use the pre-built reverse map for O(1) lookup instead of scanning all peers.
-                                    let peer_session_id = email_to_sid.get(peer.as_str());
+                                    let peer_session_id = user_id_to_sid.get(peer.as_str());
                                     let muted = peer_session_id
                                         .and_then(|sid| audio_states.get(sid).copied())
                                         .map(|enabled| !enabled)

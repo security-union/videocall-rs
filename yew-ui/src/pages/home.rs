@@ -262,7 +262,7 @@ pub fn home() -> Html {
                                     <div class="auth-dropdown-menu">
                                         <div class="auth-dropdown-header">
                                             <p class="auth-dropdown-name">{&profile.name}</p>
-                                            <p class="auth-dropdown-email">{&profile.email}</p>
+                                            <p class="auth-dropdown-email">{&profile.user_id}</p>
                                         </div>
                                         <button
                                             type="button"

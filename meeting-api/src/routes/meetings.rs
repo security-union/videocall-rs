@@ -66,7 +66,7 @@ fn generate_meeting_id() -> String {
 /// POST /api/v1/meetings
 pub async fn create_meeting(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(body): Json<CreateMeetingRequest>,
 ) -> Result<(StatusCode, Json<APIResponse<CreateMeetingResponse>>), AppError> {
     let meeting_id = match &body.meeting_id {
@@ -104,7 +104,7 @@ pub async fn create_meeting(
     let row = db_meetings::create_with_options(
         &state.db,
         &meeting_id,
-        &email,
+        &user_id,
         password_hash.as_deref(),
         &attendees_json,
         waiting_room_enabled,
@@ -119,7 +119,7 @@ pub async fn create_meeting(
 
     let response = CreateMeetingResponse {
         meeting_id: row.room_id,
-        host: email,
+        host: user_id,
         created_at: row.created_at.timestamp(),
         state: row.state.unwrap_or_else(|| "idle".to_string()),
         attendees: body.attendees,
@@ -133,14 +133,14 @@ pub async fn create_meeting(
 /// GET /api/v1/meetings
 pub async fn list_meetings(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Query(params): Query<ListMeetingsQuery>,
 ) -> Result<Json<APIResponse<ListMeetingsResponse>>, AppError> {
     let limit = params.limit.clamp(1, 100);
     let offset = params.offset.max(0);
 
-    let rows = db_meetings::list_by_owner(&state.db, &email, limit, offset).await?;
-    let total = db_meetings::count_by_owner(&state.db, &email).await?;
+    let rows = db_meetings::list_by_owner(&state.db, &user_id, limit, offset).await?;
+    let total = db_meetings::count_by_owner(&state.db, &user_id).await?;
 
     let mut meetings = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -172,14 +172,14 @@ pub async fn list_meetings(
 /// GET /api/v1/meetings/{meeting_id}
 pub async fn get_meeting(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    let your_status = db_participants::get_status(&state.db, row.id, &email).await?;
+    let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
     let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
@@ -203,7 +203,7 @@ pub async fn get_meeting(
 /// DELETE /api/v1/meetings/{meeting_id}
 pub async fn delete_meeting(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<DeleteMeetingResponse>>, AppError> {
     // Check the meeting exists first to distinguish 404 from 403.
@@ -211,11 +211,11 @@ pub async fn delete_meeting(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    if row.creator_id.as_deref() != Some(email.as_str()) {
+    if row.creator_id.as_deref() != Some(user_id.as_str()) {
         return Err(AppError::not_owner());
     }
 
-    db_meetings::soft_delete(&state.db, &meeting_id, &email).await?;
+    db_meetings::soft_delete(&state.db, &meeting_id, &user_id).await?;
 
     Ok(Json(APIResponse::ok(DeleteMeetingResponse {
         message: format!("Meeting '{meeting_id}' has been deleted"),
@@ -225,20 +225,20 @@ pub async fn delete_meeting(
 /// POST /api/v1/meetings/{meeting_id}/end
 pub async fn end_meeting_handler(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    if meeting.creator_id.as_deref() != Some(email.as_str()) {
+    if meeting.creator_id.as_deref() != Some(user_id.as_str()) {
         return Err(AppError::not_owner());
     }
 
     // Idempotent: if already ended, return the current state.
     if meeting.state.as_deref() == Some("ended") {
-        let your_status = db_participants::get_status(&state.db, meeting.id, &email).await?;
+        let your_status = db_participants::get_status(&state.db, meeting.id, &user_id).await?;
         let your_status = your_status.map(|p| p.into_participant_status(None));
 
         let participant_count = db_participants::count_admitted(&state.db, meeting.id).await?;
@@ -265,7 +265,7 @@ pub async fn end_meeting_handler(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    let your_status = db_participants::get_status(&state.db, row.id, &email).await?;
+    let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
     let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
@@ -289,7 +289,7 @@ pub async fn end_meeting_handler(
 /// PATCH /api/v1/meetings/{meeting_id}
 pub async fn update_meeting(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
@@ -298,7 +298,7 @@ pub async fn update_meeting(
         // all waiting participants within a single transaction.
         // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
         // so we only fetch separately on failure to distinguish 404 vs 403.
-        match db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &email, enabled)
+        match db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &user_id, enabled)
             .await?
         {
             Some(row) => row,
@@ -316,13 +316,13 @@ pub async fn update_meeting(
         let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
             .await?
             .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
-        if row.creator_id.as_deref() != Some(email.as_str()) {
+        if row.creator_id.as_deref() != Some(user_id.as_str()) {
             return Err(AppError::not_owner());
         }
         row
     };
 
-    let your_status = db_participants::get_status(&state.db, row.id, &email).await?;
+    let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
     let participant_count = db_participants::count_admitted(&state.db, row.id).await?;

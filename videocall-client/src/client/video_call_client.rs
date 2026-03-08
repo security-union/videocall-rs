@@ -45,7 +45,7 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
 use videocall_types::Callback;
-use videocall_types::SYSTEM_USER_EMAIL;
+use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
 
 /// Configuration options for creating a [`VideoCallClient`].
@@ -62,7 +62,7 @@ pub struct VideoCallClientOptions {
     pub on_peer_removed: Option<Callback<String>>,
     pub get_peer_video_canvas_id: Callback<String, String>,
     pub get_peer_screen_canvas_id: Callback<String, String>,
-    pub userid: String,
+    pub user_id: String,
     pub meeting_id: String,
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
@@ -105,7 +105,7 @@ pub struct VideoCallClientOptions {
 #[derive(Debug)]
 struct InnerOptions {
     enable_e2ee: bool,
-    userid: String,
+    user_id: String,
     on_peer_added: Callback<String>,
     on_meeting_info: Option<Callback<f64>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
@@ -160,10 +160,10 @@ impl VideoCallClient {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
 
         let diagnostics = if options.enable_diagnostics {
-            let diagnostics = Rc::new(DiagnosticManager::new(options.userid.clone()));
+            let diagnostics = Rc::new(DiagnosticManager::new(options.user_id.clone()));
 
             if let Some(interval) = options.diagnostics_update_interval_ms {
-                let mut diag = DiagnosticManager::new(options.userid.clone());
+                let mut diag = DiagnosticManager::new(options.user_id.clone());
                 diag.set_reporting_interval(interval);
                 let diagnostics = Rc::new(diag);
 
@@ -176,7 +176,7 @@ impl VideoCallClient {
         };
 
         let sender_diagnostics = if options.enable_diagnostics {
-            let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.userid.clone()));
+            let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.user_id.clone()));
 
             if let Some(interval) = options.diagnostics_update_interval_ms {
                 sender_diagnostics.set_reporting_interval(interval);
@@ -198,7 +198,7 @@ impl VideoCallClient {
 
             let mut reporter = HealthReporter::new(
                 session_id,
-                options.userid.clone(),
+                options.user_id.clone(),
                 options.health_reporting_interval_ms.unwrap_or(5000),
             );
 
@@ -221,7 +221,7 @@ impl VideoCallClient {
             inner: Rc::new(RefCell::new(Inner {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
-                    userid: options.userid.clone(),
+                    user_id: options.user_id.clone(),
                     on_peer_added: options.on_peer_added.clone(),
                     on_meeting_ended: options.on_meeting_ended.clone(),
                     on_meeting_info: options.on_meeting_info.clone(),
@@ -303,7 +303,7 @@ impl VideoCallClient {
             } else {
                 Vec::new()
             },
-            userid: self.options.userid.clone(),
+            userid: self.options.user_id.clone(),
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {
@@ -485,16 +485,16 @@ impl VideoCallClient {
         }
     }
 
-    pub fn get_peer_email(&self, session_id: &str) -> Option<String> {
+    pub fn get_peer_user_id(&self, session_id: &str) -> Option<String> {
         let sid: u64 = session_id.parse().ok()?;
         match self.inner.try_borrow() {
             Ok(inner) => inner
                 .peer_decode_manager
                 .get(&sid)
-                .map(|peer| peer.email.clone()),
+                .map(|peer| peer.user_id.clone()),
             Err(_) => {
                 warn!(
-                    "Failed to borrow inner in get_peer_email for session_id: {}",
+                    "Failed to borrow inner in get_peer_user_id for session_id: {}",
                     session_id
                 );
                 None
@@ -572,8 +572,8 @@ impl VideoCallClient {
         self.aes.clone()
     }
 
-    pub fn userid(&self) -> &String {
-        &self.options.userid
+    pub fn user_id(&self) -> &String {
+        &self.options.user_id
     }
 
     pub fn get_connection_state(&self) -> Option<ConnectionState> {
@@ -665,7 +665,7 @@ impl VideoCallClient {
     pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
         let wrapper = PacketWrapper {
             packet_type: PacketType::DIAGNOSTICS.into(),
-            email: self.options.userid.clone(),
+            user_id: self.options.user_id.clone(),
             data: packet.write_to_bytes().unwrap(),
             ..Default::default()
         };
@@ -793,16 +793,16 @@ impl Inner {
         debug!(
             "<< Received {:?} from {} (session: {})",
             response.packet_type.enum_value(),
-            response.email,
+            response.user_id,
             response.session_id
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let peer_status = if response.email == SYSTEM_USER_EMAIL || response.session_id == 0 {
+        let peer_status = if response.user_id == SYSTEM_USER_ID || response.session_id == 0 {
             PeerStatus::NoChange
         } else {
             self.peer_decode_manager
-                .ensure_peer(response.session_id, &response.email)
+                .ensure_peer(response.session_id, &response.user_id)
         };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
@@ -810,7 +810,7 @@ impl Inner {
                     return;
                 }
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                    debug!("Decrypted AES_KEY from {}", response.email);
+                    debug!("Decrypted AES_KEY from {}", response.user_id);
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
                             if let Err(e) = self.peer_decode_manager.set_peer_aes(
@@ -846,14 +846,14 @@ impl Inner {
 
                 match encrypted_aes_packet {
                     Ok(data) => {
-                        debug!(">> {} sending AES key", self.options.userid);
+                        debug!(">> {} sending AES key", self.options.user_id);
 
                         // Send AES key packet via ConnectionController
                         if let Ok(cc) = self.connection_controller.try_borrow() {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::AES_KEY.into(),
-                                    email: self.options.userid.clone(),
+                                    user_id: self.options.user_id.clone(),
                                     data,
                                     ..Default::default()
                                 };
@@ -876,7 +876,7 @@ impl Inner {
 
                 if let Err(e) = self
                     .peer_decode_manager
-                    .decode(response, &self.options.userid)
+                    .decode(response, &self.options.user_id)
                 {
                     error!("error decoding packet: {e}");
                     match e {
@@ -907,7 +907,7 @@ impl Inner {
             Ok(PacketType::HEALTH) => {
                 debug!(
                     "Received unexpected health packet from {}, ignoring",
-                    response.email
+                    response.user_id
                 );
             }
             Ok(PacketType::SESSION_ASSIGNED) => {
@@ -976,10 +976,10 @@ impl Inner {
                     Ok(MeetingEventType::PARTICIPANT_ADMITTED) => {
                         info!(
                             "Received PARTICIPANT_ADMITTED: room={}, target={}",
-                            meeting_packet.room_id, meeting_packet.target_email
+                            meeting_packet.room_id, meeting_packet.target_user_id
                         );
                         // Only fire callback if this event is targeted at us
-                        if meeting_packet.target_email == self.options.userid {
+                        if meeting_packet.target_user_id == self.options.user_id {
                             if let Some(callback) = &self.options.on_participant_admitted {
                                 callback.emit(());
                             }
@@ -988,10 +988,10 @@ impl Inner {
                     Ok(MeetingEventType::PARTICIPANT_REJECTED) => {
                         info!(
                             "Received PARTICIPANT_REJECTED: room={}, target={}",
-                            meeting_packet.room_id, meeting_packet.target_email
+                            meeting_packet.room_id, meeting_packet.target_user_id
                         );
                         // Only fire callback if this event is targeted at us
-                        if meeting_packet.target_email == self.options.userid {
+                        if meeting_packet.target_user_id == self.options.user_id {
                             if let Some(callback) = &self.options.on_participant_rejected {
                                 callback.emit(());
                             }
@@ -1023,7 +1023,7 @@ impl Inner {
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",
-                    response.email
+                    response.user_id
                 );
             }
             Err(e) => {
@@ -1040,7 +1040,7 @@ impl Inner {
         if !self.options.enable_e2ee {
             return;
         }
-        let userid = self.options.userid.clone();
+        let userid = self.options.user_id.clone();
         let rsa = &*self.rsa;
         match rsa.pub_key.to_public_key_der() {
             Ok(public_key_der) => {
@@ -1058,7 +1058,7 @@ impl Inner {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::RSA_PUB_KEY.into(),
-                                    email: userid,
+                                    user_id: userid,
                                     data,
                                     ..Default::default()
                                 };

@@ -270,7 +270,7 @@ async fn run_webtransport_connection_from_request(
             anyhow!("token validation failed: {}", e.client_message())
         })?;
         info!(
-            "WT token-based connection: email={}, room={}, observer={}",
+            "WT token-based connection: user_id={}, room={}, observer={}",
             claims.sub, claims.room, claims.observer
         );
         (claims.sub, claims.room, claims.observer)
@@ -278,7 +278,7 @@ async fn run_webtransport_connection_from_request(
         // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
         if parts.len() != 3 {
             return Err(anyhow!(
-                "Invalid path: expected /lobby/{{email}}/{{room}} (deprecated) or /lobby?token=<JWT>"
+                "Invalid path: expected /lobby/{{user_id}}/{{room}} (deprecated) or /lobby?token=<JWT>"
             ));
         }
         let username = parts[1].replace(' ', "_");
@@ -288,7 +288,7 @@ async fn run_webtransport_connection_from_request(
             return Err(anyhow!("Invalid path input chars"));
         }
         info!(
-            "WT deprecated path-based connection: email={}, room={}",
+            "WT deprecated path-based connection: user_id={}, room={}",
             username, lobby_id
         );
         (username, lobby_id, false) // deprecated path-based endpoint: never observer
@@ -702,12 +702,12 @@ mod tests {
         // Craft a MEDIA packet that is not RTT and not health
         let media = VcMediaPacket {
             media_type: VcMediaType::AUDIO.into(),
-            email: user_a.to_string(),
+            user_id: user_a.to_string(),
             ..Default::default()
         };
         let packet = VcPacketWrapper {
             packet_type: VcPacketType::MEDIA.into(),
-            email: user_a.to_string(),
+            user_id: user_a.to_string(),
             data: media.write_to_bytes().expect("serialize media"),
             ..Default::default()
         };
@@ -753,7 +753,7 @@ mod tests {
             sent_packet.packet_type, received_packet.packet_type,
             "packet_type must match"
         );
-        assert_eq!(sent_packet.email, received_packet.email, "email must match");
+        assert_eq!(sent_packet.user_id, received_packet.user_id, "user_id must match");
         assert_eq!(sent_packet.data, received_packet.data, "data must match");
         // Verify that server added session_id (it should not be empty)
         assert!(
@@ -1074,12 +1074,12 @@ mod tests {
     fn create_test_packet(sender: &str, media_type: VcMediaType, _message: String) -> Vec<u8> {
         let media = VcMediaPacket {
             media_type: media_type.into(),
-            email: sender.to_string(),
+            user_id: sender.to_string(),
             ..Default::default()
         };
         let packet = VcPacketWrapper {
             packet_type: VcPacketType::MEDIA.into(),
-            email: sender.to_string(),
+            user_id: sender.to_string(),
             data: media.write_to_bytes().expect("serialize media"),
             ..Default::default()
         };

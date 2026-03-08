@@ -36,7 +36,7 @@ use actix::{
 use actix_web_actors::ws::{self, WebsocketContext};
 use tracing::{error, info, trace};
 
-pub use crate::actors::session_logic::{Email, RoomId, SessionId};
+pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
 /// WebSocket Chat Session Actor
 ///
@@ -57,7 +57,7 @@ impl WsChatSession {
     pub fn new(
         addr: Addr<ChatServer>,
         room: String,
-        email: String,
+        user_id: String,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -66,7 +66,7 @@ impl WsChatSession {
         let logic = SessionLogic::new(
             addr,
             room,
-            email,
+            user_id,
             nats_client,
             tracker_sender,
             session_manager,
@@ -107,13 +107,13 @@ impl Actor for WsChatSession {
         // Start session via SessionManager
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
-        let email = self.logic.email.clone();
+        let user_id = self.logic.user_id.clone();
         let session_id = self.logic.id;
 
         ctx.wait(
             async move {
                 session_manager
-                    .start_session(&room, &email, session_id)
+                    .start_session(&room, &user_id, session_id)
                     .await
             }
             .into_actor(self)
@@ -255,7 +255,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 self.logic.addr.do_send(Leave {
                     session: self.logic.id,
                     room: self.logic.room.clone(),
-                    user_id: self.logic.email.clone(),
+                    user_id: self.logic.user_id.clone(),
                 });
                 ctx.close(reason);
                 ctx.stop();
@@ -339,7 +339,7 @@ mod tests {
                 let session_manager = session_manager.clone();
 
                 App::new().route(
-                    "/ws/{room}/{email}",
+                    "/ws/{room}/{user_id}",
                     web::get().to(
                         move |req: HttpRequest,
                               stream: web::Payload,
@@ -350,11 +350,11 @@ mod tests {
                             let session_manager = session_manager.clone();
 
                             async move {
-                                let (room, email) = path.into_inner();
+                                let (room, user_id) = path.into_inner();
                                 let actor = WsChatSession::new(
                                     chat,
                                     room,
-                                    email,
+                                    user_id,
                                     nats_client,
                                     tracker_sender,
                                     session_manager,

@@ -37,7 +37,7 @@ use crate::token::{generate_observer_token, generate_room_token};
 /// Attendees enter the waiting room.
 pub async fn join_meeting(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
@@ -48,11 +48,11 @@ pub async fn join_meeting(
         None => {
             // Auto-create meeting with this user as host.
             let attendees = serde_json::Value::Array(vec![]);
-            db_meetings::create(&state.db, &meeting_id, &email, None, &attendees).await?
+            db_meetings::create(&state.db, &meeting_id, &user_id, None, &attendees).await?
         }
     };
 
-    let is_host = meeting.creator_id.as_deref() == Some(email.as_str());
+    let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
 
     if is_host {
         // Activate the meeting if it's idle or ended.
@@ -66,15 +66,15 @@ pub async fn join_meeting(
             db_meetings::set_host_display_name(&state.db, meeting.id, dn).await?;
         }
 
-        let row = db_participants::upsert_host(&state.db, meeting.id, &email, display_name).await?;
+        let row = db_participants::upsert_host(&state.db, meeting.id, &user_id, display_name).await?;
 
         let token = generate_room_token(
             &state.jwt_secret,
             state.token_ttl_secs,
-            &email,
+            &user_id,
             &meeting_id,
             true,
-            display_name.unwrap_or(&email),
+            display_name.unwrap_or(&user_id),
         )?;
 
         let mut resp = row.into_participant_status(Some(token));
@@ -88,15 +88,15 @@ pub async fn join_meeting(
             // Meeting exists but isn't active yet. Return a "waiting_for_meeting"
             // status with an observer token so the client can receive a push
             // notification when the host activates the meeting.
-            let dn = display_name.unwrap_or(&email);
+            let dn = display_name.unwrap_or(&user_id);
             let observer = generate_observer_token(
                 &state.jwt_secret,
-                &email,
+                &user_id,
                 &meeting_id,
                 dn,
             )?;
             let resp = ParticipantStatusResponse {
-                email: email.clone(),
+                user_id: user_id.clone(),
                 display_name: display_name.map(String::from),
                 status: "waiting_for_meeting".to_string(),
                 is_host: false,
@@ -113,16 +113,16 @@ pub async fn join_meeting(
         // Atomically check waiting_room_enabled and insert participant in one
         // transaction, using FOR UPDATE to serialize against concurrent toggles.
         let (auto_admitted, row, waiting_room_enabled) =
-            db_participants::join_attendee(&state.db, meeting.id, &email, display_name).await?;
+            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name).await?;
 
         let token = if auto_admitted {
             Some(generate_room_token(
                 &state.jwt_secret,
                 state.token_ttl_secs,
-                &email,
+                &user_id,
                 &meeting_id,
                 false,
-                display_name.unwrap_or(&email),
+                display_name.unwrap_or(&user_id),
             )?)
         } else {
             None
@@ -132,10 +132,10 @@ pub async fn join_meeting(
         // When the participant is placed in the waiting room (not auto-admitted),
         // include an observer token so they can receive push notifications.
         if !auto_admitted {
-            let dn = display_name.unwrap_or(&email);
+            let dn = display_name.unwrap_or(&user_id);
             resp.observer_token = Some(generate_observer_token(
                 &state.jwt_secret,
-                &email,
+                &user_id,
                 &meeting_id,
                 dn,
             )?);
@@ -153,7 +153,7 @@ pub async fn join_meeting(
 /// Polling endpoint. When status is 'admitted', the response includes the room_token.
 pub async fn get_my_status(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -165,7 +165,7 @@ pub async fn get_my_status(
         return Err(AppError::meeting_not_active(&meeting_id));
     }
 
-    let row = db_participants::get_status(&state.db, meeting.id, &email)
+    let row = db_participants::get_status(&state.db, meeting.id, &user_id)
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 
@@ -173,10 +173,10 @@ pub async fn get_my_status(
         Some(generate_room_token(
             &state.jwt_secret,
             state.token_ttl_secs,
-            &email,
+            &user_id,
             &meeting_id,
             row.is_host,
-            row.display_name.as_deref().unwrap_or(&email),
+            row.display_name.as_deref().unwrap_or(&user_id),
         )?)
     } else {
         None
@@ -191,19 +191,19 @@ pub async fn get_my_status(
 /// POST /api/v1/meetings/{meeting_id}/leave
 pub async fn leave_meeting(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    let row = db_participants::leave(&state.db, meeting.id, &email)
+    let row = db_participants::leave(&state.db, meeting.id, &user_id)
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 
     // If host left or no admitted participants remain, end the meeting.
-    let is_host = meeting.creator_id.as_deref() == Some(email.as_str());
+    let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
     if is_host {
         db_meetings::end_meeting(&state.db, meeting.id).await?;
     } else {
@@ -221,7 +221,7 @@ pub async fn leave_meeting(
 /// Only participants who are themselves in the meeting can list other participants.
 pub async fn get_participants(
     State(state): State<AppState>,
-    AuthUser { email, .. }: AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<Vec<ParticipantStatusResponse>>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -229,7 +229,7 @@ pub async fn get_participants(
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
     // Verify the requester is actually a participant in this meeting.
-    db_participants::get_status(&state.db, meeting.id, &email)
+    db_participants::get_status(&state.db, meeting.id, &user_id)
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 

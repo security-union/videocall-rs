@@ -24,20 +24,20 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::SYSTEM_USER_EMAIL;
+use videocall_types::SYSTEM_USER_ID;
 
 /// Error type for session management operations
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionError {
-    /// User tried to use the reserved system email
-    ReservedUserEmail,
+    /// User tried to use the reserved system user ID
+    ReservedUserId,
 }
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SessionError::ReservedUserEmail => {
-                write!(f, "Cannot use reserved system email as user ID")
+            SessionError::ReservedUserId => {
+                write!(f, "Cannot use reserved system user ID")
             }
         }
     }
@@ -84,15 +84,15 @@ impl SessionManager {
     /// already been verified.
     ///
     /// # Errors
-    /// Returns `SessionError::ReservedUserEmail` if user_id matches the system email.
+    /// Returns `SessionError::ReservedUserId` if user_id matches the system user ID.
     pub async fn start_session(
         &self,
         room_id: &str,
         user_id: &str,
         id: u64,
     ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
-        if user_id == SYSTEM_USER_EMAIL {
-            return Err(Box::new(SessionError::ReservedUserEmail));
+        if user_id == SYSTEM_USER_ID {
+            return Err(Box::new(SessionError::ReservedUserId));
         }
 
         let now_ms = SystemTime::now()
@@ -125,7 +125,7 @@ impl SessionManager {
     pub fn build_session_assigned_packet(session_id: u64) -> Vec<u8> {
         let wrapper = PacketWrapper {
             packet_type: PacketType::SESSION_ASSIGNED.into(),
-            email: SYSTEM_USER_EMAIL.to_string(),
+            user_id: SYSTEM_USER_ID.to_string(),
             session_id,
             ..Default::default()
         };
@@ -148,7 +148,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            email: SYSTEM_USER_EMAIL.to_string(),
+            user_id: SYSTEM_USER_ID.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -167,7 +167,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            email: SYSTEM_USER_EMAIL.to_string(),
+            user_id: SYSTEM_USER_ID.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -200,14 +200,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_system_email_rejected() {
+    async fn test_system_user_id_rejected() {
         let manager = SessionManager::new();
-        let result = manager.start_session("room-1", SYSTEM_USER_EMAIL, 0).await;
+        let result = manager.start_session("room-1", SYSTEM_USER_ID, 0).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("reserved system email"));
+            .contains("reserved system user ID"));
     }
 
     #[tokio::test]

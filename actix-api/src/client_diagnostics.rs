@@ -32,7 +32,7 @@ pub mod health_processor {
     pub fn process_health_packet(health_data: &PbHealthPacket, client: async_nats::client::Client) {
         debug!(
             "Publishing health report from {} in session {} for meeting {} to NATS",
-            health_data.reporting_peer, health_data.session_id, health_data.meeting_id
+            health_data.reporting_user_id, health_data.session_id, health_data.meeting_id
         );
 
         // Publish to NATS instead of processing locally

@@ -31,9 +31,9 @@ pub type Text = Result<String, anyhow::Error>;
 /// A representation of a value which can be stored and restored as a binary.
 pub type Binary = Result<Vec<u8>, anyhow::Error>;
 
-/// System username used for server-generated messages (meeting info, meeting started/ended).
+/// System user ID used for server-generated messages (meeting info, meeting started/ended).
 /// This is not a real user and should be filtered out in UI/peer management.
-pub const SYSTEM_USER_EMAIL: &str = "system-&^%$#@!";
+pub const SYSTEM_USER_ID: &str = "system-&^%$#@!";
 
 impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {

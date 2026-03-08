@@ -144,27 +144,27 @@ pub fn HostControls(
                     }
                     for participant in waiting().iter() {
                         {
-                            let email = participant.email.clone();
-                            let email_admit = email.clone();
-                            let email_reject = email.clone();
+                            let peer_user_id = participant.user_id.clone();
+                            let uid_admit = peer_user_id.clone();
+                            let uid_reject = peer_user_id.clone();
                             let meeting_id_admit = meeting_id.clone();
                             let meeting_id_reject = meeting_id.clone();
                             let fetch_admit = fetch_waiting_list.clone();
                             let fetch_reject = fetch_waiting_list.clone();
                             rsx! {
-                                div { key: "{email}", class: "waiting-participant",
-                                    span { class: "participant-email", "{email}" }
+                                div { key: "{peer_user_id}", class: "waiting-participant",
+                                    span { class: "participant-email", "{peer_user_id}" }
                                     div { class: "participant-actions",
                                         button {
                                             class: "btn-admit",
                                             title: "Admit",
                                             onclick: move |_| {
-                                                waiting.write().retain(|p| p.email != email_admit);
-                                                let email = email_admit.clone();
+                                                waiting.write().retain(|p| p.user_id != uid_admit);
+                                                let uid = uid_admit.clone();
                                                 let meeting_id = meeting_id_admit.clone();
                                                 let fetch = fetch_admit.clone();
                                                 spawn(async move {
-                                                    match admit_participant(&meeting_id, &email).await {
+                                                    match admit_participant(&meeting_id, &uid).await {
                                                         Ok(_) => fetch(),
                                                         Err(e) => {
                                                             error.set(Some(e));
@@ -184,12 +184,12 @@ pub fn HostControls(
                                             class: "btn-reject",
                                             title: "Reject",
                                             onclick: move |_| {
-                                                waiting.write().retain(|p| p.email != email_reject);
-                                                let email = email_reject.clone();
+                                                waiting.write().retain(|p| p.user_id != uid_reject);
+                                                let uid = uid_reject.clone();
                                                 let meeting_id = meeting_id_reject.clone();
                                                 let fetch = fetch_reject.clone();
                                                 spawn(async move {
-                                                    match reject_participant(&meeting_id, &email).await {
+                                                    match reject_participant(&meeting_id, &uid).await {
                                                         Ok(_) => fetch(),
                                                         Err(e) => {
                                                             error.set(Some(e));
@@ -235,19 +235,19 @@ async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, Stri
     }
 }
 
-async fn admit_participant(meeting_id: &str, email: &str) -> Result<(), String> {
+async fn admit_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     client
-        .admit_participant(meeting_id, email)
+        .admit_participant(meeting_id, user_id)
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))
 }
 
-async fn reject_participant(meeting_id: &str, email: &str) -> Result<(), String> {
+async fn reject_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     client
-        .reject_participant(meeting_id, email)
+        .reject_participant(meeting_id, user_id)
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))

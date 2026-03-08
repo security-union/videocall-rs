@@ -30,7 +30,7 @@ use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
-    load_username_from_storage, save_username_to_storage, validate_display_name,
+    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
     VideoCallClientCtx,
 };
 
@@ -459,7 +459,7 @@ pub fn Host(
                 class: "change-name-fab",
                 title: "Change name",
                 onclick: move |_| {
-                    pending_name.set(load_username_from_storage().unwrap_or_default());
+                    pending_name.set(load_display_name_from_storage().unwrap_or_default());
                     show_change_name.set(true);
                     change_name_error.set(None);
                 },
@@ -484,7 +484,7 @@ pub fn Host(
                     class: "change-name-fab",
                     title: "Change name",
                     onclick: move |_| {
-                        pending_name.set(load_username_from_storage().unwrap_or_default());
+                        pending_name.set(load_display_name_from_storage().unwrap_or_default());
                         show_change_name.set(true);
                         change_name_error.set(None);
                     },
@@ -564,7 +564,7 @@ pub fn Host(
                         let new_name = pending_name().trim().to_string();
                         match validate_display_name(&new_name) {
                             Ok(valid_name) => {
-                                save_username_to_storage(&valid_name);
+                                save_display_name_to_storage(&valid_name);
                                 if let Some(win) = web_sys::window() {
                                     let _ = win.location().reload();
                                 }
@@ -605,7 +605,7 @@ pub fn Host(
                                 let new_name = pending_name().trim().to_string();
                                 match validate_display_name(&new_name) {
                                     Ok(valid_name) => {
-                                        save_username_to_storage(&valid_name);
+                                        save_display_name_to_storage(&valid_name);
                                         if let Some(win) = web_sys::window() {
                                             let _ = win.location().reload();
                                         }

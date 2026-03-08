@@ -91,7 +91,7 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                 let obs_connected_on_lost = observer_connected.clone();
 
                 let opts = VideoCallClientOptions {
-                    userid: email.clone(),
+                    user_id: email.clone(),
                     meeting_id: meeting_id.clone(),
                     websocket_urls: observer_ws_urls,
                     webtransport_urls: observer_wt_urls,

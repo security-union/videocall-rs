@@ -38,10 +38,10 @@ pub fn generate_for_peer(
     is_speaking: bool,
     host_display_name: Option<&str>,
 ) -> Element {
-    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
-    let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
+    let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
+    let is_host = host_display_name.map(|h| h == peer_user_id).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
-    if !allowed.is_empty() && !allowed.contains(&peer_email) {
+    if !allowed.is_empty() && !allowed.contains(&peer_user_id) {
         return rsx! {};
     }
 
@@ -60,11 +60,11 @@ pub fn generate_for_peer(
         let div_id_pin = (*peer_video_div_id).clone();
         let canvas_id_crop = key.clone();
         let key_clone = key.clone();
-        let peer_email_display = peer_email.clone();
+        let peer_user_id_display = peer_user_id.clone();
         let title = if is_host {
-            format!("Host: {peer_email}")
+            format!("Host: {peer_user_id}")
         } else {
-            peer_email.clone()
+            peer_user_id.clone()
         };
         let full_bleed_class = if is_video_enabled_for_peer {
             format!("canvas-container video-on{speaking_class}")
@@ -98,7 +98,7 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{title}",
                         dir: "auto",
-                        "{peer_email_display}"
+                        "{peer_user_id_display}"
                         if is_host {
                             CrownIcon {}
                         }
@@ -133,17 +133,17 @@ pub fn generate_for_peer(
     let ss_div_mobile = (*screen_share_div_id).clone();
     let ss_div_pin = (*screen_share_div_id).clone();
     let ss_canvas_crop = format!("screen-share-{}", key);
-    let ss_name = format!("{}-screen", peer_email);
+    let ss_name = format!("{}-screen", peer_user_id);
 
     let pv_div_mobile = (*peer_video_div_id).clone();
     let pv_div_pin = (*peer_video_div_id).clone();
     let pv_canvas_crop = key.clone();
     let key_clone = key.clone();
-    let peer_email_grid = peer_email.clone();
+    let peer_user_id_grid = peer_user_id.clone();
     let title_grid = if is_host {
-        format!("Host: {peer_email}")
+        format!("Host: {peer_user_id}")
     } else {
-        peer_email.clone()
+        peer_user_id.clone()
     };
 
     rsx! {
@@ -209,7 +209,7 @@ pub fn generate_for_peer(
                             class: "floating-name",
                             title: "{title_grid}",
                             dir: "auto",
-                            "{peer_email_grid}"
+                            "{peer_user_id_grid}"
                             if is_host {
                                 CrownIcon {}
                             }

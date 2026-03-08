@@ -165,11 +165,11 @@ fn transform_audio_chunk(
 ) -> anyhow::Result<PacketWrapper> {
     Ok(PacketWrapper {
         packet_type: PacketType::MEDIA.into(),
-        email: email.clone(),
+        user_id: email.clone(),
         data: MediaPacket {
             media_type: MediaType::AUDIO.into(),
             data,
-            email,
+            user_id: email,
             frame_type: String::from("key"),
             timestamp: get_micros_now(),
             // TODO: Duration of the audio in microseconds.

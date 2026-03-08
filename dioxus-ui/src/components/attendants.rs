@@ -64,12 +64,12 @@ impl ScreenShareState {
 
 /// Build the WebSocket and WebTransport lobby URLs for the media server.
 #[allow(unused_variables)]
-fn build_lobby_urls(token: &str, email: &str, id: &str) -> (Vec<String>, Vec<String>) {
+fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<String>) {
     #[cfg(feature = "media-server-jwt-auth")]
     let lobby_url = |base: &str| format!("{base}/lobby?token={token}");
 
     #[cfg(not(feature = "media-server-jwt-auth"))]
-    let lobby_url = |base: &str| format!("{base}/lobby/{email}/{id}");
+    let lobby_url = |base: &str| format!("{base}/lobby/{user_id}/{id}");
 
     let websocket_urls = actix_websocket_base()
         .unwrap_or_default()
@@ -120,7 +120,7 @@ fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
 fn schedule_reconnect(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
     meeting_id: String,
-    email: String,
+    user_id: String,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
     attempt: u32,
@@ -140,7 +140,7 @@ fn schedule_reconnect(
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
-                    let (ws, wt) = build_lobby_urls(&new_token, &email, &meeting_id);
+                    let (ws, wt) = build_lobby_urls(&new_token, &user_id, &meeting_id);
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
                         if let Err(e) = client.connect() {
@@ -157,7 +157,7 @@ fn schedule_reconnect(
                     schedule_reconnect(
                         client_cell,
                         meeting_id,
-                        email,
+                        user_id,
                         connection_error,
                         meeting_ended_message,
                         attempt + 1,
@@ -213,7 +213,7 @@ fn schedule_reconnect_no_jwt(
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
-    #[props(default)] email: String,
+    #[props(default)] user_id: String,
     e2ee_enabled: bool,
     webtransport_enabled: bool,
     #[props(default)] user_name: Option<String>,
@@ -274,11 +274,11 @@ pub fn AttendantsComponent(
         #[cfg(not(feature = "media-server-jwt-auth"))]
         let token = String::new();
 
-        let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &email, &id);
+        let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &user_id, &id);
 
         log::info!(
             "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
-            email,
+            user_id,
             id
         );
 
@@ -286,7 +286,7 @@ pub fn AttendantsComponent(
             Rc::new(RefCell::new(None));
 
         let opts = VideoCallClientOptions {
-            userid: email.clone(),
+            user_id: user_id.clone(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -301,7 +301,7 @@ pub fn AttendantsComponent(
             }),
             on_connection_lost: {
                 let id = id.clone();
-                let email = email.clone();
+                let user_id = user_id.clone();
                 let client_cell = client_for_reconnect.clone();
                 VcCallback::from(move |_| {
                     log::warn!("DIOXUS-UI: Connection lost");
@@ -313,11 +313,11 @@ pub fn AttendantsComponent(
                     {
                         let client_cell = client_cell.clone();
                         let meeting_id = id.clone();
-                        let email = email.clone();
+                        let user_id = user_id.clone();
                         schedule_reconnect(
                             client_cell,
                             meeting_id,
-                            email,
+                            user_id,
                             connection_error,
                             meeting_ended_message,
                             0,
@@ -354,8 +354,8 @@ pub fn AttendantsComponent(
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
-            get_peer_video_canvas_id: VcCallback::from(|email| email),
-            get_peer_screen_canvas_id: VcCallback::from(|email| format!("screen-share-{}", &email)),
+            get_peer_video_canvas_id: VcCallback::from(|id| id),
+            get_peer_screen_canvas_id: VcCallback::from(|id| format!("screen-share-{}", &id)),
             enable_diagnostics: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
@@ -505,7 +505,7 @@ pub fn AttendantsComponent(
         .iter()
         .map(|session_id| {
             client
-                .get_peer_email(session_id)
+                .get_peer_user_id(session_id)
                 .unwrap_or_else(|| session_id.clone())
         })
         .collect();
@@ -523,7 +523,7 @@ pub fn AttendantsComponent(
     };
 
     let is_allowed = users_allowed_to_stream().unwrap_or_default();
-    let can_stream = is_allowed.is_empty() || is_allowed.iter().any(|host| host == &email);
+    let can_stream = is_allowed.is_empty() || is_allowed.iter().any(|host| host == &user_id);
 
     // --- Pre-join screen ---
     if !meeting_joined() {

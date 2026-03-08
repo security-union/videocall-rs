@@ -511,7 +511,7 @@ impl HealthReporter {
         let mut pb = PbHealthPacket::new();
         pb.session_id = session_id.to_string();
         pb.meeting_id = meeting_id.to_string();
-        pb.reporting_peer = reporting_peer.to_string();
+        pb.reporting_user_id = reporting_peer.to_string();
         pb.timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -628,7 +628,7 @@ impl HealthReporter {
         let bytes = pb.write_to_bytes().unwrap_or_default();
         Some(PacketWrapper {
             packet_type: PacketType::HEALTH.into(),
-            email: reporting_peer.to_string(),
+            user_id: reporting_peer.to_string(),
             data: bytes,
             ..Default::default()
         })

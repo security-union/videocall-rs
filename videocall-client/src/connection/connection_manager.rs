@@ -299,7 +299,7 @@ impl ConnectionManager {
             }
 
             // Handle RTT responses internally
-            if packet.email == userid {
+            if packet.user_id == userid {
                 let reception_time = js_sys::Date::now();
                 if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
@@ -410,7 +410,7 @@ impl ConnectionManager {
     fn create_rtt_packet(&self, timestamp: f64) -> Result<PacketWrapper> {
         let media_packet = MediaPacket {
             media_type: MediaType::RTT.into(),
-            email: self.options.userid.clone(),
+            user_id: self.options.userid.clone(),
             timestamp,
             ..Default::default()
         };
@@ -418,7 +418,7 @@ impl ConnectionManager {
         let data = self.aes.encrypt(&media_packet.write_to_bytes()?)?;
         Ok(PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
-            email: self.options.userid.clone(),
+            user_id: self.options.userid.clone(),
             data,
             ..Default::default()
         })

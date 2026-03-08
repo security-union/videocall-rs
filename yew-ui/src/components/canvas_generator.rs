@@ -39,7 +39,7 @@ pub fn generate_for_peer(
     is_speaking: bool,
     host_display_name: Option<&str>,
 ) -> Html {
-    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
+    let peer_email = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
 
     let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();

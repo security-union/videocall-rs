@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::SYSTEM_USER_EMAIL;
+use videocall_types::SYSTEM_USER_ID;
 
 use super::session_logic::{ConnectionState, SessionId};
 
@@ -267,8 +267,8 @@ impl Handler<JoinRoom> for ChatServer {
         // Validate user_id synchronously BEFORE spawning async task.
         // This ensures we return an error to the client if validation fails,
         // rather than returning Ok and silently failing in the spawned task.
-        if user_id == SYSTEM_USER_EMAIL {
-            return MessageResult(Err("Cannot use reserved system email as user ID".into()));
+        if user_id == SYSTEM_USER_ID {
+            return MessageResult(Err("Cannot use reserved system user ID".into()));
         }
 
         if self.active_subs.contains_key(&session) {
@@ -436,14 +436,14 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: JoinRoom rejects reserved system email synchronously
+    // TEST: JoinRoom rejects reserved system user ID synchronously
     // ==========================================================================
     // This test verifies the fix for the race condition where JoinRoom would
     // spawn an async task and immediately return Ok(()), even if validation
     // would fail inside the task. Now validation happens synchronously.
     #[actix_rt::test]
     #[serial]
-    async fn test_join_room_rejects_system_email_synchronously() {
+    async fn test_join_room_rejects_system_user_id_synchronously() {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
@@ -475,13 +475,13 @@ mod tests {
             .await
             .expect("Connect should succeed");
 
-        // Attempt to join with the reserved system email
+        // Attempt to join with the reserved system user ID
         // This should return an error SYNCHRONOUSLY (not Ok then fail async)
         let result = chat_server
             .send(JoinRoom {
                 session: session_id,
                 room: "test-room".to_string(),
-                user_id: SYSTEM_USER_EMAIL.to_string(),
+                user_id: SYSTEM_USER_ID.to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -489,13 +489,13 @@ mod tests {
         // The key assertion: JoinRoom should return Err immediately
         assert!(
             result.is_err(),
-            "JoinRoom with system email should return Err, not Ok"
+            "JoinRoom with system user ID should return Err, not Ok"
         );
 
         let error_msg = result.unwrap_err();
         assert!(
-            error_msg.contains("reserved system email"),
-            "Error should mention reserved system email, got: {error_msg}"
+            error_msg.contains("reserved system user ID"),
+            "Error should mention reserved system user ID, got: {error_msg}"
         );
     }
 
@@ -650,11 +650,11 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: Two clients with same email get unique session_id values
+    // TEST: Two clients with same user_id get unique session_id values
     // ==========================================================================
     #[actix_rt::test]
     #[serial]
-    async fn test_same_email_unique_session_ids() {
+    async fn test_same_user_id_unique_session_ids() {
         use crate::actors::session_logic::SessionLogic;
         use crate::server_diagnostics::{TrackerMessage, TrackerSender};
         use crate::session_manager::SessionManager;
@@ -672,14 +672,14 @@ mod tests {
         let tracker_sender: TrackerSender = tx;
         let session_manager = SessionManager::new();
 
-        // Create two sessions with the same email
-        let email = "same-user@example.com".to_string();
+        // Create two sessions with the same user_id
+        let user_id = "same-user@example.com".to_string();
         let room = "test-room-unique".to_string();
 
         let session1 = SessionLogic::new(
             chat_server.clone(),
             room.clone(),
-            email.clone(),
+            user_id.clone(),
             nats_client.clone(),
             tracker_sender.clone(),
             session_manager.clone(),
@@ -689,7 +689,7 @@ mod tests {
         let session2 = SessionLogic::new(
             chat_server.clone(),
             room.clone(),
-            email.clone(),
+            user_id.clone(),
             nats_client.clone(),
             tracker_sender.clone(),
             session_manager.clone(),
@@ -699,7 +699,7 @@ mod tests {
         // Verify they have different session IDs
         assert_ne!(
             session1.id, session2.id,
-            "Two sessions with same email should have different session_id values"
+            "Two sessions with same user_id should have different session_id values"
         );
         assert!(session1.id != 0, "Session ID should not be zero");
         assert!(session2.id != 0, "Session ID should not be zero");

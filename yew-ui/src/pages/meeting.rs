@@ -182,7 +182,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     .unwrap_or_else(|| display_name.clone());
 
                 let opts = VideoCallClientOptions {
-                    userid: email_for_userid,
+                    user_id: email_for_userid,
                     meeting_id: meeting_id.clone(),
                     websocket_urls: observer_ws_urls,
                     webtransport_urls: observer_wt_urls,
@@ -225,7 +225,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                         response.status,
                                         response.is_host
                                     );
-                                    current_user_email.set(Some(response.email.clone()));
+                                    current_user_email.set(Some(response.user_id.clone()));
                                     let determined_host = response.host_display_name.clone();
                                     host_display_name.set(determined_host.clone());
 
@@ -320,7 +320,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         );
 
                         // Store the current user's email from the response
-                        current_user_email.set(Some(response.email.clone()));
+                        current_user_email.set(Some(response.user_id.clone()));
 
                         // Get the host's display name from meeting info
                         let determined_host_display_name = if response.is_host {
@@ -492,7 +492,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 webtransport_enabled={webtransport_enabled().unwrap_or(false)}
                                 e2ee_enabled={e2ee_enabled().unwrap_or(false)}
                                 user_name={(*user_profile).as_ref().map(|p| p.name.clone())}
-                                user_email={(*current_user_email).clone().or_else(|| (*user_profile).as_ref().map(|p| p.email.clone()))}
+                                user_email={(*current_user_email).clone().or_else(|| (*user_profile).as_ref().map(|p| p.user_id.clone()))}
                                 on_logout={Some(on_logout.clone())}
                                 host_display_name={host_display_name.clone()}
                                 auto_join={should_auto_join}

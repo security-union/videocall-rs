@@ -28,8 +28,8 @@ message MeetingPacket {
   string message = 4;
   string creator_id = 5;
   int64 participant_count = 6;
-  // For ADMITTED/REJECTED: affected user's email
-  string target_email = 7;
+  // For ADMITTED/REJECTED: affected user's ID
+  string target_user_id = 7;
   // For ADMITTED: JWT to upgrade connection
   string room_token = 8;
 }

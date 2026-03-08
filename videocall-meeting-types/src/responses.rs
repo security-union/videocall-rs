@@ -140,7 +140,7 @@ pub struct MeetingSummary {
 /// are not applicable for a given status are set to `null`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ParticipantStatusResponse {
-    pub email: String,
+    pub user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub status: String,
@@ -189,6 +189,6 @@ pub struct DeleteMeetingResponse {
 /// Response payload for `GET /profile`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProfileResponse {
-    pub email: String,
+    pub user_id: String,
     pub name: String,
 }

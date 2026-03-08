@@ -28,7 +28,7 @@ const POLL_INTERVAL_MS: i32 = 5000;
 #[component]
 pub fn WaitingRoom(
     meeting_id: String,
-    email: String,
+    user_id: String,
     observer_token: String,
     on_admitted: EventHandler<ParticipantStatus>,
     on_rejected: EventHandler<()>,
@@ -48,7 +48,7 @@ pub fn WaitingRoom(
     {
         let observer_token = observer_token.clone();
         let meeting_id = meeting_id.clone();
-        let email = email.clone();
+        let user_id = user_id.clone();
         let observer_connected = observer_connected.clone();
         use_effect(move || {
             if observer_token.is_empty() {
@@ -76,7 +76,7 @@ pub fn WaitingRoom(
             let obs_conn_on_lost = observer_connected.clone();
 
             let opts = VideoCallClientOptions {
-                userid: email.clone(),
+                user_id: user_id.clone(),
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,

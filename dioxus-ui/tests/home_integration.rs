@@ -23,7 +23,7 @@ use web_sys::{Event, EventInit, HtmlButtonElement, HtmlInputElement};
 use dioxus::prelude::*;
 use dioxus_ui::components::config_error::ConfigError;
 use dioxus_ui::constants::app_config;
-use dioxus_ui::context::UsernameCtx;
+use dioxus_ui::context::DisplayNameCtx;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
@@ -47,7 +47,7 @@ fn bubbling_submit_event() -> Event {
 // ---------------------------------------------------------------------------
 
 /// Push the browser URL to "/" so that Router renders the Home route, then
-/// render the full app shell (UsernameCtx + Router) matching `main.rs`.
+/// render the full app shell (DisplayNameCtx + Router) matching `main.rs`.
 fn ensure_root_url() {
     let _ = gloo_utils::window().history().unwrap().push_state_with_url(
         &wasm_bindgen::JsValue::NULL,
@@ -56,11 +56,11 @@ fn ensure_root_url() {
     );
 }
 
-/// Full app wrapper: provides UsernameCtx then renders Router<Route>.
+/// Full app wrapper: provides DisplayNameCtx then renders Router<Route>.
 /// The Router picks the component based on the current URL (pushed to "/").
 fn home_wrapper_direct() -> Element {
     let username_signal = use_signal(|| None::<String>);
-    use_context_provider(|| UsernameCtx(username_signal));
+    use_context_provider(|| DisplayNameCtx(username_signal));
     match app_config() {
         Ok(_) => rsx! {
             Router::<dioxus_ui::routing::Route> {}
@@ -316,7 +316,7 @@ async fn home_normalizes_spaces_in_display_name() {
         .local_storage()
         .unwrap()
         .unwrap();
-    let saved = storage.get_item("vc_username").unwrap().unwrap();
+    let saved = storage.get_item("vc_display_name").unwrap().unwrap();
     assert_eq!(saved, "John Doe");
 
     cleanup(&mount);

@@ -22,7 +22,7 @@ use sqlx::PgPool;
 pub struct ParticipantRow {
     pub id: i32,
     pub meeting_id: i32,
-    pub email: String,
+    pub user_id: String,
     pub status: String,
     pub is_host: bool,
     pub is_required: bool,
@@ -35,7 +35,7 @@ pub struct ParticipantRow {
 }
 
 const PARTICIPANT_COLUMNS: &str = r#"
-    id, meeting_id, email, status, is_host, is_required,
+    id, meeting_id, user_id, status, is_host, is_required,
     joined_at, admitted_at, left_at, created_at, updated_at, display_name
 "#;
 
@@ -43,14 +43,14 @@ const PARTICIPANT_COLUMNS: &str = r#"
 pub async fn upsert_host(
     pool: &PgPool,
     meeting_id: i32,
-    email: &str,
+    user_id: &str,
     display_name: Option<&str>,
 ) -> Result<ParticipantRow, sqlx::Error> {
     let query = format!(
         r#"
-        INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name, admitted_at)
+        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
         VALUES ($1, $2, 'admitted', TRUE, $3, NOW())
-        ON CONFLICT (meeting_id, email)
+        ON CONFLICT (meeting_id, user_id)
         DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(), left_at = NULL,
                       display_name = COALESCE($3, meeting_participants.display_name)
         RETURNING {PARTICIPANT_COLUMNS}
@@ -58,7 +58,7 @@ pub async fn upsert_host(
     );
     sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
-        .bind(email)
+        .bind(user_id)
         .bind(display_name)
         .fetch_one(pool)
         .await
@@ -75,7 +75,7 @@ pub async fn upsert_host(
 pub async fn join_attendee(
     pool: &PgPool,
     meeting_id: i32,
-    email: &str,
+    user_id: &str,
     display_name: Option<&str>,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -90,9 +90,9 @@ pub async fn join_attendee(
     let row = if waiting_room_enabled {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name)
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name)
             VALUES ($1, $2, 'waiting', FALSE, $3)
-            ON CONFLICT (meeting_id, email)
+            ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'waiting', left_at = NULL,
                           display_name = COALESCE($3, meeting_participants.display_name)
             RETURNING {PARTICIPANT_COLUMNS}
@@ -100,16 +100,16 @@ pub async fn join_attendee(
         );
         sqlx::query_as::<_, ParticipantRow>(&query)
             .bind(meeting_id)
-            .bind(email)
+            .bind(user_id)
             .bind(display_name)
             .fetch_one(&mut *tx)
             .await?
     } else {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, email, status, is_host, display_name, admitted_at)
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
             VALUES ($1, $2, 'admitted', FALSE, $3, NOW())
-            ON CONFLICT (meeting_id, email)
+            ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
                           display_name = COALESCE($3, meeting_participants.display_name)
             RETURNING {PARTICIPANT_COLUMNS}
@@ -117,7 +117,7 @@ pub async fn join_attendee(
         );
         sqlx::query_as::<_, ParticipantRow>(&query)
             .bind(meeting_id)
-            .bind(email)
+            .bind(user_id)
             .bind(display_name)
             .fetch_one(&mut *tx)
             .await?
@@ -159,14 +159,14 @@ pub async fn get_admitted(
 pub async fn get_status(
     pool: &PgPool,
     meeting_id: i32,
-    email: &str,
+    user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
-        "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants WHERE meeting_id = $1 AND email = $2"
+        "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2"
     );
     sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
-        .bind(email)
+        .bind(user_id)
         .fetch_optional(pool)
         .await
 }
@@ -175,19 +175,19 @@ pub async fn get_status(
 pub async fn admit(
     pool: &PgPool,
     meeting_id: i32,
-    email: &str,
+    user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
         SET status = 'admitted', admitted_at = NOW()
-        WHERE meeting_id = $1 AND email = $2 AND status = 'waiting'
+        WHERE meeting_id = $1 AND user_id = $2 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
     sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
-        .bind(email)
+        .bind(user_id)
         .fetch_optional(pool)
         .await
 }
@@ -212,19 +212,19 @@ pub async fn admit_all(pool: &PgPool, meeting_id: i32) -> Result<Vec<Participant
 pub async fn reject(
     pool: &PgPool,
     meeting_id: i32,
-    email: &str,
+    user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
         SET status = 'rejected'
-        WHERE meeting_id = $1 AND email = $2 AND status = 'waiting'
+        WHERE meeting_id = $1 AND user_id = $2 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
     sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
-        .bind(email)
+        .bind(user_id)
         .fetch_optional(pool)
         .await
 }
@@ -233,19 +233,19 @@ pub async fn reject(
 pub async fn leave(
     pool: &PgPool,
     meeting_id: i32,
-    email: &str,
+    user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
         SET status = 'left', left_at = NOW()
-        WHERE meeting_id = $1 AND email = $2 AND status IN ('admitted', 'waiting')
+        WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
     sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
-        .bind(email)
+        .bind(user_id)
         .fetch_optional(pool)
         .await
 }
@@ -282,7 +282,7 @@ impl ParticipantRow {
         room_token: Option<String>,
     ) -> videocall_meeting_types::responses::ParticipantStatusResponse {
         videocall_meeting_types::responses::ParticipantStatusResponse {
-            email: self.email,
+            user_id: self.user_id,
             display_name: self.display_name,
             status: self.status,
             is_host: self.is_host,

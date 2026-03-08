@@ -8,9 +8,9 @@
 use dioxus::prelude::*;
 use videocall_client::VideoCallClient;
 
-/// Wrapper for the username signal used as context.
+/// Wrapper for the display name signal used as context.
 #[derive(Clone, Copy)]
-pub struct UsernameCtx(pub Signal<Option<String>>);
+pub struct DisplayNameCtx(pub Signal<Option<String>>);
 
 /// VideoCallClient context for sharing the client instance across components.
 pub type VideoCallClientCtx = VideoCallClient;
@@ -44,13 +44,13 @@ pub type PeerStatusMap = Signal<std::collections::HashMap<String, Signal<PeerMed
 #[derive(Clone, PartialEq, Default)]
 #[allow(dead_code)]
 pub struct MeetingHost {
-    pub host_email: Option<String>,
+    pub host_user_id: Option<String>,
 }
 
 impl MeetingHost {
     #[allow(dead_code)]
-    pub fn is_host(&self, email: &str) -> bool {
-        self.host_email.as_deref() == Some(email)
+    pub fn is_host(&self, user_id: &str) -> bool {
+        self.host_user_id.as_deref() == Some(user_id)
     }
 }
 
@@ -61,22 +61,22 @@ pub type MeetingHostCtx = Signal<MeetingHost>;
 // Local-storage helpers
 // ---------------------------------------------------------------------------
 
-const STORAGE_KEY: &str = "vc_username";
+const STORAGE_KEY: &str = "vc_display_name";
 
-pub fn load_username_from_storage() -> Option<String> {
+pub fn load_display_name_from_storage() -> Option<String> {
     web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
         .and_then(|storage| storage.get_item(STORAGE_KEY).ok().flatten())
 }
 
-pub fn save_username_to_storage(username: &str) {
+pub fn save_display_name_to_storage(display_name: &str) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.set_item(STORAGE_KEY, username);
+        let _ = storage.set_item(STORAGE_KEY, display_name);
     }
 }
 
-/// Remove the username from `localStorage` entirely (e.g. on logout).
-pub fn clear_username_from_storage() {
+/// Remove the display name from `localStorage` entirely (e.g. on logout).
+pub fn clear_display_name_from_storage() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item(STORAGE_KEY);
     }
@@ -87,5 +87,5 @@ pub fn clear_username_from_storage() {
 // ---------------------------------------------------------------------------
 
 pub use videocall_types::validation::{
-    email_to_display_name, is_valid_meeting_id, normalize_spaces, validate_display_name, DISPLAY_NAME_MAX_LEN,
+    email_to_display_name, is_valid_meeting_id, validate_display_name, DISPLAY_NAME_MAX_LEN,
 };

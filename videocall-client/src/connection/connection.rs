@@ -247,7 +247,7 @@ fn build_heartbeat_packet(
 
     let packet = MediaPacket {
         media_type: MediaType::HEARTBEAT.into(),
-        email: userid.to_owned(),
+        user_id: userid.to_owned(),
         timestamp: js_sys::Date::now(),
         heartbeat_metadata: Some(heartbeat_metadata).into(),
         ..Default::default()
@@ -271,7 +271,7 @@ fn build_heartbeat_packet(
         .ok()?;
     let mut packet_wrapper = PacketWrapper {
         data,
-        email: userid.to_owned(),
+        user_id: userid.to_owned(),
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     };

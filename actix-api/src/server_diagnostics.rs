@@ -35,7 +35,7 @@ use videocall_types::protos::server_connection_packet::{
 pub enum TrackerMessage {
     ConnectionStarted {
         session_id: u64,
-        customer_email: String,
+        user_id: String,
         meeting_id: String,
         protocol: String,
     },
@@ -64,13 +64,13 @@ pub type TrackerSender = mpsc::UnboundedSender<TrackerMessage>;
 pub fn send_connection_started(
     sender: &TrackerSender,
     session_id: u64,
-    customer_email: String,
+    user_id: String,
     meeting_id: String,
     protocol: String,
 ) {
     let _ = sender.send(TrackerMessage::ConnectionStarted {
         session_id,
-        customer_email,
+        user_id,
         meeting_id,
         protocol,
     });
@@ -109,7 +109,7 @@ impl DataTracker {
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
     pub session_id: u64,
-    pub customer_email: String,
+    pub user_id: String,
     pub meeting_id: String,
     pub protocol: String, // "websocket", "webtransport", "quic"
     pub start_time: Instant,
@@ -134,7 +134,7 @@ fn get_reporting_interval() -> Duration {
 #[derive(Debug)]
 pub struct ServerDiagnostics {
     connections: Mutex<HashMap<u64, ConnectionInfo>>,
-    // (customer_email, meeting_id) -> reconnection_count
+    // (user_id, meeting_id) -> reconnection_count
     reconnections: Mutex<HashMap<(String, String), u64>>,
     nats_client: Client,
     server_instance: String,
@@ -186,13 +186,13 @@ impl ServerDiagnostics {
     fn create_metadata(
         &self,
         session_id: u64,
-        customer_email: &str,
+        user_id: &str,
         meeting_id: &str,
         protocol: &str,
     ) -> ConnectionMetadata {
         let mut metadata = ConnectionMetadata::new();
         metadata.session_id = session_id.to_string();
-        metadata.customer_email = customer_email.to_string();
+        metadata.user_id = user_id.to_string();
         metadata.meeting_id = meeting_id.to_string();
         metadata.protocol = protocol.to_string();
         metadata.server_instance = self.server_instance.clone();
@@ -232,20 +232,20 @@ impl ServerDiagnostics {
     pub fn connection_started(
         &self,
         session_id: u64,
-        customer_email: String,
+        user_id: String,
         meeting_id: String,
         protocol: String,
     ) {
         let mut connections = self.connections.lock().unwrap();
         let mut reconnections = self.reconnections.lock().unwrap();
 
-        let key = (customer_email.clone(), meeting_id.clone());
+        let key = (user_id.clone(), meeting_id.clone());
         let is_reconnection = reconnections.contains_key(&key);
 
         if is_reconnection {
             info!(
                 "Reconnection detected for customer: {}, meeting: {}",
-                customer_email, meeting_id
+                user_id, meeting_id
             );
         }
         let count = reconnections.get(&key).unwrap_or(&0) + 1;
@@ -254,7 +254,7 @@ impl ServerDiagnostics {
         let now = Instant::now();
         let info = ConnectionInfo {
             session_id,
-            customer_email: customer_email.clone(),
+            user_id: user_id.clone(),
             meeting_id: meeting_id.clone(),
             protocol: protocol.clone(),
             start_time: now,
@@ -266,11 +266,11 @@ impl ServerDiagnostics {
 
         debug!(
             "Connection started: session={}, customer={}, meeting={}, protocol={}",
-            session_id, customer_email, meeting_id, protocol
+            session_id, user_id, meeting_id, protocol
         );
 
         // Publish connection started event
-        let metadata = self.create_metadata(session_id, &customer_email, &meeting_id, &protocol);
+        let metadata = self.create_metadata(session_id, &user_id, &meeting_id, &protocol);
         let mut packet = ServerConnectionPacket::new();
         packet.event_type = EventType::CONNECTION_STARTED.into();
         packet.timestamp_ms = Self::current_timestamp_ms();
@@ -311,13 +311,13 @@ impl ServerDiagnostics {
 
             debug!(
                 "Connection ended: session={}, customer={}, meeting={}, protocol={}, duration={}ms, sent={}B, received={}B",
-                info.session_id, info.customer_email, info.meeting_id, info.protocol, duration_ms, info.bytes_sent, info.bytes_received
+                info.session_id, info.user_id, info.meeting_id, info.protocol, duration_ms, info.bytes_sent, info.bytes_received
             );
 
             // Publish connection ended event
             let metadata = self.create_metadata(
                 info.session_id,
-                &info.customer_email,
+                &info.user_id,
                 &info.meeting_id,
                 &info.protocol,
             );
@@ -421,11 +421,11 @@ impl ServerDiagnostics {
         match msg {
             TrackerMessage::ConnectionStarted {
                 session_id,
-                customer_email,
+                user_id,
                 meeting_id,
                 protocol,
             } => {
-                self.connection_started(session_id, customer_email, meeting_id, protocol);
+                self.connection_started(session_id, user_id, meeting_id, protocol);
             }
             TrackerMessage::ConnectionEnded { session_id } => {
                 self.connection_ended(session_id);
@@ -453,7 +453,7 @@ impl ServerDiagnostics {
             if should_report {
                 let metadata = self.create_metadata(
                     info.session_id,
-                    &info.customer_email,
+                    &info.user_id,
                     &info.meeting_id,
                     &info.protocol,
                 );

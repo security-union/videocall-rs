@@ -213,7 +213,7 @@ impl Component for PeerList {
             .filter(|peer| {
                 // Resolve session_id to display name for search filtering
                 let display_name = if let Some(ref client) = client_ctx {
-                    client.get_peer_email(peer).unwrap_or_else(|| (*peer).clone())
+                    client.get_peer_user_id(peer).unwrap_or_else(|| (*peer).clone())
                 } else {
                     (*peer).clone()
                 };
@@ -336,7 +336,7 @@ impl Component for PeerList {
                                 { for filtered_peers.iter().map(|peer_id| {
                                     // peer_id is session_id, get email for display
                                     let display_name = if let Some(ref client) = client_ctx {
-                                        client.get_peer_email(peer_id).unwrap_or_else(|| peer_id.clone())
+                                        client.get_peer_user_id(peer_id).unwrap_or_else(|| peer_id.clone())
                                     } else {
                                         peer_id.clone()
                                     };

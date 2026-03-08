@@ -375,13 +375,13 @@ async fn test_admit_and_reject_work_with_nats_none() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"alice@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"alice@example.com"}"#))
     .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
     assert_eq!(body.result.status, "admitted");
-    assert_eq!(body.result.email, "alice@example.com");
+    assert_eq!(body.result.user_id, "alice@example.com");
 
     // Reject bob.
     let app = build_app(pool.clone());
@@ -391,13 +391,13 @@ async fn test_admit_and_reject_work_with_nats_none() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"bob@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"bob@example.com"}"#))
     .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
     assert_eq!(body.result.status, "rejected");
-    assert_eq!(body.result.email, "bob@example.com");
+    assert_eq!(body.result.user_id, "bob@example.com");
 
     // Waiting room should now be empty.
     let app = build_app(pool.clone());

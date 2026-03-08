@@ -283,7 +283,7 @@ impl AttendantsComponent {
         log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
 
         let opts = VideoCallClientOptions {
-            userid: email.clone(),
+            user_id: email.clone(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,

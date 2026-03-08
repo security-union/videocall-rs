@@ -209,7 +209,7 @@ async fn update_connection_with_timestamp(
 
     debug!(
         "Updating connection timestamp for server: {} with data from {}@{} via {}",
-        conn.server_instance, conn.customer_email, conn.meeting_id, conn.protocol
+        conn.server_instance, conn.user_id, conn.meeting_id, conn.protocol
     );
 
     let mut snapshots_guard = snapshots.lock().unwrap();
@@ -235,7 +235,7 @@ async fn update_connection_with_timestamp(
         "{}_{}_{}_{}_{}_{}",
         conn.session_id,
         conn.protocol,
-        conn.customer_email,
+        conn.user_id,
         conn.meeting_id,
         conn.server_instance,
         conn.region
@@ -250,7 +250,7 @@ async fn update_connection_with_timestamp(
 
     let user_key = format!(
         "{}@{}_{}",
-        conn.customer_email, conn.meeting_id, conn.region
+        conn.user_id, conn.meeting_id, conn.region
     );
     snapshot.unique_users.insert(
         user_key,
@@ -267,7 +267,7 @@ async fn update_connection_with_timestamp(
                 "sent_{}_{}_{}_{}_{}_{}",
                 conn.session_id,
                 conn.protocol,
-                conn.customer_email,
+                conn.user_id,
                 conn.meeting_id,
                 conn.server_instance,
                 conn.region
@@ -285,7 +285,7 @@ async fn update_connection_with_timestamp(
                 "received_{}_{}_{}_{}_{}_{}",
                 conn.session_id,
                 conn.protocol,
-                conn.customer_email,
+                conn.user_id,
                 conn.meeting_id,
                 conn.server_instance,
                 conn.region

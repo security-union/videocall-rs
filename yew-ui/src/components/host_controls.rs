@@ -137,7 +137,7 @@ impl Component for HostControls {
                 });
 
                 // Remove from local list immediately for responsiveness
-                self.waiting.retain(|p| p.email != email);
+                self.waiting.retain(|p| p.user_id != email);
                 true
             }
             HostControlsMsg::AdmitAll => {
@@ -168,7 +168,7 @@ impl Component for HostControls {
                 });
 
                 // Remove from local list immediately for responsiveness
-                self.waiting.retain(|p| p.email != email);
+                self.waiting.retain(|p| p.user_id != email);
                 true
             }
             HostControlsMsg::ActionComplete => {
@@ -242,7 +242,7 @@ impl Component for HostControls {
                                     }
                                 }
                                 { for self.waiting.iter().map(|participant| {
-                                    let email = participant.email.clone();
+                                    let email = participant.user_id.clone();
                                     let email_for_admit = email.clone();
                                     let email_for_reject = email.clone();
 

@@ -72,6 +72,7 @@ pub fn WaitingRoom(
                 .collect();
 
             let meeting_id_for_fetch = meeting_id.clone();
+            let meeting_id_for_post_connect = meeting_id.clone();
             let obs_conn_on_connect = observer_connected.clone();
             let obs_conn_on_lost = observer_connected.clone();
 
@@ -85,6 +86,31 @@ pub fn WaitingRoom(
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting room)");
                     obs_conn_on_connect.set(true);
+                    // Poll once immediately after connection is established.
+                    // This catches admissions that occurred during the WebSocket
+                    // handshake window (NATS event already published but observer
+                    // wasn't subscribed yet).
+                    let mid = meeting_id_for_post_connect.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match check_status(&mid).await {
+                            Ok(status) => match status.status.as_str() {
+                                "admitted" if status.room_token.is_some() => {
+                                    log::info!("Post-connect poll: participant already admitted");
+                                    on_admitted.call(status);
+                                }
+                                "rejected" => {
+                                    log::info!("Post-connect poll: participant rejected");
+                                    on_rejected.call(());
+                                }
+                                other => {
+                                    log::debug!("Post-connect poll: status={other}, waiting for push");
+                                }
+                            },
+                            Err(e) => {
+                                log::warn!("Post-connect poll: status check failed: {e}");
+                            }
+                        }
+                    });
                 }),
                 on_connection_lost: VcCallback::from(move |_| {
                     log::warn!("Observer connection lost (waiting room); polling fallback will activate");
@@ -179,6 +205,33 @@ pub fn WaitingRoom(
             };
 
             log::info!("WaitingRoom: starting polling fallback timer (every {POLL_INTERVAL_MS}ms, skips when observer connected)");
+
+            // Poll once immediately on mount to catch admissions that
+            // occurred before any connection was established (host admitted
+            // during the join -> connect gap).
+            {
+                let meeting_id = meeting_id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match check_status(&meeting_id).await {
+                        Ok(status) => match status.status.as_str() {
+                            "admitted" if status.room_token.is_some() => {
+                                log::info!("Immediate mount poll: participant already admitted");
+                                on_admitted.call(status);
+                            }
+                            "rejected" => {
+                                log::info!("Immediate mount poll: participant rejected");
+                                on_rejected.call(());
+                            }
+                            other => {
+                                log::debug!("Immediate mount poll: status={other}, will continue polling");
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("Immediate mount poll: status check failed: {e}");
+                        }
+                    }
+                });
+            }
 
             let meeting_id = meeting_id.clone();
             let observer_connected = observer_connected.clone();

@@ -31,7 +31,7 @@ use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
-    load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
+    load_display_name_from_storage, save_display_name_to_storage, VideoCallClientCtx,
     validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
 
@@ -357,7 +357,7 @@ impl Component for Host {
             }
             Msg::ToggleChangeNameModal => {
                 if !self.show_change_name {
-                    let stored = load_username_from_storage().unwrap_or_default();
+                    let stored = load_display_name_from_storage().unwrap_or_default();
                     match validate_display_name(&stored) {
                         Ok(v) => {
                             self.pending_name = v;
@@ -394,7 +394,7 @@ impl Component for Host {
                     Ok(valid_name) => {
                         self.pending_name = valid_name.clone();
 
-                        save_username_to_storage(&valid_name);
+                        save_display_name_to_storage(&valid_name);
 
                         // Force a soft reload so meeting picks up new name
                         if let Some(win) = web_sys::window() {

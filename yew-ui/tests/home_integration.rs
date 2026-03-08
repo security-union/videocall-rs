@@ -26,7 +26,7 @@ use yew_router::prelude::*;
 
 use videocall_ui::components::config_error::ConfigError;
 use videocall_ui::constants::app_config;
-use videocall_ui::context::UsernameCtx;
+use videocall_ui::context::DisplayNameCtx;
 use videocall_ui::pages::home::Home;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -56,17 +56,17 @@ use web_sys::{Event, EventInit, HtmlButtonElement, HtmlInputElement};
 /// function in `main.rs`, just without the full router.
 #[function_component(HomeTestWrapper)]
 fn home_test_wrapper() -> Html {
-    let username_state = use_state(|| None::<String>);
+    let display_name_state = use_state(|| None::<String>);
     let inner = match app_config() {
         Ok(_) => html! { <Home /> },
         Err(e) => html! { <ConfigError message={e} /> },
     };
     html! {
-        <ContextProvider<UsernameCtx> context={username_state.clone()}>
+        <ContextProvider<DisplayNameCtx> context={display_name_state.clone()}>
             <BrowserRouter>
                 { inner }
             </BrowserRouter>
-        </ContextProvider<UsernameCtx>>
+        </ContextProvider<DisplayNameCtx>>
     }
 }
 

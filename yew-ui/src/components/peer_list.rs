@@ -18,7 +18,7 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::{UsernameCtx, VideoCallClientCtx};
+use crate::context::{DisplayNameCtx, VideoCallClientCtx};
 use futures::future::{AbortHandle, Abortable};
 use std::collections::HashMap;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
@@ -236,7 +236,7 @@ impl Component for PeerList {
         // Get username from context and append (You)
         let current_user_name: Option<String> = ctx
             .link()
-            .context::<UsernameCtx>(Callback::noop())
+            .context::<DisplayNameCtx>(Callback::noop())
             .and_then(|(state, _handle)| state.as_ref().cloned());
 
         let display_name = current_user_name

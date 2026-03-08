@@ -37,9 +37,9 @@ const POLL_INTERVAL_MS: i32 = 5000;
 #[derive(Properties, Clone, PartialEq)]
 pub struct WaitingRoomProps {
     pub meeting_id: String,
-    /// The authenticated user's email, used as the observer `userid` so
-    /// the server can match push-notification `target_email` to this client.
-    pub email: String,
+    /// The authenticated user's ID, used as the observer `userid` so
+    /// the server can match push notifications to this client.
+    pub user_id: String,
     /// Observer JWT token for receiving push notifications.
     #[prop_or_default]
     pub observer_token: Option<String>,
@@ -64,7 +64,7 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
     {
         let observer_token = props.observer_token.clone();
         let meeting_id = props.meeting_id.clone();
-        let email = props.email.clone();
+        let user_id = props.user_id.clone();
         let on_admitted = props.on_admitted.clone();
         let on_rejected = props.on_rejected.clone();
         let observer_connected = observer_connected.clone();
@@ -91,7 +91,7 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                 let obs_connected_on_lost = observer_connected.clone();
 
                 let opts = VideoCallClientOptions {
-                    user_id: email.clone(),
+                    user_id: user_id.clone(),
                     meeting_id: meeting_id.clone(),
                     websocket_urls: observer_ws_urls,
                     webtransport_urls: observer_wt_urls,

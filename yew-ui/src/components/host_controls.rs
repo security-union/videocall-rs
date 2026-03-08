@@ -124,20 +124,20 @@ impl Component for HostControls {
                 self.error = Some(error);
                 true
             }
-            HostControlsMsg::Admit(email) => {
+            HostControlsMsg::Admit(peer_user_id) => {
                 let meeting_id = ctx.props().meeting_id.clone();
                 let link = ctx.link().clone();
-                let email_for_api = email.clone();
+                let user_id_for_admit = peer_user_id.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    match admit_participant(&meeting_id, &email_for_api).await {
+                    match admit_participant(&meeting_id, &user_id_for_admit).await {
                         Ok(_) => link.send_message(HostControlsMsg::ActionComplete),
                         Err(e) => link.send_message(HostControlsMsg::ActionError(e)),
                     }
                 });
 
                 // Remove from local list immediately for responsiveness
-                self.waiting.retain(|p| p.user_id != email);
+                self.waiting.retain(|p| p.user_id != peer_user_id);
                 true
             }
             HostControlsMsg::AdmitAll => {
@@ -155,20 +155,20 @@ impl Component for HostControls {
                 self.waiting.clear();
                 true
             }
-            HostControlsMsg::Reject(email) => {
+            HostControlsMsg::Reject(peer_user_id) => {
                 let meeting_id = ctx.props().meeting_id.clone();
                 let link = ctx.link().clone();
-                let email_for_api = email.clone();
+                let user_id_for_reject = peer_user_id.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    match reject_participant(&meeting_id, &email_for_api).await {
+                    match reject_participant(&meeting_id, &user_id_for_reject).await {
                         Ok(_) => link.send_message(HostControlsMsg::ActionComplete),
                         Err(e) => link.send_message(HostControlsMsg::ActionError(e)),
                     }
                 });
 
                 // Remove from local list immediately for responsiveness
-                self.waiting.retain(|p| p.user_id != email);
+                self.waiting.retain(|p| p.user_id != peer_user_id);
                 true
             }
             HostControlsMsg::ActionComplete => {
@@ -242,20 +242,20 @@ impl Component for HostControls {
                                     }
                                 }
                                 { for self.waiting.iter().map(|participant| {
-                                    let email = participant.user_id.clone();
-                                    let email_for_admit = email.clone();
-                                    let email_for_reject = email.clone();
+                                    let peer_user_id = participant.user_id.clone();
+                                    let user_id_for_admit = peer_user_id.clone();
+                                    let user_id_for_reject = peer_user_id.clone();
 
                                     let on_admit = ctx.link().callback(move |_| {
-                                        HostControlsMsg::Admit(email_for_admit.clone())
+                                        HostControlsMsg::Admit(user_id_for_admit.clone())
                                     });
                                     let on_reject = ctx.link().callback(move |_| {
-                                        HostControlsMsg::Reject(email_for_reject.clone())
+                                        HostControlsMsg::Reject(user_id_for_reject.clone())
                                     });
 
                                     html! {
                                         <div class="waiting-participant">
-                                            <span class="participant-email">{&email}</span>
+                                            <span class="participant-email">{&peer_user_id}</span>
                                             <div class="participant-actions">
                                                 <button
                                                     class="btn-admit"
@@ -300,19 +300,19 @@ async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, Stri
     }
 }
 
-async fn admit_participant(meeting_id: &str, email: &str) -> Result<(), String> {
+async fn admit_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     client
-        .admit_participant(meeting_id, email)
+        .admit_participant(meeting_id, user_id)
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))
 }
 
-async fn reject_participant(meeting_id: &str, email: &str) -> Result<(), String> {
+async fn reject_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     client
-        .reject_participant(meeting_id, email)
+        .reject_participant(meeting_id, user_id)
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))

@@ -150,7 +150,7 @@ pub struct AttendantsComponentProps {
     pub id: String,
 
     #[prop_or_default]
-    pub email: String,
+    pub display_name: String,
 
     pub e2ee_enabled: bool,
 
@@ -160,7 +160,7 @@ pub struct AttendantsComponentProps {
     pub user_name: Option<String>,
 
     #[prop_or_default]
-    pub user_email: Option<String>,
+    pub user_id: Option<String>,
 
     #[prop_or_default]
     pub on_logout: Option<Callback<()>>,
@@ -226,14 +226,14 @@ impl AttendantsComponent {
     /// Build the WebSocket and WebTransport lobby URLs for the media server.
     ///
     /// When `media-server-jwt-auth` is enabled, the token is embedded as a query
-    /// parameter. When disabled, the legacy `/{email}/{room}` path is used.
+    /// parameter. When disabled, the legacy `/{user_id}/{room}` path is used.
     #[allow(unused_variables)]
-    fn build_lobby_urls(token: &str, email: &str, id: &str) -> (Vec<String>, Vec<String>) {
+    fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<String>) {
         #[cfg(feature = "media-server-jwt-auth")]
         let lobby_url = |base: &str| format!("{base}/lobby?token={token}");
 
         #[cfg(not(feature = "media-server-jwt-auth"))]
-        let lobby_url = |base: &str| format!("{base}/lobby/{email}/{id}");
+        let lobby_url = |base: &str| format!("{base}/lobby/{user_id}/{id}");
 
         let websocket_urls = actix_websocket_base()
             .unwrap_or_default()
@@ -250,7 +250,7 @@ impl AttendantsComponent {
     }
 
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
-        let email = ctx.props().email.clone();
+        let display_name = ctx.props().display_name.clone();
         let id = ctx.props().id.clone();
 
         #[cfg(feature = "media-server-jwt-auth")]
@@ -267,11 +267,11 @@ impl AttendantsComponent {
         #[cfg(not(feature = "media-server-jwt-auth"))]
         let token = String::new();
 
-        let (websocket_urls, webtransport_urls) = Self::build_lobby_urls(&token, &email, &id);
+        let (websocket_urls, webtransport_urls) = Self::build_lobby_urls(&token, &display_name, &id);
 
         log::info!(
             "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}, jwt_auth={}",
-            email,
+            display_name,
             id,
             ctx.props().webtransport_enabled,
             cfg!(feature = "media-server-jwt-auth"),
@@ -283,7 +283,7 @@ impl AttendantsComponent {
         log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
 
         let opts = VideoCallClientOptions {
-            user_id: email.clone(),
+            user_id: display_name.clone(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -311,12 +311,12 @@ impl AttendantsComponent {
             },
             on_peer_added: {
                 let link = ctx.link().clone();
-                VcCallback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
+                VcCallback::from(move |peer_id| link.send_message(Msg::OnPeerAdded(peer_id)))
             },
             on_peer_first_frame: {
                 let link = ctx.link().clone();
-                VcCallback::from(move |(email, media_type)| {
-                    link.send_message(Msg::OnFirstFrame((email, media_type)))
+                VcCallback::from(move |(peer_id, media_type)| {
+                    link.send_message(Msg::OnFirstFrame((peer_id, media_type)))
                 })
             },
             on_peer_removed: Some({
@@ -690,8 +690,8 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(email) => {
-                log::info!("New user joined: {email}");
+            Msg::OnPeerAdded(peer_id) => {
+                log::info!("New user joined: {peer_id}");
                 Self::play_user_joined();
 
                 true
@@ -699,7 +699,7 @@ impl Component for AttendantsComponent {
             Msg::OnPeerRemoved(_peer_id) => {
                 true
             }
-            Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
+            Msg::OnFirstFrame((_peer_id, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::OnMicrophoneError(err) => {
                 log::error!("Microphone error (full): {err}");
                 self.mic_enabled = false;
@@ -891,7 +891,7 @@ impl Component for AttendantsComponent {
                 self.error = None;
                 self.reconnect_attempt = 0;
                 let (ws_urls, wt_urls) =
-                    Self::build_lobby_urls(&new_token, &ctx.props().email, &ctx.props().id);
+                    Self::build_lobby_urls(&new_token, &ctx.props().display_name, &ctx.props().id);
                 self.client.update_server_urls(ws_urls, wt_urls);
                 if let Err(e) = self.client.connect() {
                     ctx.link().send_message(WsAction::Log(format!(
@@ -922,7 +922,7 @@ impl Component for AttendantsComponent {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let email = ctx.props().email.clone();
+        let display_name = ctx.props().display_name.clone();
         let media_access_granted = self.media_device_access.is_granted();
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
@@ -1072,7 +1072,7 @@ impl Component for AttendantsComponent {
                     }
 
                     {
-                        if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty() {
+                        if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &display_name) || users_allowed_to_stream().unwrap_or_default().is_empty() {
                             html! {
                                 <nav class="host">
                                     <div class="controls">

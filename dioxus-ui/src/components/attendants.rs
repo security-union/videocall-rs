@@ -120,7 +120,7 @@ fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
 fn schedule_reconnect(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
     meeting_id: String,
-    user_id: String,
+    display_name: String,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
     attempt: u32,
@@ -140,7 +140,7 @@ fn schedule_reconnect(
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
-                    let (ws, wt) = build_lobby_urls(&new_token, &user_id, &meeting_id);
+                    let (ws, wt) = build_lobby_urls(&new_token, &display_name, &meeting_id);
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
                         if let Err(e) = client.connect() {
@@ -157,7 +157,7 @@ fn schedule_reconnect(
                     schedule_reconnect(
                         client_cell,
                         meeting_id,
-                        user_id,
+                        display_name,
                         connection_error,
                         meeting_ended_message,
                         attempt + 1,
@@ -213,11 +213,11 @@ fn schedule_reconnect_no_jwt(
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
-    #[props(default)] user_id: String,
+    #[props(default)] display_name: String,
     e2ee_enabled: bool,
     webtransport_enabled: bool,
     #[props(default)] user_name: Option<String>,
-    #[props(default)] user_email: Option<String>,
+    #[props(default)] user_id: Option<String>,
     #[props(default)] on_logout: Option<EventHandler<()>>,
     #[props(default)] host_display_name: Option<String>,
     #[props(default)] auto_join: bool,
@@ -274,11 +274,11 @@ pub fn AttendantsComponent(
         #[cfg(not(feature = "media-server-jwt-auth"))]
         let token = String::new();
 
-        let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &user_id, &id);
+        let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &display_name, &id);
 
         log::info!(
             "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
-            user_id,
+            display_name,
             id
         );
 
@@ -286,7 +286,7 @@ pub fn AttendantsComponent(
             Rc::new(RefCell::new(None));
 
         let opts = VideoCallClientOptions {
-            user_id: user_id.clone(),
+            user_id: display_name.clone(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -301,7 +301,7 @@ pub fn AttendantsComponent(
             }),
             on_connection_lost: {
                 let id = id.clone();
-                let user_id = user_id.clone();
+                let display_name = display_name.clone();
                 let client_cell = client_for_reconnect.clone();
                 VcCallback::from(move |_| {
                     log::warn!("DIOXUS-UI: Connection lost");
@@ -313,11 +313,11 @@ pub fn AttendantsComponent(
                     {
                         let client_cell = client_cell.clone();
                         let meeting_id = id.clone();
-                        let user_id = user_id.clone();
+                        let display_name = display_name.clone();
                         schedule_reconnect(
                             client_cell,
                             meeting_id,
-                            user_id,
+                            display_name,
                             connection_error,
                             meeting_ended_message,
                             0,
@@ -523,7 +523,7 @@ pub fn AttendantsComponent(
     };
 
     let is_allowed = users_allowed_to_stream().unwrap_or_default();
-    let can_stream = is_allowed.is_empty() || is_allowed.iter().any(|host| host == &user_id);
+    let can_stream = is_allowed.is_empty() || is_allowed.iter().any(|host| host == &display_name);
 
     // --- Pre-join screen ---
     if !meeting_joined() {

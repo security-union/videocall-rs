@@ -455,12 +455,12 @@ pub fn MeetingPage(id: String) -> Element {
             // User is admitted - show the meeting
             (Some(username), MeetingStatus::Admitted { is_host, host_display_name, room_token, waiting_room_enabled }) => rsx! {
                 AttendantsComponent {
-                    user_id: username.clone(),
+                    display_name: username.clone(),
                     id: id.clone(),
                     webtransport_enabled: webtransport_enabled().unwrap_or(false),
                     e2ee_enabled: e2ee_enabled().unwrap_or(false),
                     user_name: user_profile().as_ref().map(|p| p.name.clone()),
-                    user_email: current_user_id()
+                    user_id: current_user_id()
                         .or_else(|| user_profile().as_ref().map(|p| p.user_id.clone()))
                         .or_else(|| Some(get_or_create_local_user_id())),
                     on_logout: Some(EventHandler::new(on_logout)),

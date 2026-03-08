@@ -3,20 +3,34 @@
  * Licensed under MIT OR Apache-2.0
  */
 
-//! Host Controls component - allows admitted participants to admit/reject waiting participants
+//! Host Controls component - allows admitted participants to admit/reject waiting participants.
+//!
+//! Instead of polling every 3 seconds, this component receives a
+//! `waiting_room_version` counter from the parent that is incremented
+//! whenever the `on_waiting_room_updated` push event fires on the main
+//! `VideoCallClient`. The `use_effect` reacts to changes in this counter
+//! and fetches the waiting room list once per notification.
 
 use crate::constants::meeting_api_client;
 use dioxus::prelude::*;
-use gloo_timers::future::TimeoutFuture;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
+use web_sys::HtmlAudioElement;
 
 pub type WaitingParticipant = ParticipantStatusResponse;
 
 #[component]
-pub fn HostControls(meeting_id: String, is_admitted: bool) -> Element {
+pub fn HostControls(
+    meeting_id: String,
+    is_admitted: bool,
+    /// Counter incremented by the parent whenever a `on_waiting_room_updated`
+    /// push event is received. The component fetches the waiting list each
+    /// time this value changes.
+    waiting_room_version: Signal<u64>,
+) -> Element {
     let mut waiting = use_signal(Vec::<WaitingParticipant>::new);
     let mut error = use_signal(|| None::<String>);
     let mut expanded = use_signal(|| true);
+    let mut prev_waiting_count = use_signal(|| 0usize);
 
     let fetch_waiting_list = {
         let meeting_id = meeting_id.clone();
@@ -40,29 +54,33 @@ pub fn HostControls(meeting_id: String, is_admitted: bool) -> Element {
         }
     };
 
-    // Start polling when admitted using a spawned async loop (not Interval callback,
-    // which runs outside the Dioxus scope and causes spawn() to panic).
+    // Fetch on mount and whenever waiting_room_version changes (push notification).
     {
         let meeting_id = meeting_id.clone();
         use_effect(move || {
+            // Read the version so Dioxus tracks it as a reactive dependency.
+            let _version = waiting_room_version();
             if !is_admitted {
                 return;
             }
 
             let meeting_id = meeting_id.clone();
             spawn(async move {
-                loop {
-                    match fetch_waiting(&meeting_id).await {
-                        Ok(w) => {
-                            waiting.set(w);
-                            error.set(None);
+                match fetch_waiting(&meeting_id).await {
+                    Ok(w) => {
+                        let new_count = w.len();
+                        let old_count = *prev_waiting_count.peek();
+                        if new_count > old_count {
+                            play_knock_sound();
                         }
-                        Err(e) => {
-                            log::warn!("Failed to fetch waiting room: {e}");
-                            error.set(Some(e));
-                        }
+                        prev_waiting_count.set(new_count);
+                        waiting.set(w);
+                        error.set(None);
                     }
-                    TimeoutFuture::new(3_000).await;
+                    Err(e) => {
+                        log::warn!("Failed to fetch waiting room: {e}");
+                        error.set(Some(e));
+                    }
                 }
             });
         });
@@ -195,6 +213,15 @@ pub fn HostControls(meeting_id: String, is_admitted: bool) -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+fn play_knock_sound() {
+    if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/knock.wav") {
+        audio.set_volume(0.5);
+        if let Err(e) = audio.play() {
+            log::warn!("Failed to play knock sound: {e:?}");
         }
     }
 }

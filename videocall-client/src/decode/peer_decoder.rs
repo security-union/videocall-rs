@@ -221,6 +221,23 @@ impl VideoPeerDecoder {
     pub fn flush(&self) {
         self.decoder.flush()
     }
+
+    /// No-op decoder for unit tests — avoids requiring WebCodecs / worker link tags.
+    #[cfg(test)]
+    pub(crate) fn noop() -> Self {
+        struct NoopDecoder;
+        impl VideoFrameDecoder for NoopDecoder {
+            fn push_frame(&self, _: FrameBuffer) {}
+            fn is_waiting_for_keyframe(&self) -> bool {
+                true
+            }
+            fn flush(&self) {}
+        }
+        Self {
+            decoder: Box::new(NoopDecoder),
+            canvas_renderer: Rc::new(RefCell::new(None)),
+        }
+    }
 }
 
 impl PeerDecode for VideoPeerDecoder {

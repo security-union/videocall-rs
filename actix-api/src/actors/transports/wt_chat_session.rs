@@ -93,6 +93,7 @@ pub struct WtChatSession {
 }
 
 impl WtChatSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: Addr<ChatServer>,
         room: String,
@@ -101,6 +102,7 @@ impl WtChatSession {
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
+        observer: bool,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -109,6 +111,7 @@ impl WtChatSession {
             nats_client,
             tracker_sender,
             session_manager,
+            observer,
         );
 
         WtChatSession {

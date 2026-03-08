@@ -60,7 +60,13 @@ pub struct RuntimeConfig {
     pub video_bitrate_kbps: u32,
     #[serde(rename = "screenBitrateKbps")]
     pub screen_bitrate_kbps: u32,
+    #[serde(rename = "vadThreshold", default = "default_vad_threshold")]
+    pub vad_threshold: f32,
     // ui_url intentionally omitted; unused by the UI
+}
+
+fn default_vad_threshold() -> f32 {
+    0.02
 }
 
 pub fn app_config() -> Result<RuntimeConfig, String> {
@@ -85,6 +91,9 @@ pub fn video_bitrate_kbps() -> Result<u32, String> {
 }
 pub fn screen_bitrate_kbps() -> Result<u32, String> {
     app_config().map(|c| c.screen_bitrate_kbps)
+}
+pub fn vad_threshold() -> Result<f32, String> {
+    app_config().map(|c| c.vad_threshold)
 }
 
 pub fn split_users(s: Option<&str>) -> Vec<String> {

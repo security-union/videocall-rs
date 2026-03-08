@@ -101,6 +101,32 @@ pub fn inject_app_config() {
     set("audioBitrateKbps", &wasm_bindgen::JsValue::from(65));
     set("videoBitrateKbps", &wasm_bindgen::JsValue::from(100));
     set("screenBitrateKbps", &wasm_bindgen::JsValue::from(100));
+    set("vadThreshold", &wasm_bindgen::JsValue::from(0.02));
+
+    let frozen = js_sys::Object::freeze(&config);
+    let window = gloo_utils::window();
+    js_sys::Reflect::set(&window, &"__APP_CONFIG".into(), &frozen).unwrap();
+}
+
+/// Inject a `window.__APP_CONFIG` with a custom VAD threshold.
+pub fn inject_app_config_with_vad_threshold(threshold: f32) {
+    let config = js_sys::Object::new();
+    let set = |key: &str, val: &wasm_bindgen::JsValue| {
+        js_sys::Reflect::set(&config, &key.into(), val).unwrap();
+    };
+    set("apiBaseUrl", &"http://test:8080".into());
+    set("wsUrl", &"ws://test:8080".into());
+    set("webTransportHost", &"https://test:4433".into());
+    set("oauthEnabled", &"false".into());
+    set("e2eeEnabled", &"false".into());
+    set("webTransportEnabled", &"false".into());
+    set("firefoxEnabled", &"false".into());
+    set("usersAllowedToStream", &"".into());
+    set("serverElectionPeriodMs", &wasm_bindgen::JsValue::from(2000));
+    set("audioBitrateKbps", &wasm_bindgen::JsValue::from(65));
+    set("videoBitrateKbps", &wasm_bindgen::JsValue::from(100));
+    set("screenBitrateKbps", &wasm_bindgen::JsValue::from(100));
+    set("vadThreshold", &wasm_bindgen::JsValue::from(threshold));
 
     let frozen = js_sys::Object::freeze(&config);
     let window = gloo_utils::window();

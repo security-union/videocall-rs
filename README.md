@@ -49,6 +49,7 @@ An open-source, ultra-low-latency video conferencing platform and API built with
 - [Testing](#testing)
   - [UI Testing (yew-ui)](#ui-testing-yew-ui)
   - [Backend Testing (actix-api)](#backend-testing-actix-api)
+  - [E2E Testing (Playwright)](#e2e-testing-playwright)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [Project Structure](#project-structure)
@@ -259,6 +260,26 @@ The Yew UI is configured at runtime via a `window.__APP_CONFIG` object provided 
 - Tip: `mkdir -p yew-ui/scripts` to ensure the directory exists.
 
 Authoritative keys and defaults: see `docker/start-yew.sh` and the Helm template referenced below.
+
+### Voice Activity Detection (VAD) Threshold
+
+The `vadThreshold` config parameter controls how sensitive the speaking detection is. It sets the minimum RMS audio level that counts as "speaking" — used for tile border glow, peer list mic glow, and self-video glow indicators.
+
+```javascript
+window.__APP_CONFIG = Object.freeze({
+    // ... other config ...
+    vadThreshold: 0.02   // default
+});
+```
+
+| Value | Sensitivity | Use case |
+|-------|-------------|----------|
+| `0.01` | High — picks up quiet speech and background noise | Quiet environments, soft speakers |
+| `0.02` | Medium (default) — good balance for most setups | General use |
+| `0.05` | Low — only triggers on louder speech | Noisy environments, reduces false positives |
+| `0.10` | Very low — requires loud/close speech | Very noisy environments |
+
+The threshold can also be set via the `VAD_THRESHOLD` environment variable when running in Docker (see `docker/start-yew.sh` and `docker/start-dioxus.sh`), or via `runtimeConfig.vadThreshold` in Helm values.
 
 ### Local/Docker: start-yew.sh
 
@@ -476,6 +497,19 @@ CI runs these tests automatically via `.github/workflows/cargo-test.yaml`,
 triggered on PRs that touch `actix-api/`, `videocall-types/`, or `protobuf/`.
 For the full backend testing guide — including test patterns, database cleanup,
 and how to write new tests — see **[actix-api/TESTING.md](actix-api/TESTING.md)**.
+
+### E2E Testing (Playwright)
+
+Full browser-based end-to-end tests using [Playwright](https://playwright.dev/).
+Tests run against both the **Dioxus UI** and **Yew UI** simultaneously, verifying
+meeting flows with real browsers. Authentication is bypassed via JWT cookie
+injection — no OAuth setup needed.
+
+The E2E stack is defined in `docker/docker-compose.e2e.yaml` and uses the same
+Nix-based dev Dockerfiles as CI. Tests run automatically on pushes to `main` and
+can be triggered manually from the GitHub Actions page.
+
+See the `e2e-*` targets in the `Makefile` for available commands.
 
 ## Roadmap
 

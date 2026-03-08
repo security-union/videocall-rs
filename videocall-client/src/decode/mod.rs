@@ -44,6 +44,15 @@ pub struct DecodeStatus {
     pub first_frame: bool,
 }
 
+impl DecodeStatus {
+    /// A no-op status for packets that were intentionally skipped (stragglers,
+    /// heartbeats, RTT, etc.).
+    pub const SKIPPED: Self = Self {
+        rendered: false,
+        first_frame: false,
+    };
+}
+
 impl From<StandardDecodeStatus> for DecodeStatus {
     fn from(status: StandardDecodeStatus) -> Self {
         DecodeStatus {
@@ -83,7 +92,8 @@ impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
 pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
     peer_id: String,
+    vad_threshold: Option<f32>,
 ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
     // NetEq decoders should start muted by default (peers start with audio_enabled=false)
-    NetEqAudioPeerDecoder::new_with_mute_state(speaker_device_id, peer_id, true)
+    NetEqAudioPeerDecoder::new_with_mute_state(speaker_device_id, peer_id, true, vad_threshold)
 }

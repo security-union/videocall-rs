@@ -69,6 +69,12 @@
 //!     session_id: "session123".to_string(),
 //!     display_name: "User 123".to_string(),
 //!     on_peer_display_name_changed: None,
+//!     on_speaking_changed: None,
+//!     vad_threshold: None,
+//!     on_meeting_activated: None,
+//!     on_participant_admitted: None,
+//!     on_participant_rejected: None,
+//!     on_waiting_room_updated: None,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -95,6 +101,12 @@
 //! #     session_id: "session123".to_string(),
 //! #     display_name: "User 123".to_string(),
 //! #     on_peer_display_name_changed: None,
+//! #     on_speaking_changed: None,
+//! #     vad_threshold: None,
+//! #     on_meeting_activated: None,
+//! #     on_participant_admitted: None,
+//! #     on_participant_rejected: None,
+//! #     on_waiting_room_updated: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(
@@ -109,6 +121,7 @@
 //!     128, // 128 kbps bitrate
 //!     Callback::noop(),
 //!     Callback::noop(),
+//!     None, // vad_threshold
 //! );
 //! let mut screen = ScreenEncoder::new(
 //!     client,

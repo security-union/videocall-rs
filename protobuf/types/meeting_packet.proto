@@ -12,8 +12,16 @@ message MeetingPacket {
     PARTICIPANT_JOINED = 3;
     // Participant left the meeting
     PARTICIPANT_LEFT = 4;
+    // Host joined, meeting now active
+    MEETING_ACTIVATED = 5;
+    // Admitted from waiting room
+    PARTICIPANT_ADMITTED = 6;
+    // Rejected from waiting room
+    PARTICIPANT_REJECTED = 7;
+    // Waiting room list changed
+    WAITING_ROOM_UPDATED = 8;
     // Participant changed their display name
-    NAME_UPDATED = 5;
+    NAME_UPDATED = 9;
   }
 
   MeetingEventType event_type = 1;
@@ -22,9 +30,13 @@ message MeetingPacket {
   string message = 4;
   string creator_id = 5;
   int64 participant_count = 6;
+  // For ADMITTED/REJECTED: affected user's email
+  string target_email = 7;
+  // For ADMITTED: JWT to upgrade connection
+  string room_token = 8;
   // Session ID of user who changed name (for NAME_UPDATED events)
-  string user_session_id = 7;
+  string user_session_id = 9;
   // New display name (for NAME_UPDATED events)
-  string new_display_name = 8;
+  string new_display_name = 10;
 }
 

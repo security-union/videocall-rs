@@ -17,6 +17,7 @@
  */
 
 use crate::components::icons::crown::CrownIcon;
+use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use yew::prelude::*;
 use yew::{html, Component, Html};
@@ -28,6 +29,10 @@ pub struct PeerListItemProps {
     pub name: String,
     #[prop_or_default]
     pub is_host: bool,
+    #[prop_or(true)]
+    pub muted: bool,
+    #[prop_or(false)]
+    pub speaking: bool,
 }
 
 impl Component for PeerListItem {
@@ -48,6 +53,12 @@ impl Component for PeerListItem {
             name.clone()
         };
 
+        let mic_class = if ctx.props().speaking {
+            "peer_item_mic speaking"
+        } else {
+            "peer_item_mic"
+        };
+
         html! {
             <div class="peer_item" title={title}>
                 <div class="peer_item_icon">
@@ -58,6 +69,9 @@ impl Component for PeerListItem {
                     if is_host {
                         <CrownIcon />
                     }
+                </div>
+                <div class={mic_class}>
+                    <MicIcon muted={ctx.props().muted} />
                 </div>
             </div>
         }

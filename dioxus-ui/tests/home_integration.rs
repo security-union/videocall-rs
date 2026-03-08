@@ -16,7 +16,9 @@ use support::{
     cleanup, create_mount_point, inject_app_config, mock_fetch_401, mock_fetch_meetings_empty,
     remove_app_config, render_into, restore_fetch, yield_now,
 };
+use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
+use web_sys::{Event, EventInit, HtmlButtonElement, HtmlInputElement};
 
 use dioxus::prelude::*;
 use dioxus_ui::components::config_error::ConfigError;
@@ -24,6 +26,21 @@ use dioxus_ui::constants::app_config;
 use dioxus_ui::context::UsernameCtx;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+/// Create a bubbling "input" event so Dioxus event delegation picks it up.
+fn bubbling_input_event() -> Event {
+    let mut init = EventInit::new();
+    init.bubbles(true);
+    Event::new_with_event_init_dict("input", &init).unwrap()
+}
+
+/// Create a bubbling, cancelable "submit" event.
+fn bubbling_submit_event() -> Event {
+    let mut init = EventInit::new();
+    init.bubbles(true);
+    init.cancelable(true);
+    Event::new_with_event_init_dict("submit", &init).unwrap()
+}
 
 // ---------------------------------------------------------------------------
 // Wrapper component — provides the context Home needs via the full Router.
@@ -77,6 +94,11 @@ async fn home_page_renders_with_oauth_disabled() {
     assert!(
         text.contains("Start or Join a Meeting"),
         "form heading missing"
+    );
+    // Both buttons are always visible (join button is disabled when no meeting ID).
+    assert!(
+        text.contains("Start or Join Meeting"),
+        "join button missing"
     );
     assert!(
         text.contains("Create a New Meeting ID"),
@@ -214,4 +236,290 @@ async fn missing_config_shows_error_not_home() {
     );
 
     cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn home_rejects_invalid_display_name() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value("John&Doe");
+    username.dispatch_event(&bubbling_input_event()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
+
+    // Yield so Dioxus processes the oninput state updates before submit reads them.
+    yield_now().await;
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
+
+    yield_now().await;
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Invalid character"),
+        "Expected invalid character error, got page text: {text}"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_normalizes_spaces_in_display_name() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value("  John    Doe   ");
+    username.dispatch_event(&bubbling_input_event()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
+
+    // Yield so Dioxus processes the oninput state updates before submit reads them.
+    yield_now().await;
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
+
+    yield_now().await;
+
+    // Navigation now succeeds, removing the Home component from the DOM,
+    // so verify the normalized username via localStorage instead.
+    let storage = web_sys::window()
+        .unwrap()
+        .local_storage()
+        .unwrap()
+        .unwrap();
+    let saved = storage.get_item("vc_username").unwrap().unwrap();
+    assert_eq!(saved, "John Doe");
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_rejects_empty_display_name() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Leave username empty, set a meeting ID, and submit.
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
+
+    // Yield so Dioxus processes the oninput state updates before submit reads them.
+    yield_now().await;
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
+
+    yield_now().await;
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Name cannot be empty"),
+        "Expected empty-name error, got page text: {text}"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_rejects_display_name_exceeding_max_length() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Create a name that exceeds 50 characters.
+    let long_name = "A".repeat(51);
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value(&long_name);
+    username.dispatch_event(&bubbling_input_event()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
+
+    // Yield so Dioxus processes the oninput state updates before submit reads them.
+    yield_now().await;
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
+
+    yield_now().await;
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("too long"),
+        "Expected max-length error, got page text: {text}"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_accepts_display_name_with_special_characters() {
+    ensure_root_url();
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Apostrophes and hyphens are allowed special characters.
+    let username = mount
+        .query_selector("#username").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    username.set_value("O'Brien-Smith");
+    username.dispatch_event(&bubbling_input_event()).unwrap();
+
+    let meeting_id = mount
+        .query_selector("#meeting-id").unwrap().unwrap()
+        .dyn_into::<HtmlInputElement>().unwrap();
+    meeting_id.set_value("abc_123");
+    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
+
+    // Yield so Dioxus processes the oninput state updates before submit reads them.
+    yield_now().await;
+
+    let form = mount.query_selector("form").unwrap().unwrap();
+    form.dispatch_event(&bubbling_submit_event()).unwrap();
+
+    yield_now().await;
+
+    // No error should be shown -- the name is valid.
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        !text.contains("Invalid character"),
+        "Should not show invalid character error for apostrophes and hyphens, got: {text}"
+    );
+    assert!(
+        !text.contains("Name cannot be empty"),
+        "Should not show empty name error, got: {text}"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_join_button_disabled_when_no_meeting_id() {
+    ensure_root_url();
+    inject_app_config();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Find the submit button (type="submit") — "Start or Join Meeting".
+    let btn = mount
+        .query_selector("button[type='submit']")
+        .unwrap()
+        .expect("submit button should exist")
+        .dyn_into::<HtmlButtonElement>()
+        .unwrap();
+
+    // With no meeting ID entered, the join button should be disabled.
+    assert!(
+        btn.disabled(),
+        "Join button should be disabled when meeting ID is empty"
+    );
+
+    // The "Create a New Meeting ID" button should also be present.
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Create a New Meeting ID"),
+        "Create button should always be visible"
+    );
+
+    cleanup(&mount);
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_join_button_enabled_when_meeting_id_entered() {
+    ensure_root_url();
+    inject_app_config();
+
+    let mount = create_mount_point();
+    render_into(&mount, home_wrapper_direct);
+    yield_now().await;
+
+    // Enter a meeting ID.
+    let meeting_input = mount
+        .query_selector("#meeting-id")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
+    meeting_input.set_value("test_meeting");
+    meeting_input
+        .dispatch_event(&bubbling_input_event())
+        .unwrap();
+
+    yield_now().await;
+
+    // The submit button should now be enabled.
+    let btn = mount
+        .query_selector("button[type='submit']")
+        .unwrap()
+        .expect("submit button should exist")
+        .dyn_into::<HtmlButtonElement>()
+        .unwrap();
+
+    assert!(
+        !btn.disabled(),
+        "Join button should be enabled when meeting ID is entered"
+    );
+
+    cleanup(&mount);
+    remove_app_config();
 }

@@ -125,10 +125,8 @@ h3 {
 
 .peer-list li {
   margin-top: 10px;
-  height: 40px;
   font-size: 16px;
   border-radius: 5px;
-  overflow: hidden;
 }
 
 .peer_item {
@@ -145,14 +143,25 @@ h3 {
 
 .peer_item_icon {
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
 }
 
 .peer_item_text {
   flex-grow: 1;
+  display: flex;
+  align-items: center;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
   padding: 0 10px;
+}
+
+.peer-indicator {
+  color: #888;
+  font-size: 0.85em;
+  margin-left: 6px;
+  flex-shrink: 0;
 }
 
 #grid-container {
@@ -3407,5 +3416,88 @@ select {
 
   .settings-field-label {
     margin-right: 0.75rem;
+  }
+}
+
+/* ===== Speaking indicator styles ===== */
+
+/* Peer list mic icon container */
+.peer_item_mic {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: #888;
+  transition: all 0.2s ease;
+}
+
+.peer_item_mic svg {
+  width: 100%;
+  height: 100%;
+}
+
+.peer_item_mic.speaking {
+  color: #00ff41;
+  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+
+.peer_item_mic.speaking svg {
+  stroke: #00ff41;
+}
+
+/* Sits between controls (above) and LED (below) inside .host — no rounded corners */
+.host-video-wrapper {
+  border-radius: 0;
+  overflow: hidden;
+}
+
+/* Speaking tile — transition-based glow that eases in/out */
+.speaking-tile,
+.canvas-container,
+.host-video-wrapper {
+  transition: border-color 0.4s ease, box-shadow 0.4s ease;
+}
+
+.speaking-tile {
+  border: 1.5px solid rgba(0, 255, 65, 0.5);
+  box-shadow: inset 0 0 18px 6px rgba(0, 255, 65, 0.4), 0 0 20px 4px rgba(0, 255, 65, 0.25);
+  animation: tile-glow 1.5s ease-in-out infinite;
+}
+
+/* Speaking glow on audio indicator (mic icon in tile) */
+.audio-indicator {
+  transition: color 0.4s ease, filter 0.4s ease;
+}
+
+.audio-indicator.speaking {
+  color: #00ff41;
+  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+
+.audio-indicator.speaking svg {
+  stroke: #00ff41;
+}
+
+@keyframes mic-pulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  }
+  50% {
+    filter: drop-shadow(0 0 12px rgba(0, 255, 65, 1));
+  }
+}
+
+@keyframes tile-glow {
+  0%, 100% {
+    border-color: rgba(0, 255, 65, 0.5);
+    box-shadow: inset 0 0 18px 6px rgba(0, 255, 65, 0.4), 0 0 20px 4px rgba(0, 255, 65, 0.25);
+  }
+  50% {
+    border-color: rgba(0, 255, 65, 0.7);
+    box-shadow: inset 0 0 25px 8px rgba(0, 255, 65, 0.55), 0 0 30px 6px rgba(0, 255, 65, 0.35);
   }
 }

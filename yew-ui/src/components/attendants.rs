@@ -36,6 +36,7 @@ use crate::constants::{
 use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
+use std::collections::HashMap;
 use log::{error, warn};
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
@@ -77,7 +78,6 @@ pub enum WsAction {
     Log(String),
     EncoderSettingsUpdated(String),
     MeetingInfoReceived(u64),
-    ToggleDropdown,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -105,6 +105,7 @@ pub enum Msg {
     OnPeerDisplayNameChanged(String, String),
     OnLocalNameChanged(String),
     OnFirstFrame((String, MediaType)),
+    OnSpeakingChanged(bool),
     OnMicrophoneError(String),
     OnCameraError(String),
     DismissUserError,
@@ -123,6 +124,8 @@ pub enum Msg {
     TokenRefreshed(String),
     /// Token refresh failed (session expired, kicked from meeting, network error).
     TokenRefreshFailed(String),
+    /// The waiting room participant list changed (push notification from server).
+    WaitingRoomUpdated,
 }
 
 impl From<WsAction> for Msg {
@@ -205,9 +208,8 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
-    pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp - the actual meeting time
-    pub call_start_time: Option<f64>,           // Track when the call started for a user
-    show_dropdown: bool,
+    pub meeting_start_time_server: Option<f64>,
+    pub call_start_time: Option<f64>,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
     #[allow(dead_code)]
@@ -215,6 +217,16 @@ pub struct AttendantsComponent {
     pub display_name: String,
     /// Map of session_id -> display_name for all peers
     pub peer_display_names: std::collections::HashMap<String, String>,
+    local_speaking: bool,
+    /// Monotonically increasing counter bumped when a `WaitingRoomUpdated`
+    /// push notification arrives. Passed as a prop to `HostControls` so it
+    /// knows to re-fetch the waiting list.
+    waiting_room_version: u32,
+    /// Tracks the current reconnection attempt number for exponential backoff.
+    /// Only meaningful in the JWT auth path (`media-server-jwt-auth` feature);
+    /// the non-JWT path manages its own attempt counter inside the recursive
+    /// `schedule_reconnect_no_jwt` closure chain.
+    reconnect_attempt: u32,
 }
 
 impl AttendantsComponent {
@@ -367,6 +379,23 @@ impl AttendantsComponent {
                     link.send_message(Msg::OnPeerDisplayNameChanged(session_id, new_name));
                 })
             }),
+            on_speaking_changed: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |speaking: bool| {
+                    link.send_message(Msg::OnSpeakingChanged(speaking));
+                })
+            }),
+            vad_threshold: crate::constants::vad_threshold().ok(),
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |_| {
+                    log::info!("Waiting room updated via push notification");
+                    link.send_message(Msg::WaitingRoomUpdated);
+                })
+            }),
         };
 
         VideoCallClient::new(opts)
@@ -450,7 +479,7 @@ impl AttendantsComponent {
 
     #[cfg(not(feature = "fake-peers"))]
     fn view_fake_peer_buttons(&self, _ctx: &Context<Self>, _add_fake_peer_disabled: bool) -> Html {
-        html! {} // Empty html when feature is not enabled
+        html! {}
     }
 
     #[cfg(feature = "fake-peers")]
@@ -480,16 +509,45 @@ impl AttendantsComponent {
 
     #[cfg(not(feature = "fake-peers"))]
     fn view_grid_toggle(&self, _ctx: &Context<Self>) -> Html {
-        html! {} // Empty html when feature is not enabled
+        html! {}
     }
 
-    /// Schedule a token refresh attempt after 1 second.
+    /// Maximum number of reconnection attempts before giving up.
+    const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+    /// Compute the reconnect delay for the given attempt using exponential
+    /// backoff with ±25% random jitter.  Returns `None` when all attempts are
+    /// exhausted.
+    fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
+        const MAX_DELAY_MS: u32 = 16_000;
+        if attempt >= Self::MAX_RECONNECT_ATTEMPTS {
+            return None;
+        }
+        let base = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(MAX_DELAY_MS);
+        let jitter = (js_sys::Math::random() * 0.5 - 0.25) * base as f64;
+        Some((base as f64 + jitter).max(500.0) as u32)
+    }
+
+    /// Schedule a token refresh attempt with exponential backoff and jitter.
     ///
-    /// If the meeting has ended (`MeetingNotActive`), sends `MeetingEnded`
-    /// instead of retrying, so the user sees a clear "meeting ended" overlay.
+    /// Retries with increasing delay (1s -> 2s -> 4s -> 8s -> 16s cap) plus +/-25%
+    /// random jitter.  Gives up after 10 attempts.  If the meeting has ended
+    /// (`MeetingNotActive`), sends `MeetingEnded` instead of retrying.
     #[cfg(feature = "media-server-jwt-auth")]
-    fn schedule_token_refresh(link: yew::html::Scope<Self>, meeting_id: String) {
-        Timeout::new(1_000, move || {
+    fn schedule_token_refresh(link: yew::html::Scope<Self>, meeting_id: String, attempt: u32) {
+        let delay_ms = match Self::reconnect_delay_ms(attempt) {
+            Some(d) => d,
+            None => {
+                link.send_message(Msg::TokenRefreshFailed(
+                    "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+                ));
+                return;
+            }
+        };
+
+        log::info!("Scheduling token refresh attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+
+        Timeout::new(delay_ms, move || {
             wasm_bindgen_futures::spawn_local(async move {
                 match crate::meeting_api::refresh_room_token(&meeting_id).await {
                     Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
@@ -502,13 +560,37 @@ impl AttendantsComponent {
                 }
             });
         })
+            .forget();
+    }
+
+    /// Schedule a reconnection attempt with exponential backoff (non-JWT path).
+    ///
+    /// Retries with increasing delay (1s -> 2s -> 4s -> 8s -> 16s cap) plus +/-25%
+    /// random jitter.  Gives up after 10 attempts.
+    #[cfg(not(feature = "media-server-jwt-auth"))]
+    fn schedule_reconnect_no_jwt(link: yew::html::Scope<Self>, attempt: u32) {
+        let delay_ms = match Self::reconnect_delay_ms(attempt) {
+            Some(d) => d,
+            None => {
+                link.send_message(Msg::TokenRefreshFailed(
+                    "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+                ));
+                return;
+            }
+        };
+
+        log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+
+        Timeout::new(delay_ms, move || {
+            link.send_message(WsAction::Connect);
+        })
         .forget();
     }
 
     fn play_user_joined() {
         if let Some(_window) = web_sys::window() {
             if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
-                audio.set_volume(0.4); // Set moderate volume
+                audio.set_volume(0.4);
                 if let Err(e) = audio.play() {
                     log::warn!("Failed to play notification sound: {e:?}");
                 }
@@ -528,6 +610,7 @@ impl Component for AttendantsComponent {
         let display_name = ctx.props().email.clone();
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
+
         let mut self_ = Self {
             session_id,
             display_name,
@@ -553,10 +636,12 @@ impl Component for AttendantsComponent {
             show_copy_toast: false,
             call_start_time: None,
             meeting_start_time_server: None,
-            show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
             peer_display_names: std::collections::HashMap::new(),
+            local_speaking: false,
+            waiting_room_version: 0,
+            reconnect_attempt: 0,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -576,6 +661,11 @@ impl Component for AttendantsComponent {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {
+            Msg::OnSpeakingChanged(speaking) => {
+                log::trace!("LOCAL Speaking state changed to: {}", speaking);
+                self.local_speaking = speaking;
+                true
+            }
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
                     if self.client.is_connected() {
@@ -593,6 +683,7 @@ impl Component for AttendantsComponent {
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
                     self.error = None;
+                    self.reconnect_attempt = 0;
                     self.call_start_time = Some(js_sys::Date::now());
                     true
                 }
@@ -607,18 +698,17 @@ impl Component for AttendantsComponent {
 
                     #[cfg(feature = "media-server-jwt-auth")]
                     {
+                        self.reconnect_attempt = 0;
                         let link = ctx.link().clone();
                         let meeting_id = ctx.props().id.clone();
-                        Self::schedule_token_refresh(link, meeting_id);
+                        Self::schedule_token_refresh(link, meeting_id, 0);
                     }
 
                     #[cfg(not(feature = "media-server-jwt-auth"))]
                     {
+                        self.reconnect_attempt = 0;
                         let link = ctx.link().clone();
-                        Timeout::new(1_000, move || {
-                            link.send_message(WsAction::Connect);
-                        })
-                        .forget();
+                        Self::schedule_reconnect_no_jwt(link, 0);
                     }
 
                     true
@@ -645,7 +735,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsError(error) => {
                     self.error = Some(error);
-                    self.meeting_joined = false; // Stay on join screen if permissions denied
+                    self.meeting_joined = false;
                     true
                 }
                 WsAction::EncoderSettingsUpdated(settings) => {
@@ -657,14 +747,9 @@ impl Component for AttendantsComponent {
                     self.meeting_start_time_server = Some(start_time as f64);
                     true
                 }
-                WsAction::ToggleDropdown => {
-                    self.show_dropdown = !self.show_dropdown;
-                    true
-                }
             },
             Msg::OnPeerAdded(email) => {
                 log::info!("New user joined: {email}");
-                // Play notification sound when a new user joins the call
                 Self::play_user_joined();
 
                 true
@@ -688,7 +773,6 @@ impl Component for AttendantsComponent {
             }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::OnMicrophoneError(err) => {
-                // Disable mic at the top and show UI
                 log::error!("Microphone error (full): {err}");
                 self.mic_enabled = false;
                 self.user_error = Some(format!("Microphone error: {err}"));
@@ -769,7 +853,6 @@ impl Component for AttendantsComponent {
                     UserScreenToggleAction::MeetingInfo => {
                         self.meeting_info_open = !self.meeting_info_open;
                         if self.meeting_info_open {
-                            //  self.peer_list_open = false;
                             self.diagnostics_open = false;
                             self.device_settings_open = false;
                         }
@@ -802,7 +885,7 @@ impl Component for AttendantsComponent {
                     self.simulation_info_message =
                         Some(format!("Maximum participants ({}) reached.", CANVAS_LIMIT));
                 }
-                true // Re-render to update button state or display message
+                true
             }
             #[cfg(feature = "fake-peers")]
             Msg::ToggleForceDesktopGrid => {
@@ -817,7 +900,7 @@ impl Component for AttendantsComponent {
                     Timeout::new(1640, move || {
                         link.send_message(Msg::ShowCopyToast(false));
                     })
-                    .forget();
+                        .forget();
                 }
                 true
             }
@@ -878,6 +961,7 @@ impl Component for AttendantsComponent {
             Msg::TokenRefreshed(new_token) => {
                 log::info!("Room token refreshed, reconnecting with new token");
                 self.error = None;
+                self.reconnect_attempt = 0;
                 let (ws_urls, wt_urls) =
                     Self::build_lobby_urls(&new_token, &ctx.props().email, &ctx.props().id);
                 self.client.update_server_urls(ws_urls, wt_urls);
@@ -892,11 +976,18 @@ impl Component for AttendantsComponent {
                 warn!("Token refresh failed: {err}");
                 self.error = Some(format!("Connection lost, retrying... ({err})"));
 
-                // Schedule another attempt after 1 second.
-                let link = ctx.link().clone();
-                let meeting_id = ctx.props().id.clone();
-                Self::schedule_token_refresh(link, meeting_id);
+                #[cfg(feature = "media-server-jwt-auth")]
+                {
+                    self.reconnect_attempt += 1;
+                    let link = ctx.link().clone();
+                    let meeting_id = ctx.props().id.clone();
+                    Self::schedule_token_refresh(link, meeting_id, self.reconnect_attempt);
+                }
 
+                true
+            }
+            Msg::WaitingRoomUpdated => {
+                self.waiting_room_version = self.waiting_room_version.wrapping_add(1);
                 true
             }
         }
@@ -911,26 +1002,13 @@ impl Component for AttendantsComponent {
         let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
-        // Convert session_id to email for display in PeerList
-        let mut peers_for_display: Vec<String> = real_peers_vec
-            .iter()
-            .map(|session_id| {
-                self.client
-                    .get_peer_email(session_id)
-                    .unwrap_or_else(|| session_id.clone())
-            })
-            .collect();
-        peers_for_display.extend(self.fake_peer_ids.iter().cloned());
-
-        // Keep session_id for PeerTile (needs session_id for identification)
+        // Keep session_id for both PeerTile and PeerList (both need session_id for audio/speaking state matching)
         let mut display_peers_vec = real_peers_vec.clone();
         display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
 
         let num_display_peers = display_peers_vec.len();
-        // Cap the number of peers used for styling at CANVAS_LIMIT
         let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
-        // Determine if the "Add Fake Peer" button should be disabled
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
         let host_display_name = ctx.props().host_display_name.clone();
@@ -945,7 +1023,6 @@ impl Component for AttendantsComponent {
             })
             .collect();
 
-        // Always let the grid take the whole stage; overlays should not shrink the grid
         let container_style = format!(
             "position: absolute; inset: 0; width: 100%; height: 100%; --num-peers: {};",
             num_peers_for_styling.max(1)
@@ -953,15 +1030,12 @@ impl Component for AttendantsComponent {
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
-        // Compute meeting link for invitation overlay
         let meeting_link = {
             let origin_result = window().location().origin();
-            // If obtaining origin fails, fallback to empty string
             let origin = origin_result.unwrap_or_else(|_| "".to_string());
             format!("{}/meeting/{}", origin, ctx.props().id)
         };
 
-        // Callback to copy and trigger toast via component state
         let copy_meeting_link = {
             let meeting_link = meeting_link.clone();
             let link = ctx.link().clone();
@@ -978,57 +1052,12 @@ impl Component for AttendantsComponent {
             grid_container_classes.push("force-desktop-grid");
         }
 
-        // Show Join Meeting button if user hasn't joined yet
         if !self.meeting_joined {
             return html! {
                 <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                     <div id="main-container" class="meeting-page">
                         <BrowserCompatibility/>
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
-                        // Logout dropdown (top-right corner)
-                        {
-                            if let (Some(name), Some(email), Some(on_logout)) = (&ctx.props().user_name, &ctx.props().user_email, &ctx.props().on_logout) {
-                                html! {
-                                    <div style="position: absolute; top: 1rem; right: 1rem; z-index: 1001;">
-                                        <button
-                                            onclick={ctx.link().callback(|_| WsAction::ToggleDropdown)}
-                                            class="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-white text-sm transition-colors"
-                                            style="display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; background: #1f2937; border-radius: 0.5rem; color: white; font-size: 0.875rem; transition: background 0.2s; border: none; cursor: pointer;"
-                                        >
-                                            <span>{name}</span>
-                                            <svg style="width: 1rem; height: 1rem;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-                                            </svg>
-                                        </button>
-
-                                        {
-                                            if self.show_dropdown {
-                                                html! {
-                                                    <div style="position: absolute; right: 0; margin-top: 0.5rem; width: 14rem; background: white; border-radius: 0.5rem; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); border: 1px solid #e5e7eb; padding: 0.25rem 0;">
-                                                        <div style="padding: 0.75rem 1rem; border-bottom: 1px solid #e5e7eb;">
-                                                            <p style="font-size: 0.875rem; font-weight: 500; color: #111827; margin: 0;">{name}</p>
-                                                            <p style="font-size: 0.75rem; color: #6b7280; margin: 0; overflow: hidden; text-overflow: ellipsis;">{email}</p>
-                                                        </div>
-                                                        <button
-                                                            onclick={on_logout.reform(|_| ())}
-                                                            class="logout-button"
-                                                            style="width: 100%; text-align: left; padding: 0.5rem 1rem; font-size: 0.875rem; color: #dc2626; background: transparent; border: none; cursor: pointer;"
-                                                        >
-                                                            {"Sign out"}
-                                                        </button>
-                                                    </div>
-                                                }
-                                            } else {
-                                                html! {}
-                                            }
-                                        }
-                                    </div>
-                                }
-                            } else {
-                                html! {}
-                            }
-                        }
-
                         <div style="text-align: center; color: white; margin-bottom: 2rem;">
                             <h2>{"Ready to join the meeting?"}</h2>
                             <p>{"Click the button below to join and start listening to others."}</p>
@@ -1050,7 +1079,6 @@ impl Component for AttendantsComponent {
             };
         }
 
-        // Create MeetingTime for context - child components (MeetingInfo) read from this
         let meeting_time = MeetingTime {
             call_start_time: self.call_start_time,
             meeting_start_time: self.meeting_start_time_server,
@@ -1067,7 +1095,7 @@ impl Component for AttendantsComponent {
                     style={container_style}>
                     { rows }
 
-                    { // Invitation overlay when there are no connected peers
+                    {
                         if num_display_peers == 0 {
                             html! {
                                 <div id="invite-overlay" class="card-apple" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;">
@@ -1129,7 +1157,6 @@ impl Component for AttendantsComponent {
                                                 enabled={self.video_enabled}
                                                 onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}
                                             />
-                                            // Hide screen share button on Safari/iOS devices
                                             {
                                                 if !is_ios() {
                                                     let is_active = matches!(self.screen_share_state, ScreenShareState::Active);
@@ -1196,6 +1223,7 @@ impl Component for AttendantsComponent {
                                                  share_screen={self.screen_share_state.is_sharing()}
                                                  mic_enabled={self.mic_enabled}
                                                  video_enabled={self.video_enabled}
+                                                 is_speaking={self.local_speaking}
                                                  on_encoder_settings_update={on_encoder_settings_update}
                                                  device_settings_open={self.device_settings_open}
                                                  on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
@@ -1224,12 +1252,19 @@ impl Component for AttendantsComponent {
                     {
                         if self.peer_list_open {
                             let toggle_meeting_info = ctx.link().callback(|_| UserScreenToggleAction::MeetingInfo);
+                            let peer_audio_states: HashMap<String, bool> = display_peers_vec
+                                .iter()
+                                .map(|peer_id| (peer_id.clone(), self.client.is_audio_enabled_for_peer(peer_id)))
+                                .collect();
                             html! {
                                 <PeerList
                                     peers={display_peers_vec.clone()}
                                     peer_display_names={self.peer_display_names.clone()}
                                     onclose={toggle_peer_list}
                                     local_user_name={self.display_name.clone()}
+                                    peer_audio_states={peer_audio_states}
+                                    self_muted={!self.mic_enabled}
+                                    self_speaking={self.local_speaking}
                                     show_meeting_info={self.meeting_info_open}
                                     room_id={ctx.props().id.clone()}
                                     num_participants={num_display_peers}
@@ -1248,6 +1283,7 @@ impl Component for AttendantsComponent {
                 <HostControls
                     meeting_id={ctx.props().id.clone()}
                     is_admitted={true}
+                    waiting_room_version={self.waiting_room_version}
                 />
 
                 {
@@ -1274,6 +1310,94 @@ impl Component for AttendantsComponent {
                 </div>
             </ContextProvider<VideoCallClientCtx>>
             </ContextProvider<MeetingTimeCtx>>
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for reconnect_delay_ms
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// attempt=0 should return Some(d) where d is in the base range.
+    /// base = 1000, jitter in [-25%, +25%), so delay in [750, 1250).
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_0_returns_value_in_expected_range() {
+        for _ in 0..50 {
+            let delay = AttendantsComponent::reconnect_delay_ms(0);
+            assert!(delay.is_some(), "attempt 0 should return Some");
+            let d = delay.unwrap();
+            assert!(d >= 750, "attempt 0 delay {d} should be >= 750");
+            assert!(d <= 1250, "attempt 0 delay {d} should be <= 1250");
+        }
+    }
+
+    /// attempt=9 should return Some(d) with base capped at MAX_DELAY_MS (16000).
+    /// jitter in [-25%, +25%), so delay in [12000, 20000).
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_9_returns_capped_value() {
+        for _ in 0..50 {
+            let delay = AttendantsComponent::reconnect_delay_ms(9);
+            assert!(delay.is_some(), "attempt 9 should return Some");
+            let d = delay.unwrap();
+            assert!(d >= 12000, "attempt 9 delay {d} should be >= 12000");
+            assert!(d <= 20000, "attempt 9 delay {d} should be <= 20000");
+        }
+    }
+
+    /// attempt=10 exceeds MAX_RECONNECT_ATTEMPTS and should return None.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_10_returns_none() {
+        assert!(
+            AttendantsComponent::reconnect_delay_ms(10).is_none(),
+            "attempt 10 should return None"
+        );
+    }
+
+    /// Attempts beyond 10 should also return None.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_attempt_beyond_max_returns_none() {
+        assert!(AttendantsComponent::reconnect_delay_ms(11).is_none());
+        assert!(AttendantsComponent::reconnect_delay_ms(100).is_none());
+        assert!(AttendantsComponent::reconnect_delay_ms(u32::MAX).is_none());
+    }
+
+    /// Backoff should roughly double each attempt (accounting for jitter).
+    /// We compare the averages of many samples to the expected base values.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_backoff_roughly_doubles() {
+        let samples = 200;
+        for attempt in 0..4u32 {
+            let expected_base =
+                (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
+            let sum: f64 = (0..samples)
+                .map(|_| AttendantsComponent::reconnect_delay_ms(attempt).unwrap() as f64)
+                .sum();
+            let avg = sum / samples as f64;
+            // Average should be close to the base (jitter is symmetric around 0).
+            // Allow 15% tolerance for randomness.
+            let tolerance = expected_base * 0.15;
+            assert!(
+                (avg - expected_base).abs() < tolerance,
+                "attempt {attempt}: avg {avg:.0} should be near expected base {expected_base:.0} (tolerance {tolerance:.0})"
+            );
+        }
+    }
+
+    /// The minimum possible return value is 500 (enforced by .max(500.0)).
+    /// Verify no value goes below 500 for any valid attempt.
+    #[wasm_bindgen_test]
+    fn reconnect_delay_never_below_500() {
+        for attempt in 0..10u32 {
+            for _ in 0..20 {
+                let d = AttendantsComponent::reconnect_delay_ms(attempt).unwrap();
+                assert!(d >= 500, "attempt {attempt}: delay {d} must be >= 500");
+            }
         }
     }
 }

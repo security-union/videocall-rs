@@ -24,6 +24,22 @@ pub struct MeetingTime {
 
 pub type MeetingTimeCtx = Signal<MeetingTime>;
 
+/// Per-peer media state tracked by the shared diagnostics subscriber.
+#[derive(Clone, Default, PartialEq)]
+pub struct PeerMediaState {
+    pub audio_enabled: bool,
+    pub video_enabled: bool,
+    pub screen_enabled: bool,
+}
+
+/// Shared map of per-peer media state signals, provided as a Dioxus context.
+///
+/// A single async task subscribes to the diagnostics broadcast channel and
+/// updates per-peer signals.  Each `PeerTile` reads only its own
+/// `Signal<PeerMediaState>`, so a state change for peer A does not cause
+/// peer B's tile to re-render.
+pub type PeerStatusMap = Signal<std::collections::HashMap<String, Signal<PeerMediaState>>>;
+
 /// Holds meeting host information shared via context.
 #[derive(Clone, PartialEq, Default)]
 #[allow(dead_code)]
@@ -59,15 +75,17 @@ pub fn save_username_to_storage(username: &str) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Validation helpers
-// ---------------------------------------------------------------------------
-
-use once_cell::sync::Lazy;
-
-static USERNAME_RE: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r"^[A-Za-z0-9_]+$").unwrap());
-
-pub fn is_valid_username(name: &str) -> bool {
-    !name.is_empty() && USERNAME_RE.is_match(name)
+/// Remove the username from `localStorage` entirely (e.g. on logout).
+pub fn clear_username_from_storage() {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(STORAGE_KEY);
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Validation helpers (re-exported from shared crate)
+// ---------------------------------------------------------------------------
+
+pub use videocall_types::validation::{
+    email_to_display_name, is_valid_meeting_id, normalize_spaces, validate_display_name, DISPLAY_NAME_MAX_LEN,
+};

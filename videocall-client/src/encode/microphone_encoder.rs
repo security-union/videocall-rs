@@ -26,14 +26,14 @@ use crate::wrappers::EncodedAudioChunkTypeWrapper;
 use crate::VideoCallClient;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
-use gloo_utils::window;
 use gloo::timers::callback::Interval;
+use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::Uint8Array;
 use protobuf::Message;
-use std::rc::Rc;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -77,7 +77,7 @@ pub fn transform_audio_chunk(
             sequence,
             ..Default::default()
         })
-            .into(),
+        .into(),
         ..Default::default()
     };
     let data = media_packet.write_to_bytes().unwrap();
@@ -273,7 +273,7 @@ impl MicrophoneEncoder {
                 &JsValue::from_str("exact"),
                 &JsValue::from_str(&device_id),
             )
-                .unwrap();
+            .unwrap();
 
             log::info!("MicrophoneEncoder: deviceId.exact = {device_id}");
             media_info.set_device_id(&exact.into());
@@ -456,8 +456,7 @@ impl MicrophoneEncoder {
             // flag is included in the 1Hz heartbeat so that *remote* peers
             // can show a speaking indicator for this user.
             let vad_interval = Interval::new(100, move || {
-                if !enabled_check.load(Ordering::Acquire)
-                    || switching_check.load(Ordering::Acquire)
+                if !enabled_check.load(Ordering::Acquire) || switching_check.load(Ordering::Acquire)
                 {
                     return;
                 }
@@ -473,7 +472,7 @@ impl MicrophoneEncoder {
 
                 let speaking = rms > vad_threshold;
 
-                log::trace!("VAD: RMS={:.4}, speaking={}", rms, speaking);
+                log::trace!("VAD: RMS={rms:.4}, speaking={speaking}");
 
                 // Only propagate when the speaking state actually changes to
                 // avoid unnecessary callback emissions every 100ms.

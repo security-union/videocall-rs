@@ -58,8 +58,7 @@ pub fn WaitingRoom(
                 return;
             }
 
-            let lobby_url =
-                |base: &str| format!("{base}/lobby?token={observer_token}");
+            let lobby_url = |base: &str| format!("{base}/lobby?token={observer_token}");
             let websocket_urls: Vec<String> = actix_websocket_base()
                 .unwrap_or_default()
                 .split(',')
@@ -87,7 +86,9 @@ pub fn WaitingRoom(
                     obs_conn_on_connect.set(true);
                 }),
                 on_connection_lost: VcCallback::from(move |_| {
-                    log::warn!("Observer connection lost (waiting room); polling fallback will activate");
+                    log::warn!(
+                        "Observer connection lost (waiting room); polling fallback will activate"
+                    );
                     obs_conn_on_lost.set(false);
                 }),
                 on_peer_added: VcCallback::noop(),
@@ -105,36 +106,32 @@ pub fn WaitingRoom(
                 on_meeting_info: None,
                 on_meeting_ended: None,
                 on_meeting_activated: None,
-                on_participant_admitted: Some(VcCallback::from(
-                    move |_: ()| {
-                        log::info!("Participant admitted push received, fetching room token via HTTP");
-                        let mid = meeting_id_for_fetch.clone();
-                        // Use spawn_local instead of dioxus::spawn because
-                        // this callback fires from a WebSocket message
-                        // handler which runs outside any Dioxus runtime
-                        // context. Calling dioxus::spawn() here would panic.
-                        wasm_bindgen_futures::spawn_local(async move {
-                            match check_status(&mid).await {
-                                Ok(status) => {
-                                    if status.room_token.is_some() {
-                                        on_admitted.call(status);
-                                    } else {
-                                        log::error!("Admitted but check_status returned no room_token");
-                                        error.set(Some(
-                                            "Admitted but failed to obtain room token".to_string(),
-                                        ));
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to fetch room token after admission: {e}");
-                                    error.set(Some(format!(
-                                        "Failed to fetch room token: {e}"
-                                    )));
+                on_participant_admitted: Some(VcCallback::from(move |_: ()| {
+                    log::info!("Participant admitted push received, fetching room token via HTTP");
+                    let mid = meeting_id_for_fetch.clone();
+                    // Use spawn_local instead of dioxus::spawn because
+                    // this callback fires from a WebSocket message
+                    // handler which runs outside any Dioxus runtime
+                    // context. Calling dioxus::spawn() here would panic.
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match check_status(&mid).await {
+                            Ok(status) => {
+                                if status.room_token.is_some() {
+                                    on_admitted.call(status);
+                                } else {
+                                    log::error!("Admitted but check_status returned no room_token");
+                                    error.set(Some(
+                                        "Admitted but failed to obtain room token".to_string(),
+                                    ));
                                 }
                             }
-                        });
-                    },
-                )),
+                            Err(e) => {
+                                log::error!("Failed to fetch room token after admission: {e}");
+                                error.set(Some(format!("Failed to fetch room token: {e}")));
+                            }
+                        }
+                    });
+                })),
                 on_participant_rejected: Some(VcCallback::from(move |_| {
                     log::info!("Participant rejected push received");
                     on_rejected.call(());
@@ -142,6 +139,9 @@ pub fn WaitingRoom(
                 on_waiting_room_updated: None,
                 on_speaking_changed: None,
                 vad_threshold: None,
+                session_id: String::new(),
+                display_name: email.clone(),
+                on_peer_display_name_changed: None,
             };
 
             let mut client = VideoCallClient::new(opts);
@@ -199,7 +199,9 @@ pub fn WaitingRoom(
                                     on_admitted.call(status);
                                 } else {
                                     // Admitted but no token yet -- keep polling.
-                                    log::warn!("Polling fallback: admitted but no room_token, will retry");
+                                    log::warn!(
+                                        "Polling fallback: admitted but no room_token, will retry"
+                                    );
                                 }
                             }
                             "rejected" => {

@@ -249,14 +249,20 @@ async fn home_rejects_invalid_display_name() {
     yield_now().await;
 
     let username = mount
-        .query_selector("#username").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
+        .query_selector("#username")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
     username.set_value("John&Doe");
     username.dispatch_event(&bubbling_input_event()).unwrap();
 
     let meeting_id = mount
-        .query_selector("#meeting-id").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
+        .query_selector("#meeting-id")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
@@ -290,14 +296,20 @@ async fn home_normalizes_spaces_in_display_name() {
     yield_now().await;
 
     let username = mount
-        .query_selector("#username").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
+        .query_selector("#username")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
     username.set_value("  John    Doe   ");
     username.dispatch_event(&bubbling_input_event()).unwrap();
 
     let meeting_id = mount
-        .query_selector("#meeting-id").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
+        .query_selector("#meeting-id")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
@@ -311,11 +323,7 @@ async fn home_normalizes_spaces_in_display_name() {
 
     // Navigation now succeeds, removing the Home component from the DOM,
     // so verify the normalized username via localStorage instead.
-    let storage = web_sys::window()
-        .unwrap()
-        .local_storage()
-        .unwrap()
-        .unwrap();
+    let storage = web_sys::window().unwrap().local_storage().unwrap().unwrap();
     let saved = storage.get_item("vc_username").unwrap().unwrap();
     assert_eq!(saved, "John Doe");
 
@@ -336,8 +344,11 @@ async fn home_rejects_empty_display_name() {
 
     // Leave username empty, set a meeting ID, and submit.
     let meeting_id = mount
-        .query_selector("#meeting-id").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
+        .query_selector("#meeting-id")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
@@ -373,14 +384,20 @@ async fn home_rejects_display_name_exceeding_max_length() {
     // Create a name that exceeds 50 characters.
     let long_name = "A".repeat(51);
     let username = mount
-        .query_selector("#username").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
+        .query_selector("#username")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
     username.set_value(&long_name);
     username.dispatch_event(&bubbling_input_event()).unwrap();
 
     let meeting_id = mount
-        .query_selector("#meeting-id").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
+        .query_selector("#meeting-id")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 
@@ -415,14 +432,20 @@ async fn home_accepts_display_name_with_special_characters() {
 
     // Apostrophes and hyphens are allowed special characters.
     let username = mount
-        .query_selector("#username").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
+        .query_selector("#username")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
     username.set_value("O'Brien-Smith");
     username.dispatch_event(&bubbling_input_event()).unwrap();
 
     let meeting_id = mount
-        .query_selector("#meeting-id").unwrap().unwrap()
-        .dyn_into::<HtmlInputElement>().unwrap();
+        .query_selector("#meeting-id")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
     meeting_id.set_value("abc_123");
     meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
 

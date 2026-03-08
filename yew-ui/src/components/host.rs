@@ -16,7 +16,14 @@
  * conditions.
  */
 
+use crate::components::{
+    device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
+};
 use crate::constants::*;
+use crate::context::{
+    is_valid_username, load_username_from_storage, save_username_to_storage, validate_display_name,
+    VideoCallClientCtx, DISPLAY_NAME_MAX_LEN,
+};
 use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
@@ -26,14 +33,6 @@ use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
-
-use crate::components::{
-    device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
-};
-use crate::context::{
-    load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
-    validate_display_name, DISPLAY_NAME_MAX_LEN,
-};
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 

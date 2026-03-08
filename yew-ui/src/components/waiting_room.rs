@@ -146,6 +146,9 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                     on_waiting_room_updated: None,
                     on_speaking_changed: None,
                     vad_threshold: None,
+                    session_id: String::new(),
+                    display_name: email.clone(),
+                    on_peer_display_name_changed: None,
                 };
 
                 let mut client = VideoCallClient::new(opts);
@@ -195,45 +198,41 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
             let mut cleanup_id: Option<i32> = None;
             if !*is_connected {
                 log::info!(
-                    "WaitingRoom: observer not connected, starting polling fallback (every {}ms)",
-                    POLL_INTERVAL_MS
+                    "WaitingRoom: observer not connected, starting polling fallback (every {POLL_INTERVAL_MS}ms)"
                 );
 
                 if let Some(window) = web_sys::window() {
-                    let poll_closure =
-                        wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                            let meeting_id = meeting_id.clone();
-                            let on_admitted = on_admitted.clone();
-                            let on_rejected = on_rejected.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                match crate::meeting_api::check_status(&meeting_id).await {
-                                    Ok(status) => match status.status.as_str() {
-                                        "admitted" => {
-                                            if status.room_token.is_some() {
-                                                log::info!(
-                                                    "Polling fallback: participant admitted"
-                                                );
-                                                on_admitted.emit(status);
-                                            } else {
-                                                log::warn!("Polling fallback: admitted but no room_token, will retry");
-                                            }
+                    let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                        let meeting_id = meeting_id.clone();
+                        let on_admitted = on_admitted.clone();
+                        let on_rejected = on_rejected.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match crate::meeting_api::check_status(&meeting_id).await {
+                                Ok(status) => match status.status.as_str() {
+                                    "admitted" => {
+                                        if status.room_token.is_some() {
+                                            log::info!("Polling fallback: participant admitted");
+                                            on_admitted.emit(status);
+                                        } else {
+                                            log::warn!("Polling fallback: admitted but no room_token, will retry");
                                         }
-                                        "rejected" => {
-                                            log::info!("Polling fallback: participant rejected");
-                                            on_rejected.emit(());
-                                        }
-                                        other => {
-                                            log::debug!(
-                                                "Polling fallback: status={other}, continuing to poll"
-                                            );
-                                        }
-                                    },
-                                    Err(e) => {
-                                        log::warn!("Polling fallback: status check failed: {e}");
                                     }
+                                    "rejected" => {
+                                        log::info!("Polling fallback: participant rejected");
+                                        on_rejected.emit(());
+                                    }
+                                    other => {
+                                        log::debug!(
+                                            "Polling fallback: status={other}, continuing to poll"
+                                        );
+                                    }
+                                },
+                                Err(e) => {
+                                    log::warn!("Polling fallback: status check failed: {e}");
                                 }
-                            });
+                            }
                         });
+                    });
 
                     let id = window
                         .set_interval_with_callback_and_timeout_and_arguments_0(

@@ -83,8 +83,7 @@ pub async fn admit_participant(
 
     // Notify the admitted participant via NATS. The client will fetch its room
     // token via HTTP after receiving this notification.
-    nats_events::publish_participant_admitted(state.nats.as_ref(), &meeting_id, &body.email)
-        .await;
+    nats_events::publish_participant_admitted(state.nats.as_ref(), &meeting_id, &body.email).await;
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }

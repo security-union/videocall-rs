@@ -36,8 +36,8 @@ use crate::constants::{
 use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
-use std::collections::HashMap;
 use log::{error, warn};
+use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
@@ -545,7 +545,12 @@ impl AttendantsComponent {
             }
         };
 
-        log::info!("Scheduling token refresh attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+        log::info!(
+            "Scheduling token refresh attempt {}/{} in {}ms",
+            attempt + 1,
+            Self::MAX_RECONNECT_ATTEMPTS,
+            delay_ms
+        );
 
         Timeout::new(delay_ms, move || {
             wasm_bindgen_futures::spawn_local(async move {
@@ -560,7 +565,7 @@ impl AttendantsComponent {
                 }
             });
         })
-            .forget();
+        .forget();
     }
 
     /// Schedule a reconnection attempt with exponential backoff (non-JWT path).
@@ -579,7 +584,12 @@ impl AttendantsComponent {
             }
         };
 
-        log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+        log::info!(
+            "Scheduling reconnect attempt {}/{} in {}ms",
+            attempt + 1,
+            Self::MAX_RECONNECT_ATTEMPTS,
+            delay_ms
+        );
 
         Timeout::new(delay_ms, move || {
             link.send_message(WsAction::Connect);
@@ -662,7 +672,7 @@ impl Component for AttendantsComponent {
         log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {
             Msg::OnSpeakingChanged(speaking) => {
-                log::trace!("LOCAL Speaking state changed to: {}", speaking);
+                log::trace!("LOCAL Speaking state changed to: {speaking}");
                 self.local_speaking = speaking;
                 true
             }
@@ -900,7 +910,7 @@ impl Component for AttendantsComponent {
                     Timeout::new(1640, move || {
                         link.send_message(Msg::ShowCopyToast(false));
                     })
-                        .forget();
+                    .forget();
                 }
                 true
             }

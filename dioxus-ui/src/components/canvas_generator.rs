@@ -51,7 +51,11 @@ pub fn generate_for_peer(
 
     // Use speaking state for the glowing border animation
     let speaking_class = if is_speaking { " speaking-tile" } else { "" };
-    let audio_speaking_class = if is_speaking { "audio-indicator speaking" } else { "audio-indicator" };
+    let audio_speaking_class = if is_speaking {
+        "audio-indicator speaking"
+    } else {
+        "audio-indicator"
+    };
 
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {

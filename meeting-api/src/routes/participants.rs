@@ -89,12 +89,7 @@ pub async fn join_meeting(
             // status with an observer token so the client can receive a push
             // notification when the host activates the meeting.
             let dn = display_name.unwrap_or(&email);
-            let observer = generate_observer_token(
-                &state.jwt_secret,
-                &email,
-                &meeting_id,
-                dn,
-            )?;
+            let observer = generate_observer_token(&state.jwt_secret, &email, &meeting_id, dn)?;
             let resp = ParticipantStatusResponse {
                 email: email.clone(),
                 display_name: display_name.map(String::from),

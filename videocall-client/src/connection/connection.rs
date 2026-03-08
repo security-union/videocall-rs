@@ -242,6 +242,7 @@ impl Drop for Connection {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_heartbeat_packet(
     userid: &str,
     video_enabled: &AtomicBool,
@@ -278,10 +279,7 @@ fn build_heartbeat_packet(
                     subsystem: "heartbeat",
                     stream_id: None,
                     ts_ms: videocall_diagnostics::now_ms(),
-                    metrics: vec![videocall_diagnostics::metric!(
-                        "encryption_failure",
-                        1u64
-                    )],
+                    metrics: vec![videocall_diagnostics::metric!("encryption_failure", 1u64)],
                 },
             );
         })
@@ -301,12 +299,11 @@ fn build_heartbeat_packet(
 }
 
 fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, String> {
-    let bytes = packet.write_to_bytes().map_err(|e| {
-        format!("Failed to serialize heartbeat packet: {e}")
-    })?;
-    aes.encrypt(&bytes).map_err(|e| {
-        format!("Failed to encrypt heartbeat packet: {e:?}")
-    })
+    let bytes = packet
+        .write_to_bytes()
+        .map_err(|e| format!("Failed to serialize heartbeat packet: {e}"))?;
+    aes.encrypt(&bytes)
+        .map_err(|e| format!("Failed to encrypt heartbeat packet: {e:?}"))
 }
 
 fn tap_callback<IN: 'static, OUT: 'static>(

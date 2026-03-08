@@ -196,8 +196,12 @@ impl Peer {
 
     fn reset(&mut self) -> Result<(), JsValue> {
         let sid_str = self.session_id.to_string();
-        let (mut audio, video, screen) =
-            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &sid_str, self.vad_threshold)?;
+        let (mut audio, video, screen) = Self::new_decoders(
+            &self.video_canvas_id,
+            &self.screen_canvas_id,
+            &sid_str,
+            self.vad_threshold,
+        )?;
 
         // Preserve the current mute state after reset
         audio.set_muted(!self.audio_enabled);
@@ -677,7 +681,7 @@ impl PeerDecodeManager {
             .map(|peer| peer.display_name.clone())
     }
 
-    pub fn is_peer_speaking(&self, key: &String) -> bool {
+    pub fn is_peer_speaking(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,
@@ -695,8 +699,8 @@ impl PeerDecodeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use protobuf::Message;
+    use std::cell::Cell;
     use videocall_types::protos::media_packet::media_packet::MediaType;
     use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -717,7 +721,12 @@ mod tests {
     impl MockAudioDecoder {
         fn new() -> (Self, Rc<Cell<bool>>) {
             let muted = Rc::new(Cell::new(true));
-            (Self { muted: muted.clone() }, muted)
+            (
+                Self {
+                    muted: muted.clone(),
+                },
+                muted,
+            )
         }
     }
 
@@ -1146,11 +1155,16 @@ mod tests {
         // Simulate the userid check from video_call_client.rs
         let my_userid = "charlie@example.com";
         let should_fire_callback = parsed.target_email == my_userid;
-        assert!(should_fire_callback, "callback should fire for matching userid");
+        assert!(
+            should_fire_callback,
+            "callback should fire for matching userid"
+        );
 
         let other_userid = "observer@example.com";
         let should_not_fire = parsed.target_email == other_userid;
-        assert!(!should_not_fire, "callback should NOT fire for non-matching userid");
-
+        assert!(
+            !should_not_fire,
+            "callback should NOT fire for non-matching userid"
+        );
     }
 }

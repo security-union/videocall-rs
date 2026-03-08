@@ -33,11 +33,7 @@ pub fn normalize_spaces(s: &str) -> String {
 /// Only ASCII alphanumerics are permitted (not full Unicode) to prevent
 /// homoglyph / spoofing attacks.
 pub fn is_allowed_display_name_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric()
-        || ch == ' '
-        || ch == '_'
-        || ch == '-'
-        || ch == '\''
+    ch.is_ascii_alphanumeric() || ch == ' ' || ch == '_' || ch == '-' || ch == '\''
 }
 
 /// Convert an email address (or its local-part) into a title-cased display name.

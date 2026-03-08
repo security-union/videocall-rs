@@ -82,9 +82,7 @@ pub fn PeerList(
     let username_ctx = use_context::<UsernameCtx>();
     let current_user_name: Option<String> = (username_ctx.0)().clone();
 
-    let display_name = current_user_name
-        .clone()
-        .unwrap_or_default();
+    let display_name = current_user_name.clone().unwrap_or_default();
 
     // Check if current user is host
     let is_current_user_host = host_display_name

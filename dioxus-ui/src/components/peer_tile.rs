@@ -22,8 +22,8 @@ use std::rc::Rc;
 use crate::components::canvas_generator::generate_for_peer;
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
-use futures::future::Abortable;
 use futures::future::AbortHandle;
+use futures::future::Abortable;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 
 #[component]

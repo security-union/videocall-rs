@@ -448,9 +448,7 @@ impl VideoCallClient {
                 }
             }
             Err(_) => {
-                error!(
-                    "Unable to borrow connection_controller -- dropping {packet_type:?} packet"
-                )
+                error!("Unable to borrow connection_controller -- dropping {packet_type:?} packet")
             }
         }
     }
@@ -594,7 +592,7 @@ impl VideoCallClient {
         false
     }
 
-    pub fn is_speaking_for_peer(&self, key: &String) -> bool {
+    pub fn is_speaking_for_peer(&self, key: &str) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             return inner.peer_decode_manager.is_peer_speaking(key);
         }
@@ -1174,8 +1172,8 @@ impl Inner {
             iv: self.aes.iv.to_vec(),
             ..Default::default()
         }
-            .write_to_bytes()
-            .map_err(|e| anyhow!("Failed to serialize aes packet: {e}"))
+        .write_to_bytes()
+        .map_err(|e| anyhow!("Failed to serialize aes packet: {e}"))
     }
 
     fn encrypt_aes_packet(&self, aes_packet: &[u8], pub_key: &RsaPublicKey) -> Result<Vec<u8>> {

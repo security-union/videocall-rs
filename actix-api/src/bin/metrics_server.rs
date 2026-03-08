@@ -311,7 +311,12 @@ fn process_health_packet_to_metrics_pb(
                     {
                         let can_listen = peer_data.can_listen;
                         PEER_CAN_LISTEN
-                            .with_label_values(&[meeting_id, session_id, reporting_user_id, peer_id])
+                            .with_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporting_user_id,
+                                peer_id,
+                            ])
                             .set(if can_listen { 1.0 } else { 0.0 });
                         // Track to_peer used
                         let mut tracker = session_tracker.lock().unwrap();
@@ -325,7 +330,12 @@ fn process_health_packet_to_metrics_pb(
                     {
                         let can_see = peer_data.can_see;
                         PEER_CAN_SEE
-                            .with_label_values(&[meeting_id, session_id, reporting_user_id, peer_id])
+                            .with_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporting_user_id,
+                                peer_id,
+                            ])
                             .set(if can_see { 1.0 } else { 0.0 });
                         let mut tracker = session_tracker.lock().unwrap();
                         let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
@@ -529,14 +539,24 @@ fn process_health_packet_to_metrics_pb(
                     {
                         let audio_enabled = peer_data.audio_enabled;
                         PEER_AUDIO_ENABLED
-                            .with_label_values(&[meeting_id, session_id, reporting_user_id, peer_id])
+                            .with_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporting_user_id,
+                                peer_id,
+                            ])
                             .set(if audio_enabled { 1.0 } else { 0.0 });
                     }
 
                     {
                         let video_enabled = peer_data.video_enabled;
                         PEER_VIDEO_ENABLED
-                            .with_label_values(&[meeting_id, session_id, reporting_user_id, peer_id])
+                            .with_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporting_user_id,
+                                peer_id,
+                            ])
                             .set(if video_enabled { 1.0 } else { 0.0 });
                     }
                 }
@@ -1075,7 +1095,8 @@ mod tests {
         let meeting_id = "meeting_rm";
         let session_id = "session_rm";
         let reporting_user_id = "alice";
-        let packet = create_test_health_packet(session_id, meeting_id, reporting_user_id, peer_stats);
+        let packet =
+            create_test_health_packet(session_id, meeting_id, reporting_user_id, peer_stats);
         let result = process_health_packet_to_metrics_pb(&packet, &tracker);
         assert!(result.is_ok());
 

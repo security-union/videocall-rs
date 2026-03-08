@@ -753,7 +753,10 @@ mod tests {
             sent_packet.packet_type, received_packet.packet_type,
             "packet_type must match"
         );
-        assert_eq!(sent_packet.user_id, received_packet.user_id, "user_id must match");
+        assert_eq!(
+            sent_packet.user_id, received_packet.user_id,
+            "user_id must match"
+        );
         assert_eq!(sent_packet.data, received_packet.data, "data must match");
         // Verify that server added session_id (it should not be empty)
         assert!(

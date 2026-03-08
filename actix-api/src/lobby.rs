@@ -102,7 +102,9 @@ pub async fn ws_connect_authenticated(
     let room = claims.room;
     let observer = claims.observer;
 
-    debug!("socket connected (token-based) for user_id={user_id}, room={room}, observer={observer}");
+    debug!(
+        "socket connected (token-based) for user_id={user_id}, room={room}, observer={observer}"
+    );
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();

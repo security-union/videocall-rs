@@ -248,10 +248,7 @@ async fn update_connection_with_timestamp(
         },
     );
 
-    let user_key = format!(
-        "{}@{}_{}",
-        conn.user_id, conn.meeting_id, conn.region
-    );
+    let user_key = format!("{}@{}_{}", conn.user_id, conn.meeting_id, conn.region);
     snapshot.unique_users.insert(
         user_key,
         ConnectionData {

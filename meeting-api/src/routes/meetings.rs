@@ -188,8 +188,9 @@ pub async fn get_meeting(
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
         state: row.state.unwrap_or_else(|| "idle".to_string()),
-        host: row.creator_id.unwrap_or_default(),
+        host: row.creator_id.clone().unwrap_or_default(),
         host_display_name: row.host_display_name,
+        host_user_id: row.creator_id,
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         participant_count,
@@ -247,8 +248,9 @@ pub async fn end_meeting_handler(
         return Ok(Json(APIResponse::ok(MeetingInfoResponse {
             meeting_id: meeting.room_id,
             state: "ended".to_string(),
-            host: meeting.creator_id.unwrap_or_default(),
+            host: meeting.creator_id.clone().unwrap_or_default(),
             host_display_name: meeting.host_display_name,
+            host_user_id: meeting.creator_id,
             has_password: meeting.password_hash.is_some(),
             waiting_room_enabled: meeting.waiting_room_enabled,
             participant_count,
@@ -274,8 +276,9 @@ pub async fn end_meeting_handler(
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
         state: row.state.unwrap_or_else(|| "idle".to_string()),
-        host: row.creator_id.unwrap_or_default(),
+        host: row.creator_id.clone().unwrap_or_default(),
         host_display_name: row.host_display_name,
+        host_user_id: row.creator_id,
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         participant_count,
@@ -331,8 +334,9 @@ pub async fn update_meeting(
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
         state: row.state.unwrap_or_else(|| "idle".to_string()),
-        host: row.creator_id.unwrap_or_default(),
+        host: row.creator_id.clone().unwrap_or_default(),
         host_display_name: row.host_display_name,
+        host_user_id: row.creator_id,
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         participant_count,

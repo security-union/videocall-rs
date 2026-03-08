@@ -11,12 +11,16 @@ mod routing;
 mod types;
 
 use crate::routing::Route;
-use context::{load_display_name_from_storage, DisplayNameCtx};
+use context::{load_display_name_from_storage, migrate_legacy_storage, DisplayNameCtx};
 use dioxus::prelude::*;
 use matomo_logger::{MatomoConfig, MatomoLogger};
 
 fn main() {
     console_error_panic_hook::set_once();
+
+    // Migrate any legacy localStorage keys before the router renders so that
+    // returning users keep their display name without re-entry.
+    migrate_legacy_storage();
 
     let _ = MatomoLogger::init(MatomoConfig {
         base_url: Some("https://matomo.videocall.rs/".into()),

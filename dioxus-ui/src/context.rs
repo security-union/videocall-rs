@@ -83,6 +83,75 @@ pub fn clear_display_name_from_storage() {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent local user ID
+// ---------------------------------------------------------------------------
+
+const USER_ID_STORAGE_KEY: &str = "vc_user_id";
+
+/// Get or create a persistent local user ID.
+///
+/// When OAuth is enabled the meeting API provides the `user_id` from the
+/// identity service.  When OAuth is disabled we generate a unique identifier
+/// and persist it in `localStorage` so the same browser always presents the
+/// same identity.
+pub fn get_or_create_local_user_id() -> String {
+    let window = web_sys::window().expect("no window");
+    if let Some(storage) = window.local_storage().ok().flatten() {
+        if let Ok(Some(id)) = storage.get_item(USER_ID_STORAGE_KEY) {
+            if !id.is_empty() {
+                return id;
+            }
+        }
+        let id = generate_uuid();
+        let _ = storage.set_item(USER_ID_STORAGE_KEY, &id);
+        id
+    } else {
+        // localStorage unavailable — generate an ephemeral ID.
+        generate_uuid()
+    }
+}
+
+/// Generate a unique identifier from the current timestamp and a random
+/// component.  We intentionally avoid pulling in the `uuid` crate to keep
+/// the WASM binary small.
+fn generate_uuid() -> String {
+    use js_sys::Math;
+    let millis = web_time::SystemTime::now()
+        .duration_since(web_time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let rand = (Math::random() * 1_000_000_000.0) as u64;
+    format!("{millis:x}-{rand:x}")
+}
+
+// ---------------------------------------------------------------------------
+// Legacy storage migration
+// ---------------------------------------------------------------------------
+
+/// Migrate old `localStorage` keys to their current names (one-time).
+///
+/// Earlier builds stored the display name under `vc_username`.  This helper
+/// copies the value to `vc_display_name` and removes the old key so that
+/// returning users keep their name without manual re-entry.
+pub fn migrate_legacy_storage() {
+    let window = web_sys::window().expect("no window");
+    if let Some(storage) = window.local_storage().ok().flatten() {
+        // Migrate vc_username -> vc_display_name
+        if storage
+            .get_item(STORAGE_KEY)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            if let Ok(Some(old_val)) = storage.get_item("vc_username") {
+                let _ = storage.set_item(STORAGE_KEY, &old_val);
+                let _ = storage.remove_item("vc_username");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Validation helpers (re-exported from shared crate)
 // ---------------------------------------------------------------------------
 

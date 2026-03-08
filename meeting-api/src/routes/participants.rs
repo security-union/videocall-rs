@@ -80,6 +80,7 @@ pub async fn join_meeting(
         let mut resp = row.into_participant_status(Some(token));
         resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
         resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
+        resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
     } else {
         // Attendee: must wait for admission if meeting is active.
@@ -106,6 +107,7 @@ pub async fn join_meeting(
                 observer_token: Some(observer),
                 waiting_room_enabled: Some(meeting.waiting_room_enabled),
                 host_display_name: meeting.host_display_name,
+                host_user_id: meeting.creator_id,
             };
             return Ok(Json(APIResponse::ok(resp)));
         }
@@ -144,6 +146,7 @@ pub async fn join_meeting(
         }
         resp.waiting_room_enabled = Some(waiting_room_enabled);
         resp.host_display_name = meeting.host_display_name;
+        resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
     }
 }
@@ -185,6 +188,7 @@ pub async fn get_my_status(
     let mut resp = row.into_participant_status(token);
     resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
     resp.host_display_name = meeting.host_display_name;
+    resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
 }
 

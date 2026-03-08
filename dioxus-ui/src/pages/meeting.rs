@@ -17,7 +17,7 @@ use crate::constants::{
     actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled,
     webtransport_host_base,
 };
-use crate::context::{load_display_name_from_storage, save_display_name_to_storage, validate_display_name, DisplayNameCtx};
+use crate::context::{get_or_create_local_user_id, load_display_name_from_storage, save_display_name_to_storage, validate_display_name, DisplayNameCtx};
 use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
@@ -214,7 +214,12 @@ pub fn MeetingPage(id: String) -> Element {
 
                             match join_meeting(&meeting_id, Some(&display_name)).await {
                                 Ok(response) => {
-                                    current_user_id.set(Some(response.user_id.clone()));
+                                    let effective_user_id = if response.user_id.is_empty() {
+                                        get_or_create_local_user_id()
+                                    } else {
+                                        response.user_id.clone()
+                                    };
+                                    current_user_id.set(Some(effective_user_id));
                                     let determined_host = response.host_display_name.clone();
                                     let wr_enabled =
                                         response.waiting_room_enabled.unwrap_or(true);
@@ -310,7 +315,15 @@ pub fn MeetingPage(id: String) -> Element {
             wasm_bindgen_futures::spawn_local(async move {
                 match join_meeting(&meeting_id, Some(&display_name)).await {
                     Ok(response) => {
-                        current_user_id.set(Some(response.user_id.clone()));
+                        // Use the API-provided user_id when available;
+                        // fall back to a locally-generated stable UUID
+                        // so non-OAuth users still get a persistent identity.
+                        let effective_user_id = if response.user_id.is_empty() {
+                            get_or_create_local_user_id()
+                        } else {
+                            response.user_id.clone()
+                        };
+                        current_user_id.set(Some(effective_user_id));
                         let determined_host = if response.is_host {
                             Some(display_name.clone())
                         } else {
@@ -447,7 +460,9 @@ pub fn MeetingPage(id: String) -> Element {
                     webtransport_enabled: webtransport_enabled().unwrap_or(false),
                     e2ee_enabled: e2ee_enabled().unwrap_or(false),
                     user_name: user_profile().as_ref().map(|p| p.name.clone()),
-                    user_email: current_user_id().or_else(|| user_profile().as_ref().map(|p| p.user_id.clone())),
+                    user_email: current_user_id()
+                        .or_else(|| user_profile().as_ref().map(|p| p.user_id.clone()))
+                        .or_else(|| Some(get_or_create_local_user_id())),
                     on_logout: Some(EventHandler::new(on_logout)),
                     host_display_name: host_display_name.clone(),
                     auto_join: should_auto_join,

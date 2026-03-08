@@ -32,5 +32,6 @@ message MeetingPacket {
   string target_user_id = 7;
   // For ADMITTED: JWT to upgrade connection
   string room_token = 8;
+  uint64 session_id = 9;
 }
 

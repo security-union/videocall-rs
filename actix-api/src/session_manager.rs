@@ -156,6 +156,27 @@ impl SessionManager {
         wrapper.write_to_bytes().unwrap_or_default()
     }
 
+    /// Build PARTICIPANT_LEFT packet to notify remaining peers about a departed session
+    pub fn build_peer_left_packet(room_id: &str, user_id: &str, session_id: u64) -> Vec<u8> {
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_LEFT.into(),
+            room_id: room_id.to_string(),
+            message: format!("{} has left the meeting", user_id),
+            target_user_id: user_id.to_string(),
+            session_id,
+            ..Default::default()
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: SYSTEM_USER_ID.to_string(),
+            data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
     /// Build MEETING_ENDED packet to send to clients (protobuf)
     pub fn build_meeting_ended_packet(room_id: &str, message: &str) -> Vec<u8> {
         let meeting_packet = MeetingPacket {

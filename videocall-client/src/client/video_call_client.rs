@@ -960,9 +960,13 @@ impl Inner {
                     }
                     Ok(MeetingEventType::PARTICIPANT_LEFT) => {
                         info!(
-                            "Received PARTICIPANT_LEFT: room={}, count={}",
-                            meeting_packet.room_id, meeting_packet.participant_count
+                            "Received PARTICIPANT_LEFT: session_id={}, user={}",
+                            meeting_packet.session_id,
+                            meeting_packet.target_user_id,
                         );
+                        if meeting_packet.session_id != 0 {
+                            self.peer_decode_manager.delete_peer(meeting_packet.session_id);
+                        }
                     }
                     Ok(MeetingEventType::MEETING_ACTIVATED) => {
                         info!(

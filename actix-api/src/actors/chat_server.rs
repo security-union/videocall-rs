@@ -83,6 +83,7 @@ impl ChatServer {
             let user_id = uid.to_string();
             let session_manager = self.session_manager.clone();
             let nc = self.nats_connection.clone();
+            let session_id_val = *session_id;
 
             tokio::spawn(async move {
                 match session_manager.end_session(&room_id, &user_id).await {
@@ -109,6 +110,16 @@ impl ChatServer {
                             "Participant {} left room {}, {} remaining",
                             user_id, room_id, remaining_count
                         );
+                        // Notify remaining peers about the departed session
+                        let bytes = SessionManager::build_peer_left_packet(
+                            &room_id,
+                            &user_id,
+                            session_id_val,
+                        );
+                        let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                        if let Err(e) = nc.publish(subject, bytes.into()).await {
+                            error!("Error publishing PARTICIPANT_LEFT: {}", e);
+                        }
                     }
                     Err(e) => {
                         error!("Error ending session for room {}: {}", room_id, e);

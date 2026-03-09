@@ -142,7 +142,10 @@ async fn test_waiting_for_meeting_observer_token_is_valid_jwt() {
     assert_eq!(claims.sub, "attendee@example.com");
     assert_eq!(claims.room, room_id);
     assert!(claims.observer, "Observer token must have observer=true");
-    assert!(!claims.room_join, "Observer token must have room_join=false");
+    assert!(
+        !claims.room_join,
+        "Observer token must have room_join=false"
+    );
     assert!(!claims.is_host);
 
     cleanup_test_data(&pool, room_id).await;
@@ -288,7 +291,10 @@ async fn test_waiting_for_meeting_with_display_name() {
         "Display name should be echoed in the response"
     );
 
-    let token = body.result.observer_token.expect("should have observer_token");
+    let token = body
+        .result
+        .observer_token
+        .expect("should have observer_token");
     let claims = decode_token(&token);
     assert_eq!(claims.display_name, "Alice Wonderland");
 
@@ -343,13 +349,9 @@ async fn test_admit_and_reject_work_with_nats_none() {
 
     for email in &["alice@example.com", "bob@example.com"] {
         let app = build_app(pool.clone());
-        let req = request_with_cookie(
-            "POST",
-            &format!("/api/v1/meetings/{room_id}/join"),
-            email,
-        )
-        .body(Body::empty())
-        .unwrap();
+        let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/join"), email)
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -431,10 +433,9 @@ async fn test_admit_all_works_with_nats_none() {
     for i in 1..=3 {
         let app = build_app(pool.clone());
         let email = format!("attendee{i}@example.com");
-        let req =
-            request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/join"), &email)
-                .body(Body::empty())
-                .unwrap();
+        let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/join"), &email)
+            .body(Body::empty())
+            .unwrap();
         let _ = app.oneshot(req).await.unwrap();
     }
 

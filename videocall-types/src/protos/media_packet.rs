@@ -31,7 +31,7 @@ pub struct MediaPacket {
     // @@protoc_insertion_point(field:MediaPacket.media_type)
     pub media_type: ::protobuf::EnumOrUnknown<media_packet::MediaType>,
     // @@protoc_insertion_point(field:MediaPacket.user_id)
-    pub user_id: ::std::string::String,
+    pub user_id: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:MediaPacket.data)
     pub data: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:MediaPacket.frame_type)
@@ -132,7 +132,7 @@ impl ::protobuf::Message for MediaPacket {
                     self.media_type = is.read_enum_or_unknown()?;
                 },
                 18 => {
-                    self.user_id = is.read_string()?;
+                    self.user_id = is.read_bytes()?;
                 },
                 26 => {
                     self.data = is.read_bytes()?;
@@ -171,7 +171,7 @@ impl ::protobuf::Message for MediaPacket {
             my_size += ::protobuf::rt::int32_size(1, self.media_type.value());
         }
         if !self.user_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(2, &self.user_id);
+            my_size += ::protobuf::rt::bytes_size(2, &self.user_id);
         }
         if !self.data.is_empty() {
             my_size += ::protobuf::rt::bytes_size(3, &self.data);
@@ -207,7 +207,7 @@ impl ::protobuf::Message for MediaPacket {
             os.write_enum(1, ::protobuf::EnumOrUnknown::value(&self.media_type))?;
         }
         if !self.user_id.is_empty() {
-            os.write_string(2, &self.user_id)?;
+            os.write_bytes(2, &self.user_id)?;
         }
         if !self.data.is_empty() {
             os.write_bytes(3, &self.data)?;
@@ -262,7 +262,7 @@ impl ::protobuf::Message for MediaPacket {
     fn default_instance() -> &'static MediaPacket {
         static instance: MediaPacket = MediaPacket {
             media_type: ::protobuf::EnumOrUnknown::from_i32(0),
-            user_id: ::std::string::String::new(),
+            user_id: ::std::vec::Vec::new(),
             data: ::std::vec::Vec::new(),
             frame_type: ::std::string::String::new(),
             timestamp: 0.,
@@ -960,7 +960,7 @@ impl VideoCodec {
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x18types/media_packet.proto\"\xda\x03\n\x0bMediaPacket\x125\n\nmedia_\
     type\x18\x01\x20\x01(\x0e2\x16.MediaPacket.MediaTypeR\tmediaType\x12\x17\
-    \n\x07user_id\x18\x02\x20\x01(\tR\x06userId\x12\x12\n\x04data\x18\x03\
+    \n\x07user_id\x18\x02\x20\x01(\x0cR\x06userId\x12\x12\n\x04data\x18\x03\
     \x20\x01(\x0cR\x04data\x12\x1d\n\nframe_type\x18\x04\x20\x01(\tR\tframeT\
     ype\x12\x1c\n\ttimestamp\x18\x05\x20\x01(\x01R\ttimestamp\x12\x1a\n\x08d\
     uration\x18\x06\x20\x01(\x01R\x08duration\x125\n\x0eaudio_metadata\x18\
@@ -1002,18 +1002,18 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \0\x04\0\x02\x05\x02\x12\x03\t\n\x0b\n\x0b\n\x04\x04\0\x02\0\x12\x03\x0b\
     \x02\x1b\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03\x0b\x02\x0b\n\x0c\n\x05\x04\
     \0\x02\0\x01\x12\x03\x0b\x0c\x16\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x0b\
-    \x19\x1a\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x0c\x02\x15\n\x0c\n\x05\x04\0\
-    \x02\x01\x05\x12\x03\x0c\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\
-    \x0c\t\x10\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x0c\x13\x14\n\x0b\n\x04\
-    \x04\0\x02\x02\x12\x03\r\x02\x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\r\
-    \x02\x07\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\r\x08\x0c\n\x0c\n\x05\x04\
-    \0\x02\x02\x03\x12\x03\r\x0f\x10\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x0e\
-    \x02\x18\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x0e\x02\x08\n\x0c\n\x05\
-    \x04\0\x02\x03\x01\x12\x03\x0e\t\x13\n\x0c\n\x05\x04\0\x02\x03\x03\x12\
-    \x03\x0e\x16\x17\n\x0b\n\x04\x04\0\x02\x04\x12\x03\x0f\x02\x17\n\x0c\n\
-    \x05\x04\0\x02\x04\x05\x12\x03\x0f\x02\x08\n\x0c\n\x05\x04\0\x02\x04\x01\
-    \x12\x03\x0f\t\x12\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x0f\x15\x16\n\
-    \x0b\n\x04\x04\0\x02\x05\x12\x03\x10\x02\x16\n\x0c\n\x05\x04\0\x02\x05\
+    \x19\x1a\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x0c\x02\x14\n\x0c\n\x05\x04\0\
+    \x02\x01\x05\x12\x03\x0c\x02\x07\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\
+    \x0c\x08\x0f\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x0c\x12\x13\n\x0b\n\
+    \x04\x04\0\x02\x02\x12\x03\r\x02\x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\
+    \x03\r\x02\x07\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\r\x08\x0c\n\x0c\n\
+    \x05\x04\0\x02\x02\x03\x12\x03\r\x0f\x10\n\x0b\n\x04\x04\0\x02\x03\x12\
+    \x03\x0e\x02\x18\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x0e\x02\x08\n\x0c\
+    \n\x05\x04\0\x02\x03\x01\x12\x03\x0e\t\x13\n\x0c\n\x05\x04\0\x02\x03\x03\
+    \x12\x03\x0e\x16\x17\n\x0b\n\x04\x04\0\x02\x04\x12\x03\x0f\x02\x17\n\x0c\
+    \n\x05\x04\0\x02\x04\x05\x12\x03\x0f\x02\x08\n\x0c\n\x05\x04\0\x02\x04\
+    \x01\x12\x03\x0f\t\x12\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x0f\x15\x16\
+    \n\x0b\n\x04\x04\0\x02\x05\x12\x03\x10\x02\x16\n\x0c\n\x05\x04\0\x02\x05\
     \x05\x12\x03\x10\x02\x08\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x10\t\x11\
     \n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\x10\x14\x15\n\x0b\n\x04\x04\0\x02\
     \x06\x12\x03\x11\x02#\n\x0c\n\x05\x04\0\x02\x06\x06\x12\x03\x11\x02\x0f\

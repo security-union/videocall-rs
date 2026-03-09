@@ -10,7 +10,7 @@ message MediaPacket {
     RTT = 5;  // Client to Server RTT
   }
   MediaType media_type = 1;
-  string user_id = 2;
+  bytes user_id = 2;
   bytes data = 3;
   string frame_type = 4;
   double timestamp = 5;

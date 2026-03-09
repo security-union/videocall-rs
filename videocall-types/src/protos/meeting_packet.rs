@@ -38,12 +38,12 @@ pub struct MeetingPacket {
     // @@protoc_insertion_point(field:MeetingPacket.message)
     pub message: ::std::string::String,
     // @@protoc_insertion_point(field:MeetingPacket.creator_id)
-    pub creator_id: ::std::string::String,
+    pub creator_id: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:MeetingPacket.participant_count)
     pub participant_count: i64,
     ///  For ADMITTED/REJECTED: affected user's ID
     // @@protoc_insertion_point(field:MeetingPacket.target_user_id)
-    pub target_user_id: ::std::string::String,
+    pub target_user_id: ::std::vec::Vec<u8>,
     ///  For ADMITTED: JWT to upgrade connection
     // @@protoc_insertion_point(field:MeetingPacket.room_token)
     pub room_token: ::std::string::String,
@@ -144,13 +144,13 @@ impl ::protobuf::Message for MeetingPacket {
                     self.message = is.read_string()?;
                 },
                 42 => {
-                    self.creator_id = is.read_string()?;
+                    self.creator_id = is.read_bytes()?;
                 },
                 48 => {
                     self.participant_count = is.read_int64()?;
                 },
                 58 => {
-                    self.target_user_id = is.read_string()?;
+                    self.target_user_id = is.read_bytes()?;
                 },
                 66 => {
                     self.room_token = is.read_string()?;
@@ -183,13 +183,13 @@ impl ::protobuf::Message for MeetingPacket {
             my_size += ::protobuf::rt::string_size(4, &self.message);
         }
         if !self.creator_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(5, &self.creator_id);
+            my_size += ::protobuf::rt::bytes_size(5, &self.creator_id);
         }
         if self.participant_count != 0 {
             my_size += ::protobuf::rt::int64_size(6, self.participant_count);
         }
         if !self.target_user_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(7, &self.target_user_id);
+            my_size += ::protobuf::rt::bytes_size(7, &self.target_user_id);
         }
         if !self.room_token.is_empty() {
             my_size += ::protobuf::rt::string_size(8, &self.room_token);
@@ -216,13 +216,13 @@ impl ::protobuf::Message for MeetingPacket {
             os.write_string(4, &self.message)?;
         }
         if !self.creator_id.is_empty() {
-            os.write_string(5, &self.creator_id)?;
+            os.write_bytes(5, &self.creator_id)?;
         }
         if self.participant_count != 0 {
             os.write_int64(6, self.participant_count)?;
         }
         if !self.target_user_id.is_empty() {
-            os.write_string(7, &self.target_user_id)?;
+            os.write_bytes(7, &self.target_user_id)?;
         }
         if !self.room_token.is_empty() {
             os.write_string(8, &self.room_token)?;
@@ -265,9 +265,9 @@ impl ::protobuf::Message for MeetingPacket {
             room_id: ::std::string::String::new(),
             start_time_ms: 0,
             message: ::std::string::String::new(),
-            creator_id: ::std::string::String::new(),
+            creator_id: ::std::vec::Vec::new(),
             participant_count: 0,
-            target_user_id: ::std::string::String::new(),
+            target_user_id: ::std::vec::Vec::new(),
             room_token: ::std::string::String::new(),
             session_id: 0,
             special_fields: ::protobuf::SpecialFields::new(),
@@ -398,12 +398,12 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     t_type\x18\x01\x20\x01(\x0e2\x1f.MeetingPacket.MeetingEventTypeR\teventT\
     ype\x12\x17\n\x07room_id\x18\x02\x20\x01(\tR\x06roomId\x12\"\n\rstart_ti\
     me_ms\x18\x03\x20\x01(\x04R\x0bstartTimeMs\x12\x18\n\x07message\x18\x04\
-    \x20\x01(\tR\x07message\x12\x1d\n\ncreator_id\x18\x05\x20\x01(\tR\tcreat\
-    orId\x12+\n\x11participant_count\x18\x06\x20\x01(\x03R\x10participantCou\
-    nt\x12$\n\x0etarget_user_id\x18\x07\x20\x01(\tR\x0ctargetUserId\x12\x1d\
-    \n\nroom_token\x18\x08\x20\x01(\tR\troomToken\x12\x1d\n\nsession_id\x18\
-    \t\x20\x01(\x04R\tsessionId\"\xed\x01\n\x10MeetingEventType\x12\x1e\n\
-    \x1aMEETING_EVENT_TYPE_UNKNOWN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\
+    \x20\x01(\tR\x07message\x12\x1d\n\ncreator_id\x18\x05\x20\x01(\x0cR\tcre\
+    atorId\x12+\n\x11participant_count\x18\x06\x20\x01(\x03R\x10participantC\
+    ount\x12$\n\x0etarget_user_id\x18\x07\x20\x01(\x0cR\x0ctargetUserId\x12\
+    \x1d\n\nroom_token\x18\x08\x20\x01(\tR\troomToken\x12\x1d\n\nsession_id\
+    \x18\t\x20\x01(\x04R\tsessionId\"\xed\x01\n\x10MeetingEventType\x12\x1e\
+    \n\x1aMEETING_EVENT_TYPE_UNKNOWN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\
     \x01\x12\x11\n\rMEETING_ENDED\x10\x02\x12\x16\n\x12PARTICIPANT_JOINED\
     \x10\x03\x12\x14\n\x10PARTICIPANT_LEFT\x10\x04\x12\x15\n\x11MEETING_ACTI\
     VATED\x10\x05\x12\x18\n\x14PARTICIPANT_ADMITTED\x10\x06\x12\x18\n\x14PAR\
@@ -450,22 +450,22 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x04\0\x02\x02\x03\x12\x03\x1a\x19\x1a\n\x0b\n\x04\x04\0\x02\x03\x12\x03\
     \x1b\x02\x15\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x1b\x02\x08\n\x0c\n\
     \x05\x04\0\x02\x03\x01\x12\x03\x1b\t\x10\n\x0c\n\x05\x04\0\x02\x03\x03\
-    \x12\x03\x1b\x13\x14\n\x0b\n\x04\x04\0\x02\x04\x12\x03\x1c\x02\x18\n\x0c\
-    \n\x05\x04\0\x02\x04\x05\x12\x03\x1c\x02\x08\n\x0c\n\x05\x04\0\x02\x04\
-    \x01\x12\x03\x1c\t\x13\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x1c\x16\x17\
-    \n\x0b\n\x04\x04\0\x02\x05\x12\x03\x1d\x02\x1e\n\x0c\n\x05\x04\0\x02\x05\
-    \x05\x12\x03\x1d\x02\x07\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x1d\x08\
-    \x19\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\x1d\x1c\x1d\n8\n\x04\x04\0\
-    \x02\x06\x12\x03\x1f\x02\x1c\x1a+\x20For\x20ADMITTED/REJECTED:\x20affect\
-    ed\x20user's\x20ID\n\n\x0c\n\x05\x04\0\x02\x06\x05\x12\x03\x1f\x02\x08\n\
-    \x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x1f\t\x17\n\x0c\n\x05\x04\0\x02\x06\
-    \x03\x12\x03\x1f\x1a\x1b\n6\n\x04\x04\0\x02\x07\x12\x03!\x02\x18\x1a)\
-    \x20For\x20ADMITTED:\x20JWT\x20to\x20upgrade\x20connection\n\n\x0c\n\x05\
-    \x04\0\x02\x07\x05\x12\x03!\x02\x08\n\x0c\n\x05\x04\0\x02\x07\x01\x12\
-    \x03!\t\x13\n\x0c\n\x05\x04\0\x02\x07\x03\x12\x03!\x16\x17\n\x0b\n\x04\
-    \x04\0\x02\x08\x12\x03\"\x02\x18\n\x0c\n\x05\x04\0\x02\x08\x05\x12\x03\"\
-    \x02\x08\n\x0c\n\x05\x04\0\x02\x08\x01\x12\x03\"\t\x13\n\x0c\n\x05\x04\0\
-    \x02\x08\x03\x12\x03\"\x16\x17b\x06proto3\
+    \x12\x03\x1b\x13\x14\n\x0b\n\x04\x04\0\x02\x04\x12\x03\x1c\x02\x17\n\x0c\
+    \n\x05\x04\0\x02\x04\x05\x12\x03\x1c\x02\x07\n\x0c\n\x05\x04\0\x02\x04\
+    \x01\x12\x03\x1c\x08\x12\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x1c\x15\
+    \x16\n\x0b\n\x04\x04\0\x02\x05\x12\x03\x1d\x02\x1e\n\x0c\n\x05\x04\0\x02\
+    \x05\x05\x12\x03\x1d\x02\x07\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x1d\
+    \x08\x19\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\x1d\x1c\x1d\n8\n\x04\x04\
+    \0\x02\x06\x12\x03\x1f\x02\x1b\x1a+\x20For\x20ADMITTED/REJECTED:\x20affe\
+    cted\x20user's\x20ID\n\n\x0c\n\x05\x04\0\x02\x06\x05\x12\x03\x1f\x02\x07\
+    \n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x1f\x08\x16\n\x0c\n\x05\x04\0\x02\
+    \x06\x03\x12\x03\x1f\x19\x1a\n6\n\x04\x04\0\x02\x07\x12\x03!\x02\x18\x1a\
+    )\x20For\x20ADMITTED:\x20JWT\x20to\x20upgrade\x20connection\n\n\x0c\n\
+    \x05\x04\0\x02\x07\x05\x12\x03!\x02\x08\n\x0c\n\x05\x04\0\x02\x07\x01\
+    \x12\x03!\t\x13\n\x0c\n\x05\x04\0\x02\x07\x03\x12\x03!\x16\x17\n\x0b\n\
+    \x04\x04\0\x02\x08\x12\x03\"\x02\x18\n\x0c\n\x05\x04\0\x02\x08\x05\x12\
+    \x03\"\x02\x08\n\x0c\n\x05\x04\0\x02\x08\x01\x12\x03\"\t\x13\n\x0c\n\x05\
+    \x04\0\x02\x08\x03\x12\x03\"\x16\x17b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

@@ -712,12 +712,12 @@ mod tests {
         // Craft a MEDIA packet that is not RTT and not health
         let media = VcMediaPacket {
             media_type: VcMediaType::AUDIO.into(),
-            user_id: user_a.to_string(),
+            user_id: user_a.as_bytes().to_vec(),
             ..Default::default()
         };
         let packet = VcPacketWrapper {
             packet_type: VcPacketType::MEDIA.into(),
-            user_id: user_a.to_string(),
+            user_id: user_a.as_bytes().to_vec(),
             data: media.write_to_bytes().expect("serialize media"),
             ..Default::default()
         };
@@ -1087,12 +1087,12 @@ mod tests {
     fn create_test_packet(sender: &str, media_type: VcMediaType, _message: String) -> Vec<u8> {
         let media = VcMediaPacket {
             media_type: media_type.into(),
-            user_id: sender.to_string(),
+            user_id: sender.as_bytes().to_vec(),
             ..Default::default()
         };
         let packet = VcPacketWrapper {
             packet_type: VcPacketType::MEDIA.into(),
-            user_id: sender.to_string(),
+            user_id: sender.as_bytes().to_vec(),
             data: media.write_to_bytes().expect("serialize media"),
             ..Default::default()
         };

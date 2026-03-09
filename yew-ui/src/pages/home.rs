@@ -28,7 +28,7 @@ use crate::constants::oauth_enabled;
 use crate::context::{
     clear_display_name_from_storage, email_to_display_name, is_valid_meeting_id,
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    DISPLAY_NAME_MAX_LEN, DisplayNameCtx,
+    DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
 };
 use crate::routing::Route;
 use web_time::SystemTime;

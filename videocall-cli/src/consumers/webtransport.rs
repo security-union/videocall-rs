@@ -54,7 +54,7 @@ impl WebTransportClient {
         };
         let packet = PacketWrapper {
             packet_type: PacketType::CONNECTION.into(),
-            user_id: self.options.user_id.clone(),
+            user_id: self.options.user_id.as_bytes().to_vec(),
             data: connection_packet.write_to_bytes()?,
             ..Default::default()
         };
@@ -93,7 +93,7 @@ impl WebTransportClient {
                 interval.tick().await;
                 let actual_heartbeat = MediaPacket {
                     media_type: MediaType::HEARTBEAT.into(),
-                    user_id: email.clone(),
+                    user_id: email.as_bytes().to_vec(),
                     timestamp: now_ms as f64,
                     heartbeat_metadata: Some(HeartbeatMetadata {
                         video_enabled: true,
@@ -104,7 +104,7 @@ impl WebTransportClient {
                 };
 
                 let packet = PacketWrapper {
-                    user_id: email.clone(),
+                    user_id: email.as_bytes().to_vec(),
                     packet_type: PacketType::MEDIA.into(),
                     data: actual_heartbeat.write_to_bytes().unwrap(),
                     ..Default::default()

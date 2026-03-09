@@ -139,7 +139,8 @@ pub async fn reject_participant(
         .await?
         .ok_or_else(|| AppError::participant_not_found(&body.user_id))?;
 
-    nats_events::publish_participant_rejected(state.nats.as_ref(), &meeting_id, &body.user_id).await;
+    nats_events::publish_participant_rejected(state.nats.as_ref(), &meeting_id, &body.user_id)
+        .await;
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }

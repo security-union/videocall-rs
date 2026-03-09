@@ -173,7 +173,7 @@ pub struct ConnectionMetadata {
     // @@protoc_insertion_point(field:server_connection_packet.ConnectionMetadata.session_id)
     pub session_id: ::std::string::String,
     // @@protoc_insertion_point(field:server_connection_packet.ConnectionMetadata.user_id)
-    pub user_id: ::std::string::String,
+    pub user_id: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:server_connection_packet.ConnectionMetadata.meeting_id)
     pub meeting_id: ::std::string::String,
     // @@protoc_insertion_point(field:server_connection_packet.ConnectionMetadata.protocol)
@@ -253,7 +253,7 @@ impl ::protobuf::Message for ConnectionMetadata {
                     self.session_id = is.read_string()?;
                 },
                 18 => {
-                    self.user_id = is.read_string()?;
+                    self.user_id = is.read_bytes()?;
                 },
                 26 => {
                     self.meeting_id = is.read_string()?;
@@ -283,7 +283,7 @@ impl ::protobuf::Message for ConnectionMetadata {
             my_size += ::protobuf::rt::string_size(1, &self.session_id);
         }
         if !self.user_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(2, &self.user_id);
+            my_size += ::protobuf::rt::bytes_size(2, &self.user_id);
         }
         if !self.meeting_id.is_empty() {
             my_size += ::protobuf::rt::string_size(3, &self.meeting_id);
@@ -307,7 +307,7 @@ impl ::protobuf::Message for ConnectionMetadata {
             os.write_string(1, &self.session_id)?;
         }
         if !self.user_id.is_empty() {
-            os.write_string(2, &self.user_id)?;
+            os.write_bytes(2, &self.user_id)?;
         }
         if !self.meeting_id.is_empty() {
             os.write_string(3, &self.meeting_id)?;
@@ -350,7 +350,7 @@ impl ::protobuf::Message for ConnectionMetadata {
     fn default_instance() -> &'static ConnectionMetadata {
         static instance: ConnectionMetadata = ConnectionMetadata {
             session_id: ::std::string::String::new(),
-            user_id: ::std::string::String::new(),
+            user_id: ::std::vec::Vec::new(),
             meeting_id: ::std::string::String::new(),
             protocol: ::std::string::String::new(),
             server_instance: ::std::string::String::new(),
@@ -673,7 +673,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \"X\n\x10DataTransferInfo\x12\x1d\n\nbytes_sent\x18\x01\x20\x01(\x04R\tb\
     ytesSent\x12%\n\x0ebytes_received\x18\x02\x20\x01(\x04R\rbytesReceived\"\
     \xc8\x01\n\x12ConnectionMetadata\x12\x1d\n\nsession_id\x18\x01\x20\x01(\
-    \tR\tsessionId\x12\x17\n\x07user_id\x18\x02\x20\x01(\tR\x06userId\x12\
+    \tR\tsessionId\x12\x17\n\x07user_id\x18\x02\x20\x01(\x0cR\x06userId\x12\
     \x1d\n\nmeeting_id\x18\x03\x20\x01(\tR\tmeetingId\x12\x1a\n\x08protocol\
     \x18\x04\x20\x01(\tR\x08protocol\x12'\n\x0fserver_instance\x18\x05\x20\
     \x01(\tR\x0eserverInstance\x12\x16\n\x06region\x18\x06\x20\x01(\tR\x06re\
@@ -709,10 +709,10 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \n\n\x03\x04\x01\x01\x12\x03\x13\x08\x1a\n\x0b\n\x04\x04\x01\x02\0\x12\
     \x03\x14\x02\x18\n\x0c\n\x05\x04\x01\x02\0\x05\x12\x03\x14\x02\x08\n\x0c\
     \n\x05\x04\x01\x02\0\x01\x12\x03\x14\t\x13\n\x0c\n\x05\x04\x01\x02\0\x03\
-    \x12\x03\x14\x16\x17\n\x0b\n\x04\x04\x01\x02\x01\x12\x03\x15\x02\x15\n\
-    \x0c\n\x05\x04\x01\x02\x01\x05\x12\x03\x15\x02\x08\n\x0c\n\x05\x04\x01\
-    \x02\x01\x01\x12\x03\x15\t\x10\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03\
-    \x15\x13\x14\n\x0b\n\x04\x04\x01\x02\x02\x12\x03\x16\x02\x18\n\x0c\n\x05\
+    \x12\x03\x14\x16\x17\n\x0b\n\x04\x04\x01\x02\x01\x12\x03\x15\x02\x14\n\
+    \x0c\n\x05\x04\x01\x02\x01\x05\x12\x03\x15\x02\x07\n\x0c\n\x05\x04\x01\
+    \x02\x01\x01\x12\x03\x15\x08\x0f\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03\
+    \x15\x12\x13\n\x0b\n\x04\x04\x01\x02\x02\x12\x03\x16\x02\x18\n\x0c\n\x05\
     \x04\x01\x02\x02\x05\x12\x03\x16\x02\x08\n\x0c\n\x05\x04\x01\x02\x02\x01\
     \x12\x03\x16\t\x13\n\x0c\n\x05\x04\x01\x02\x02\x03\x12\x03\x16\x16\x17\n\
     2\n\x04\x04\x01\x02\x03\x12\x03\x17\x02\x16\"%\x20\"websocket\",\x20\"we\

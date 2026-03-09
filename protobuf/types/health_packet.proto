@@ -50,7 +50,7 @@ message PeerStats {
 message HealthPacket {
   string session_id = 1;
   string meeting_id = 2;
-  string reporting_user_id = 3;
+  bytes reporting_user_id = 3;
   uint64 timestamp_ms = 4;
 
   // Sender self-reported state (authoritative)

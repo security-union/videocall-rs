@@ -127,9 +127,7 @@ impl Component for PeerList {
                                 ("audio_enabled", MetricValue::U64(v)) => {
                                     audio_enabled = Some(*v != 0)
                                 }
-                                ("is_speaking", MetricValue::U64(v)) => {
-                                    is_speaking = Some(*v != 0)
-                                }
+                                ("is_speaking", MetricValue::U64(v)) => is_speaking = Some(*v != 0),
                                 _ => {}
                             }
                         }
@@ -213,11 +211,14 @@ impl Component for PeerList {
             .filter(|peer| {
                 // Resolve session_id to display name for search filtering
                 let display_name = if let Some(ref client) = client_ctx {
-                    client.get_peer_user_id(peer).unwrap_or_else(|| (*peer).clone())
+                    client
+                        .get_peer_user_id(peer)
+                        .unwrap_or_else(|| (*peer).clone())
                 } else {
                     (*peer).clone()
                 };
-                display_name.to_lowercase()
+                display_name
+                    .to_lowercase()
                     .contains(&self.search_query.to_lowercase())
             })
             .cloned()

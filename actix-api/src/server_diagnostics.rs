@@ -192,7 +192,7 @@ impl ServerDiagnostics {
     ) -> ConnectionMetadata {
         let mut metadata = ConnectionMetadata::new();
         metadata.session_id = session_id.to_string();
-        metadata.user_id = user_id.to_string();
+        metadata.user_id = user_id.as_bytes().to_vec();
         metadata.meeting_id = meeting_id.to_string();
         metadata.protocol = protocol.to_string();
         metadata.server_instance = self.server_instance.clone();

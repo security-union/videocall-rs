@@ -285,7 +285,9 @@ pub async fn check_session(AuthUser { .. }: AuthUser) -> StatusCode {
 ///
 /// Because the session JWT embeds both user ID and display name, this endpoint
 /// does not need a database query.
-pub async fn get_profile(AuthUser { user_id, name }: AuthUser) -> Json<APIResponse<ProfileResponse>> {
+pub async fn get_profile(
+    AuthUser { user_id, name }: AuthUser,
+) -> Json<APIResponse<ProfileResponse>> {
     Json(APIResponse::ok(ProfileResponse { user_id, name }))
 }
 

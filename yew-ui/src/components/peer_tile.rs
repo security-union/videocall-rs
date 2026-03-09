@@ -113,9 +113,7 @@ impl Component for PeerTile {
                                 ("screen_enabled", MetricValue::U64(v)) => {
                                     screen_enabled = Some(*v != 0)
                                 }
-                                ("is_speaking", MetricValue::U64(v)) => {
-                                    is_speaking = Some(*v != 0)
-                                }
+                                ("is_speaking", MetricValue::U64(v)) => is_speaking = Some(*v != 0),
                                 _ => {}
                             }
                         }

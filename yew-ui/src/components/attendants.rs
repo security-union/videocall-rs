@@ -36,8 +36,8 @@ use crate::constants::{
 use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
-use std::collections::HashMap;
 use log::{error, warn};
+use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
@@ -279,7 +279,8 @@ impl AttendantsComponent {
         #[cfg(not(feature = "media-server-jwt-auth"))]
         let token = String::new();
 
-        let (websocket_urls, webtransport_urls) = Self::build_lobby_urls(&token, &display_name, &id);
+        let (websocket_urls, webtransport_urls) =
+            Self::build_lobby_urls(&token, &display_name, &id);
 
         log::info!(
             "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}, jwt_auth={}",
@@ -295,7 +296,11 @@ impl AttendantsComponent {
         log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
 
         let opts = VideoCallClientOptions {
-            user_id: ctx.props().user_id.clone().unwrap_or_else(|| display_name.clone()),
+            user_id: ctx
+                .props()
+                .user_id
+                .clone()
+                .unwrap_or_else(|| display_name.clone()),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -516,7 +521,12 @@ impl AttendantsComponent {
             }
         };
 
-        log::info!("Scheduling token refresh attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+        log::info!(
+            "Scheduling token refresh attempt {}/{} in {}ms",
+            attempt + 1,
+            Self::MAX_RECONNECT_ATTEMPTS,
+            delay_ms
+        );
 
         Timeout::new(delay_ms, move || {
             wasm_bindgen_futures::spawn_local(async move {
@@ -531,7 +541,7 @@ impl AttendantsComponent {
                 }
             });
         })
-            .forget();
+        .forget();
     }
 
     /// Schedule a reconnection attempt with exponential backoff (non-JWT path).
@@ -550,7 +560,12 @@ impl AttendantsComponent {
             }
         };
 
-        log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+        log::info!(
+            "Scheduling reconnect attempt {}/{} in {}ms",
+            attempt + 1,
+            Self::MAX_RECONNECT_ATTEMPTS,
+            delay_ms
+        );
 
         Timeout::new(delay_ms, move || {
             link.send_message(WsAction::Connect);
@@ -598,10 +613,10 @@ impl AttendantsComponent {
             let _ = osc.connect_with_audio_node(&gain);
             let _ = gain.connect_with_audio_node(&ctx.destination());
             osc.set_type(web_sys::OscillatorType::Triangle);
-            let _ = osc.frequency().set_value_at_time(freq2 as f32, now + duration);
-            let _ = gain
-                .gain()
-                .set_value_at_time(volume as f32, now + duration);
+            let _ = osc
+                .frequency()
+                .set_value_at_time(freq2 as f32, now + duration);
+            let _ = gain.gain().set_value_at_time(volume as f32, now + duration);
             let _ = gain
                 .gain()
                 .exponential_ramp_to_value_at_time(0.01, now + duration * 2.0);
@@ -761,9 +776,7 @@ impl Component for AttendantsComponent {
 
                 true
             }
-            Msg::OnPeerRemoved(_peer_id) => {
-                true
-            }
+            Msg::OnPeerRemoved(_peer_id) => true,
             Msg::OnFirstFrame((_peer_id, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::OnMicrophoneError(err) => {
                 log::error!("Microphone error (full): {err}");
@@ -893,7 +906,7 @@ impl Component for AttendantsComponent {
                     Timeout::new(1640, move || {
                         link.send_message(Msg::ShowCopyToast(false));
                     })
-                        .forget();
+                    .forget();
                 }
                 true
             }
@@ -987,11 +1000,7 @@ impl Component for AttendantsComponent {
                 log::info!("TOAST-RX: peer left: {} ({})", display_name, user_id);
                 // Don't play sound immediately -- defer it so a rapid
                 // join event (waiting-room admission) can cancel it.
-                let msg = if display_name == user_id {
-                    format!("{display_name} left the meeting")
-                } else {
-                    format!("{display_name} ({user_id}) left the meeting")
-                };
+                let msg = format!("{display_name} ({user_id}) left the meeting");
                 let id = self.toast_counter;
                 self.toast_counter += 1;
                 self.peer_toasts.push((id, msg, user_id));
@@ -1018,15 +1027,12 @@ impl Component for AttendantsComponent {
                 // there is a pending "left" toast for this user, remove it
                 // (the deferred leave sound will also be suppressed because
                 // it checks whether the toast still exists).
-                self.peer_toasts.retain(|(_, msg, uid)| !(uid == &user_id && msg.contains("left")));
+                self.peer_toasts
+                    .retain(|(_, msg, uid)| !(uid == &user_id && msg.contains("left")));
 
                 // Always show the join toast and play the join sound.
                 Self::play_user_joined();
-                let msg = if display_name == user_id {
-                    format!("{display_name} joined the meeting")
-                } else {
-                    format!("{display_name} ({user_id}) joined the meeting")
-                };
+                let msg = format!("{display_name} ({user_id}) joined the meeting");
                 let id = self.toast_counter;
                 self.toast_counter += 1;
                 self.peer_toasts.push((id, msg, user_id));

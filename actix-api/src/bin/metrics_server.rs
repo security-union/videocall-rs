@@ -182,11 +182,12 @@ fn process_health_packet_to_metrics_pb(
         &health_packet.session_id
     };
 
-    let reporting_user_id = if health_packet.reporting_user_id.is_empty() {
-        "unknown"
+    let reporting_user_id_str = if health_packet.reporting_user_id.is_empty() {
+        "unknown".to_string()
     } else {
-        &health_packet.reporting_user_id
+        videocall_types::user_id_bytes_to_string(&health_packet.reporting_user_id)
     };
+    let reporting_user_id = reporting_user_id_str.as_str();
 
     // Update session tracker
     {
@@ -631,7 +632,11 @@ async fn handle_health_message(
         let json_val = json!({
             "session_id": health_packet.session_id,
             "meeting_id": health_packet.meeting_id,
-            "reporting_user_id": health_packet.reporting_user_id,
+            "reporting_user_id": if health_packet.reporting_user_id.is_empty() {
+                "unknown".to_string()
+            } else {
+                videocall_types::user_id_bytes_to_string(&health_packet.reporting_user_id)
+            },
             "timestamp_ms": health_packet.timestamp_ms,
         });
         store.insert(topic.to_string(), json_val);
@@ -713,7 +718,7 @@ mod tests {
         let mut hp = PbHealthPacket::new();
         hp.session_id = "s1".to_string();
         hp.meeting_id = "m1".to_string();
-        hp.reporting_user_id = "alice@example.com".to_string();
+        hp.reporting_user_id = "alice@example.com".as_bytes().to_vec();
         hp.timestamp_ms = 12345;
         hp.reporting_audio_enabled = true;
         hp.reporting_video_enabled = true;
@@ -741,7 +746,7 @@ mod tests {
         let mut hp = PbHealthPacket::new();
         hp.session_id = session_id.to_string();
         hp.meeting_id = meeting_id.to_string();
-        hp.reporting_user_id = reporting_user_id.to_string();
+        hp.reporting_user_id = reporting_user_id.as_bytes().to_vec();
         hp.timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1316,7 +1321,7 @@ mod tests {
         let mut hp = PbHealthPacket::new();
         hp.session_id = "sess_rtt".to_string();
         hp.meeting_id = "meet_rtt".to_string();
-        hp.reporting_user_id = "alice".to_string();
+        hp.reporting_user_id = "alice".as_bytes().to_vec();
         hp.timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

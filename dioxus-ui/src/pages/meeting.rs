@@ -14,10 +14,12 @@
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
-    actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled,
-    webtransport_host_base,
+    actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled, webtransport_host_base,
 };
-use crate::context::{get_or_create_local_user_id, load_display_name_from_storage, save_display_name_to_storage, validate_display_name, DisplayNameCtx};
+use crate::context::{
+    get_or_create_local_user_id, load_display_name_from_storage, save_display_name_to_storage,
+    validate_display_name, DisplayNameCtx,
+};
 use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
@@ -151,8 +153,7 @@ pub fn MeetingPage(id: String) -> Element {
             let display_name = input_value_state();
 
             // Build observer lobby URLs using the observer token
-            let lobby_url =
-                |base: &str| format!("{base}/lobby?token={observer_token}");
+            let lobby_url = |base: &str| format!("{base}/lobby?token={observer_token}");
             let websocket_urls: Vec<String> = actix_websocket_base()
                 .unwrap_or_default()
                 .split(',')
@@ -166,8 +167,7 @@ pub fn MeetingPage(id: String) -> Element {
 
             // Use the user's ID so the server can match
             // push-notification `target_user_id` to this observer client.
-            let user_id_for_client = current_user_id()
-                .unwrap_or_else(|| display_name.clone());
+            let user_id_for_client = current_user_id().unwrap_or_else(|| display_name.clone());
 
             let opts = VideoCallClientOptions {
                 user_id: user_id_for_client,
@@ -221,8 +221,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     };
                                     current_user_id.set(Some(effective_user_id));
                                     let determined_host = response.host_display_name.clone();
-                                    let wr_enabled =
-                                        response.waiting_room_enabled.unwrap_or(true);
+                                    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                                     host_display_name.set(determined_host.clone());
                                     match response.status.as_str() {
                                         "admitted" => {
@@ -240,14 +239,12 @@ pub fn MeetingPage(id: String) -> Element {
                                             }
                                         }
                                         "waiting" => {
-                                            let obs_token = response
-                                                .observer_token
-                                                .unwrap_or_default();
+                                            let obs_token =
+                                                response.observer_token.unwrap_or_default();
                                             came_from_waiting_room.set(true);
                                             // Also set observer_token_signal for
                                             // the Waiting state (observer stays alive).
-                                            observer_token_signal
-                                                .set(Some(obs_token.clone()));
+                                            observer_token_signal.set(Some(obs_token.clone()));
                                             meeting_status.set(MeetingStatus::Waiting {
                                                 observer_token: obs_token,
                                             });
@@ -255,17 +252,14 @@ pub fn MeetingPage(id: String) -> Element {
                                         "rejected" => {
                                             meeting_status.set(MeetingStatus::Rejected);
                                         }
-                                        _ => meeting_status.set(MeetingStatus::Error(
-                                            format!(
-                                                "Unknown status: {}",
-                                                response.status
-                                            ),
-                                        )),
+                                        _ => meeting_status.set(MeetingStatus::Error(format!(
+                                            "Unknown status: {}",
+                                            response.status
+                                        ))),
                                     }
                                 }
                                 Err(e) => {
-                                    meeting_status
-                                        .set(MeetingStatus::Error(e.to_string()));
+                                    meeting_status.set(MeetingStatus::Error(e.to_string()));
                                 }
                             }
                         });
@@ -350,19 +344,15 @@ pub fn MeetingPage(id: String) -> Element {
                                 }
                             }
                             "waiting_for_meeting" => {
-                                let obs_token =
-                                    response.observer_token.unwrap_or_default();
-                                observer_token_signal
-                                    .set(Some(obs_token.clone()));
+                                let obs_token = response.observer_token.unwrap_or_default();
+                                observer_token_signal.set(Some(obs_token.clone()));
                                 meeting_status.set(MeetingStatus::WaitingForMeeting {
                                     observer_token: obs_token,
                                 });
                             }
                             "waiting" => {
-                                let obs_token =
-                                    response.observer_token.unwrap_or_default();
-                                observer_token_signal
-                                    .set(Some(obs_token.clone()));
+                                let obs_token = response.observer_token.unwrap_or_default();
+                                observer_token_signal.set(Some(obs_token.clone()));
                                 came_from_waiting_room.set(true);
                                 meeting_status.set(MeetingStatus::Waiting {
                                     observer_token: obs_token,

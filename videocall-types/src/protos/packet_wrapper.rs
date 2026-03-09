@@ -31,7 +31,7 @@ pub struct PacketWrapper {
     // @@protoc_insertion_point(field:PacketWrapper.packet_type)
     pub packet_type: ::protobuf::EnumOrUnknown<packet_wrapper::PacketType>,
     // @@protoc_insertion_point(field:PacketWrapper.user_id)
-    pub user_id: ::std::string::String,
+    pub user_id: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:PacketWrapper.data)
     pub data: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:PacketWrapper.session_id)
@@ -97,7 +97,7 @@ impl ::protobuf::Message for PacketWrapper {
                     self.packet_type = is.read_enum_or_unknown()?;
                 },
                 18 => {
-                    self.user_id = is.read_string()?;
+                    self.user_id = is.read_bytes()?;
                 },
                 26 => {
                     self.data = is.read_bytes()?;
@@ -121,7 +121,7 @@ impl ::protobuf::Message for PacketWrapper {
             my_size += ::protobuf::rt::int32_size(1, self.packet_type.value());
         }
         if !self.user_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(2, &self.user_id);
+            my_size += ::protobuf::rt::bytes_size(2, &self.user_id);
         }
         if !self.data.is_empty() {
             my_size += ::protobuf::rt::bytes_size(3, &self.data);
@@ -139,7 +139,7 @@ impl ::protobuf::Message for PacketWrapper {
             os.write_enum(1, ::protobuf::EnumOrUnknown::value(&self.packet_type))?;
         }
         if !self.user_id.is_empty() {
-            os.write_string(2, &self.user_id)?;
+            os.write_bytes(2, &self.user_id)?;
         }
         if !self.data.is_empty() {
             os.write_bytes(3, &self.data)?;
@@ -174,7 +174,7 @@ impl ::protobuf::Message for PacketWrapper {
     fn default_instance() -> &'static PacketWrapper {
         static instance: PacketWrapper = PacketWrapper {
             packet_type: ::protobuf::EnumOrUnknown::from_i32(0),
-            user_id: ::std::string::String::new(),
+            user_id: ::std::vec::Vec::new(),
             data: ::std::vec::Vec::new(),
             session_id: 0,
             special_fields: ::protobuf::SpecialFields::new(),
@@ -303,7 +303,7 @@ pub mod packet_wrapper {
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x1atypes/packet_wrapper.proto\"\xb8\x02\n\rPacketWrapper\x12:\n\x0bpa\
     cket_type\x18\x01\x20\x01(\x0e2\x19.PacketWrapper.PacketTypeR\npacketTyp\
-    e\x12\x17\n\x07user_id\x18\x02\x20\x01(\tR\x06userId\x12\x12\n\x04data\
+    e\x12\x17\n\x07user_id\x18\x02\x20\x01(\x0cR\x06userId\x12\x12\n\x04data\
     \x18\x03\x20\x01(\x0cR\x04data\x12\x1d\n\nsession_id\x18\x04\x20\x01(\
     \x04R\tsessionId\"\x9e\x01\n\nPacketType\x12\x17\n\x13PACKET_TYPE_UNKNOW\
     N\x10\0\x12\x0f\n\x0bRSA_PUB_KEY\x10\x01\x12\x0b\n\x07AES_KEY\x10\x02\
@@ -336,14 +336,15 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x18\n\x0b\n\x04\x04\0\x02\0\x12\x03\x0f\x02\x1d\n\x0c\n\x05\x04\0\x02\0\
     \x06\x12\x03\x0f\x02\x0c\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x0f\r\x18\n\
     \x0c\n\x05\x04\0\x02\0\x03\x12\x03\x0f\x1b\x1c\n\x0b\n\x04\x04\0\x02\x01\
-    \x12\x03\x10\x02\x15\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x10\x02\x08\n\
-    \x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x10\t\x10\n\x0c\n\x05\x04\0\x02\x01\
-    \x03\x12\x03\x10\x13\x14\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x11\x02\x11\n\
-    \x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x11\x02\x07\n\x0c\n\x05\x04\0\x02\
-    \x02\x01\x12\x03\x11\x08\x0c\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x11\
-    \x0f\x10\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x12\x02\x18\n\x0c\n\x05\x04\0\
-    \x02\x03\x05\x12\x03\x12\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\
-    \x12\t\x13\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x12\x16\x17b\x06proto3\
+    \x12\x03\x10\x02\x14\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x10\x02\x07\n\
+    \x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x10\x08\x0f\n\x0c\n\x05\x04\0\x02\
+    \x01\x03\x12\x03\x10\x12\x13\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x11\x02\
+    \x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x11\x02\x07\n\x0c\n\x05\x04\0\
+    \x02\x02\x01\x12\x03\x11\x08\x0c\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\
+    \x11\x0f\x10\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x12\x02\x18\n\x0c\n\x05\
+    \x04\0\x02\x03\x05\x12\x03\x12\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\
+    \x03\x12\t\x13\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x12\x16\x17b\x06pro\
+    to3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

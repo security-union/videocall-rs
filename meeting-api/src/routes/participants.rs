@@ -66,7 +66,8 @@ pub async fn join_meeting(
             db_meetings::set_host_display_name(&state.db, meeting.id, dn).await?;
         }
 
-        let row = db_participants::upsert_host(&state.db, meeting.id, &user_id, display_name).await?;
+        let row =
+            db_participants::upsert_host(&state.db, meeting.id, &user_id, display_name).await?;
 
         let token = generate_room_token(
             &state.jwt_secret,
@@ -90,12 +91,7 @@ pub async fn join_meeting(
             // status with an observer token so the client can receive a push
             // notification when the host activates the meeting.
             let dn = display_name.unwrap_or(&user_id);
-            let observer = generate_observer_token(
-                &state.jwt_secret,
-                &user_id,
-                &meeting_id,
-                dn,
-            )?;
+            let observer = generate_observer_token(&state.jwt_secret, &user_id, &meeting_id, dn)?;
             let resp = ParticipantStatusResponse {
                 user_id: user_id.clone(),
                 display_name: display_name.map(String::from),

@@ -39,7 +39,12 @@ pub fn generate_for_peer(
     host_display_name: Option<&str>,
 ) -> Element {
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
-    let is_host = host_display_name.map(|h| h == peer_user_id).unwrap_or(false);
+    let peer_display_name = client
+        .get_peer_display_name(key)
+        .unwrap_or_else(|| peer_user_id.clone());
+    let is_host = host_display_name
+        .map(|h| h == peer_user_id)
+        .unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.contains(&peer_user_id) {
         return rsx! {};
@@ -51,7 +56,11 @@ pub fn generate_for_peer(
 
     // Use speaking state for the glowing border animation
     let speaking_class = if is_speaking { " speaking-tile" } else { "" };
-    let audio_speaking_class = if is_speaking { "audio-indicator speaking" } else { "audio-indicator" };
+    let audio_speaking_class = if is_speaking {
+        "audio-indicator speaking"
+    } else {
+        "audio-indicator"
+    };
 
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {
@@ -60,7 +69,7 @@ pub fn generate_for_peer(
         let div_id_pin = (*peer_video_div_id).clone();
         let canvas_id_crop = key.clone();
         let key_clone = key.clone();
-        let peer_user_id_display = peer_user_id.clone();
+        let peer_display_name_fb = peer_display_name.clone();
         let title = if is_host {
             format!("Host: {peer_user_id}")
         } else {
@@ -98,7 +107,7 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{title}",
                         dir: "auto",
-                        "{peer_user_id_display}"
+                        "{peer_display_name_fb}"
                         if is_host {
                             CrownIcon {}
                         }
@@ -133,13 +142,13 @@ pub fn generate_for_peer(
     let ss_div_mobile = (*screen_share_div_id).clone();
     let ss_div_pin = (*screen_share_div_id).clone();
     let ss_canvas_crop = format!("screen-share-{}", key);
-    let ss_name = format!("{}-screen", peer_user_id);
+    let ss_name = format!("{}-screen", peer_display_name);
 
     let pv_div_mobile = (*peer_video_div_id).clone();
     let pv_div_pin = (*peer_video_div_id).clone();
     let pv_canvas_crop = key.clone();
     let key_clone = key.clone();
-    let peer_user_id_grid = peer_user_id.clone();
+    let peer_display_name_grid = peer_display_name.clone();
     let title_grid = if is_host {
         format!("Host: {peer_user_id}")
     } else {
@@ -209,7 +218,7 @@ pub fn generate_for_peer(
                             class: "floating-name",
                             title: "{title_grid}",
                             dir: "auto",
-                            "{peer_user_id_grid}"
+                            "{peer_display_name_grid}"
                             if is_host {
                                 CrownIcon {}
                             }

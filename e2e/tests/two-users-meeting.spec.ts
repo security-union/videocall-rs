@@ -200,18 +200,33 @@ test.describe("Two users in a meeting", () => {
       await expect(hostPeer.first()).toBeVisible({ timeout: 30_000 });
       await expect(guestPeer.first()).toBeVisible({ timeout: 30_000 });
 
+      // ---- ASSERT: peer tile shows display_name as text, user_id as tooltip ----
+      // The floating name overlay on each peer tile should show the display name,
+      // with the user_id (email) available as a tooltip via the title attribute.
+      const guestNameOnHost = hostPage.locator(".floating-name", {
+        hasText: "GuestUser",
+      });
+      const hostNameOnGuest = guestPage.locator(".floating-name", {
+        hasText: "HostUser",
+      });
+
+      // Check that the guest's display name is visible on the host side
+      await expect(guestNameOnHost.first()).toBeVisible({ timeout: 10_000 });
+      await expect(guestNameOnHost.first()).toHaveAttribute("title", "guest@videocall.rs");
+
+      // Check that the host's display name is visible on the guest side
+      await expect(hostNameOnGuest.first()).toBeVisible({ timeout: 10_000 });
+      await expect(hostNameOnGuest.first()).toHaveAttribute("title", "host@videocall.rs");
+
       // ---- ASSERT: "joined the meeting" toast notifications ----
-      // When the guest joins, the host should see a toast notification.
-      // Toast message format:
-      //   "DisplayName joined the meeting" (when display_name == user_id)
-      //   "DisplayName (user_id) joined the meeting" (when they differ)
-      // Toasts auto-dismiss after 4 seconds, so we check within a generous
+      // Toast message format: "DisplayName (user_id) joined the meeting"
+      // Toasts auto-dismiss after ~8 seconds, so we check within a generous
       // timeout but also accept that the toast may have already appeared
       // and disappeared during the peer discovery wait above.
       //
       // We use a soft check: if the toast container exists, verify its
-      // content. The toast may have already been removed by the 4s timer
-      // if peer discovery was slow, so we don't fail if it's gone.
+      // content. The toast may have already been removed by the auto-dismiss
+      // timer if peer discovery was slow, so we don't fail if it's gone.
       // CSS classes: .peer-toasts (container), .peer-toast (individual toast)
       const hostJoinedToast = hostPage.locator(".peer-toast", {
         hasText: "joined the meeting",
@@ -225,7 +240,7 @@ test.describe("Two users in a meeting", () => {
 
       // At least one side should have seen a "joined" toast. We check
       // both but only require at least one to have been visible, since
-      // the 4s auto-dismiss may have already cleared one side.
+      // the auto-dismiss may have already cleared one side.
       const hostSawToast = await hostJoinedToast.isVisible().catch(() => false);
       const guestSawToast = await guestJoinedToast.isVisible().catch(() => false);
 
@@ -233,14 +248,19 @@ test.describe("Two users in a meeting", () => {
       console.log(`Host saw "joined" toast: ${hostSawToast}`);
       console.log(`Guest saw "joined" toast: ${guestSawToast}`);
 
-      // If either side still has a visible toast, verify the display name format
+      // If either side still has a visible toast, verify the new format:
+      // "DisplayName (user_id) joined the meeting"
       if (hostSawToast) {
         const text = await hostJoinedToast.first().textContent();
-        expect(text).toMatch(/\w+ (joined the meeting|\(.+\) joined the meeting)/);
+        expect(text).toContain("GuestUser");
+        expect(text).toContain("(guest@videocall.rs)");
+        expect(text).toContain("joined the meeting");
       }
       if (guestSawToast) {
         const text = await guestJoinedToast.first().textContent();
-        expect(text).toMatch(/\w+ (joined the meeting|\(.+\) joined the meeting)/);
+        expect(text).toContain("HostUser");
+        expect(text).toContain("(host@videocall.rs)");
+        expect(text).toContain("joined the meeting");
       }
 
       // Pause so you can watch both browsers

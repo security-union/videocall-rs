@@ -31,8 +31,8 @@ use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
-    load_display_name_from_storage, save_display_name_to_storage, VideoCallClientCtx,
-    validate_display_name, DISPLAY_NAME_MAX_LEN,
+    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
+    VideoCallClientCtx, DISPLAY_NAME_MAX_LEN,
 };
 
 const VIDEO_ELEMENT_ID: &str = "webcam";

@@ -449,9 +449,7 @@ impl VideoCallClient {
                 }
             }
             Err(_) => {
-                error!(
-                    "Unable to borrow connection_controller -- dropping {packet_type:?} packet"
-                )
+                error!("Unable to borrow connection_controller -- dropping {packet_type:?} packet")
             }
         }
     }
@@ -514,6 +512,21 @@ impl VideoCallClient {
             Err(_) => {
                 warn!(
                     "Failed to borrow inner in get_peer_user_id for session_id: {}",
+                    session_id
+                );
+                None
+            }
+        }
+    }
+
+    /// Get the display name for a peer by session_id string.
+    /// Returns `None` if the peer doesn't exist or no display name has been set.
+    pub fn get_peer_display_name(&self, session_id: &str) -> Option<String> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get_peer_display_name(session_id),
+            Err(_) => {
+                warn!(
+                    "Failed to borrow inner in get_peer_display_name for session_id: {}",
                     session_id
                 );
                 None
@@ -684,7 +697,7 @@ impl VideoCallClient {
     pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
         let wrapper = PacketWrapper {
             packet_type: PacketType::DIAGNOSTICS.into(),
-            user_id: self.options.user_id.clone(),
+            user_id: self.options.user_id.as_bytes().to_vec(),
             data: packet.write_to_bytes().unwrap(),
             ..Default::default()
         };
@@ -833,24 +846,29 @@ impl Inner {
         debug!(
             "<< Received {:?} from {} (session: {})",
             response.packet_type.enum_value(),
-            response.user_id,
+            String::from_utf8_lossy(&response.user_id),
             response.session_id
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let peer_status = if response.user_id == SYSTEM_USER_ID || response.session_id == 0 {
-            PeerStatus::NoChange
-        } else {
-            self.peer_decode_manager
-                .ensure_peer(response.session_id, &response.user_id)
-        };
+        let peer_status =
+            if response.user_id == SYSTEM_USER_ID.as_bytes() || response.session_id == 0 {
+                PeerStatus::NoChange
+            } else {
+                let peer_user_id = String::from_utf8_lossy(&response.user_id);
+                self.peer_decode_manager
+                    .ensure_peer(response.session_id, &peer_user_id)
+            };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 if !self.options.enable_e2ee {
                     return;
                 }
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                    debug!("Decrypted AES_KEY from {}", response.user_id);
+                    debug!(
+                        "Decrypted AES_KEY from {}",
+                        String::from_utf8_lossy(&response.user_id)
+                    );
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
                             if let Err(e) = self.peer_decode_manager.set_peer_aes(
@@ -893,7 +911,7 @@ impl Inner {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::AES_KEY.into(),
-                                    user_id: self.options.user_id.clone(),
+                                    user_id: self.options.user_id.as_bytes().to_vec(),
                                     data,
                                     ..Default::default()
                                 };
@@ -947,7 +965,7 @@ impl Inner {
             Ok(PacketType::HEALTH) => {
                 debug!(
                     "Received unexpected health packet from {}, ignoring",
-                    response.user_id
+                    String::from_utf8_lossy(&response.user_id)
                 );
             }
             Ok(PacketType::SESSION_ASSIGNED) => {
@@ -971,136 +989,146 @@ impl Inner {
                         "Received MEETING packet: event_type={:?}, room={}, target={}, creator={}, session={}",
                         meeting_packet.event_type.enum_value(),
                         meeting_packet.room_id,
-                        meeting_packet.target_user_id,
-                        meeting_packet.creator_id,
+                        String::from_utf8_lossy(&meeting_packet.target_user_id),
+                        String::from_utf8_lossy(&meeting_packet.creator_id),
                         meeting_packet.session_id,
                     );
                     match meeting_packet.event_type.enum_value() {
-                    Ok(MeetingEventType::MEETING_STARTED) => {
-                        info!(
-                            "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
-                            meeting_packet.room_id,
-                            meeting_packet.start_time_ms,
-                            meeting_packet.creator_id,
-                        );
+                        Ok(MeetingEventType::MEETING_STARTED) => {
+                            info!(
+                                "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
+                                meeting_packet.room_id,
+                                meeting_packet.start_time_ms,
+                                String::from_utf8_lossy(&meeting_packet.creator_id),
+                            );
 
-                        if let Some(callback) = &self.options.on_meeting_info {
-                            callback.emit(meeting_packet.start_time_ms as f64);
-                        }
-                    }
-                    Ok(MeetingEventType::MEETING_ENDED) => {
-                        info!(
-                            "Received MEETING_ENDED: room={}, message={}",
-                            meeting_packet.room_id, meeting_packet.message
-                        );
-                        if let Some(callback) = &self.options.on_meeting_ended {
-                            let end_time_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_millis() as f64)
-                                .unwrap_or(0.0);
-                            callback.emit((end_time_ms, meeting_packet.message));
-                        }
-                    }
-                    Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                        // Check dedup before borrowing self.options to avoid
-                        // overlapping mutable/immutable borrows.
-                        let should_emit = !meeting_packet.target_user_id.is_empty()
-                            && meeting_packet.target_user_id != self.options.user_id
-                            && !self.is_duplicate_peer_event(
-                                "joined",
-                                &meeting_packet.target_user_id,
-                            );
-                        if should_emit {
-                            info!("Peer joined: {}", meeting_packet.target_user_id);
-                            if let Some(ref cb) = self.options.on_peer_joined {
-                                let display_name = if meeting_packet.creator_id.is_empty() {
-                                    meeting_packet.target_user_id.clone()
-                                } else {
-                                    meeting_packet.creator_id.clone()
-                                };
-                                cb.emit((display_name, meeting_packet.target_user_id.clone()));
-                            }
-                        } else {
-                            debug!(
-                                "Suppressed PARTICIPANT_JOINED for target={}",
-                                meeting_packet.target_user_id,
-                            );
-                        }
-                    }
-                    Ok(MeetingEventType::PARTICIPANT_LEFT) => {
-                        if meeting_packet.session_id != 0 {
-                            self.peer_decode_manager.delete_peer(meeting_packet.session_id);
-                        }
-                        let should_emit = !meeting_packet.target_user_id.is_empty()
-                            && meeting_packet.target_user_id != self.options.user_id
-                            && !self.is_duplicate_peer_event(
-                                "left",
-                                &meeting_packet.target_user_id,
-                            );
-                        if should_emit {
-                            info!("Peer left: {}", meeting_packet.target_user_id);
-                            if let Some(ref cb) = self.options.on_peer_left {
-                                let display_name = if meeting_packet.creator_id.is_empty() {
-                                    meeting_packet.target_user_id.clone()
-                                } else {
-                                    meeting_packet.creator_id.clone()
-                                };
-                                cb.emit((display_name, meeting_packet.target_user_id.clone()));
+                            if let Some(callback) = &self.options.on_meeting_info {
+                                callback.emit(meeting_packet.start_time_ms as f64);
                             }
                         }
-                    }
-                    Ok(MeetingEventType::MEETING_ACTIVATED) => {
-                        info!(
-                            "Received MEETING_ACTIVATED: room={}",
-                            meeting_packet.room_id
-                        );
-                        if let Some(callback) = &self.options.on_meeting_activated {
-                            callback.emit(());
+                        Ok(MeetingEventType::MEETING_ENDED) => {
+                            info!(
+                                "Received MEETING_ENDED: room={}, message={}",
+                                meeting_packet.room_id, meeting_packet.message
+                            );
+                            if let Some(callback) = &self.options.on_meeting_ended {
+                                let end_time_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as f64)
+                                    .unwrap_or(0.0);
+                                callback.emit((end_time_ms, meeting_packet.message));
+                            }
                         }
-                    }
-                    Ok(MeetingEventType::PARTICIPANT_ADMITTED) => {
-                        info!(
-                            "Received PARTICIPANT_ADMITTED: room={}, target={}",
-                            meeting_packet.room_id, meeting_packet.target_user_id
-                        );
-                        // Only fire callback if this event is targeted at us
-                        if meeting_packet.target_user_id == self.options.user_id {
-                            if let Some(callback) = &self.options.on_participant_admitted {
+                        Ok(MeetingEventType::PARTICIPANT_JOINED) => {
+                            // Check dedup before borrowing self.options to avoid
+                            // overlapping mutable/immutable borrows.
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            let display_name = if meeting_packet.creator_id.is_empty() {
+                                target_str.clone()
+                            } else {
+                                String::from_utf8_lossy(&meeting_packet.creator_id).to_string()
+                            };
+                            // Store the display name on the peer so the UI can
+                            // show it on tiles instead of the raw user_id/email.
+                            self.peer_decode_manager.set_peer_display_name_by_user_id(
+                                &target_str,
+                                display_name.clone(),
+                            );
+                            let should_emit = !meeting_packet.target_user_id.is_empty()
+                                && meeting_packet.target_user_id[..]
+                                    != *self.options.user_id.as_bytes()
+                                && !self.is_duplicate_peer_event("joined", &target_str);
+                            if should_emit {
+                                info!("Peer joined: {}", target_str);
+                                if let Some(ref cb) = self.options.on_peer_joined {
+                                    cb.emit((display_name, target_str));
+                                }
+                            } else {
+                                debug!("Suppressed PARTICIPANT_JOINED for target={}", target_str,);
+                            }
+                        }
+                        Ok(MeetingEventType::PARTICIPANT_LEFT) => {
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager
+                                    .delete_peer(meeting_packet.session_id);
+                            }
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            let should_emit = !meeting_packet.target_user_id.is_empty()
+                                && meeting_packet.target_user_id[..]
+                                    != *self.options.user_id.as_bytes()
+                                && !self.is_duplicate_peer_event("left", &target_str);
+                            if should_emit {
+                                info!("Peer left: {}", target_str);
+                                if let Some(ref cb) = self.options.on_peer_left {
+                                    let display_name = if meeting_packet.creator_id.is_empty() {
+                                        target_str.clone()
+                                    } else {
+                                        String::from_utf8_lossy(&meeting_packet.creator_id)
+                                            .to_string()
+                                    };
+                                    cb.emit((display_name, target_str));
+                                }
+                            }
+                        }
+                        Ok(MeetingEventType::MEETING_ACTIVATED) => {
+                            info!(
+                                "Received MEETING_ACTIVATED: room={}",
+                                meeting_packet.room_id
+                            );
+                            if let Some(callback) = &self.options.on_meeting_activated {
                                 callback.emit(());
                             }
                         }
-                    }
-                    Ok(MeetingEventType::PARTICIPANT_REJECTED) => {
-                        info!(
-                            "Received PARTICIPANT_REJECTED: room={}, target={}",
-                            meeting_packet.room_id, meeting_packet.target_user_id
-                        );
-                        // Only fire callback if this event is targeted at us
-                        if meeting_packet.target_user_id == self.options.user_id {
-                            if let Some(callback) = &self.options.on_participant_rejected {
+                        Ok(MeetingEventType::PARTICIPANT_ADMITTED) => {
+                            info!(
+                                "Received PARTICIPANT_ADMITTED: room={}, target={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(&meeting_packet.target_user_id)
+                            );
+                            // Only fire callback if this event is targeted at us
+                            if meeting_packet.target_user_id[..] == *self.options.user_id.as_bytes()
+                            {
+                                if let Some(callback) = &self.options.on_participant_admitted {
+                                    callback.emit(());
+                                }
+                            }
+                        }
+                        Ok(MeetingEventType::PARTICIPANT_REJECTED) => {
+                            info!(
+                                "Received PARTICIPANT_REJECTED: room={}, target={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(&meeting_packet.target_user_id)
+                            );
+                            // Only fire callback if this event is targeted at us
+                            if meeting_packet.target_user_id[..] == *self.options.user_id.as_bytes()
+                            {
+                                if let Some(callback) = &self.options.on_participant_rejected {
+                                    callback.emit(());
+                                }
+                            }
+                        }
+                        Ok(MeetingEventType::WAITING_ROOM_UPDATED) => {
+                            info!(
+                                "Received WAITING_ROOM_UPDATED: room={}",
+                                meeting_packet.room_id
+                            );
+                            if let Some(callback) = &self.options.on_waiting_room_updated {
                                 callback.emit(());
                             }
                         }
-                    }
-                    Ok(MeetingEventType::WAITING_ROOM_UPDATED) => {
-                        info!(
-                            "Received WAITING_ROOM_UPDATED: room={}",
-                            meeting_packet.room_id
-                        );
-                        if let Some(callback) = &self.options.on_waiting_room_updated {
-                            callback.emit(());
+                        Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
+                            error!(
+                                "Received meeting packet with unknown event type: room={}",
+                                meeting_packet.room_id
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to parse MeetingEventType: {e}");
                         }
                     }
-                    Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
-                        error!(
-                            "Received meeting packet with unknown event type: room={}",
-                            meeting_packet.room_id
-                        );
-                    }
-                    Err(e) => {
-                        error!("Failed to parse MeetingEventType: {e}");
-                    }
-                }},
+                }
                 Err(e) => {
                     error!("Failed to parse MeetingPacket: {e}");
                 }
@@ -1108,7 +1136,7 @@ impl Inner {
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",
-                    response.user_id
+                    String::from_utf8_lossy(&response.user_id)
                 );
             }
             Err(e) => {
@@ -1130,7 +1158,7 @@ impl Inner {
         match rsa.pub_key.to_public_key_der() {
             Ok(public_key_der) => {
                 let packet = RsaPacket {
-                    user_id: userid.clone(),
+                    user_id: userid.as_bytes().to_vec(),
                     public_key_der: public_key_der.to_vec(),
                     ..Default::default()
                 };
@@ -1143,7 +1171,7 @@ impl Inner {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::RSA_PUB_KEY.into(),
-                                    user_id: userid,
+                                    user_id: userid.as_bytes().to_vec(),
                                     data,
                                     ..Default::default()
                                 };
@@ -1173,8 +1201,8 @@ impl Inner {
             iv: self.aes.iv.to_vec(),
             ..Default::default()
         }
-            .write_to_bytes()
-            .map_err(|e| anyhow!("Failed to serialize aes packet: {e}"))
+        .write_to_bytes()
+        .map_err(|e| anyhow!("Failed to serialize aes packet: {e}"))
     }
 
     fn encrypt_aes_packet(&self, aes_packet: &[u8], pub_key: &RsaPublicKey) -> Result<Vec<u8>> {

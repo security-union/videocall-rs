@@ -85,8 +85,7 @@ impl Component for HostControls {
         }
 
         // If waiting_room_version changed, re-fetch the waiting list
-        if ctx.props().waiting_room_version != self.last_fetched_version
-            && ctx.props().is_admitted
+        if ctx.props().waiting_room_version != self.last_fetched_version && ctx.props().is_admitted
         {
             self.last_fetched_version = ctx.props().waiting_room_version;
             ctx.link().send_message(HostControlsMsg::FetchWaiting);

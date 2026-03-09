@@ -178,15 +178,29 @@ test.describe("Toast notifications for participant join/leave", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
+      // ---- ASSERT: peer tile shows display_name as text, user_id as tooltip ----
+      // Wait for the guest's peer tile to appear on the host side
+      const hostPeerTile = hostPage.locator("#grid-container .canvas-container");
+      await expect(hostPeerTile.first()).toBeVisible({ timeout: 30_000 });
+
+      // The floating name overlay should show the display name
+      const guestFloatingName = hostPage.locator(".floating-name", {
+        hasText: "ToastGuest",
+      });
+      await expect(guestFloatingName.first()).toBeVisible({ timeout: 10_000 });
+
+      // The title attribute (tooltip) should contain the user_id (email)
+      await expect(guestFloatingName.first()).toHaveAttribute("title", "guest-toast@videocall.rs");
+
       // Wait for the toast that we started watching for before the guest joined.
       await toastPromise;
 
-      // Verify the toast text contains the guest's display name.
-      // Format: "DisplayName (user_id) joined the meeting"
+      // Verify the toast text matches the new format:
+      // "DisplayName (user_id) joined the meeting"
       const toastText = await hostJoinedToast.first().textContent();
+      expect(toastText).toContain("ToastGuest");
+      expect(toastText).toContain("(guest-toast@videocall.rs)");
       expect(toastText).toContain("joined the meeting");
-      // The guest's display name or user_id should appear in the toast
-      expect(toastText).toMatch(/\w+ (joined the meeting|\(.+\) joined the meeting)/);
 
       // Verify the toast container has the correct CSS class (.peer-toasts)
       await expect(hostPage.locator(".peer-toasts")).toBeVisible();
@@ -258,11 +272,12 @@ test.describe("Toast notifications for participant join/leave", () => {
       });
       await expect(hostLeftToast.first()).toBeVisible({ timeout: 20_000 });
 
-      // Verify the toast text includes the display name.
-      // Format: "DisplayName left the meeting" or "DisplayName (user_id) left the meeting"
+      // Verify the toast text matches the new format:
+      // "DisplayName (user_id) left the meeting"
       const toastText = await hostLeftToast.first().textContent();
+      expect(toastText).toContain("LeaveGuest");
+      expect(toastText).toContain("(guest-leave@videocall.rs)");
       expect(toastText).toContain("left the meeting");
-      expect(toastText).toMatch(/\w+ (left the meeting|\(.+\) left the meeting)/);
 
       // Verify the toast is inside the correct container (.peer-toasts)
       await expect(hostPage.locator(".peer-toasts")).toBeVisible();
@@ -450,8 +465,11 @@ test.describe("Toast notifications for participant join/leave", () => {
       const leftToastVisible = await hostLeftToast.isVisible().catch(() => false);
       expect(leftToastVisible).toBe(false);
 
-      // Verify the "joined" toast text includes the guest's display name
+      // Verify the "joined" toast text matches the new format:
+      // "DisplayName (user_id) joined the meeting"
       const toastText = await hostJoinedToast.first().textContent();
+      expect(toastText).toContain("AdmitGuest");
+      expect(toastText).toContain("(guest-admit@videocall.rs)");
       expect(toastText).toContain("joined the meeting");
 
       // Verify the toast container uses the correct CSS class

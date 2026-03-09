@@ -137,12 +137,7 @@ pub fn migrate_legacy_storage() {
     let window = web_sys::window().expect("no window");
     if let Some(storage) = window.local_storage().ok().flatten() {
         // Migrate vc_username -> vc_display_name
-        if storage
-            .get_item(STORAGE_KEY)
-            .ok()
-            .flatten()
-            .is_none()
-        {
+        if storage.get_item(STORAGE_KEY).ok().flatten().is_none() {
             if let Ok(Some(old_val)) = storage.get_item("vc_username") {
                 let _ = storage.set_item(STORAGE_KEY, &old_val);
                 let _ = storage.remove_item("vc_username");

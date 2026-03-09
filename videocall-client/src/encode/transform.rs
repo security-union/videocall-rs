@@ -47,7 +47,7 @@ pub fn transform_video_chunk(
     let mut media_packet: MediaPacket = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
         frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
-        user_id: String::new(),
+        user_id: Vec::new(),
         media_type: MediaType::VIDEO.into(),
         timestamp: chunk.timestamp(),
         video_metadata: Some(VideoMetadata {
@@ -65,7 +65,7 @@ pub fn transform_video_chunk(
     let data = aes.encrypt(&data).unwrap();
     PacketWrapper {
         data,
-        user_id: user_id.to_owned(),
+        user_id: user_id.as_bytes().to_vec(),
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }
@@ -83,7 +83,7 @@ pub fn transform_screen_chunk(
         log::error!("Error copying video chunk: {e:?}");
     }
     let mut media_packet: MediaPacket = MediaPacket {
-        user_id: String::new(),
+        user_id: Vec::new(),
         data: buffer[0..byte_length].to_vec(),
         frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
         media_type: MediaType::SCREEN.into(),
@@ -103,7 +103,7 @@ pub fn transform_screen_chunk(
     let data = aes.encrypt(&data).unwrap();
     PacketWrapper {
         data,
-        user_id: user_id.to_owned(),
+        user_id: user_id.as_bytes().to_vec(),
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }

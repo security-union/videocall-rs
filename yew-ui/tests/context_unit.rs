@@ -160,11 +160,17 @@ fn storage_round_trip() {
 
     // Save and reload
     save_display_name_to_storage("test_user");
-    assert_eq!(load_display_name_from_storage(), Some("test_user".to_string()));
+    assert_eq!(
+        load_display_name_from_storage(),
+        Some("test_user".to_string())
+    );
 
     // Overwrite
     save_display_name_to_storage("new_user");
-    assert_eq!(load_display_name_from_storage(), Some("new_user".to_string()));
+    assert_eq!(
+        load_display_name_from_storage(),
+        Some("new_user".to_string())
+    );
 
     // Cleanup
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {

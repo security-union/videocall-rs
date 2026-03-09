@@ -19,11 +19,13 @@
 pub mod callback;
 pub mod feature_flags;
 pub mod protos;
+pub mod user_id;
 pub mod validation;
 
 pub use callback::Callback;
 pub use feature_flags::FeatureFlags;
 use protobuf::Message;
+pub use user_id::{is_system_user, to_user_id_bytes, user_id_bytes_to_string};
 
 /// A representation of a value which can be stored and restored as a text.
 pub type Text = Result<String, anyhow::Error>;

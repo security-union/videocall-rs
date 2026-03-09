@@ -20,14 +20,10 @@ pub enum MeetingStatus {
     Joining,
     /// Waiting for the host to start the meeting.
     /// Contains the observer token for receiving push notifications.
-    WaitingForMeeting {
-        observer_token: Option<String>,
-    },
+    WaitingForMeeting { observer_token: Option<String> },
     /// In the waiting room, pending host admission.
     /// Contains the observer token for receiving push notifications.
-    Waiting {
-        observer_token: Option<String>,
-    },
+    Waiting { observer_token: Option<String> },
     /// Admitted to the meeting
     Admitted {
         is_host: bool,
@@ -48,11 +44,10 @@ pub struct MeetingPageProps {
 
 #[function_component(MeetingPage)]
 pub fn meeting_page(props: &MeetingPageProps) -> Html {
-    
     // --- ALL Hooks MUST be declared first (unconditionally) ---
     // Retrieve the display name context (may be None on first load)
-    let display_name_state =
-        use_context::<DisplayNameCtx>().expect("DisplayName context provider is missing – this is a bug");
+    let display_name_state = use_context::<DisplayNameCtx>()
+        .expect("DisplayName context provider is missing – this is a bug");
 
     // Check authentication if OAuth is enabled (runtime check)
     let auth_checked = use_state(|| false);
@@ -360,7 +355,9 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 });
                             }
                             "waiting_for_meeting" => {
-                                log::info!("Meeting not active yet, using observer for push notifications");
+                                log::info!(
+                                    "Meeting not active yet, using observer for push notifications"
+                                );
                                 meeting_status.set(MeetingStatus::WaitingForMeeting {
                                     observer_token: response.observer_token.clone(),
                                 });
@@ -400,19 +397,16 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         let has_display_name = (*display_name_state).is_some();
         let is_not_joined = matches!(*meeting_status, MeetingStatus::NotJoined);
         let auto_join_attempted = use_mut_ref(|| false);
-        use_effect_with(
-            (has_display_name, is_not_joined),
-            {
-                let auto_join_attempted = auto_join_attempted.clone();
-                move |(has_display_name, is_not_joined)| {
-                    if *has_display_name && *is_not_joined && !*auto_join_attempted.borrow() {
-                        *auto_join_attempted.borrow_mut() = true;
-                        on_join_meeting.emit(());
-                    }
-                    || ()
+        use_effect_with((has_display_name, is_not_joined), {
+            let auto_join_attempted = auto_join_attempted.clone();
+            move |(has_display_name, is_not_joined)| {
+                if *has_display_name && *is_not_joined && !*auto_join_attempted.borrow() {
+                    *auto_join_attempted.borrow_mut() = true;
+                    on_join_meeting.emit(());
                 }
-            },
-        );
+                || ()
+            }
+        });
     }
 
     // Logout handler

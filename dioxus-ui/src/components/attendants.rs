@@ -126,10 +126,10 @@ fn play_tone_pair(freq1: f64, freq2: f64, duration: f64, volume: f64) {
         let _ = osc.connect_with_audio_node(&gain);
         let _ = gain.connect_with_audio_node(&ctx.destination());
         osc.set_type(web_sys::OscillatorType::Triangle);
-        let _ = osc.frequency().set_value_at_time(freq2 as f32, now + duration);
-        let _ = gain
-            .gain()
-            .set_value_at_time(volume as f32, now + duration);
+        let _ = osc
+            .frequency()
+            .set_value_at_time(freq2 as f32, now + duration);
+        let _ = gain.gain().set_value_at_time(volume as f32, now + duration);
         let _ = gain
             .gain()
             .exponential_ramp_to_value_at_time(0.01, now + duration * 2.0);
@@ -170,12 +170,19 @@ fn schedule_reconnect(
     let delay_ms = match reconnect_delay_ms(attempt) {
         Some(d) => d,
         None => {
-            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            connection_error.set(Some(
+                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+            ));
             return;
         }
     };
 
-    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
+    log::info!(
+        "Scheduling reconnect attempt {}/{} in {}ms",
+        attempt + 1,
+        MAX_RECONNECT_ATTEMPTS,
+        delay_ms
+    );
 
     Timeout::new(delay_ms, move || {
         wasm_bindgen_futures::spawn_local(async move {
@@ -224,12 +231,19 @@ fn schedule_reconnect_no_jwt(
     let delay_ms = match reconnect_delay_ms(attempt) {
         Some(d) => d,
         None => {
-            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            connection_error.set(Some(
+                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+            ));
             return;
         }
     };
 
-    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
+    log::info!(
+        "Scheduling reconnect attempt {}/{} in {}ms",
+        attempt + 1,
+        MAX_RECONNECT_ATTEMPTS,
+        delay_ms
+    );
 
     Timeout::new(delay_ms, move || {
         let reconnect_needed = {
@@ -435,62 +449,83 @@ pub fn AttendantsComponent(
                 let mut v = waiting_room_version;
                 v.set(v() + 1);
             })),
-            on_peer_left: Some(VcCallback::from(move |(display_name, user_id): (String, String)| {
-                log::info!("TOAST-RX: peer left: {} ({})", display_name, user_id);
-                let mut toast_counter = toast_counter;
-                let mut peer_toasts = peer_toasts;
-                let mut toast_version = toast_version;
-                let msg = if display_name == user_id {
-                    format!("{display_name} left the meeting")
-                } else {
-                    format!("{display_name} ({user_id}) left the meeting")
-                };
-                let id = *toast_counter.peek();
-                toast_counter.set(id + 1);
-                let mut current = peer_toasts.peek().clone();
-                current.push((id, msg, user_id));
-                peer_toasts.set(current);
-                { let v = *toast_version.peek(); toast_version.set(v + 1); }
-                // Defer the leave sound: only play if the toast still exists
-                // after 500ms (i.e. no join event cancelled it).
-                Timeout::new(500, move || {
-                    if peer_toasts.peek().iter().any(|(tid, _, _)| *tid == id) {
-                        play_user_left();
+            on_peer_left: Some(VcCallback::from(
+                move |(display_name, user_id): (String, String)| {
+                    log::info!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+                    let mut toast_counter = toast_counter;
+                    let mut peer_toasts = peer_toasts;
+                    let mut toast_version = toast_version;
+                    let msg = format!("{display_name} ({user_id}) left the meeting");
+                    let id = *toast_counter.peek();
+                    toast_counter.set(id + 1);
+                    let mut current = peer_toasts.peek().clone();
+                    current.push((id, msg, user_id));
+                    peer_toasts.set(current);
+                    {
+                        let v = *toast_version.peek();
+                        toast_version.set(v + 1);
                     }
-                }).forget();
-                // Schedule toast removal after 8 seconds.
-                Timeout::new(8_000, move || {
-                    let updated: Vec<_> = peer_toasts.peek().iter().filter(|(tid, _, _)| *tid != id).cloned().collect();
-                    peer_toasts.set(updated);
-                    { let v = *toast_version.peek(); toast_version.set(v + 1); }
-                }).forget();
-            })),
-            on_peer_joined: Some(VcCallback::from(move |(display_name, user_id): (String, String)| {
-                log::info!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
-                let mut toast_counter = toast_counter;
-                let mut peer_toasts = peer_toasts;
-                let mut toast_version = toast_version;
-                // Remove any pending "left" toast for this user (waiting room admission).
-                let mut current = peer_toasts.peek().clone();
-                current.retain(|(_, msg, uid)| !(uid == &user_id && msg.contains("left")));
-                play_user_joined();
-                let msg = if display_name == user_id {
-                    format!("{display_name} joined the meeting")
-                } else {
-                    format!("{display_name} ({user_id}) joined the meeting")
-                };
-                let id = *toast_counter.peek();
-                toast_counter.set(id + 1);
-                current.push((id, msg, user_id));
-                peer_toasts.set(current);
-                { let v = *toast_version.peek(); toast_version.set(v + 1); }
-                // Schedule toast removal after 8 seconds.
-                Timeout::new(8_000, move || {
-                    let updated: Vec<_> = peer_toasts.peek().iter().filter(|(tid, _, _)| *tid != id).cloned().collect();
-                    peer_toasts.set(updated);
-                    { let v = *toast_version.peek(); toast_version.set(v + 1); }
-                }).forget();
-            })),
+                    // Defer the leave sound: only play if the toast still exists
+                    // after 500ms (i.e. no join event cancelled it).
+                    Timeout::new(500, move || {
+                        if peer_toasts.peek().iter().any(|(tid, _, _)| *tid == id) {
+                            play_user_left();
+                        }
+                    })
+                    .forget();
+                    // Schedule toast removal after 8 seconds.
+                    Timeout::new(8_000, move || {
+                        let updated: Vec<_> = peer_toasts
+                            .peek()
+                            .iter()
+                            .filter(|(tid, _, _)| *tid != id)
+                            .cloned()
+                            .collect();
+                        peer_toasts.set(updated);
+                        {
+                            let v = *toast_version.peek();
+                            toast_version.set(v + 1);
+                        }
+                    })
+                    .forget();
+                },
+            )),
+            on_peer_joined: Some(VcCallback::from(
+                move |(display_name, user_id): (String, String)| {
+                    log::info!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                    let mut toast_counter = toast_counter;
+                    let mut peer_toasts = peer_toasts;
+                    let mut toast_version = toast_version;
+                    // Remove any pending "left" toast for this user (waiting room admission).
+                    let mut current = peer_toasts.peek().clone();
+                    current.retain(|(_, msg, uid)| !(uid == &user_id && msg.contains("left")));
+                    play_user_joined();
+                    let msg = format!("{display_name} ({user_id}) joined the meeting");
+                    let id = *toast_counter.peek();
+                    toast_counter.set(id + 1);
+                    current.push((id, msg, user_id));
+                    peer_toasts.set(current);
+                    {
+                        let v = *toast_version.peek();
+                        toast_version.set(v + 1);
+                    }
+                    // Schedule toast removal after 8 seconds.
+                    Timeout::new(8_000, move || {
+                        let updated: Vec<_> = peer_toasts
+                            .peek()
+                            .iter()
+                            .filter(|(tid, _, _)| *tid != id)
+                            .cloned()
+                            .collect();
+                        peer_toasts.set(updated);
+                        {
+                            let v = *toast_version.peek();
+                            toast_version.set(v + 1);
+                        }
+                    })
+                    .forget();
+                },
+            )),
         };
 
         let client = VideoCallClient::new(opts);
@@ -1194,7 +1229,10 @@ mod tests {
     /// attempt=10 exceeds MAX_RECONNECT_ATTEMPTS and should return None.
     #[wasm_bindgen_test]
     fn reconnect_delay_attempt_10_returns_none() {
-        assert!(reconnect_delay_ms(10).is_none(), "attempt 10 should return None");
+        assert!(
+            reconnect_delay_ms(10).is_none(),
+            "attempt 10 should return None"
+        );
     }
 
     /// Attempts beyond 10 should also return None.
@@ -1213,7 +1251,8 @@ mod tests {
         // Collect many samples per attempt and check the average is near the expected base.
         let samples = 200;
         for attempt in 0..4u32 {
-            let expected_base = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
+            let expected_base =
+                (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
             let sum: f64 = (0..samples)
                 .map(|_| reconnect_delay_ms(attempt).unwrap() as f64)
                 .sum();

@@ -128,8 +128,13 @@ pub fn Host(
                 handler.call(err);
             }
         });
-        let mut microphone =
-            create_microphone_encoder(client.clone(), audio_bitrate, mic_settings_cb, mic_error_cb, vad_threshold().ok());
+        let mut microphone = create_microphone_encoder(
+            client.clone(),
+            audio_bitrate,
+            mic_settings_cb,
+            mic_error_cb,
+            vad_threshold().ok(),
+        );
 
         let screen_settings_cell = screen_settings_handler.clone();
         let screen_settings_cb = VcCallback::from(move |settings: String| {

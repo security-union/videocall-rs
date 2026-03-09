@@ -95,6 +95,7 @@ pub struct Peer {
     pub audio_enabled: bool,
     pub screen_enabled: bool,
     pub is_speaking: bool,
+    pub display_name: Option<String>,
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
@@ -143,6 +144,7 @@ impl Peer {
             audio_enabled: false,
             screen_enabled: false,
             is_speaking: false,
+            display_name: None,
             context_initialized: false,
             vad_threshold,
             has_received_heartbeat: false,
@@ -192,8 +194,12 @@ impl Peer {
 
     fn reset(&mut self) -> Result<(), JsValue> {
         let sid_str = self.session_id.to_string();
-        let (mut audio, video, screen) =
-            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &sid_str, self.vad_threshold)?;
+        let (mut audio, video, screen) = Self::new_decoders(
+            &self.video_canvas_id,
+            &self.screen_canvas_id,
+            &sid_str,
+            self.vad_threshold,
+        )?;
 
         // Preserve the current mute state after reset
         audio.set_muted(!self.audio_enabled);
@@ -634,6 +640,27 @@ impl PeerDecodeManager {
         Ok(())
     }
 
+    /// Set the display name for a peer identified by user_id (email).
+    /// This is called when a PARTICIPANT_JOINED event provides the display name.
+    pub fn set_peer_display_name_by_user_id(&mut self, user_id: &str, display_name: String) {
+        let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
+        for key in keys {
+            if let Some(peer) = self.connected_peers.get_mut(&key) {
+                if peer.user_id == user_id {
+                    peer.display_name = Some(display_name.clone());
+                }
+            }
+        }
+    }
+
+    /// Get the display name for a peer by session_id string.
+    pub fn get_peer_display_name(&self, session_id_str: &str) -> Option<String> {
+        let sid: u64 = session_id_str.parse().ok()?;
+        self.connected_peers
+            .get(&sid)
+            .and_then(|peer| peer.display_name.clone())
+    }
+
     pub fn is_peer_speaking(&self, key: &String) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
@@ -652,8 +679,8 @@ impl PeerDecodeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use protobuf::Message;
+    use std::cell::Cell;
     use videocall_types::protos::media_packet::media_packet::MediaType;
     use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -674,7 +701,12 @@ mod tests {
     impl MockAudioDecoder {
         fn new() -> (Self, Rc<Cell<bool>>) {
             let muted = Rc::new(Cell::new(true));
-            (Self { muted: muted.clone() }, muted)
+            (
+                Self {
+                    muted: muted.clone(),
+                },
+                muted,
+            )
         }
     }
 
@@ -773,6 +805,7 @@ mod tests {
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
+            display_name: None,
             context_initialized: false,
             has_received_heartbeat: false,
             is_speaking: false,
@@ -986,11 +1019,10 @@ mod tests {
     fn meeting_packet_participant_admitted_deserializes_correctly() {
         use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
         use videocall_types::protos::meeting_packet::MeetingPacket;
-
         let mut packet = MeetingPacket::new();
         packet.event_type = MeetingEventType::PARTICIPANT_ADMITTED.into();
         packet.room_id = "room-123".into();
-        packet.target_user_id = "alice@example.com".into();
+        packet.target_user_id = "alice@example.com".as_bytes().to_vec();
         packet.message = "Welcome".into();
 
         let bytes = packet.write_to_bytes().expect("serialize MeetingPacket");
@@ -1002,7 +1034,7 @@ mod tests {
             "event_type should be PARTICIPANT_ADMITTED"
         );
         assert_eq!(parsed.room_id, "room-123");
-        assert_eq!(parsed.target_user_id, "alice@example.com");
+        assert_eq!(parsed.target_user_id[..], *"alice@example.com".as_bytes());
         assert_eq!(parsed.message, "Welcome");
     }
 
@@ -1013,19 +1045,21 @@ mod tests {
         use videocall_types::protos::meeting_packet::MeetingPacket;
 
         let mut packet = MeetingPacket::new();
-        packet.target_user_id = "alice@example.com".into();
+        packet.target_user_id = "alice@example.com".as_bytes().to_vec();
 
-        // Matching case: target_user_id equals userid
-        let userid = "alice@example.com";
+        // Matching case: target_user_id equals userid converted to bytes
+        let userid_bytes = "alice@example.com".as_bytes();
         assert_eq!(
-            packet.target_user_id, userid,
+            packet.target_user_id[..],
+            *userid_bytes,
             "target_user_id should match the local userid"
         );
 
         // Non-matching case: target_user_id does not equal a different userid
-        let observer_userid = "observer";
+        let observer_bytes = "observer".as_bytes();
         assert_ne!(
-            packet.target_user_id, observer_userid,
+            packet.target_user_id[..],
+            *observer_bytes,
             "target_user_id should NOT match a different userid"
         );
     }
@@ -1038,7 +1072,7 @@ mod tests {
 
         let mut packet = MeetingPacket::new();
         packet.event_type = MeetingEventType::PARTICIPANT_REJECTED.into();
-        packet.target_user_id = "bob@example.com".into();
+        packet.target_user_id = "bob@example.com".as_bytes().to_vec();
         packet.room_id = "room-456".into();
 
         let bytes = packet.write_to_bytes().expect("serialize");
@@ -1048,7 +1082,7 @@ mod tests {
             parsed.event_type.enum_value(),
             Ok(MeetingEventType::PARTICIPANT_REJECTED)
         );
-        assert_eq!(parsed.target_user_id, "bob@example.com");
+        assert_eq!(parsed.target_user_id[..], *"bob@example.com".as_bytes());
         assert_eq!(parsed.room_id, "room-456");
     }
 
@@ -1060,9 +1094,10 @@ mod tests {
         let packet = MeetingPacket::new();
         assert!(packet.target_user_id.is_empty());
 
-        let userid = "alice@example.com";
+        let userid_bytes = "alice@example.com".as_bytes();
         assert_ne!(
-            packet.target_user_id, userid,
+            packet.target_user_id[..],
+            *userid_bytes,
             "empty target_user_id should not match any userid"
         );
     }
@@ -1076,7 +1111,7 @@ mod tests {
 
         let mut meeting = MeetingPacket::new();
         meeting.event_type = MeetingEventType::PARTICIPANT_ADMITTED.into();
-        meeting.target_user_id = "charlie@example.com".into();
+        meeting.target_user_id = "charlie@example.com".as_bytes().to_vec();
         meeting.room_id = "room-789".into();
 
         let meeting_bytes = meeting.write_to_bytes().expect("serialize MeetingPacket");
@@ -1084,7 +1119,7 @@ mod tests {
         // Wrap in a PacketWrapper like the real code path does
         let wrapper = PacketWrapper {
             data: meeting_bytes,
-            user_id: "server".into(),
+            user_id: "server".as_bytes().to_vec(),
             packet_type: PacketType::MEETING.into(),
             ..Default::default()
         };
@@ -1093,19 +1128,25 @@ mod tests {
         assert_eq!(wrapper.packet_type.enum_value(), Ok(PacketType::MEETING));
         let parsed =
             MeetingPacket::parse_from_bytes(&wrapper.data).expect("parse from wrapper data");
-        assert_eq!(parsed.target_user_id, "charlie@example.com");
+        assert_eq!(parsed.target_user_id[..], *"charlie@example.com".as_bytes());
         assert_eq!(
             parsed.event_type.enum_value(),
             Ok(MeetingEventType::PARTICIPANT_ADMITTED)
         );
 
         // Simulate the userid check from video_call_client.rs
-        let my_userid = "charlie@example.com";
-        let should_fire_callback = parsed.target_user_id == my_userid;
-        assert!(should_fire_callback, "callback should fire for matching userid");
+        let my_userid_bytes = "charlie@example.com".as_bytes();
+        let should_fire_callback = parsed.target_user_id[..] == *my_userid_bytes;
+        assert!(
+            should_fire_callback,
+            "callback should fire for matching userid"
+        );
 
-        let other_userid = "observer@example.com";
-        let should_not_fire = parsed.target_user_id == other_userid;
-        assert!(!should_not_fire, "callback should NOT fire for non-matching userid");
+        let other_userid_bytes = "observer@example.com".as_bytes();
+        let should_not_fire = parsed.target_user_id[..] == *other_userid_bytes;
+        assert!(
+            !should_not_fire,
+            "callback should NOT fire for non-matching userid"
+        );
     }
 }

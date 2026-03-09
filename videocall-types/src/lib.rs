@@ -19,6 +19,7 @@
 pub mod callback;
 pub mod feature_flags;
 pub mod protos;
+pub mod validation;
 
 pub use callback::Callback;
 pub use feature_flags::FeatureFlags;

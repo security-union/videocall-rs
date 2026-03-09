@@ -92,6 +92,7 @@ Always delegate work to the specialized roster agents instead of making changes 
 - **integration-test-writer** — Write integration tests for new or changed features
 - **deploy-sync-expert** — Update Docker/K8s configs when services or dependencies change
 - **e2e-test-sync** — Create/update E2E tests when user-facing behavior changes
+- **ux-ui-expert** — UI/UX design guidance, component design, visual polish, accessibility
 
 Run agents in parallel when tasks are independent. Always run `code-reviewer` after substantive code changes.
 

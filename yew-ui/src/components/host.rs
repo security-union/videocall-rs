@@ -31,7 +31,8 @@ use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
+    load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
+    validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
@@ -111,6 +112,9 @@ pub struct MeetingProps {
 
     pub video_enabled: bool,
 
+    #[prop_or_default]
+    pub is_speaking: bool,
+
     pub on_encoder_settings_update: Callback<String>,
 
     pub device_settings_open: bool,
@@ -181,6 +185,7 @@ impl Component for Host {
             audio_bitrate,
             microphone_callback,
             microphone_error_cb.clone(),
+            vad_threshold().ok(),
         );
 
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
@@ -352,10 +357,18 @@ impl Component for Host {
             }
             Msg::ToggleChangeNameModal => {
                 if !self.show_change_name {
-                    // Opening: prefill with current username from storage
-                    self.pending_name = load_username_from_storage().unwrap_or_default();
+                    let stored = load_username_from_storage().unwrap_or_default();
+                    match validate_display_name(&stored) {
+                        Ok(v) => {
+                            self.pending_name = v;
+                            self.change_name_error = None;
+                        }
+                        Err(e) => {
+                            self.pending_name = stored;
+                            self.change_name_error = Some(e);
+                        }
+                    }
                     self.show_change_name = true;
-                    self.change_name_error = None;
                 } else {
                     self.show_change_name = false;
                     self.change_name_error = None;
@@ -363,7 +376,12 @@ impl Component for Host {
                 true
             }
             Msg::UpdatePendingName(value) => {
-                self.pending_name = value;
+                self.pending_name = value.clone();
+                self.change_name_error = if value.trim().is_empty() {
+                    None
+                } else {
+                    validate_display_name(&value).err()
+                };
                 true
             }
             Msg::CancelChangeName => {
@@ -372,20 +390,25 @@ impl Component for Host {
                 false
             }
             Msg::SaveChangeName => {
-                let new_name = self.pending_name.trim().to_string();
-                if is_valid_username(&new_name) && !new_name.is_empty() {
-                    save_username_to_storage(&new_name);
-                    // Force a soft reload so meeting picks up new name
-                    if let Some(win) = web_sys::window() {
-                        let _ = win.location().reload();
+                match validate_display_name(&self.pending_name) {
+                    Ok(valid_name) => {
+                        self.pending_name = valid_name.clone();
+
+                        save_username_to_storage(&valid_name);
+
+                        // Force a soft reload so meeting picks up new name
+                        if let Some(win) = web_sys::window() {
+                            let _ = win.location().reload();
+                        }
+
+                        self.show_change_name = false;
+                        self.change_name_error = None;
+                        false
                     }
-                    self.show_change_name = false;
-                    self.change_name_error = None;
-                    false
-                } else {
-                    self.change_name_error =
-                        Some("Use letters, numbers, and underscore only.".to_string());
-                    true
+                    Err(message) => {
+                        self.change_name_error = Some(message);
+                        true
+                    }
                 }
             }
             Msg::AudioDeviceChanged(audio) => {
@@ -518,12 +541,18 @@ impl Component for Host {
         let selected_camera_id = self.media_devices.video_inputs.selected();
         let selected_speaker_id = self.media_devices.audio_outputs.selected();
 
+        let speaking_class = if ctx.props().is_speaking {
+            "speaking-tile"
+        } else {
+            ""
+        };
+
         html! {
             <>
                 {
                     if ctx.props().video_enabled {
                         html! {
-                            <div class="host-video-wrapper" style="position:relative;">
+                            <div class={classes!("host-video-wrapper", speaking_class)} style="position:relative;">
                                 <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
                                 <button class="change-name-fab" title="Change name"
                                     onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
@@ -533,7 +562,7 @@ impl Component for Host {
                         }
                     } else {
                         html! {
-                            <div class="" style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 1rem; position:relative;">
+                            <div class={classes!("", speaking_class)} style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative;">
                                 <div class="placeholder-content">
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                         <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
@@ -596,27 +625,20 @@ impl Component for Host {
                     if self.show_change_name {
                         html!{
                             <div class="glass-backdrop"
-                                onkeydown={{
-                                    let link = ctx.link().clone();
-                                    Callback::from(move |e: KeyboardEvent| {
-                                        let key = e.key();
-                                        if key == "Escape" {
-                                            e.prevent_default();
-                                            link.send_message(Msg::CancelChangeName);
-                                        } else if key == "Enter" {
-                                            e.prevent_default();
-                                            link.send_message(Msg::SaveChangeName);
-                                        }
-                                    })
-                                }}
                             >
                                 <div class="card-apple" style="width: 380px;">
                                     <h3 style="margin-top:0;">{"Change your name"}</h3>
                                     <p style="color:#AEAEB2; margin-top:0.25rem;">{"This name will be visible to others in the meeting."}</p>
-                                    <input class="input-apple" value={self.pending_name.clone()} oninput={ctx.link().callback(|e: InputEvent| {
-                                        let input: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                        Msg::UpdatePendingName(input.value())
-                                    })} placeholder="Enter new name" pattern="^[a-zA-Z0-9_]*$" autofocus=true
+                                    <input
+                                        class="input-apple"
+                                        value={self.pending_name.clone()}
+                                        placeholder="Enter new name"
+                                        autofocus=true
+                                        maxlength={DISPLAY_NAME_MAX_LEN.to_string()}
+                                        oninput={ctx.link().callback(|e: InputEvent| {
+                                            let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                            Msg::UpdatePendingName(input.value())
+                                        })}
                                         onkeydown={{
                                             let link = ctx.link().clone();
                                             Callback::from(move |e: KeyboardEvent| {

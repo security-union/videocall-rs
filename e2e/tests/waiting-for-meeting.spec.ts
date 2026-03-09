@@ -44,7 +44,9 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
 
   await page.locator("#meeting-id").click();
   await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+  // Display name is a controlled input -- clear before typing to handle any pre-fill
   await page.locator("#username").click();
+  await page.locator("#username").fill("");
   await page.locator("#username").pressSequentially(username, { delay: 50 });
   await page.waitForTimeout(500);
   await page.locator("#username").press("Enter");
@@ -54,22 +56,26 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
   await page.waitForTimeout(1500);
 }
 
-async function submitDisplayName(page: Page, displayName: string) {
-  const displayInput = page.locator(".username-input");
-  if (await displayInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
-    await displayInput.fill(displayName);
-    await page.waitForTimeout(500);
-    await page.locator("button.cta-button").click();
-    await page.waitForTimeout(2000);
-  }
-}
-
+/**
+ * From the meeting page, wait for the meeting UI to load and click through
+ * "Start Meeting" / "Join Meeting" to enter the grid.
+ *
+ * The meeting page auto-joins the API when navigated to with a username
+ * already set (from the home page). Users who lack a username see an inline
+ * display name prompt on the meeting page itself.
+ *
+ * The auto-join shows a brief "Joining as [name]..." spinner while the API
+ * call is in flight. Once the API responds the UI transitions to one of:
+ *   - "Ready to join?" with Start/Join Meeting button (admitted)
+ *   - "Waiting to be admitted" (waiting room)
+ *   - "Waiting for meeting to start" (host hasn't started yet)
+ *
+ * Auth dropdown (user name/email, sign-out) is only shown on the home
+ * page -- it no longer appears on this pre-meeting screen.
+ */
 async function joinMeetingFromPage(
   page: Page,
-  displayName: string,
 ): Promise<"in-meeting" | "waiting" | "waiting-for-meeting"> {
-  await submitDisplayName(page, displayName);
-
   const joinButton = page.getByText(/Start Meeting|Join Meeting/);
   const waitingRoom = page.getByText("Waiting to be admitted");
   const waitingForMeeting = page.getByText("Waiting for meeting to start");
@@ -117,7 +123,7 @@ test.describe("Waiting for meeting (push notifications)", () => {
 
       await navigateToMeeting(guestPage, meetingId, "EarlyGuest");
 
-      const guestResult = await joinMeetingFromPage(guestPage, "EarlyGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
       expect(guestResult).toBe("waiting-for-meeting");
 
       await expect(guestPage.getByText("Waiting for meeting to start")).toBeVisible({
@@ -161,7 +167,7 @@ test.describe("Waiting for meeting (push notifications)", () => {
 
       // Guest joins first, lands on waiting-for-meeting
       await navigateToMeeting(guestPage, meetingId, "GuestEarly");
-      const guestResult = await joinMeetingFromPage(guestPage, "GuestEarly");
+      const guestResult = await joinMeetingFromPage(guestPage);
       expect(guestResult).toBe("waiting-for-meeting");
 
       await expect(guestPage.getByText("Waiting for meeting to start")).toBeVisible({
@@ -170,7 +176,7 @@ test.describe("Waiting for meeting (push notifications)", () => {
 
       // Host joins and starts the meeting
       await navigateToMeeting(hostPage, meetingId, "HostLate");
-      const hostResult = await joinMeetingFromPage(hostPage, "HostLate");
+      const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
@@ -246,14 +252,13 @@ test.describe("Waiting for meeting (push notifications)", () => {
 
       // Host starts the meeting
       await navigateToMeeting(hostPage, meetingId, "HostReject");
-      const hostResult = await joinMeetingFromPage(hostPage, "HostReject");
+      const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
-      // Guest joins and lands in waiting room
-      await guestPage.goto(`/meeting/${meetingId}`);
-      await guestPage.waitForTimeout(1500);
-      const guestResult = await joinMeetingFromPage(guestPage, "GuestReject");
+      // Guest joins via home page and lands in waiting room
+      await navigateToMeeting(guestPage, meetingId, "GuestReject");
+      const guestResult = await joinMeetingFromPage(guestPage);
 
       if (guestResult === "in-meeting" || guestResult === "waiting-for-meeting") {
         // Waiting room disabled or edge case -- skip gracefully

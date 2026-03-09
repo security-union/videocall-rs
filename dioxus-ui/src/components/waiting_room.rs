@@ -14,7 +14,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::constants::{actix_websocket_base, webtransport_enabled, webtransport_host_base};
-use crate::meeting_api::{check_status, join_meeting, JoinMeetingResponse};
+use crate::meeting_api::{check_status, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -114,12 +114,12 @@ pub fn WaitingRoom(
                         // handler which runs outside any Dioxus runtime
                         // context. Calling dioxus::spawn() here would panic.
                         wasm_bindgen_futures::spawn_local(async move {
-                            match join_meeting(&mid, None).await {
+                            match check_status(&mid).await {
                                 Ok(status) => {
                                     if status.room_token.is_some() {
                                         on_admitted.call(status);
                                     } else {
-                                        log::error!("Admitted but join_meeting returned no room_token");
+                                        log::error!("Admitted but check_status returned no room_token");
                                         error.set(Some(
                                             "Admitted but failed to obtain room token".to_string(),
                                         ));
@@ -140,6 +140,8 @@ pub fn WaitingRoom(
                     on_rejected.call(());
                 })),
                 on_waiting_room_updated: None,
+                on_speaking_changed: None,
+                vad_threshold: None,
             };
 
             let mut client = VideoCallClient::new(opts);

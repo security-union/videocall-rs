@@ -30,7 +30,8 @@ use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
+    load_username_from_storage, save_username_to_storage, validate_display_name,
+    VideoCallClientCtx,
 };
 
 use std::cell::RefCell;
@@ -65,6 +66,7 @@ pub fn Host(
     share_screen: bool,
     mic_enabled: bool,
     video_enabled: bool,
+    #[props(default)] is_speaking: bool,
     on_encoder_settings_update: EventHandler<String>,
     device_settings_open: bool,
     on_device_settings_toggle: EventHandler<MouseEvent>,
@@ -127,7 +129,7 @@ pub fn Host(
             }
         });
         let mut microphone =
-            create_microphone_encoder(client.clone(), audio_bitrate, mic_settings_cb, mic_error_cb);
+            create_microphone_encoder(client.clone(), audio_bitrate, mic_settings_cb, mic_error_cb, vad_threshold().ok());
 
         let screen_settings_cell = screen_settings_handler.clone();
         let screen_settings_cb = VcCallback::from(move |settings: String| {
@@ -446,9 +448,9 @@ pub fn Host(
         // Dioxus patches individual CSS properties (doesn't replace the whole
         // style attribute), so both branches must set ALL properties explicitly.
         div {
-            class: "host-video-wrapper",
+            class: if is_speaking && video_enabled { "host-video-wrapper speaking-tile" } else { "host-video-wrapper" },
             style: if video_enabled {
-                "position:relative; width:auto; height:auto; opacity:1; overflow:visible; pointer-events:auto;"
+                "position:relative; width:auto; height:auto; opacity:1; overflow:hidden; pointer-events:auto;"
             } else {
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
@@ -468,7 +470,9 @@ pub fn Host(
             }
         }
         if !video_enabled {
-            div { style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 1rem; position:relative;",
+            div {
+                class: if is_speaking { "speaking-tile" } else { "" },
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
@@ -558,13 +562,16 @@ pub fn Host(
                         change_name_error.set(None);
                     } else if key == Key::Enter {
                         let new_name = pending_name().trim().to_string();
-                        if is_valid_username(&new_name) && !new_name.is_empty() {
-                            save_username_to_storage(&new_name);
-                            if let Some(win) = web_sys::window() {
-                                let _ = win.location().reload();
+                        match validate_display_name(&new_name) {
+                            Ok(valid_name) => {
+                                save_username_to_storage(&valid_name);
+                                if let Some(win) = web_sys::window() {
+                                    let _ = win.location().reload();
+                                }
                             }
-                        } else {
-                            change_name_error.set(Some("Use letters, numbers, and underscore only.".to_string()));
+                            Err(message) => {
+                                change_name_error.set(Some(message));
+                            }
                         }
                     }
                 },
@@ -578,7 +585,6 @@ pub fn Host(
                             pending_name.set(e.value());
                         },
                         placeholder: "Enter new name",
-                        pattern: "^[a-zA-Z0-9_]*$",
                         autofocus: true,
                     }
                     if let Some(err) = change_name_error() {
@@ -597,13 +603,16 @@ pub fn Host(
                             class: "btn-apple btn-primary btn-sm",
                             onclick: move |_| {
                                 let new_name = pending_name().trim().to_string();
-                                if is_valid_username(&new_name) && !new_name.is_empty() {
-                                    save_username_to_storage(&new_name);
-                                    if let Some(win) = web_sys::window() {
-                                        let _ = win.location().reload();
+                                match validate_display_name(&new_name) {
+                                    Ok(valid_name) => {
+                                        save_username_to_storage(&valid_name);
+                                        if let Some(win) = web_sys::window() {
+                                            let _ = win.location().reload();
+                                        }
                                     }
-                                } else {
-                                    change_name_error.set(Some("Use letters, numbers, and underscore only.".to_string()));
+                                    Err(message) => {
+                                        change_name_error.set(Some(message));
+                                    }
                                 }
                             },
                             "Save"

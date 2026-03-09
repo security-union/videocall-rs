@@ -49,6 +49,7 @@ runtimeConfig:
   audioBitrateKbps: 65
   videoBitrateKbps: 1000
   screenBitrateKbps: 1000
+  vadThreshold: 0.02
 
 ingress:
   enabled: true

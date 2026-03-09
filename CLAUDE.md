@@ -102,3 +102,13 @@ Run agents in parallel when tasks are independent. Always run `code-reviewer` af
 
 - **No symlinks or hardlinks for source files.** Each crate/UI must own its files independently. Do not use symlinks between `dioxus-ui/` and `yew-ui/` static assets or any other source directories. If both UIs need shared CSS, copy the shared base and maintain framework-specific additions separately.
 
+## Linter & Formatter Rules
+
+**All code changes MUST pass project linters before being considered complete.** Agents must run the appropriate linter/formatter after editing any file:
+
+- **Rust code:** Run `cargo fmt` on changed crates. Run `cargo clippy` to catch warnings and fix them.
+- **TypeScript / JS (e2e/):** Run `cd e2e && npx prettier --write <files> && npx eslint <files> && npx tsc --noEmit` to match the CI `ci:lint` check.
+- **General:** No unused imports, no unused variables, follow existing code style. Respect all project lint configs (`.eslintrc`, `rustfmt.toml`, `.prettierrc`, etc.).
+
+This is mandatory for every agent making code changes — not optional. CI will reject PRs that fail linting.
+

@@ -145,24 +145,50 @@ pub fn HostControls(
                     for participant in waiting().iter() {
                         {
                             let peer_user_id = participant.user_id.clone();
+                            let display_name = participant.display_name.clone();
+
+                            let uid_for_key = peer_user_id.clone();
+                            let uid_for_view = peer_user_id.clone();
                             let uid_admit = peer_user_id.clone();
                             let uid_reject = peer_user_id.clone();
+
                             let meeting_id_admit = meeting_id.clone();
                             let meeting_id_reject = meeting_id.clone();
+
                             let fetch_admit = fetch_waiting_list.clone();
                             let fetch_reject = fetch_waiting_list.clone();
+
+                            let mut waiting_admit = waiting.clone();
+                            let mut waiting_reject = waiting.clone();
+
+                            let mut error_admit = error.clone();
+                            let mut error_reject = error.clone();
+
                             rsx! {
-                                div { key: "{peer_user_id}", class: "waiting-participant",
-                                    span { class: "participant-email", "{peer_user_id}" }
+                                div { key: "{uid_for_key}", class: "waiting-participant",
+                                    div { class: "participant-info",
+                                        if let Some(name) = display_name.clone() {
+                                            if !name.trim().is_empty() {
+                                                div { class: "participant-name", "{name}" }
+                                                div { class: "participant-email", "{uid_for_view}" }
+                                            } else {
+                                                div { class: "participant-name", "{uid_for_view}" }
+                                            }
+                                        } else {
+                                            div { class: "participant-name", "{uid_for_view}" }
+                                        }
+                                    }
                                     div { class: "participant-actions",
                                         button {
                                             class: "btn-admit",
                                             title: "Admit",
                                             onclick: move |_| {
-                                                waiting.write().retain(|p| p.user_id != uid_admit);
+                                                waiting_admit.write().retain(|p| p.user_id != uid_admit);
                                                 let uid = uid_admit.clone();
                                                 let meeting_id = meeting_id_admit.clone();
                                                 let fetch = fetch_admit.clone();
+                                                let mut error = error_admit.clone();
+
                                                 spawn(async move {
                                                     match admit_participant(&meeting_id, &uid).await {
                                                         Ok(_) => fetch(),
@@ -184,10 +210,12 @@ pub fn HostControls(
                                             class: "btn-reject",
                                             title: "Reject",
                                             onclick: move |_| {
-                                                waiting.write().retain(|p| p.user_id != uid_reject);
+                                                waiting_reject.write().retain(|p| p.user_id != uid_reject);
                                                 let uid = uid_reject.clone();
                                                 let meeting_id = meeting_id_reject.clone();
                                                 let fetch = fetch_reject.clone();
+                                                let mut error = error_reject.clone();
+
                                                 spawn(async move {
                                                     match reject_participant(&meeting_id, &uid).await {
                                                         Ok(_) => fetch(),

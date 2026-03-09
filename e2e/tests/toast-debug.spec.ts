@@ -21,11 +21,31 @@ test("debug toast visibility", async ({ baseURL }) => {
     const hostCtx = await browser1.newContext({ baseURL: uiURL, ignoreHTTPSErrors: true });
     const token1 = generateSessionToken("host-dbg@test.rs", "DebugHost");
     const url = new URL(uiURL);
-    await hostCtx.addCookies([{ name: COOKIE_NAME, value: token1, domain: url.hostname, path: "/", httpOnly: true, secure: false, sameSite: "Lax" }]);
+    await hostCtx.addCookies([
+      {
+        name: COOKIE_NAME,
+        value: token1,
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        secure: false,
+        sameSite: "Lax",
+      },
+    ]);
 
     const guestCtx = await browser2.newContext({ baseURL: uiURL, ignoreHTTPSErrors: true });
     const token2 = generateSessionToken("guest-dbg@test.rs", "DebugGuest");
-    await guestCtx.addCookies([{ name: COOKIE_NAME, value: token2, domain: url.hostname, path: "/", httpOnly: true, secure: false, sameSite: "Lax" }]);
+    await guestCtx.addCookies([
+      {
+        name: COOKIE_NAME,
+        value: token2,
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        secure: false,
+        sameSite: "Lax",
+      },
+    ]);
 
     const hostPage = await hostCtx.newPage();
     const guestPage = await guestCtx.newPage();
@@ -121,21 +141,30 @@ test("debug toast visibility", async ({ baseURL }) => {
     console.log(`Host page: .peer-toasts count=${toastContainer}, .peer-toast count=${toasts}`);
 
     // Dump relevant console logs
-    const participantLogs = hostConsole.filter(l =>
-      l.includes("PARTICIPANT") || l.includes("peer_joined") || l.includes("should_emit") || l.includes("MeetingEvent") || l.includes("TOAST-RX") || l.includes("Peer joined") || l.includes("Peer left")
+    const participantLogs = hostConsole.filter(
+      (l) =>
+        l.includes("PARTICIPANT") ||
+        l.includes("peer_joined") ||
+        l.includes("should_emit") ||
+        l.includes("MeetingEvent") ||
+        l.includes("TOAST-RX") ||
+        l.includes("Peer joined") ||
+        l.includes("Peer left"),
     );
     console.log(`Host console logs with PARTICIPANT/toast/peer (${participantLogs.length}):`);
-    participantLogs.forEach(l => console.log(`  ${l}`));
+    participantLogs.forEach((l) => console.log(`  ${l}`));
 
     // Show ALL error messages
-    const errorLogs = hostConsole.filter(l => l.startsWith("[error]") || l.includes("panic") || l.includes("Error"));
+    const errorLogs = hostConsole.filter(
+      (l) => l.startsWith("[error]") || l.includes("panic") || l.includes("Error"),
+    );
     console.log(`Host error messages (${errorLogs.length}):`);
-    errorLogs.forEach(l => console.log(`  ${l}`));
+    errorLogs.forEach((l) => console.log(`  ${l}`));
 
     // Also dump ALL info-level logs
-    const infoLogs = hostConsole.filter(l => l.startsWith("[info]") || l.startsWith("[log]"));
+    const infoLogs = hostConsole.filter((l) => l.startsWith("[info]") || l.startsWith("[log]"));
     console.log(`Host info/log messages (${infoLogs.length}):`);
-    infoLogs.slice(-30).forEach(l => console.log(`  ${l}`));
+    infoLogs.slice(-30).forEach((l) => console.log(`  ${l}`));
 
     // Check page HTML for any toast elements
     const html = await hostPage.locator("body").innerHTML();

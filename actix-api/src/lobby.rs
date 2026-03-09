@@ -101,9 +101,10 @@ pub async fn ws_connect_authenticated(
     let user_id = claims.sub;
     let room = claims.room;
     let observer = claims.observer;
+    let display_name = claims.display_name;
 
     debug!(
-        "socket connected (token-based) for user_id={user_id}, room={room}, observer={observer}"
+        "socket connected (token-based) for user_id={user_id}, room={room}, display_name={display_name}, observer={observer}"
     );
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
@@ -113,6 +114,7 @@ pub async fn ws_connect_authenticated(
         chat,
         room,
         user_id,
+        display_name,
         nats_client,
         tracker_sender,
         session_manager,
@@ -165,7 +167,8 @@ pub async fn ws_connect(
     let actor = WsChatSession::new(
         chat,
         room_clean,
-        user_id_clean,
+        user_id_clean.clone(),
+        user_id_clean, // display_name fallback: use user_id for deprecated path
         nats_client,
         tracker_sender,
         session_manager,

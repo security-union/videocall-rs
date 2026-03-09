@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
-use crate::messages::server::{ActivateConnection, Leave, Packet};
+use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -54,10 +54,12 @@ pub struct WsChatSession {
 }
 
 impl WsChatSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: Addr<ChatServer>,
         room: String,
         user_id: String,
+        display_name: String,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -67,6 +69,7 @@ impl WsChatSession {
             addr,
             room,
             user_id,
+            display_name,
             nats_client,
             tracker_sender,
             session_manager,
@@ -252,11 +255,10 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                     "Close received for session {} in room {}",
                     self.logic.id, self.logic.room
                 );
-                self.logic.addr.do_send(Leave {
-                    session: self.logic.id,
-                    room: self.logic.room.clone(),
-                    user_id: self.logic.user_id.clone(),
-                });
+                // Do NOT send Leave here. ctx.stop() triggers stopping() which
+                // sends Disconnect with the correct observer flag. A separate
+                // Leave would bypass the observer check and emit a spurious
+                // PARTICIPANT_LEFT for observer (waiting-room) sessions.
                 ctx.close(reason);
                 ctx.stop();
             }
@@ -351,10 +353,12 @@ mod tests {
 
                             async move {
                                 let (room, user_id) = path.into_inner();
+                                let display_name = user_id.clone(); // test fallback
                                 let actor = WsChatSession::new(
                                     chat,
                                     room,
                                     user_id,
+                                    display_name,
                                     nats_client,
                                     tracker_sender,
                                     session_manager,

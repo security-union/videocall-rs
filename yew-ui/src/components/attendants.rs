@@ -124,6 +124,14 @@ pub enum Msg {
     TokenRefreshFailed(String),
     /// The waiting room participant list changed (push notification from server).
     WaitingRoomUpdated,
+    /// A remote participant left the meeting. Carries (display_name, user_id).
+    OnPeerLeft((String, String)),
+    /// A remote participant joined the meeting. Carries (display_name, user_id).
+    OnPeerJoined((String, String)),
+    /// Remove an expired toast by its monotonic ID.
+    RemovePeerToast(u64),
+    /// Play the leave sound only if the toast still exists (not cancelled by a join).
+    PlayLeftSoundIfStillActive(u64),
 }
 
 impl From<WsAction> for Msg {
@@ -220,6 +228,10 @@ pub struct AttendantsComponent {
     /// the non-JWT path manages its own attempt counter inside the recursive
     /// `schedule_reconnect_no_jwt` closure chain.
     reconnect_attempt: u32,
+    /// Active "participant join/leave" toast messages: (toast_id, message, user_id).
+    peer_toasts: Vec<(u64, String, String)>,
+    /// Monotonic counter for toast IDs.
+    toast_counter: u64,
 }
 
 impl AttendantsComponent {
@@ -283,7 +295,7 @@ impl AttendantsComponent {
         log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
 
         let opts = VideoCallClientOptions {
-            user_id: display_name.clone(),
+            user_id: ctx.props().user_id.clone().unwrap_or_else(|| display_name.clone()),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -376,6 +388,18 @@ impl AttendantsComponent {
                 VcCallback::from(move |_| {
                     log::info!("Waiting room updated via push notification");
                     link.send_message(Msg::WaitingRoomUpdated);
+                })
+            }),
+            on_peer_left: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |pair: (String, String)| {
+                    link.send_message(Msg::OnPeerLeft(pair));
+                })
+            }),
+            on_peer_joined: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |pair: (String, String)| {
+                    link.send_message(Msg::OnPeerJoined(pair));
                 })
             }),
         };
@@ -535,15 +559,54 @@ impl AttendantsComponent {
     }
 
     fn play_user_joined() {
-        if let Some(_window) = web_sys::window() {
-            if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
-                audio.set_volume(0.4);
-                if let Err(e) = audio.play() {
-                    log::warn!("Failed to play notification sound: {e:?}");
-                }
-            } else {
-                log::warn!("Failed to create audio element for notification sound");
-            }
+        // Ascending two-tone chime: C5 -> E5 (pleasant, welcoming)
+        Self::play_tone_pair(523.25, 659.25, 0.12, 0.35);
+    }
+
+    fn play_user_left() {
+        // Descending two-tone: E5 -> A4 (subtle, muted)
+        Self::play_tone_pair(659.25, 440.0, 0.12, 0.25);
+    }
+
+    /// Play two short sine-wave tones in sequence using the Web Audio API.
+    fn play_tone_pair(freq1: f64, freq2: f64, duration: f64, volume: f64) {
+        let Some(_window) = web_sys::window() else {
+            return;
+        };
+        let ctx = match web_sys::AudioContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let now = ctx.current_time();
+
+        // First tone
+        if let (Ok(osc), Ok(gain)) = (ctx.create_oscillator(), ctx.create_gain()) {
+            let _ = osc.connect_with_audio_node(&gain);
+            let _ = gain.connect_with_audio_node(&ctx.destination());
+            osc.set_type(web_sys::OscillatorType::Triangle);
+            let _ = osc.frequency().set_value_at_time(freq1 as f32, now);
+            let _ = gain.gain().set_value_at_time(volume as f32, now);
+            let _ = gain
+                .gain()
+                .exponential_ramp_to_value_at_time(0.01, now + duration);
+            let _ = osc.start();
+            let _ = osc.stop_with_when(now + duration);
+        }
+
+        // Second tone (starts after first ends)
+        if let (Ok(osc), Ok(gain)) = (ctx.create_oscillator(), ctx.create_gain()) {
+            let _ = osc.connect_with_audio_node(&gain);
+            let _ = gain.connect_with_audio_node(&ctx.destination());
+            osc.set_type(web_sys::OscillatorType::Triangle);
+            let _ = osc.frequency().set_value_at_time(freq2 as f32, now + duration);
+            let _ = gain
+                .gain()
+                .set_value_at_time(volume as f32, now + duration);
+            let _ = gain
+                .gain()
+                .exponential_ramp_to_value_at_time(0.01, now + duration * 2.0);
+            let _ = osc.start_with_when(now + duration);
+            let _ = osc.stop_with_when(now + duration * 2.0);
         }
     }
 }
@@ -584,6 +647,8 @@ impl Component for AttendantsComponent {
             local_speaking: false,
             waiting_room_version: 0,
             reconnect_attempt: 0,
+            peer_toasts: Vec::new(),
+            toast_counter: 0,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -918,6 +983,71 @@ impl Component for AttendantsComponent {
                 self.waiting_room_version = self.waiting_room_version.wrapping_add(1);
                 true
             }
+            Msg::OnPeerLeft((display_name, user_id)) => {
+                log::info!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+                // Don't play sound immediately -- defer it so a rapid
+                // join event (waiting-room admission) can cancel it.
+                let msg = if display_name == user_id {
+                    format!("{display_name} left the meeting")
+                } else {
+                    format!("{display_name} ({user_id}) left the meeting")
+                };
+                let id = self.toast_counter;
+                self.toast_counter += 1;
+                self.peer_toasts.push((id, msg, user_id));
+                // Defer the leave sound: only play if the toast still exists
+                // after 500ms (i.e. no join event cancelled it).
+                let link_sound = ctx.link().clone();
+                Timeout::new(500, move || {
+                    link_sound.send_message(Msg::PlayLeftSoundIfStillActive(id));
+                })
+                .forget();
+                // Schedule toast removal after 8 seconds.
+                let link = ctx.link().clone();
+                Timeout::new(8_000, move || {
+                    link.send_message(Msg::RemovePeerToast(id));
+                })
+                .forget();
+                true
+            }
+            Msg::OnPeerJoined((display_name, user_id)) => {
+                log::info!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                // When an observer is admitted from the waiting room, the
+                // observer connection closes (PARTICIPANT_LEFT) and the user
+                // reconnects as a real participant (PARTICIPANT_JOINED). If
+                // there is a pending "left" toast for this user, remove it
+                // (the deferred leave sound will also be suppressed because
+                // it checks whether the toast still exists).
+                self.peer_toasts.retain(|(_, msg, uid)| !(uid == &user_id && msg.contains("left")));
+
+                // Always show the join toast and play the join sound.
+                Self::play_user_joined();
+                let msg = if display_name == user_id {
+                    format!("{display_name} joined the meeting")
+                } else {
+                    format!("{display_name} ({user_id}) joined the meeting")
+                };
+                let id = self.toast_counter;
+                self.toast_counter += 1;
+                self.peer_toasts.push((id, msg, user_id));
+                let link = ctx.link().clone();
+                Timeout::new(8_000, move || {
+                    link.send_message(Msg::RemovePeerToast(id));
+                })
+                .forget();
+                true
+            }
+            Msg::RemovePeerToast(toast_id) => {
+                let before = self.peer_toasts.len();
+                self.peer_toasts.retain(|(id, _, _)| *id != toast_id);
+                self.peer_toasts.len() != before
+            }
+            Msg::PlayLeftSoundIfStillActive(toast_id) => {
+                if self.peer_toasts.iter().any(|(id, _, _)| *id == toast_id) {
+                    Self::play_user_left();
+                }
+                false // no re-render needed
+            }
         }
     }
 
@@ -1017,6 +1147,59 @@ impl Component for AttendantsComponent {
             <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
+
+                    // "participant joined/left" toast notifications
+                    if !self.peer_toasts.is_empty() {
+                        <div class="peer-toasts">
+                            { for self.peer_toasts.iter().map(|(id, msg, _uid)| {
+                                let key = id.to_string();
+                                let is_joined = msg.contains("joined");
+                                let variant_class = if is_joined {
+                                    "peer-toast toast-joined"
+                                } else {
+                                    "peer-toast toast-left"
+                                };
+                                let name = if is_joined {
+                                    msg.trim_end_matches(" joined the meeting")
+                                } else {
+                                    msg.trim_end_matches(" left the meeting")
+                                };
+                                let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
+                                let icon_svg = if is_joined {
+                                    html! {
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                                             stroke="currentColor" stroke-width="2"
+                                             stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+                                            <circle cx="9" cy="7" r="4"/>
+                                            <line x1="19" y1="8" x2="19" y2="14"/>
+                                            <line x1="22" y1="11" x2="16" y2="11"/>
+                                        </svg>
+                                    }
+                                } else {
+                                    html! {
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                                             stroke="currentColor" stroke-width="2"
+                                             stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+                                            <circle cx="9" cy="7" r="4"/>
+                                            <line x1="22" y1="11" x2="16" y2="11"/>
+                                        </svg>
+                                    }
+                                };
+                                html! {
+                                    <div {key} class={variant_class}>
+                                        <span class="toast-icon">{ icon_svg }</span>
+                                        <span class="toast-text">
+                                            <span class="toast-name">{ format!("{name} ") }</span>
+                                            <span class="toast-action">{ action_text }</span>
+                                        </span>
+                                    </div>
+                                }
+                            })}
+                        </div>
+                    }
+
                 <div id="grid-container"
                     class={grid_container_classes}
                     data-peers={num_peers_for_styling.to_string()}

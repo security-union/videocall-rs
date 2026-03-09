@@ -100,6 +100,14 @@ pub struct VideoCallClientOptions {
 
     /// Callback triggered when the waiting room participant list changes (optional)
     pub on_waiting_room_updated: Option<Callback<()>>,
+
+    /// Callback triggered when a remote participant leaves the meeting.
+    /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
+    pub on_peer_left: Option<Callback<(String, String)>>,
+
+    /// Callback triggered when a remote participant joins the meeting.
+    /// Emits `(display_name, user_id)` from the PARTICIPANT_JOINED meeting event.
+    pub on_peer_joined: Option<Callback<(String, String)>>,
 }
 
 #[derive(Debug)]
@@ -113,6 +121,8 @@ struct InnerOptions {
     on_participant_admitted: Option<Callback<()>>,
     on_participant_rejected: Option<Callback<()>>,
     on_waiting_room_updated: Option<Callback<()>>,
+    on_peer_left: Option<Callback<(String, String)>>,
+    on_peer_joined: Option<Callback<(String, String)>>,
 }
 
 #[derive(Debug)]
@@ -127,6 +137,12 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
+    /// Recently processed peer events for deduplication.
+    /// Both WebSocket and WebTransport connections receive the same NATS system
+    /// messages, so we deduplicate by (event_type, target_user_id) within a
+    /// short time window to avoid firing duplicate toast notifications.
+    /// Key: (event_type_str, target_user_id), Value: timestamp_ms
+    recent_peer_events: HashMap<(String, String), f64>,
 }
 
 /// The main client handle for a video call session.
@@ -229,6 +245,8 @@ impl VideoCallClient {
                     on_participant_admitted: options.on_participant_admitted.clone(),
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
+                    on_peer_left: options.on_peer_left.clone(),
+                    on_peer_joined: options.on_peer_joined.clone(),
                 },
                 connection_controller: connection_controller.clone(),
                 connection_state: ConnectionState::Failed {
@@ -245,6 +263,7 @@ impl VideoCallClient {
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
+                recent_peer_events: HashMap::new(),
             })),
             connection_controller,
             aes,
@@ -789,6 +808,27 @@ impl VideoCallClient {
 }
 
 impl Inner {
+    /// Returns `true` if this peer event was already seen recently (within 5 s).
+    ///
+    /// Both WebSocket and WebTransport connections receive the same NATS system
+    /// messages, so the same PARTICIPANT_JOINED / PARTICIPANT_LEFT event can
+    /// arrive twice.  This helper deduplicates them so the UI only fires one
+    /// toast notification per actual event.
+    fn is_duplicate_peer_event(&mut self, event_type: &str, target_user_id: &str) -> bool {
+        let now = js_sys::Date::now();
+        let key = (event_type.to_string(), target_user_id.to_string());
+
+        // Evict stale entries (older than 5 seconds).
+        self.recent_peer_events.retain(|_, ts| now - *ts < 5000.0);
+
+        if self.recent_peer_events.contains_key(&key) {
+            true // duplicate
+        } else {
+            self.recent_peer_events.insert(key, now);
+            false // first occurrence
+        }
+    }
+
     fn on_inbound_media(&mut self, response: PacketWrapper) {
         debug!(
             "<< Received {:?} from {} (session: {})",
@@ -926,7 +966,16 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEETING) => match MeetingPacket::parse_from_bytes(&response.data) {
-                Ok(meeting_packet) => match meeting_packet.event_type.enum_value() {
+                Ok(meeting_packet) => {
+                    info!(
+                        "Received MEETING packet: event_type={:?}, room={}, target={}, creator={}, session={}",
+                        meeting_packet.event_type.enum_value(),
+                        meeting_packet.room_id,
+                        meeting_packet.target_user_id,
+                        meeting_packet.creator_id,
+                        meeting_packet.session_id,
+                    );
+                    match meeting_packet.event_type.enum_value() {
                     Ok(MeetingEventType::MEETING_STARTED) => {
                         info!(
                             "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
@@ -953,19 +1002,51 @@ impl Inner {
                         }
                     }
                     Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                        debug!(
-                            "Received PARTICIPANT_JOINED: room={}, count={}",
-                            meeting_packet.room_id, meeting_packet.participant_count
-                        );
+                        // Check dedup before borrowing self.options to avoid
+                        // overlapping mutable/immutable borrows.
+                        let should_emit = !meeting_packet.target_user_id.is_empty()
+                            && meeting_packet.target_user_id != self.options.user_id
+                            && !self.is_duplicate_peer_event(
+                                "joined",
+                                &meeting_packet.target_user_id,
+                            );
+                        if should_emit {
+                            info!("Peer joined: {}", meeting_packet.target_user_id);
+                            if let Some(ref cb) = self.options.on_peer_joined {
+                                let display_name = if meeting_packet.creator_id.is_empty() {
+                                    meeting_packet.target_user_id.clone()
+                                } else {
+                                    meeting_packet.creator_id.clone()
+                                };
+                                cb.emit((display_name, meeting_packet.target_user_id.clone()));
+                            }
+                        } else {
+                            debug!(
+                                "Suppressed PARTICIPANT_JOINED for target={}",
+                                meeting_packet.target_user_id,
+                            );
+                        }
                     }
                     Ok(MeetingEventType::PARTICIPANT_LEFT) => {
-                        info!(
-                            "Received PARTICIPANT_LEFT: session_id={}, user={}",
-                            meeting_packet.session_id,
-                            meeting_packet.target_user_id,
-                        );
                         if meeting_packet.session_id != 0 {
                             self.peer_decode_manager.delete_peer(meeting_packet.session_id);
+                        }
+                        let should_emit = !meeting_packet.target_user_id.is_empty()
+                            && meeting_packet.target_user_id != self.options.user_id
+                            && !self.is_duplicate_peer_event(
+                                "left",
+                                &meeting_packet.target_user_id,
+                            );
+                        if should_emit {
+                            info!("Peer left: {}", meeting_packet.target_user_id);
+                            if let Some(ref cb) = self.options.on_peer_left {
+                                let display_name = if meeting_packet.creator_id.is_empty() {
+                                    meeting_packet.target_user_id.clone()
+                                } else {
+                                    meeting_packet.creator_id.clone()
+                                };
+                                cb.emit((display_name, meeting_packet.target_user_id.clone()));
+                            }
                         }
                     }
                     Ok(MeetingEventType::MEETING_ACTIVATED) => {
@@ -1019,7 +1100,7 @@ impl Inner {
                     Err(e) => {
                         error!("Failed to parse MeetingEventType: {e}");
                     }
-                },
+                }},
                 Err(e) => {
                     error!("Failed to parse MeetingPacket: {e}");
                 }

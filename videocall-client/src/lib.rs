@@ -72,6 +72,8 @@
 //!     on_participant_admitted: None,
 //!     on_participant_rejected: None,
 //!     on_waiting_room_updated: None,
+//!     on_peer_left: None,    // Option<Callback<(String, String)>> -- (display_name, user_id)
+//!     on_peer_joined: None,  // Option<Callback<(String, String)>> -- (display_name, user_id)
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -101,6 +103,8 @@
 //! #     on_participant_admitted: None,
 //! #     on_participant_rejected: None,
 //! #     on_waiting_room_updated: None,
+//! #     on_peer_left: None,
+//! #     on_peer_joined: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(

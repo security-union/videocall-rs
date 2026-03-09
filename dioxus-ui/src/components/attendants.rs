@@ -47,7 +47,6 @@ use videocall_client::Callback as VcCallback;
 use videocall_client::{
     MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
-use web_sys::HtmlAudioElement;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
@@ -86,13 +85,56 @@ fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<S
 }
 
 fn play_user_joined() {
-    if let Some(_window) = web_sys::window() {
-        if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
-            audio.set_volume(0.4);
-            if let Err(e) = audio.play() {
-                log::warn!("Failed to play notification sound: {e:?}");
-            }
-        }
+    // Ascending two-tone chime: C5 -> E5 (pleasant, welcoming)
+    play_tone_pair(523.25, 659.25, 0.12, 0.35);
+}
+
+fn play_user_left() {
+    // Descending two-tone: E5 -> A4 (subtle, muted)
+    play_tone_pair(659.25, 440.0, 0.12, 0.25);
+}
+
+/// Play two short sine-wave tones in sequence using the Web Audio API.
+/// `freq1` / `freq2` are the frequencies in Hz, `duration` is how long each
+/// tone lasts (seconds), and `volume` is the peak gain (0.0 – 1.0).
+fn play_tone_pair(freq1: f64, freq2: f64, duration: f64, volume: f64) {
+    let Some(_window) = web_sys::window() else {
+        return;
+    };
+    let ctx = match web_sys::AudioContext::new() {
+        Ok(ctx) => ctx,
+        Err(_) => return,
+    };
+    let now = ctx.current_time();
+
+    // First tone
+    if let (Ok(osc), Ok(gain)) = (ctx.create_oscillator(), ctx.create_gain()) {
+        let _ = osc.connect_with_audio_node(&gain);
+        let _ = gain.connect_with_audio_node(&ctx.destination());
+        osc.set_type(web_sys::OscillatorType::Triangle);
+        let _ = osc.frequency().set_value_at_time(freq1 as f32, now);
+        let _ = gain.gain().set_value_at_time(volume as f32, now);
+        let _ = gain
+            .gain()
+            .exponential_ramp_to_value_at_time(0.01, now + duration);
+        let _ = osc.start();
+        let _ = osc.stop_with_when(now + duration);
+    }
+
+    // Second tone (starts after first ends)
+    if let (Ok(osc), Ok(gain)) = (ctx.create_oscillator(), ctx.create_gain()) {
+        let _ = osc.connect_with_audio_node(&gain);
+        let _ = gain.connect_with_audio_node(&ctx.destination());
+        osc.set_type(web_sys::OscillatorType::Triangle);
+        let _ = osc.frequency().set_value_at_time(freq2 as f32, now + duration);
+        let _ = gain
+            .gain()
+            .set_value_at_time(volume as f32, now + duration);
+        let _ = gain
+            .gain()
+            .exponential_ramp_to_value_at_time(0.01, now + duration * 2.0);
+        let _ = osc.start_with_when(now + duration);
+        let _ = osc.stop_with_when(now + duration * 2.0);
     }
 }
 
@@ -252,6 +294,9 @@ pub fn AttendantsComponent(
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
+    let peer_toasts: Signal<Vec<(u64, String, String)>> = use_signal(Vec::new);
+    let toast_counter: Signal<u64> = use_signal(|| 0);
+    let toast_version: Signal<u32> = use_signal(|| 0);
 
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
@@ -286,7 +331,7 @@ pub fn AttendantsComponent(
             Rc::new(RefCell::new(None));
 
         let opts = VideoCallClientOptions {
-            user_id: display_name.clone(),
+            user_id: user_id.clone().unwrap_or_else(|| display_name.clone()),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -389,6 +434,62 @@ pub fn AttendantsComponent(
                 log::info!("Waiting room updated push received");
                 let mut v = waiting_room_version;
                 v.set(v() + 1);
+            })),
+            on_peer_left: Some(VcCallback::from(move |(display_name, user_id): (String, String)| {
+                log::info!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+                let mut toast_counter = toast_counter;
+                let mut peer_toasts = peer_toasts;
+                let mut toast_version = toast_version;
+                let msg = if display_name == user_id {
+                    format!("{display_name} left the meeting")
+                } else {
+                    format!("{display_name} ({user_id}) left the meeting")
+                };
+                let id = *toast_counter.peek();
+                toast_counter.set(id + 1);
+                let mut current = peer_toasts.peek().clone();
+                current.push((id, msg, user_id));
+                peer_toasts.set(current);
+                { let v = *toast_version.peek(); toast_version.set(v + 1); }
+                // Defer the leave sound: only play if the toast still exists
+                // after 500ms (i.e. no join event cancelled it).
+                Timeout::new(500, move || {
+                    if peer_toasts.peek().iter().any(|(tid, _, _)| *tid == id) {
+                        play_user_left();
+                    }
+                }).forget();
+                // Schedule toast removal after 8 seconds.
+                Timeout::new(8_000, move || {
+                    let updated: Vec<_> = peer_toasts.peek().iter().filter(|(tid, _, _)| *tid != id).cloned().collect();
+                    peer_toasts.set(updated);
+                    { let v = *toast_version.peek(); toast_version.set(v + 1); }
+                }).forget();
+            })),
+            on_peer_joined: Some(VcCallback::from(move |(display_name, user_id): (String, String)| {
+                log::info!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                let mut toast_counter = toast_counter;
+                let mut peer_toasts = peer_toasts;
+                let mut toast_version = toast_version;
+                // Remove any pending "left" toast for this user (waiting room admission).
+                let mut current = peer_toasts.peek().clone();
+                current.retain(|(_, msg, uid)| !(uid == &user_id && msg.contains("left")));
+                play_user_joined();
+                let msg = if display_name == user_id {
+                    format!("{display_name} joined the meeting")
+                } else {
+                    format!("{display_name} ({user_id}) joined the meeting")
+                };
+                let id = *toast_counter.peek();
+                toast_counter.set(id + 1);
+                current.push((id, msg, user_id));
+                peer_toasts.set(current);
+                { let v = *toast_version.peek(); toast_version.set(v + 1); }
+                // Schedule toast removal after 8 seconds.
+                Timeout::new(8_000, move || {
+                    let updated: Vec<_> = peer_toasts.peek().iter().filter(|(tid, _, _)| *tid != id).cloned().collect();
+                    peer_toasts.set(updated);
+                    { let v = *toast_version.peek(); toast_version.set(v + 1); }
+                }).forget();
             })),
         };
 
@@ -500,6 +601,7 @@ pub fn AttendantsComponent(
 
     // --- Derived values ---
     let _ = peer_list_version(); // subscribe to trigger re-renders when peers change
+    let _ = toast_version(); // subscribe to trigger re-renders when toasts change
     let display_peers = client.sorted_peer_keys();
     let peers_for_display: Vec<String> = display_peers
         .iter()
@@ -622,6 +724,66 @@ pub fn AttendantsComponent(
                 id: "main-container",
                 class: "meeting-page",
                 BrowserCompatibility {}
+
+                // "participant joined/left" toast notifications
+                if !peer_toasts().is_empty() {
+                    div {
+                        class: "peer-toasts",
+                        for (id, msg, _uid) in peer_toasts().iter().cloned() {
+                            {
+                                let is_joined = msg.contains("joined");
+                                let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
+                                let name = if is_joined {
+                                    msg.trim_end_matches(" joined the meeting")
+                                } else {
+                                    msg.trim_end_matches(" left the meeting")
+                                };
+                                let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
+                                rsx! {
+                                    div { key: "{id}", class: "{variant_class}",
+                                        span { class: "toast-icon",
+                                            if is_joined {
+                                                svg {
+                                                    width: "16",
+                                                    height: "16",
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
+                                                    circle { cx: "9", cy: "7", r: "4" }
+                                                    line { x1: "19", y1: "8", x2: "19", y2: "14" }
+                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
+                                                }
+                                            } else {
+                                                svg {
+                                                    width: "16",
+                                                    height: "16",
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
+                                                    circle { cx: "9", cy: "7", r: "4" }
+                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
+                                                }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name", "{name} " }
+                                            span { class: "toast-action", "{action_text}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 div {
                     id: "grid-container",
                     "data-peers": "{num_peers_for_styling}",

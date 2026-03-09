@@ -156,14 +156,57 @@ impl SessionManager {
         wrapper.write_to_bytes().unwrap_or_default()
     }
 
-    /// Build PARTICIPANT_LEFT packet to notify remaining peers about a departed session
-    pub fn build_peer_left_packet(room_id: &str, user_id: &str, session_id: u64) -> Vec<u8> {
+    /// Build PARTICIPANT_JOINED packet to notify peers about a new session joining the room.
+    ///
+    /// The `display_name` is carried in the `creator_id` field of `MeetingPacket`.
+    /// For MEETING_STARTED events `creator_id` holds the meeting creator; for
+    /// PARTICIPANT_JOINED / PARTICIPANT_LEFT it is repurposed to hold the
+    /// participant's display name so the client can show friendly toast messages.
+    pub fn build_peer_joined_packet(
+        room_id: &str,
+        user_id: &str,
+        session_id: u64,
+        display_name: &str,
+    ) -> Vec<u8> {
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_JOINED.into(),
+            room_id: room_id.to_string(),
+            message: format!("{} has joined the meeting", user_id),
+            target_user_id: user_id.to_string(),
+            session_id,
+            // Repurpose creator_id to carry display_name for join/leave events
+            creator_id: display_name.to_string(),
+            ..Default::default()
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: SYSTEM_USER_ID.to_string(),
+            data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
+    /// Build PARTICIPANT_LEFT packet to notify remaining peers about a departed session.
+    ///
+    /// See [`build_peer_joined_packet`](Self::build_peer_joined_packet) for the
+    /// `display_name` / `creator_id` convention.
+    pub fn build_peer_left_packet(
+        room_id: &str,
+        user_id: &str,
+        session_id: u64,
+        display_name: &str,
+    ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::PARTICIPANT_LEFT.into(),
             room_id: room_id.to_string(),
             message: format!("{} has left the meeting", user_id),
             target_user_id: user_id.to_string(),
             session_id,
+            // Repurpose creator_id to carry display_name for join/leave events
+            creator_id: display_name.to_string(),
             ..Default::default()
         };
 
@@ -263,5 +306,100 @@ mod tests {
         assert_eq!(inner.event_type, MeetingEventType::MEETING_ENDED.into());
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.message, "Host left");
+    }
+
+    #[tokio::test]
+    async fn test_build_peer_joined_packet() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let packet = SessionManager::build_peer_joined_packet("my-room", "bob", 42, "Bob Smith");
+        let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
+        assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
+        assert_eq!(wrapper.user_id, SYSTEM_USER_ID);
+
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::PARTICIPANT_JOINED.into()
+        );
+        assert_eq!(inner.room_id, "my-room");
+        assert_eq!(inner.target_user_id, "bob");
+        assert_eq!(inner.session_id, 42);
+        assert!(inner.message.contains("bob"));
+        assert_eq!(inner.creator_id, "Bob Smith");
+    }
+
+    #[tokio::test]
+    async fn test_build_peer_left_packet() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let packet = SessionManager::build_peer_left_packet("my-room", "alice", 99, "Alice Jones");
+        let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
+        assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
+
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(inner.event_type, MeetingEventType::PARTICIPANT_LEFT.into());
+        assert_eq!(inner.room_id, "my-room");
+        assert_eq!(inner.target_user_id, "alice");
+        assert_eq!(inner.session_id, 99);
+    }
+
+    /// Verify that build_peer_joined_packet and build_peer_left_packet are
+    /// structurally symmetric: same fields populated, only event_type differs.
+    /// Also verify outer wrapper session_id is 0 (system messages).
+    #[tokio::test]
+    async fn test_peer_joined_and_left_packets_are_symmetric() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let room = "symmetry-room";
+        let user = "charlie";
+        let sid = 77u64;
+        let display = "Charlie Brown";
+
+        let joined_bytes = SessionManager::build_peer_joined_packet(room, user, sid, display);
+        let left_bytes = SessionManager::build_peer_left_packet(room, user, sid, display);
+
+        let joined_wrapper = PacketWrapper::parse_from_bytes(&joined_bytes).unwrap();
+        let left_wrapper = PacketWrapper::parse_from_bytes(&left_bytes).unwrap();
+
+        // Both wrappers should be system messages with session_id 0
+        assert_eq!(
+            joined_wrapper.session_id, 0,
+            "PARTICIPANT_JOINED wrapper session_id should be 0"
+        );
+        assert_eq!(
+            left_wrapper.session_id, 0,
+            "PARTICIPANT_LEFT wrapper session_id should be 0"
+        );
+        assert_eq!(joined_wrapper.user_id, SYSTEM_USER_ID);
+        assert_eq!(left_wrapper.user_id, SYSTEM_USER_ID);
+        assert_eq!(joined_wrapper.packet_type, left_wrapper.packet_type);
+
+        let joined_inner = MeetingPacket::parse_from_bytes(&joined_wrapper.data).unwrap();
+        let left_inner = MeetingPacket::parse_from_bytes(&left_wrapper.data).unwrap();
+
+        // Same fields populated
+        assert_eq!(joined_inner.room_id, left_inner.room_id);
+        assert_eq!(joined_inner.target_user_id, left_inner.target_user_id);
+        assert_eq!(joined_inner.session_id, left_inner.session_id);
+        assert_eq!(joined_inner.session_id, sid);
+        // display_name carried via creator_id
+        assert_eq!(joined_inner.creator_id, display);
+        assert_eq!(left_inner.creator_id, display);
+
+        // Only event_type and message differ
+        assert_eq!(
+            joined_inner.event_type,
+            MeetingEventType::PARTICIPANT_JOINED.into()
+        );
+        assert_eq!(
+            left_inner.event_type,
+            MeetingEventType::PARTICIPANT_LEFT.into()
+        );
+        assert!(joined_inner.message.contains("joined"));
+        assert!(left_inner.message.contains("left"));
     }
 }

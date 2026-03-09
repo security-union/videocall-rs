@@ -71,6 +71,9 @@ pub struct SessionLogic {
     pub id: u64,
     pub room: RoomId,
     pub user_id: UserId,
+    /// Participant's chosen display name (from JWT claims).
+    /// Falls back to `user_id` when no display name is available.
+    pub display_name: String,
     pub addr: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
@@ -82,10 +85,12 @@ pub struct SessionLogic {
 
 impl SessionLogic {
     /// Create a new session logic instance
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: Addr<ChatServer>,
         room: String,
         user_id: String,
+        display_name: String,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -93,14 +98,15 @@ impl SessionLogic {
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
-            "new session: room={} user_id={} session_id={} observer={}",
-            room, user_id, id, observer
+            "new session: room={} user_id={} display_name={} session_id={} observer={}",
+            room, user_id, display_name, id, observer
         );
 
         SessionLogic {
             id,
             room,
             user_id,
+            display_name,
             addr,
             nats_client,
             tracker_sender,
@@ -156,6 +162,8 @@ impl SessionLogic {
             room: self.room.clone(),
             session: self.id,
             user_id: self.user_id.clone(),
+            display_name: self.display_name.clone(),
+            observer: self.observer,
         }
     }
 
@@ -201,6 +209,8 @@ impl SessionLogic {
             session: self.id,
             room: self.room.clone(),
             user_id: self.user_id.clone(),
+            display_name: self.display_name.clone(),
+            observer: self.observer,
         });
     }
 

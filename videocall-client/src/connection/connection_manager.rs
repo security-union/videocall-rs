@@ -334,6 +334,16 @@ impl ConnectionManager {
                 }
             }
 
+            // Only forward packets from the elected connection.
+            // During the election period (active_connection_id is None), all
+            // connections forward packets so that RTT probes work and the
+            // first SESSION_ASSIGNED can be processed.
+            if let Some(ref elected_id) = *active_connection_id.borrow() {
+                if *elected_id != connection_id {
+                    return;
+                }
+            }
+
             on_inbound_media.emit(packet);
         })
     }

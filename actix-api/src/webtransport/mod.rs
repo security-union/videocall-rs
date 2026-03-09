@@ -259,7 +259,7 @@ async fn run_webtransport_connection_from_request(
         .map(|(_, val)| val.into_owned());
 
     // Determine username, room, and observer flag from either the JWT or URL path params.
-    let (username, lobby_id, observer) = if let Some(ref tok) = token {
+    let (username, lobby_id, observer, display_name) = if let Some(ref tok) = token {
         // Token-based flow: identity and room come from the JWT claims.
         let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
         if jwt_secret.is_empty() {
@@ -270,10 +270,15 @@ async fn run_webtransport_connection_from_request(
             anyhow!("token validation failed: {}", e.client_message())
         })?;
         info!(
-            "WT token-based connection: user_id={}, room={}, observer={}",
-            claims.sub, claims.room, claims.observer
+            "WT token-based connection: user_id={}, room={}, display_name={}, observer={}",
+            claims.sub, claims.room, claims.display_name, claims.observer
         );
-        (claims.sub, claims.room, claims.observer)
+        (
+            claims.sub,
+            claims.room,
+            claims.observer,
+            claims.display_name,
+        )
     } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
         // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
         if parts.len() != 3 {
@@ -291,7 +296,9 @@ async fn run_webtransport_connection_from_request(
             "WT deprecated path-based connection: user_id={}, room={}",
             username, lobby_id
         );
-        (username, lobby_id, false) // deprecated path-based endpoint: never observer
+        // display_name fallback: use user_id for deprecated path
+        let display = username.clone();
+        (username, lobby_id, false, display) // deprecated path-based endpoint: never observer
     } else {
         // FF=on but no token provided
         info!("WT connection rejected: no token provided and meeting management is enabled");
@@ -309,6 +316,7 @@ async fn run_webtransport_connection_from_request(
         session,
         &username,
         &lobby_id,
+        &display_name,
         chat_server,
         nats_client,
         tracker_sender,
@@ -332,6 +340,7 @@ async fn handle_webtransport_session(
     session: Session,
     username: &str,
     lobby_id: &str,
+    display_name: &str,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
@@ -346,6 +355,7 @@ async fn handle_webtransport_session(
         chat_server,
         lobby_id.to_string(),
         username.to_string(),
+        display_name.to_string(),
         outbound_tx,
         nats_client,
         tracker_sender,

@@ -160,7 +160,9 @@ jobs:
             "google-oauth-credentials"
             "jwt-secret"
             "harbor-pull-secret"
-            "videocall-wildcard-tls"
+            "api-tls"
+            "websocket-tls"
+            "webtransport-tls"
           )
 
           MISSING_SECRETS=()
@@ -254,7 +256,7 @@ jobs:
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-webtransport" \
             --set "ingress.hosts[0].paths[0].service.port.number=8080" \
-            --set "ingress.tls[0].secretName=videocall-wildcard-tls" \
+            --set "ingress.tls[0].secretName=webtransport-tls" \
             --set "ingress.tls[0].hosts[0]=webtransport.videocall.fnxlabs.com" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
@@ -296,7 +298,7 @@ jobs:
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-websocket" \
             --set "ingress.hosts[0].paths[0].service.port.number=8080" \
-            --set "ingress.tls[0].secretName=videocall-wildcard-tls" \
+            --set "ingress.tls[0].secretName=websocket-tls" \
             --set "ingress.tls[0].hosts[0]=websocket.videocall.fnxlabs.com" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
@@ -361,7 +363,7 @@ jobs:
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-api" \
             --set "ingress.hosts[0].paths[0].service.port.number=8081" \
-            --set "ingress.tls[0].secretName=videocall-wildcard-tls" \
+            --set "ingress.tls[0].secretName=api-tls" \
             --set "ingress.tls[0].hosts[0]=api.videocall.fnxlabs.com" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
@@ -400,9 +402,10 @@ jobs:
             --set "ingress.hosts[0].host=app-dx.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
-            --set "ingress.tls[0].secretName=videocall-wildcard-tls" \
+            --set "ingress.tls[0].secretName=dioxus-ui-tls" \
             --set "ingress.tls[0].hosts[0]=app-dx.videocall.fnxlabs.com" \
-            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.cert-manager\.io/issuer=letsencrypt-prod" \
+            --set "ingress.annotations.cert-manager\.io/issuer-kind=Issuer" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 

@@ -22,15 +22,16 @@ use yew::prelude::*;
 #[derive(Properties, PartialEq)]
 pub struct MicButtonProps {
     pub enabled: bool,
+    pub available: bool,
     pub onclick: Callback<MouseEvent>,
 }
 
 #[function_component(MicButton)]
 pub fn mic_button(props: &MicButtonProps) -> Html {
-    let class = classes!("video-control-button", props.enabled.then_some("active"));
+    let class = classes!("video-control-button", props.enabled.then_some("active"),(!props.available).then_some("error"));
 
     html! {
-        <button {class} onclick={props.onclick.clone()}>
+        <button {class} onclick={props.onclick.clone()} disabled={!props.available}>
             {
                 if props.enabled {
                     html! {
@@ -57,6 +58,15 @@ pub fn mic_button(props: &MicButtonProps) -> Html {
                     }
                 }
             }
+            {
+                if !props.available {
+                    html!{
+                      <span class="device-warning">{"!"}</span>
+                    }
+                } else {
+                   html! {}
+                }
+            }
         </button>
     }
 }
@@ -68,15 +78,16 @@ pub fn mic_button(props: &MicButtonProps) -> Html {
 #[derive(Properties, PartialEq)]
 pub struct CameraButtonProps {
     pub enabled: bool,
+    pub available: bool,
     pub onclick: Callback<MouseEvent>,
 }
 
 #[function_component(CameraButton)]
 pub fn camera_button(props: &CameraButtonProps) -> Html {
-    let class = classes!("video-control-button", props.enabled.then_some("active"));
+    let class = classes!("video-control-button", props.enabled.then_some("active"),(!props.available).then_some("error"));
 
     html! {
-        <button {class} onclick={props.onclick.clone()}>
+        <button {class} onclick={props.onclick.clone()} disabled={!props.available}>
             {
                 if props.enabled {
                     html! {
@@ -98,6 +109,15 @@ pub fn camera_button(props: &CameraButtonProps) -> Html {
                             <span class="tooltip">{"Start Video"}</span>
                         </>
                     }
+                }
+            }
+            {
+                if !props.available {
+                    html! {
+                      <span class="device-warning">{"!"}</span>
+                    }
+                } else {
+                   html! {}
                 }
             }
         </button>

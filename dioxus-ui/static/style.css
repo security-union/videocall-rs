@@ -18,7 +18,6 @@ body {
 
 input {
   margin: auto;
-  /* nice thing of auto margin if display:flex; it center both horizontal and vertical :) */
 }
 
 canvas {
@@ -37,7 +36,10 @@ canvas {
   position: relative;
 }
 
-/* Updated Peer List Container Styles */
+/* ============================================================
+   Peer List Container
+   ============================================================ */
+
 #peer-list-container {
   position: fixed;
   left: -400px;
@@ -170,26 +172,28 @@ h3 {
   width: 100%;
   height: 100%;
 
-  /* Default auto-fill grid that prevents horizontal overflow, acts as fallback */
-  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-  grid-auto-rows: minmax(150px, 1fr); /* Default row sizing */
+  /* Layout (grid-template-columns / grid-template-rows) is set entirely
+     via inline style from Rust. CSS only provides a safe 1×1 fallback. */
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
 
   /* Set reasonable gaps and padding */
   gap: 10px;
   padding: 16px;
   box-sizing: border-box;
 
-  /* Ensure content is centered */
-  justify-items: center;
-  align-items: center;
-  overflow: auto; /* Allow scrolling if content overflows, e.g. many participants on small screen */
+  /* Items fill their cell completely */
+  justify-items: stretch;
+  align-items: stretch;
+  overflow: hidden;
 }
 
 .grid-item {
   /* Item sizing */
   width: 100%;
   height: 100%;
-  min-height: 150px; /* Minimum height for a video item */
+  min-width: 0;  /* Required for fr-unit children to shrink properly */
+  min-height: 0; /* Required for fr-unit children to shrink properly */
 
   /* Center content within grid item */
   display: flex;
@@ -206,222 +210,32 @@ h3 {
   border-radius: 10px;
 }
 
-/* --- Layouts for specific number of peers --- */
+/* --- data-peers rules removed: layout is now fully computed in Rust
+       and applied as inline style on #grid-container --- */
 
-/* 1 peer: Full width/height for the single peer */
-#grid-container[data-peers="1"] {
-  grid-template-columns: 1fr;
-  grid-auto-rows: minmax(
-    150px,
-    calc(100vh - 32px - 80px)
-  ); /* 100vh minus padding and approx host video height */
-}
+/* ============================================================
+   Mobile: narrower gap/padding, layout still from Rust
+   ============================================================ */
 
-/* 2 peers: Two columns, one row */
-#grid-container[data-peers="2"] {
-  grid-template-columns: repeat(2, 1fr);
-  grid-auto-rows: minmax(150px, calc(100vh - 32px - 80px));
-}
-
-/* 3 peers: Pyramid style (2 top, 1 centered below) */
-#grid-container[data-peers="3"] {
-  grid-template-columns: repeat(2, 1fr);
-  grid-template-rows: repeat(
-    2,
-    minmax(150px, calc((100vh - 32px - 10px - 80px) / 2))
-  ); /* 2 rows */
-  grid-template-areas:
-    "peer1 peer2"
-    "peer3 peer3";
-}
-#grid-container[data-peers="3"] .grid-item:nth-child(1) {
-  grid-area: peer1;
-}
-#grid-container[data-peers="3"] .grid-item:nth-child(2) {
-  grid-area: peer2;
-}
-#grid-container[data-peers="3"] .grid-item:nth-child(3) {
-  grid-area: peer3;
-  max-width: 75%; /* Make bottom item not stretch full width */
-  justify-self: center;
-}
-
-/* 4 peers: 2x2 grid */
-#grid-container[data-peers="4"] {
-  grid-template-columns: repeat(2, 1fr);
-  grid-auto-rows: minmax(
-    150px,
-    calc((100vh - 32px - 10px - 80px) / 2)
-  ); /* 2 rows */
-}
-
-/* 5 peers: 2 columns, 3 rows (bottom right empty) */
-#grid-container[data-peers="5"] {
-  grid-template-columns: repeat(2, 1fr);
-  grid-auto-rows: minmax(
-    150px,
-    calc((100vh - 32px - 20px - 80px) / 3)
-  ); /* 3 rows */
-}
-
-/* 6 peers: 2x3 grid (full) */
-#grid-container[data-peers="6"] {
-  grid-template-columns: repeat(2, 1fr);
-  grid-auto-rows: minmax(
-    150px,
-    calc((100vh - 32px - 20px - 80px) / 3)
-  ); /* 3 rows */
-}
-
-/* 7 peers: 2 columns, 4 rows (bottom right empty) */
-#grid-container[data-peers="7"] {
-  grid-template-columns: repeat(2, 1fr);
-  grid-auto-rows: minmax(
-    150px,
-    calc((100vh - 32px - 30px - 80px) / 4)
-  ); /* 4 rows */
-}
-
-/* 8 peers: 2x4 grid (full) */
-#grid-container[data-peers="8"] {
-  grid-template-columns: repeat(2, 1fr);
-  grid-auto-rows: minmax(
-    150px,
-    calc((100vh - 32px - 30px - 80px) / 4)
-  ); /* 4 rows */
-}
-
-/* Desktop Grid for 9+ Peers: Maintain item height from 4-row layout, allow more columns based on width */
-#grid-container[data-peers="9"],
-#grid-container[data-peers^="1"],
-#grid-container[data-peers="20"] /* Added to include 20 peers */ {
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4));
-}
-
-/* Mobile override: Single column, items take significant height */
-@media (max-width: 600px) {
-  #grid-container:not(.force-desktop-grid) {
-    grid-template-columns: 1fr !important; /* Force single column */
-    /* Simplified and more robust row height for default mobile stacking */
-    grid-auto-rows: minmax(180px, auto) !important;
-    padding: 8px !important; /* Reduce padding on mobile */
-    gap: 8px !important; /* Reduce gap on mobile */
+@media (max-width: 37.5em) {
+  #grid-container {
+    gap: 8px;
+    padding: 8px;
   }
 
-  /* Reset grid areas and specific placements for mobile to ensure stacking, unless desktop grid is forced */
-  #grid-container[data-peers="3"]:not(.force-desktop-grid) {
-    grid-template-areas: unset !important;
-  }
-  #grid-container[data-peers="3"]:not(.force-desktop-grid) .grid-item {
-    grid-area: auto !important;
-    max-width: 100% !important; /* Allow full width */
-    justify-self: stretch !important;
-  }
-
-  /* For other specific peer counts, they will naturally fall into single column due to the above :not(.force-desktop-grid) rule */
-  #grid-container[data-peers="1"]:not(.force-desktop-grid) .grid-item,
-  #grid-container[data-peers="2"]:not(.force-desktop-grid) .grid-item,
-  #grid-container[data-peers="4"]:not(.force-desktop-grid) .grid-item,
-  #grid-container[data-peers="5"]:not(.force-desktop-grid) .grid-item,
-  #grid-container[data-peers="6"]:not(.force-desktop-grid) .grid-item,
-  #grid-container[data-peers="7"]:not(.force-desktop-grid) .grid-item,
-  #grid-container[data-peers="8"]:not(.force-desktop-grid) .grid-item {
-    max-width: 100% !important;
-    height: auto !important; /* Let content or grid-auto-rows define height */
-  }
-
-  /* This rule is the fallback for .force-desktop-grid on mobile.
-     It will apply to data-peers = 0, 1, 2 (stacking them) */
-  #grid-container.force-desktop-grid {
-    grid-template-columns: 1fr !important; /* Default to single column (stacking) for 0,1,2 peers */
-    grid-auto-rows: minmax(180px, auto) !important;
-    padding: 8px !important;
-    gap: 8px !important;
-  }
-
-  /* Specific 2-column layouts for .force-desktop-grid on mobile when peer count is 3+ */
-  #grid-container.force-desktop-grid[data-peers="3"] {
-    /* 4 attendees total */
-    grid-template-columns: repeat(2, 1fr) !important;
-    /* Re-apply row calculation from desktop pyramid rule, ensuring high precedence */
-    grid-template-rows: repeat(
-      2,
-      minmax(150px, calc((100vh - 32px - 10px - 80px) / 2))
-    ) !important;
-    /* Ensure grid-areas are active for pyramid if they were unset by :not selector */
-    grid-template-areas:
-      "peer1 peer2"
-      "peer3 peer3" !important;
-  }
-
-  #grid-container.force-desktop-grid[data-peers="4"] {
-    grid-template-columns: repeat(2, 1fr) !important;
-    grid-auto-rows: minmax(
-      150px,
-      calc((100vh - 32px - 10px - 80px) / 2)
-    ) !important;
-  }
-
-  #grid-container.force-desktop-grid[data-peers="5"] {
-    grid-template-columns: repeat(2, 1fr) !important;
-    grid-auto-rows: minmax(
-      150px,
-      calc((100vh - 32px - 20px - 80px) / 3)
-    ) !important;
-  }
-
-  /* Add specific 2-column rules for data-peers=6,7,8 in forced mobile mode */
-  #grid-container.force-desktop-grid[data-peers="6"] {
-    grid-template-columns: repeat(2, 1fr) !important;
-    grid-auto-rows: minmax(
-      150px,
-      calc((100vh - 32px - 20px - 80px) / 3)
-    ) !important; /* Consistent with 2x3 desktop row height */
-  }
-
-  #grid-container.force-desktop-grid[data-peers="7"] {
-    grid-template-columns: repeat(2, 1fr) !important;
-    grid-auto-rows: minmax(
-      150px,
-      calc((100vh - 32px - 30px - 80px) / 4)
-    ) !important; /* Consistent with 2x4 desktop row height */
-  }
-
-  #grid-container.force-desktop-grid[data-peers="8"] {
-    grid-template-columns: repeat(2, 1fr) !important;
-    grid-auto-rows: minmax(
-      150px,
-      calc((100vh - 32px - 30px - 80px) / 4)
-    ) !important; /* Consistent with 2x4 desktop row height */
-  }
-
-  /* Specific override for data-peers=9+ in forced mobile mode to ensure 2 columns and consistent row height */
-  #grid-container.force-desktop-grid[data-peers="9"],
-  #grid-container.force-desktop-grid[data-peers^="1"],
-  #grid-container.force-desktop-grid[data-peers="20"] /* Added to include 20 peers */ {
-    grid-template-columns: repeat(2, 1fr) !important; /* Explicitly 2 columns */
-    grid-auto-rows: minmax(
-      150px,
-      calc((100vh - 32px - 30px - 80px) / 4)
-    ) !important; /* Row height from 8-peer layout */
-  }
-
+  /* Host video adjustments */
   .host {
-    /* Make host video smaller and ensure it doesn't overlap too much on mobile */
     width: 25% !important;
-    max-width: 120px !important;
-    bottom: 78px !important; /* Adjust position from bottom - increased from 8px */
-    right: 8px !important; /* Adjust position from right */
+    max-width: 25vw !important;
+    bottom: clamp(4rem, 10vh, 5rem) !important;
+    right: clamp(0.5rem, 2vw, 1rem) !important;
   }
 
-  /* Hide the top bar on mobile screens */
   .top-bar {
     display: none !important;
   }
 
-  /* Mobile Modal Styles for Sidebars */
-  /* Peer List Modal */
+  /* Mobile Modal — Peer List */
   #peer-list-container {
     position: fixed !important;
     left: 0 !important;
@@ -429,7 +243,6 @@ h3 {
     width: 100% !important;
     height: 100% !important;
     background-color: #242526 !important;
-    color: white !important;
     transition: transform 0.3s ease !important;
     z-index: 1000 !important;
     overflow-y: auto !important;
@@ -437,13 +250,12 @@ h3 {
     box-shadow: none !important;
     border-radius: 0 !important;
   }
-
   #peer-list-container.visible {
     transform: translateX(0) !important;
     visibility: visible !important;
   }
 
-  /* Diagnostics Modal */
+  /* Mobile Modal — Diagnostics */
   #diagnostics-sidebar {
     position: fixed !important;
     left: 0 !important;
@@ -451,7 +263,6 @@ h3 {
     width: 100% !important;
     height: 100% !important;
     background-color: #242526 !important;
-    color: white !important;
     transition: transform 0.3s ease !important;
     z-index: 1000 !important;
     overflow-y: auto !important;
@@ -459,27 +270,22 @@ h3 {
     box-shadow: none !important;
     border-radius: 0 !important;
   }
-
   #diagnostics-sidebar.visible {
     transform: translateX(0) !important;
     visibility: visible !important;
   }
 
-  /* Make headers more prominent on mobile */
   #peer-list-container .sidebar-header,
   #diagnostics-sidebar .sidebar-header {
     padding: 20px !important;
     background-color: #18191a !important;
     border-bottom: 2px solid #3a3b3c !important;
   }
-
   #peer-list-container .sidebar-header h2,
   #diagnostics-sidebar .sidebar-header h2 {
     font-size: 20px !important;
     font-weight: 600 !important;
   }
-
-  /* Larger close button for mobile */
   #peer-list-container .close-button,
   #diagnostics-sidebar .close-button {
     font-size: 28px !important;
@@ -492,40 +298,36 @@ h3 {
     align-items: center !important;
     justify-content: center !important;
   }
-
-  /* Better content spacing for mobile */
   #peer-list-container .sidebar-content,
   #diagnostics-sidebar .sidebar-content {
     padding: 20px !important;
   }
-
-  /* Improve peer list items for mobile */
   .peer_item {
     padding: 15px !important;
     margin-bottom: 8px !important;
     border-radius: 8px !important;
     background-color: rgba(255, 255, 255, 0.05) !important;
   }
-
   .peer_item_text {
     font-size: 16px !important;
     padding: 0 15px !important;
   }
-
-  /* Better diagnostics display on mobile */
   #diagnostics-sidebar .diagnostics-section {
     margin-bottom: 25px !important;
     padding: 15px !important;
     background-color: rgba(255, 255, 255, 0.05) !important;
     border-radius: 8px !important;
   }
-
   #diagnostics-sidebar .diagnostics-data pre {
     font-size: 12px !important;
     padding: 15px !important;
     max-height: 30vh !important;
   }
 }
+
+/* ============================================================
+   Canvas container & video
+   ============================================================ */
 
 .canvas-container {
   position: relative;
@@ -542,35 +344,32 @@ canvas {
   object-fit: contain;
 }
 
-/* Host camera frame rendered in the bottom right corner */
+/* ============================================================
+   Host camera (self-view, bottom-right corner)
+   ============================================================ */
+
 .host {
   position: absolute;
-  bottom: 16px; /* Default spacing from bottom */
-  right: 16px; /* Default spacing from right */
-  width: 20%; /* Default width */
-  max-width: 240px; /* Max width to prevent it from being too large on wide screens */
-  min-width: 150px; /* Min width to ensure it's usable, increased to accommodate selectors */
-  /* height: auto; */ /* Let content dictate height with flex */
-  /* aspect-ratio: 16/9; */ /* Aspect ratio might be tricky with added selectors, manage via video element */
+  bottom: clamp(1rem, 2vh, 1.5rem);
+  right: clamp(1rem, 2vw, 1.5rem);
+  width: clamp(10rem, 18vw, 15rem);
+  max-width: 240px;
   border: 2px solid #444;
   border-radius: 8px;
-  /* overflow: hidden; */ /* Remove to prevent clipping, flexbox will manage layout */
-  z-index: 10; /* Make sure it's above the grid items if any overlap occurs */
-  background-color: #1c1c1c; /* Slightly different background for the host box */
-  display: flex; /* ADDED for layout */
-  flex-direction: column; /* ADDED: Stack video and selectors vertically */
+  z-index: 10;
+  background-color: #1c1c1c;
+  display: flex;
+  flex-direction: column;
 }
 
-.host canvas, /* Target canvas if used directly by video encoder */
+.host canvas,
 .host .self-camera {
-  /* Target video element */
   width: 100%;
-  /* height: 100%; */ /* Let flexbox determine height or set specific flex properties */
-  object-fit: contain; /* Contain to ensure full video is visible */
-  flex-grow: 1; /* ADDED: Allow video to take up available space */
-  min-height: 0; /* ADDED: Important for flex item shrinking */
-  background-color: #000; /* Background for video area */
-  border-radius: 6px 6px 0 0; /* Rounded top corners if selectors are below */
+  object-fit: contain;
+  flex-grow: 1;
+  min-height: 0;
+  background-color: #000;
+  border-radius: 6px 6px 0 0;
 }
 
 .hidden {
@@ -582,15 +381,16 @@ canvas {
   height: 100%;
 }
 
+/* ============================================================
+   Floating name chip
+   ============================================================ */
+
 .floating-name {
   position: absolute;
-  /* Updated: default anchor top-left with safe inset */
   top: 12px;
   left: 12px;
   right: auto;
   bottom: auto;
-
-  /* Recommendation 2: high-contrast compact chip */
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -599,43 +399,39 @@ canvas {
   background-color: rgba(0, 0, 0, 0.36);
   color: rgba(255, 255, 255, 0.92);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
-    "Helvetica Neue", Arial, sans-serif;
+  "Helvetica Neue", Arial, sans-serif;
   font-weight: 600;
   font-size: 14px;
   line-height: 1.2;
   white-space: nowrap;
   max-width: 55%;
   overflow: hidden;
-  text-overflow: ellipsis; /* additional safety on narrow tiles */
-  z-index: 2; /* stay above video/placeholder */
+  text-overflow: ellipsis;
+  z-index: 2;
   user-select: none;
 }
 
-/* Slightly stronger background on hover/focus for readability */
 .floating-name:hover,
 .floating-name:focus {
   background-color: rgba(0, 0, 0, 0.44);
 }
 
-/* Speaker/full-bleed view: already top-left */
 .grid-item.full-bleed .floating-name {
   top: 12px;
 }
 
-/* RTL support: mirror anchor to top-right when the element is RTL */
 .floating-name[dir="rtl"] {
   left: auto;
   right: 12px;
 }
 
-/* Host crown icon styling */
 .host-crown-icon {
   display: inline-block;
   width: 16px;
   height: 16px;
   margin-right: 4px;
   vertical-align: middle;
-  color: #fbbf24; /* Amber/gold color for the crown */
+  color: #fbbf24;
   flex-shrink: 0;
 }
 
@@ -648,57 +444,53 @@ canvas {
   margin-right: 6px;
 }
 
-/* Recommendation 2: subtle bottom gradient scrim for readability */
+/* Bottom gradient scrim on video tiles */
 .grid-item .canvas-container.video-on::after {
   content: "";
   position: absolute;
   left: 0;
   right: 0;
   bottom: 0;
-  height: 64px; /* ~56–72px */
+  height: 64px;
   background: linear-gradient(to top, rgba(0, 0, 0, 0.24), rgba(0, 0, 0, 0));
   pointer-events: none;
-  z-index: 1; /* below the name chip */
+  z-index: 1;
 }
+
+/* ============================================================
+   Device selectors
+   ============================================================ */
 
 .controls {
   top: 0;
   left: 0;
   margin-top: 0;
   margin-left: 0;
-  /* ADDED: Ensure controls (if this refers to device selectors) are styled */
-  /* This class seems generic, the more specific .device-selector-wrapper is better */
 }
 
 .device-selector {
-  width: calc(100% - 10px); /* Take most of the wrapper width */
-  margin: 3px 5px; /* Add some margin */
+  width: calc(100% - 10px);
+  margin: 3px 5px;
   padding: 4px;
   border-radius: 3px;
   border: 1px solid #555;
-  background-color: white; /* Ensure select is visible */
-  color: black; /* Text color for select options */
+  background-color: white;
+  color: black;
 }
 
 .device-selector-wrapper {
-  /* margin-bottom: 20px; */ /* Original, might not be needed with flex */
-  padding: 8px 5px 5px 5px; /* Add padding */
-  background-color: rgba(
-    30,
-    30,
-    30,
-    0.85
-  ); /* Darker, slightly transparent background for the selectors area */
-  flex-shrink: 0; /* ADDED: Prevent this container from shrinking */
-  border-top: 1px solid #444; /* Separator line if video is above */
-  border-radius: 0 0 6px 6px; /* Rounded bottom corners */
+  padding: 8px 5px 5px 5px;
+  background-color: rgba(30, 30, 30, 0.85);
+  flex-shrink: 0;
+  border-top: 1px solid #444;
+  border-radius: 0 0 6px 6px;
 }
 
 .device-selector-wrapper label {
-  color: #e0e0e0; /* Light color for labels */
+  color: #e0e0e0;
   font-size: 0.9em;
   margin: 0 5px 2px 5px;
-  display: block; /* Make labels take full width for better spacing */
+  display: block;
 }
 
 :disabled {
@@ -712,6 +504,10 @@ select {
   color: black;
 }
 
+/* ============================================================
+   Top bar
+   ============================================================ */
+
 .top-bar {
   display: flex;
   flex-direction: row;
@@ -721,6 +517,10 @@ select {
   color: white;
   padding: 8px;
 }
+
+/* ============================================================
+   Video placeholder (camera off)
+   ============================================================ */
 
 .video-placeholder {
   width: 100%;
@@ -751,6 +551,10 @@ select {
   font-weight: 500;
 }
 
+/* ============================================================
+   Pin & crop icons
+   ============================================================ */
+
 .pin-icon {
   visibility: hidden;
   position: absolute;
@@ -770,19 +574,6 @@ select {
 
 .grid-item:hover .pin-icon {
   visibility: visible;
-}
-
-.audio-indicator {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  background-color: rgba(0, 0, 0, 0.6);
-  border-radius: 50%;
-  padding: 6px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 2;
 }
 
 .crop-icon {
@@ -806,7 +597,22 @@ select {
   visibility: visible;
 }
 
-/* No additional local positioning; unified in global.css to match mic size */
+/* ============================================================
+   Audio indicator
+   ============================================================ */
+
+.audio-indicator {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background-color: rgba(0, 0, 0, 0.6);
+  border-radius: 50%;
+  padding: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+}
 
 .audio-indicator svg {
   width: 20px;
@@ -814,7 +620,10 @@ select {
   stroke: white;
 }
 
-/* Diagnostics styling */
+/* ============================================================
+   Diagnostics
+   ============================================================ */
+
 .diagnostics-container {
   position: fixed;
   bottom: 10px;
@@ -836,7 +645,6 @@ select {
   white-space: pre-wrap;
 }
 
-/* Diagnostics Sidebar */
 #diagnostics-sidebar {
   position: fixed;
   right: -650px;
@@ -856,7 +664,6 @@ select {
   visibility: visible;
 }
 
-/* Diagnostics specific styles */
 #diagnostics-sidebar .diagnostics-data {
   padding: 10px;
 }
@@ -895,7 +702,6 @@ select {
   font-style: italic;
 }
 
-/* Sidebar Header */
 #diagnostics-sidebar .sidebar-header {
   display: flex;
   justify-content: space-between;
@@ -958,17 +764,23 @@ select {
 }
 
 .close-button {
-  background: none;
+  background: rgba(255, 255, 255, 0.1);
   border: none;
-  color: white;
-  font-size: 24px;
+  border-radius: 8px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
-  padding: 0;
-  margin: 0;
+  transition: all 0.2s ease;
+  color: #ffffff;
+  font-size: 1.5rem;
 }
 
 .close-button:hover {
-  color: #ff4444;
+  background: rgba(255, 68, 68, 0.2);
+  color: #ef4444;
 }
 
 .diagnostics-data {
@@ -1030,7 +842,6 @@ select {
   background-color: #1a1a1a;
 }
 
-/* NetEQ Dashboard Styles */
 .neteq-advanced-chart {
   margin: 10px 0;
   text-align: center;
@@ -1129,7 +940,6 @@ select {
   padding: 10px;
 }
 
-/* Peer Selection Styles */
 .peer-selector {
   width: 100%;
   padding: 8px 12px;
@@ -1154,7 +964,6 @@ select {
   font-style: italic;
 }
 
-/* Per-Peer Summary Styles */
 .peer-summary {
   display: flex;
   flex-direction: column;
@@ -1183,44 +992,30 @@ select {
   font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
 }
 
-/* Mobile responsive adjustments for diagnostics */
-@media (max-width: 600px) {
+@media (max-width: 37.5em) {
   .charts-grid {
     grid-template-columns: 1fr;
     gap: 10px;
   }
-
   .status-grid {
     grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
     gap: 5px;
   }
-
-  .status-item {
-    padding: 8px;
-  }
-
-  .status-value {
-    font-size: 14px;
-  }
-
-  .status-label {
-    font-size: 9px;
-  }
-
-  .neteq-advanced-chart {
-    padding: 10px;
-  }
-
+  .status-item { padding: 8px; }
+  .status-value { font-size: 14px; }
+  .status-label { font-size: 9px; }
+  .neteq-advanced-chart { padding: 10px; }
   .peer-summary-item {
     flex-direction: column;
     gap: 4px;
     text-align: center;
   }
-
-  .peer-summary-item span {
-    font-size: 10px;
-  }
+  .peer-summary-item span { font-size: 10px; }
 }
+
+/* ============================================================
+   Pinned tile
+   ============================================================ */
 
 .grid-item-pinned {
   position: fixed;
@@ -1240,36 +1035,21 @@ select {
   height: min(100%, calc(100vw * 9 / 16));
 }
 
-.pin-icon {
-  visibility: hidden;
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  font-size: 2em;
-  opacity: 0.6;
-  background-color: black;
-  border-radius: 50%;
-  padding: 10px;
-  text-align: center;
-  line-height: 1;
-  cursor: pointer;
-  z-index: 2;
-}
+/* ============================================================
+   Simulation info message
+   ============================================================ */
 
-.grid-item:hover .pin-icon {
-  visibility: visible;
-}
-
-/* Style for the simulation info message */
 .simulation-info-message {
-  color: #ffcc00; /* A warning-like yellow color */
+  color: #ffcc00;
   text-align: center;
   margin-top: 10px;
   font-size: 0.9em;
 }
 
-/* Device Settings Menu Button */
+/* ============================================================
+   Device Settings Modal
+   ============================================================ */
+
 .device-settings-menu-button {
   visibility: hidden;
   position: absolute;
@@ -1298,7 +1078,6 @@ select {
   height: 20px;
 }
 
-/* Device Settings Modal */
 .device-settings-modal-overlay {
   position: fixed;
   top: 0;
@@ -1375,16 +1154,18 @@ select {
   border-radius: 4px;
 }
 
-/* Desktop Device Selector */
 .desktop-device-selector {
   display: block;
 }
 
-/* Bottom left timer display */
+/* ============================================================
+   Timer
+   ============================================================ */
+
 .bottom-left-timer {
   position: fixed;
-  bottom: 100px;
-  left: 20px;
+  bottom: clamp(5rem, 12vh, 6.5rem);
+  left: clamp(0.75rem, 2vw, 1.25rem);
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1392,13 +1173,9 @@ select {
   pointer-events: none;
 }
 
-/* Adjust for mobile - position above the control bar */
-@media (max-width: 600px) {
-  .bottom-left-timer {
-    bottom: 90px;
-    left: 10px;
-  }
-}
+/* ============================================================
+   Control buttons
+   ============================================================ */
 
 .control-button {
   width: 40px;
@@ -1460,7 +1237,7 @@ select {
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 12px;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5),
-    0 0 0 1px rgba(255, 255, 255, 0.05);
+  0 0 0 1px rgba(255, 255, 255, 0.05);
   min-width: 220px;
   z-index: 1000;
   overflow: hidden;
@@ -1478,7 +1255,6 @@ select {
   }
 }
 
-/* Context menu items */
 .context-menu-item {
   width: 100%;
   padding: 0.75rem 1rem;
@@ -1512,27 +1288,7 @@ select {
   flex-shrink: 0;
 }
 
-.close-button {
-  background: rgba(255, 255, 255, 0.1);
-  border: none;
-  border-radius: 8px;
-  width: 32px;
-  height: 32px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  color: #ffffff;
-  font-size: 1.5rem;
-}
-
-.close-button:hover {
-  background: rgba(255, 68, 68, 0.2);
-  color: #ef4444;
-}
-
-/* Meeting Info Panel - Compact */
+/* Meeting Info Panel */
 .meeting-info-compact {
   padding: 0.75rem 1rem;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
@@ -1566,35 +1322,25 @@ select {
   animation: blink 1.5s ease-in-out infinite;
 }
 
-.status-active {
-  color: #4ade80;
-}
-
-.status-ended {
-  color: #ef4444;
-}
+.status-active { color: #4ade80; }
+.status-ended  { color: #ef4444; }
 
 @keyframes blink {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
+  50%       { opacity: 0.3; }
 }
 
-/* Mobile elements are shown by default, hidden on desktop */
-@media (min-width: 600px) {
-  .mobile-only-grid-toggle {
-    display: none !important;
-  }
+/* ============================================================
+   Hide mobile-only controls on desktop
+   ============================================================ */
 
-  .mobile-only-device-settings {
-    display: none !important;
-  }
+@media (min-width: 37.5em) {
+  .mobile-only-grid-toggle,
+  .mobile-only-device-settings { display: none !important; }
 }
 
-/* Mobile Device Selector Hiding */
-@media (max-width: 600px) {
-  .desktop-device-selector {
-    display: none !important;
-  }
+@media (max-width: 37.5em) {
+  .desktop-device-selector { display: none !important; }
 
   .device-settings-menu-button {
     bottom: 8px;
@@ -1602,13 +1348,12 @@ select {
     width: 36px;
     height: 36px;
   }
-
   .device-settings-menu-button svg {
     width: 18px;
     height: 18px;
   }
 
-  /* Mobile Device Settings Modal - Full Screen */
+  /* Mobile Device Settings — full screen */
   .device-settings-modal-overlay {
     visibility: visible !important;
     position: fixed !important;
@@ -1617,7 +1362,6 @@ select {
     width: 100% !important;
     height: 100% !important;
     background-color: #242526 !important;
-    color: white !important;
     transition: transform 0.3s ease !important;
     z-index: 1000 !important;
     overflow-y: auto !important;
@@ -1625,12 +1369,10 @@ select {
     box-shadow: none !important;
     border-radius: 0 !important;
   }
-
   .device-settings-modal-overlay.visible {
     transform: translateX(0) !important;
     visibility: visible !important;
   }
-
   .device-settings-modal {
     position: fixed !important;
     left: 0 !important;
@@ -1642,37 +1384,35 @@ select {
     border-radius: 0 !important;
     box-shadow: none !important;
   }
-
   .device-settings-header {
     padding: 20px !important;
     background-color: #18191a !important;
     border-bottom: 2px solid #3a3b3c !important;
   }
-
   .device-settings-header h2 {
     font-size: 20px !important;
     font-weight: 600 !important;
   }
-
   .device-settings-content {
     padding: 20px !important;
     max-height: none !important;
   }
-
   .device-setting-group {
     margin-bottom: 25px !important;
     padding: 15px !important;
     background-color: rgba(255, 255, 255, 0.05) !important;
     border-radius: 8px !important;
   }
-
   .device-selector-modal {
     font-size: 16px !important;
     padding: 15px !important;
   }
 }
 
-/* Connection LED Indicator */
+/* ============================================================
+   Connection LED
+   ============================================================ */
+
 .connection-led {
   position: absolute;
   top: 8px;
@@ -1697,33 +1437,18 @@ select {
 }
 
 @keyframes pulse {
-  0% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.7;
-    transform: scale(1.1);
-  }
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
+  0%   { opacity: 1; transform: scale(1); }
+  50%  { opacity: 0.7; transform: scale(1.1); }
+  100% { opacity: 1; transform: scale(1); }
 }
 
-/* Mobile adjustments for LED */
-@media (max-width: 600px) {
-  .connection-led {
-    width: 10px;
-    height: 10px;
-    top: 6px;
-    right: 6px;
-  }
+@media (max-width: 37.5em) {
+  .connection-led { width: 10px; height: 10px; top: 6px; right: 6px; }
 }
 
-/* ========================================
+/* ============================================================
    Meetings List Component
-   ======================================== */
+   ============================================================ */
 
 .meetings-list-container {
   margin-top: 0.75rem;
@@ -1745,19 +1470,9 @@ select {
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
-
-.meetings-list-toggle:hover {
-  background: rgba(255, 255, 255, 0.05);
-}
-
-.meetings-list-toggle .chevron-icon {
-  transition: transform 0.2s ease;
-}
-
-.meetings-list-toggle .chevron-icon.expanded {
-  transform: rotate(180deg);
-}
-
+.meetings-list-toggle:hover { background: rgba(255, 255, 255, 0.05); }
+.meetings-list-toggle .chevron-icon { transition: transform 0.2s ease; }
+.meetings-list-toggle .chevron-icon.expanded { transform: rotate(180deg); }
 .meetings-list-toggle .meeting-count {
   margin-left: auto;
   color: var(--text-quaternary, #636366);
@@ -1811,9 +1526,7 @@ select {
   animation: spin 0.8s linear infinite;
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .meetings-error {
   color: var(--error, #FF453A);
@@ -1833,31 +1546,21 @@ select {
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
+.retry-btn:hover { background: var(--glass-bg-hover, rgba(255, 255, 255, 0.10)); }
 
-.retry-btn:hover {
-  background: var(--glass-bg-hover, rgba(255, 255, 255, 0.10));
-}
-
-.meetings-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
+.meetings-list { list-style: none; margin: 0; padding: 0; }
 
 .meeting-item {
   padding: 0.625rem 1rem;
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
-
-.meeting-item:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.meeting-item:last-child {
-  border-bottom: none;
-}
+.meeting-item:hover { background: rgba(255, 255, 255, 0.06); }
+.meeting-item:last-child { border-bottom: none; }
 
 .meeting-info {
   display: flex;
@@ -1880,21 +1583,9 @@ select {
   font-weight: 600;
   letter-spacing: 0.03em;
 }
-
-.meeting-state.state-active {
-  background: rgba(48, 209, 88, 0.18);
-  color: var(--success, #30D158);
-}
-
-.meeting-state.state-idle {
-  background: rgba(255, 159, 10, 0.18);
-  color: var(--warning, #FF9F0A);
-}
-
-.meeting-state.state-ended {
-  background: rgba(142, 142, 147, 0.18);
-  color: var(--text-tertiary, #8E8E93);
-}
+.meeting-state.state-active  { background: rgba(48, 209, 88, 0.18);  color: var(--success, #30D158); }
+.meeting-state.state-idle    { background: rgba(255, 159, 10, 0.18); color: var(--warning, #FF9F0A); }
+.meeting-state.state-ended   { background: rgba(142, 142, 147, 0.18); color: var(--text-tertiary, #8E8E93); }
 
 .meeting-details {
   display: flex;
@@ -1904,35 +1595,11 @@ select {
   color: var(--text-quaternary, #636366);
 }
 
-.meeting-host {
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.meeting-host { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meeting-participants { display: flex; align-items: center; gap: 0.25rem; }
+.meeting-password     { display: flex; align-items: center; color: rgba(255, 193, 7, 0.8); }
 
-.meeting-participants {
-  display: flex;
-  align-items: center;
-  gap: 0.25rem;
-}
-
-.meeting-password {
-  display: flex;
-  align-items: center;
-  color: rgba(255, 193, 7, 0.8);
-}
-
-.meeting-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.meeting-item-content {
-  flex: 1;
-  min-width: 0;
-}
+.meeting-item-content { flex: 1; min-width: 0; }
 
 .meeting-delete-btn {
   display: flex;
@@ -1948,79 +1615,29 @@ select {
   transition: all 0.2s ease;
   flex-shrink: 0;
 }
+.meeting-delete-btn:hover { background: rgba(220, 53, 69, 0.15); color: #dc3545; }
+.meeting-delete-btn svg { width: 16px; height: 16px; }
 
-.meeting-delete-btn:hover {
-  background: rgba(220, 53, 69, 0.15);
-  color: #dc3545;
-}
+.meeting-delete-btn-ended  { color: rgba(220, 53, 69, 0.7); }
+.meeting-delete-btn-ended:hover { background: rgba(220, 53, 69, 0.2); color: #dc3545; }
 
-.meeting-delete-btn svg {
-  width: 16px;
-  height: 16px;
-}
+.meeting-item.meeting-ended { background: rgba(158, 158, 158, 0.05); }
+.meeting-item.meeting-ended .meeting-id { color: rgba(255, 255, 255, 0.6); }
 
-/* Ended meeting delete button - red color */
-.meeting-delete-btn-ended {
-  color: rgba(220, 53, 69, 0.7);
-}
+.meeting-duration      { display: flex; align-items: center; gap: 0.25rem; color: rgba(255, 255, 255, 0.5); }
+.meeting-duration-live { color: rgba(76, 175, 80, 0.9); font-weight: 500; }
+.meeting-waiting       { display: flex; align-items: center; gap: 0.25rem; color: rgba(255, 193, 7, 0.9); font-weight: 500; }
+.meeting-time          { color: rgba(255, 255, 255, 0.5); font-size: 0.75rem; }
+.meeting-time-separator{ color: rgba(255, 255, 255, 0.3); font-size: 0.75rem; }
 
-.meeting-delete-btn-ended:hover {
-  background: rgba(220, 53, 69, 0.2);
-  color: #dc3545;
-}
-
-/* Ended meeting row styling */
-.meeting-item.meeting-ended {
-  background: rgba(158, 158, 158, 0.05);
-}
-
-.meeting-item.meeting-ended .meeting-id {
-  color: rgba(255, 255, 255, 0.6);
-}
-
-/* Meeting duration display */
-.meeting-duration {
-  display: flex;
-  align-items: center;
-  gap: 0.25rem;
-  color: rgba(255, 255, 255, 0.5);
-}
-
-.meeting-duration-live {
-  color: rgba(76, 175, 80, 0.9);
-  font-weight: 500;
-}
-
-/* Meeting waiting count */
-.meeting-waiting {
-  display: flex;
-  align-items: center;
-  gap: 0.25rem;
-  color: rgba(255, 193, 7, 0.9);
-  font-weight: 500;
-}
-
-/* Meeting time display */
-.meeting-time {
-  color: rgba(255, 255, 255, 0.5);
-  font-size: 0.75rem;
-}
-
-.meeting-time-separator {
-  color: rgba(255, 255, 255, 0.3);
-  font-size: 0.75rem;
-}
-
-/* ========================================
-   Waiting Room Component
-   ======================================== */
+/* ============================================================
+   Waiting Room
+   ============================================================ */
 
 .waiting-room-container {
   position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
-  height: 100vh;
+  top: 0; left: 0;
+  width: 100vw; height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2072,33 +1689,22 @@ select {
 }
 
 .spinner-dot {
-  width: 10px;
-  height: 10px;
+  width: 10px; height: 10px;
   background: rgba(255, 255, 255, 0.6);
   border-radius: 50%;
   animation: bounce 1.4s infinite ease-in-out both;
 }
-
-.spinner-dot:nth-child(1) {
-  animation-delay: -0.32s;
-}
-
-.spinner-dot:nth-child(2) {
-  animation-delay: -0.16s;
-}
+.spinner-dot:nth-child(1) { animation-delay: -0.32s; }
+.spinner-dot:nth-child(2) { animation-delay: -0.16s; }
 
 @keyframes bounce {
-  0%, 80%, 100% {
-    transform: scale(0);
-  }
-  40% {
-    transform: scale(1);
-  }
+  0%, 80%, 100% { transform: scale(0); }
+  40%            { transform: scale(1); }
 }
 
-/* ========================================
-   Host Controls Component
-   ======================================== */
+/* ============================================================
+   Host Controls
+   ============================================================ */
 
 .host-controls-container {
   position: fixed;
@@ -2128,19 +1734,9 @@ select {
   cursor: pointer;
   transition: background-color 0.2s ease;
 }
-
-.host-controls-toggle:hover {
-  background: rgba(255, 255, 255, 0.05);
-}
-
-.host-controls-toggle .chevron-icon {
-  margin-left: auto;
-  transition: transform 0.2s ease;
-}
-
-.host-controls-toggle .chevron-icon.expanded {
-  transform: rotate(180deg);
-}
+.host-controls-toggle:hover { background: rgba(255, 255, 255, 0.05); }
+.host-controls-toggle .chevron-icon { margin-left: auto; transition: transform 0.2s ease; }
+.host-controls-toggle .chevron-icon.expanded { transform: rotate(180deg); }
 
 .waiting-badge {
   background: #ff6b6b;
@@ -2166,10 +1762,7 @@ select {
   padding: 0.75rem 1rem;
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
 }
-
-.waiting-participant:last-child {
-  border-bottom: none;
-}
+.waiting-participant:last-child { border-bottom: none; }
 
 .participant-info {
   min-width: 0;
@@ -2196,15 +1789,11 @@ select {
   white-space: nowrap;
 }
 
-.participant-actions {
-  display: flex;
-  gap: 0.5rem;
-}
+.participant-actions { display: flex; gap: 0.5rem; }
 
 .btn-admit,
 .btn-reject {
-  width: 32px;
-  height: 32px;
+  width: 32px; height: 32px;
   border-radius: 50%;
   border: none;
   display: flex;
@@ -2213,24 +1802,10 @@ select {
   cursor: pointer;
   transition: all 0.2s ease;
 }
-
-.btn-admit {
-  background: rgba(76, 175, 80, 0.2);
-  color: #4caf50;
-}
-
-.btn-admit:hover {
-  background: rgba(76, 175, 80, 0.4);
-}
-
-.btn-reject {
-  background: rgba(244, 67, 54, 0.2);
-  color: #f44336;
-}
-
-.btn-reject:hover {
-  background: rgba(244, 67, 54, 0.4);
-}
+.btn-admit { background: rgba(76, 175, 80, 0.2); color: #4caf50; }
+.btn-admit:hover { background: rgba(76, 175, 80, 0.4); }
+.btn-reject { background: rgba(244, 67, 54, 0.2); color: #f44336; }
+.btn-reject:hover { background: rgba(244, 67, 54, 0.4); }
 
 .admit-all-container {
   padding: 0.5rem 0.75rem;
@@ -2254,26 +1829,18 @@ select {
   cursor: pointer;
   transition: all 0.2s ease;
 }
+.btn-admit-all:hover { background: rgba(76, 175, 80, 0.4); }
+.btn-admit-all:active { transform: scale(0.98); }
 
-.btn-admit-all:hover {
-  background: rgba(76, 175, 80, 0.4);
-}
-
-.btn-admit-all:active {
-  transform: scale(0.98);
-}
-
-/* ========================================
+/* ============================================================
    Rejected / Error Containers
-   ======================================== */
+   ============================================================ */
 
 .rejected-container,
 .error-container {
   position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
-  height: 100vh;
+  top: 0; left: 0;
+  width: 100vw; height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2290,22 +1857,13 @@ select {
 }
 
 .rejected-card h2,
-.error-card h2 {
-  margin: 1rem 0 0.5rem 0;
-  font-size: 1.5rem;
-  font-weight: 600;
-}
-
+.error-card h2 { margin: 1rem 0 0.5rem 0; font-size: 1.5rem; font-weight: 600; }
 .rejected-card p,
-.error-card p {
-  color: rgba(255, 255, 255, 0.7);
-  margin-bottom: 2rem;
-}
+.error-card p   { color: rgba(255, 255, 255, 0.7); margin-bottom: 2rem; }
 
-/* ---------------------------------------------------------------------------
- * Google Sign-In (GSI) Material Button — dark theme
- * Based on Google Identity Services branding guidelines.
- * ------------------------------------------------------------------------- */
+/* ============================================================
+   Google Sign-In button
+   ============================================================ */
 
 .gsi-material-button {
   -moz-user-select: none;
@@ -2330,9 +1888,9 @@ select {
   position: relative;
   text-align: center;
   transition: background 0.25s cubic-bezier(0.4, 0, 0.2, 1),
-              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
-              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
-              transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+  box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+  transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   vertical-align: middle;
   white-space: nowrap;
   width: auto;
@@ -2340,12 +1898,7 @@ select {
   min-width: min-content;
 }
 
-.gsi-material-button .gsi-material-button-icon {
-  height: 20px;
-  margin-right: 10px;
-  min-width: 20px;
-  width: 20px;
-}
+.gsi-material-button .gsi-material-button-icon { height: 20px; margin-right: 10px; min-width: 20px; width: 20px; }
 
 .gsi-material-button .gsi-material-button-content-wrapper {
   align-items: center;
@@ -2369,12 +1922,8 @@ select {
 
 .gsi-material-button .gsi-material-button-state {
   transition: opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-  bottom: 0;
-  left: 0;
-  opacity: 0;
-  position: absolute;
-  right: 0;
-  top: 0;
+  bottom: 0; left: 0; opacity: 0;
+  position: absolute; right: 0; top: 0;
 }
 
 .gsi-material-button:disabled {
@@ -2382,45 +1931,29 @@ select {
   background: rgba(255, 255, 255, 0.03);
   border-color: rgba(255, 255, 255, 0.08);
 }
-
-.gsi-material-button:disabled .gsi-material-button-state {
-  background-color: rgba(255, 255, 255, 0.03);
-}
-
-.gsi-material-button:disabled .gsi-material-button-contents {
-  opacity: 38%;
-}
-
-.gsi-material-button:disabled .gsi-material-button-icon {
-  opacity: 38%;
-}
+.gsi-material-button:disabled .gsi-material-button-state    { background-color: rgba(255, 255, 255, 0.03); }
+.gsi-material-button:disabled .gsi-material-button-contents { opacity: 38%; }
+.gsi-material-button:disabled .gsi-material-button-icon     { opacity: 38%; }
 
 .gsi-material-button:not(:disabled):active .gsi-material-button-state,
-.gsi-material-button:not(:disabled):focus .gsi-material-button-state {
+.gsi-material-button:not(:disabled):focus  .gsi-material-button-state {
   background-color: white;
   opacity: 12%;
 }
-
-.gsi-material-button:not(:disabled):active {
-  transform: scale(0.98);
-}
-
+.gsi-material-button:not(:disabled):active { transform: scale(0.98); }
 .gsi-material-button:not(:disabled):hover {
   background: var(--glass-bg-hover);
   border-color: var(--glass-border-hover);
-  box-shadow:
-    0 4px 16px var(--glass-shadow),
-    inset 0 1px 0 var(--glass-highlight);
+  box-shadow: 0 4px 16px var(--glass-shadow), inset 0 1px 0 var(--glass-highlight);
 }
-
 .gsi-material-button:not(:disabled):hover .gsi-material-button-state {
   background-color: white;
   opacity: 6%;
 }
 
-/* ---------------------------------------------------------------------------
- * Okta Sign-In Button — dark theme, matching GSI dimensions
- * ------------------------------------------------------------------------- */
+/* ============================================================
+   Okta Sign-In button
+   ============================================================ */
 
 .okta-sign-in-button {
   -moz-user-select: none;
@@ -2445,9 +1978,9 @@ select {
   position: relative;
   text-align: center;
   transition: background 0.25s cubic-bezier(0.4, 0, 0.2, 1),
-              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
-              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
-              transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+  box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+  transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   vertical-align: middle;
   white-space: nowrap;
   width: auto;
@@ -2465,14 +1998,7 @@ select {
   position: relative;
   width: 100%;
 }
-
-.okta-sign-in-button .okta-sign-in-button-icon {
-  height: 20px;
-  margin-right: 10px;
-  min-width: 20px;
-  width: 20px;
-}
-
+.okta-sign-in-button .okta-sign-in-button-icon { height: 20px; margin-right: 10px; min-width: 20px; width: 20px; }
 .okta-sign-in-button .okta-sign-in-button-label {
   flex-grow: 1;
   font-family: inherit;
@@ -2481,24 +2007,17 @@ select {
   text-overflow: ellipsis;
   vertical-align: top;
 }
-
 .okta-sign-in-button:not(:disabled):active,
-.okta-sign-in-button:not(:disabled):focus {
-  background: rgba(255, 255, 255, 0.12);
-  transform: scale(0.98);
-}
-
-.okta-sign-in-button:not(:disabled):hover {
+.okta-sign-in-button:not(:disabled):focus  { background: rgba(255, 255, 255, 0.12); transform: scale(0.98); }
+.okta-sign-in-button:not(:disabled):hover  {
   background: var(--glass-bg-hover);
   border-color: var(--glass-border-hover);
-  box-shadow:
-    0 4px 16px var(--glass-shadow),
-    inset 0 1px 0 var(--glass-highlight);
+  box-shadow: 0 4px 16px var(--glass-shadow), inset 0 1px 0 var(--glass-highlight);
 }
 
-/* ---------------------------------------------------------------------------
- * Generic OAuth Sign-In Button — fallback when no provider is configured
- * ------------------------------------------------------------------------- */
+/* ============================================================
+   Generic OAuth button
+   ============================================================ */
 
 .generic-sign-in-button {
   -webkit-appearance: none;
@@ -2519,26 +2038,22 @@ select {
   padding: 0 32px;
   text-align: center;
   transition: background 0.25s cubic-bezier(0.4, 0, 0.2, 1),
-              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
-              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
-              transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+  box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+  transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   white-space: nowrap;
 }
-
-.generic-sign-in-button:not(:disabled):hover {
+.generic-sign-in-button:not(:disabled):hover  {
   background: rgba(10, 132, 255, 0.35);
   border-color: rgba(10, 132, 255, 0.50);
-  box-shadow:
-    0 4px 16px var(--glass-shadow),
-    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+  box-shadow: 0 4px 16px var(--glass-shadow), inset 0 1px 0 rgba(255, 255, 255, 0.15);
 }
+.generic-sign-in-button:not(:disabled):active { background: rgba(10, 132, 255, 0.40); transform: scale(0.98); }
 
-.generic-sign-in-button:not(:disabled):active {
-  background: rgba(10, 132, 255, 0.40);
-  transform: scale(0.98);
-}
+/* ============================================================
+   Meeting Settings Page
+   ============================================================ */
 
-/* Edit/settings button - neutral color */
 .meeting-edit-btn {
   display: flex;
   align-items: center;
@@ -2552,27 +2067,10 @@ select {
   transition: all 0.2s ease;
   flex-shrink: 0;
 }
+.meeting-edit-btn:hover { background: rgba(255, 255, 255, 0.1); color: rgba(255, 255, 255, 0.9); }
+.meeting-edit-btn svg   { width: 16px; height: 16px; }
 
-.meeting-edit-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.9);
-}
-
-.meeting-edit-btn svg {
-  width: 16px;
-  height: 16px;
-}
-
-/* ========================================
-   Meeting Settings Page
-   ======================================== */
-
-/* -- Header / back nav -- */
-.settings-header {
-  display: flex;
-  align-items: center;
-  margin-bottom: 0.25rem;
-}
+.settings-header { display: flex; align-items: center; margin-bottom: 0.25rem; }
 
 .settings-back-btn {
   display: inline-flex;
@@ -2590,16 +2088,9 @@ select {
   min-height: 44px;
   transition: background 0.2s ease, opacity 0.2s ease;
 }
+.settings-back-btn:hover  { background: rgba(10, 132, 255, 0.08); }
+.settings-back-btn:active { opacity: 0.7; }
 
-.settings-back-btn:hover {
-  background: rgba(10, 132, 255, 0.08);
-}
-
-.settings-back-btn:active {
-  opacity: 0.7;
-}
-
-/* -- Cards -- */
 .settings-card {
   background: rgba(0, 0, 0, 0.20);
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -2609,10 +2100,7 @@ select {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
   transition: border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
-
-.settings-card:hover {
-  border-color: rgba(255, 255, 255, 0.12);
-}
+.settings-card:hover { border-color: rgba(255, 255, 255, 0.12); }
 
 .settings-card-title {
   margin: 0 0 1.25rem 0;
@@ -2623,16 +2111,9 @@ select {
   color: var(--text-tertiary, #8E8E93);
 }
 
-/* -- Compact card variant -- */
-.settings-card-compact {
-  padding: 1rem 1.5rem;
-}
+.settings-card-compact { padding: 1rem 1.5rem; }
+.settings-card-compact .settings-card-title { margin-bottom: 0.75rem; }
 
-.settings-card-compact .settings-card-title {
-  margin-bottom: 0.75rem;
-}
-
-/* -- Detail fields -- */
 .settings-field {
   display: flex;
   justify-content: space-between;
@@ -2641,15 +2122,8 @@ select {
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   min-height: 44px;
 }
-
-.settings-field:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.settings-field:first-of-type {
-  padding-top: 0;
-}
+.settings-field:last-child  { border-bottom: none; padding-bottom: 0; }
+.settings-field:first-of-type { padding-top: 0; }
 
 .settings-field-label {
   font-size: 0.9375rem;
@@ -2675,7 +2149,6 @@ select {
   letter-spacing: 0.02em;
 }
 
-/* -- Compact field rows -- */
 .settings-field-compact {
   display: flex;
   justify-content: space-between;
@@ -2683,23 +2156,11 @@ select {
   padding: 0.5rem 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
+.settings-field-compact:last-child   { border-bottom: none; padding-bottom: 0; }
+.settings-field-compact:first-of-type { padding-top: 0; }
 
-.settings-field-compact:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
+.settings-field .meeting-state { font-size: 0.6875rem; padding: 0.1875rem 0.5625rem; }
 
-.settings-field-compact:first-of-type {
-  padding-top: 0;
-}
-
-/* Meeting state badge in settings context */
-.settings-field .meeting-state {
-  font-size: 0.6875rem;
-  padding: 0.1875rem 0.5625rem;
-}
-
-/* -- Stats -- */
 .settings-stat-row {
   display: flex;
   align-items: center;
@@ -2707,50 +2168,19 @@ select {
   padding: 0.375rem 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
+.settings-stat-row:last-child   { border-bottom: none; padding-bottom: 0; }
+.settings-stat-row:first-of-type { padding-top: 0; }
+.settings-stat-row svg { flex-shrink: 0; color: var(--text-quaternary, #636366); }
 
-.settings-stat-row:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.settings-stat-row:first-of-type {
-  padding-top: 0;
-}
-
-.settings-stat-row svg {
-  flex-shrink: 0;
-  color: var(--text-quaternary, #636366);
-}
-
-.settings-stat-label {
-  font-size: 0.8125rem;
-  color: var(--text-tertiary, #8E8E93);
-}
-
-.settings-stat-value {
-  margin-left: auto;
-  font-size: 0.8125rem;
-  font-weight: 400;
-  color: var(--text-secondary, #AEAEB2);
-  white-space: nowrap;
-}
-
-.settings-stat-separator {
-  color: var(--text-tertiary, #8E8E93);
-  font-weight: 400;
-}
+.settings-stat-label  { font-size: 0.8125rem; color: var(--text-tertiary, #8E8E93); }
+.settings-stat-value  { margin-left: auto; font-size: 0.8125rem; font-weight: 400; color: var(--text-secondary, #AEAEB2); white-space: nowrap; }
+.settings-stat-separator { color: var(--text-tertiary, #8E8E93); font-weight: 400; }
 
 .settings-stat-warning .settings-stat-label,
 .settings-stat-warning svg,
-.settings-stat-warning .settings-stat-value {
-  color: var(--warning, #FF9F0A);
-}
+.settings-stat-warning .settings-stat-value { color: var(--warning, #FF9F0A); }
+.settings-stat-waiting { color: var(--warning, #FF9F0A); }
 
-.settings-stat-waiting {
-  color: var(--warning, #FF9F0A);
-}
-
-/* -- Option rows -- */
 .settings-option-row {
   display: flex;
   align-items: center;
@@ -2758,29 +2188,11 @@ select {
   padding: 0.625rem 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
+.settings-option-row:last-child   { border-bottom: none; padding-bottom: 0; }
+.settings-option-row:first-of-type { padding-top: 0; }
+.settings-option-label    { font-size: 0.9375rem; font-weight: 500; color: var(--text-primary, #FFFFFF); }
+.settings-option-controls { display: flex; align-items: center; gap: 0.75rem; }
 
-.settings-option-row:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.settings-option-row:first-of-type {
-  padding-top: 0;
-}
-
-.settings-option-label {
-  font-size: 0.9375rem;
-  font-weight: 500;
-  color: var(--text-primary, #FFFFFF);
-}
-
-.settings-option-controls {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-/* -- Info icon with tooltip -- */
 .settings-info-icon {
   position: relative;
   display: inline-flex;
@@ -2793,12 +2205,7 @@ select {
   border-radius: 50%;
   transition: color 0.2s ease, background 0.2s ease;
 }
-
-.settings-info-icon:hover {
-  color: var(--text-secondary, #AEAEB2);
-  background: rgba(255, 255, 255, 0.06);
-}
-
+.settings-info-icon:hover { color: var(--text-secondary, #AEAEB2); background: rgba(255, 255, 255, 0.06); }
 .settings-info-icon::after {
   content: attr(title);
   position: absolute;
@@ -2822,19 +2229,10 @@ select {
   z-index: 10;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
 }
+.settings-info-icon:hover::after { opacity: 1; }
 
-.settings-info-icon:hover::after {
-  opacity: 1;
-}
-
-/* -- Action rows -- */
-.settings-action-row {
-  margin-bottom: 0.75rem;
-}
-
-.settings-action-row:last-child {
-  margin-bottom: 0;
-}
+.settings-action-row { margin-bottom: 0.75rem; }
+.settings-action-row:last-child { margin-bottom: 0; }
 
 .settings-action-btn {
   display: flex;
@@ -2847,36 +2245,21 @@ select {
   font-weight: 600;
 }
 
-/* -- Warning button -- */
 .btn-warning {
   background: rgba(255, 159, 10, 0.18);
   border: 1px solid rgba(255, 159, 10, 0.25);
   color: var(--warning, #FF9F0A);
 }
+.btn-warning:hover  { background: rgba(255, 159, 10, 0.28); border-color: rgba(255, 159, 10, 0.40); }
+.btn-warning:active { transform: scale(0.98); }
 
-.btn-warning:hover {
-  background: rgba(255, 159, 10, 0.28);
-  border-color: rgba(255, 159, 10, 0.40);
-}
-
-.btn-warning:active {
-  transform: scale(0.98);
-}
-
-/* -- Danger zone -- */
 .settings-danger-zone {
   display: flex;
   align-items: center;
   gap: 0.75rem;
   margin: 1.25rem 0;
 }
-
-.settings-danger-divider {
-  flex: 1;
-  height: 1px;
-  background: rgba(255, 69, 58, 0.20);
-}
-
+.settings-danger-divider { flex: 1; height: 1px; background: rgba(255, 69, 58, 0.20); }
 .settings-danger-label {
   font-size: 0.6875rem;
   font-weight: 600;
@@ -2886,23 +2269,14 @@ select {
   white-space: nowrap;
 }
 
-/* -- Danger button -- */
 .btn-danger {
   background: rgba(255, 69, 58, 0.10);
   border: 1px solid rgba(255, 69, 58, 0.18);
   color: var(--error, #FF453A);
 }
+.btn-danger:hover  { background: rgba(255, 69, 58, 0.22); border-color: rgba(255, 69, 58, 0.35); }
+.btn-danger:active { transform: scale(0.98); }
 
-.btn-danger:hover {
-  background: rgba(255, 69, 58, 0.22);
-  border-color: rgba(255, 69, 58, 0.35);
-}
-
-.btn-danger:active {
-  transform: scale(0.98);
-}
-
-/* -- Loading / empty states -- */
 .settings-loading-state {
   display: flex;
   flex-direction: column;
@@ -2913,12 +2287,7 @@ select {
   color: var(--text-secondary, #AEAEB2);
   font-size: 0.9375rem;
 }
-
-.settings-loading-state .loading-spinner {
-  width: 28px;
-  height: 28px;
-  border-width: 2.5px;
-}
+.settings-loading-state .loading-spinner { width: 28px; height: 28px; border-width: 2.5px; }
 
 .settings-empty-state {
   display: flex;
@@ -2930,521 +2299,28 @@ select {
   text-align: center;
   color: var(--text-secondary, #AEAEB2);
 }
+.settings-empty-state h2 { margin: 0.5rem 0 0; font-size: 1.25rem; font-weight: 600; color: var(--text-primary, #FFFFFF); }
+.settings-empty-state p  { font-size: 0.875rem; color: var(--text-tertiary, #8E8E93); max-width: 280px; }
 
-.settings-empty-state h2 {
-  margin: 0.5rem 0 0;
-  font-size: 1.25rem;
-  font-weight: 600;
-  color: var(--text-primary, #FFFFFF);
-}
-
-.settings-empty-state p {
-  font-size: 0.875rem;
-  color: var(--text-tertiary, #8E8E93);
-  max-width: 280px;
-}
-
-/* -- Toggle error -- */
-.toggle-error {
-  text-align: center;
-  color: var(--error, #FF453A);
-  font-size: 0.8rem;
-  margin-top: 0.5rem;
-}
-
-/* -- Responsive -- */
-@media (max-width: 768px) {
-  .settings-card {
-    padding: 1.25rem;
-  }
-
-  .settings-field-label {
-    font-size: 0.875rem;
-    margin-right: 1.5rem;
-  }
-
-  .settings-field-value {
-    font-size: 0.875rem;
-  }
-}
-
-@media (max-width: 480px) {
-  .settings-card {
-    padding: 1rem;
-    border-radius: var(--radius-input, 12px);
-  }
-
-  .settings-info-icon::after {
-    right: auto;
-    left: 50%;
-    top: calc(100% + 8px);
-    transform: translateX(-50%);
-  }
-
-  .settings-field {
-    padding: 0.75rem 0;
-  }
-
-  .settings-field-label {
-    margin-right: 0.75rem;
-  }
-}
-
-/* Edit/settings button - neutral color */
-.meeting-edit-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: none;
-  color: rgba(255, 255, 255, 0.5);
-  padding: 0.5rem;
-  border-radius: 0.375rem;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  flex-shrink: 0;
-}
-
-.meeting-edit-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.9);
-}
-
-.meeting-edit-btn svg {
-  width: 16px;
-  height: 16px;
-}
-
-/* ========================================
-   Meeting Settings Page
-   ======================================== */
-
-/* -- Header / back nav -- */
-.settings-header {
-  display: flex;
-  align-items: center;
-  margin-bottom: 0.25rem;
-}
-
-.settings-back-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.375rem;
-  background: none;
-  border: none;
-  color: var(--accent, #0A84FF);
-  font-size: 0.9375rem;
-  font-weight: 500;
-  cursor: pointer;
-  padding: 0.625rem 0.75rem;
-  margin-left: -0.75rem;
-  border-radius: var(--radius-button, 10px);
-  min-height: 44px;
-  transition: background 0.2s ease, opacity 0.2s ease;
-}
-
-.settings-back-btn:hover {
-  background: rgba(10, 132, 255, 0.08);
-}
-
-.settings-back-btn:active {
-  opacity: 0.7;
-}
-
-/* -- Cards -- */
-.settings-card {
-  background: rgba(0, 0, 0, 0.20);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: var(--radius-card, 16px);
-  padding: 1.5rem;
-  margin-bottom: 1rem;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-  transition: border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.settings-card:hover {
-  border-color: rgba(255, 255, 255, 0.12);
-}
-
-.settings-card-title {
-  margin: 0 0 1.25rem 0;
-  font-size: 0.8125rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-tertiary, #8E8E93);
-}
-
-/* -- Compact card variant -- */
-.settings-card-compact {
-  padding: 1rem 1.5rem;
-}
-
-.settings-card-compact .settings-card-title {
-  margin-bottom: 0.75rem;
-}
-
-/* -- Detail fields -- */
-.settings-field {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 0.875rem 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  min-height: 44px;
-}
-
-.settings-field:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.settings-field:first-of-type {
-  padding-top: 0;
-}
-
-.settings-field-label {
-  font-size: 0.9375rem;
-  font-weight: 500;
-  color: var(--text-primary, #FFFFFF);
-  flex-shrink: 0;
-  margin-right: 2rem;
-}
-
-.settings-field-value {
-  font-size: 0.9375rem;
-  color: var(--text-secondary, #AEAEB2);
-  text-align: right;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.settings-field-mono {
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
-  font-size: 0.875rem;
-  letter-spacing: 0.02em;
-}
-
-/* -- Compact field rows -- */
-.settings-field-compact {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 0.5rem 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.settings-field-compact:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.settings-field-compact:first-of-type {
-  padding-top: 0;
-}
-
-/* Meeting state badge in settings context */
-.settings-field .meeting-state {
-  font-size: 0.6875rem;
-  padding: 0.1875rem 0.5625rem;
-}
-
-/* -- Stats -- */
-.settings-stat-row {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.375rem 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.settings-stat-row:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.settings-stat-row:first-of-type {
-  padding-top: 0;
-}
-
-.settings-stat-row svg {
-  flex-shrink: 0;
-  color: var(--text-quaternary, #636366);
-}
-
-.settings-stat-label {
-  font-size: 0.8125rem;
-  color: var(--text-tertiary, #8E8E93);
-}
-
-.settings-stat-value {
-  margin-left: auto;
-  font-size: 0.8125rem;
-  font-weight: 400;
-  color: var(--text-secondary, #AEAEB2);
-  white-space: nowrap;
-}
-
-.settings-stat-separator {
-  color: var(--text-tertiary, #8E8E93);
-  font-weight: 400;
-}
-
-.settings-stat-warning .settings-stat-label,
-.settings-stat-warning svg,
-.settings-stat-warning .settings-stat-value {
-  color: var(--warning, #FF9F0A);
-}
-
-.settings-stat-waiting {
-  color: var(--warning, #FF9F0A);
-}
-
-/* -- Option rows -- */
-.settings-option-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0.625rem 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.settings-option-row:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.settings-option-row:first-of-type {
-  padding-top: 0;
-}
-
-.settings-option-label {
-  font-size: 0.9375rem;
-  font-weight: 500;
-  color: var(--text-primary, #FFFFFF);
-}
-
-.settings-option-controls {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-/* -- Info icon with tooltip -- */
-.settings-info-icon {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-quaternary, #636366);
-  cursor: help;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  transition: color 0.2s ease, background 0.2s ease;
-}
-
-.settings-info-icon:hover {
-  color: var(--text-secondary, #AEAEB2);
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.settings-info-icon::after {
-  content: attr(title);
-  position: absolute;
-  right: calc(100% + 8px);
-  top: 50%;
-  transform: translateY(-50%);
-  background: rgba(30, 30, 30, 0.95);
-  backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  padding: 0.5rem 0.75rem;
-  font-size: 0.75rem;
-  line-height: 1.4;
-  color: var(--text-secondary, #AEAEB2);
-  white-space: normal;
-  width: max-content;
-  max-width: 200px;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.15s ease;
-  z-index: 10;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
-}
-
-.settings-info-icon:hover::after {
-  opacity: 1;
-}
-
-/* -- Action rows -- */
-.settings-action-row {
-  margin-bottom: 0.75rem;
-}
-
-.settings-action-row:last-child {
-  margin-bottom: 0;
-}
-
-.settings-action-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  width: 100%;
-  height: 40px;
-  font-size: 0.875rem;
-  font-weight: 600;
-}
-
-/* -- Warning button -- */
-.btn-warning {
-  background: rgba(255, 159, 10, 0.18);
-  border: 1px solid rgba(255, 159, 10, 0.25);
-  color: var(--warning, #FF9F0A);
-}
-
-.btn-warning:hover {
-  background: rgba(255, 159, 10, 0.28);
-  border-color: rgba(255, 159, 10, 0.40);
-}
-
-.btn-warning:active {
-  transform: scale(0.98);
-}
-
-/* -- Danger zone -- */
-.settings-danger-zone {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  margin: 1.25rem 0;
-}
-
-.settings-danger-divider {
-  flex: 1;
-  height: 1px;
-  background: rgba(255, 69, 58, 0.20);
-}
-
-.settings-danger-label {
-  font-size: 0.6875rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: rgba(255, 69, 58, 0.6);
-  white-space: nowrap;
-}
-
-/* -- Danger button -- */
-.btn-danger {
-  background: rgba(255, 69, 58, 0.10);
-  border: 1px solid rgba(255, 69, 58, 0.18);
-  color: var(--error, #FF453A);
-}
-
-.btn-danger:hover {
-  background: rgba(255, 69, 58, 0.22);
-  border-color: rgba(255, 69, 58, 0.35);
-}
-
-.btn-danger:active {
-  transform: scale(0.98);
-}
+.toggle-error { text-align: center; color: var(--error, #FF453A); font-size: 0.8rem; margin-top: 0.5rem; }
 
-/* -- Loading / empty states -- */
-.settings-loading-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 1rem;
-  min-height: 200px;
-  color: var(--text-secondary, #AEAEB2);
-  font-size: 0.9375rem;
+@media (max-width: 48em) {
+  .settings-card { padding: 1.25rem; }
+  .settings-field-label { font-size: 0.875rem; margin-right: 1.5rem; }
+  .settings-field-value { font-size: 0.875rem; }
 }
-
-.settings-loading-state .loading-spinner {
-  width: 28px;
-  height: 28px;
-  border-width: 2.5px;
-}
-
-.settings-empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.75rem;
-  min-height: 200px;
-  text-align: center;
-  color: var(--text-secondary, #AEAEB2);
-}
-
-.settings-empty-state h2 {
-  margin: 0.5rem 0 0;
-  font-size: 1.25rem;
-  font-weight: 600;
-  color: var(--text-primary, #FFFFFF);
-}
-
-.settings-empty-state p {
-  font-size: 0.875rem;
-  color: var(--text-tertiary, #8E8E93);
-  max-width: 280px;
-}
-
-/* -- Toggle error -- */
-.toggle-error {
-  text-align: center;
-  color: var(--error, #FF453A);
-  font-size: 0.8rem;
-  margin-top: 0.5rem;
-}
-
-/* -- Responsive -- */
-@media (max-width: 768px) {
-  .settings-card {
-    padding: 1.25rem;
-  }
-
-  .settings-field-label {
-    font-size: 0.875rem;
-    margin-right: 1.5rem;
-  }
-
-  .settings-field-value {
-    font-size: 0.875rem;
-  }
-}
-
-@media (max-width: 480px) {
-  .settings-card {
-    padding: 1rem;
-    border-radius: var(--radius-input, 12px);
-  }
-
-  .settings-info-icon::after {
-    right: auto;
-    left: 50%;
-    top: calc(100% + 8px);
-    transform: translateX(-50%);
-  }
-
-  .settings-field {
-    padding: 0.75rem 0;
-  }
 
-  .settings-field-label {
-    margin-right: 0.75rem;
-  }
+@media (max-width: 30em) {
+  .settings-card { padding: 1rem; border-radius: var(--radius-input, 12px); }
+  .settings-info-icon::after { right: auto; left: 50%; top: calc(100% + 8px); transform: translateX(-50%); }
+  .settings-field { padding: 0.75rem 0; }
+  .settings-field-label { margin-right: 0.75rem; }
 }
 
-/* ===== Speaking indicator styles ===== */
+/* ============================================================
+   Speaking indicator
+   ============================================================ */
 
-/* Peer list mic icon container */
 .peer_item_mic {
   flex-shrink: 0;
   display: flex;
@@ -3455,29 +2331,17 @@ select {
   color: #888;
   transition: all 0.2s ease;
 }
-
-.peer_item_mic svg {
-  width: 100%;
-  height: 100%;
-}
+.peer_item_mic svg { width: 100%; height: 100%; }
 
 .peer_item_mic.speaking {
   color: #00ff41;
   filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
   animation: mic-pulse 1.5s ease-in-out infinite;
 }
+.peer_item_mic.speaking svg { stroke: #00ff41; }
 
-.peer_item_mic.speaking svg {
-  stroke: #00ff41;
-}
+.host-video-wrapper { border-radius: 0; overflow: hidden; }
 
-/* Sits between controls (above) and LED (below) inside .host — no rounded corners */
-.host-video-wrapper {
-  border-radius: 0;
-  overflow: hidden;
-}
-
-/* Speaking tile — transition-based glow that eases in/out */
 .speaking-tile,
 .canvas-container,
 .host-video-wrapper {
@@ -3490,28 +2354,19 @@ select {
   animation: tile-glow 1.5s ease-in-out infinite;
 }
 
-/* Speaking glow on audio indicator (mic icon in tile) */
 .audio-indicator {
   transition: color 0.4s ease, filter 0.4s ease;
 }
-
 .audio-indicator.speaking {
   color: #00ff41;
   filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
   animation: mic-pulse 1.5s ease-in-out infinite;
 }
-
-.audio-indicator.speaking svg {
-  stroke: #00ff41;
-}
+.audio-indicator.speaking svg { stroke: #00ff41; }
 
 @keyframes mic-pulse {
-  0%, 100% {
-    filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
-  }
-  50% {
-    filter: drop-shadow(0 0 12px rgba(0, 255, 65, 1));
-  }
+  0%, 100% { filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8)); }
+  50%       { filter: drop-shadow(0 0 12px rgba(0, 255, 65, 1)); }
 }
 
 @keyframes tile-glow {

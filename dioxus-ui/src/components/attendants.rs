@@ -222,7 +222,7 @@ fn schedule_reconnect(
             }
         });
     })
-        .forget();
+    .forget();
 }
 
 /// Schedule a reconnection attempt with exponential backoff (non-JWT path).

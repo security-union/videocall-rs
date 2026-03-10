@@ -60,9 +60,9 @@ jobs:
           echo "   - Web UI (WASM frontend)"
           echo ""
 
-          # Clean up old log directories (older than 2 hours) to prevent accumulation
-          echo "🧹 Cleaning up old build logs (>2 hours old)..."
-          find /tmp -maxdepth 1 -name "build-logs-*" -type d -mmin +120 -exec rm -rf {} \; 2>/dev/null || {
+          # Clean up old log directories (older than 24 hours) to prevent accumulation
+          echo "🧹 Cleaning up old build logs (>24 hours old)..."
+          find /tmp -maxdepth 1 -name "build-logs-*" -type d -mmin +1440 -exec rm -rf {} \; 2>/dev/null || {
             echo "⚠️  Warning: Could not clean some old log directories (non-fatal)"
           }
 
@@ -128,11 +128,11 @@ jobs:
           fi
           echo ""
 
-          # Conditional cleanup based on success/failure
+          # Report status and keep logs for 24 hours
           if [ $FAILED -eq 1 ]; then
             echo "❌ One or more builds failed"
             echo "⚠️  Full build logs retained at: ${LOG_DIR}"
-            echo "   Logs will be automatically cleaned after 2 hours"
+            echo "   Logs will be automatically cleaned after 24 hours"
             echo ""
             echo "To view full logs, SSH to runner and:"
             echo "   cat ${LOG_DIR}/media-server.log"
@@ -141,8 +141,8 @@ jobs:
             exit 1
           else
             echo "✅ All builds completed successfully!"
-            echo "🧹 Cleaning up build logs..."
-            rm -rf ${LOG_DIR}
+            echo "📁 Build logs retained at: ${LOG_DIR}"
+            echo "   Logs will be automatically cleaned after 24 hours"
           fi
 
       - name: Cleanup build directory

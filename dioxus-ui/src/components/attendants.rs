@@ -244,6 +244,8 @@ fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) 
     let avail_w = (container_w - PADDING).max(1.0);
     let avail_h = (container_h - PADDING).max(1.0);
 
+    const MAX_ASPECT: f64 = 2.0;
+
     let mut best_cols = 1usize;
     let mut best_rows = n;
     let mut best_area = 0.0f64;
@@ -255,11 +257,33 @@ fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) 
         if tile_w <= 0.0 || tile_h <= 0.0 {
             continue;
         }
+        let aspect = tile_w / tile_h;
+        if aspect > MAX_ASPECT || aspect < 1.0 / MAX_ASPECT {
+            continue;
+        }
         let area = tile_w * tile_h;
         if area > best_area {
             best_area = area;
             best_cols = cols;
             best_rows = rows;
+        }
+    }
+
+    if best_area == 0.0 {
+        let mut best_delta = f64::MAX;
+        for cols in 1..=n {
+            let rows = (n + cols - 1) / cols;
+            let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
+            let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
+            if tile_w <= 0.0 || tile_h <= 0.0 {
+                continue;
+            }
+            let delta = (tile_w / tile_h - 1.0).abs();
+            if delta < best_delta {
+                best_delta = delta;
+                best_cols = cols;
+                best_rows = rows;
+            }
         }
     }
 

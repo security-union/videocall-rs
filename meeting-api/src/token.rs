@@ -34,7 +34,7 @@ use crate::error::AppError;
 /// Claims embedded in a session JWT (stored in an HttpOnly cookie).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionTokenClaims {
-    /// User email (the identity principal).
+    /// User ID (the identity principal).
     pub sub: String,
     /// Display name.
     pub name: String,
@@ -56,13 +56,13 @@ impl SessionTokenClaims {
 /// handler so that the browser sends it automatically with every request.
 pub fn generate_session_token(
     secret: &str,
-    email: &str,
+    user_id: &str,
     name: &str,
     ttl_secs: i64,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = SessionTokenClaims {
-        sub: email.to_string(),
+        sub: user_id.to_string(),
         name: name.to_string(),
         exp: now + ttl_secs,
         iat: now,
@@ -105,18 +105,19 @@ pub fn decode_session_token(secret: &str, token: &str) -> Result<SessionTokenCla
 pub fn generate_room_token(
     secret: &str,
     ttl_secs: i64,
-    email: &str,
+    user_id: &str,
     room: &str,
     is_host: bool,
     display_name: &str,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = RoomAccessTokenClaims {
-        sub: email.to_string(),
+        sub: user_id.to_string(),
         room: room.to_string(),
         room_join: true,
         is_host,
         display_name: display_name.to_string(),
+        observer: false,
         exp: now + ttl_secs,
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
     };
@@ -129,6 +130,43 @@ pub fn generate_room_token(
     .map_err(|e| {
         tracing::error!("Failed to sign JWT: {e}");
         AppError::internal("failed to generate room token")
+    })
+}
+
+/// Observer token TTL: 30 minutes. Users may wait a long time in the lobby
+/// for the host to start the meeting or admit them.
+const OBSERVER_TOKEN_TTL_SECS: i64 = 1800;
+
+/// Sign an observer token for a participant who is waiting for meeting
+/// activation or waiting-room admission. The token grants read-only access
+/// to the media server so the client can receive push notifications
+/// (e.g. MEETING_ACTIVATED, PARTICIPANT_ADMITTED) without polling.
+pub fn generate_observer_token(
+    secret: &str,
+    user_id: &str,
+    room: &str,
+    display_name: &str,
+) -> Result<String, AppError> {
+    let now = Utc::now().timestamp();
+    let claims = RoomAccessTokenClaims {
+        sub: user_id.to_string(),
+        room: room.to_string(),
+        room_join: false,
+        is_host: false,
+        display_name: display_name.to_string(),
+        observer: true,
+        exp: now + OBSERVER_TOKEN_TTL_SECS,
+        iss: RoomAccessTokenClaims::ISSUER.to_string(),
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to sign observer JWT: {e}");
+        AppError::internal("failed to generate observer token")
     })
 }
 

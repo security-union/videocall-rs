@@ -29,24 +29,38 @@ use videocall_client::VideoCallClient;
 use web_sys::{window, HtmlCanvasElement};
 
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
-/// the video tile will occupy the full grid area. If `host_display_name` matches `key`, a crown
-/// icon is displayed next to the name.
+/// the video tile will occupy the full grid area. The `is_speaking` parameter indicates voice activity.
+/// If `host_user_id` matches the peer's authenticated user_id, a crown icon is displayed next to the name.
 pub fn generate_for_peer(
     client: &VideoCallClient,
     key: &String,
     full_bleed: bool,
-    host_display_name: Option<&str>,
+    is_speaking: bool,
+    host_user_id: Option<&str>,
 ) -> Element {
-    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
-    let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
+    let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
+    let peer_display_name = client
+        .get_peer_display_name(key)
+        .unwrap_or_else(|| peer_user_id.clone());
+    // Compare authenticated user_id (from JWT/DB) instead of user-chosen display name
+    // to prevent spoofing the host crown icon.
+    let is_host = host_user_id.map(|h| h == peer_user_id).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
-    if !allowed.is_empty() && !allowed.contains(&peer_email) {
+    if !allowed.is_empty() && !allowed.contains(&peer_user_id) {
         return rsx! {};
     }
 
     let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
+
+    // Use speaking state for the glowing border animation
+    let speaking_class = if is_speaking { " speaking-tile" } else { "" };
+    let audio_speaking_class = if is_speaking {
+        "audio-indicator speaking"
+    } else {
+        "audio-indicator"
+    };
 
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {
@@ -55,18 +69,23 @@ pub fn generate_for_peer(
         let div_id_pin = (*peer_video_div_id).clone();
         let canvas_id_crop = key.clone();
         let key_clone = key.clone();
-        let peer_email_display = peer_email.clone();
+        let peer_display_name_fb = peer_display_name.clone();
         let title = if is_host {
-            format!("Host: {peer_email}")
+            format!("Host: {peer_user_id}")
         } else {
-            peer_email.clone()
+            peer_user_id.clone()
+        };
+        let full_bleed_class = if is_video_enabled_for_peer {
+            format!("canvas-container video-on{speaking_class}")
+        } else {
+            format!("canvas-container{speaking_class}")
         };
         return rsx! {
             div {
                 class: "grid-item full-bleed",
                 id: "{peer_video_div_id}",
                 div {
-                    class: if is_video_enabled_for_peer { "canvas-container video-on" } else { "canvas-container" },
+                    class: "{full_bleed_class}",
                     onclick: move |_| {
                         if is_mobile_viewport() {
                             toggle_pinned_div(&div_id_mobile);
@@ -88,12 +107,12 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{title}",
                         dir: "auto",
-                        "{peer_email_display}"
+                        "{peer_display_name_fb}"
                         if is_host {
                             CrownIcon {}
                         }
                     }
-                    div { class: "audio-indicator",
+                    div { class: "{audio_speaking_class}",
                         MicIcon { muted: !is_audio_enabled_for_peer }
                     }
                     button {
@@ -123,17 +142,17 @@ pub fn generate_for_peer(
     let ss_div_mobile = (*screen_share_div_id).clone();
     let ss_div_pin = (*screen_share_div_id).clone();
     let ss_canvas_crop = format!("screen-share-{}", key);
-    let ss_name = format!("{}-screen", peer_email);
+    let ss_name = format!("{}-screen", peer_display_name);
 
     let pv_div_mobile = (*peer_video_div_id).clone();
     let pv_div_pin = (*peer_video_div_id).clone();
     let pv_canvas_crop = key.clone();
     let key_clone = key.clone();
-    let peer_email_grid = peer_email.clone();
+    let peer_display_name_grid = peer_display_name.clone();
     let title_grid = if is_host {
-        format!("Host: {peer_email}")
+        format!("Host: {peer_user_id}")
     } else {
-        peer_email.clone()
+        peer_user_id.clone()
     };
 
     rsx! {
@@ -169,46 +188,55 @@ pub fn generate_for_peer(
                 }
             }
         }
-        div {
-            class: "grid-item",
-            id: "{peer_video_div_id}",
-            // One canvas for the User Video
-            div {
-                class: if is_video_enabled_for_peer { "canvas-container video-on" } else { "canvas-container" },
-                onclick: move |_| {
-                    if is_mobile_viewport() {
-                        toggle_pinned_div(&pv_div_mobile);
+        {
+            let grid_class = if is_video_enabled_for_peer {
+                format!("canvas-container video-on{speaking_class}")
+            } else {
+                format!("canvas-container{speaking_class}")
+            };
+            rsx! {
+                div {
+                    class: "grid-item",
+                    id: "{peer_video_div_id}",
+                    // One canvas for the User Video
+                    div {
+                        class: "{grid_class}",
+                        onclick: move |_| {
+                            if is_mobile_viewport() {
+                                toggle_pinned_div(&pv_div_mobile);
+                            }
+                        },
+                        if is_video_enabled_for_peer {
+                            UserVideo { id: key_clone.clone(), hidden: false }
+                        } else {
+                            div { class: "placeholder-content",
+                                PeerIcon {}
+                                span { class: "placeholder-text", "Video Disabled" }
+                            }
+                        }
+                        h4 {
+                            class: "floating-name",
+                            title: "{title_grid}",
+                            dir: "auto",
+                            "{peer_display_name_grid}"
+                            if is_host {
+                                CrownIcon {}
+                            }
+                        }
+                        div { class: "{audio_speaking_class}",
+                            MicIcon { muted: !is_audio_enabled_for_peer }
+                        }
+                        button {
+                            onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
+                            class: "crop-icon",
+                            CropIcon {}
+                        }
+                        button {
+                            onclick: move |_| toggle_pinned_div(&pv_div_pin),
+                            class: "pin-icon",
+                            PushPinIcon {}
+                        }
                     }
-                },
-                if is_video_enabled_for_peer {
-                    UserVideo { id: key_clone.clone(), hidden: false }
-                } else {
-                    div { class: "placeholder-content",
-                        PeerIcon {}
-                        span { class: "placeholder-text", "Video Disabled" }
-                    }
-                }
-                h4 {
-                    class: "floating-name",
-                    title: "{title_grid}",
-                    dir: "auto",
-                    "{peer_email_grid}"
-                    if is_host {
-                        CrownIcon {}
-                    }
-                }
-                div { class: "audio-indicator",
-                    MicIcon { muted: !is_audio_enabled_for_peer }
-                }
-                button {
-                    onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
-                    class: "crop-icon",
-                    CropIcon {}
-                }
-                button {
-                    onclick: move |_| toggle_pinned_div(&pv_div_pin),
-                    class: "pin-icon",
-                    PushPinIcon {}
                 }
             }
         }

@@ -91,7 +91,7 @@ async fn test_get_waiting_room_success() {
     assert!(body.success);
     assert_eq!(body.result.meeting_id, room_id);
     assert_eq!(body.result.waiting.len(), 1);
-    assert_eq!(body.result.waiting[0].email, "attendee@example.com");
+    assert_eq!(body.result.waiting[0].user_id, "attendee@example.com");
 
     cleanup_test_data(&pool, room_id).await;
 }
@@ -112,7 +112,7 @@ async fn test_admit_participant_success() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"attendee@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
     .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -165,7 +165,7 @@ async fn test_admit_participant_not_found() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"nonexistent@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"nonexistent@example.com"}"#))
     .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -257,7 +257,7 @@ async fn test_reject_participant_success() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"attendee@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
     .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();

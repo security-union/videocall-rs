@@ -19,7 +19,7 @@
 //!   from the JWT claims. This is the only endpoint available when meeting
 //!   management is enabled.
 //!
-//! - **`GET /lobby/{email}/{room}`** (deprecated): Identity and room come from
+//! - **`GET /lobby/{user_id}/{room}`** (deprecated): Identity and room come from
 //!   URL path parameters. Only available when `FEATURE_MEETING_MANAGEMENT=false`.
 //!   Returns 410 Gone when meeting management is enabled.
 
@@ -70,8 +70,8 @@ where
 
 /// Primary WebSocket connection endpoint (token-based).
 ///
-/// Identity (email) and room are extracted from the JWT claims.
-/// No email or room in the URL path.
+/// Identity (user_id) and room are extracted from the JWT claims.
+/// No user_id or room in the URL path.
 #[get("/lobby")]
 pub async fn ws_connect_authenticated(
     query: web::Query<LobbyTokenQuery>,
@@ -98,10 +98,14 @@ pub async fn ws_connect_authenticated(
         }
     };
 
-    let email = claims.sub;
+    let user_id = claims.sub;
     let room = claims.room;
+    let observer = claims.observer;
+    let display_name = claims.display_name;
 
-    debug!("socket connected (token-based) for email={email}, room={room}");
+    debug!(
+        "socket connected (token-based) for user_id={user_id}, room={room}, display_name={display_name}, observer={observer}"
+    );
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();
@@ -109,10 +113,12 @@ pub async fn ws_connect_authenticated(
     let actor = WsChatSession::new(
         chat,
         room,
-        email,
+        user_id,
+        display_name,
         nats_client,
         tracker_sender,
         session_manager,
+        observer,
     );
     let codec = Codec::new().max_size(1_000_000);
     start_with_codec(actor, &req, stream, codec)
@@ -124,7 +130,7 @@ pub async fn ws_connect_authenticated(
 /// Identity and room are taken from URL path parameters.
 /// Only available when `FEATURE_MEETING_MANAGEMENT` is disabled (FF=off).
 /// When FF=on, returns 410 Gone.
-#[get("/lobby/{email}/{room}")]
+#[get("/lobby/{user_id}/{room}")]
 pub async fn ws_connect(
     session: web::Path<(String, String)>,
     _query: web::Query<LobbyQuery>,
@@ -137,22 +143,22 @@ pub async fn ws_connect(
             .body("This endpoint is deprecated. Use GET /lobby?token=<JWT> instead."));
     }
 
-    let (email, room) = session.into_inner();
+    let (user_id, room) = session.into_inner();
 
-    let email_clean = email.replace(' ', "_");
+    let user_id_clean = user_id.replace(' ', "_");
     let room_clean = room.replace(' ', "_");
     let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-    if !re.is_match(&email_clean) || !re.is_match(&room_clean) {
+    if !re.is_match(&user_id_clean) || !re.is_match(&room_clean) {
         error!(
-            "Invalid email or room format: email={}, room={}",
-            email, room
+            "Invalid user_id or room format: user_id={}, room={}",
+            user_id, room
         );
-        return Ok(HttpResponse::BadRequest().body("Invalid email or room format"));
+        return Ok(HttpResponse::BadRequest().body("Invalid user_id or room format"));
     }
 
     debug!(
-        "socket connected (deprecated path-based) for email={}, room={}",
-        email_clean, room_clean
+        "socket connected (deprecated path-based) for user_id={}, room={}",
+        user_id_clean, room_clean
     );
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
@@ -161,10 +167,12 @@ pub async fn ws_connect(
     let actor = WsChatSession::new(
         chat,
         room_clean,
-        email_clean,
+        user_id_clean.clone(),
+        user_id_clean, // display_name fallback: use user_id for deprecated path
         nats_client,
         tracker_sender,
         session_manager,
+        false, // deprecated path-based endpoint: never observer
     );
     let codec = Codec::new().max_size(1_000_000);
     start_with_codec(actor, &req, stream, codec)

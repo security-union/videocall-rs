@@ -16,25 +16,28 @@
  * conditions.
  */
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::components::canvas_generator::generate_for_peer;
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
-use futures::future::{AbortHandle, Abortable};
-use std::cell::RefCell;
-use std::rc::Rc;
+use futures::future::AbortHandle;
+use futures::future::Abortable;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 
 #[component]
 pub fn PeerTile(
     peer_id: String,
     #[props(default = false)] full_bleed: bool,
-    #[props(default)] host_display_name: Option<String>,
+    #[props(default)] host_user_id: Option<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
     let mut audio_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
     let mut screen_enabled = use_signal(|| false);
+    let mut is_speaking = use_signal(|| false);
 
     // Initialize from client snapshot and subscribe to diagnostics
     let peer_id_owned = peer_id.clone();
@@ -50,6 +53,7 @@ pub fn PeerTile(
         audio_enabled.set(effect_client.is_audio_enabled_for_peer(&peer_id_owned));
         video_enabled.set(effect_client.is_video_enabled_for_peer(&peer_id_owned));
         screen_enabled.set(effect_client.is_screen_share_enabled_for_peer(&peer_id_owned));
+        is_speaking.set(effect_client.is_speaking_for_peer(&peer_id_owned));
 
         let peer_id_inner = peer_id_owned.clone();
 
@@ -66,23 +70,25 @@ pub fn PeerTile(
                     &mut audio_enabled,
                     &mut video_enabled,
                     &mut screen_enabled,
+                    &mut is_speaking,
                 );
             }
         };
         let abortable = Abortable::new(fut, abort_reg);
-        wasm_bindgen_futures::spawn_local(async move {
+        spawn(async move {
             let _ = abortable.await;
         });
     });
 
-    let host_dn = host_display_name.as_deref();
+    let host_uid = host_user_id.as_deref();
 
     // Re-read signals to trigger reactive re-renders
     let _ = audio_enabled();
     let _ = video_enabled();
     let _ = screen_enabled();
+    let speaking = is_speaking();
 
-    generate_for_peer(&client, &peer_id, full_bleed, host_dn)
+    generate_for_peer(&client, &peer_id, full_bleed, speaking, host_uid)
 }
 
 fn handle_diagnostics_event(
@@ -91,39 +97,69 @@ fn handle_diagnostics_event(
     audio_enabled: &mut Signal<bool>,
     video_enabled: &mut Signal<bool>,
     screen_enabled: &mut Signal<bool>,
+    is_speaking: &mut Signal<bool>,
 ) {
-    if evt.subsystem != "peer_status" {
-        return;
-    }
-    let mut to_peer: Option<String> = None;
-    let mut audio: Option<bool> = None;
-    let mut video: Option<bool> = None;
-    let mut screen: Option<bool> = None;
-    for m in &evt.metrics {
-        match (m.name, &m.value) {
-            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
-            ("audio_enabled", MetricValue::U64(v)) => audio = Some(*v != 0),
-            ("video_enabled", MetricValue::U64(v)) => video = Some(*v != 0),
-            ("screen_enabled", MetricValue::U64(v)) => screen = Some(*v != 0),
-            _ => {}
+    match evt.subsystem {
+        "peer_status" => {
+            let mut to_peer: Option<String> = None;
+            let mut audio: Option<bool> = None;
+            let mut video: Option<bool> = None;
+            let mut screen: Option<bool> = None;
+            let mut speaking: Option<bool> = None;
+            for m in &evt.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("audio_enabled", MetricValue::U64(v)) => audio = Some(*v != 0),
+                    ("video_enabled", MetricValue::U64(v)) => video = Some(*v != 0),
+                    ("screen_enabled", MetricValue::U64(v)) => screen = Some(*v != 0),
+                    ("is_speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                    _ => {}
+                }
+            }
+            if to_peer.as_deref() != Some(peer_id) {
+                return;
+            }
+            if let Some(a) = audio {
+                if a != *audio_enabled.peek() {
+                    audio_enabled.set(a);
+                }
+            }
+            if let Some(v) = video {
+                if v != *video_enabled.peek() {
+                    video_enabled.set(v);
+                }
+            }
+            if let Some(s) = screen {
+                if s != *screen_enabled.peek() {
+                    screen_enabled.set(s);
+                }
+            }
+            if let Some(s) = speaking {
+                if s != *is_speaking.peek() {
+                    is_speaking.set(s);
+                }
+            }
         }
-    }
-    if to_peer.as_deref() != Some(peer_id) {
-        return;
-    }
-    if let Some(a) = audio {
-        if a != *audio_enabled.peek() {
-            audio_enabled.set(a);
+        "peer_speaking" => {
+            // Fast-path speaking updates from decoded audio frames
+            let mut to_peer: Option<String> = None;
+            let mut speaking: Option<bool> = None;
+            for m in &evt.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                    _ => {}
+                }
+            }
+            if to_peer.as_deref() != Some(peer_id) {
+                return;
+            }
+            if let Some(s) = speaking {
+                if s != *is_speaking.peek() {
+                    is_speaking.set(s);
+                }
+            }
         }
-    }
-    if let Some(v) = video {
-        if v != *video_enabled.peek() {
-            video_enabled.set(v);
-        }
-    }
-    if let Some(s) = screen {
-        if s != *screen_enabled.peek() {
-            screen_enabled.set(s);
-        }
+        _ => {}
     }
 }

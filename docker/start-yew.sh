@@ -17,7 +17,8 @@ window.__APP_CONFIG = Object.freeze({
   audioBitrateKbps: ${AUDIO_BITRATE_KBPS:-65},
   videoBitrateKbps: ${VIDEO_BITRATE_KBPS:-100},
   screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-100},
-  oauthProvider: "${OAUTH_PROVIDER:-}"
+  oauthProvider: "${OAUTH_PROVIDER:-}",
+  vadThreshold: ${VAD_THRESHOLD:-0.02}
 });
 EOF
 

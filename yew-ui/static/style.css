@@ -155,6 +155,41 @@ h3 {
   padding: 0 10px;
 }
 
+.peer_item_mic {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: #888;
+  transition: all 0.2s ease;
+}
+
+.peer_item_mic svg {
+  width: 100%;
+  height: 100%;
+}
+
+.peer_item_mic.speaking {
+  color: #00ff41;
+  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+
+.peer_item_mic.speaking svg {
+  stroke: #00ff41;
+}
+
+@keyframes mic-pulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  }
+  50% {
+    filter: drop-shadow(0 0 12px rgba(0, 255, 65, 1));
+  }
+}
+
 #grid-container {
   /* Basic grid setup */
   display: grid;
@@ -525,6 +560,37 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: all 0.2s ease;
+}
+
+/* Sits between controls (above) and LED (below) inside .host — no rounded corners */
+.host-video-wrapper {
+  border-radius: 0;
+  overflow: hidden;
+}
+
+/* Speaking tile — transition-based glow that eases in/out */
+.speaking-tile,
+.canvas-container,
+.host-video-wrapper {
+  transition: border-color 0.4s ease, box-shadow 0.4s ease;
+}
+
+.speaking-tile {
+  border: 1.5px solid rgba(0, 255, 65, 0.5);
+  box-shadow: inset 0 0 18px 6px rgba(0, 255, 65, 0.4), 0 0 20px 4px rgba(0, 255, 65, 0.25);
+  animation: tile-glow 1.5s ease-in-out infinite;
+}
+
+@keyframes tile-glow {
+  0%, 100% {
+    border-color: rgba(0, 255, 65, 0.5);
+    box-shadow: inset 0 0 18px 6px rgba(0, 255, 65, 0.4), 0 0 20px 4px rgba(0, 255, 65, 0.25);
+  }
+  50% {
+    border-color: rgba(0, 255, 65, 0.7);
+    box-shadow: inset 0 0 25px 8px rgba(0, 255, 65, 0.55), 0 0 30px 6px rgba(0, 255, 65, 0.35);
+  }
 }
 
 canvas {
@@ -774,6 +840,7 @@ select {
   align-items: center;
   justify-content: center;
   z-index: 2;
+  transition: color 0.4s ease, filter 0.4s ease;
 }
 
 .crop-icon {
@@ -803,6 +870,16 @@ select {
   width: 20px;
   height: 20px;
   stroke: white;
+}
+
+.audio-indicator.speaking {
+  color: #00ff41;
+  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+
+.audio-indicator.speaking svg {
+  stroke: #00ff41;
 }
 
 /* Diagnostics styling */
@@ -2037,6 +2114,13 @@ select {
   font-weight: 600;
 }
 
+.waiting-room-identity {
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
 .waiting-room-message {
   color: rgba(255, 255, 255, 0.7);
   margin-bottom: 2rem;
@@ -2153,6 +2237,22 @@ select {
 
 .waiting-participant:last-child {
   border-bottom: none;
+}
+
+.participant-info {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.participant-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .participant-email {
@@ -2504,4 +2604,151 @@ select {
 .generic-sign-in-button:not(:disabled):active {
   background: rgba(10, 132, 255, 0.40);
   transform: scale(0.98);
+}
+
+/* ── Participant join/leave toast notifications ─────────────────────── */
+
+.peer-toasts {
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1100;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+    max-width: 360px;
+    width: calc(100% - 32px);
+}
+
+.peer-toast {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: rgba(30, 30, 30, 0.88);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    padding: 10px 16px;
+    color: rgba(255, 255, 255, 0.92);
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.3;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4),
+        0 0 0 1px rgba(255, 255, 255, 0.05);
+    animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+        toast-exit 0.4s ease-in 7.5s forwards;
+}
+
+.peer-toast .toast-icon {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.peer-toast.toast-joined .toast-icon {
+    background: rgba(52, 199, 89, 0.15);
+}
+
+.peer-toast.toast-joined .toast-icon svg {
+    color: #34c759;
+}
+
+.peer-toast.toast-left .toast-icon {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.peer-toast.toast-left .toast-icon svg {
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.peer-toast .toast-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.peer-toast .toast-name {
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.95);
+}
+
+.peer-toast.toast-joined .toast-action {
+    color: rgba(52, 199, 89, 0.9);
+    font-weight: 500;
+}
+
+.peer-toast.toast-left .toast-action {
+    color: rgba(255, 255, 255, 0.5);
+    font-weight: 400;
+}
+
+@keyframes toast-enter {
+    from {
+        opacity: 0;
+        transform: translateY(-12px) scale(0.96);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+@keyframes toast-exit {
+    from {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+    to {
+        opacity: 0;
+        transform: translateY(-8px) scale(0.98);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .peer-toast {
+        animation: toast-enter-reduced 0.15s ease-out,
+            toast-exit-reduced 0.2s ease-in 7.5s forwards;
+    }
+
+    @keyframes toast-enter-reduced {
+        from { opacity: 0; }
+        to   { opacity: 1; }
+    }
+
+    @keyframes toast-exit-reduced {
+        from { opacity: 1; }
+        to   { opacity: 0; }
+    }
+}
+
+/* Mobile: slightly smaller padding */
+@media (max-width: 639px) {
+    .peer-toasts {
+        top: 8px;
+        max-width: 300px;
+    }
+
+    .peer-toast {
+        padding: 8px 12px;
+        font-size: 12px;
+        border-radius: 10px;
+    }
+
+    .peer-toast .toast-icon {
+        width: 24px;
+        height: 24px;
+        border-radius: 6px;
+    }
+
+    .peer-toast .toast-icon svg {
+        width: 14px;
+        height: 14px;
+    }
 }

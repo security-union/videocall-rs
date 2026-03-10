@@ -31,7 +31,7 @@
 //! );
 //!
 //! let profile = client.get_profile().await?;
-//! println!("Logged in as: {}", profile.email);
+//! println!("Logged in as: {}", profile.user_id);
 //! # Ok(())
 //! # }
 //! ```

@@ -12,13 +12,28 @@ message MeetingPacket {
     PARTICIPANT_JOINED = 3;
     // Participant left the meeting
     PARTICIPANT_LEFT = 4;
+    // Host joined, meeting now active
+    MEETING_ACTIVATED = 5;
+    // Admitted from waiting room
+    PARTICIPANT_ADMITTED = 6;
+    // Rejected from waiting room
+    PARTICIPANT_REJECTED = 7;
+    // Waiting room list changed
+    WAITING_ROOM_UPDATED = 8;
   }
 
   MeetingEventType event_type = 1;
   string room_id = 2;
   uint64 start_time_ms = 3;
   string message = 4;
-  string creator_id = 5;
+  bytes creator_id = 5;
   int64 participant_count = 6;
+  // For ADMITTED/REJECTED: affected user's ID
+  bytes target_user_id = 7;
+  // For ADMITTED: JWT to upgrade connection
+  string room_token = 8;
+  uint64 session_id = 9;
+  // Display name of the participant (for PARTICIPANT_JOINED/LEFT events)
+  bytes display_name = 10;
 }
 

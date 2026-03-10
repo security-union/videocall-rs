@@ -46,6 +46,24 @@ async fn main() {
 
     tracing::info!("Connected to PostgreSQL");
 
+    // Connect to NATS if configured. The server works without NATS (graceful degradation).
+    let nats = match &config.nats_url {
+        Some(url) => match async_nats::connect(url).await {
+            Ok(client) => {
+                tracing::info!("Connected to NATS at {url}");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to NATS at {url}: {e}. Continuing without NATS.");
+                None
+            }
+        },
+        None => {
+            tracing::info!("NATS_URL not set — meeting event push notifications disabled");
+            None
+        }
+    };
+
     // CORS: In production set `CORS_ALLOWED_ORIGIN` to the exact frontend
     // origin (e.g. "https://app.videocall.rs").  Comma-separate for multiple
     // origins. When unset, the server mirrors the request origin which is
@@ -83,7 +101,7 @@ async fn main() {
         ])
         .allow_credentials(true);
 
-    let state = AppState::new(pool, &config);
+    let state = AppState::new(pool, &config, nats);
     let app = routes::router().layer(cors).with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)

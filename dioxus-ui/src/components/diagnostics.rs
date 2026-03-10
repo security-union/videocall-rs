@@ -561,9 +561,8 @@ pub fn Diagnostics(
                             match m.name {
                                 "stats_json" => {
                                     if let MetricValue::Text(json) = &m.value {
-                                        let entry = neteq_stats
-                                            .entry(target_peer.to_string())
-                                            .or_default();
+                                        let entry =
+                                            neteq_stats.entry(target_peer.to_string()).or_default();
                                         entry.push(json.clone());
                                         if entry.len() > 60 {
                                             entry.remove(0);
@@ -629,7 +628,7 @@ pub fn Diagnostics(
     let client = use_context::<VideoCallClient>();
     let peer_display_name = move |session_id: &str| -> String {
         client
-            .get_peer_email(session_id)
+            .get_peer_user_id(session_id)
             .unwrap_or_else(|| session_id.to_string())
     };
 

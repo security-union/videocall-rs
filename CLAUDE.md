@@ -88,7 +88,7 @@ Always delegate work to the specialized roster agents instead of making changes 
 - **backend-rust-streaming** — All backend/API changes (Axum routes, DB queries, server logic)
 - **code-reviewer** — Review all code changes before committing
 - **performance-reviewer** — Performance review for low-power devices and low-bandwidth networks. Audit payload sizes, unnecessary re-renders, uncompressed assets, polling intervals, missing pagination, protobuf message sizes, bundle sizes, memory leaks, and any patterns that degrade on constrained hardware or slow connections. Should be run after substantive code changes alongside code-reviewer.
-- **web-security-auditor** — Review code touching auth, user input, API endpoints
+- **web-security-auditor** — Full-scope application security: backend auth/authz, API endpoints, input validation, XSS/injection, CSRF, UI trust indicators (e.g. host badges, role icons, permission displays), identity comparison logic, token handling, phishing vectors, architectural security review. Must audit both server-side AND client-side code — rendering code that conveys trust or authority is security-critical.
 - **database-reviewer** — Review schema, migration, and query changes
 - **integration-test-writer** — Write integration tests for new or changed features
 - **deploy-sync-expert** — Update Docker/K8s configs when services or dependencies change
@@ -102,3 +102,13 @@ Run agents in parallel when tasks are independent. Always run `code-reviewer` af
 ## Source Code Rules
 
 - **No symlinks or hardlinks for source files.** Each crate/UI must own its files independently. Do not use symlinks between `dioxus-ui/` and `yew-ui/` static assets or any other source directories. If both UIs need shared CSS, copy the shared base and maintain framework-specific additions separately.
+
+## Linter & Formatter Rules
+
+**All code changes MUST pass project linters before being considered complete.** Agents must run the appropriate linter/formatter after editing any file:
+
+- **Rust code:** Run `cargo fmt` on changed crates. Run `cargo clippy` to catch warnings and fix them.
+- **TypeScript / JS (e2e/):** Run `cd e2e && npx prettier --write <files> && npx eslint <files> && npx tsc --noEmit` to match the CI `ci:lint` check.
+- **General:** No unused imports, no unused variables, follow existing code style. Respect all project lint configs (`.eslintrc`, `rustfmt.toml`, `.prettierrc`, etc.).
+
+This is mandatory for every agent making code changes — not optional. CI will reject PRs that fail linting.

@@ -18,42 +18,100 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::UsernameCtx;
+use crate::context::{DisplayNameCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
+use futures::future::{AbortHandle, Abortable};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 
 #[component]
 pub fn PeerList(
     peers: Vec<String>,
     onclose: EventHandler<MouseEvent>,
+    #[props(default = true)] self_muted: bool,
+    #[props(default = false)] self_speaking: bool,
     show_meeting_info: bool,
     room_id: String,
     num_participants: usize,
     is_active: bool,
     on_toggle_meeting_info: EventHandler<()>,
     #[props(default)] host_display_name: Option<String>,
+    #[props(default)] host_user_id: Option<String>,
 ) -> Element {
     let mut search_query = use_signal(String::new);
     let mut show_context_menu = use_signal(|| false);
 
+    // Track peer audio and speaking states from diagnostics
+    let mut peer_audio_states = use_signal(HashMap::<String, bool>::new);
+    let mut peer_speaking_states = use_signal(HashMap::<String, bool>::new);
+
+    // Subscribe to diagnostics for peer_status and peer_speaking updates
+    let _client = use_context::<VideoCallClientCtx>();
+    let prev_abort_handle = use_hook(|| Rc::new(RefCell::new(None::<AbortHandle>)));
+    use_effect(move || {
+        if let Some(h) = prev_abort_handle.borrow_mut().take() {
+            h.abort();
+        }
+        let (abort_handle, abort_reg) = AbortHandle::new_pair();
+        *prev_abort_handle.borrow_mut() = Some(abort_handle);
+
+        let fut = async move {
+            let mut rx = subscribe();
+            while let Ok(evt) = rx.recv().await {
+                handle_peer_list_diagnostics(
+                    &evt,
+                    &mut peer_audio_states,
+                    &mut peer_speaking_states,
+                );
+            }
+        };
+        let abortable = Abortable::new(fut, abort_reg);
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = abortable.await;
+        });
+    });
+
+    // Get client from context to convert session_id to user_id for display
+    let client_ctx = use_context::<VideoCallClientCtx>();
+    let audio_states = peer_audio_states();
+    let speaking_states = peer_speaking_states();
+
+    // Build reverse lookup (user_id -> session_id) once, to avoid O(N^2) scanning inside the loop.
+    let user_id_to_sid: HashMap<String, String> = client_ctx
+        .sorted_peer_keys()
+        .into_iter()
+        .filter_map(|sid| client_ctx.get_peer_user_id(&sid).map(|uid| (uid, sid)))
+        .collect();
+
     let filtered_peers: Vec<String> = peers
         .iter()
-        .filter(|peer| peer.to_lowercase().contains(&search_query().to_lowercase()))
+        .filter(|peer| {
+            let peer_display_name = user_id_to_sid
+                .get(peer.as_str())
+                .and_then(|sid| client_ctx.get_peer_display_name(sid))
+                .unwrap_or_else(|| peer.to_string());
+            let query = search_query().to_lowercase();
+            peer.to_lowercase().contains(&query)
+                || peer_display_name.to_lowercase().contains(&query)
+        })
         .cloned()
         .collect();
 
     // Get username from context and append (You)
-    let username_ctx = use_context::<UsernameCtx>();
-    let current_user_name: Option<String> = (username_ctx.0)().clone();
+    let display_name_ctx = use_context::<DisplayNameCtx>();
+    let current_user_name: Option<String> = (display_name_ctx.0)().clone();
 
-    let display_name = current_user_name
-        .clone()
-        .map(|name| format!("{name} (You)"))
-        .unwrap_or_else(|| "(You)".to_string());
+    let display_name = current_user_name.clone().unwrap_or_default();
 
-    // Check if current user is host
-    let is_current_user_host = host_display_name
+    // Check if current user is host by comparing authenticated user_ids
+    // (not display names, which are user-chosen and spoofable).
+    // We need the current user's user_id from the client context.
+    let current_user_id_val = client_ctx.user_id().clone();
+    let is_current_user_host = host_user_id
         .as_ref()
-        .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
+        .map(|h| h == &current_user_id_val)
         .unwrap_or(false);
 
     rsx! {
@@ -144,14 +202,39 @@ pub fn PeerList(
                     div { class: "peer-list",
                         ul {
                             // show self as the first item with actual username
-                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host } }
+                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_self: true, muted: self_muted, speaking: self_speaking } }
 
                             for peer in filtered_peers.iter() {
-                                li {
-                                    key: "{peer}",
-                                    PeerListItem {
-                                        name: peer.clone(),
-                                        is_host: host_display_name.as_ref().map(|h| h == peer).unwrap_or(false),
+                                {
+                                    // peer is the display user_id; we need the session_id to look up states.
+                                    // Use the pre-built reverse map for O(1) lookup instead of scanning all peers.
+                                    let peer_session_id = user_id_to_sid.get(peer.as_str());
+                                    let peer_display_name = peer_session_id
+                                        .and_then(|sid| client_ctx.get_peer_display_name(sid))
+                                        .unwrap_or_else(|| peer.clone());
+                                    // Compare using authenticated user_id, not display name
+                                    let is_peer_host = host_user_id
+                                        .as_ref()
+                                        .map(|h| h == peer)
+                                        .unwrap_or(false);
+                                    let muted = peer_session_id
+                                        .and_then(|sid| audio_states.get(sid).copied())
+                                        .map(|enabled| !enabled)
+                                        .unwrap_or(true);
+                                    let speaking = peer_session_id
+                                        .and_then(|sid| speaking_states.get(sid).copied())
+                                        .unwrap_or(false);
+                                    rsx! {
+                                        li {
+                                            key: "{peer}",
+                                            PeerListItem {
+                                                name: peer_display_name,
+                                                tooltip: peer.clone(),
+                                                is_host: is_peer_host,
+                                                muted: muted,
+                                                speaking: speaking,
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -160,5 +243,68 @@ pub fn PeerList(
                 }
             }
         }
+    }
+}
+
+fn handle_peer_list_diagnostics(
+    evt: &DiagEvent,
+    peer_audio_states: &mut Signal<HashMap<String, bool>>,
+    peer_speaking_states: &mut Signal<HashMap<String, bool>>,
+) {
+    match evt.subsystem {
+        "peer_status" => {
+            let mut to_peer: Option<String> = None;
+            let mut audio_enabled: Option<bool> = None;
+            let mut is_speaking: Option<bool> = None;
+            for m in &evt.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("audio_enabled", MetricValue::U64(v)) => audio_enabled = Some(*v != 0),
+                    ("is_speaking", MetricValue::U64(v)) => is_speaking = Some(*v != 0),
+                    _ => {}
+                }
+            }
+            if let Some(peer) = to_peer {
+                if let Some(audio) = audio_enabled {
+                    let current = match peer_audio_states.try_peek() {
+                        Ok(map) => map.get(&peer).copied(),
+                        Err(_) => return,
+                    };
+                    if current != Some(audio) {
+                        peer_audio_states.write().insert(peer.clone(), audio);
+                    }
+                }
+                if let Some(speaking) = is_speaking {
+                    let current = match peer_speaking_states.try_peek() {
+                        Ok(map) => map.get(&peer).copied(),
+                        Err(_) => return,
+                    };
+                    if current != Some(speaking) {
+                        peer_speaking_states.write().insert(peer, speaking);
+                    }
+                }
+            }
+        }
+        "peer_speaking" => {
+            let mut to_peer: Option<String> = None;
+            let mut speaking: Option<bool> = None;
+            for m in &evt.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                    _ => {}
+                }
+            }
+            if let (Some(peer), Some(speaking_val)) = (to_peer, speaking) {
+                let current = match peer_speaking_states.try_peek() {
+                    Ok(map) => map.get(&peer).copied(),
+                    Err(_) => return,
+                };
+                if current != Some(speaking_val) {
+                    peer_speaking_states.write().insert(peer, speaking_val);
+                }
+            }
+        }
+        _ => {}
     }
 }

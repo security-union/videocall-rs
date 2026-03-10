@@ -17,7 +17,7 @@ enum FetchMeetingsError {
 #[component]
 pub fn MeetingsList(
     on_select_meeting: Option<EventHandler<String>>,
-    user_email: Option<String>,
+    user_id: Option<String>,
 ) -> Element {
     let mut meetings = use_signal(Vec::<MeetingSummary>::new);
     let mut loading = use_signal(|| true);

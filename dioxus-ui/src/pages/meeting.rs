@@ -13,13 +13,17 @@
 
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
-use crate::constants::{e2ee_enabled, oauth_enabled, webtransport_enabled};
+use crate::constants::{
+    actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled, webtransport_host_base,
+};
 use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
+    get_or_create_local_user_id, load_display_name_from_storage, save_display_name_to_storage,
+    validate_display_name, DisplayNameCtx,
 };
 use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
-use gloo_timers::future::TimeoutFuture;
+use videocall_client::Callback as VcCallback;
+use videocall_client::{VideoCallClient, VideoCallClientOptions};
 use web_sys::window;
 
 use crate::auth::{check_session, get_user_profile, logout, UserProfile};
@@ -30,11 +34,16 @@ use crate::routing::Route;
 pub enum MeetingStatus {
     NotJoined,
     Joining,
-    WaitingForMeeting,
-    Waiting,
+    WaitingForMeeting {
+        observer_token: String,
+    },
+    Waiting {
+        observer_token: String,
+    },
     Admitted {
         is_host: bool,
         host_display_name: Option<String>,
+        host_user_id: Option<String>,
         room_token: String,
         waiting_room_enabled: bool,
     },
@@ -44,21 +53,27 @@ pub enum MeetingStatus {
 
 #[component]
 pub fn MeetingPage(id: String) -> Element {
-    let mut username_ctx = use_context::<UsernameCtx>();
+    let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut auth_checked = use_signal(|| false);
     let navigator = use_navigator();
     let mut user_profile = use_signal(|| None::<UserProfile>);
-    let mut show_dropdown = use_signal(|| false);
     let mut meeting_status = use_signal(|| MeetingStatus::NotJoined);
     let mut host_display_name = use_signal(|| None::<String>);
-    let mut current_user_email = use_signal(|| None::<String>);
+    let mut host_user_id = use_signal(|| None::<String>);
+    let mut current_user_id = use_signal(|| None::<String>);
     let mut came_from_waiting_room = use_signal(|| false);
-    let mut error_state = use_signal(|| None::<String>);
 
-    let initial_username: String = if let Some(name) = (username_ctx.0)() {
+    // Separate signal that tracks only the observer token for the WaitingForMeeting
+    // state. The observer `use_effect` subscribes to THIS signal instead of
+    // `meeting_status`, breaking the circular dependency that caused a
+    // `RefCell already borrowed` panic in dioxus-core when `on_meeting_activated`
+    // set `meeting_status` and the effect tried to re-run synchronously.
+    let mut observer_token_signal = use_signal(|| None::<String>);
+
+    let initial_username: String = if let Some(name) = (display_name_ctx.0)() {
         name
     } else {
-        load_username_from_storage().unwrap_or_default()
+        load_display_name_from_storage().unwrap_or_default()
     };
     let mut input_value_state = use_signal(|| initial_username);
 
@@ -77,7 +92,10 @@ pub fn MeetingPage(id: String) -> Element {
                                 // so we cannot rely on ?returnTo= surviving in the URL.
                                 match win.session_storage() {
                                     Ok(Some(storage)) => {
-                                        if storage.set_item("vc_oauth_return_to", &current_url).is_err() {
+                                        if storage
+                                            .set_item("vc_oauth_return_to", &current_url)
+                                            .is_err()
+                                        {
                                             log::warn!("Failed to write vc_oauth_return_to to sessionStorage — post-login redirect will fall back to app root");
                                         }
                                     }
@@ -108,66 +126,164 @@ pub fn MeetingPage(id: String) -> Element {
         }
     });
 
-    // Poll for meeting activation when WaitingForMeeting.
-    // Reading `meeting_status()` inside the closure lets Dioxus track the
-    // reactive dependency so the effect re-runs when the status changes.
-    // `spawn` returns a `Task` that Dioxus automatically cancels on re-run.
+    // When WaitingForMeeting, create an observer WebSocket client that receives
+    // a push notification when the host activates the meeting, replacing the
+    // old 2-second polling loop.
+    //
+    // IMPORTANT: This effect subscribes to `observer_token_signal` (NOT
+    // `meeting_status`) to avoid a circular reactive dependency. The
+    // `on_meeting_activated` callback sets `meeting_status` to Admitted (or
+    // another variant) and clears `observer_token_signal` to None. Because the
+    // effect only watches `observer_token_signal`, writing to `meeting_status`
+    // does not cause re-entrant execution of this effect.
+    let mut observer_client = use_signal(|| None::<VideoCallClient>);
     {
         let meeting_id = id.clone();
         use_effect(move || {
-            let status = meeting_status();
-            if status != MeetingStatus::WaitingForMeeting {
-                return;
-            }
+            let observer_token = match observer_token_signal() {
+                Some(t) if !t.is_empty() => t,
+                _ => {
+                    // Clean up observer client when leaving WaitingForMeeting
+                    if let Some(client) = observer_client.write().take() {
+                        let _ = client.disconnect();
+                    }
+                    return;
+                }
+            };
+
             let meeting_id = meeting_id.clone();
             let display_name = input_value_state();
 
-            spawn(async move {
-                loop {
-                    match join_meeting(&meeting_id, Some(&display_name)).await {
-                        Ok(response) => {
-                            current_user_email.set(Some(response.email.clone()));
-                            let determined_host = response.host_display_name.clone();
-                            let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
-                            host_display_name.set(determined_host.clone());
-                            match response.status.as_str() {
-                                "admitted" => {
-                                    if let Some(token) = response.room_token {
-                                        meeting_status.set(MeetingStatus::Admitted {
-                                            is_host: response.is_host,
-                                            host_display_name: determined_host,
-                                            room_token: token,
-                                            waiting_room_enabled: wr_enabled,
-                                        });
+            // Build observer lobby URLs using the observer token
+            let lobby_url = |base: &str| format!("{base}/lobby?token={observer_token}");
+            let websocket_urls: Vec<String> = actix_websocket_base()
+                .unwrap_or_default()
+                .split(',')
+                .map(&lobby_url)
+                .collect();
+            let webtransport_urls: Vec<String> = webtransport_host_base()
+                .unwrap_or_default()
+                .split(',')
+                .map(&lobby_url)
+                .collect();
+
+            // Use the user's ID so the server can match
+            // push-notification `target_user_id` to this observer client.
+            let user_id_for_client = current_user_id().unwrap_or_else(|| display_name.clone());
+
+            let opts = VideoCallClientOptions {
+                user_id: user_id_for_client,
+                meeting_id: meeting_id.clone(),
+                websocket_urls,
+                webtransport_urls,
+                enable_e2ee: false,
+                enable_webtransport: webtransport_enabled().unwrap_or(false),
+                on_connected: VcCallback::from(move |_| {
+                    log::info!("Observer connection established (waiting for meeting)");
+                }),
+                on_connection_lost: VcCallback::from(move |_| {
+                    log::warn!("Observer connection lost (waiting for meeting)");
+                }),
+                on_peer_added: VcCallback::noop(),
+                on_peer_first_frame: VcCallback::noop(),
+                on_peer_removed: None,
+                get_peer_video_canvas_id: VcCallback::from(|id| id),
+                get_peer_screen_canvas_id: VcCallback::from(|id| id),
+                enable_diagnostics: false,
+                diagnostics_update_interval_ms: None,
+                enable_health_reporting: false,
+                health_reporting_interval_ms: None,
+                on_encoder_settings_update: None,
+                rtt_testing_period_ms: 3000,
+                rtt_probe_interval_ms: None,
+                on_meeting_info: None,
+                on_meeting_ended: None,
+                on_meeting_activated: Some(VcCallback::from({
+                    let meeting_id = meeting_id.clone();
+                    move |_| {
+                        log::info!("Meeting activated push received, re-joining...");
+                        let meeting_id = meeting_id.clone();
+                        let display_name = display_name.clone();
+                        // Use spawn_local instead of dioxus::spawn because
+                        // this callback fires from a WebSocket message
+                        // handler (Inner::on_inbound_media) which runs
+                        // outside any Dioxus runtime context. Calling
+                        // dioxus::spawn() here would panic.
+                        wasm_bindgen_futures::spawn_local(async move {
+                            // Clear the observer token FIRST so the observer
+                            // effect tears down the client without re-entering.
+                            observer_token_signal.set(None);
+
+                            match join_meeting(&meeting_id, Some(&display_name)).await {
+                                Ok(response) => {
+                                    let effective_user_id = if response.user_id.is_empty() {
+                                        get_or_create_local_user_id()
                                     } else {
-                                        meeting_status.set(MeetingStatus::Error(
-                                            "Admitted but no room token".to_string(),
-                                        ));
+                                        response.user_id.clone()
+                                    };
+                                    current_user_id.set(Some(effective_user_id));
+                                    let determined_host = response.host_display_name.clone();
+                                    let determined_host_uid = response.host_user_id.clone();
+                                    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
+                                    host_display_name.set(determined_host.clone());
+                                    host_user_id.set(determined_host_uid.clone());
+                                    match response.status.as_str() {
+                                        "admitted" => {
+                                            if let Some(token) = response.room_token {
+                                                meeting_status.set(MeetingStatus::Admitted {
+                                                    is_host: response.is_host,
+                                                    host_display_name: determined_host,
+                                                    host_user_id: determined_host_uid,
+                                                    room_token: token,
+                                                    waiting_room_enabled: wr_enabled,
+                                                });
+                                            } else {
+                                                meeting_status.set(MeetingStatus::Error(
+                                                    "Admitted but no room token".to_string(),
+                                                ));
+                                            }
+                                        }
+                                        "waiting" => {
+                                            let obs_token =
+                                                response.observer_token.unwrap_or_default();
+                                            came_from_waiting_room.set(true);
+                                            // Also set observer_token_signal for
+                                            // the Waiting state (observer stays alive).
+                                            observer_token_signal.set(Some(obs_token.clone()));
+                                            meeting_status.set(MeetingStatus::Waiting {
+                                                observer_token: obs_token,
+                                            });
+                                        }
+                                        "rejected" => {
+                                            meeting_status.set(MeetingStatus::Rejected);
+                                        }
+                                        _ => meeting_status.set(MeetingStatus::Error(format!(
+                                            "Unknown status: {}",
+                                            response.status
+                                        ))),
                                     }
                                 }
-                                "waiting" => {
-                                    came_from_waiting_room.set(true);
-                                    meeting_status.set(MeetingStatus::Waiting);
+                                Err(e) => {
+                                    meeting_status.set(MeetingStatus::Error(e.to_string()));
                                 }
-                                "rejected" => {
-                                    meeting_status.set(MeetingStatus::Rejected);
-                                }
-                                _ => meeting_status.set(MeetingStatus::Error(format!(
-                                    "Unknown status: {}",
-                                    response.status
-                                ))),
                             }
-                            break;
-                        }
-                        Err(JoinError::MeetingNotActive) => {}
-                        Err(e) => {
-                            meeting_status.set(MeetingStatus::Error(e.to_string()));
-                            break;
-                        }
+                        });
                     }
-                    TimeoutFuture::new(2_000).await;
-                }
-            });
+                })),
+                on_participant_admitted: None,
+                on_participant_rejected: None,
+                on_waiting_room_updated: None,
+                on_speaking_changed: None,
+                vad_threshold: None,
+                on_peer_left: None,
+                on_peer_joined: None,
+            };
+
+            let mut client = VideoCallClient::new(opts);
+            if let Err(e) = client.connect() {
+                log::error!("Failed to connect observer client: {e}");
+            }
+            observer_client.set(Some(client));
         });
     }
 
@@ -200,20 +316,41 @@ pub fn MeetingPage(id: String) -> Element {
             wasm_bindgen_futures::spawn_local(async move {
                 match join_meeting(&meeting_id, Some(&display_name)).await {
                     Ok(response) => {
-                        current_user_email.set(Some(response.email.clone()));
+                        // Use the API-provided user_id when available;
+                        // fall back to a locally-generated stable UUID
+                        // so non-OAuth users still get a persistent identity.
+                        let effective_user_id = if response.user_id.is_empty() {
+                            get_or_create_local_user_id()
+                        } else {
+                            response.user_id.clone()
+                        };
+                        current_user_id.set(Some(effective_user_id.clone()));
                         let determined_host = if response.is_host {
                             Some(display_name.clone())
                         } else {
                             response.host_display_name.clone()
                         };
+                        // Use the API-provided host_user_id; if the current user
+                        // is the host and the API didn't include it, fall back to
+                        // the effective_user_id we just computed.
+                        let determined_host_uid = response.host_user_id.clone().or_else(|| {
+                            if response.is_host {
+                                Some(effective_user_id.clone())
+                            } else {
+                                None
+                            }
+                        });
                         let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                         host_display_name.set(determined_host.clone());
+                        host_user_id.set(determined_host_uid.clone());
                         match response.status.as_str() {
                             "admitted" => {
+                                observer_token_signal.set(None);
                                 if let Some(token) = response.room_token {
                                     meeting_status.set(MeetingStatus::Admitted {
                                         is_host: response.is_host,
                                         host_display_name: determined_host,
+                                        host_user_id: determined_host_uid,
                                         room_token: token,
                                         waiting_room_enabled: wr_enabled,
                                     });
@@ -223,21 +360,45 @@ pub fn MeetingPage(id: String) -> Element {
                                     ));
                                 }
                             }
-                            "waiting" => {
-                                came_from_waiting_room.set(true);
-                                meeting_status.set(MeetingStatus::Waiting);
+                            "waiting_for_meeting" => {
+                                let obs_token = response.observer_token.unwrap_or_default();
+                                observer_token_signal.set(Some(obs_token.clone()));
+                                meeting_status.set(MeetingStatus::WaitingForMeeting {
+                                    observer_token: obs_token,
+                                });
                             }
-                            "rejected" => meeting_status.set(MeetingStatus::Rejected),
-                            _ => meeting_status.set(MeetingStatus::Error(format!(
-                                "Unknown status: {}",
-                                response.status
-                            ))),
+                            "waiting" => {
+                                let obs_token = response.observer_token.unwrap_or_default();
+                                observer_token_signal.set(Some(obs_token.clone()));
+                                came_from_waiting_room.set(true);
+                                meeting_status.set(MeetingStatus::Waiting {
+                                    observer_token: obs_token,
+                                });
+                            }
+                            "rejected" => {
+                                observer_token_signal.set(None);
+                                meeting_status.set(MeetingStatus::Rejected);
+                            }
+                            _ => {
+                                observer_token_signal.set(None);
+                                meeting_status.set(MeetingStatus::Error(format!(
+                                    "Unknown status: {}",
+                                    response.status
+                                )));
+                            }
                         }
                     }
                     Err(JoinError::MeetingNotActive) => {
-                        meeting_status.set(MeetingStatus::WaitingForMeeting)
+                        // Fallback for older server versions that still return 400
+                        observer_token_signal.set(Some(String::new()));
+                        meeting_status.set(MeetingStatus::WaitingForMeeting {
+                            observer_token: String::new(),
+                        });
                     }
-                    Err(e) => meeting_status.set(MeetingStatus::Error(e.to_string())),
+                    Err(e) => {
+                        observer_token_signal.set(None);
+                        meeting_status.set(MeetingStatus::Error(e.to_string()));
+                    }
                 }
             });
         }
@@ -247,12 +408,16 @@ pub fn MeetingPage(id: String) -> Element {
     let on_admitted = {
         move |status: JoinMeetingResponse| {
             let determined_host = status.host_display_name.clone();
+            let determined_host_uid = status.host_user_id.clone();
             let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
+            host_user_id.set(determined_host_uid.clone());
+            observer_token_signal.set(None);
             meeting_status.set(MeetingStatus::Admitted {
                 is_host: false,
                 host_display_name: determined_host,
+                host_user_id: determined_host_uid,
                 room_token: token,
                 waiting_room_enabled: wr_enabled,
             });
@@ -260,6 +425,7 @@ pub fn MeetingPage(id: String) -> Element {
     };
 
     let on_rejected = move |_| {
+        observer_token_signal.set(None);
         meeting_status.set(MeetingStatus::Rejected);
     };
 
@@ -276,55 +442,42 @@ pub fn MeetingPage(id: String) -> Element {
         }
     };
 
-    // Submit handler
-    let on_submit = {
+    // Auto-join: when the username is already set and the meeting status is
+    // NotJoined, trigger the join flow automatically so the user does not
+    // have to interact with a redundant form.
+    {
         let mut on_join = on_join_meeting.clone();
-        move |e: FormEvent| {
-            e.prevent_default();
-            let value = input_value_state();
-            if is_valid_username(&value) {
-                save_username_to_storage(&value);
-
-                if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-                    if let Ok(Some(flag)) = storage.get_item("vc_username_reset") {
-                        if flag == "1" {
-                            let _ = storage.remove_item("vc_username_reset");
-                            if let Some(win) = window() {
-                                let _ = win.location().reload();
-                            }
-                            return;
-                        }
-                    }
-                }
-
-                (username_ctx.0).set(Some(value));
-                error_state.set(None);
+        let mut auto_join_attempted = use_signal(|| false);
+        use_effect(move || {
+            let has_username = (display_name_ctx.0)().is_some();
+            let is_not_joined = matches!(meeting_status(), MeetingStatus::NotJoined);
+            if has_username && is_not_joined && !auto_join_attempted() {
+                auto_join_attempted.set(true);
                 on_join();
-            } else {
-                error_state.set(Some(
-                    "Please enter a valid username (letters, numbers, underscore).".to_string(),
-                ));
             }
-        }
-    };
+        });
+    }
 
-    let maybe_username = (username_ctx.0)();
+    let maybe_username = (display_name_ctx.0)();
     let current_meeting_status = meeting_status();
     let should_auto_join = came_from_waiting_room();
 
     rsx! {
         match (&maybe_username, &current_meeting_status) {
             // User is admitted - show the meeting
-            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, room_token, waiting_room_enabled }) => rsx! {
+            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled }) => rsx! {
                 AttendantsComponent {
-                    email: username.clone(),
+                    display_name: username.clone(),
                     id: id.clone(),
                     webtransport_enabled: webtransport_enabled().unwrap_or(false),
                     e2ee_enabled: e2ee_enabled().unwrap_or(false),
                     user_name: user_profile().as_ref().map(|p| p.name.clone()),
-                    user_email: current_user_email().or_else(|| user_profile().as_ref().map(|p| p.email.clone())),
+                    user_id: current_user_id()
+                        .or_else(|| user_profile().as_ref().map(|p| p.user_id.clone()))
+                        .or_else(|| Some(get_or_create_local_user_id())),
                     on_logout: Some(EventHandler::new(on_logout)),
                     host_display_name: host_display_name.clone(),
+                    host_user_id: host_user_id.clone(),
                     auto_join: should_auto_join,
                     is_owner: *is_host,
                     room_token: room_token.clone(),
@@ -333,9 +486,12 @@ pub fn MeetingPage(id: String) -> Element {
             },
 
             // Waiting room
-            (Some(_), MeetingStatus::Waiting) => rsx! {
+            (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {
                 WaitingRoom {
                     meeting_id: id.clone(),
+                    user_id: current_user_id().unwrap_or_default(),
+                    display_name: input_value_state(),
+                    observer_token: observer_token.clone(),
                     on_admitted: on_admitted,
                     on_rejected: on_rejected,
                     on_cancel: on_cancel_waiting,
@@ -343,7 +499,7 @@ pub fn MeetingPage(id: String) -> Element {
             },
 
             // Waiting for host to start
-            (Some(_), MeetingStatus::WaitingForMeeting) => rsx! {
+            (Some(_), MeetingStatus::WaitingForMeeting { .. }) => rsx! {
                 div { class: "waiting-room-container",
                     div { class: "waiting-room-card card-apple",
                         div { class: "waiting-room-icon",
@@ -411,91 +567,86 @@ pub fn MeetingPage(id: String) -> Element {
             },
 
             // Joining in progress
-            (Some(_), MeetingStatus::Joining) => rsx! {
-                div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
-                    div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                    p { style: "color: white; font-size: 1rem;", "Joining meeting..." }
+            (Some(_), MeetingStatus::Joining) => {
+                let display_name = maybe_username.as_deref().unwrap_or("...");
+                rsx! {
+                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                        div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
+                        p { style: "color: white; font-size: 1rem;",
+                            "Joining as "
+                            strong { "{display_name}" }
+                            "..."
+                        }
+                    }
                 }
             },
 
-            // Username prompt (not joined or no username)
+            // No username set, or waiting for auto-join to fire
             _ => {
-                let mut on_join = on_join_meeting.clone();
-                rsx! {
-                    div { id: "username-prompt", class: "username-prompt-container relative",
-                        // User profile dropdown (OAuth)
-                        if oauth_enabled().unwrap_or(false) {
-                            if let Some(profile) = user_profile() {
-                                div { class: "fixed top-4 right-4 z-50",
-                                    button {
-                                        r#type: "button",
-                                        onclick: move |_| show_dropdown.set(!show_dropdown()),
-                                        class: "flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-white text-sm transition-colors",
-                                        span { "{profile.name}" }
-                                        svg { class: "w-4 h-4", fill: "none", stroke: "currentColor", view_box: "0 0 24 24",
-                                            path { stroke_linecap: "round", stroke_linejoin: "round", stroke_width: "2", d: "M19 9l-7 7-7-7" }
+                if maybe_username.is_none() {
+                    // Show inline display name prompt instead of redirecting
+                    rsx! {
+                        div {
+                            style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                            div {
+                                class: "card-apple p-8",
+                                style: "max-width: 400px; width: 90%;",
+                                h2 {
+                                    style: "color: white; text-align: center; margin-bottom: 0.5rem;",
+                                    "Enter your display name"
+                                }
+                                p {
+                                    style: "color: rgba(255,255,255,0.6); text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;",
+                                    "Choose a name to join the meeting"
+                                }
+                                form {
+                                    onsubmit: move |e| {
+                                        e.prevent_default();
+                                        let raw = input_value_state();
+                                        match validate_display_name(&raw) {
+                                            Ok(valid_name) => {
+                                                save_display_name_to_storage(&valid_name);
+                                                (display_name_ctx.0).set(Some(valid_name));
+                                            }
+                                            Err(msg) => {
+                                                if let Some(w) = web_sys::window() {
+                                                    let _ = w.alert_with_message(&msg);
+                                                }
+                                            }
                                         }
+                                    },
+                                    input {
+                                        class: "input-apple",
+                                        r#type: "text",
+                                        placeholder: "Enter your display name",
+                                        required: true,
+                                        autofocus: true,
+                                        value: "{input_value_state}",
+                                        oninput: move |e: Event<FormData>| {
+                                            input_value_state.set(e.value());
+                                        },
                                     }
-                                    if show_dropdown() {
-                                        div { class: "absolute right-0 mt-2 w-56 bg-white rounded-lg shadow-lg border border-gray-200 py-1",
-                                            div { class: "px-4 py-3 border-b border-gray-200",
-                                                p { class: "text-sm font-medium text-gray-900", "{profile.name}" }
-                                                p { class: "text-xs text-gray-500 truncate", "{profile.email}" }
-                                            }
-                                            button {
-                                                onclick: move |_| on_logout(()),
-                                                class: "w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors",
-                                                "Sign out"
-                                            }
-                                        }
+                                    button {
+                                        r#type: "submit",
+                                        class: "btn-apple btn-primary w-full",
+                                        style: "margin-top: 1rem;",
+                                        "Join Meeting"
                                     }
                                 }
                             }
                         }
-
-                        form {
-                            class: "username-form",
-                            onsubmit: on_submit,
-                            h1 { "Choose a display name" }
-                            input {
-                                class: "username-input",
-                                placeholder: "Your name",
-                                pattern: "^[a-zA-Z0-9_]*$",
-                                required: true,
-                                autofocus: true,
-                                oninput: move |e: Event<FormData>| {
-                                    input_value_state.set(e.value());
-                                },
-                                onkeydown: move |e: Event<KeyboardData>| {
-                                    if e.key() == Key::Enter {
-                                        let value = input_value_state();
-                                        if is_valid_username(&value) {
-                                            save_username_to_storage(&value);
-                                            if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-                                                if let Ok(Some(flag)) = storage.get_item("vc_username_reset") {
-                                                    if flag == "1" {
-                                                        let _ = storage.remove_item("vc_username_reset");
-                                                        if let Some(win) = window() { let _ = win.location().reload(); }
-                                                        e.prevent_default();
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            (username_ctx.0).set(Some(value));
-                                            error_state.set(None);
-                                            on_join();
-                                        } else {
-                                            error_state.set(Some("Please enter a valid username (letters, numbers, underscore).".to_string()));
-                                        }
-                                        e.prevent_default();
-                                    }
-                                },
-                                value: "{input_value_state}",
+                    }
+                } else {
+                    // Username is set; the auto-join effect will fire momentarily
+                    let display_name = maybe_username.as_deref().unwrap_or("Unknown");
+                    rsx! {
+                        div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                            div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
+                            p { style: "color: white; font-size: 1rem;",
+                                "Joining as "
+                                strong { "{display_name}" }
+                                "..."
                             }
-                            if let Some(err) = error_state() {
-                                p { class: "error", "{err}" }
-                            }
-                            button { class: "cta-button", r#type: "submit", "Continue" }
                         }
                     }
                 }

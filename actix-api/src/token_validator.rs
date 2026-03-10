@@ -38,7 +38,7 @@ pub enum TokenError {
         token_room: String,
         requested_room: String,
     },
-    /// The `sub` claim does not match the email/identity in the connection URL.
+    /// The `sub` claim does not match the user ID/identity in the connection URL.
     IdentityMismatch {
         token_identity: String,
         requested_identity: String,
@@ -118,7 +118,7 @@ impl TokenError {
 /// Decode and validate a JWT room access token, extracting claims.
 ///
 /// This is the primary validation function for the **token-based** connection
-/// endpoint (`GET /lobby?token=<JWT>`). The identity (email) and room are
+/// endpoint (`GET /lobby?token=<JWT>`). The identity (user_id) and room are
 /// extracted from the token claims themselves -- there are no URL path
 /// parameters to cross-check.
 ///
@@ -145,7 +145,11 @@ pub fn decode_room_token(secret: &str, token: &str) -> Result<RoomAccessTokenCla
 
     let claims = token_data.claims;
 
-    if !claims.room_join {
+    // Allow connection if the token grants room join permission OR is an
+    // observer token. Observers have `room_join: false` but `observer: true`
+    // as a defense-in-depth measure — they can connect to receive push
+    // notifications but cannot participate in the room media exchange.
+    if !claims.room_join && !claims.observer {
         return Err(TokenError::RoomJoinDenied);
     }
 
@@ -156,7 +160,7 @@ pub fn decode_room_token(secret: &str, token: &str) -> Result<RoomAccessTokenCla
 ///
 /// Validate a JWT room access token against expected room and identity.
 ///
-/// **DEPRECATED**: This function is used by the legacy `GET /lobby/{email}/{room}`
+/// **DEPRECATED**: This function is used by the legacy `GET /lobby/{user_id}/{room}`
 /// endpoint. Prefer [`decode_room_token`] for the new token-based endpoint where
 /// identity and room are extracted from the JWT claims directly.
 ///
@@ -208,6 +212,7 @@ mod tests {
             room_join,
             is_host: false,
             display_name: email.to_string(),
+            observer: false,
             exp: now + exp_offset_secs,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
         };
@@ -248,10 +253,36 @@ mod tests {
     }
 
     #[test]
-    fn decode_room_join_false_fails() {
+    fn decode_room_join_false_non_observer_fails() {
         let token = make_token("alice@test.com", "room-1", false, 600);
         let result = decode_room_token(TEST_SECRET, &token);
         assert!(matches!(result, Err(TokenError::RoomJoinDenied)));
+    }
+
+    #[test]
+    fn decode_observer_token_with_room_join_false_succeeds() {
+        let now = Utc::now().timestamp();
+        let claims = RoomAccessTokenClaims {
+            sub: "observer@test.com".to_string(),
+            room: "room-1".to_string(),
+            room_join: false,
+            is_host: false,
+            display_name: "Observer".to_string(),
+            observer: true,
+            exp: now + 600,
+            iss: RoomAccessTokenClaims::ISSUER.to_string(),
+        };
+        let token = jsonwebtoken::encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+        )
+        .unwrap();
+        let result = decode_room_token(TEST_SECRET, &token);
+        assert!(result.is_ok());
+        let decoded = result.unwrap();
+        assert!(decoded.observer);
+        assert!(!decoded.room_join);
     }
 
     #[test]

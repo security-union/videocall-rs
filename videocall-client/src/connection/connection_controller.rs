@@ -150,6 +150,13 @@ impl ConnectionController {
         inner.connection_manager.set_screen_enabled(enabled)
     }
 
+    /// Set speaking state on active connection
+    pub fn set_speaking(&self, speaking: bool) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner.connection_manager.set_speaking(speaking);
+        }
+    }
+
     /// Set own session_id for filtering self-packets
     pub fn set_own_session_id(&self, session_id: u64) -> Result<()> {
         let inner = self

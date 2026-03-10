@@ -37,7 +37,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 
-pub use crate::actors::session_logic::{Email, RoomId, SessionId};
+pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
 /// Heartbeat interval for WebTransport sessions
 const WT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -93,22 +93,27 @@ pub struct WtChatSession {
 }
 
 impl WtChatSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: Addr<ChatServer>,
         room: String,
-        email: String,
+        user_id: String,
+        display_name: String,
         outbound_tx: mpsc::Sender<WtOutbound>,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
+        observer: bool,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
             room,
-            email,
+            user_id,
+            display_name,
             nats_client,
             tracker_sender,
             session_manager,
+            observer,
         );
 
         WtChatSession {
@@ -188,13 +193,13 @@ impl Actor for WtChatSession {
         // Start session via SessionManager
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
-        let email = self.logic.email.clone();
+        let user_id = self.logic.user_id.clone();
         let session_id = self.logic.id;
 
         ctx.wait(
             async move {
                 session_manager
-                    .start_session(&room, &email, session_id)
+                    .start_session(&room, &user_id, session_id)
                     .await
             }
             .into_actor(self)

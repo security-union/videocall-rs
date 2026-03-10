@@ -84,7 +84,9 @@ impl MediaDeviceAccess {
                     granted.store(true, Ordering::Release);
                     on_granted.emit(());
                 }
-                Err(e) => on_denied.emit(e),
+                Err(e) => {
+                    on_denied.emit(e);
+                }
             }
         });
     }

@@ -60,8 +60,8 @@ pub struct JoinMeetingRequest {
 /// and `POST /api/v1/meetings/{meeting_id}/reject`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AdmitRequest {
-    /// Email of the participant to admit or reject.
-    pub email: String,
+    /// User ID of the participant to admit or reject.
+    pub user_id: String,
 }
 
 /// Query parameters for `GET /api/v1/meetings`.

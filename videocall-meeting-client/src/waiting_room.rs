@@ -45,11 +45,11 @@ impl MeetingApiClient {
     pub async fn admit_participant(
         &self,
         meeting_id: &str,
-        email: &str,
+        user_id: &str,
     ) -> Result<ParticipantStatusResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/admit");
         let body = AdmitRequest {
-            email: email.to_string(),
+            user_id: user_id.to_string(),
         };
         let response = self.post(&path).json(&body).send().await?;
         parse_api_response(response).await
@@ -70,11 +70,11 @@ impl MeetingApiClient {
     pub async fn reject_participant(
         &self,
         meeting_id: &str,
-        email: &str,
+        user_id: &str,
     ) -> Result<ParticipantStatusResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/reject");
         let body = AdmitRequest {
-            email: email.to_string(),
+            user_id: user_id.to_string(),
         };
         let response = self.post(&path).json(&body).send().await?;
         parse_api_response(response).await

@@ -105,7 +105,7 @@ pub struct ConnectionManager {
     rtt_reporter: Option<Interval>,
     rtt_probe_timer: Option<Interval>,
     election_timer: Option<Interval>,
-    rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
+    rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>,
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
     own_session_id: Rc<RefCell<Option<u64>>>,
@@ -299,7 +299,7 @@ impl ConnectionManager {
             }
 
             // Handle RTT responses internally
-            if packet.email == userid {
+            if packet.user_id[..] == *userid.as_bytes() {
                 let reception_time = js_sys::Date::now();
                 if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
@@ -330,6 +330,16 @@ impl ConnectionManager {
                         "Rejecting packet from same session_id: {}",
                         packet.session_id
                     );
+                    return;
+                }
+            }
+
+            // Only forward packets from the elected connection.
+            // During the election period (active_connection_id is None), all
+            // connections forward packets so that RTT probes work and the
+            // first SESSION_ASSIGNED can be processed.
+            if let Some(ref elected_id) = *active_connection_id.borrow() {
+                if *elected_id != connection_id {
                     return;
                 }
             }
@@ -410,7 +420,7 @@ impl ConnectionManager {
     fn create_rtt_packet(&self, timestamp: f64) -> Result<PacketWrapper> {
         let media_packet = MediaPacket {
             media_type: MediaType::RTT.into(),
-            email: self.options.userid.clone(),
+            user_id: self.options.userid.as_bytes().to_vec(),
             timestamp,
             ..Default::default()
         };
@@ -418,7 +428,7 @@ impl ConnectionManager {
         let data = self.aes.encrypt(&media_packet.write_to_bytes()?)?;
         Ok(PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
-            email: self.options.userid.clone(),
+            user_id: self.options.userid.as_bytes().to_vec(),
             data,
             ..Default::default()
         })
@@ -594,7 +604,7 @@ impl ConnectionManager {
         }
     }
 
-    /// Start 1Hz diagnostics reporting  
+    /// Start 1Hz diagnostics reporting
     fn start_diagnostics_reporting(&mut self) {
         // Note: Due to borrow checker constraints, diagnostics reporting
         // will be triggered externally through trigger_diagnostics_report()
@@ -876,6 +886,15 @@ impl ConnectionManager {
         }
 
         Err(anyhow!("No active connection available"))
+    }
+
+    /// Set speaking on active connection
+    pub fn set_speaking(&self, speaking: bool) {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            if let Some(connection) = self.connections.get(active_id) {
+                connection.set_speaking(speaking);
+            }
+        }
     }
 
     /// Set own session_id for filtering self-packets and stamp outgoing heartbeats

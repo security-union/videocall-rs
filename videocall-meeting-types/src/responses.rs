@@ -90,6 +90,9 @@ pub struct MeetingInfoResponse {
     pub host: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_display_name: Option<String>,
+    /// The host's user_id (i.e. `creator_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_user_id: Option<String>,
     pub has_password: bool,
     pub waiting_room_enabled: bool,
     pub participant_count: i64,
@@ -140,7 +143,7 @@ pub struct MeetingSummary {
 /// are not applicable for a given status are set to `null`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ParticipantStatusResponse {
-    pub email: String,
+    pub user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub status: String,
@@ -153,12 +156,20 @@ pub struct ParticipantStatusResponse {
     /// Signed JWT room access token. Present only when `status` is `"admitted"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room_token: Option<String>,
+    /// Signed JWT observer token. Present when `status` is `"waiting"` or
+    /// `"waiting_for_meeting"`, allowing the client to open a read-only
+    /// connection for push notifications without polling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observer_token: Option<String>,
     /// Meeting-level: whether the waiting room is enabled. Present in join/status responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_room_enabled: Option<bool>,
     /// Meeting-level: the host's display name. Present in join/status responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_display_name: Option<String>,
+    /// Meeting-level: the host's user_id (i.e. `creator_id`). Present in join/status responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_user_id: Option<String>,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}/waiting`.
@@ -184,6 +195,6 @@ pub struct DeleteMeetingResponse {
 /// Response payload for `GET /profile`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProfileResponse {
-    pub email: String,
+    pub user_id: String,
     pub name: String,
 }

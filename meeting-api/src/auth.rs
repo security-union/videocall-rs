@@ -19,8 +19,8 @@
 //! 2. `Authorization: Bearer <JWT>` -- for non-browser clients.
 //!
 //! The extractor validates the JWT signature using the shared secret from
-//! [`AppState`](crate::state::AppState) and extracts the user's email from
-//! the `sub` claim.
+//! [`AppState`](crate::state::AppState) and extracts the user's identity from
+//! the `sub` claim (the user ID).
 
 use axum::{
     extract::FromRequestParts,
@@ -37,11 +37,11 @@ use crate::token;
 ///
 /// Usage in a handler:
 /// ```ignore
-/// async fn my_handler(AuthUser { email, .. }: AuthUser) { ... }
+/// async fn my_handler(AuthUser { user_id, .. }: AuthUser) { ... }
 /// ```
 #[derive(Debug)]
 pub struct AuthUser {
-    pub email: String,
+    pub user_id: String,
     pub name: String,
 }
 
@@ -58,7 +58,7 @@ impl FromRequestParts<AppState> for AuthUser {
         let claims = token::decode_session_token(&state.jwt_secret, &token)?;
 
         Ok(AuthUser {
-            email: claims.sub,
+            user_id: claims.sub,
             name: claims.name,
         })
     }
@@ -133,6 +133,7 @@ mod tests {
             cookie_domain: None,
             cookie_name: name.to_string(),
             cookie_secure: false,
+            nats: None,
         }
     }
 
@@ -172,14 +173,14 @@ mod tests {
         let auth = extract_with_cookie(Some(&format!("session={jwt}")))
             .await
             .expect("should succeed");
-        assert_eq!(auth.email, "alice@test.com");
+        assert_eq!(auth.user_id, "alice@test.com");
     }
 
     #[tokio::test]
     async fn valid_bearer_token_returns_auth_user() {
         let jwt = generate_session_token(TEST_SECRET, "bob@test.com", "Bob", 3600).unwrap();
         let auth = extract_with_bearer(&jwt).await.expect("should succeed");
-        assert_eq!(auth.email, "bob@test.com");
+        assert_eq!(auth.user_id, "bob@test.com");
         assert_eq!(auth.name, "Bob");
     }
 
@@ -190,7 +191,7 @@ mod tests {
         let auth = extract_with_cookie(Some(&format!("session={jwt}")))
             .await
             .expect("should succeed");
-        assert_eq!(auth.email, "alice@test.com");
+        assert_eq!(auth.user_id, "alice@test.com");
         assert_eq!(auth.name, "Alice Wonder");
     }
 
@@ -271,7 +272,7 @@ mod tests {
         let auth = AuthUser::from_request_parts(&mut parts, &state)
             .await
             .expect("should succeed");
-        assert_eq!(auth.email, "cookie@test.com");
+        assert_eq!(auth.user_id, "cookie@test.com");
     }
 
     #[tokio::test]
@@ -280,7 +281,7 @@ mod tests {
         let auth = extract_with_cookie(Some(&format!("lang=en; session={jwt}; theme=dark")))
             .await
             .expect("should find session in middle");
-        assert_eq!(auth.email, "multi@test.com");
+        assert_eq!(auth.user_id, "multi@test.com");
     }
 
     // -----------------------------------------------------------------------
@@ -295,7 +296,7 @@ mod tests {
         let auth = extract_with_cookie_and_state(Some(&format!("pr1-session={jwt}")), &state)
             .await
             .expect("pr1-session cookie should be accepted");
-        assert_eq!(auth.email, "alice@test.com");
+        assert_eq!(auth.user_id, "alice@test.com");
     }
 
     /// Core regression test: PR preview API configured with "pr1-session" must
@@ -308,10 +309,9 @@ mod tests {
         let production_jwt =
             generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
         // Even with a valid JWT, the wrong cookie name must be rejected.
-        let err =
-            extract_with_cookie_and_state(Some(&format!("session={production_jwt}")), &state)
-                .await
-                .unwrap_err();
+        let err = extract_with_cookie_and_state(Some(&format!("session={production_jwt}")), &state)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
@@ -335,12 +335,14 @@ mod tests {
         // "session" appears as a prefix of "pr1-session" in the cookie header —
         // verify we match the full name and don't accidentally split on it.
         let auth = extract_with_cookie_and_state(
-            Some(&format!("lang=en; session=garbage; pr1-session={jwt}; theme=dark")),
+            Some(&format!(
+                "lang=en; session=garbage; pr1-session={jwt}; theme=dark"
+            )),
             &state,
         )
         .await
         .expect("should find pr1-session and ignore session=garbage");
-        assert_eq!(auth.email, "multi@test.com");
+        assert_eq!(auth.user_id, "multi@test.com");
     }
 
     /// Bearer token still works regardless of cookie_name configuration.
@@ -358,6 +360,6 @@ mod tests {
         let auth = AuthUser::from_request_parts(&mut parts, &state)
             .await
             .expect("bearer should work regardless of cookie_name");
-        assert_eq!(auth.email, "bob@test.com");
+        assert_eq!(auth.user_id, "bob@test.com");
     }
 }

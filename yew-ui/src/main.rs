@@ -36,7 +36,7 @@ use yew::prelude::*;
 use yew_router::prelude::*;
 
 use components::login::Login;
-use context::{load_username_from_storage, UsernameCtx};
+use context::{load_display_name_from_storage, migrate_legacy_storage, DisplayNameCtx};
 use pages::meeting::MeetingPage;
 
 /// Videocall UI
@@ -64,13 +64,14 @@ fn switch(routes: Route) -> Html {
 
 #[function_component(AppRoot)]
 fn app_root() -> Html {
-    let username_state = use_state(load_username_from_storage);
+    migrate_legacy_storage();
+    let display_name_state = use_state(load_display_name_from_storage);
     html! {
-        <ContextProvider<UsernameCtx> context={username_state.clone()}>
+        <ContextProvider<DisplayNameCtx> context={display_name_state.clone()}>
             <BrowserRouter>
                 <Switch<Route> render={switch} />
             </BrowserRouter>
-        </ContextProvider<UsernameCtx>>
+        </ContextProvider<DisplayNameCtx>>
     }
 }
 

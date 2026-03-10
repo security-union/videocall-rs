@@ -30,19 +30,25 @@ use yew::prelude::*;
 use yew::{html, Html};
 
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
-/// the video tile will occupy the full grid area. If `host_display_name` matches `key`, a crown
-/// icon is displayed next to the name.
+/// the video tile will occupy the full grid area. The `is_speaking` parameter indicates voice activity.
+/// If `host_user_id` matches the peer's authenticated user_id, a crown icon is displayed next to the name.
 pub fn generate_for_peer(
     client: &VideoCallClient,
     key: &String,
     full_bleed: bool,
-    host_display_name: Option<&str>,
+    is_speaking: bool,
+    host_user_id: Option<&str>,
 ) -> Html {
-    let peer_email = client.get_peer_email(key).unwrap_or_else(|| key.clone());
+    let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
+    let peer_display_name = client
+        .get_peer_display_name(key)
+        .unwrap_or_else(|| peer_user_id.clone());
 
-    let is_host = host_display_name.map(|h| h == peer_email).unwrap_or(false);
+    // Compare authenticated user_id (from JWT/DB) instead of user-chosen display name
+    // to prevent spoofing the host crown icon.
+    let is_host = host_user_id.map(|h| h == peer_user_id).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
-    if !allowed.is_empty() && !allowed.contains(&peer_email) {
+    if !allowed.is_empty() && !allowed.contains(&peer_user_id) {
         return html! {};
     }
 
@@ -50,23 +56,27 @@ pub fn generate_for_peer(
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
 
+    // Use speaking state for the glowing border animation
+    let speaking_class = if is_speaking { "speaking-tile" } else { "" };
+
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {
         let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+
         return html! {
             <div class="grid-item full-bleed" id={(*peer_video_div_id).clone()}>
-                <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
+                <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" }, speaking_class)}
                     onclick={Callback::from({
                         let div_id = (*peer_video_div_id).clone();
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
                     })}
                 >
                     { if is_video_enabled_for_peer { html!{ <UserVideo id={key.clone()} hidden={false}/> } } else { html!{ <div class=""><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> } } }
-                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_email}") } else {peer_email.clone() }} dir={"auto"}>
-                        {peer_email.clone()}
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_user_id}") } else {peer_user_id.clone() }} dir={"auto"}>
+                        {peer_display_name.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>
-                    <div class="audio-indicator"><MicIcon muted={!is_audio_enabled_for_peer}/></div>
+                    <div class={classes!("audio-indicator", if is_speaking { "speaking" } else { "" })}><MicIcon muted={!is_audio_enabled_for_peer}/></div>
                     <button onclick={Callback::from({ let canvas_id = key.clone(); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon"><CropIcon/></button>
                     <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon"><PushPinIcon/></button>
                 </div>
@@ -82,6 +92,7 @@ pub fn generate_for_peer(
     };
     let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
     let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+
     html! {
         <>
             // Canvas for Screen share.
@@ -92,7 +103,7 @@ pub fn generate_for_peer(
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
                     })}>
                         <ScreenCanvas peer_id={key.clone()} />
-                        <h4 class="floating-name" title={format!("{}-screen", &peer_email)} dir={"auto"}>{format!("{}-screen", &peer_email)}</h4>
+                        <h4 class="floating-name" title={format!("{}-screen", &peer_user_id)} dir={"auto"}>{format!("{}-screen", &peer_display_name)}</h4>
                         <button onclick={Callback::from({ let canvas_id = format!("screen-share-{}", key.clone()); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon">
                             <CropIcon/>
                         </button>
@@ -106,7 +117,7 @@ pub fn generate_for_peer(
             }
             <div class="grid-item" id={(*peer_video_div_id).clone()}>
                 // One canvas for the User Video
-                <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
+                <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" }, speaking_class)}
                     onclick={Callback::from({
                         let div_id = (*peer_video_div_id).clone();
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
@@ -120,11 +131,11 @@ pub fn generate_for_peer(
                             <span class="placeholder-text">{"Video Disabled"}</span>
                         </div>
                     }
-                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_email}") } else { peer_email.clone() }} dir={"auto"}>
-                        {peer_email.clone()}
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_user_id}") } else { peer_user_id.clone() }} dir={"auto"}>
+                        {peer_display_name.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>
-                    <div class="audio-indicator">
+                    <div class={classes!("audio-indicator", if is_speaking { "speaking" } else { "" })}>
                         <MicIcon muted={!is_audio_enabled_for_peer}/>
                     </div>
                     <button onclick={Callback::from({ let canvas_id = key.clone(); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon">

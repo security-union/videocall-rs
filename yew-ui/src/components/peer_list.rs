@@ -18,7 +18,10 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::UsernameCtx;
+use crate::context::{DisplayNameCtx, VideoCallClientCtx};
+use futures::future::{AbortHandle, Abortable};
+use std::collections::HashMap;
+use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew::{html, Component, Context};
@@ -26,12 +29,26 @@ use yew::{html, Component, Context};
 pub struct PeerList {
     search_query: String,
     show_context_menu: bool,
+    peer_audio_states: HashMap<String, bool>,
+    peer_speaking_states: HashMap<String, bool>,
+    abort_handle: Option<AbortHandle>,
+    local_speaking: bool,
 }
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct PeerListProperties {
     pub peers: Vec<String>,
     pub onclose: yew::Callback<yew::MouseEvent>,
+
+    // audio states
+    #[prop_or_default]
+    pub peer_audio_states: HashMap<String, bool>,
+    #[prop_or(true)]
+    pub self_muted: bool,
+
+    // speaking state for local user
+    #[prop_or(false)]
+    pub self_speaking: bool,
 
     // meeting info
     pub show_meeting_info: bool,
@@ -43,11 +60,17 @@ pub struct PeerListProperties {
     /// Display name (username) of the meeting host (for displaying crown icon)
     #[prop_or_default]
     pub host_display_name: Option<String>,
+
+    /// Authenticated user_id of the meeting host (for host identity comparison).
+    /// Compared against each peer's user_id to prevent display-name spoofing.
+    #[prop_or_default]
+    pub host_user_id: Option<String>,
 }
 
 pub enum PeerListMsg {
     UpdateSearchQuery(String),
     ToggleContextMenu,
+    Diagnostics(DiagEvent),
 }
 
 impl Component for PeerList {
@@ -55,10 +78,34 @@ impl Component for PeerList {
 
     type Properties = PeerListProperties;
 
-    fn create(_ctx: &Context<Self>) -> Self {
+    fn create(ctx: &Context<Self>) -> Self {
+        // Initialize with audio states from props
         PeerList {
             search_query: String::new(),
             show_context_menu: false,
+            peer_audio_states: ctx.props().peer_audio_states.clone(),
+            peer_speaking_states: HashMap::new(),
+            abort_handle: None,
+            local_speaking: ctx.props().self_speaking,
+        }
+    }
+
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render {
+            // Subscribe to global diagnostics for peer_status updates
+            let link = ctx.link().clone();
+            let (abort_handle, abort_reg) = AbortHandle::new_pair();
+            let fut = async move {
+                let mut rx = subscribe();
+                while let Ok(evt) = rx.recv().await {
+                    link.send_message(PeerListMsg::Diagnostics(evt));
+                }
+            };
+            let abortable = Abortable::new(fut, abort_reg);
+            self.abort_handle = Some(abort_handle);
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = abortable.await;
+            });
         }
     }
 
@@ -72,17 +119,119 @@ impl Component for PeerList {
                 self.show_context_menu = !self.show_context_menu;
                 true
             }
+            PeerListMsg::Diagnostics(evt) => {
+                match evt.subsystem {
+                    "peer_status" => {
+                        // Parse peer_status metrics for audio enabled state AND speaking state
+                        let mut to_peer: Option<String> = None;
+                        let mut audio_enabled: Option<bool> = None;
+                        let mut is_speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("audio_enabled", MetricValue::U64(v)) => {
+                                    audio_enabled = Some(*v != 0)
+                                }
+                                ("is_speaking", MetricValue::U64(v)) => is_speaking = Some(*v != 0),
+                                _ => {}
+                            }
+                        }
+
+                        let mut updated = false;
+
+                        if let (Some(peer), Some(audio)) = (to_peer.as_ref(), audio_enabled) {
+                            let current = self.peer_audio_states.get(peer).copied();
+                            if current != Some(audio) {
+                                self.peer_audio_states.insert(peer.clone(), audio);
+                                updated = true;
+                            }
+                        }
+
+                        if let (Some(peer), Some(speaking)) = (to_peer, is_speaking) {
+                            let current = self.peer_speaking_states.get(&peer).copied();
+                            if current != Some(speaking) {
+                                self.peer_speaking_states.insert(peer, speaking);
+                                updated = true;
+                            }
+                        }
+
+                        updated
+                    }
+                    "peer_speaking" => {
+                        // Fast-path speaking updates from decoded audio frames
+                        let mut to_peer: Option<String> = None;
+                        let mut speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                                _ => {}
+                            }
+                        }
+
+                        if let (Some(peer), Some(speaking_val)) = (to_peer, speaking) {
+                            let current = self.peer_speaking_states.get(&peer).copied();
+                            if current != Some(speaking_val) {
+                                self.peer_speaking_states.insert(peer, speaking_val);
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    fn changed(&mut self, ctx: &Context<Self>, _old_props: &Self::Properties) -> bool {
+        // Merge new peer audio states from props (for newly joined peers)
+        for (peer, audio) in &ctx.props().peer_audio_states {
+            if !self.peer_audio_states.contains_key(peer) {
+                self.peer_audio_states.insert(peer.clone(), *audio);
+            }
+        }
+        // Update local speaking state
+        self.local_speaking = ctx.props().self_speaking;
+        true
+    }
+
+    fn destroy(&mut self, _ctx: &Context<Self>) {
+        if let Some(handle) = self.abort_handle.take() {
+            handle.abort();
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        // Get VideoCallClient from context to convert session_id to email for display
+        let client_ctx = ctx
+            .link()
+            .context::<VideoCallClientCtx>(Callback::noop())
+            .map(|(client, _)| client);
+
         let filtered_peers: Vec<_> = ctx
             .props()
             .peers
             .iter()
             .filter(|peer| {
-                peer.to_lowercase()
-                    .contains(&self.search_query.to_lowercase())
+                // Resolve session_id to user_id and display_name for search filtering
+                let user_id = if let Some(ref client) = client_ctx {
+                    client
+                        .get_peer_user_id(peer)
+                        .unwrap_or_else(|| (*peer).clone())
+                } else {
+                    (*peer).clone()
+                };
+                let display_name = if let Some(ref client) = client_ctx {
+                    client
+                        .get_peer_display_name(peer)
+                        .unwrap_or_else(|| user_id.clone())
+                } else {
+                    user_id.clone()
+                };
+                let query = self.search_query.to_lowercase();
+                display_name.to_lowercase().contains(&query)
+                    || user_id.to_lowercase().contains(&query)
             })
             .cloned()
             .collect();
@@ -100,7 +249,7 @@ impl Component for PeerList {
         // Get username from context and append (You)
         let current_user_name: Option<String> = ctx
             .link()
-            .context::<UsernameCtx>(Callback::noop())
+            .context::<DisplayNameCtx>(Callback::noop())
             .and_then(|(state, _handle)| state.as_ref().cloned());
 
         let display_name = current_user_name
@@ -108,11 +257,18 @@ impl Component for PeerList {
             .map(|name| format!("{name} (You)"))
             .unwrap_or_else(|| "(You)".to_string());
 
-        // Check if current user is host by comparing display names
-        let host_display_name = ctx.props().host_display_name.clone();
-        let is_current_user_host = host_display_name
+        // Check if current user is host by comparing authenticated user_ids
+        // (not display names, which are user-chosen and spoofable).
+        let host_user_id = ctx.props().host_user_id.clone();
+        let current_user_id_val = client_ctx.as_ref().map(|c| c.user_id().clone());
+        let is_current_user_host = host_user_id
             .as_ref()
-            .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
+            .map(|h| {
+                current_user_id_val
+                    .as_ref()
+                    .map(|c| h == c)
+                    .unwrap_or(false)
+            })
             .unwrap_or(false);
 
         html! {
@@ -195,14 +351,29 @@ impl Component for PeerList {
                         <div class="peer-list">
                             <ul>
                                 // show self as the first item with actual username
-                                <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} /></li>
+                                <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} muted={ctx.props().self_muted} speaking={self.local_speaking} /></li>
 
-                                { for filtered_peers.iter().map(|peer| {
-                                    let is_peer_host = host_display_name.as_ref()
-                                        .map(|h| h == peer)
+                                { for filtered_peers.iter().map(|peer_id| {
+                                    // peer_id is session_id; resolve user_id and display_name
+                                    let user_id = if let Some(ref client) = client_ctx {
+                                        client.get_peer_user_id(peer_id).unwrap_or_else(|| peer_id.clone())
+                                    } else {
+                                        peer_id.clone()
+                                    };
+                                    let display_name = if let Some(ref client) = client_ctx {
+                                        client.get_peer_display_name(peer_id).unwrap_or_else(|| user_id.clone())
+                                    } else {
+                                        user_id.clone()
+                                    };
+
+                                    // Compare using authenticated user_id, not display name
+                                    let is_peer_host = host_user_id.as_ref()
+                                        .map(|h| h == &user_id)
                                         .unwrap_or(false);
+                                    let muted = !self.peer_audio_states.get(peer_id).copied().unwrap_or(false);
+                                    let speaking = self.peer_speaking_states.get(peer_id).copied().unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={peer.clone()} is_host={is_peer_host} /></li>
+                                        <li><PeerListItem name={display_name} tooltip={user_id} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
                                     }
                                 })}
                             </ul>

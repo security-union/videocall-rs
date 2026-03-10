@@ -25,12 +25,12 @@ use yew::prelude::*;
 #[derive(Properties, Debug, PartialEq, Clone)]
 pub struct PeerTileProps {
     pub peer_id: String,
-    /// True when layout has only this peer and no screen share; affects styling
     #[prop_or(false)]
     pub full_bleed: bool,
-    /// Display name (username) of the meeting host (for displaying crown icon)
+    /// Authenticated user_id of the meeting host (for displaying crown icon).
+    /// Compared against each peer's user_id to prevent display-name spoofing.
     #[prop_or_default]
-    pub host_display_name: Option<String>,
+    pub host_user_id: Option<String>,
 }
 
 pub enum Msg {
@@ -42,6 +42,7 @@ pub struct PeerTile {
     audio_enabled: bool,
     video_enabled: bool,
     screen_enabled: bool,
+    is_speaking: bool,
     abort_handle: Option<AbortHandle>,
 }
 
@@ -50,7 +51,6 @@ impl Component for PeerTile {
     type Properties = PeerTileProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        // Query context ONCE on creation and cache it
         let (client, _) = ctx
             .link()
             .context::<VideoCallClientCtx>(Callback::noop())
@@ -61,20 +61,20 @@ impl Component for PeerTile {
             audio_enabled: false,
             video_enabled: false,
             screen_enabled: false,
+            is_speaking: false,
             abort_handle: None,
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         if first_render {
-            // Initialize from client snapshot to avoid waiting for first diagnostic
             self.audio_enabled = self.client.is_audio_enabled_for_peer(&ctx.props().peer_id);
             self.video_enabled = self.client.is_video_enabled_for_peer(&ctx.props().peer_id);
             self.screen_enabled = self
                 .client
                 .is_screen_share_enabled_for_peer(&ctx.props().peer_id);
+            self.is_speaking = self.client.is_speaking_for_peer(&ctx.props().peer_id);
 
-            // Subscribe to global diagnostics for peer_status updates
             let link = ctx.link().clone();
             let (abort_handle, abort_reg) = AbortHandle::new_pair();
             let fut = async move {
@@ -94,62 +94,103 @@ impl Component for PeerTile {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::Diagnostics(evt) => {
-                if evt.subsystem != "peer_status" {
-                    return false;
-                }
-                // Parse peer_status metrics
-                let mut to_peer: Option<String> = None;
-                let mut audio_enabled: Option<bool> = None;
-                let mut video_enabled: Option<bool> = None;
-                let mut screen_enabled: Option<bool> = None;
-                for m in &evt.metrics {
-                    match (m.name, &m.value) {
-                        ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
-                        ("audio_enabled", MetricValue::U64(v)) => audio_enabled = Some(*v != 0),
-                        ("video_enabled", MetricValue::U64(v)) => video_enabled = Some(*v != 0),
-                        ("screen_enabled", MetricValue::U64(v)) => screen_enabled = Some(*v != 0),
-                        _ => {}
-                    }
-                }
+                match evt.subsystem {
+                    "peer_status" => {
+                        // Parse peer_status metrics
+                        let mut to_peer: Option<String> = None;
+                        let mut audio_enabled: Option<bool> = None;
+                        let mut video_enabled: Option<bool> = None;
+                        let mut screen_enabled: Option<bool> = None;
+                        let mut is_speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("audio_enabled", MetricValue::U64(v)) => {
+                                    audio_enabled = Some(*v != 0)
+                                }
+                                ("video_enabled", MetricValue::U64(v)) => {
+                                    video_enabled = Some(*v != 0)
+                                }
+                                ("screen_enabled", MetricValue::U64(v)) => {
+                                    screen_enabled = Some(*v != 0)
+                                }
+                                ("is_speaking", MetricValue::U64(v)) => is_speaking = Some(*v != 0),
+                                _ => {}
+                            }
+                        }
 
-                if to_peer.as_deref() != Some(ctx.props().peer_id.as_str()) {
-                    return false;
-                }
+                        if to_peer.as_deref() != Some(ctx.props().peer_id.as_str()) {
+                            return false;
+                        }
 
-                let mut changed = false;
-                if let Some(a) = audio_enabled {
-                    if a != self.audio_enabled {
-                        self.audio_enabled = a;
-                        changed = true;
+                        let mut changed = false;
+                        if let Some(a) = audio_enabled {
+                            if a != self.audio_enabled {
+                                self.audio_enabled = a;
+                                changed = true;
+                            }
+                        }
+                        if let Some(v) = video_enabled {
+                            if v != self.video_enabled {
+                                self.video_enabled = v;
+                                changed = true;
+                            }
+                        }
+                        if let Some(s) = screen_enabled {
+                            if s != self.screen_enabled {
+                                self.screen_enabled = s;
+                                changed = true;
+                            }
+                        }
+                        if let Some(s) = is_speaking {
+                            if s != self.is_speaking {
+                                self.is_speaking = s;
+                                changed = true;
+                            }
+                        }
+                        changed
                     }
-                }
-                if let Some(v) = video_enabled {
-                    if v != self.video_enabled {
-                        self.video_enabled = v;
-                        changed = true;
+                    "peer_speaking" => {
+                        // Fast-path speaking updates from decoded audio frames
+                        let mut to_peer: Option<String> = None;
+                        let mut speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                                _ => {}
+                            }
+                        }
+
+                        if to_peer.as_deref() != Some(ctx.props().peer_id.as_str()) {
+                            return false;
+                        }
+
+                        if let Some(s) = speaking {
+                            if s != self.is_speaking {
+                                self.is_speaking = s;
+                                return true;
+                            }
+                        }
+                        false
                     }
+                    _ => false,
                 }
-                if let Some(s) = screen_enabled {
-                    if s != self.screen_enabled {
-                        self.screen_enabled = s;
-                        changed = true;
-                    }
-                }
-                changed
             }
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        // Get host display name from props
-        let host_display_name = ctx.props().host_display_name.as_deref();
+        // Get host user_id from props for crown icon comparison
+        let host_user_id = ctx.props().host_user_id.as_deref();
 
         // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
         generate_for_peer(
             &self.client,
             &ctx.props().peer_id,
             ctx.props().full_bleed,
-            host_display_name,
+            self.is_speaking,
+            host_user_id,
         )
     }
 

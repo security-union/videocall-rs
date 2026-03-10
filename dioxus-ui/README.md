@@ -92,7 +92,7 @@ dioxus-ui/
 
 ### Application Flow
 
-1. **App Launch** (`main.rs`): Sets up panic hook, logging, `UsernameCtx` context provider, and `Router<Route>`.
+1. **App Launch** (`main.rs`): Sets up panic hook, logging, `DisplayNameCtx` context provider, and `Router<Route>`.
 
 2. **Home Page** (`pages/home.rs`): User enters username and meeting ID. Validates input, saves username to localStorage, navigates to meeting route.
 
@@ -132,6 +132,7 @@ window.__APP_CONFIG = Object.freeze({
     audioBitrateKbps: 65,
     videoBitrateKbps: 100,
     screenBitrateKbps: 100,
+    vadThreshold: 0.02,         // Voice activity detection sensitivity (0.01=high, 0.05=low)
 });
 ```
 

@@ -258,8 +258,8 @@ async fn run_webtransport_connection_from_request(
         .find(|(key, _)| key == "token")
         .map(|(_, val)| val.into_owned());
 
-    // Determine username and room from either the JWT or URL path params.
-    let (username, lobby_id) = if let Some(ref tok) = token {
+    // Determine username, room, and observer flag from either the JWT or URL path params.
+    let (username, lobby_id, observer, display_name) = if let Some(ref tok) = token {
         // Token-based flow: identity and room come from the JWT claims.
         let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
         if jwt_secret.is_empty() {
@@ -270,15 +270,20 @@ async fn run_webtransport_connection_from_request(
             anyhow!("token validation failed: {}", e.client_message())
         })?;
         info!(
-            "WT token-based connection: email={}, room={}",
-            claims.sub, claims.room
+            "WT token-based connection: user_id={}, room={}, display_name={}, observer={}",
+            claims.sub, claims.room, claims.display_name, claims.observer
         );
-        (claims.sub, claims.room)
+        (
+            claims.sub,
+            claims.room,
+            claims.observer,
+            claims.display_name,
+        )
     } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
         // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
         if parts.len() != 3 {
             return Err(anyhow!(
-                "Invalid path: expected /lobby/{{email}}/{{room}} (deprecated) or /lobby?token=<JWT>"
+                "Invalid path: expected /lobby/{{user_id}}/{{room}} (deprecated) or /lobby?token=<JWT>"
             ));
         }
         let username = parts[1].replace(' ', "_");
@@ -288,10 +293,12 @@ async fn run_webtransport_connection_from_request(
             return Err(anyhow!("Invalid path input chars"));
         }
         info!(
-            "WT deprecated path-based connection: email={}, room={}",
+            "WT deprecated path-based connection: user_id={}, room={}",
             username, lobby_id
         );
-        (username, lobby_id)
+        // display_name fallback: use user_id for deprecated path
+        let display = username.clone();
+        (username, lobby_id, false, display) // deprecated path-based endpoint: never observer
     } else {
         // FF=on but no token provided
         info!("WT connection rejected: no token provided and meeting management is enabled");
@@ -309,10 +316,12 @@ async fn run_webtransport_connection_from_request(
         session,
         &username,
         &lobby_id,
+        &display_name,
         chat_server,
         nats_client,
         tracker_sender,
         session_manager,
+        observer,
     )
     .await
     {
@@ -322,6 +331,7 @@ async fn run_webtransport_connection_from_request(
 }
 
 /// Handle a WebTransport session using the WtChatSession actor
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     level = "trace",
     skip(session, chat_server, nats_client, tracker_sender, session_manager)
@@ -330,10 +340,12 @@ async fn handle_webtransport_session(
     session: Session,
     username: &str,
     lobby_id: &str,
+    display_name: &str,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
+    observer: bool,
 ) -> anyhow::Result<()> {
     // Create channel for actor → WebTransport I/O
     let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
@@ -343,10 +355,12 @@ async fn handle_webtransport_session(
         chat_server,
         lobby_id.to_string(),
         username.to_string(),
+        display_name.to_string(),
         outbound_tx,
         nats_client,
         tracker_sender,
         session_manager,
+        observer,
     );
     let actor_addr = actor.start();
 
@@ -698,12 +712,12 @@ mod tests {
         // Craft a MEDIA packet that is not RTT and not health
         let media = VcMediaPacket {
             media_type: VcMediaType::AUDIO.into(),
-            email: user_a.to_string(),
+            user_id: user_a.as_bytes().to_vec(),
             ..Default::default()
         };
         let packet = VcPacketWrapper {
             packet_type: VcPacketType::MEDIA.into(),
-            email: user_a.to_string(),
+            user_id: user_a.as_bytes().to_vec(),
             data: media.write_to_bytes().expect("serialize media"),
             ..Default::default()
         };
@@ -723,8 +737,24 @@ mod tests {
                     if let Ok(mut stream) = session.accept_uni().await {
                         if let Ok(buf) = stream.read_to_end(usize::MAX).await {
                             if !buf.is_empty() {
-                                println!("Received packet on B (size: {} bytes)", buf.len());
-                                return Some(buf);
+                                if let Ok(pkt) = VcPacketWrapper::parse_from_bytes(&buf) {
+                                    let media_type: ::protobuf::EnumOrUnknown<VcPacketType> =
+                                        VcPacketType::MEDIA.into();
+                                    if pkt.packet_type == media_type {
+                                        println!(
+                                            "Received MEDIA packet on B (size: {} bytes)",
+                                            buf.len()
+                                        );
+                                        return Some(buf);
+                                    }
+                                    println!(
+                                        "Skipping non-MEDIA packet on B (type: {:?})",
+                                        pkt.packet_type
+                                    );
+                                } else {
+                                    println!("Received unparseable packet on B, returning it");
+                                    return Some(buf);
+                                }
                             }
                         }
                     }
@@ -749,7 +779,10 @@ mod tests {
             sent_packet.packet_type, received_packet.packet_type,
             "packet_type must match"
         );
-        assert_eq!(sent_packet.email, received_packet.email, "email must match");
+        assert_eq!(
+            sent_packet.user_id, received_packet.user_id,
+            "user_id must match"
+        );
         assert_eq!(sent_packet.data, received_packet.data, "data must match");
         // Verify that server added session_id (it should not be empty)
         assert!(
@@ -1070,12 +1103,12 @@ mod tests {
     fn create_test_packet(sender: &str, media_type: VcMediaType, _message: String) -> Vec<u8> {
         let media = VcMediaPacket {
             media_type: media_type.into(),
-            email: sender.to_string(),
+            user_id: sender.as_bytes().to_vec(),
             ..Default::default()
         };
         let packet = VcPacketWrapper {
             packet_type: VcPacketType::MEDIA.into(),
-            email: sender.to_string(),
+            user_id: sender.as_bytes().to_vec(),
             data: media.write_to_bytes().expect("serialize media"),
             ..Default::default()
         };

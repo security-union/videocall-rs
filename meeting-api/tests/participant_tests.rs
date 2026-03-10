@@ -136,11 +136,11 @@ async fn test_join_meeting_attendee_waits() {
     cleanup_test_data(&pool, room_id).await;
 }
 
-// ── Attendee cannot join inactive meeting ────────────────────────────────
+// ── Attendee joins inactive meeting -> waiting_for_meeting ───────────────
 
 #[tokio::test]
 #[serial]
-async fn test_join_meeting_not_active() {
+async fn test_join_meeting_not_active_returns_waiting_for_meeting() {
     let pool = get_test_pool().await;
     let room_id = "test-join-not-active";
     cleanup_test_data(&pool, room_id).await;
@@ -156,7 +156,8 @@ async fn test_join_meeting_not_active() {
         .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
-    // Non-host tries to join.
+    // Non-host tries to join an idle meeting -- now returns waiting_for_meeting
+    // with an observer_token instead of an error.
     let app = build_app(pool.clone());
     let req = request_with_cookie(
         "POST",
@@ -167,10 +168,23 @@ async fn test_join_meeting_not_active() {
     .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let body: APIResponse<APIError> = response_json(resp).await;
-    assert_eq!(body.result.code, "MEETING_NOT_ACTIVE");
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    assert!(body.success);
+    assert_eq!(
+        body.result.status, "waiting_for_meeting",
+        "Non-host joining idle meeting should get waiting_for_meeting status"
+    );
+    assert!(!body.result.is_host);
+    assert!(
+        body.result.room_token.is_none(),
+        "waiting_for_meeting should NOT include a room_token"
+    );
+    assert!(
+        body.result.observer_token.is_some(),
+        "waiting_for_meeting should include an observer_token for push notifications"
+    );
 
     cleanup_test_data(&pool, room_id).await;
 }
@@ -203,7 +217,7 @@ async fn test_leave_meeting_success() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"attendee@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
@@ -250,7 +264,7 @@ async fn test_get_my_status_success() {
 
     let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
     assert!(body.success);
-    assert_eq!(body.result.email, "host@example.com");
+    assert_eq!(body.result.user_id, "host@example.com");
     assert!(body.result.is_host);
     assert_eq!(body.result.status, "admitted");
     assert!(
@@ -289,7 +303,7 @@ async fn test_status_refused_after_meeting_ends() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"attendee@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
@@ -341,7 +355,7 @@ async fn test_status_refused_after_meeting_ends() {
 
 #[tokio::test]
 #[serial]
-async fn test_attendee_cannot_rejoin_ended_meeting() {
+async fn test_attendee_rejoin_ended_meeting_gets_waiting_for_meeting() {
     let pool = get_test_pool().await;
     let room_id = "test-rejoin-ended";
     setup_active_meeting(&pool, room_id).await;
@@ -357,7 +371,7 @@ async fn test_attendee_cannot_rejoin_ended_meeting() {
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
-    // Attendee tries to join → should be refused.
+    // Attendee tries to join the ended meeting.
     let app = build_app(pool.clone());
     let req = request_with_cookie(
         "POST",
@@ -367,10 +381,25 @@ async fn test_attendee_cannot_rejoin_ended_meeting() {
     .body(Body::empty())
     .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    let body: APIResponse<APIError> = response_json(resp).await;
-    assert_eq!(body.result.code, "MEETING_NOT_ACTIVE");
+    // New behavior: non-host joining a non-active meeting gets
+    // waiting_for_meeting with an observer_token (instead of an error).
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    assert!(body.success);
+    assert_eq!(
+        body.result.status, "waiting_for_meeting",
+        "Non-host joining ended meeting should get waiting_for_meeting"
+    );
+    assert!(
+        body.result.observer_token.is_some(),
+        "Should receive an observer_token to listen for meeting reactivation"
+    );
+    assert!(
+        body.result.room_token.is_none(),
+        "Should NOT receive a room_token"
+    );
 
     cleanup_test_data(&pool, room_id).await;
 }
@@ -402,7 +431,7 @@ async fn test_get_participants_success() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"attendee@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 

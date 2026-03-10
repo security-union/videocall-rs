@@ -20,15 +20,19 @@ use dioxus::prelude::*;
 // =============================================================================
 
 #[component]
-pub fn MicButton(enabled: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    let class = if enabled {
-        "video-control-button active"
-    } else {
-        "video-control-button"
+pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEvent>) -> Element {
+    let class = match (enabled, available) {
+        (true, false) => "video-control-button active error",
+        (true, true) => "video-control-button active",
+        (false, false) => "video-control-button error",
+        (false, true) => "video-control-button",
     };
 
     rsx! {
-        button { class, onclick: move |evt| onclick.call(evt),
+        button {
+            class,
+            disabled: !available,
+            onclick: move |evt| onclick.call(evt),
             if enabled {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -59,6 +63,9 @@ pub fn MicButton(enabled: bool, onclick: EventHandler<MouseEvent>) -> Element {
                 }
                 span { class: "tooltip", "Unmute" }
             }
+            if !available {
+                span { class: "device-warning", "!" }
+            }
         }
     }
 }
@@ -68,15 +75,19 @@ pub fn MicButton(enabled: bool, onclick: EventHandler<MouseEvent>) -> Element {
 // =============================================================================
 
 #[component]
-pub fn CameraButton(enabled: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    let class = if enabled {
-        "video-control-button active"
-    } else {
-        "video-control-button"
+pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseEvent>) -> Element {
+    let class = match (enabled, available) {
+        (true, false) => "video-control-button active error",
+        (true, true) => "video-control-button active",
+        (false, false) => "video-control-button error",
+        (false, true) => "video-control-button",
     };
 
     rsx! {
-        button { class, onclick: move |evt| onclick.call(evt),
+        button {
+            class,
+            disabled: !available,
+            onclick: move |evt| onclick.call(evt),
             if enabled {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -103,6 +114,9 @@ pub fn CameraButton(enabled: bool, onclick: EventHandler<MouseEvent>) -> Element
                     line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
                 span { class: "tooltip", "Start Video" }
+            }
+            if !available {
+                span { class: "device-warning", "!" }
             }
         }
     }
@@ -160,7 +174,7 @@ pub fn ScreenShareButton(
                     path { d: "M13 3H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-3" }
                     polyline { points: "8 21 12 17 16 21" }
                     polyline { points: "16 7 20 7 20 3" }
-                    line { x1: "10", y1: "14", x2: "21", y2: "3" }
+                    line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
                 span { class: "tooltip", "Share Screen" }
             }
@@ -195,7 +209,6 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
                     circle { cx: "9", cy: "7", r: "4" }
                     path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
                     path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
-                    line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
                 span { class: "tooltip", "Close Peers" }
             } else {
@@ -211,6 +224,7 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
                     circle { cx: "9", cy: "7", r: "4" }
                     path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
                     path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
+                    line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
                 span { class: "tooltip", "Open Peers" }
             }

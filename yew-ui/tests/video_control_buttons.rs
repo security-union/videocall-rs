@@ -39,7 +39,7 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 async fn mic_button_enabled_shows_mute_tooltip() {
     #[function_component(Wrapper)]
     fn wrapper() -> Html {
-        html! { <MicButton enabled={true} onclick={Callback::noop()} /> }
+        html! { <MicButton enabled={true} available={true} onclick={Callback::noop()} /> }
     }
 
     let mount = create_mount_point();
@@ -67,7 +67,7 @@ async fn mic_button_enabled_shows_mute_tooltip() {
 async fn mic_button_disabled_shows_unmute_tooltip() {
     #[function_component(Wrapper)]
     fn wrapper() -> Html {
-        html! { <MicButton enabled={false} onclick={Callback::noop()} /> }
+        html! { <MicButton enabled={false} available={true} onclick={Callback::noop()} /> }
     }
 
     let mount = create_mount_point();
@@ -99,7 +99,7 @@ async fn mic_button_disabled_shows_unmute_tooltip() {
 async fn camera_button_enabled_shows_stop_video_tooltip() {
     #[function_component(Wrapper)]
     fn wrapper() -> Html {
-        html! { <CameraButton enabled={true} onclick={Callback::noop()} /> }
+        html! { <CameraButton enabled={true} available={true} onclick={Callback::noop()} /> }
     }
 
     let mount = create_mount_point();
@@ -116,7 +116,7 @@ async fn camera_button_enabled_shows_stop_video_tooltip() {
 async fn camera_button_disabled_shows_start_video_tooltip() {
     #[function_component(Wrapper)]
     fn wrapper() -> Html {
-        html! { <CameraButton enabled={false} onclick={Callback::noop()} /> }
+        html! { <CameraButton enabled={false} available={true} onclick={Callback::noop()} /> }
     }
 
     let mount = create_mount_point();

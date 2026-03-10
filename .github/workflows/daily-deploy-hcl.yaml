@@ -46,6 +46,15 @@ jobs:
           # Strip ANSI color codes before grep
           echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
 
+      - name: Download image tag artifact (for workflow_run trigger)
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag
+          path: /tmp
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
       - name: Determine image tag
         id: determine-tag
         run: |
@@ -53,10 +62,9 @@ jobs:
             TAG="${{ inputs.image_tag }}"
             echo "Using manually specified tag: $TAG"
           else
-            # For workflow_run trigger, extract tag from build workflow
-            # The tag follows format: daily-YYYY-MM-DD-HHMM
-            TAG="daily-$(TZ=America/New_York date +%Y-%m-%d-%H%M)"
-            echo "Using auto-generated tag from build workflow: $TAG"
+            # For workflow_run trigger, read tag from artifact
+            TAG=$(cat /tmp/image-tag.txt)
+            echo "Using tag from build workflow artifact: $TAG"
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Deploying images with tag: $TAG"

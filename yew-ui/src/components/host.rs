@@ -16,7 +16,14 @@
  * conditions.
  */
 
+use crate::components::{
+    device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
+};
 use crate::constants::*;
+use crate::context::{
+    is_valid_username, load_username_from_storage, save_username_to_storage, validate_display_name,
+    VideoCallClientCtx, DISPLAY_NAME_MAX_LEN,
+};
 use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
@@ -26,14 +33,6 @@ use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
-
-use crate::components::{
-    device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
-};
-use crate::context::{
-    load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
-    validate_display_name, DISPLAY_NAME_MAX_LEN,
-};
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -134,6 +133,11 @@ pub struct MeetingProps {
     /// Called when screen share state changes (started, cancelled, stopped).
     /// This allows the parent component to react to screen share lifecycle events.
     pub on_screen_share_state: Callback<ScreenShareEvent>,
+
+    /// Called when the user changes their display name.
+    /// This allows the parent component to update the UsernameCtx.
+    #[prop_or_default]
+    pub on_name_changed: Option<Callback<String>>,
 }
 
 impl Component for Host {
@@ -390,25 +394,42 @@ impl Component for Host {
                 false
             }
             Msg::SaveChangeName => {
-                match validate_display_name(&self.pending_name) {
-                    Ok(valid_name) => {
-                        self.pending_name = valid_name.clone();
+                let new_name = self.pending_name.trim().to_string();
 
-                        save_username_to_storage(&valid_name);
+                log::info!(
+                    ">>> SaveChangeName triggered, new_name='{}', valid={}, empty={}",
+                    new_name,
+                    is_valid_username(&new_name),
+                    new_name.is_empty()
+                );
 
-                        // Force a soft reload so meeting picks up new name
-                        if let Some(win) = web_sys::window() {
-                            let _ = win.location().reload();
-                        }
+                if is_valid_username(&new_name) && !new_name.is_empty() {
+                    save_username_to_storage(&new_name);
 
-                        self.show_change_name = false;
-                        self.change_name_error = None;
-                        false
+                    log::info!(">>> Calling client.update_display_name");
+
+                    // Don't reload, change the username in the client and still maintain connection
+                    if let Err(error) = self.client.update_display_name(&new_name) {
+                        log::error!("Failed to update display name: {error}");
+                        self.change_name_error =
+                            Some("Failed to update name. Try again.".to_string());
+                        return true;
                     }
-                    Err(message) => {
-                        self.change_name_error = Some(message);
-                        true
+
+                    // Notify parent to update UsernameCtx so the UI reflects the change
+                    if let Some(callback) = &ctx.props().on_name_changed {
+                        callback.emit(new_name.clone());
                     }
+
+                    log::info!(">>> Display name updated to: {new_name}");
+                    self.show_change_name = false;
+                    self.change_name_error = None;
+
+                    true
+                } else {
+                    self.change_name_error =
+                        Some("Use letters, numbers, and underscore only.".to_string());
+                    true
                 }
             }
             Msg::AudioDeviceChanged(audio) => {

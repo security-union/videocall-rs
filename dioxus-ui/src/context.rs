@@ -86,6 +86,8 @@ pub fn clear_username_from_storage() {
 // Validation helpers (re-exported from shared crate)
 // ---------------------------------------------------------------------------
 
+#[allow(unused_imports)] // normalize_spaces is used in integration tests
 pub use videocall_types::validation::{
-    email_to_display_name, is_valid_meeting_id, normalize_spaces, validate_display_name, DISPLAY_NAME_MAX_LEN,
+    email_to_display_name, is_valid_meeting_id, normalize_spaces, validate_display_name,
+    DISPLAY_NAME_MAX_LEN,
 };

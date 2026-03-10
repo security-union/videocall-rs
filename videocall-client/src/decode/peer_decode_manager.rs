@@ -56,6 +56,7 @@ pub enum PeerDecodeError {
 pub enum PeerStatus {
     Added(u64),
     NoChange,
+    NameChanged(String, String),
 }
 
 impl Display for PeerDecodeError {
@@ -87,6 +88,7 @@ pub struct Peer {
     /// Cached `session_id.to_string()` to avoid repeated allocations.
     sid_str: String,
     pub email: String,
+    pub display_name: String,
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
@@ -116,12 +118,13 @@ impl Peer {
     fn new(
         video_canvas_id: String,
         screen_canvas_id: String,
-        session_id: u64,
+        session_id_str: String,
         email: String,
         aes: Option<Aes128State>,
         vad_threshold: Option<f32>,
     ) -> Result<Self, JsValue> {
-        let sid_str = session_id.to_string();
+        let sid_str = session_id_str.clone();
+        let session_id: u64 = session_id_str.parse().unwrap_or(0);
         let (mut audio, video, screen) =
             Self::new_decoders(&video_canvas_id, &screen_canvas_id, &sid_str, vad_threshold)?;
 
@@ -134,6 +137,7 @@ impl Peer {
             screen,
             session_id,
             sid_str,
+            display_name: email.clone(),
             email,
             video_canvas_id,
             screen_canvas_id,
@@ -192,8 +196,12 @@ impl Peer {
 
     fn reset(&mut self) -> Result<(), JsValue> {
         let sid_str = self.session_id.to_string();
-        let (mut audio, video, screen) =
-            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &sid_str, self.vad_threshold)?;
+        let (mut audio, video, screen) = Self::new_decoders(
+            &self.video_canvas_id,
+            &self.screen_canvas_id,
+            &sid_str,
+            self.vad_threshold,
+        )?;
 
         // Preserve the current mute state after reset
         audio.set_muted(!self.audio_enabled);
@@ -336,6 +344,10 @@ impl Peer {
                 self.has_received_heartbeat = true;
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
+                    // Update display name from heartbeat if non-empty
+                    if !metadata.display_name.is_empty() {
+                        self.display_name = metadata.display_name.clone();
+                    }
                     // Check if video is being turned off (on -> off transition)
                     let video_turned_off = self.video_enabled && !metadata.video_enabled;
                     // Check if audio is being turned off (on -> off transition)
@@ -398,6 +410,15 @@ impl Peer {
         }
     }
 
+    /// We need to change the display name without re-creating decoders for such operation
+    pub fn set_display_name(&mut self, name: String) {
+        debug!(
+            "Peer {} display name changed from: {} to {}",
+            self.session_id, self.display_name, name
+        );
+        self.display_name = name;
+    }
+
     fn on_heartbeat(&mut self) {
         self.heartbeat_count += 1;
     }
@@ -426,6 +447,8 @@ pub struct PeerDecodeManager {
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Rc<DiagnosticManager>>,
     pub on_peer_removed: Callback<String>,
+    /// Called as `callback(peer_userid, new_display_name)` when a peer's display name changes
+    pub on_peer_display_name_changed: Callback<(String, String)>,
     vad_threshold: Option<f32>,
 }
 
@@ -444,6 +467,7 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
             on_peer_removed: Callback::noop(),
+            on_peer_display_name_changed: Callback::noop(),
             vad_threshold: None,
         }
     }
@@ -456,6 +480,7 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: Some(diagnostics),
             on_peer_removed: Callback::noop(),
+            on_peer_display_name_changed: Callback::noop(),
             vad_threshold: None,
         }
     }
@@ -519,9 +544,15 @@ impl PeerDecodeManager {
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
                 peer.context_initialized = true;
             }
+
+            let old_display_name = peer.display_name.clone();
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
                     peer.on_heartbeat();
+                    if !peer.display_name.is_empty() && peer.display_name != old_display_name {
+                        self.on_peer_display_name_changed
+                            .emit((peer_session_id.to_string(), peer.display_name.clone()));
+                    }
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {
@@ -559,8 +590,8 @@ impl PeerDecodeManager {
             session_id,
             Peer::new(
                 self.get_video_canvas_id.emit(sid_str.clone()),
-                self.get_screen_canvas_id.emit(sid_str),
-                session_id,
+                self.get_screen_canvas_id.emit(sid_str.clone()),
+                sid_str.clone(),
                 email.to_owned(),
                 aes,
                 self.vad_threshold,
@@ -634,7 +665,23 @@ impl PeerDecodeManager {
         Ok(())
     }
 
-    pub fn is_peer_speaking(&self, key: &String) -> bool {
+    /// Update peer display name by session ID
+    pub fn update_peer_display_name(&mut self, session_id: &str, new_name: &str) {
+        if let Ok(sid) = session_id.parse::<u64>() {
+            if let Some(peer) = self.connected_peers.get_mut(&sid) {
+                peer.set_display_name(new_name.to_string());
+            }
+        }
+    }
+
+    pub fn get_peer_display_name(&self, session_id: &str) -> Option<String> {
+        let sid: u64 = session_id.parse().ok()?;
+        self.connected_peers
+            .get(&sid)
+            .map(|peer| peer.display_name.clone())
+    }
+
+    pub fn is_peer_speaking(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,
@@ -652,8 +699,8 @@ impl PeerDecodeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use protobuf::Message;
+    use std::cell::Cell;
     use videocall_types::protos::media_packet::media_packet::MediaType;
     use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -674,7 +721,12 @@ mod tests {
     impl MockAudioDecoder {
         fn new() -> (Self, Rc<Cell<bool>>) {
             let muted = Rc::new(Cell::new(true));
-            (Self { muted: muted.clone() }, muted)
+            (
+                Self {
+                    muted: muted.clone(),
+                },
+                muted,
+            )
         }
     }
 
@@ -766,6 +818,7 @@ mod tests {
             session_id,
             sid_str,
             email: "test@test.com".into(),
+            display_name: "test@test.com".into(),
             video_canvas_id: format!("video-{session_id}"),
             screen_canvas_id: format!("screen-{session_id}"),
             aes: None,
@@ -1102,10 +1155,16 @@ mod tests {
         // Simulate the userid check from video_call_client.rs
         let my_userid = "charlie@example.com";
         let should_fire_callback = parsed.target_email == my_userid;
-        assert!(should_fire_callback, "callback should fire for matching userid");
+        assert!(
+            should_fire_callback,
+            "callback should fire for matching userid"
+        );
 
         let other_userid = "observer@example.com";
         let should_not_fire = parsed.target_email == other_userid;
-        assert!(!should_not_fire, "callback should NOT fire for non-matching userid");
+        assert!(
+            !should_not_fire,
+            "callback should NOT fire for non-matching userid"
+        );
     }
 }

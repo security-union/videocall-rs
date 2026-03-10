@@ -240,10 +240,7 @@ impl CameraEncoder {
         };
         let on_error = self.on_error.clone();
 
-        log::info!(
-            "CameraEncoder::start(): using video device_id = {}",
-            device_id
-        );
+        log::info!("CameraEncoder::start(): using video device_id = {device_id}");
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -255,11 +252,7 @@ impl CameraEncoder {
                 if let Some(doc) = window().document() {
                     if let Some(elem) = doc.get_element_by_id(&video_elem_id) {
                         if let Ok(video_elem) = elem.dyn_into::<HtmlVideoElement>() {
-                            log::info!(
-                                "CameraEncoder: found <video id='{}'> after {} attempts",
-                                video_elem_id,
-                                attempt
-                            );
+                            log::info!("CameraEncoder: found <video id='{video_elem_id}'> after {attempt} attempts");
                             break video_elem;
                         }
                     }
@@ -269,8 +262,7 @@ impl CameraEncoder {
                 attempt += 1;
                 if attempt > 20 {
                     let msg = format!(
-                        "Camera error: video element '{}' not found in DOM after 1 second",
-                        video_elem_id
+                        "Camera error: video element '{video_elem_id}' not found in DOM after 1 second"
                     );
                     error!("{msg}");
                     if let Some(cb) = &on_error {
@@ -303,7 +295,7 @@ impl CameraEncoder {
             )
             .unwrap();
 
-            log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
+            log::debug!("CameraEncoder: deviceId.exact = {device_id}");
             media_info.set_device_id(&exact.into());
 
             constraints.set_video(&media_info.into());
@@ -352,31 +344,24 @@ impl CameraEncoder {
                 Ok(promise) => {
                     if let Err(e) = JsFuture::from(promise).await {
                         log::warn!(
-                            "VIDEO PLAY promise rejected on '{}': {:?}  — retrying in 200ms",
-                            video_elem_id,
-                            e
+                            "VIDEO PLAY promise rejected on '{video_elem_id}': {e:?}  — retrying in 200ms"
                         );
                         sleep(Duration::from_millis(200)).await;
                         if let Ok(p2) = video_element.play() {
                             if let Err(e2) = JsFuture::from(p2).await {
                                 log::warn!(
-                                    "VIDEO PLAY retry also rejected on '{}': {:?}",
-                                    video_elem_id,
-                                    e2
+                                    "VIDEO PLAY retry also rejected on '{video_elem_id}': {e2:?}"
                                 );
                             } else {
-                                log::info!("VIDEO PLAY retry succeeded on {}", video_elem_id);
+                                log::info!("VIDEO PLAY retry succeeded on {video_elem_id}");
                             }
                         }
                     } else {
-                        log::info!(
-                            "VIDEO PLAY started successfully on element {}",
-                            video_elem_id
-                        );
+                        log::info!("VIDEO PLAY started successfully on element {video_elem_id}");
                     }
                 }
                 Err(e) => {
-                    error!("VIDEO PLAY method call failed: {:?}", e);
+                    error!("VIDEO PLAY method call failed: {e:?}");
                 }
             }
 

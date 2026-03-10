@@ -57,6 +57,7 @@ pub struct Connection {
     /// unlike `session_id` which is shared with the heartbeat `Interval` closure.
     userid: RefCell<Option<String>>,
     url: String,
+    display_name: Rc<RefCell<String>>,
 }
 
 impl Connection {
@@ -66,6 +67,9 @@ impl Connection {
         aes: Rc<Aes128State>,
     ) -> anyhow::Result<Self> {
         let mut new_options = options.clone();
+        let userid = new_options.userid.clone();
+        let _session_id = new_options.session_id.clone();
+        let display_name = Rc::new(RefCell::new(new_options.display_name.clone()));
         let status = Rc::new(Cell::new(Status::Connecting));
 
         let url = if webtransport {
@@ -89,7 +93,7 @@ impl Connection {
         let monitor = new_options.peer_monitor.clone();
         let task = Task::connect(webtransport, new_options)?;
 
-        let connection = Self {
+        let mut connection = Self {
             task: Rc::new(task),
             heartbeat: None,
             heartbeat_monitor: Some(Interval::new(5000, move || {
@@ -104,9 +108,20 @@ impl Connection {
             session_id: Rc::new(RefCell::new(None)),
             userid: RefCell::new(None),
             url,
+            display_name,
         };
+        connection.start_heartbeat(userid);
 
         Ok(connection)
+    }
+
+    pub fn set_display_name(&self, name: String) {
+        *self.display_name.borrow_mut() = name;
+    }
+
+    pub fn set_session_id(&self, session_id: u64) {
+        *self.session_id.borrow_mut() = Some(session_id);
+        log::debug!("Connection session_id set to {session_id}");
     }
 
     pub fn is_connected(&self) -> bool {
@@ -123,6 +138,7 @@ impl Connection {
         let screen_enabled = Rc::clone(&self.screen_enabled);
         let is_speaking = Rc::clone(&self.is_speaking);
         let session_id = Rc::clone(&self.session_id);
+        let display_name = Rc::clone(&self.display_name);
 
         self.heartbeat = Some(Interval::new(1000, move || {
             if let Some(packet_wrapper) = build_heartbeat_packet(
@@ -133,6 +149,7 @@ impl Connection {
                 &is_speaking,
                 &aes,
                 &session_id,
+                &display_name,
             ) {
                 if let Status::Connected = status.get() {
                     task.send_packet(packet_wrapper);
@@ -206,6 +223,7 @@ impl Connection {
             &self.is_speaking,
             &self.aes,
             &self.session_id,
+            &self.display_name,
         ) {
             self.task.send_packet(packet_wrapper);
         }
@@ -214,10 +232,6 @@ impl Connection {
     pub fn set_speaking(&self, speaking: bool) {
         self.is_speaking
             .store(speaking, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn set_session_id(&self, session_id: u64) {
-        *self.session_id.borrow_mut() = Some(session_id);
     }
 }
 
@@ -228,6 +242,7 @@ impl Drop for Connection {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_heartbeat_packet(
     userid: &str,
     video_enabled: &AtomicBool,
@@ -236,12 +251,15 @@ fn build_heartbeat_packet(
     is_speaking: &AtomicBool,
     aes: &Aes128State,
     session_id: &RefCell<Option<u64>>,
+    display_name: &RefCell<String>,
 ) -> Option<PacketWrapper> {
+    let current_display_name = display_name.borrow().clone();
     let heartbeat_metadata = HeartbeatMetadata {
         video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
         audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
         screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
         is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
+        display_name: current_display_name,
         ..Default::default()
     };
 
@@ -261,10 +279,7 @@ fn build_heartbeat_packet(
                     subsystem: "heartbeat",
                     stream_id: None,
                     ts_ms: videocall_diagnostics::now_ms(),
-                    metrics: vec![videocall_diagnostics::metric!(
-                        "encryption_failure",
-                        1u64
-                    )],
+                    metrics: vec![videocall_diagnostics::metric!("encryption_failure", 1u64)],
                 },
             );
         })
@@ -284,12 +299,11 @@ fn build_heartbeat_packet(
 }
 
 fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, String> {
-    let bytes = packet.write_to_bytes().map_err(|e| {
-        format!("Failed to serialize heartbeat packet: {e}")
-    })?;
-    aes.encrypt(&bytes).map_err(|e| {
-        format!("Failed to encrypt heartbeat packet: {e:?}")
-    })
+    let bytes = packet
+        .write_to_bytes()
+        .map_err(|e| format!("Failed to serialize heartbeat packet: {e}"))?;
+    aes.encrypt(&bytes)
+        .map_err(|e| format!("Failed to encrypt heartbeat packet: {e:?}"))
 }
 
 fn tap_callback<IN: 'static, OUT: 'static>(

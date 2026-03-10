@@ -18,7 +18,6 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::{UsernameCtx, VideoCallClientCtx};
 use futures::future::{AbortHandle, Abortable};
 use std::collections::HashMap;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
@@ -38,7 +37,13 @@ pub struct PeerList {
 #[derive(Properties, Clone, PartialEq)]
 pub struct PeerListProperties {
     pub peers: Vec<String>,
+    /// Map of session_id -> display_name for looking up peer names
+    #[prop_or_default]
+    pub peer_display_names: HashMap<String, String>,
     pub onclose: yew::Callback<yew::MouseEvent>,
+
+    /// The local user's display name (shown with "(You)" suffix)
+    pub local_user_name: String,
 
     // audio states
     #[prop_or_default]
@@ -127,9 +132,7 @@ impl Component for PeerList {
                                 ("audio_enabled", MetricValue::U64(v)) => {
                                     audio_enabled = Some(*v != 0)
                                 }
-                                ("is_speaking", MetricValue::U64(v)) => {
-                                    is_speaking = Some(*v != 0)
-                                }
+                                ("is_speaking", MetricValue::U64(v)) => is_speaking = Some(*v != 0),
                                 _ => {}
                             }
                         }
@@ -200,24 +203,19 @@ impl Component for PeerList {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        // Get VideoCallClient from context to convert session_id to email for display
-        let client_ctx = ctx
-            .link()
-            .context::<VideoCallClientCtx>(Callback::noop())
-            .map(|(client, _)| client);
-
+        let peer_names = &ctx.props().peer_display_names;
         let filtered_peers: Vec<_> = ctx
             .props()
             .peers
             .iter()
-            .filter(|peer| {
-                // Resolve session_id to display name for search filtering
-                let display_name = if let Some(ref client) = client_ctx {
-                    client.get_peer_email(peer).unwrap_or_else(|| (*peer).clone())
-                } else {
-                    (*peer).clone()
-                };
-                display_name.to_lowercase()
+            .filter(|session_id| {
+                // Get display name for filtering, fallback to session_id
+                let display_name = peer_names
+                    .get(*session_id)
+                    .cloned()
+                    .unwrap_or_else(|| (*session_id).clone());
+                display_name
+                    .to_lowercase()
                     .contains(&self.search_query.to_lowercase())
             })
             .cloned()
@@ -234,15 +232,9 @@ impl Component for PeerList {
         });
 
         // Get username from context and append (You)
-        let current_user_name: Option<String> = ctx
-            .link()
-            .context::<UsernameCtx>(Callback::noop())
-            .and_then(|(state, _handle)| state.as_ref().cloned());
+        let current_user_name = Some(ctx.props().local_user_name.clone());
 
-        let display_name = current_user_name
-            .clone()
-            .map(|name| format!("{name} (You)"))
-            .unwrap_or_else(|| "(You)".to_string());
+        let display_name = format!("{} (You)", ctx.props().local_user_name);
 
         // Check if current user is host by comparing display names
         let host_display_name = ctx.props().host_display_name.clone();
@@ -334,22 +326,22 @@ impl Component for PeerList {
                                 <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} muted={ctx.props().self_muted} speaking={self.local_speaking} /></li>
 
                                 { for filtered_peers.iter().map(|peer_id| {
-                                    // peer_id is session_id, get email for display
-                                    let display_name = if let Some(ref client) = client_ctx {
-                                        client.get_peer_email(peer_id).unwrap_or_else(|| peer_id.clone())
-                                    } else {
-                                        peer_id.clone()
-                                    };
-
+                                    // Look up display name from prop map, fallback to peer_id
+                                    let name = peer_names
+                                        .get(peer_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| peer_id.clone());
+                                    // Check if this peer is the host
                                     let is_peer_host = host_display_name.as_ref()
-                                        .map(|h| h == &display_name)
+                                        .map(|h| h == &name)
                                         .unwrap_or(false);
                                     let muted = !self.peer_audio_states.get(peer_id).copied().unwrap_or(false);
                                     let speaking = self.peer_speaking_states.get(peer_id).copied().unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={display_name} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
+                                        <li><PeerListItem name={name} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
                                     }
-                                })}
+                                })
+                                }
                             </ul>
                         </div>
                     </div>

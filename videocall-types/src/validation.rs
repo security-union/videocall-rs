@@ -33,11 +33,7 @@ pub fn normalize_spaces(s: &str) -> String {
 /// Only ASCII alphanumerics are permitted (not full Unicode) to prevent
 /// homoglyph / spoofing attacks.
 pub fn is_allowed_display_name_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric()
-        || ch == ' '
-        || ch == '_'
-        || ch == '-'
-        || ch == '\''
+    ch.is_ascii_alphanumeric() || ch == ' ' || ch == '_' || ch == '-' || ch == '\''
 }
 
 /// Convert an email address (or its local-part) into a title-cased display name.
@@ -81,8 +77,7 @@ pub fn validate_display_name(raw: &str) -> Result<String, String> {
 
     if value.chars().count() > DISPLAY_NAME_MAX_LEN {
         return Err(format!(
-            "Name is too long (max {} characters).",
-            DISPLAY_NAME_MAX_LEN
+            "Name is too long (max {DISPLAY_NAME_MAX_LEN} characters).",
         ));
     }
 
@@ -95,8 +90,7 @@ pub fn validate_display_name(raw: &str) -> Result<String, String> {
 
     if !invalid_chars.is_empty() {
         return Err(format!(
-            "Invalid character(s): {:?}. Allowed: ASCII letters, numbers, spaces, '_', '-', and apostrophe (').",
-            invalid_chars
+            "Invalid character(s): {invalid_chars:?}. Allowed: ASCII letters, numbers, spaces, '_', '-', and apostrophe (').",
         ));
     }
 

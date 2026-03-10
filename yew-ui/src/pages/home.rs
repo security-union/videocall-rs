@@ -27,8 +27,8 @@ use crate::components::meetings_list::MeetingsList;
 use crate::constants::oauth_enabled;
 use crate::context::{
     clear_username_from_storage, email_to_display_name, is_valid_username,
-    load_username_from_storage, save_username_to_storage, validate_display_name,
-    DISPLAY_NAME_MAX_LEN, UsernameCtx,
+    load_username_from_storage, save_username_to_storage, validate_display_name, UsernameCtx,
+    DISPLAY_NAME_MAX_LEN,
 };
 use crate::routing::Route;
 use web_time::SystemTime;

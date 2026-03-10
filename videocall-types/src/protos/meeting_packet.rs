@@ -45,6 +45,12 @@ pub struct MeetingPacket {
     pub target_email: ::std::string::String,
     // @@protoc_insertion_point(field:MeetingPacket.room_token)
     pub room_token: ::std::string::String,
+    ///  Session ID of user who changed name (for NAME_UPDATED events)
+    // @@protoc_insertion_point(field:MeetingPacket.user_session_id)
+    pub user_session_id: ::std::string::String,
+    ///  New display name (for NAME_UPDATED events)
+    // @@protoc_insertion_point(field:MeetingPacket.new_display_name)
+    pub new_display_name: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:MeetingPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -62,7 +68,7 @@ impl MeetingPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(8);
+        let mut fields = ::std::vec::Vec::with_capacity(10);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "event_type",
@@ -103,6 +109,16 @@ impl MeetingPacket {
             "room_token",
             |m: &MeetingPacket| { &m.room_token },
             |m: &mut MeetingPacket| { &mut m.room_token },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "user_session_id",
+            |m: &MeetingPacket| { &m.user_session_id },
+            |m: &mut MeetingPacket| { &mut m.user_session_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "new_display_name",
+            |m: &MeetingPacket| { &m.new_display_name },
+            |m: &mut MeetingPacket| { &mut m.new_display_name },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MeetingPacket>(
             "MeetingPacket",
@@ -146,6 +162,12 @@ impl ::protobuf::Message for MeetingPacket {
                 66 => {
                     self.room_token = is.read_string()?;
                 },
+                74 => {
+                    self.user_session_id = is.read_string()?;
+                },
+                82 => {
+                    self.new_display_name = is.read_string()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -182,6 +204,12 @@ impl ::protobuf::Message for MeetingPacket {
         if !self.room_token.is_empty() {
             my_size += ::protobuf::rt::string_size(8, &self.room_token);
         }
+        if !self.user_session_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(9, &self.user_session_id);
+        }
+        if !self.new_display_name.is_empty() {
+            my_size += ::protobuf::rt::string_size(10, &self.new_display_name);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -212,6 +240,12 @@ impl ::protobuf::Message for MeetingPacket {
         if !self.room_token.is_empty() {
             os.write_string(8, &self.room_token)?;
         }
+        if !self.user_session_id.is_empty() {
+            os.write_string(9, &self.user_session_id)?;
+        }
+        if !self.new_display_name.is_empty() {
+            os.write_string(10, &self.new_display_name)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -237,6 +271,8 @@ impl ::protobuf::Message for MeetingPacket {
         self.participant_count = 0;
         self.target_email.clear();
         self.room_token.clear();
+        self.user_session_id.clear();
+        self.new_display_name.clear();
         self.special_fields.clear();
     }
 
@@ -250,6 +286,8 @@ impl ::protobuf::Message for MeetingPacket {
             participant_count: 0,
             target_email: ::std::string::String::new(),
             room_token: ::std::string::String::new(),
+            user_session_id: ::std::string::String::new(),
+            new_display_name: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -296,6 +334,8 @@ pub mod meeting_packet {
         PARTICIPANT_REJECTED = 7,
         // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.WAITING_ROOM_UPDATED)
         WAITING_ROOM_UPDATED = 8,
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.NAME_UPDATED)
+        NAME_UPDATED = 9,
     }
 
     impl ::protobuf::Enum for MeetingEventType {
@@ -316,6 +356,7 @@ pub mod meeting_packet {
                 6 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_ADMITTED),
                 7 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_REJECTED),
                 8 => ::std::option::Option::Some(MeetingEventType::WAITING_ROOM_UPDATED),
+                9 => ::std::option::Option::Some(MeetingEventType::NAME_UPDATED),
                 _ => ::std::option::Option::None
             }
         }
@@ -331,6 +372,7 @@ pub mod meeting_packet {
                 "PARTICIPANT_ADMITTED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_ADMITTED),
                 "PARTICIPANT_REJECTED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_REJECTED),
                 "WAITING_ROOM_UPDATED" => ::std::option::Option::Some(MeetingEventType::WAITING_ROOM_UPDATED),
+                "NAME_UPDATED" => ::std::option::Option::Some(MeetingEventType::NAME_UPDATED),
                 _ => ::std::option::Option::None
             }
         }
@@ -345,6 +387,7 @@ pub mod meeting_packet {
             MeetingEventType::PARTICIPANT_ADMITTED,
             MeetingEventType::PARTICIPANT_REJECTED,
             MeetingEventType::WAITING_ROOM_UPDATED,
+            MeetingEventType::NAME_UPDATED,
         ];
     }
 

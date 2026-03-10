@@ -389,6 +389,7 @@ impl NetEqAudioPeerDecoder {
     }
 
     /// Create message handler for NetEq worker
+    #[allow(clippy::too_many_arguments)]
     fn create_message_handler(
         pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
         audio_context: AudioContext,
@@ -468,7 +469,8 @@ impl NetEqAudioPeerDecoder {
         peer_id: String,
         vad_threshold: Option<f32>,
     ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
-        Self::new_with_mute_state(speaker_device_id, peer_id, true, vad_threshold) // Default to muted
+        Self::new_with_mute_state(speaker_device_id, peer_id, true, vad_threshold)
+        // Default to muted
     }
 
     /// Create audio decoder with explicit initial mute state

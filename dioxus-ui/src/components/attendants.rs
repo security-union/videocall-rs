@@ -128,12 +128,19 @@ fn schedule_reconnect(
     let delay_ms = match reconnect_delay_ms(attempt) {
         Some(d) => d,
         None => {
-            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            connection_error.set(Some(
+                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+            ));
             return;
         }
     };
 
-    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
+    log::info!(
+        "Scheduling reconnect attempt {}/{} in {}ms",
+        attempt + 1,
+        MAX_RECONNECT_ATTEMPTS,
+        delay_ms
+    );
 
     Timeout::new(delay_ms, move || {
         wasm_bindgen_futures::spawn_local(async move {
@@ -182,12 +189,19 @@ fn schedule_reconnect_no_jwt(
     let delay_ms = match reconnect_delay_ms(attempt) {
         Some(d) => d,
         None => {
-            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            connection_error.set(Some(
+                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+            ));
             return;
         }
     };
 
-    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
+    log::info!(
+        "Scheduling reconnect attempt {}/{} in {}ms",
+        attempt + 1,
+        MAX_RECONNECT_ATTEMPTS,
+        delay_ms
+    );
 
     Timeout::new(delay_ms, move || {
         let reconnect_needed = {
@@ -255,7 +269,7 @@ pub fn AttendantsComponent(
 
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
-    let mut peer_status_map: PeerStatusMap = use_signal(|| HashMap::new());
+    let mut peer_status_map: PeerStatusMap = use_signal(HashMap::new);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -276,11 +290,7 @@ pub fn AttendantsComponent(
 
         let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &email, &id);
 
-        log::info!(
-            "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
-            email,
-            id
-        );
+        log::info!("DIOXUS-UI: Creating VideoCallClient for {email} in meeting {id}");
 
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
@@ -377,6 +387,9 @@ pub fn AttendantsComponent(
                     meeting_ended_message.set(Some(message));
                 },
             )),
+            session_id: id.clone(),
+            display_name: email.clone(),
+            on_peer_display_name_changed: None,
             on_speaking_changed: Some(VcCallback::from(move |speaking: bool| {
                 let mut s = local_speaking;
                 s.set(speaking);
@@ -519,7 +532,7 @@ pub fn AttendantsComponent(
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
-        format!("{}/meeting/{}", origin, id)
+        format!("{origin}/meeting/{id}")
     };
 
     let is_allowed = users_allowed_to_stream().unwrap_or_default();
@@ -1032,7 +1045,10 @@ mod tests {
     /// attempt=10 exceeds MAX_RECONNECT_ATTEMPTS and should return None.
     #[wasm_bindgen_test]
     fn reconnect_delay_attempt_10_returns_none() {
-        assert!(reconnect_delay_ms(10).is_none(), "attempt 10 should return None");
+        assert!(
+            reconnect_delay_ms(10).is_none(),
+            "attempt 10 should return None"
+        );
     }
 
     /// Attempts beyond 10 should also return None.
@@ -1051,7 +1067,8 @@ mod tests {
         // Collect many samples per attempt and check the average is near the expected base.
         let samples = 200;
         for attempt in 0..4u32 {
-            let expected_base = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
+            let expected_base =
+                (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
             let sum: f64 = (0..samples)
                 .map(|_| reconnect_delay_ms(attempt).unwrap() as f64)
                 .sum();

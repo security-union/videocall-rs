@@ -20,6 +20,8 @@ message MeetingPacket {
     PARTICIPANT_REJECTED = 7;
     // Waiting room list changed
     WAITING_ROOM_UPDATED = 8;
+    // Participant changed their display name
+    NAME_UPDATED = 9;
   }
 
   MeetingEventType event_type = 1;
@@ -32,5 +34,9 @@ message MeetingPacket {
   string target_email = 7;
   // For ADMITTED: JWT to upgrade connection
   string room_token = 8;
+  // Session ID of user who changed name (for NAME_UPDATED events)
+  string user_session_id = 9;
+  // New display name (for NAME_UPDATED events)
+  string new_display_name = 10;
 }
 

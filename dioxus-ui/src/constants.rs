@@ -92,7 +92,7 @@ pub fn split_users(s: Option<&str>) -> Vec<String> {
 }
 
 pub fn login_url() -> Result<String, String> {
-    meeting_api_base_url().map(|url| format!("{}/login", url))
+    meeting_api_base_url().map(|url| format!("{url}/login"))
 }
 pub fn actix_websocket_base() -> Result<String, String> {
     app_config().map(|c| c.ws_url)

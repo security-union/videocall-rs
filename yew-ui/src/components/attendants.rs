@@ -29,15 +29,15 @@ use crate::components::{
         PeerListButton, ScreenShareButton,
     },
 };
-use crate::constants::actix_websocket_base;
 use crate::constants::{
-    server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
+    actix_websocket_base, server_election_period_ms, users_allowed_to_stream,
+    webtransport_host_base, CANVAS_LIMIT, SESSION_ID_KEY,
 };
 use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
-use std::collections::HashMap;
 use log::{error, warn};
+use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
@@ -102,6 +102,8 @@ pub enum Msg {
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
     OnPeerRemoved(String),
+    OnPeerDisplayNameChanged(String, String),
+    OnLocalNameChanged(String),
     OnFirstFrame((String, MediaType)),
     OnSpeakingChanged(bool),
     OnMicrophoneError(String),
@@ -210,6 +212,11 @@ pub struct AttendantsComponent {
     pub call_start_time: Option<f64>,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    #[allow(dead_code)]
+    pub session_id: String,
+    pub display_name: String,
+    /// Map of session_id -> display_name for all peers
+    pub peer_display_names: std::collections::HashMap<String, String>,
     local_speaking: bool,
     /// Monotonically increasing counter bumped when a `WaitingRoomUpdated`
     /// push notification arrives. Passed as a prop to `HostControls` so it
@@ -250,6 +257,8 @@ impl AttendantsComponent {
     }
 
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
+        let session_id = Self::get_or_create_session_id();
+        let display_name = ctx.props().email.clone();
         let email = ctx.props().email.clone();
         let id = ctx.props().id.clone();
 
@@ -284,6 +293,8 @@ impl AttendantsComponent {
 
         let opts = VideoCallClientOptions {
             userid: email.clone(),
+            session_id: session_id.to_string(),
+            display_name: display_name.to_string(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -361,6 +372,13 @@ impl AttendantsComponent {
                     link.send_message(Msg::MeetingEnded(message));
                 })
             }),
+            on_peer_display_name_changed: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |(session_id, new_name): (String, String)| {
+                    log::info!("Peer {session_id} changed name to: {new_name}");
+                    link.send_message(Msg::OnPeerDisplayNameChanged(session_id, new_name));
+                })
+            }),
             on_speaking_changed: Some({
                 let link = ctx.link().clone();
                 VcCallback::from(move |speaking: bool| {
@@ -381,6 +399,41 @@ impl AttendantsComponent {
         };
 
         VideoCallClient::new(opts)
+    }
+
+    fn random_segment() -> String {
+        (0..3)
+            .map(|_| {
+                let n = (js_sys::Math::random() * 26.0).floor() as u8;
+                (b'a' + n) as char
+            })
+            .collect::<String>()
+    }
+
+    fn generate_session_id() -> String {
+        format!(
+            "{}-{}-{}",
+            Self::random_segment(),
+            Self::random_segment(),
+            Self::random_segment()
+        )
+    }
+
+    fn get_or_create_session_id() -> String {
+        if let Some(storage) = web_sys::window()
+            .and_then(|w| w.local_storage().ok())
+            .flatten()
+        {
+            if let Ok(Some(id)) = storage.get_item("session_id") {
+                return id;
+            }
+
+            let new_id = Self::generate_session_id();
+            let _ = storage.set_item(SESSION_ID_KEY, &new_id);
+            new_id
+        } else {
+            Self::generate_session_id()
+        }
     }
 
     fn create_media_device_access(ctx: &Context<Self>) -> MediaDeviceAccess {
@@ -492,7 +545,12 @@ impl AttendantsComponent {
             }
         };
 
-        log::info!("Scheduling token refresh attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+        log::info!(
+            "Scheduling token refresh attempt {}/{} in {}ms",
+            attempt + 1,
+            Self::MAX_RECONNECT_ATTEMPTS,
+            delay_ms
+        );
 
         Timeout::new(delay_ms, move || {
             wasm_bindgen_futures::spawn_local(async move {
@@ -507,7 +565,7 @@ impl AttendantsComponent {
                 }
             });
         })
-            .forget();
+        .forget();
     }
 
     /// Schedule a reconnection attempt with exponential backoff (non-JWT path).
@@ -526,7 +584,12 @@ impl AttendantsComponent {
             }
         };
 
-        log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+        log::info!(
+            "Scheduling reconnect attempt {}/{} in {}ms",
+            attempt + 1,
+            Self::MAX_RECONNECT_ATTEMPTS,
+            delay_ms
+        );
 
         Timeout::new(delay_ms, move || {
             link.send_message(WsAction::Connect);
@@ -553,10 +616,14 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
+        let session_id = Self::get_or_create_session_id();
+        let display_name = ctx.props().email.clone();
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
 
         let mut self_ = Self {
+            session_id,
+            display_name,
             client,
             media_device_access,
             screen_share_state: ScreenShareState::Idle,
@@ -581,6 +648,7 @@ impl Component for AttendantsComponent {
             meeting_start_time_server: None,
             meeting_ended_message: None,
             meeting_info_open: false,
+            peer_display_names: std::collections::HashMap::new(),
             local_speaking: false,
             waiting_room_version: 0,
             reconnect_attempt: 0,
@@ -604,7 +672,7 @@ impl Component for AttendantsComponent {
         log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {
             Msg::OnSpeakingChanged(speaking) => {
-                log::trace!("LOCAL Speaking state changed to: {}", speaking);
+                log::trace!("LOCAL Speaking state changed to: {speaking}");
                 self.local_speaking = speaking;
                 true
             }
@@ -696,7 +764,21 @@ impl Component for AttendantsComponent {
 
                 true
             }
-            Msg::OnPeerRemoved(_peer_id) => {
+            Msg::OnPeerRemoved(peer_id) => {
+                // Remove from display names map and trigger re-render
+                self.peer_display_names.remove(&peer_id);
+                true
+            }
+            Msg::OnPeerDisplayNameChanged(session_id, new_name) => {
+                log::info!("Peer {session_id} changed name to: {new_name}");
+                self.peer_display_names.insert(session_id, new_name);
+                // Trigger re-render to update UI with new name
+                true
+            }
+            Msg::OnLocalNameChanged(new_name) => {
+                log::info!("Local user changed name to: {new_name}");
+                // Update the local display_name state so the UI reflects the change
+                self.display_name = new_name;
                 true
             }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
@@ -828,7 +910,7 @@ impl Component for AttendantsComponent {
                     Timeout::new(1640, move || {
                         link.send_message(Msg::ShowCopyToast(false));
                     })
-                        .forget();
+                    .forget();
                 }
                 true
             }
@@ -1158,6 +1240,7 @@ impl Component for AttendantsComponent {
                                                  on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
                                                  on_camera_error={ctx.link().callback(Msg::OnCameraError)}
                                                  on_screen_share_state={ctx.link().callback(Msg::ScreenShareStateChange)}
+                                                 on_name_changed={Some(ctx.link().callback(Msg::OnLocalNameChanged))}
                                              />}
                                          } else {
                                              html! {<></>}
@@ -1186,7 +1269,9 @@ impl Component for AttendantsComponent {
                             html! {
                                 <PeerList
                                     peers={display_peers_vec.clone()}
+                                    peer_display_names={self.peer_display_names.clone()}
                                     onclose={toggle_peer_list}
+                                    local_user_name={self.display_name.clone()}
                                     peer_audio_states={peer_audio_states}
                                     self_muted={!self.mic_enabled}
                                     self_speaking={self.local_speaking}

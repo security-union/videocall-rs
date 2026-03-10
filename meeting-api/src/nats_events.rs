@@ -161,7 +161,10 @@ mod tests {
             MeetingEventType::PARTICIPANT_ADMITTED.into()
         );
         assert_eq!(inner.target_email, "alice@example.com");
-        assert!(inner.room_token.is_empty(), "room_token must not be broadcast via NATS");
+        assert!(
+            inner.room_token.is_empty(),
+            "room_token must not be broadcast via NATS"
+        );
     }
 
     #[test]

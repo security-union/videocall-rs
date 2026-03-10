@@ -310,109 +310,109 @@ pub fn home() -> Html {
 
                 // Form section - moved to top for prominence
                 <div class="w-full mb-8 card-apple p-8">
-                <form {onsubmit}>
-                    <h3 class="text-center text-xl font-semibold mb-6 text-white/90">{"Start or Join a Meeting"}</h3>
-                    <div class="space-y-6">
-                        <div>
-                            <label for="username" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Display Name"}</label>
-                            <input
-                                id="username"
-                                class={TEXT_INPUT_CLASSES}
-                                type="text"
-                                placeholder="Enter your display name"
-                                required={true}
-                                autofocus={true}
-                                maxlength={DISPLAY_NAME_MAX_LEN.to_string()}
-                                value={(*display_name_value).clone()}
-                                oninput={{
-                                    let display_name_value = display_name_value.clone();
-                                    let display_name_error = display_name_error.clone();
-                                    Callback::from(move |e: InputEvent| {
-                                        let input: HtmlInputElement = e.target_unchecked_into();
-                                        display_name_value.set(input.value());
-                                        display_name_error.set(None);
-                                    })
-                                }}
-                            />
-                            <p class="text-sm text-foreground-subtle mt-2 ml-1">
-                                {"Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes"}
-                            </p>
-                            {
-                                if let Some(err) = &*display_name_error {
-                                    html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
-                                } else {
-                                    html! {}
-                                }
-                            }
-                        </div>
-
-                        <div>
-                            <label for="meeting-id" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Meeting ID"}</label>
-                            <input
-                                id="meeting-id"
-                                class={TEXT_INPUT_CLASSES}
-                                type="text"
-                                placeholder="Enter meeting code"
-                                ref={meeting_id_ref.clone()}
-                                required={true}
-                                pattern="^[a-zA-Z0-9_]*$"
-                                oninput={
-                                    let meeting_id_value = meeting_id_value.clone();
-                                    Callback::from(move |e: InputEvent| {
-                                        let input: HtmlInputElement = e.target_unchecked_into();
-                                        meeting_id_value.set(input.value());
-                                    })
-                                }
-                            />
-                            <p class="text-sm text-foreground-subtle mt-2 ml-1">{ "Characters allowed: a-z, A-Z, 0-9, and _" }</p>
-                            {
-                                if let Some(err) = &*meeting_id_error {
-                                    html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
-                                } else {
-                                    html! {}
-                                }
-                            }
-                        </div>
-
-                        <div class="mt-4">
-                            <button type="submit" class={join_btn_class} disabled={!has_meeting_id}>
-                                <span class="text-lg">{ "Start or Join Meeting" }</span>
-                            </button>
-                        </div>
-
-                        <div class="mt-2">
-                            <button type="button" class={create_btn_class} onclick={create_meeting.clone()}>
-                                <span class="text-lg">{"Create a New Meeting ID"}</span>
-                            </button>
-                        </div>
-                    </div>
-                </form>
-
-                // Auth removed from here — now rendered as a fixed dropdown in the top-right
-
-                // Active meetings list — only show when OAuth is disabled
-                // or the user is authenticated (has a profile)
-                {
-                    if !oauth_enabled().unwrap_or(false) || (*user_profile).is_some() {
-                        html! {
-                            <MeetingsList on_select_meeting={
-                                let meeting_id_ref = meeting_id_ref.clone();
-                                let meeting_id_value = meeting_id_value.clone();
-                                Callback::from(move |meeting_id: String| {
-                                    if let Some(input) = meeting_id_ref.cast::<HtmlInputElement>() {
-                                        input.set_value(&meeting_id);
+                    <form {onsubmit}>
+                        <h3 class="text-center text-xl font-semibold mb-6 text-white/90">{"Start or Join a Meeting"}</h3>
+                        <div class="space-y-6">
+                            <div>
+                                <label for="username" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Display Name"}</label>
+                                <input
+                                    id="username"
+                                    class={TEXT_INPUT_CLASSES}
+                                    type="text"
+                                    placeholder="Enter your display name"
+                                    required={true}
+                                    autofocus={true}
+                                    maxlength={DISPLAY_NAME_MAX_LEN.to_string()}
+                                    value={(*display_name_value).clone()}
+                                    oninput={{
+                                        let display_name_value = display_name_value.clone();
+                                        let display_name_error = display_name_error.clone();
+                                        Callback::from(move |e: InputEvent| {
+                                            let input: HtmlInputElement = e.target_unchecked_into();
+                                            display_name_value.set(input.value());
+                                            display_name_error.set(None);
+                                        })
+                                    }}
+                                />
+                                <p class="text-sm text-foreground-subtle mt-2 ml-1">
+                                    {"Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes"}
+                                </p>
+                                {
+                                    if let Some(err) = &*display_name_error {
+                                        html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
+                                    } else {
+                                        html! {}
                                     }
-                                    meeting_id_value.set(meeting_id);
-                                })
-                            } />
+                                }
+                            </div>
+
+                            <div>
+                                <label for="meeting-id" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Meeting ID"}</label>
+                                <input
+                                    id="meeting-id"
+                                    class={TEXT_INPUT_CLASSES}
+                                    type="text"
+                                    placeholder="Enter meeting code"
+                                    ref={meeting_id_ref.clone()}
+                                    required={true}
+                                    pattern="^[a-zA-Z0-9_]*$"
+                                    oninput={
+                                        let meeting_id_value = meeting_id_value.clone();
+                                        Callback::from(move |e: InputEvent| {
+                                            let input: HtmlInputElement = e.target_unchecked_into();
+                                            meeting_id_value.set(input.value());
+                                        })
+                                    }
+                                />
+                                <p class="text-sm text-foreground-subtle mt-2 ml-1">{ "Characters allowed: a-z, A-Z, 0-9, and _" }</p>
+                                {
+                                    if let Some(err) = &*meeting_id_error {
+                                        html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
+                                    } else {
+                                        html! {}
+                                    }
+                                }
+                            </div>
+
+                            <div class="mt-4">
+                                <button type="submit" class={join_btn_class} disabled={!has_meeting_id}>
+                                    <span class="text-lg">{ "Start or Join Meeting" }</span>
+                                </button>
+                            </div>
+
+                            <div class="mt-2">
+                                <button type="button" class={create_btn_class} onclick={create_meeting.clone()}>
+                                    <span class="text-lg">{"Create a New Meeting ID"}</span>
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+
+                    // Auth removed from here — now rendered as a fixed dropdown in the top-right
+
+                    // Active meetings list — only show when OAuth is disabled
+                    // or the user is authenticated (has a profile)
+                    {
+                        if !oauth_enabled().unwrap_or(false) || (*user_profile).is_some() {
+                            html! {
+                                <MeetingsList on_select_meeting={
+                                    let meeting_id_ref = meeting_id_ref.clone();
+                                    let meeting_id_value = meeting_id_value.clone();
+                                    Callback::from(move |meeting_id: String| {
+                                        if let Some(input) = meeting_id_ref.cast::<HtmlInputElement>() {
+                                            input.set_value(&meeting_id);
+                                        }
+                                        meeting_id_value.set(meeting_id);
+                                    })
+                                } />
+                            }
+                        } else {
+                            html! {}
                         }
-                    } else {
-                        html! {}
                     }
-                }
                 </div>
 
-                // <div class="content-separator"></div>
+                <div class="content-separator"></div>
 
                 // <div class="grid grid-cols-1 md:grid-cols-2 gap-8" style="margin-top:1em">
                 //     <div>

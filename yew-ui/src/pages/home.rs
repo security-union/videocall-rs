@@ -26,9 +26,9 @@ use crate::components::login::{build_login_callback, render_provider_button};
 use crate::components::meetings_list::MeetingsList;
 use crate::constants::oauth_enabled;
 use crate::context::{
-    clear_username_from_storage, email_to_display_name, is_valid_username,
-    load_username_from_storage, save_username_to_storage, validate_display_name,
-    DISPLAY_NAME_MAX_LEN, UsernameCtx,
+    clear_display_name_from_storage, email_to_display_name, is_valid_meeting_id,
+    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
+    DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
 };
 use crate::routing::Route;
 use web_time::SystemTime;
@@ -44,19 +44,19 @@ pub fn home() -> Html {
     // Track meeting ID value for enabling/disabling the submit button
     let meeting_id_value = use_state(String::new);
 
-    let username_ctx = use_context::<UsernameCtx>().expect("Username context missing");
+    let display_name_ctx = use_context::<DisplayNameCtx>().expect("DisplayName context missing");
 
-    let existing_username: String = if let Some(name) = &*username_ctx {
+    let existing_display_name: String = if let Some(name) = &*display_name_ctx {
         name.clone()
     } else {
-        load_username_from_storage().unwrap_or_default()
+        load_display_name_from_storage().unwrap_or_default()
     };
 
-    // Controlled username value
-    let username_value = use_state(|| existing_username.clone());
+    // Controlled display name value
+    let display_name_value = use_state(|| existing_display_name.clone());
 
     // Inline error messages
-    let username_error = use_state(|| None as Option<String>);
+    let display_name_error = use_state(|| None as Option<String>);
     let meeting_id_error = use_state(|| None as Option<String>);
 
     // User profile state (for displaying auth info when OAuth is enabled)
@@ -65,9 +65,9 @@ pub fn home() -> Html {
     // Dropdown toggle for auth menu
     let show_dropdown = use_state(|| false);
 
-    // If we already have a stored username, set the Matomo user id early
+    // If we already have a stored display name, set the Matomo user id early
     use_effect_with((), {
-        let uid = existing_username.clone();
+        let uid = existing_display_name.clone();
         move |_| {
             if !uid.is_empty() {
                 matomo_logger::set_user_id(&uid);
@@ -79,7 +79,7 @@ pub fn home() -> Html {
     // Fetch user profile when OAuth is enabled
     {
         let user_profile = user_profile.clone();
-        let username_ctx = username_ctx.clone();
+        let display_name_ctx = display_name_ctx.clone();
         use_effect_with((), move |_| {
             if oauth_enabled().unwrap_or(false) {
                 wasm_bindgen_futures::spawn_local(async move {
@@ -87,7 +87,7 @@ pub fn home() -> Html {
                     if check_session().await.is_ok() {
                         if let Ok(profile) = get_user_profile().await {
                             // Auto-set display name from auth profile if not already saved
-                            if load_username_from_storage().is_none() {
+                            if load_display_name_from_storage().is_none() {
                                 // Use the profile name directly; only transform if it looks like an email
                                 let display_name = if profile.name.contains('@') {
                                     email_to_display_name(&profile.name)
@@ -95,8 +95,8 @@ pub fn home() -> Html {
                                     profile.name.clone()
                                 };
                                 if let Ok(valid_name) = validate_display_name(&display_name) {
-                                    save_username_to_storage(&valid_name);
-                                    username_ctx.set(Some(valid_name));
+                                    save_display_name_to_storage(&valid_name);
+                                    display_name_ctx.set(Some(valid_name));
                                 }
                             }
                             user_profile.set(Some(profile));
@@ -111,18 +111,18 @@ pub fn home() -> Html {
     // Logout handler — clear profile state and display name, then stay on home page
     let on_logout = {
         let user_profile = user_profile.clone();
-        let username_ctx = username_ctx.clone();
-        let username_value = username_value.clone();
+        let display_name_ctx = display_name_ctx.clone();
+        let display_name_value = display_name_value.clone();
         Callback::from(move |_: web_sys::MouseEvent| {
             let user_profile = user_profile.clone();
-            let username_ctx = username_ctx.clone();
-            let username_value = username_value.clone();
+            let display_name_ctx = display_name_ctx.clone();
+            let display_name_value = display_name_value.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = logout().await;
                 user_profile.set(None);
-                clear_username_from_storage();
-                username_ctx.set(None);
-                username_value.set(String::new());
+                clear_display_name_from_storage();
+                display_name_ctx.set(None);
+                display_name_value.set(String::new());
             });
         })
     };
@@ -130,43 +130,43 @@ pub fn home() -> Html {
     let onsubmit = {
         let meeting_id_ref = meeting_id_ref.clone();
         let navigator = navigator.clone();
-        let username_ctx = username_ctx.clone();
+        let display_name_ctx = display_name_ctx.clone();
 
-        let username_value = username_value.clone();
-        let username_error = username_error.clone();
+        let display_name_value = display_name_value.clone();
+        let display_name_error = display_name_error.clone();
         let meeting_id_error = meeting_id_error.clone();
 
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
 
-            let username_raw = (*username_value).clone();
+            let display_name_raw = (*display_name_value).clone();
             let meeting_id = meeting_id_ref.cast::<HtmlInputElement>().unwrap().value();
 
             // Reset errors
-            username_error.set(None);
+            display_name_error.set(None);
             meeting_id_error.set(None);
 
             // Validate display name (user-friendly)
-            let username = match validate_display_name(&username_raw) {
+            let display_name = match validate_display_name(&display_name_raw) {
                 Ok(v) => v,
                 Err(msg) => {
-                    username_error.set(Some(msg));
+                    display_name_error.set(Some(msg));
                     return;
                 }
             };
 
-            username_value.set(username.clone());
+            display_name_value.set(display_name.clone());
 
-            if meeting_id.is_empty() || !is_valid_username(&meeting_id) {
+            if meeting_id.is_empty() || !is_valid_meeting_id(&meeting_id) {
                 meeting_id_error.set(Some(
                     "Please provide a valid meeting id (a-z, A-Z, 0-9, _).".to_string(),
                 ));
                 return;
             }
 
-            save_username_to_storage(&username);
-            username_ctx.set(Some(username.clone()));
-            matomo_logger::set_user_id(&username);
+            save_display_name_to_storage(&display_name);
+            display_name_ctx.set(Some(display_name.clone()));
+            matomo_logger::set_user_id(&display_name);
 
             navigator.push(&Route::Meeting { id: meeting_id });
         })
@@ -187,30 +187,30 @@ pub fn home() -> Html {
 
     let create_meeting = {
         let navigator = navigator.clone();
-        let username_ctx = username_ctx.clone();
+        let display_name_ctx = display_name_ctx.clone();
 
-        let username_value = username_value.clone();
-        let username_error = username_error.clone();
+        let display_name_value = display_name_value.clone();
+        let display_name_error = display_name_error.clone();
         let meeting_id_error = meeting_id_error.clone();
 
         Callback::from(move |_| {
-            username_error.set(None);
+            display_name_error.set(None);
             meeting_id_error.set(None);
 
-            let username_raw = (*username_value).clone();
+            let display_name_raw = (*display_name_value).clone();
 
-            let username = match validate_display_name(&username_raw) {
+            let display_name = match validate_display_name(&display_name_raw) {
                 Ok(v) => v,
                 Err(msg) => {
-                    username_error.set(Some(msg));
+                    display_name_error.set(Some(msg));
                     return;
                 }
             };
 
             let meeting_id = generate_meeting_id();
-            save_username_to_storage(&username);
-            username_ctx.set(Some(username.clone()));
-            matomo_logger::set_user_id(&username);
+            save_display_name_to_storage(&display_name);
+            display_name_ctx.set(Some(display_name.clone()));
+            matomo_logger::set_user_id(&display_name);
 
             navigator.push(&Route::Meeting { id: meeting_id });
         })
@@ -262,7 +262,7 @@ pub fn home() -> Html {
                                     <div class="auth-dropdown-menu">
                                         <div class="auth-dropdown-header">
                                             <p class="auth-dropdown-name">{&profile.name}</p>
-                                            <p class="auth-dropdown-email">{&profile.email}</p>
+                                            <p class="auth-dropdown-email">{&profile.user_id}</p>
                                         </div>
                                         <button
                                             type="button"
@@ -310,109 +310,109 @@ pub fn home() -> Html {
 
                 // Form section - moved to top for prominence
                 <div class="w-full mb-8 card-apple p-8">
-                <form {onsubmit}>
-                    <h3 class="text-center text-xl font-semibold mb-6 text-white/90">{"Start or Join a Meeting"}</h3>
-                    <div class="space-y-6">
-                        <div>
-                            <label for="username" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Display Name"}</label>
-                            <input
-                                id="username"
-                                class={TEXT_INPUT_CLASSES}
-                                type="text"
-                                placeholder="Enter your display name"
-                                required={true}
-                                autofocus={true}
-                                maxlength={DISPLAY_NAME_MAX_LEN.to_string()}
-                                value={(*username_value).clone()}
-                                oninput={{
-                                    let username_value = username_value.clone();
-                                    let username_error = username_error.clone();
-                                    Callback::from(move |e: InputEvent| {
-                                        let input: HtmlInputElement = e.target_unchecked_into();
-                                        username_value.set(input.value());
-                                        username_error.set(None);
-                                    })
-                                }}
-                            />
-                            <p class="text-sm text-foreground-subtle mt-2 ml-1">
-                                {"Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes"}
-                            </p>
-                            {
-                                if let Some(err) = &*username_error {
-                                    html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
-                                } else {
-                                    html! {}
-                                }
-                            }
-                        </div>
-
-                        <div>
-                            <label for="meeting-id" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Meeting ID"}</label>
-                            <input
-                                id="meeting-id"
-                                class={TEXT_INPUT_CLASSES}
-                                type="text"
-                                placeholder="Enter meeting code"
-                                ref={meeting_id_ref.clone()}
-                                required={true}
-                                pattern="^[a-zA-Z0-9_]*$"
-                                oninput={
-                                    let meeting_id_value = meeting_id_value.clone();
-                                    Callback::from(move |e: InputEvent| {
-                                        let input: HtmlInputElement = e.target_unchecked_into();
-                                        meeting_id_value.set(input.value());
-                                    })
-                                }
-                            />
-                            <p class="text-sm text-foreground-subtle mt-2 ml-1">{ "Characters allowed: a-z, A-Z, 0-9, and _" }</p>
-                            {
-                                if let Some(err) = &*meeting_id_error {
-                                    html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
-                                } else {
-                                    html! {}
-                                }
-                            }
-                        </div>
-
-                        <div class="mt-4">
-                            <button type="submit" class={join_btn_class} disabled={!has_meeting_id}>
-                                <span class="text-lg">{ "Start or Join Meeting" }</span>
-                            </button>
-                        </div>
-
-                        <div class="mt-2">
-                            <button type="button" class={create_btn_class} onclick={create_meeting.clone()}>
-                                <span class="text-lg">{"Create a New Meeting ID"}</span>
-                            </button>
-                        </div>
-                    </div>
-                </form>
-
-                // Auth removed from here — now rendered as a fixed dropdown in the top-right
-
-                // Active meetings list — only show when OAuth is disabled
-                // or the user is authenticated (has a profile)
-                {
-                    if !oauth_enabled().unwrap_or(false) || (*user_profile).is_some() {
-                        html! {
-                            <MeetingsList on_select_meeting={
-                                let meeting_id_ref = meeting_id_ref.clone();
-                                let meeting_id_value = meeting_id_value.clone();
-                                Callback::from(move |meeting_id: String| {
-                                    if let Some(input) = meeting_id_ref.cast::<HtmlInputElement>() {
-                                        input.set_value(&meeting_id);
+                    <form {onsubmit}>
+                        <h3 class="text-center text-xl font-semibold mb-6 text-white/90">{"Start or Join a Meeting"}</h3>
+                        <div class="space-y-6">
+                            <div>
+                                <label for="username" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Display Name"}</label>
+                                <input
+                                    id="username"
+                                    class={TEXT_INPUT_CLASSES}
+                                    type="text"
+                                    placeholder="Enter your display name"
+                                    required={true}
+                                    autofocus={true}
+                                    maxlength={DISPLAY_NAME_MAX_LEN.to_string()}
+                                    value={(*display_name_value).clone()}
+                                    oninput={{
+                                        let display_name_value = display_name_value.clone();
+                                        let display_name_error = display_name_error.clone();
+                                        Callback::from(move |e: InputEvent| {
+                                            let input: HtmlInputElement = e.target_unchecked_into();
+                                            display_name_value.set(input.value());
+                                            display_name_error.set(None);
+                                        })
+                                    }}
+                                />
+                                <p class="text-sm text-foreground-subtle mt-2 ml-1">
+                                    {"Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes"}
+                                </p>
+                                {
+                                    if let Some(err) = &*display_name_error {
+                                        html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
+                                    } else {
+                                        html! {}
                                     }
-                                    meeting_id_value.set(meeting_id);
-                                })
-                            } />
+                                }
+                            </div>
+
+                            <div>
+                                <label for="meeting-id" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Meeting ID"}</label>
+                                <input
+                                    id="meeting-id"
+                                    class={TEXT_INPUT_CLASSES}
+                                    type="text"
+                                    placeholder="Enter meeting code"
+                                    ref={meeting_id_ref.clone()}
+                                    required={true}
+                                    pattern="^[a-zA-Z0-9_]*$"
+                                    oninput={
+                                        let meeting_id_value = meeting_id_value.clone();
+                                        Callback::from(move |e: InputEvent| {
+                                            let input: HtmlInputElement = e.target_unchecked_into();
+                                            meeting_id_value.set(input.value());
+                                        })
+                                    }
+                                />
+                                <p class="text-sm text-foreground-subtle mt-2 ml-1">{ "Characters allowed: a-z, A-Z, 0-9, and _" }</p>
+                                {
+                                    if let Some(err) = &*meeting_id_error {
+                                        html! { <p class="text-sm mt-2 ml-1" style="color:#ff6b6b;">{err}</p> }
+                                    } else {
+                                        html! {}
+                                    }
+                                }
+                            </div>
+
+                            <div class="mt-4">
+                                <button type="submit" class={join_btn_class} disabled={!has_meeting_id}>
+                                    <span class="text-lg">{ "Start or Join Meeting" }</span>
+                                </button>
+                            </div>
+
+                            <div class="mt-2">
+                                <button type="button" class={create_btn_class} onclick={create_meeting.clone()}>
+                                    <span class="text-lg">{"Create a New Meeting ID"}</span>
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+
+                    // Auth removed from here — now rendered as a fixed dropdown in the top-right
+
+                    // Active meetings list — only show when OAuth is disabled
+                    // or the user is authenticated (has a profile)
+                    {
+                        if !oauth_enabled().unwrap_or(false) || (*user_profile).is_some() {
+                            html! {
+                                <MeetingsList on_select_meeting={
+                                    let meeting_id_ref = meeting_id_ref.clone();
+                                    let meeting_id_value = meeting_id_value.clone();
+                                    Callback::from(move |meeting_id: String| {
+                                        if let Some(input) = meeting_id_ref.cast::<HtmlInputElement>() {
+                                            input.set_value(&meeting_id);
+                                        }
+                                        meeting_id_value.set(meeting_id);
+                                    })
+                                } />
+                            }
+                        } else {
+                            html! {}
                         }
-                    } else {
-                        html! {}
                     }
-                }
                 </div>
 
-                // <div class="content-separator"></div>
+                <div class="content-separator"></div>
 
                 // <div class="grid grid-cols-1 md:grid-cols-2 gap-8" style="margin-top:1em">
                 //     <div>

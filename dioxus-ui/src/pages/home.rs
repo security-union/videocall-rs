@@ -22,9 +22,9 @@ use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
 use crate::constants::oauth_enabled;
 use crate::context::{
-    clear_username_from_storage, email_to_display_name, is_valid_meeting_id,
-    load_username_from_storage, save_username_to_storage, validate_display_name, UsernameCtx,
-    DISPLAY_NAME_MAX_LEN,
+    clear_display_name_from_storage, email_to_display_name, is_valid_meeting_id,
+    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
+    DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
 };
 use crate::routing::Route;
 use dioxus::prelude::*;
@@ -49,12 +49,12 @@ pub fn Home() -> Element {
 
     let mut meeting_id_ref = use_signal(|| None::<web_sys::Element>);
     let mut meeting_id_value = use_signal(String::new);
-    let mut username_ctx = use_context::<UsernameCtx>();
+    let mut display_name_ctx = use_context::<DisplayNameCtx>();
 
-    let existing_username: String = if let Some(name) = (username_ctx.0)() {
+    let existing_username: String = if let Some(name) = (display_name_ctx.0)() {
         name
     } else {
-        load_username_from_storage().unwrap_or_default()
+        load_display_name_from_storage().unwrap_or_default()
     };
 
     let mut username_value = use_signal(|| existing_username.clone());
@@ -84,7 +84,7 @@ pub fn Home() -> Element {
                 if check_session().await.is_ok() {
                     if let Ok(profile) = get_user_profile().await {
                         // Auto-set display name from auth profile if not already saved
-                        if load_username_from_storage().is_none() {
+                        if load_display_name_from_storage().is_none() {
                             // Use the profile name directly; only transform if it looks like an email
                             let display_name = if profile.name.contains('@') {
                                 email_to_display_name(&profile.name)
@@ -92,8 +92,8 @@ pub fn Home() -> Element {
                                 profile.name.clone()
                             };
                             if let Ok(valid_name) = validate_display_name(&display_name) {
-                                save_username_to_storage(&valid_name);
-                                username_ctx.0.set(Some(valid_name.clone()));
+                                save_display_name_to_storage(&valid_name);
+                                display_name_ctx.0.set(Some(valid_name.clone()));
                                 username_value.set(valid_name);
                             }
                         }
@@ -109,8 +109,8 @@ pub fn Home() -> Element {
         wasm_bindgen_futures::spawn_local(async move {
             let _ = logout().await;
             user_profile.set(None);
-            clear_username_from_storage();
-            username_ctx.0.set(None);
+            clear_display_name_from_storage();
+            display_name_ctx.0.set(None);
             username_value.set(String::new());
         });
     };
@@ -157,7 +157,7 @@ pub fn Home() -> Element {
                             div { class: "auth-dropdown-menu",
                                 div { class: "auth-dropdown-header",
                                     p { class: "auth-dropdown-name", "{profile.name}" }
-                                    p { class: "auth-dropdown-email", "{profile.email}" }
+                                    p { class: "auth-dropdown-email", "{profile.user_id}" }
                                 }
                                 button {
                                     r#type: "button",
@@ -216,8 +216,8 @@ pub fn Home() -> Element {
                             match validate_display_name(&username) {
                                 Ok(valid_name) => {
                                     username_value.set(valid_name.clone());
-                                    save_username_to_storage(&valid_name);
-                                    (username_ctx.0).set(Some(valid_name.clone()));
+                                    save_display_name_to_storage(&valid_name);
+                                    (display_name_ctx.0).set(Some(valid_name.clone()));
                                     matomo_logger::set_user_id(&valid_name);
 
                                     spawn(async move {
@@ -324,8 +324,8 @@ pub fn Home() -> Element {
                                             Ok(valid_name) => {
                                                 let meeting_id = generate_meeting_id();
                                                 username_value.set(valid_name.clone());
-                                                save_username_to_storage(&valid_name);
-                                                (username_ctx.0).set(Some(valid_name.clone()));
+                                                save_display_name_to_storage(&valid_name);
+                                                (display_name_ctx.0).set(Some(valid_name.clone()));
                                                 matomo_logger::set_user_id(&valid_name);
 
                                                 spawn(async move {
@@ -361,9 +361,9 @@ pub fn Home() -> Element {
                         }
                     }
                 }
-            
-            // div { class: "content-separator" }
 
+                div { class: "content-separator" }
+            
             // div { class: "grid grid-cols-1 md:grid-cols-2 gap-8", style: "margin-top:1em",
             //     div {
             //         button {

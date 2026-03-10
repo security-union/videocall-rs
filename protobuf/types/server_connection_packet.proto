@@ -19,7 +19,7 @@ message DataTransferInfo {
 // Connection metadata
 message ConnectionMetadata {
   string session_id = 1;
-  string customer_email = 2;
+  bytes user_id = 2;
   string meeting_id = 3;
   string protocol = 4;  // "websocket", "webtransport", "quic"
   string server_instance = 5;  // K8s pod name or server identifier

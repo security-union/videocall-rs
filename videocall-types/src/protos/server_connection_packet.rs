@@ -172,8 +172,8 @@ pub struct ConnectionMetadata {
     // message fields
     // @@protoc_insertion_point(field:server_connection_packet.ConnectionMetadata.session_id)
     pub session_id: ::std::string::String,
-    // @@protoc_insertion_point(field:server_connection_packet.ConnectionMetadata.customer_email)
-    pub customer_email: ::std::string::String,
+    // @@protoc_insertion_point(field:server_connection_packet.ConnectionMetadata.user_id)
+    pub user_id: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:server_connection_packet.ConnectionMetadata.meeting_id)
     pub meeting_id: ::std::string::String,
     // @@protoc_insertion_point(field:server_connection_packet.ConnectionMetadata.protocol)
@@ -207,9 +207,9 @@ impl ConnectionMetadata {
             |m: &mut ConnectionMetadata| { &mut m.session_id },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "customer_email",
-            |m: &ConnectionMetadata| { &m.customer_email },
-            |m: &mut ConnectionMetadata| { &mut m.customer_email },
+            "user_id",
+            |m: &ConnectionMetadata| { &m.user_id },
+            |m: &mut ConnectionMetadata| { &mut m.user_id },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "meeting_id",
@@ -253,7 +253,7 @@ impl ::protobuf::Message for ConnectionMetadata {
                     self.session_id = is.read_string()?;
                 },
                 18 => {
-                    self.customer_email = is.read_string()?;
+                    self.user_id = is.read_bytes()?;
                 },
                 26 => {
                     self.meeting_id = is.read_string()?;
@@ -282,8 +282,8 @@ impl ::protobuf::Message for ConnectionMetadata {
         if !self.session_id.is_empty() {
             my_size += ::protobuf::rt::string_size(1, &self.session_id);
         }
-        if !self.customer_email.is_empty() {
-            my_size += ::protobuf::rt::string_size(2, &self.customer_email);
+        if !self.user_id.is_empty() {
+            my_size += ::protobuf::rt::bytes_size(2, &self.user_id);
         }
         if !self.meeting_id.is_empty() {
             my_size += ::protobuf::rt::string_size(3, &self.meeting_id);
@@ -306,8 +306,8 @@ impl ::protobuf::Message for ConnectionMetadata {
         if !self.session_id.is_empty() {
             os.write_string(1, &self.session_id)?;
         }
-        if !self.customer_email.is_empty() {
-            os.write_string(2, &self.customer_email)?;
+        if !self.user_id.is_empty() {
+            os.write_bytes(2, &self.user_id)?;
         }
         if !self.meeting_id.is_empty() {
             os.write_string(3, &self.meeting_id)?;
@@ -339,7 +339,7 @@ impl ::protobuf::Message for ConnectionMetadata {
 
     fn clear(&mut self) {
         self.session_id.clear();
-        self.customer_email.clear();
+        self.user_id.clear();
         self.meeting_id.clear();
         self.protocol.clear();
         self.server_instance.clear();
@@ -350,7 +350,7 @@ impl ::protobuf::Message for ConnectionMetadata {
     fn default_instance() -> &'static ConnectionMetadata {
         static instance: ConnectionMetadata = ConnectionMetadata {
             session_id: ::std::string::String::new(),
-            customer_email: ::std::string::String::new(),
+            user_id: ::std::vec::Vec::new(),
             meeting_id: ::std::string::String::new(),
             protocol: ::std::string::String::new(),
             server_instance: ::std::string::String::new(),
@@ -672,47 +672,47 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \n$types/server_connection_packet.proto\x12\x18server_connection_packet\
     \"X\n\x10DataTransferInfo\x12\x1d\n\nbytes_sent\x18\x01\x20\x01(\x04R\tb\
     ytesSent\x12%\n\x0ebytes_received\x18\x02\x20\x01(\x04R\rbytesReceived\"\
-    \xd6\x01\n\x12ConnectionMetadata\x12\x1d\n\nsession_id\x18\x01\x20\x01(\
-    \tR\tsessionId\x12%\n\x0ecustomer_email\x18\x02\x20\x01(\tR\rcustomerEma\
-    il\x12\x1d\n\nmeeting_id\x18\x03\x20\x01(\tR\tmeetingId\x12\x1a\n\x08pro\
-    tocol\x18\x04\x20\x01(\tR\x08protocol\x12'\n\x0fserver_instance\x18\x05\
-    \x20\x01(\tR\x0eserverInstance\x12\x16\n\x06region\x18\x06\x20\x01(\tR\
-    \x06region\"\xfd\x02\n\x16ServerConnectionPacket\x12B\n\nevent_type\x18\
-    \x01\x20\x01(\x0e2#.server_connection_packet.EventTypeR\teventType\x12!\
-    \n\x0ctimestamp_ms\x18\x02\x20\x01(\x04R\x0btimestampMs\x12L\n\nconnecti\
-    on\x18\x03\x20\x01(\x0b2,.server_connection_packet.ConnectionMetadataR\n\
-    connection\x12O\n\rdata_transfer\x18\x04\x20\x01(\x0b2*.server_connectio\
-    n_packet.DataTransferInfoR\x0cdataTransfer\x124\n\x16connection_duration\
-    _ms\x18\x05\x20\x01(\x04R\x14connectionDurationMs\x12'\n\x0fis_reconnect\
-    ion\x18\x06\x20\x01(\x08R\x0eisReconnection*\\\n\tEventType\x12\x0b\n\
-    \x07UNKNOWN\x10\0\x12\x16\n\x12CONNECTION_STARTED\x10\x01\x12\x14\n\x10C\
-    ONNECTION_ENDED\x10\x02\x12\x14\n\x10DATA_TRANSFERRED\x10\x03J\x90\x0b\n\
-    \x06\x12\x04\0\0(\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\
-    \x12\x03\x02\0!\n+\n\x02\x05\0\x12\x04\x05\0\n\x01\x1a\x1f\x20Server\x20\
-    connection\x20event\x20types\n\n\n\n\x03\x05\0\x01\x12\x03\x05\x05\x0e\n\
-    \x0b\n\x04\x05\0\x02\0\x12\x03\x06\x02\x0e\n\x0c\n\x05\x05\0\x02\0\x01\
-    \x12\x03\x06\x02\t\n\x0c\n\x05\x05\0\x02\0\x02\x12\x03\x06\x0c\r\n\x0b\n\
-    \x04\x05\0\x02\x01\x12\x03\x07\x02\x19\n\x0c\n\x05\x05\0\x02\x01\x01\x12\
-    \x03\x07\x02\x14\n\x0c\n\x05\x05\0\x02\x01\x02\x12\x03\x07\x17\x18\n\x0b\
-    \n\x04\x05\0\x02\x02\x12\x03\x08\x02\x17\n\x0c\n\x05\x05\0\x02\x02\x01\
-    \x12\x03\x08\x02\x12\n\x0c\n\x05\x05\0\x02\x02\x02\x12\x03\x08\x15\x16\n\
-    \x0b\n\x04\x05\0\x02\x03\x12\x03\t\x02\x17\n\x0c\n\x05\x05\0\x02\x03\x01\
-    \x12\x03\t\x02\x12\n\x0c\n\x05\x05\0\x02\x03\x02\x12\x03\t\x15\x16\n'\n\
-    \x02\x04\0\x12\x04\r\0\x10\x01\x1a\x1b\x20Data\x20transfer\x20informatio\
-    n\n\n\n\n\x03\x04\0\x01\x12\x03\r\x08\x18\n\x0b\n\x04\x04\0\x02\0\x12\
-    \x03\x0e\x02\x18\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x0e\x02\x08\n\x0c\n\
-    \x05\x04\0\x02\0\x01\x12\x03\x0e\t\x13\n\x0c\n\x05\x04\0\x02\0\x03\x12\
-    \x03\x0e\x16\x17\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x0f\x02\x1c\n\x0c\n\
-    \x05\x04\0\x02\x01\x05\x12\x03\x0f\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\
-    \x12\x03\x0f\t\x17\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x0f\x1a\x1b\n!\
-    \n\x02\x04\x01\x12\x04\x13\0\x1a\x01\x1a\x15\x20Connection\x20metadata\n\
-    \n\n\n\x03\x04\x01\x01\x12\x03\x13\x08\x1a\n\x0b\n\x04\x04\x01\x02\0\x12\
+    \xc8\x01\n\x12ConnectionMetadata\x12\x1d\n\nsession_id\x18\x01\x20\x01(\
+    \tR\tsessionId\x12\x17\n\x07user_id\x18\x02\x20\x01(\x0cR\x06userId\x12\
+    \x1d\n\nmeeting_id\x18\x03\x20\x01(\tR\tmeetingId\x12\x1a\n\x08protocol\
+    \x18\x04\x20\x01(\tR\x08protocol\x12'\n\x0fserver_instance\x18\x05\x20\
+    \x01(\tR\x0eserverInstance\x12\x16\n\x06region\x18\x06\x20\x01(\tR\x06re\
+    gion\"\xfd\x02\n\x16ServerConnectionPacket\x12B\n\nevent_type\x18\x01\
+    \x20\x01(\x0e2#.server_connection_packet.EventTypeR\teventType\x12!\n\
+    \x0ctimestamp_ms\x18\x02\x20\x01(\x04R\x0btimestampMs\x12L\n\nconnection\
+    \x18\x03\x20\x01(\x0b2,.server_connection_packet.ConnectionMetadataR\nco\
+    nnection\x12O\n\rdata_transfer\x18\x04\x20\x01(\x0b2*.server_connection_\
+    packet.DataTransferInfoR\x0cdataTransfer\x124\n\x16connection_duration_m\
+    s\x18\x05\x20\x01(\x04R\x14connectionDurationMs\x12'\n\x0fis_reconnectio\
+    n\x18\x06\x20\x01(\x08R\x0eisReconnection*\\\n\tEventType\x12\x0b\n\x07U\
+    NKNOWN\x10\0\x12\x16\n\x12CONNECTION_STARTED\x10\x01\x12\x14\n\x10CONNEC\
+    TION_ENDED\x10\x02\x12\x14\n\x10DATA_TRANSFERRED\x10\x03J\x90\x0b\n\x06\
+    \x12\x04\0\0(\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\
+    \x03\x02\0!\n+\n\x02\x05\0\x12\x04\x05\0\n\x01\x1a\x1f\x20Server\x20conn\
+    ection\x20event\x20types\n\n\n\n\x03\x05\0\x01\x12\x03\x05\x05\x0e\n\x0b\
+    \n\x04\x05\0\x02\0\x12\x03\x06\x02\x0e\n\x0c\n\x05\x05\0\x02\0\x01\x12\
+    \x03\x06\x02\t\n\x0c\n\x05\x05\0\x02\0\x02\x12\x03\x06\x0c\r\n\x0b\n\x04\
+    \x05\0\x02\x01\x12\x03\x07\x02\x19\n\x0c\n\x05\x05\0\x02\x01\x01\x12\x03\
+    \x07\x02\x14\n\x0c\n\x05\x05\0\x02\x01\x02\x12\x03\x07\x17\x18\n\x0b\n\
+    \x04\x05\0\x02\x02\x12\x03\x08\x02\x17\n\x0c\n\x05\x05\0\x02\x02\x01\x12\
+    \x03\x08\x02\x12\n\x0c\n\x05\x05\0\x02\x02\x02\x12\x03\x08\x15\x16\n\x0b\
+    \n\x04\x05\0\x02\x03\x12\x03\t\x02\x17\n\x0c\n\x05\x05\0\x02\x03\x01\x12\
+    \x03\t\x02\x12\n\x0c\n\x05\x05\0\x02\x03\x02\x12\x03\t\x15\x16\n'\n\x02\
+    \x04\0\x12\x04\r\0\x10\x01\x1a\x1b\x20Data\x20transfer\x20information\n\
+    \n\n\n\x03\x04\0\x01\x12\x03\r\x08\x18\n\x0b\n\x04\x04\0\x02\0\x12\x03\
+    \x0e\x02\x18\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x0e\x02\x08\n\x0c\n\x05\
+    \x04\0\x02\0\x01\x12\x03\x0e\t\x13\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\
+    \x0e\x16\x17\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x0f\x02\x1c\n\x0c\n\x05\
+    \x04\0\x02\x01\x05\x12\x03\x0f\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\
+    \x03\x0f\t\x17\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x0f\x1a\x1b\n!\n\
+    \x02\x04\x01\x12\x04\x13\0\x1a\x01\x1a\x15\x20Connection\x20metadata\n\n\
+    \n\n\x03\x04\x01\x01\x12\x03\x13\x08\x1a\n\x0b\n\x04\x04\x01\x02\0\x12\
     \x03\x14\x02\x18\n\x0c\n\x05\x04\x01\x02\0\x05\x12\x03\x14\x02\x08\n\x0c\
     \n\x05\x04\x01\x02\0\x01\x12\x03\x14\t\x13\n\x0c\n\x05\x04\x01\x02\0\x03\
-    \x12\x03\x14\x16\x17\n\x0b\n\x04\x04\x01\x02\x01\x12\x03\x15\x02\x1c\n\
-    \x0c\n\x05\x04\x01\x02\x01\x05\x12\x03\x15\x02\x08\n\x0c\n\x05\x04\x01\
-    \x02\x01\x01\x12\x03\x15\t\x17\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03\
-    \x15\x1a\x1b\n\x0b\n\x04\x04\x01\x02\x02\x12\x03\x16\x02\x18\n\x0c\n\x05\
+    \x12\x03\x14\x16\x17\n\x0b\n\x04\x04\x01\x02\x01\x12\x03\x15\x02\x14\n\
+    \x0c\n\x05\x04\x01\x02\x01\x05\x12\x03\x15\x02\x07\n\x0c\n\x05\x04\x01\
+    \x02\x01\x01\x12\x03\x15\x08\x0f\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03\
+    \x15\x12\x13\n\x0b\n\x04\x04\x01\x02\x02\x12\x03\x16\x02\x18\n\x0c\n\x05\
     \x04\x01\x02\x02\x05\x12\x03\x16\x02\x08\n\x0c\n\x05\x04\x01\x02\x02\x01\
     \x12\x03\x16\t\x13\n\x0c\n\x05\x04\x01\x02\x02\x03\x12\x03\x16\x16\x17\n\
     2\n\x04\x04\x01\x02\x03\x12\x03\x17\x02\x16\"%\x20\"websocket\",\x20\"we\

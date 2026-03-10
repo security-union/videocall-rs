@@ -1,7 +1,7 @@
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{e2ee_enabled, webtransport_enabled};
-use crate::context::{load_username_from_storage, UsernameCtx};
+use crate::context::{load_display_name_from_storage, DisplayNameCtx};
 use crate::meeting_api::{join_meeting, JoinError};
 use web_sys::window;
 use yew::prelude::*;
@@ -20,18 +20,16 @@ pub enum MeetingStatus {
     Joining,
     /// Waiting for the host to start the meeting.
     /// Contains the observer token for receiving push notifications.
-    WaitingForMeeting {
-        observer_token: Option<String>,
-    },
+    WaitingForMeeting { observer_token: Option<String> },
     /// In the waiting room, pending host admission.
     /// Contains the observer token for receiving push notifications.
-    Waiting {
-        observer_token: Option<String>,
-    },
+    Waiting { observer_token: Option<String> },
     /// Admitted to the meeting
     Admitted {
         is_host: bool,
         host_display_name: Option<String>,
+        /// Authenticated user_id of the meeting host (from JWT/DB).
+        host_user_id: Option<String>,
         /// Signed JWT room access token for connecting to the media server
         room_token: String,
     },
@@ -48,11 +46,10 @@ pub struct MeetingPageProps {
 
 #[function_component(MeetingPage)]
 pub fn meeting_page(props: &MeetingPageProps) -> Html {
-    
     // --- ALL Hooks MUST be declared first (unconditionally) ---
-    // Retrieve the username context (may be None on first load)
-    let username_state =
-        use_context::<UsernameCtx>().expect("Username context provider is missing – this is a bug");
+    // Retrieve the display name context (may be None on first load)
+    let display_name_state = use_context::<DisplayNameCtx>()
+        .expect("DisplayName context provider is missing – this is a bug");
 
     // Check authentication if OAuth is enabled (runtime check)
     let auth_checked = use_state(|| false);
@@ -64,22 +61,23 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     // Meeting status state
     let meeting_status = use_state(|| MeetingStatus::NotJoined);
     let host_display_name = use_state(|| None::<String>);
-    let current_user_email = use_state(|| None::<String>);
+    let host_user_id_state = use_state(|| None::<String>);
+    let current_user_id = use_state(|| None::<String>);
     // Track if user came from waiting room (should auto-join when admitted)
     let came_from_waiting_room = use_state(|| false);
 
-    // Retrieve previously cached username (if any) either from the context
+    // Retrieve previously cached display name (if any) either from the context
     // or from localStorage and use it as the initial value for the input.
-    let initial_username: String = if let Some(name) = &*username_state {
+    let initial_display_name: String = if let Some(name) = &*display_name_state {
         name.clone()
     } else {
-        load_username_from_storage().unwrap_or_default()
+        load_display_name_from_storage().unwrap_or_default()
     };
 
     // Keep an internal controlled value so that re-renders do NOT wipe what
     // the user is typing. This fixes the issue where the field kept
     // resetting to an empty string.
-    let input_value_state = use_state(|| initial_username);
+    let input_value_state = use_state(|| initial_display_name);
 
     // Auth check effect
     {
@@ -142,7 +140,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         let meeting_id = props.id.clone();
         let meeting_status = meeting_status.clone();
         let host_display_name = host_display_name.clone();
-        let current_user_email = current_user_email.clone();
+        let host_user_id_state = host_user_id_state.clone();
+        let current_user_id = current_user_id.clone();
         let came_from_waiting_room = came_from_waiting_room.clone();
         let input_value_state = input_value_state.clone();
         let current_status = (*meeting_status).clone();
@@ -160,7 +159,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                 let meeting_id_for_rejoin = meeting_id.clone();
                 let meeting_status_for_rejoin = meeting_status.clone();
                 let host_display_name_for_rejoin = host_display_name.clone();
-                let current_user_email_for_rejoin = current_user_email.clone();
+                let host_user_id_for_rejoin = host_user_id_state.clone();
+                let current_user_id_for_rejoin = current_user_id.clone();
                 let came_from_waiting_room_for_rejoin = came_from_waiting_room.clone();
                 let display_name = (*input_value_state).clone();
 
@@ -176,13 +176,13 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     .map(|base| format!("{base}/lobby?token={token}"))
                     .collect();
 
-                // Use the user's email as userid so the server can match
-                // push-notification `target_email` to this observer client.
-                let email_for_userid = (*current_user_email).clone()
+                // Use the user's ID so the server can match
+                // push-notification `target_user_id` to this observer client.
+                let user_id_value = (*current_user_id).clone()
                     .unwrap_or_else(|| display_name.clone());
 
                 let opts = VideoCallClientOptions {
-                    userid: email_for_userid,
+                    user_id: user_id_value,
                     meeting_id: meeting_id.clone(),
                     websocket_urls: observer_ws_urls,
                     webtransport_urls: observer_wt_urls,
@@ -213,7 +213,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         let meeting_id = meeting_id_for_rejoin.clone();
                         let meeting_status = meeting_status_for_rejoin.clone();
                         let host_display_name = host_display_name_for_rejoin.clone();
-                        let current_user_email = current_user_email_for_rejoin.clone();
+                        let host_user_id_state = host_user_id_for_rejoin.clone();
+                        let current_user_id = current_user_id_for_rejoin.clone();
                         let came_from_waiting_room = came_from_waiting_room_for_rejoin.clone();
                         let display_name = display_name.clone();
 
@@ -225,9 +226,11 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                         response.status,
                                         response.is_host
                                     );
-                                    current_user_email.set(Some(response.email.clone()));
+                                    current_user_id.set(Some(response.user_id.clone()));
                                     let determined_host = response.host_display_name.clone();
+                                    let determined_host_uid = response.host_user_id.clone();
                                     host_display_name.set(determined_host.clone());
+                                    host_user_id_state.set(determined_host_uid.clone());
 
                                     match response.status.as_str() {
                                         "admitted" => {
@@ -235,6 +238,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                                 meeting_status.set(MeetingStatus::Admitted {
                                                     is_host: response.is_host,
                                                     host_display_name: determined_host,
+                                                    host_user_id: determined_host_uid,
                                                     room_token: token,
                                                 });
                                             } else {
@@ -273,6 +277,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     on_waiting_room_updated: None,
                     on_speaking_changed: None,
                     vad_threshold: None,
+                    on_peer_left: None,
+                    on_peer_joined: None,
                 };
 
                 let mut client = VideoCallClient::new(opts);
@@ -295,7 +301,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         let meeting_id = props.id.clone();
         let meeting_status = meeting_status.clone();
         let host_display_name = host_display_name.clone();
-        let current_user_email = current_user_email.clone();
+        let host_user_id_state = host_user_id_state.clone();
+        let current_user_id = current_user_id.clone();
         let input_value_state = input_value_state.clone();
         let came_from_waiting_room = came_from_waiting_room.clone();
 
@@ -303,9 +310,10 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
             let meeting_id = meeting_id.clone();
             let meeting_status = meeting_status.clone();
             let host_display_name = host_display_name.clone();
-            let current_user_email = current_user_email.clone();
+            let host_user_id_state = host_user_id_state.clone();
+            let current_user_id = current_user_id.clone();
             let came_from_waiting_room = came_from_waiting_room.clone();
-            // Get the username that the user entered
+            // Get the display name that the user entered
             let display_name = (*input_value_state).clone();
 
             meeting_status.set(MeetingStatus::Joining);
@@ -319,8 +327,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                             response.is_host
                         );
 
-                        // Store the current user's email from the response
-                        current_user_email.set(Some(response.email.clone()));
+                        // Store the current user's ID from the response
+                        current_user_id.set(Some(response.user_id.clone()));
 
                         // Get the host's display name from meeting info
                         let determined_host_display_name = if response.is_host {
@@ -333,7 +341,18 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 Err(_) => None,
                             }
                         };
+                        // Use the API-provided host_user_id; if the current user
+                        // is the host and the API didn't include it, fall back to
+                        // the user_id from the response.
+                        let determined_host_uid = response.host_user_id.clone().or_else(|| {
+                            if response.is_host {
+                                Some(response.user_id.clone())
+                            } else {
+                                None
+                            }
+                        });
                         host_display_name.set(determined_host_display_name.clone());
+                        host_user_id_state.set(determined_host_uid.clone());
 
                         match response.status.as_str() {
                             "admitted" => {
@@ -341,6 +360,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                     meeting_status.set(MeetingStatus::Admitted {
                                         is_host: response.is_host,
                                         host_display_name: determined_host_display_name,
+                                        host_user_id: determined_host_uid,
                                         room_token: token,
                                     });
                                 } else {
@@ -358,7 +378,9 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 });
                             }
                             "waiting_for_meeting" => {
-                                log::info!("Meeting not active yet, using observer for push notifications");
+                                log::info!(
+                                    "Meeting not active yet, using observer for push notifications"
+                                );
                                 meeting_status.set(MeetingStatus::WaitingForMeeting {
                                     observer_token: response.observer_token.clone(),
                                 });
@@ -390,27 +412,24 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         })
     };
 
-    // Auto-join: when the username is already set and the meeting status is
+    // Auto-join: when the display name is already set and the meeting status is
     // NotJoined, trigger the join flow automatically so the user does not
     // have to interact with a redundant form.
     {
         let on_join_meeting = on_join_meeting.clone();
-        let has_username = (*username_state).is_some();
+        let has_display_name = (*display_name_state).is_some();
         let is_not_joined = matches!(*meeting_status, MeetingStatus::NotJoined);
         let auto_join_attempted = use_mut_ref(|| false);
-        use_effect_with(
-            (has_username, is_not_joined),
-            {
-                let auto_join_attempted = auto_join_attempted.clone();
-                move |(has_username, is_not_joined)| {
-                    if *has_username && *is_not_joined && !*auto_join_attempted.borrow() {
-                        *auto_join_attempted.borrow_mut() = true;
-                        on_join_meeting.emit(());
-                    }
-                    || ()
+        use_effect_with((has_display_name, is_not_joined), {
+            let auto_join_attempted = auto_join_attempted.clone();
+            move |(has_display_name, is_not_joined)| {
+                if *has_display_name && *is_not_joined && !*auto_join_attempted.borrow() {
+                    *auto_join_attempted.borrow_mut() = true;
+                    on_join_meeting.emit(());
                 }
-            },
-        );
+                || ()
+            }
+        });
     }
 
     // Logout handler
@@ -438,14 +457,18 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     let on_admitted = {
         let meeting_status = meeting_status.clone();
         let host_display_name = host_display_name.clone();
+        let host_user_id_state = host_user_id_state.clone();
 
         Callback::from(move |response: crate::meeting_api::JoinMeetingResponse| {
             let determined_host = response.host_display_name.clone();
+            let determined_host_uid = response.host_user_id.clone();
             let token = response.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
+            host_user_id_state.set(determined_host_uid.clone());
             meeting_status.set(MeetingStatus::Admitted {
                 is_host: false,
                 host_display_name: determined_host,
+                host_user_id: determined_host_uid,
                 room_token: token,
             });
         })
@@ -475,26 +498,27 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     };
 
     // Clone values for use inside html! macro
-    let maybe_username = (*username_state).clone();
+    let maybe_display_name = (*display_name_state).clone();
 
     let current_meeting_status = (*meeting_status).clone();
     let should_auto_join = *came_from_waiting_room;
     html! {
         <>
             {
-                match (&maybe_username, &current_meeting_status) {
+                match (&maybe_display_name, &current_meeting_status) {
                     // User is admitted - show the meeting
-                    (Some(username), MeetingStatus::Admitted { is_host, host_display_name, room_token }) => {
+                    (Some(display_name), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token }) => {
                         html! {
                             <AttendantsComponent
-                                email={username.clone()}
+                                display_name={display_name.clone()}
                                 id={props.id.clone()}
                                 webtransport_enabled={webtransport_enabled().unwrap_or(false)}
                                 e2ee_enabled={e2ee_enabled().unwrap_or(false)}
                                 user_name={(*user_profile).as_ref().map(|p| p.name.clone())}
-                                user_email={(*current_user_email).clone().or_else(|| (*user_profile).as_ref().map(|p| p.email.clone()))}
+                                user_id={(*current_user_id).clone().or_else(|| (*user_profile).as_ref().map(|p| p.user_id.clone()))}
                                 on_logout={Some(on_logout.clone())}
                                 host_display_name={host_display_name.clone()}
+                                host_user_id={host_user_id.clone()}
                                 auto_join={should_auto_join}
                                 is_owner={*is_host}
                                 room_token={room_token.clone()}
@@ -507,7 +531,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         html! {
                             <WaitingRoom
                                 meeting_id={props.id.clone()}
-                                email={(*current_user_email).clone().unwrap_or_default()}
+                                user_id={(*current_user_id).clone().unwrap_or_default()}
+                                display_name={(*input_value_state).clone()}
                                 observer_token={observer_token.clone()}
                                 on_admitted={on_admitted}
                                 on_rejected={on_rejected}
@@ -599,7 +624,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
 
                     // Joining in progress
                     (Some(_), MeetingStatus::Joining) => {
-                        let display_name = maybe_username.as_deref().unwrap_or("...");
+                        let display_name = maybe_display_name.as_deref().unwrap_or("...");
                         html! {
                             <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;">
                                 <div class="loading-spinner" style="width: 40px; height: 40px; margin-bottom: 1rem;"></div>
@@ -612,20 +637,20 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         }
                     }
 
-                    // No username set, or waiting for auto-join to fire
+                    // No display name set, or waiting for auto-join to fire
                     _ => {
-                        if maybe_username.is_none() {
+                        if maybe_display_name.is_none() {
                             // Show inline display name prompt instead of redirecting
                             let on_display_name_submit = {
                                 let input_value_state = input_value_state.clone();
-                                let username_state = username_state.clone();
+                                let display_name_state = display_name_state.clone();
                                 Callback::from(move |e: SubmitEvent| {
                                     e.prevent_default();
                                     let raw = (*input_value_state).clone();
                                     match crate::context::validate_display_name(&raw) {
                                         Ok(valid_name) => {
-                                            crate::context::save_username_to_storage(&valid_name);
-                                            username_state.set(Some(valid_name));
+                                            crate::context::save_display_name_to_storage(&valid_name);
+                                            display_name_state.set(Some(valid_name));
                                         }
                                         Err(msg) => {
                                             if let Some(w) = web_sys::window() {
@@ -673,8 +698,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 </div>
                             }
                         } else {
-                            // Username is set; the auto-join effect will fire momentarily
-                            let display_name = maybe_username.as_deref().unwrap_or("Unknown");
+                            // Display name is set; the auto-join effect will fire momentarily
+                            let display_name = maybe_display_name.as_deref().unwrap_or("Unknown");
                             html! {
                                 <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;">
                                     <div class="loading-spinner" style="width: 40px; height: 40px; margin-bottom: 1rem;"></div>

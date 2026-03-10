@@ -14,10 +14,12 @@
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
-    actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled,
-    webtransport_host_base,
+    actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled, webtransport_host_base,
 };
-use crate::context::{load_username_from_storage, save_username_to_storage, validate_display_name, UsernameCtx};
+use crate::context::{
+    get_or_create_local_user_id, load_display_name_from_storage, save_display_name_to_storage,
+    validate_display_name, DisplayNameCtx,
+};
 use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
@@ -41,6 +43,7 @@ pub enum MeetingStatus {
     Admitted {
         is_host: bool,
         host_display_name: Option<String>,
+        host_user_id: Option<String>,
         room_token: String,
         waiting_room_enabled: bool,
     },
@@ -50,13 +53,14 @@ pub enum MeetingStatus {
 
 #[component]
 pub fn MeetingPage(id: String) -> Element {
-    let mut username_ctx = use_context::<UsernameCtx>();
+    let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut auth_checked = use_signal(|| false);
     let navigator = use_navigator();
     let mut user_profile = use_signal(|| None::<UserProfile>);
     let mut meeting_status = use_signal(|| MeetingStatus::NotJoined);
     let mut host_display_name = use_signal(|| None::<String>);
-    let mut current_user_email = use_signal(|| None::<String>);
+    let mut host_user_id = use_signal(|| None::<String>);
+    let mut current_user_id = use_signal(|| None::<String>);
     let mut came_from_waiting_room = use_signal(|| false);
 
     // Separate signal that tracks only the observer token for the WaitingForMeeting
@@ -66,10 +70,10 @@ pub fn MeetingPage(id: String) -> Element {
     // set `meeting_status` and the effect tried to re-run synchronously.
     let mut observer_token_signal = use_signal(|| None::<String>);
 
-    let initial_username: String = if let Some(name) = (username_ctx.0)() {
+    let initial_username: String = if let Some(name) = (display_name_ctx.0)() {
         name
     } else {
-        load_username_from_storage().unwrap_or_default()
+        load_display_name_from_storage().unwrap_or_default()
     };
     let mut input_value_state = use_signal(|| initial_username);
 
@@ -151,8 +155,7 @@ pub fn MeetingPage(id: String) -> Element {
             let display_name = input_value_state();
 
             // Build observer lobby URLs using the observer token
-            let lobby_url =
-                |base: &str| format!("{base}/lobby?token={observer_token}");
+            let lobby_url = |base: &str| format!("{base}/lobby?token={observer_token}");
             let websocket_urls: Vec<String> = actix_websocket_base()
                 .unwrap_or_default()
                 .split(',')
@@ -164,13 +167,12 @@ pub fn MeetingPage(id: String) -> Element {
                 .map(&lobby_url)
                 .collect();
 
-            // Use the user's email as userid so the server can match
-            // push-notification `target_email` to this observer client.
-            let email_for_userid = current_user_email()
-                .unwrap_or_else(|| display_name.clone());
+            // Use the user's ID so the server can match
+            // push-notification `target_user_id` to this observer client.
+            let user_id_for_client = current_user_id().unwrap_or_else(|| display_name.clone());
 
             let opts = VideoCallClientOptions {
-                userid: email_for_userid,
+                user_id: user_id_for_client,
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,
@@ -214,17 +216,24 @@ pub fn MeetingPage(id: String) -> Element {
 
                             match join_meeting(&meeting_id, Some(&display_name)).await {
                                 Ok(response) => {
-                                    current_user_email.set(Some(response.email.clone()));
+                                    let effective_user_id = if response.user_id.is_empty() {
+                                        get_or_create_local_user_id()
+                                    } else {
+                                        response.user_id.clone()
+                                    };
+                                    current_user_id.set(Some(effective_user_id));
                                     let determined_host = response.host_display_name.clone();
-                                    let wr_enabled =
-                                        response.waiting_room_enabled.unwrap_or(true);
+                                    let determined_host_uid = response.host_user_id.clone();
+                                    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                                     host_display_name.set(determined_host.clone());
+                                    host_user_id.set(determined_host_uid.clone());
                                     match response.status.as_str() {
                                         "admitted" => {
                                             if let Some(token) = response.room_token {
                                                 meeting_status.set(MeetingStatus::Admitted {
                                                     is_host: response.is_host,
                                                     host_display_name: determined_host,
+                                                    host_user_id: determined_host_uid,
                                                     room_token: token,
                                                     waiting_room_enabled: wr_enabled,
                                                 });
@@ -235,14 +244,12 @@ pub fn MeetingPage(id: String) -> Element {
                                             }
                                         }
                                         "waiting" => {
-                                            let obs_token = response
-                                                .observer_token
-                                                .unwrap_or_default();
+                                            let obs_token =
+                                                response.observer_token.unwrap_or_default();
                                             came_from_waiting_room.set(true);
                                             // Also set observer_token_signal for
                                             // the Waiting state (observer stays alive).
-                                            observer_token_signal
-                                                .set(Some(obs_token.clone()));
+                                            observer_token_signal.set(Some(obs_token.clone()));
                                             meeting_status.set(MeetingStatus::Waiting {
                                                 observer_token: obs_token,
                                             });
@@ -250,17 +257,14 @@ pub fn MeetingPage(id: String) -> Element {
                                         "rejected" => {
                                             meeting_status.set(MeetingStatus::Rejected);
                                         }
-                                        _ => meeting_status.set(MeetingStatus::Error(
-                                            format!(
-                                                "Unknown status: {}",
-                                                response.status
-                                            ),
-                                        )),
+                                        _ => meeting_status.set(MeetingStatus::Error(format!(
+                                            "Unknown status: {}",
+                                            response.status
+                                        ))),
                                     }
                                 }
                                 Err(e) => {
-                                    meeting_status
-                                        .set(MeetingStatus::Error(e.to_string()));
+                                    meeting_status.set(MeetingStatus::Error(e.to_string()));
                                 }
                             }
                         });
@@ -271,6 +275,8 @@ pub fn MeetingPage(id: String) -> Element {
                 on_waiting_room_updated: None,
                 on_speaking_changed: None,
                 vad_threshold: None,
+                on_peer_left: None,
+                on_peer_joined: None,
             };
 
             let mut client = VideoCallClient::new(opts);
@@ -310,14 +316,33 @@ pub fn MeetingPage(id: String) -> Element {
             wasm_bindgen_futures::spawn_local(async move {
                 match join_meeting(&meeting_id, Some(&display_name)).await {
                     Ok(response) => {
-                        current_user_email.set(Some(response.email.clone()));
+                        // Use the API-provided user_id when available;
+                        // fall back to a locally-generated stable UUID
+                        // so non-OAuth users still get a persistent identity.
+                        let effective_user_id = if response.user_id.is_empty() {
+                            get_or_create_local_user_id()
+                        } else {
+                            response.user_id.clone()
+                        };
+                        current_user_id.set(Some(effective_user_id.clone()));
                         let determined_host = if response.is_host {
                             Some(display_name.clone())
                         } else {
                             response.host_display_name.clone()
                         };
+                        // Use the API-provided host_user_id; if the current user
+                        // is the host and the API didn't include it, fall back to
+                        // the effective_user_id we just computed.
+                        let determined_host_uid = response.host_user_id.clone().or_else(|| {
+                            if response.is_host {
+                                Some(effective_user_id.clone())
+                            } else {
+                                None
+                            }
+                        });
                         let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                         host_display_name.set(determined_host.clone());
+                        host_user_id.set(determined_host_uid.clone());
                         match response.status.as_str() {
                             "admitted" => {
                                 observer_token_signal.set(None);
@@ -325,6 +350,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     meeting_status.set(MeetingStatus::Admitted {
                                         is_host: response.is_host,
                                         host_display_name: determined_host,
+                                        host_user_id: determined_host_uid,
                                         room_token: token,
                                         waiting_room_enabled: wr_enabled,
                                     });
@@ -335,19 +361,15 @@ pub fn MeetingPage(id: String) -> Element {
                                 }
                             }
                             "waiting_for_meeting" => {
-                                let obs_token =
-                                    response.observer_token.unwrap_or_default();
-                                observer_token_signal
-                                    .set(Some(obs_token.clone()));
+                                let obs_token = response.observer_token.unwrap_or_default();
+                                observer_token_signal.set(Some(obs_token.clone()));
                                 meeting_status.set(MeetingStatus::WaitingForMeeting {
                                     observer_token: obs_token,
                                 });
                             }
                             "waiting" => {
-                                let obs_token =
-                                    response.observer_token.unwrap_or_default();
-                                observer_token_signal
-                                    .set(Some(obs_token.clone()));
+                                let obs_token = response.observer_token.unwrap_or_default();
+                                observer_token_signal.set(Some(obs_token.clone()));
                                 came_from_waiting_room.set(true);
                                 meeting_status.set(MeetingStatus::Waiting {
                                     observer_token: obs_token,
@@ -386,13 +408,16 @@ pub fn MeetingPage(id: String) -> Element {
     let on_admitted = {
         move |status: JoinMeetingResponse| {
             let determined_host = status.host_display_name.clone();
+            let determined_host_uid = status.host_user_id.clone();
             let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
+            host_user_id.set(determined_host_uid.clone());
             observer_token_signal.set(None);
             meeting_status.set(MeetingStatus::Admitted {
                 is_host: false,
                 host_display_name: determined_host,
+                host_user_id: determined_host_uid,
                 room_token: token,
                 waiting_room_enabled: wr_enabled,
             });
@@ -424,7 +449,7 @@ pub fn MeetingPage(id: String) -> Element {
         let mut on_join = on_join_meeting.clone();
         let mut auto_join_attempted = use_signal(|| false);
         use_effect(move || {
-            let has_username = (username_ctx.0)().is_some();
+            let has_username = (display_name_ctx.0)().is_some();
             let is_not_joined = matches!(meeting_status(), MeetingStatus::NotJoined);
             if has_username && is_not_joined && !auto_join_attempted() {
                 auto_join_attempted.set(true);
@@ -433,23 +458,26 @@ pub fn MeetingPage(id: String) -> Element {
         });
     }
 
-    let maybe_username = (username_ctx.0)();
+    let maybe_username = (display_name_ctx.0)();
     let current_meeting_status = meeting_status();
     let should_auto_join = came_from_waiting_room();
 
     rsx! {
         match (&maybe_username, &current_meeting_status) {
             // User is admitted - show the meeting
-            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, room_token, waiting_room_enabled }) => rsx! {
+            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled }) => rsx! {
                 AttendantsComponent {
-                    email: username.clone(),
+                    display_name: username.clone(),
                     id: id.clone(),
                     webtransport_enabled: webtransport_enabled().unwrap_or(false),
                     e2ee_enabled: e2ee_enabled().unwrap_or(false),
                     user_name: user_profile().as_ref().map(|p| p.name.clone()),
-                    user_email: current_user_email().or_else(|| user_profile().as_ref().map(|p| p.email.clone())),
+                    user_id: current_user_id()
+                        .or_else(|| user_profile().as_ref().map(|p| p.user_id.clone()))
+                        .or_else(|| Some(get_or_create_local_user_id())),
                     on_logout: Some(EventHandler::new(on_logout)),
                     host_display_name: host_display_name.clone(),
+                    host_user_id: host_user_id.clone(),
                     auto_join: should_auto_join,
                     is_owner: *is_host,
                     room_token: room_token.clone(),
@@ -461,7 +489,8 @@ pub fn MeetingPage(id: String) -> Element {
             (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {
                 WaitingRoom {
                     meeting_id: id.clone(),
-                    email: current_user_email().unwrap_or_default(),
+                    user_id: current_user_id().unwrap_or_default(),
+                    display_name: input_value_state(),
                     observer_token: observer_token.clone(),
                     on_admitted: on_admitted,
                     on_rejected: on_rejected,
@@ -576,8 +605,8 @@ pub fn MeetingPage(id: String) -> Element {
                                         let raw = input_value_state();
                                         match validate_display_name(&raw) {
                                             Ok(valid_name) => {
-                                                save_username_to_storage(&valid_name);
-                                                (username_ctx.0).set(Some(valid_name));
+                                                save_display_name_to_storage(&valid_name);
+                                                (display_name_ctx.0).set(Some(valid_name));
                                             }
                                             Err(msg) => {
                                                 if let Some(w) = web_sys::window() {

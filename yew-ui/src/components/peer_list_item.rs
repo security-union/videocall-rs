@@ -28,6 +28,8 @@ pub struct PeerListItem {}
 pub struct PeerListItemProps {
     pub name: String,
     #[prop_or_default]
+    pub tooltip: String,
+    #[prop_or_default]
     pub is_host: bool,
     #[prop_or(true)]
     pub muted: bool,
@@ -47,10 +49,16 @@ impl Component for PeerListItem {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let name = ctx.props().name.clone();
         let is_host = ctx.props().is_host;
-        let title = if is_host {
-            format!("Host: {name}")
-        } else {
+        let tooltip = &ctx.props().tooltip;
+        let effective_tooltip = if tooltip.is_empty() {
             name.clone()
+        } else {
+            tooltip.clone()
+        };
+        let title = if is_host {
+            format!("Host: {effective_tooltip}")
+        } else {
+            effective_tooltip
         };
 
         let mic_class = if ctx.props().speaking {

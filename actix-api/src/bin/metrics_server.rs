@@ -21,7 +21,7 @@ type HealthDataStore = Arc<Mutex<HashMap<String, Value>>>;
 struct SessionInfo {
     session_id: String,
     meeting_id: String,
-    reporting_peer: String,
+    reporting_user_id: String,
     last_seen: Instant,
     // Peers we have published metrics for in this session (as to_peer)
     to_peers: HashSet<String>,
@@ -94,7 +94,7 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker) {
         if let Some(session_info) = tracker.remove(&key) {
             info!(
                 "Cleaning up stale session: {} (meeting: {}, peer: {})",
-                session_info.session_id, session_info.meeting_id, session_info.reporting_peer
+                session_info.session_id, session_info.meeting_id, session_info.reporting_user_id
             );
 
             // Remove all metrics for this session
@@ -111,16 +111,16 @@ fn remove_session_metrics(session_info: &SessionInfo) {
 
     // Remove self-reported enabled metrics for the reporting peer in this meeting
     let _ = SELF_AUDIO_ENABLED
-        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_peer]);
+        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_user_id]);
     let _ = SELF_VIDEO_ENABLED
-        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_peer]);
+        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_user_id]);
 
     // Remove active server metrics for this session
     for (server_url, server_type) in &session_info.active_servers {
         let server_labels = [
             &session_info.meeting_id,
             &session_info.session_id,
-            &session_info.reporting_peer,
+            &session_info.reporting_user_id,
             server_url.as_str(),
             server_type.as_str(),
         ];
@@ -138,7 +138,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         let labels = [
             &session_info.meeting_id,
             &session_info.session_id,
-            &session_info.reporting_peer,
+            &session_info.reporting_user_id,
             to_peer.as_str(),
         ];
         let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
@@ -162,7 +162,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     // Meeting participants is recomputed on next scrape; no need to force remove
     debug!(
         "Removed all series for session {} (meeting: {}, peer: {})",
-        session_info.session_id, session_info.meeting_id, session_info.reporting_peer
+        session_info.session_id, session_info.meeting_id, session_info.reporting_user_id
     );
 }
 
@@ -182,22 +182,23 @@ fn process_health_packet_to_metrics_pb(
         &health_packet.session_id
     };
 
-    let reporting_peer = if health_packet.reporting_peer.is_empty() {
-        "unknown"
+    let reporting_user_id_str = if health_packet.reporting_user_id.is_empty() {
+        "unknown".to_string()
     } else {
-        &health_packet.reporting_peer
+        videocall_types::user_id_bytes_to_string(&health_packet.reporting_user_id)
     };
+    let reporting_user_id = reporting_user_id_str.as_str();
 
     // Update session tracker
     {
         let mut tracker = session_tracker.lock().unwrap();
-        let session_key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
         tracker.insert(
             session_key,
             SessionInfo {
                 session_id: session_id.to_string(),
                 meeting_id: meeting_id.to_string(),
-                reporting_peer: reporting_peer.to_string(),
+                reporting_user_id: reporting_user_id.to_string(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
@@ -209,7 +210,7 @@ fn process_health_packet_to_metrics_pb(
     // Check if this session is active (not cleaned up)
     let is_session_active = {
         let tracker = session_tracker.lock().unwrap();
-        let session_key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
         tracker.contains_key(&session_key)
     };
 
@@ -228,7 +229,7 @@ fn process_health_packet_to_metrics_pb(
                 .with_label_values(&[
                     meeting_id,
                     session_id,
-                    reporting_peer,
+                    reporting_user_id,
                     server_url,
                     server_type,
                 ])
@@ -239,7 +240,7 @@ fn process_health_packet_to_metrics_pb(
                     .with_label_values(&[
                         meeting_id,
                         session_id,
-                        reporting_peer,
+                        reporting_user_id,
                         server_url,
                         server_type,
                     ])
@@ -249,7 +250,7 @@ fn process_health_packet_to_metrics_pb(
             // Track server info used for cleanup
             {
                 let mut tracker = session_tracker.lock().unwrap();
-                let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                 if let Some(info) = tracker.get_mut(&key) {
                     info.active_servers
                         .insert((server_url.to_string(), server_type.to_string()));
@@ -264,10 +265,10 @@ fn process_health_packet_to_metrics_pb(
         // Self-state reported by the sender (authoritative)
         debug!(
             "Setting SELF_AUDIO_ENABLED for meeting={}, peer={}, value={}",
-            meeting_id, reporting_peer, health_packet.reporting_audio_enabled
+            meeting_id, reporting_user_id, health_packet.reporting_audio_enabled
         );
         SELF_AUDIO_ENABLED
-            .with_label_values(&[meeting_id, reporting_peer])
+            .with_label_values(&[meeting_id, reporting_user_id])
             .set(if health_packet.reporting_audio_enabled {
                 1.0
             } else {
@@ -276,10 +277,10 @@ fn process_health_packet_to_metrics_pb(
 
         debug!(
             "Setting SELF_VIDEO_ENABLED for meeting={}, peer={}, value={}",
-            meeting_id, reporting_peer, health_packet.reporting_video_enabled
+            meeting_id, reporting_user_id, health_packet.reporting_video_enabled
         );
         SELF_VIDEO_ENABLED
-            .with_label_values(&[meeting_id, reporting_peer])
+            .with_label_values(&[meeting_id, reporting_user_id])
             .set(if health_packet.reporting_video_enabled {
                 1.0
             } else {
@@ -300,7 +301,7 @@ fn process_health_packet_to_metrics_pb(
                 // Track peer_id used for connections
                 {
                     let mut tracker = session_tracker.lock().unwrap();
-                    let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                    let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                     if let Some(info) = tracker.get_mut(&key) {
                         info.peer_ids.insert(peer_id.clone());
                     }
@@ -311,11 +312,16 @@ fn process_health_packet_to_metrics_pb(
                     {
                         let can_listen = peer_data.can_listen;
                         PEER_CAN_LISTEN
-                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
+                            .with_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporting_user_id,
+                                peer_id,
+                            ])
                             .set(if can_listen { 1.0 } else { 0.0 });
                         // Track to_peer used
                         let mut tracker = session_tracker.lock().unwrap();
-                        let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                        let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                         if let Some(info) = tracker.get_mut(&key) {
                             info.to_peers.insert(peer_id.clone());
                         }
@@ -325,10 +331,15 @@ fn process_health_packet_to_metrics_pb(
                     {
                         let can_see = peer_data.can_see;
                         PEER_CAN_SEE
-                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
+                            .with_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporting_user_id,
+                                peer_id,
+                            ])
                             .set(if can_see { 1.0 } else { 0.0 });
                         let mut tracker = session_tracker.lock().unwrap();
-                        let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                        let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                         if let Some(info) = tracker.get_mut(&key) {
                             info.to_peers.insert(peer_id.clone());
                         }
@@ -341,12 +352,12 @@ fn process_health_packet_to_metrics_pb(
                                 .with_label_values(&[
                                     meeting_id,
                                     session_id,
-                                    reporting_peer,
+                                    reporting_user_id,
                                     peer_id,
                                 ])
                                 .set(neteq_stats.current_buffer_size_ms);
                             let mut tracker = session_tracker.lock().unwrap();
-                            let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                            let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                             if let Some(info) = tracker.get_mut(&key) {
                                 info.to_peers.insert(peer_id.clone());
                             }
@@ -357,12 +368,12 @@ fn process_health_packet_to_metrics_pb(
                                 .with_label_values(&[
                                     meeting_id,
                                     session_id,
-                                    reporting_peer,
+                                    reporting_user_id,
                                     peer_id,
                                 ])
                                 .set(neteq_stats.packets_awaiting_decode);
                             let mut tracker = session_tracker.lock().unwrap();
-                            let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                            let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                             if let Some(info) = tracker.get_mut(&key) {
                                 info.to_peers.insert(peer_id.clone());
                             }
@@ -373,12 +384,12 @@ fn process_health_packet_to_metrics_pb(
                                 .with_label_values(&[
                                     meeting_id,
                                     session_id,
-                                    reporting_peer,
+                                    reporting_user_id,
                                     peer_id,
                                 ])
                                 .set(neteq_stats.packets_per_sec);
                             let mut tracker = session_tracker.lock().unwrap();
-                            let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                            let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                             if let Some(info) = tracker.get_mut(&key) {
                                 info.to_peers.insert(peer_id.clone());
                             }
@@ -393,7 +404,7 @@ fn process_health_packet_to_metrics_pb(
                                         .with_label_values(&[
                                             meeting_id,
                                             session_id,
-                                            reporting_peer,
+                                            reporting_user_id,
                                             peer_id,
                                         ])
                                         .set(operation_counters.normal_per_sec);
@@ -405,7 +416,7 @@ fn process_health_packet_to_metrics_pb(
                                         .with_label_values(&[
                                             meeting_id,
                                             session_id,
-                                            reporting_peer,
+                                            reporting_user_id,
                                             peer_id,
                                         ])
                                         .set(operation_counters.expand_per_sec);
@@ -417,7 +428,7 @@ fn process_health_packet_to_metrics_pb(
                                         .with_label_values(&[
                                             meeting_id,
                                             session_id,
-                                            reporting_peer,
+                                            reporting_user_id,
                                             peer_id,
                                         ])
                                         .set(operation_counters.accelerate_per_sec);
@@ -429,7 +440,7 @@ fn process_health_packet_to_metrics_pb(
                                         .with_label_values(&[
                                             meeting_id,
                                             session_id,
-                                            reporting_peer,
+                                            reporting_user_id,
                                             peer_id,
                                         ])
                                         .set(operation_counters.fast_accelerate_per_sec);
@@ -441,7 +452,7 @@ fn process_health_packet_to_metrics_pb(
                                         .with_label_values(&[
                                             meeting_id,
                                             session_id,
-                                            reporting_peer,
+                                            reporting_user_id,
                                             peer_id,
                                         ])
                                         .set(operation_counters.preemptive_expand_per_sec);
@@ -453,7 +464,7 @@ fn process_health_packet_to_metrics_pb(
                                         .with_label_values(&[
                                             meeting_id,
                                             session_id,
-                                            reporting_peer,
+                                            reporting_user_id,
                                             peer_id,
                                         ])
                                         .set(operation_counters.merge_per_sec);
@@ -465,7 +476,7 @@ fn process_health_packet_to_metrics_pb(
                                         .with_label_values(&[
                                             meeting_id,
                                             session_id,
-                                            reporting_peer,
+                                            reporting_user_id,
                                             peer_id,
                                         ])
                                         .set(operation_counters.comfort_noise_per_sec);
@@ -477,7 +488,7 @@ fn process_health_packet_to_metrics_pb(
                                         .with_label_values(&[
                                             meeting_id,
                                             session_id,
-                                            reporting_peer,
+                                            reporting_user_id,
                                             peer_id,
                                         ])
                                         .set(operation_counters.dtmf_per_sec);
@@ -489,7 +500,7 @@ fn process_health_packet_to_metrics_pb(
                                         .with_label_values(&[
                                             meeting_id,
                                             session_id,
-                                            reporting_peer,
+                                            reporting_user_id,
                                             peer_id,
                                         ])
                                         .set(operation_counters.undefined_per_sec);
@@ -505,7 +516,7 @@ fn process_health_packet_to_metrics_pb(
                                 .with_label_values(&[
                                     meeting_id,
                                     session_id,
-                                    reporting_peer,
+                                    reporting_user_id,
                                     peer_id,
                                 ])
                                 .set(video_stats.fps_received);
@@ -513,12 +524,12 @@ fn process_health_packet_to_metrics_pb(
 
                         if video_stats.frames_buffered != 0.0 {
                             debug!("Setting VIDEO_PACKETS_BUFFERED for meeting={}, session={}, from_peer={}, to_peer={}, value={}", 
-                                   meeting_id, session_id, reporting_peer, peer_id, video_stats.frames_buffered);
+                                   meeting_id, session_id, reporting_user_id, peer_id, video_stats.frames_buffered);
                             VIDEO_PACKETS_BUFFERED
                                 .with_label_values(&[
                                     meeting_id,
                                     session_id,
-                                    reporting_peer,
+                                    reporting_user_id,
                                     peer_id,
                                 ])
                                 .set(video_stats.frames_buffered);
@@ -529,14 +540,24 @@ fn process_health_packet_to_metrics_pb(
                     {
                         let audio_enabled = peer_data.audio_enabled;
                         PEER_AUDIO_ENABLED
-                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
+                            .with_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporting_user_id,
+                                peer_id,
+                            ])
                             .set(if audio_enabled { 1.0 } else { 0.0 });
                     }
 
                     {
                         let video_enabled = peer_data.video_enabled;
                         PEER_VIDEO_ENABLED
-                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
+                            .with_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporting_user_id,
+                                peer_id,
+                            ])
                             .set(if video_enabled { 1.0 } else { 0.0 });
                     }
                 }
@@ -611,7 +632,11 @@ async fn handle_health_message(
         let json_val = json!({
             "session_id": health_packet.session_id,
             "meeting_id": health_packet.meeting_id,
-            "reporting_peer": health_packet.reporting_peer,
+            "reporting_user_id": if health_packet.reporting_user_id.is_empty() {
+                "unknown".to_string()
+            } else {
+                videocall_types::user_id_bytes_to_string(&health_packet.reporting_user_id)
+            },
             "timestamp_ms": health_packet.timestamp_ms,
         });
         store.insert(topic.to_string(), json_val);
@@ -693,7 +718,7 @@ mod tests {
         let mut hp = PbHealthPacket::new();
         hp.session_id = "s1".to_string();
         hp.meeting_id = "m1".to_string();
-        hp.reporting_peer = "alice@example.com".to_string();
+        hp.reporting_user_id = "alice@example.com".as_bytes().to_vec();
         hp.timestamp_ms = 12345;
         hp.reporting_audio_enabled = true;
         hp.reporting_video_enabled = true;
@@ -715,13 +740,13 @@ mod tests {
     fn create_test_health_packet(
         session_id: &str,
         meeting_id: &str,
-        reporting_peer: &str,
+        reporting_user_id: &str,
         peer_stats: std::collections::HashMap<String, PbPeerStats>,
     ) -> PbHealthPacket {
         let mut hp = PbHealthPacket::new();
         hp.session_id = session_id.to_string();
         hp.meeting_id = meeting_id.to_string();
-        hp.reporting_peer = reporting_peer.to_string();
+        hp.reporting_user_id = reporting_user_id.as_bytes().to_vec();
         hp.timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -824,7 +849,7 @@ mod tests {
         let session_info = SessionInfo {
             session_id: "session_123".to_string(),
             meeting_id: "meeting_456".to_string(),
-            reporting_peer: "alice".to_string(),
+            reporting_user_id: "alice".to_string(),
             last_seen: Instant::now(),
             to_peers: HashSet::new(),
             peer_ids: HashSet::new(),
@@ -833,7 +858,7 @@ mod tests {
 
         assert_eq!(session_info.session_id, "session_123");
         assert_eq!(session_info.meeting_id, "meeting_456");
-        assert_eq!(session_info.reporting_peer, "alice");
+        assert_eq!(session_info.reporting_user_id, "alice");
         assert!(session_info.last_seen.elapsed() < Duration::from_secs(1));
     }
 
@@ -848,7 +873,7 @@ mod tests {
             let session_info = SessionInfo {
                 session_id: "session_1".to_string(),
                 meeting_id: "meeting_1".to_string(),
-                reporting_peer: "alice".to_string(),
+                reporting_user_id: "alice".to_string(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
@@ -890,7 +915,7 @@ mod tests {
             let session_info = SessionInfo {
                 session_id: "session_1".to_string(),
                 meeting_id: "meeting_1".to_string(),
-                reporting_peer: "alice".to_string(),
+                reporting_user_id: "alice".to_string(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
@@ -906,7 +931,7 @@ mod tests {
             let mut session_info = SessionInfo {
                 session_id: "session_2".to_string(),
                 meeting_id: "meeting_1".to_string(),
-                reporting_peer: "bob".to_string(),
+                reporting_user_id: "bob".to_string(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
@@ -960,7 +985,7 @@ mod tests {
             let session_info = tracker_guard.get(&session_key).unwrap();
             assert_eq!(session_info.session_id, "session_123");
             assert_eq!(session_info.meeting_id, "meeting_456");
-            assert_eq!(session_info.reporting_peer, "alice");
+            assert_eq!(session_info.reporting_user_id, "alice");
         }
     }
 
@@ -1074,8 +1099,9 @@ mod tests {
         peer_stats.insert(peer_id.clone(), peer_stat);
         let meeting_id = "meeting_rm";
         let session_id = "session_rm";
-        let reporting_peer = "alice";
-        let packet = create_test_health_packet(session_id, meeting_id, reporting_peer, peer_stats);
+        let reporting_user_id = "alice";
+        let packet =
+            create_test_health_packet(session_id, meeting_id, reporting_user_id, peer_stats);
         let result = process_health_packet_to_metrics_pb(&packet, &tracker);
         assert!(result.is_ok());
 
@@ -1085,13 +1111,13 @@ mod tests {
             &[
                 ("meeting_id", meeting_id),
                 ("session_id", session_id),
-                ("from_peer", reporting_peer),
+                ("from_peer", reporting_user_id),
                 ("to_peer", "bob"),
             ],
         ));
 
         // Remove and ensure it disappears
-        let session_key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
         let info = {
             let guard = tracker.lock().unwrap();
             guard.get(&session_key).unwrap().clone()
@@ -1103,7 +1129,7 @@ mod tests {
             &[
                 ("meeting_id", meeting_id),
                 ("session_id", session_id),
-                ("from_peer", reporting_peer),
+                ("from_peer", reporting_user_id),
                 ("to_peer", "bob"),
             ],
         ));
@@ -1163,7 +1189,7 @@ mod tests {
             let session_info1 = SessionInfo {
                 session_id: "session_1".to_string(),
                 meeting_id: "meeting_1".to_string(),
-                reporting_peer: "alice".to_string(),
+                reporting_user_id: "alice".to_string(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
@@ -1176,7 +1202,7 @@ mod tests {
             let mut session_info2 = SessionInfo {
                 session_id: "session_2".to_string(),
                 meeting_id: "meeting_1".to_string(),
-                reporting_peer: "bob".to_string(),
+                reporting_user_id: "bob".to_string(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
@@ -1190,7 +1216,7 @@ mod tests {
             let session_info3 = SessionInfo {
                 session_id: "session_3".to_string(),
                 meeting_id: "meeting_2".to_string(),
-                reporting_peer: "charlie".to_string(),
+                reporting_user_id: "charlie".to_string(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
@@ -1223,7 +1249,7 @@ mod tests {
         let session_info = SessionInfo {
             session_id: "test_session".to_string(),
             meeting_id: "test_meeting".to_string(),
-            reporting_peer: "test_peer".to_string(),
+            reporting_user_id: "test_peer".to_string(),
             last_seen: Instant::now(),
             to_peers: HashSet::new(),
             peer_ids: HashSet::new(),
@@ -1247,7 +1273,7 @@ mod tests {
             let session_info = SessionInfo {
                 session_id: "session_concurrent".to_string(),
                 meeting_id: "meeting_concurrent".to_string(),
-                reporting_peer: "concurrent_peer".to_string(),
+                reporting_user_id: "concurrent_peer".to_string(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
@@ -1295,7 +1321,7 @@ mod tests {
         let mut hp = PbHealthPacket::new();
         hp.session_id = "sess_rtt".to_string();
         hp.meeting_id = "meet_rtt".to_string();
-        hp.reporting_peer = "alice".to_string();
+        hp.reporting_user_id = "alice".as_bytes().to_vec();
         hp.timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1384,7 +1410,7 @@ mod tests {
             let mut session_info = SessionInfo {
                 session_id: "session_boundary".to_string(),
                 meeting_id: "meeting_boundary".to_string(),
-                reporting_peer: "boundary_peer".to_string(),
+                reporting_user_id: "boundary_peer".to_string(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),

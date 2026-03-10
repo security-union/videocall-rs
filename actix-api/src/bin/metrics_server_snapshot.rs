@@ -207,9 +207,11 @@ async fn update_connection_with_timestamp(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Missing connection metadata"))?;
 
+    let user_id_str = videocall_types::user_id_bytes_to_string(&conn.user_id);
+
     debug!(
         "Updating connection timestamp for server: {} with data from {}@{} via {}",
-        conn.server_instance, conn.customer_email, conn.meeting_id, conn.protocol
+        conn.server_instance, user_id_str, conn.meeting_id, conn.protocol
     );
 
     let mut snapshots_guard = snapshots.lock().unwrap();
@@ -235,7 +237,7 @@ async fn update_connection_with_timestamp(
         "{}_{}_{}_{}_{}_{}",
         conn.session_id,
         conn.protocol,
-        conn.customer_email,
+        user_id_str,
         conn.meeting_id,
         conn.server_instance,
         conn.region
@@ -248,10 +250,7 @@ async fn update_connection_with_timestamp(
         },
     );
 
-    let user_key = format!(
-        "{}@{}_{}",
-        conn.customer_email, conn.meeting_id, conn.region
-    );
+    let user_key = format!("{}@{}_{}", user_id_str, conn.meeting_id, conn.region);
     snapshot.unique_users.insert(
         user_key,
         ConnectionData {
@@ -267,7 +266,7 @@ async fn update_connection_with_timestamp(
                 "sent_{}_{}_{}_{}_{}_{}",
                 conn.session_id,
                 conn.protocol,
-                conn.customer_email,
+                user_id_str,
                 conn.meeting_id,
                 conn.server_instance,
                 conn.region
@@ -285,7 +284,7 @@ async fn update_connection_with_timestamp(
                 "received_{}_{}_{}_{}_{}_{}",
                 conn.session_id,
                 conn.protocol,
-                conn.customer_email,
+                user_id_str,
                 conn.meeting_id,
                 conn.server_instance,
                 conn.region

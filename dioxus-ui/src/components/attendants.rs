@@ -270,7 +270,7 @@ fn schedule_reconnect_no_jwt(
             schedule_reconnect_no_jwt(client_cell, connection_error, attempt + 1);
         }
     })
-        .forget();
+    .forget();
 }
 
 fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) {

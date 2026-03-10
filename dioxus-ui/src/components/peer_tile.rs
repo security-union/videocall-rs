@@ -30,7 +30,7 @@ use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 pub fn PeerTile(
     peer_id: String,
     #[props(default = false)] full_bleed: bool,
-    #[props(default)] host_display_name: Option<String>,
+    #[props(default)] host_user_id: Option<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -80,7 +80,7 @@ pub fn PeerTile(
         });
     });
 
-    let host_dn = host_display_name.as_deref();
+    let host_uid = host_user_id.as_deref();
 
     // Re-read signals to trigger reactive re-renders
     let _ = audio_enabled();
@@ -88,7 +88,7 @@ pub fn PeerTile(
     let _ = screen_enabled();
     let speaking = is_speaking();
 
-    generate_for_peer(&client, &peer_id, full_bleed, speaking, host_dn)
+    generate_for_peer(&client, &peer_id, full_bleed, speaking, host_uid)
 }
 
 fn handle_diagnostics_event(

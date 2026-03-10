@@ -60,6 +60,11 @@ pub struct PeerListProperties {
     /// Display name (username) of the meeting host (for displaying crown icon)
     #[prop_or_default]
     pub host_display_name: Option<String>,
+
+    /// Authenticated user_id of the meeting host (for host identity comparison).
+    /// Compared against each peer's user_id to prevent display-name spoofing.
+    #[prop_or_default]
+    pub host_user_id: Option<String>,
 }
 
 pub enum PeerListMsg {
@@ -252,11 +257,18 @@ impl Component for PeerList {
             .map(|name| format!("{name} (You)"))
             .unwrap_or_else(|| "(You)".to_string());
 
-        // Check if current user is host by comparing display names
-        let host_display_name = ctx.props().host_display_name.clone();
-        let is_current_user_host = host_display_name
+        // Check if current user is host by comparing authenticated user_ids
+        // (not display names, which are user-chosen and spoofable).
+        let host_user_id = ctx.props().host_user_id.clone();
+        let current_user_id_val = client_ctx.as_ref().map(|c| c.user_id().clone());
+        let is_current_user_host = host_user_id
             .as_ref()
-            .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
+            .map(|h| {
+                current_user_id_val
+                    .as_ref()
+                    .map(|c| h == c)
+                    .unwrap_or(false)
+            })
             .unwrap_or(false);
 
         html! {
@@ -354,8 +366,9 @@ impl Component for PeerList {
                                         user_id.clone()
                                     };
 
-                                    let is_peer_host = host_display_name.as_ref()
-                                        .map(|h| h == &display_name)
+                                    // Compare using authenticated user_id, not display name
+                                    let is_peer_host = host_user_id.as_ref()
+                                        .map(|h| h == &user_id)
                                         .unwrap_or(false);
                                     let muted = !self.peer_audio_states.get(peer_id).copied().unwrap_or(false);
                                     let speaking = self.peer_speaking_states.get(peer_id).copied().unwrap_or(false);

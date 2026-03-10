@@ -43,6 +43,7 @@ pub enum MeetingStatus {
     Admitted {
         is_host: bool,
         host_display_name: Option<String>,
+        host_user_id: Option<String>,
         room_token: String,
         waiting_room_enabled: bool,
     },
@@ -58,6 +59,7 @@ pub fn MeetingPage(id: String) -> Element {
     let mut user_profile = use_signal(|| None::<UserProfile>);
     let mut meeting_status = use_signal(|| MeetingStatus::NotJoined);
     let mut host_display_name = use_signal(|| None::<String>);
+    let mut host_user_id = use_signal(|| None::<String>);
     let mut current_user_id = use_signal(|| None::<String>);
     let mut came_from_waiting_room = use_signal(|| false);
 
@@ -221,14 +223,17 @@ pub fn MeetingPage(id: String) -> Element {
                                     };
                                     current_user_id.set(Some(effective_user_id));
                                     let determined_host = response.host_display_name.clone();
+                                    let determined_host_uid = response.host_user_id.clone();
                                     let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                                     host_display_name.set(determined_host.clone());
+                                    host_user_id.set(determined_host_uid.clone());
                                     match response.status.as_str() {
                                         "admitted" => {
                                             if let Some(token) = response.room_token {
                                                 meeting_status.set(MeetingStatus::Admitted {
                                                     is_host: response.is_host,
                                                     host_display_name: determined_host,
+                                                    host_user_id: determined_host_uid,
                                                     room_token: token,
                                                     waiting_room_enabled: wr_enabled,
                                                 });
@@ -319,14 +324,25 @@ pub fn MeetingPage(id: String) -> Element {
                         } else {
                             response.user_id.clone()
                         };
-                        current_user_id.set(Some(effective_user_id));
+                        current_user_id.set(Some(effective_user_id.clone()));
                         let determined_host = if response.is_host {
                             Some(display_name.clone())
                         } else {
                             response.host_display_name.clone()
                         };
+                        // Use the API-provided host_user_id; if the current user
+                        // is the host and the API didn't include it, fall back to
+                        // the effective_user_id we just computed.
+                        let determined_host_uid = response.host_user_id.clone().or_else(|| {
+                            if response.is_host {
+                                Some(effective_user_id.clone())
+                            } else {
+                                None
+                            }
+                        });
                         let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                         host_display_name.set(determined_host.clone());
+                        host_user_id.set(determined_host_uid.clone());
                         match response.status.as_str() {
                             "admitted" => {
                                 observer_token_signal.set(None);
@@ -334,6 +350,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     meeting_status.set(MeetingStatus::Admitted {
                                         is_host: response.is_host,
                                         host_display_name: determined_host,
+                                        host_user_id: determined_host_uid,
                                         room_token: token,
                                         waiting_room_enabled: wr_enabled,
                                     });
@@ -391,13 +408,16 @@ pub fn MeetingPage(id: String) -> Element {
     let on_admitted = {
         move |status: JoinMeetingResponse| {
             let determined_host = status.host_display_name.clone();
+            let determined_host_uid = status.host_user_id.clone();
             let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
+            host_user_id.set(determined_host_uid.clone());
             observer_token_signal.set(None);
             meeting_status.set(MeetingStatus::Admitted {
                 is_host: false,
                 host_display_name: determined_host,
+                host_user_id: determined_host_uid,
                 room_token: token,
                 waiting_room_enabled: wr_enabled,
             });
@@ -445,7 +465,7 @@ pub fn MeetingPage(id: String) -> Element {
     rsx! {
         match (&maybe_username, &current_meeting_status) {
             // User is admitted - show the meeting
-            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, room_token, waiting_room_enabled }) => rsx! {
+            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled }) => rsx! {
                 AttendantsComponent {
                     display_name: username.clone(),
                     id: id.clone(),
@@ -457,6 +477,7 @@ pub fn MeetingPage(id: String) -> Element {
                         .or_else(|| Some(get_or_create_local_user_id())),
                     on_logout: Some(EventHandler::new(on_logout)),
                     host_display_name: host_display_name.clone(),
+                    host_user_id: host_user_id.clone(),
                     auto_join: should_auto_join,
                     is_owner: *is_host,
                     room_token: room_token.clone(),

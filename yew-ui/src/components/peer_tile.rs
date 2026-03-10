@@ -27,9 +27,10 @@ pub struct PeerTileProps {
     pub peer_id: String,
     #[prop_or(false)]
     pub full_bleed: bool,
-    /// Display name (username) of the meeting host (for displaying crown icon)
+    /// Authenticated user_id of the meeting host (for displaying crown icon).
+    /// Compared against each peer's user_id to prevent display-name spoofing.
     #[prop_or_default]
-    pub host_display_name: Option<String>,
+    pub host_user_id: Option<String>,
 }
 
 pub enum Msg {
@@ -180,8 +181,8 @@ impl Component for PeerTile {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        // Get host display name from props
-        let host_display_name = ctx.props().host_display_name.as_deref();
+        // Get host user_id from props for crown icon comparison
+        let host_user_id = ctx.props().host_user_id.as_deref();
 
         // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
         generate_for_peer(
@@ -189,7 +190,7 @@ impl Component for PeerTile {
             &ctx.props().peer_id,
             ctx.props().full_bleed,
             self.is_speaking,
-            host_display_name,
+            host_user_id,
         )
     }
 

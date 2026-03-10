@@ -28,6 +28,8 @@ pub enum MeetingStatus {
     Admitted {
         is_host: bool,
         host_display_name: Option<String>,
+        /// Authenticated user_id of the meeting host (from JWT/DB).
+        host_user_id: Option<String>,
         /// Signed JWT room access token for connecting to the media server
         room_token: String,
     },
@@ -59,6 +61,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     // Meeting status state
     let meeting_status = use_state(|| MeetingStatus::NotJoined);
     let host_display_name = use_state(|| None::<String>);
+    let host_user_id_state = use_state(|| None::<String>);
     let current_user_id = use_state(|| None::<String>);
     // Track if user came from waiting room (should auto-join when admitted)
     let came_from_waiting_room = use_state(|| false);
@@ -137,6 +140,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         let meeting_id = props.id.clone();
         let meeting_status = meeting_status.clone();
         let host_display_name = host_display_name.clone();
+        let host_user_id_state = host_user_id_state.clone();
         let current_user_id = current_user_id.clone();
         let came_from_waiting_room = came_from_waiting_room.clone();
         let input_value_state = input_value_state.clone();
@@ -155,6 +159,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                 let meeting_id_for_rejoin = meeting_id.clone();
                 let meeting_status_for_rejoin = meeting_status.clone();
                 let host_display_name_for_rejoin = host_display_name.clone();
+                let host_user_id_for_rejoin = host_user_id_state.clone();
                 let current_user_id_for_rejoin = current_user_id.clone();
                 let came_from_waiting_room_for_rejoin = came_from_waiting_room.clone();
                 let display_name = (*input_value_state).clone();
@@ -208,6 +213,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         let meeting_id = meeting_id_for_rejoin.clone();
                         let meeting_status = meeting_status_for_rejoin.clone();
                         let host_display_name = host_display_name_for_rejoin.clone();
+                        let host_user_id_state = host_user_id_for_rejoin.clone();
                         let current_user_id = current_user_id_for_rejoin.clone();
                         let came_from_waiting_room = came_from_waiting_room_for_rejoin.clone();
                         let display_name = display_name.clone();
@@ -222,7 +228,9 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                     );
                                     current_user_id.set(Some(response.user_id.clone()));
                                     let determined_host = response.host_display_name.clone();
+                                    let determined_host_uid = response.host_user_id.clone();
                                     host_display_name.set(determined_host.clone());
+                                    host_user_id_state.set(determined_host_uid.clone());
 
                                     match response.status.as_str() {
                                         "admitted" => {
@@ -230,6 +238,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                                 meeting_status.set(MeetingStatus::Admitted {
                                                     is_host: response.is_host,
                                                     host_display_name: determined_host,
+                                                    host_user_id: determined_host_uid,
                                                     room_token: token,
                                                 });
                                             } else {
@@ -292,6 +301,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         let meeting_id = props.id.clone();
         let meeting_status = meeting_status.clone();
         let host_display_name = host_display_name.clone();
+        let host_user_id_state = host_user_id_state.clone();
         let current_user_id = current_user_id.clone();
         let input_value_state = input_value_state.clone();
         let came_from_waiting_room = came_from_waiting_room.clone();
@@ -300,6 +310,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
             let meeting_id = meeting_id.clone();
             let meeting_status = meeting_status.clone();
             let host_display_name = host_display_name.clone();
+            let host_user_id_state = host_user_id_state.clone();
             let current_user_id = current_user_id.clone();
             let came_from_waiting_room = came_from_waiting_room.clone();
             // Get the display name that the user entered
@@ -330,7 +341,18 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 Err(_) => None,
                             }
                         };
+                        // Use the API-provided host_user_id; if the current user
+                        // is the host and the API didn't include it, fall back to
+                        // the user_id from the response.
+                        let determined_host_uid = response.host_user_id.clone().or_else(|| {
+                            if response.is_host {
+                                Some(response.user_id.clone())
+                            } else {
+                                None
+                            }
+                        });
                         host_display_name.set(determined_host_display_name.clone());
+                        host_user_id_state.set(determined_host_uid.clone());
 
                         match response.status.as_str() {
                             "admitted" => {
@@ -338,6 +360,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                     meeting_status.set(MeetingStatus::Admitted {
                                         is_host: response.is_host,
                                         host_display_name: determined_host_display_name,
+                                        host_user_id: determined_host_uid,
                                         room_token: token,
                                     });
                                 } else {
@@ -434,14 +457,18 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     let on_admitted = {
         let meeting_status = meeting_status.clone();
         let host_display_name = host_display_name.clone();
+        let host_user_id_state = host_user_id_state.clone();
 
         Callback::from(move |response: crate::meeting_api::JoinMeetingResponse| {
             let determined_host = response.host_display_name.clone();
+            let determined_host_uid = response.host_user_id.clone();
             let token = response.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
+            host_user_id_state.set(determined_host_uid.clone());
             meeting_status.set(MeetingStatus::Admitted {
                 is_host: false,
                 host_display_name: determined_host,
+                host_user_id: determined_host_uid,
                 room_token: token,
             });
         })
@@ -480,7 +507,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
             {
                 match (&maybe_display_name, &current_meeting_status) {
                     // User is admitted - show the meeting
-                    (Some(display_name), MeetingStatus::Admitted { is_host, host_display_name, room_token }) => {
+                    (Some(display_name), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token }) => {
                         html! {
                             <AttendantsComponent
                                 display_name={display_name.clone()}
@@ -491,6 +518,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 user_id={(*current_user_id).clone().or_else(|| (*user_profile).as_ref().map(|p| p.user_id.clone()))}
                                 on_logout={Some(on_logout.clone())}
                                 host_display_name={host_display_name.clone()}
+                                host_user_id={host_user_id.clone()}
                                 auto_join={should_auto_join}
                                 is_owner={*is_host}
                                 room_token={room_token.clone()}

@@ -177,6 +177,11 @@ pub struct AttendantsComponentProps {
     #[prop_or_default]
     pub host_display_name: Option<String>,
 
+    /// Authenticated user_id of the meeting host (for host identity comparison).
+    /// Compared against each peer's user_id to prevent display-name spoofing.
+    #[prop_or_default]
+    pub host_user_id: Option<String>,
+
     /// If true, automatically join the meeting without showing the "Join Meeting" button.
     /// Used when user was admitted from the waiting room.
     #[prop_or_default]
@@ -1088,7 +1093,6 @@ impl Component for AttendantsComponent {
 
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
-        let host_display_name = ctx.props().host_display_name.clone();
         let rows: Vec<Html> = display_peers_vec
             .iter()
             .take(CANVAS_LIMIT)
@@ -1096,7 +1100,7 @@ impl Component for AttendantsComponent {
             .map(|(i, peer_id)| {
                 let full_bleed = display_peers_vec.len() == 1
                     && !self.client.is_screen_share_enabled_for_peer(peer_id);
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_display_name={host_display_name.clone()} /> }
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_user_id={ctx.props().host_user_id.clone()} /> }
             })
             .collect();
 
@@ -1394,6 +1398,7 @@ impl Component for AttendantsComponent {
                                     is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
                                     on_toggle_meeting_info={toggle_meeting_info}
                                     host_display_name={ctx.props().host_display_name.clone()}
+                                    host_user_id={ctx.props().host_user_id.clone()}
                                 />
                             }
                         } else {

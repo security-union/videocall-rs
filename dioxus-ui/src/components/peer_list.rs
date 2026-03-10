@@ -38,6 +38,7 @@ pub fn PeerList(
     is_active: bool,
     on_toggle_meeting_info: EventHandler<()>,
     #[props(default)] host_display_name: Option<String>,
+    #[props(default)] host_user_id: Option<String>,
 ) -> Element {
     let mut search_query = use_signal(String::new);
     let mut show_context_menu = use_signal(|| false);
@@ -104,10 +105,13 @@ pub fn PeerList(
 
     let display_name = current_user_name.clone().unwrap_or_default();
 
-    // Check if current user is host
-    let is_current_user_host = host_display_name
+    // Check if current user is host by comparing authenticated user_ids
+    // (not display names, which are user-chosen and spoofable).
+    // We need the current user's user_id from the client context.
+    let current_user_id_val = client_ctx.user_id().clone();
+    let is_current_user_host = host_user_id
         .as_ref()
-        .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
+        .map(|h| h == &current_user_id_val)
         .unwrap_or(false);
 
     rsx! {
@@ -208,9 +212,10 @@ pub fn PeerList(
                                     let peer_display_name = peer_session_id
                                         .and_then(|sid| client_ctx.get_peer_display_name(sid))
                                         .unwrap_or_else(|| peer.clone());
-                                    let is_peer_host = host_display_name
+                                    // Compare using authenticated user_id, not display name
+                                    let is_peer_host = host_user_id
                                         .as_ref()
-                                        .map(|h| h == &peer_display_name)
+                                        .map(|h| h == peer)
                                         .unwrap_or(false);
                                     let muted = peer_session_id
                                         .and_then(|sid| audio_states.get(sid).copied())

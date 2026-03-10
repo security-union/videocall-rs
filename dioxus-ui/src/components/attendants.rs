@@ -283,6 +283,7 @@ pub fn AttendantsComponent(
     #[props(default)] user_id: Option<String>,
     #[props(default)] on_logout: Option<EventHandler<()>>,
     #[props(default)] host_display_name: Option<String>,
+    #[props(default)] host_user_id: Option<String>,
     #[props(default)] auto_join: bool,
     #[props(default)] is_owner: bool,
     #[props(default)] room_token: String,
@@ -841,7 +842,7 @@ pub fn AttendantsComponent(
                                     key: "tile-{i}-{peer_id}",
                                     peer_id: peer_id.clone(),
                                     full_bleed: full_bleed,
-                                    host_display_name: host_display_name.clone(),
+                                    host_user_id: host_user_id.clone(),
                                 }
                             }
                         }
@@ -1132,6 +1133,7 @@ pub fn AttendantsComponent(
                                 }
                             },
                             host_display_name: host_display_name.clone(),
+                            host_user_id: host_user_id.clone(),
                         }
                     }
                 }

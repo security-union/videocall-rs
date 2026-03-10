@@ -1,14 +1,13 @@
 #!/bin/bash
 set -e
 
-TAG=$1
-if [ -z "$1" ]
-then
-    TAG=$(git rev-parse HEAD)
-fi
+REGISTRY="${REGISTRY:-securityunion}"
+
+# Tag from argument or git SHA
+TAG="${1:-$(git rev-parse HEAD)}"
 
 # --- Yew UI ---
-IMAGE_URL=securityunion/videocall-web-ui:$TAG
+IMAGE_URL=${REGISTRY}/videocall-web-ui:$TAG
 echo "Building image $IMAGE_URL"
 if ! docker build -t $IMAGE_URL --build-arg USERS_ALLOWED_TO_STREAM="dario,griffin,hamdy" . --file Dockerfile.yew; then
     echo "Failed to build yew-ui"
@@ -18,7 +17,7 @@ else
 fi
 
 # --- Dioxus UI ---
-DIOXUS_IMAGE_URL=securityunion/videocall-dioxus-ui:$TAG
+DIOXUS_IMAGE_URL=${REGISTRY}/videocall-dioxus-ui:$TAG
 echo "Building image $DIOXUS_IMAGE_URL"
 if ! docker build -t $DIOXUS_IMAGE_URL . --file Dockerfile.dioxus; then
     echo "Failed to build dioxus-ui"

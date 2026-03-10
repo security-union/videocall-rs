@@ -23,7 +23,11 @@
 
 use crate::constants::meeting_api_client;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
+use wasm_bindgen::JsCast;
 use yew::prelude::*;
+
+/// Polling interval in milliseconds for the safety-net timer.
+const POLL_INTERVAL_MS: i32 = 10_000;
 
 /// Type alias for waiting participant (uses shared type)
 pub type WaitingParticipant = ParticipantStatusResponse;
@@ -58,6 +62,8 @@ pub struct HostControls {
     expanded: bool,
     /// Track the last version we fetched for, so we re-fetch when it changes.
     last_fetched_version: u32,
+    /// Interval ID for the polling safety net timer.
+    poll_interval_id: Option<i32>,
 }
 
 impl Component for HostControls {
@@ -70,18 +76,41 @@ impl Component for HostControls {
             ctx.link().send_message(HostControlsMsg::FetchWaiting);
         }
 
+        // Start a polling safety net timer that fetches the waiting list
+        // every POLL_INTERVAL_MS. This catches attendees who joined the
+        // waiting room before the host's observer WebSocket was connected.
+        let poll_interval_id = if ctx.props().is_admitted {
+            Self::start_poll_timer(ctx)
+        } else {
+            None
+        };
+
         Self {
             waiting: Vec::new(),
             error: None,
             expanded: true,
             last_fetched_version: ctx.props().waiting_room_version,
+            poll_interval_id,
+        }
+    }
+
+    fn destroy(&mut self, _ctx: &Context<Self>) {
+        // Clean up the polling interval on unmount.
+        if let Some(id) = self.poll_interval_id.take() {
+            if let Some(window) = web_sys::window() {
+                window.clear_interval_with_handle(id);
+                log::debug!("HostControls: cleared polling interval {id} on destroy");
+            }
         }
     }
 
     fn changed(&mut self, ctx: &Context<Self>, old_props: &Self::Properties) -> bool {
-        // If we became admitted, fetch immediately
+        // If we became admitted, fetch immediately and start polling
         if ctx.props().is_admitted && !old_props.is_admitted {
             ctx.link().send_message(HostControlsMsg::FetchWaiting);
+            if self.poll_interval_id.is_none() {
+                self.poll_interval_id = Self::start_poll_timer(ctx);
+            }
         }
 
         // If waiting_room_version changed, re-fetch the waiting list
@@ -308,6 +337,31 @@ impl Component for HostControls {
                 }
             </div>
         }
+    }
+}
+
+impl HostControls {
+    /// Start a setInterval timer that sends `FetchWaiting` every `POLL_INTERVAL_MS`.
+    fn start_poll_timer(ctx: &Context<Self>) -> Option<i32> {
+        let window = web_sys::window()?;
+        let link = ctx.link().clone();
+
+        log::info!("HostControls: starting polling safety net (every {POLL_INTERVAL_MS}ms)");
+
+        let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+            link.send_message(HostControlsMsg::FetchWaiting);
+        });
+
+        let id = window
+            .set_interval_with_callback_and_timeout_and_arguments_0(
+                poll_closure.as_ref().unchecked_ref(),
+                POLL_INTERVAL_MS,
+            )
+            .ok()?;
+
+        // Prevent the closure from being dropped while the interval is active.
+        poll_closure.forget();
+        Some(id)
     }
 }
 

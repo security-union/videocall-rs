@@ -11,10 +11,17 @@
 //! `VideoCallClient`. The `use_effect` reacts to changes in this counter
 //! and fetches the waiting room list once per notification.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use crate::constants::meeting_api_client;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
+use wasm_bindgen::JsCast;
 use web_sys::HtmlAudioElement;
+
+/// Polling interval in milliseconds for the safety-net timer.
+const POLL_INTERVAL_MS: i32 = 10_000;
 
 pub type WaitingParticipant = ParticipantStatusResponse;
 
@@ -83,6 +90,73 @@ pub fn HostControls(
                     }
                 }
             });
+        });
+    }
+
+    // Polling safety net: fetch the waiting list every POLL_INTERVAL_MS
+    // regardless of whether push notifications are working. This catches
+    // attendees who joined the waiting room before the host's observer
+    // WebSocket was connected (NATS event lost).
+    let poll_interval_id: Rc<Cell<i32>> = use_hook(|| Rc::new(Cell::new(-1)));
+    {
+        let meeting_id = meeting_id.clone();
+        let poll_interval_id = poll_interval_id.clone();
+        use_effect(move || {
+            if !is_admitted {
+                return;
+            }
+            let window = match web_sys::window() {
+                Some(w) => w,
+                None => return,
+            };
+
+            log::info!("HostControls: starting polling safety net (every {POLL_INTERVAL_MS}ms)");
+
+            let meeting_id = meeting_id.clone();
+            let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                let meeting_id = meeting_id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match fetch_waiting(&meeting_id).await {
+                        Ok(w) => {
+                            let new_count = w.len();
+                            let old_count = *prev_waiting_count.peek();
+                            if new_count > old_count {
+                                play_knock_sound();
+                            }
+                            prev_waiting_count.set(new_count);
+                            waiting.set(w);
+                            error.set(None);
+                        }
+                        Err(e) => {
+                            log::warn!("HostControls poll: failed to fetch waiting room: {e}");
+                        }
+                    }
+                });
+            });
+
+            let interval_id = window
+                .set_interval_with_callback_and_timeout_and_arguments_0(
+                    poll_closure.as_ref().unchecked_ref(),
+                    POLL_INTERVAL_MS,
+                )
+                .unwrap_or(-1);
+
+            poll_closure.forget();
+            poll_interval_id.set(interval_id);
+        });
+    }
+
+    // Clean up the polling interval when the component unmounts.
+    {
+        let poll_interval_id = poll_interval_id.clone();
+        use_drop(move || {
+            let id = poll_interval_id.get();
+            if id >= 0 {
+                if let Some(window) = web_sys::window() {
+                    window.clear_interval_with_handle(id);
+                    log::debug!("HostControls: cleared polling interval {id} on unmount");
+                }
+            }
         });
     }
 

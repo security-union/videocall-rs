@@ -184,21 +184,16 @@ pub fn WaitingRoom(
         });
     }
 
-    // Polling fallback: always start a setInterval timer that checks
-    // participant status every POLL_INTERVAL_MS. On each tick, if the
-    // observer WebSocket is connected (checked via Rc<Cell<bool>>), the
-    // tick is a no-op. This avoids the complexity of reactively
-    // starting/stopping the timer and covers three failure modes:
-    //   1. Empty observer token (old server, no push support)
-    //   2. WebSocket connection failed or was rejected
-    //   3. WebSocket disconnected (e.g. token expired after 30 min)
+    // Polling safety net: always poll participant status every
+    // POLL_INTERVAL_MS regardless of observer WebSocket state. The push
+    // path provides instant notification when it works, but polling
+    // ensures we never miss an admission/rejection if a NATS event is lost.
     //
     // The interval_id is stored in an Rc<Cell<i32>> so use_drop can
     // clear it when the component unmounts, preventing leaked timers.
     let poll_interval_id: Rc<Cell<i32>> = use_hook(|| Rc::new(Cell::new(-1)));
     {
         let meeting_id = meeting_id.clone();
-        let observer_connected = observer_connected.clone();
         let poll_interval_id = poll_interval_id.clone();
         use_effect(move || {
             let window = match web_sys::window() {
@@ -206,7 +201,9 @@ pub fn WaitingRoom(
                 None => return,
             };
 
-            log::info!("WaitingRoom: starting polling fallback timer (every {POLL_INTERVAL_MS}ms, skips when observer connected)");
+            log::info!(
+                "WaitingRoom: starting polling safety net timer (every {POLL_INTERVAL_MS}ms)"
+            );
 
             // Poll once immediately on mount to catch admissions that
             // occurred before any connection was established (host admitted
@@ -238,14 +235,7 @@ pub fn WaitingRoom(
             }
 
             let meeting_id = meeting_id.clone();
-            let observer_connected = observer_connected.clone();
             let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                if observer_connected.get() {
-                    // Observer WebSocket is connected; push notifications
-                    // are handling admission/rejection. Skip this poll.
-                    return;
-                }
-
                 let meeting_id = meeting_id.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     match check_status(&meeting_id).await {

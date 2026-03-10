@@ -87,6 +87,7 @@ Always delegate work to the specialized roster agents instead of making changes 
 - **frontend-rust-webtransport-and-websocket** — All Dioxus/Yew UI changes (components, pages, styling, state management)
 - **backend-rust-streaming** — All backend/API changes (Axum routes, DB queries, server logic)
 - **code-reviewer** — Review all code changes before committing
+- **performance-reviewer** — Performance review for low-power devices and low-bandwidth networks. Audit payload sizes, unnecessary re-renders, uncompressed assets, polling intervals, missing pagination, protobuf message sizes, bundle sizes, memory leaks, and any patterns that degrade on constrained hardware or slow connections. Should be run after substantive code changes alongside code-reviewer.
 - **web-security-auditor** — Full-scope application security: backend auth/authz, API endpoints, input validation, XSS/injection, CSRF, UI trust indicators (e.g. host badges, role icons, permission displays), identity comparison logic, token handling, phishing vectors, architectural security review. Must audit both server-side AND client-side code — rendering code that conveys trust or authority is security-critical.
 - **database-reviewer** — Review schema, migration, and query changes
 - **integration-test-writer** — Write integration tests for new or changed features
@@ -94,7 +95,7 @@ Always delegate work to the specialized roster agents instead of making changes 
 - **e2e-test-sync** — Create/update E2E tests when user-facing behavior changes
 - **ux-ui-expert** — UI/UX design guidance, component design, visual polish, accessibility
 
-Run agents in parallel when tasks are independent. Always run `code-reviewer` after substantive code changes.
+Run agents in parallel when tasks are independent. Always run `code-reviewer` after substantive code changes. Always run `e2e-test-sync` after any change that affects user-facing behavior — E2E tests must be updated to cover the change and must pass before the work is considered complete.
 
 **Never generate your own general-purpose agents.** Only use the agents listed on this roster. If no roster agent fits the task, stop everything and ask the user for direction.
 
@@ -111,4 +112,3 @@ Run agents in parallel when tasks are independent. Always run `code-reviewer` af
 - **General:** No unused imports, no unused variables, follow existing code style. Respect all project lint configs (`.eslintrc`, `rustfmt.toml`, `.prettierrc`, etc.).
 
 This is mandatory for every agent making code changes — not optional. CI will reject PRs that fail linting.
-

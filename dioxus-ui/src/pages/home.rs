@@ -204,59 +204,20 @@ pub fn Home() -> Element {
 
                 // Form section
                 div { class: "w-full mb-8 card-apple p-8",
-                form {
-                    onsubmit: move |e| {
-                        e.prevent_default();
-                        username_error.set(None);
-                        let username = username_value();
-                        let meeting_id = get_meeting_id();
-                        if meeting_id.is_empty() || !is_valid_meeting_id(&meeting_id) {
-                            return;
-                        }
-                        match validate_display_name(&username) {
-                            Ok(valid_name) => {
-                                username_value.set(valid_name.clone());
-                                save_display_name_to_storage(&valid_name);
-                                (display_name_ctx.0).set(Some(valid_name.clone()));
-                                matomo_logger::set_user_id(&valid_name);
-
-                                spawn(async move {
-                                    gloo_timers::future::TimeoutFuture::new(0).await;
-                                    navigator.push(Route::Meeting { id: meeting_id });
-                                });
-                            }
-                            Err(message) => {
-                                username_error.set(Some(message));
-                            }
-                        }
-                    },
-                    h3 { class: "text-center text-xl font-semibold mb-6 text-white/90", "Start or Join a Meeting" }
-                    div { class: "space-y-6",
-                        div {
-                            label { r#for: "username", class: "block text-white/80 text-sm font-medium mb-2 ml-1", "Display Name" }
-                            input {
-                                id: "username",
-                                class: TEXT_INPUT_CLASSES,
-                                r#type: "text",
-                                placeholder: "Enter your display name",
-                                required: true,
-                                autofocus: true,
-                                maxlength: DISPLAY_NAME_MAX_LEN as i64,
-                                value: "{username_value}",
-                                oninput: move |e: Event<FormData>| {
-                                    username_value.set(e.value());
-                                    username_error.set(None);
-                                },
-                            }
-                            p { class: "text-sm text-foreground-subtle mt-2 ml-1", "Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes" }
-                            if let Some(err) = username_error() {
-                                p { class: "text-sm mt-2 ml-1", style: "color:#ff6b6b;", "{err}" }
+                    form {
+                        onsubmit: move |e| {
+                            e.prevent_default();
+                            username_error.set(None);
+                            let username = username_value();
+                            let meeting_id = get_meeting_id();
+                            if meeting_id.is_empty() || !is_valid_meeting_id(&meeting_id) {
+                                return;
                             }
                             match validate_display_name(&username) {
                                 Ok(valid_name) => {
                                     username_value.set(valid_name.clone());
-                                    save_username_to_storage(&valid_name);
-                                    (username_ctx.0).set(Some(valid_name.clone()));
+                                    save_display_name_to_storage(&valid_name);
+                                    (display_name_ctx.0).set(Some(valid_name.clone()));
                                     matomo_logger::set_user_id(&valid_name);
 
                                     spawn(async move {
@@ -304,33 +265,25 @@ pub fn Home() -> Element {
                                     }
                                 }
                             }
-                        }
-                        div { class: "mt-2",
-                            button {
-                                r#type: "button",
-                                class: {
-                                    let has_meeting_id = !meeting_id_value().is_empty();
-                                    if has_meeting_id {
-                                        "btn-apple btn-secondary w-full flex items-center justify-center gap-2"
-                                    } else {
-                                        "btn-apple btn-primary w-full flex items-center justify-center gap-2"
-                                    }
-                                },
-                                onclick: move |_| {
-                                    username_error.set(None);
-                                    let username = username_value();
-                                    match validate_display_name(&username) {
-                                        Ok(valid_name) => {
-                                            let meeting_id = generate_meeting_id();
-                                            username_value.set(valid_name.clone());
-                                            save_display_name_to_storage(&valid_name);
-                                            (display_name_ctx.0).set(Some(valid_name.clone()));
-                                            matomo_logger::set_user_id(&valid_name);
-
-                                            spawn(async move {
-                                                gloo_timers::future::TimeoutFuture::new(0).await;
-                                                navigator.push(Route::Meeting { id: meeting_id });
-                                            });
+                            div {
+                                label {
+                                    r#for: "meeting-id",
+                                    class: "block text-white/80 text-sm font-medium mb-2 ml-1",
+                                    "Meeting ID"
+                                }
+                                input {
+                                    id: "meeting-id",
+                                    class: TEXT_INPUT_CLASSES,
+                                    r#type: "text",
+                                    placeholder: "Enter meeting code",
+                                    required: true,
+                                    pattern: "^[a-zA-Z0-9_]*$",
+                                    oninput: move |e: Event<FormData>| {
+                                        meeting_id_value.set(e.value());
+                                    },
+                                    onmounted: move |evt| {
+                                        if let Some(elem) = evt.try_as_web_event() {
+                                            meeting_id_ref.set(Some(elem));
                                         }
                                     },
                                 }
@@ -371,8 +324,8 @@ pub fn Home() -> Element {
                                             Ok(valid_name) => {
                                                 let meeting_id = generate_meeting_id();
                                                 username_value.set(valid_name.clone());
-                                                save_username_to_storage(&valid_name);
-                                                (username_ctx.0).set(Some(valid_name.clone()));
+                                                save_display_name_to_storage(&valid_name);
+                                                (display_name_ctx.0).set(Some(valid_name.clone()));
                                                 matomo_logger::set_user_id(&valid_name);
 
                                                 spawn(async move {
@@ -408,9 +361,9 @@ pub fn Home() -> Element {
                         }
                     }
                 }
-            
-            // div { class: "content-separator" }
 
+                div { class: "content-separator" }
+            
             // div { class: "grid grid-cols-1 md:grid-cols-2 gap-8", style: "margin-top:1em",
             //     div {
             //         button {

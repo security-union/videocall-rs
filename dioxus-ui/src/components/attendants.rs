@@ -210,16 +210,6 @@ fn schedule_reconnect_no_jwt(
         .forget();
 }
 
-/// Compute the optimal grid (cols × rows) for `n` tiles that maximises tile
-/// area inside a container of `container_w × container_h` pixels.
-///
-/// Layout rules:
-///   n=1        → 1×1
-///   n=2        → 2×1 (wide container) or 1×2 (tall container)
-///   n=3 or 4   → 2×2  (symmetric, same tile size for everyone)
-///   n≥5        → exhaustive search over all (cols, rows) pairs; picks the
-///                one that gives the largest tile area; rows = ceil(n/cols)
-///                so the last row never breaks tile dimensions
 fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) {
     const PADDING: f64 = 16.0 * 2.0;
     const GAP: f64 = 10.0;

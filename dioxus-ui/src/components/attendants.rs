@@ -166,7 +166,7 @@ fn schedule_reconnect(
             }
         });
     })
-    .forget();
+        .forget();
 }
 
 /// Schedule a reconnection attempt with exponential backoff (non-JWT path).
@@ -207,7 +207,63 @@ fn schedule_reconnect_no_jwt(
             schedule_reconnect_no_jwt(client_cell, connection_error, attempt + 1);
         }
     })
-    .forget();
+        .forget();
+}
+
+/// Compute the optimal grid (cols × rows) for `n` tiles that maximises tile
+/// area inside a container of `container_w × container_h` pixels.
+///
+/// Layout rules:
+///   n=1        → 1×1
+///   n=2        → 2×1 (wide container) or 1×2 (tall container)
+///   n=3 or 4   → 2×2  (symmetric, same tile size for everyone)
+///   n≥5        → exhaustive search over all (cols, rows) pairs; picks the
+///                one that gives the largest tile area; rows = ceil(n/cols)
+///                so the last row never breaks tile dimensions
+fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) {
+    const PADDING: f64 = 16.0 * 2.0;
+    const GAP: f64 = 10.0;
+
+    if n == 0 {
+        return (1, 1);
+    }
+    if n == 1 {
+        return (1, 1);
+    }
+    if n == 2 {
+        if container_w >= container_h {
+            return (2, 1);
+        } else {
+            return (1, 2);
+        }
+    }
+    if n == 3 || n == 4 {
+        return (2, 2);
+    }
+
+    let avail_w = (container_w - PADDING).max(1.0);
+    let avail_h = (container_h - PADDING).max(1.0);
+
+    let mut best_cols = 1usize;
+    let mut best_rows = n;
+    let mut best_area = 0.0f64;
+
+    for cols in 1..=n {
+        let rows = (n + cols - 1) / cols;
+        let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
+        let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
+        if tile_w <= 0.0 || tile_h <= 0.0 {
+            continue;
+        }
+        let area = tile_w * tile_h;
+        if area > best_area {
+            best_area = area;
+            best_cols = cols;
+            best_rows = rows;
+        }
+    }
+
+    (best_cols, best_rows)
 }
 
 #[component]
@@ -252,6 +308,21 @@ pub fn AttendantsComponent(
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
+
+    // Container dimensions — updated on every window resize so compute_grid
+    // reacts to viewport changes without any JS ResizeObserver boilerplate.
+    let mut container_w = use_signal(|| {
+        web_sys::window()
+            .and_then(|w| w.inner_width().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1280.0)
+    });
+    let mut container_h = use_signal(|| {
+        web_sys::window()
+            .and_then(|w| w.inner_height().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(720.0)
+    });
 
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
@@ -480,6 +551,36 @@ pub fn AttendantsComponent(
         }
     });
 
+    // Window resize listener — updates container_w / container_h so
+    // compute_grid() reacts to viewport changes on every re-render.
+    use_effect(move || {
+        use wasm_bindgen::prelude::*;
+        use wasm_bindgen::JsCast;
+
+        let closure = Closure::wrap(Box::new(move || {
+            if let Some(win) = web_sys::window() {
+                if let Ok(w) = win.inner_width() {
+                    if let Some(w) = w.as_f64() {
+                        container_w.set(w);
+                    }
+                }
+                if let Ok(h) = win.inner_height() {
+                    if let Some(h) = h.as_f64() {
+                        container_h.set(h);
+                    }
+                }
+            }
+        }) as Box<dyn FnMut()>);
+
+        if let Some(win) = web_sys::window() {
+            let _ = win.add_event_listener_with_callback(
+                "resize",
+                closure.as_ref().unchecked_ref(),
+            );
+        }
+        closure.forget();
+    });
+
     // Check for config errors
     use_effect(move || {
         if let Err(e) = crate::constants::app_config() {
@@ -512,9 +613,19 @@ pub fn AttendantsComponent(
     let num_display_peers = display_peers.len();
     let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
+    // Compute grid dimensions from current viewport size.
+    let cw = container_w();
+    let ch = container_h();
+    let (cols, rows) = compute_grid(num_display_peers.min(CANVAS_LIMIT), cw, ch);
+
     let container_style = format!(
-        "position: absolute; inset: 0; width: 100%; height: 100%; --num-peers: {};",
-        num_peers_for_styling.max(1)
+        "position: absolute; inset: 0; width: 100%; height: 100%; \
+         --num-peers: {}; \
+         grid-template-columns: repeat({}, 1fr); \
+         grid-template-rows: repeat({}, 1fr);",
+        num_peers_for_styling.max(1),
+        cols,
+        rows,
     );
 
     let meeting_link = {
@@ -624,7 +735,6 @@ pub fn AttendantsComponent(
                 BrowserCompatibility {}
                 div {
                     id: "grid-container",
-                    "data-peers": "{num_peers_for_styling}",
                     style: "{container_style}",
 
                     // Peer tiles

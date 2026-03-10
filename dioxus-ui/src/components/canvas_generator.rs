@@ -43,7 +43,7 @@ pub fn generate_for_peer(
         .get_peer_display_name(key)
         .unwrap_or_else(|| peer_user_id.clone());
     let is_host = host_display_name
-        .map(|h| h == peer_user_id)
+        .map(|h| h == peer_display_name)
         .unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.contains(&peer_user_id) {

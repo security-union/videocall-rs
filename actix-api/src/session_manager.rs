@@ -158,10 +158,8 @@ impl SessionManager {
 
     /// Build PARTICIPANT_JOINED packet to notify peers about a new session joining the room.
     ///
-    /// The `display_name` is carried in the `creator_id` field of `MeetingPacket`.
-    /// For MEETING_STARTED events `creator_id` holds the meeting creator; for
-    /// PARTICIPANT_JOINED / PARTICIPANT_LEFT it is repurposed to hold the
-    /// participant's display name so the client can show friendly toast messages.
+    /// The `display_name` field carries the participant's display name so the
+    /// client can show friendly toast messages.
     pub fn build_peer_joined_packet(
         room_id: &str,
         user_id: &str,
@@ -174,8 +172,7 @@ impl SessionManager {
             message: format!("{} has joined the meeting", user_id),
             target_user_id: user_id.as_bytes().to_vec(),
             session_id,
-            // Repurpose creator_id to carry display_name as raw UTF-8 bytes
-            creator_id: display_name.as_bytes().to_vec(),
+            display_name: display_name.as_bytes().to_vec(),
             ..Default::default()
         };
 
@@ -190,9 +187,6 @@ impl SessionManager {
     }
 
     /// Build PARTICIPANT_LEFT packet to notify remaining peers about a departed session.
-    ///
-    /// See [`build_peer_joined_packet`](Self::build_peer_joined_packet) for the
-    /// `display_name` / `creator_id` convention.
     pub fn build_peer_left_packet(
         room_id: &str,
         user_id: &str,
@@ -205,8 +199,7 @@ impl SessionManager {
             message: format!("{} has left the meeting", user_id),
             target_user_id: user_id.as_bytes().to_vec(),
             session_id,
-            // Repurpose creator_id to carry display_name as raw UTF-8 bytes
-            creator_id: display_name.as_bytes().to_vec(),
+            display_name: display_name.as_bytes().to_vec(),
             ..Default::default()
         };
 
@@ -327,7 +320,7 @@ mod tests {
         assert_eq!(inner.target_user_id, "bob".as_bytes().to_vec());
         assert_eq!(inner.session_id, 42);
         assert!(inner.message.contains("bob"));
-        assert_eq!(inner.creator_id, "Bob Smith".as_bytes().to_vec());
+        assert_eq!(inner.display_name, "Bob Smith".as_bytes().to_vec());
     }
 
     #[tokio::test]
@@ -386,9 +379,9 @@ mod tests {
         assert_eq!(joined_inner.target_user_id, left_inner.target_user_id);
         assert_eq!(joined_inner.session_id, left_inner.session_id);
         assert_eq!(joined_inner.session_id, sid);
-        // display_name carried via creator_id as raw UTF-8 bytes
-        assert_eq!(joined_inner.creator_id, display.as_bytes().to_vec());
-        assert_eq!(left_inner.creator_id, display.as_bytes().to_vec());
+        // display_name carried via dedicated display_name field
+        assert_eq!(joined_inner.display_name, display.as_bytes().to_vec());
+        assert_eq!(left_inner.display_name, display.as_bytes().to_vec());
 
         // Only event_type and message differ
         assert_eq!(

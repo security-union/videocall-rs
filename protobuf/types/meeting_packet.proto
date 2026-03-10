@@ -33,5 +33,7 @@ message MeetingPacket {
   // For ADMITTED: JWT to upgrade connection
   string room_token = 8;
   uint64 session_id = 9;
+  // Display name of the participant (for PARTICIPANT_JOINED/LEFT events)
+  bytes display_name = 10;
 }
 

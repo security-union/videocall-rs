@@ -219,7 +219,7 @@ test.describe("Two users in a meeting", () => {
       await expect(hostNameOnGuest.first()).toHaveAttribute("title", "host@videocall.rs");
 
       // ---- ASSERT: "joined the meeting" toast notifications ----
-      // Toast message format: "DisplayName (user_id) joined the meeting"
+      // Toast format: Line 1 = user_id (email), Line 2 = "joined the meeting"
       // Toasts auto-dismiss after ~8 seconds, so we check within a generous
       // timeout but also accept that the toast may have already appeared
       // and disappeared during the peer discovery wait above.
@@ -248,19 +248,17 @@ test.describe("Two users in a meeting", () => {
       console.log(`Host saw "joined" toast: ${hostSawToast}`);
       console.log(`Guest saw "joined" toast: ${guestSawToast}`);
 
-      // If either side still has a visible toast, verify the new format:
-      // "DisplayName (user_id) joined the meeting"
+      // If either side still has a visible toast, verify the new two-line format:
+      // Line 1: user_id (email), Line 2: "joined the meeting"
       if (hostSawToast) {
-        const text = await hostJoinedToast.first().textContent();
-        expect(text).toContain("GuestUser");
-        expect(text).toContain("(guest@videocall.rs)");
-        expect(text).toContain("joined the meeting");
+        const toast = hostJoinedToast.first();
+        await expect(toast.locator(".toast-name")).toContainText("guest@videocall.rs");
+        await expect(toast.locator(".toast-action")).toContainText("joined the meeting");
       }
       if (guestSawToast) {
-        const text = await guestJoinedToast.first().textContent();
-        expect(text).toContain("HostUser");
-        expect(text).toContain("(host@videocall.rs)");
-        expect(text).toContain("joined the meeting");
+        const toast = guestJoinedToast.first();
+        await expect(toast.locator(".toast-name")).toContainText("host@videocall.rs");
+        await expect(toast.locator(".toast-action")).toContainText("joined the meeting");
       }
 
       // Pause so you can watch both browsers

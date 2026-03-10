@@ -228,8 +228,8 @@ pub struct AttendantsComponent {
     /// the non-JWT path manages its own attempt counter inside the recursive
     /// `schedule_reconnect_no_jwt` closure chain.
     reconnect_attempt: u32,
-    /// Active "participant join/leave" toast messages: (toast_id, message, user_id).
-    peer_toasts: Vec<(u64, String, String)>,
+    /// Active "participant join/leave" toast messages: (toast_id, display_name, user_id, is_joined).
+    peer_toasts: Vec<(u64, String, String, bool)>,
     /// Monotonic counter for toast IDs.
     toast_counter: u64,
 }
@@ -623,6 +623,13 @@ impl AttendantsComponent {
             let _ = osc.start_with_when(now + duration);
             let _ = osc.stop_with_when(now + duration * 2.0);
         }
+
+        // Close the AudioContext after playback completes to avoid resource leaks.
+        let duration_ms = (duration * 2.0 * 1000.0) as u32 + 100;
+        Timeout::new(duration_ms, move || {
+            let _ = ctx.close();
+        })
+        .forget();
     }
 }
 
@@ -772,8 +779,7 @@ impl Component for AttendantsComponent {
             },
             Msg::OnPeerAdded(peer_id) => {
                 log::info!("New user joined: {peer_id}");
-                Self::play_user_joined();
-
+                // Sound is played by OnPeerJoined which has display name context.
                 true
             }
             Msg::OnPeerRemoved(_peer_id) => true,
@@ -1000,10 +1006,9 @@ impl Component for AttendantsComponent {
                 log::info!("TOAST-RX: peer left: {} ({})", display_name, user_id);
                 // Don't play sound immediately -- defer it so a rapid
                 // join event (waiting-room admission) can cancel it.
-                let msg = format!("{display_name} ({user_id}) left the meeting");
                 let id = self.toast_counter;
                 self.toast_counter += 1;
-                self.peer_toasts.push((id, msg, user_id));
+                self.peer_toasts.push((id, display_name, user_id, false));
                 // Defer the leave sound: only play if the toast still exists
                 // after 500ms (i.e. no join event cancelled it).
                 let link_sound = ctx.link().clone();
@@ -1028,14 +1033,13 @@ impl Component for AttendantsComponent {
                 // (the deferred leave sound will also be suppressed because
                 // it checks whether the toast still exists).
                 self.peer_toasts
-                    .retain(|(_, msg, uid)| !(uid == &user_id && msg.contains("left")));
+                    .retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
 
                 // Always show the join toast and play the join sound.
                 Self::play_user_joined();
-                let msg = format!("{display_name} ({user_id}) joined the meeting");
                 let id = self.toast_counter;
                 self.toast_counter += 1;
-                self.peer_toasts.push((id, msg, user_id));
+                self.peer_toasts.push((id, display_name, user_id, true));
                 let link = ctx.link().clone();
                 Timeout::new(8_000, move || {
                     link.send_message(Msg::RemovePeerToast(id));
@@ -1045,11 +1049,11 @@ impl Component for AttendantsComponent {
             }
             Msg::RemovePeerToast(toast_id) => {
                 let before = self.peer_toasts.len();
-                self.peer_toasts.retain(|(id, _, _)| *id != toast_id);
+                self.peer_toasts.retain(|(id, _, _, _)| *id != toast_id);
                 self.peer_toasts.len() != before
             }
             Msg::PlayLeftSoundIfStillActive(toast_id) => {
-                if self.peer_toasts.iter().any(|(id, _, _)| *id == toast_id) {
+                if self.peer_toasts.iter().any(|(id, _, _, _)| *id == toast_id) {
                     Self::play_user_left();
                 }
                 false // no re-render needed
@@ -1059,6 +1063,15 @@ impl Component for AttendantsComponent {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let display_name = ctx.props().display_name.clone();
+        let effective_user_id = ctx
+            .props()
+            .user_id
+            .as_deref()
+            .unwrap_or(&display_name)
+            .to_string();
+        let is_allowed = users_allowed_to_stream().unwrap_or_default();
+        let can_stream =
+            is_allowed.is_empty() || is_allowed.iter().any(|host| host == &effective_user_id);
         let media_access_granted = self.media_device_access.is_granted();
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
@@ -1157,18 +1170,13 @@ impl Component for AttendantsComponent {
                     // "participant joined/left" toast notifications
                     if !self.peer_toasts.is_empty() {
                         <div class="peer-toasts">
-                            { for self.peer_toasts.iter().map(|(id, msg, _uid)| {
+                            { for self.peer_toasts.iter().map(|(id, _display_name, uid, is_joined)| {
                                 let key = id.to_string();
-                                let is_joined = msg.contains("joined");
+                                let is_joined = *is_joined;
                                 let variant_class = if is_joined {
                                     "peer-toast toast-joined"
                                 } else {
                                     "peer-toast toast-left"
-                                };
-                                let name = if is_joined {
-                                    msg.trim_end_matches(" joined the meeting")
-                                } else {
-                                    msg.trim_end_matches(" left the meeting")
                                 };
                                 let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
                                 let icon_svg = if is_joined {
@@ -1197,7 +1205,8 @@ impl Component for AttendantsComponent {
                                     <div {key} class={variant_class}>
                                         <span class="toast-icon">{ icon_svg }</span>
                                         <span class="toast-text">
-                                            <span class="toast-name">{ format!("{name} ") }</span>
+                                            <span class="toast-name">{ uid.clone() }</span>
+                                            <br/>
                                             <span class="toast-action">{ action_text }</span>
                                         </span>
                                     </div>
@@ -1261,7 +1270,7 @@ impl Component for AttendantsComponent {
                     }
 
                     {
-                        if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &display_name) || users_allowed_to_stream().unwrap_or_default().is_empty() {
+                        if can_stream {
                             html! {
                                 <nav class="host">
                                     <div class="controls">

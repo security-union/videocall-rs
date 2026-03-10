@@ -986,11 +986,12 @@ impl Inner {
             Ok(PacketType::MEETING) => match MeetingPacket::parse_from_bytes(&response.data) {
                 Ok(meeting_packet) => {
                     info!(
-                        "Received MEETING packet: event_type={:?}, room={}, target={}, creator={}, session={}",
+                        "Received MEETING packet: event_type={:?}, room={}, target={}, creator={}, display_name={}, session={}",
                         meeting_packet.event_type.enum_value(),
                         meeting_packet.room_id,
                         String::from_utf8_lossy(&meeting_packet.target_user_id),
                         String::from_utf8_lossy(&meeting_packet.creator_id),
+                        String::from_utf8_lossy(&meeting_packet.display_name),
                         meeting_packet.session_id,
                     );
                     match meeting_packet.event_type.enum_value() {
@@ -1024,10 +1025,10 @@ impl Inner {
                             // overlapping mutable/immutable borrows.
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
-                            let display_name = if meeting_packet.creator_id.is_empty() {
+                            let display_name = if meeting_packet.display_name.is_empty() {
                                 target_str.clone()
                             } else {
-                                String::from_utf8_lossy(&meeting_packet.creator_id).to_string()
+                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
                             };
                             // Store the display name on the peer so the UI can
                             // show it on tiles instead of the raw user_id/email.
@@ -1062,10 +1063,10 @@ impl Inner {
                             if should_emit {
                                 info!("Peer left: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_left {
-                                    let display_name = if meeting_packet.creator_id.is_empty() {
+                                    let display_name = if meeting_packet.display_name.is_empty() {
                                         target_str.clone()
                                     } else {
-                                        String::from_utf8_lossy(&meeting_packet.creator_id)
+                                        String::from_utf8_lossy(&meeting_packet.display_name)
                                             .to_string()
                                     };
                                     cb.emit((display_name, target_str));

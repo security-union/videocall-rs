@@ -136,6 +136,13 @@ fn play_tone_pair(freq1: f64, freq2: f64, duration: f64, volume: f64) {
         let _ = osc.start_with_when(now + duration);
         let _ = osc.stop_with_when(now + duration * 2.0);
     }
+
+    // Close the AudioContext after playback completes to avoid resource leaks.
+    let duration_ms = (duration * 2.0 * 1000.0) as u32 + 100;
+    Timeout::new(duration_ms, move || {
+        let _ = ctx.close();
+    })
+    .forget();
 }
 
 /// Maximum number of reconnection attempts before giving up.
@@ -308,7 +315,7 @@ pub fn AttendantsComponent(
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
-    let peer_toasts: Signal<Vec<(u64, String, String)>> = use_signal(Vec::new);
+    let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
 
@@ -392,7 +399,7 @@ pub fn AttendantsComponent(
             },
             on_peer_added: VcCallback::from(move |session_id: String| {
                 log::info!("New user joined: {session_id}");
-                play_user_joined();
+                // Sound is played by on_peer_joined which has display name context.
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             }),
@@ -455,11 +462,10 @@ pub fn AttendantsComponent(
                     let mut toast_counter = toast_counter;
                     let mut peer_toasts = peer_toasts;
                     let mut toast_version = toast_version;
-                    let msg = format!("{display_name} ({user_id}) left the meeting");
                     let id = *toast_counter.peek();
                     toast_counter.set(id + 1);
                     let mut current = peer_toasts.peek().clone();
-                    current.push((id, msg, user_id));
+                    current.push((id, display_name, user_id, false));
                     peer_toasts.set(current);
                     {
                         let v = *toast_version.peek();
@@ -468,7 +474,7 @@ pub fn AttendantsComponent(
                     // Defer the leave sound: only play if the toast still exists
                     // after 500ms (i.e. no join event cancelled it).
                     Timeout::new(500, move || {
-                        if peer_toasts.peek().iter().any(|(tid, _, _)| *tid == id) {
+                        if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
                             play_user_left();
                         }
                     })
@@ -478,7 +484,7 @@ pub fn AttendantsComponent(
                         let updated: Vec<_> = peer_toasts
                             .peek()
                             .iter()
-                            .filter(|(tid, _, _)| *tid != id)
+                            .filter(|(tid, _, _, _)| *tid != id)
                             .cloned()
                             .collect();
                         peer_toasts.set(updated);
@@ -498,12 +504,11 @@ pub fn AttendantsComponent(
                     let mut toast_version = toast_version;
                     // Remove any pending "left" toast for this user (waiting room admission).
                     let mut current = peer_toasts.peek().clone();
-                    current.retain(|(_, msg, uid)| !(uid == &user_id && msg.contains("left")));
+                    current.retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
                     play_user_joined();
-                    let msg = format!("{display_name} ({user_id}) joined the meeting");
                     let id = *toast_counter.peek();
                     toast_counter.set(id + 1);
-                    current.push((id, msg, user_id));
+                    current.push((id, display_name, user_id, true));
                     peer_toasts.set(current);
                     {
                         let v = *toast_version.peek();
@@ -514,7 +519,7 @@ pub fn AttendantsComponent(
                         let updated: Vec<_> = peer_toasts
                             .peek()
                             .iter()
-                            .filter(|(tid, _, _)| *tid != id)
+                            .filter(|(tid, _, _, _)| *tid != id)
                             .cloned()
                             .collect();
                         peer_toasts.set(updated);
@@ -660,7 +665,9 @@ pub fn AttendantsComponent(
     };
 
     let is_allowed = users_allowed_to_stream().unwrap_or_default();
-    let can_stream = is_allowed.is_empty() || is_allowed.iter().any(|host| host == &display_name);
+    let effective_user_id = user_id.as_deref().unwrap_or(&display_name);
+    let can_stream =
+        is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
 
     // --- Pre-join screen ---
     if !meeting_joined() {
@@ -764,15 +771,9 @@ pub fn AttendantsComponent(
                 if !peer_toasts().is_empty() {
                     div {
                         class: "peer-toasts",
-                        for (id, msg, _uid) in peer_toasts().iter().cloned() {
+                        for (id, _display_name, uid, is_joined) in peer_toasts().iter().cloned() {
                             {
-                                let is_joined = msg.contains("joined");
                                 let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
-                                let name = if is_joined {
-                                    msg.trim_end_matches(" joined the meeting")
-                                } else {
-                                    msg.trim_end_matches(" left the meeting")
-                                };
                                 let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
                                 rsx! {
                                     div { key: "{id}", class: "{variant_class}",
@@ -809,7 +810,8 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                         span { class: "toast-text",
-                                            span { class: "toast-name", "{name} " }
+                                            span { class: "toast-name", "{uid}" }
+                                            br {}
                                             span { class: "toast-action", "{action_text}" }
                                         }
                                     }

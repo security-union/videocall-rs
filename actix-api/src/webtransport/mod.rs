@@ -737,8 +737,24 @@ mod tests {
                     if let Ok(mut stream) = session.accept_uni().await {
                         if let Ok(buf) = stream.read_to_end(usize::MAX).await {
                             if !buf.is_empty() {
-                                println!("Received packet on B (size: {} bytes)", buf.len());
-                                return Some(buf);
+                                if let Ok(pkt) = VcPacketWrapper::parse_from_bytes(&buf) {
+                                    let media_type: ::protobuf::EnumOrUnknown<VcPacketType> =
+                                        VcPacketType::MEDIA.into();
+                                    if pkt.packet_type == media_type {
+                                        println!(
+                                            "Received MEDIA packet on B (size: {} bytes)",
+                                            buf.len()
+                                        );
+                                        return Some(buf);
+                                    }
+                                    println!(
+                                        "Skipping non-MEDIA packet on B (type: {:?})",
+                                        pkt.packet_type
+                                    );
+                                } else {
+                                    println!("Received unparseable packet on B, returning it");
+                                    return Some(buf);
+                                }
                             }
                         }
                     }

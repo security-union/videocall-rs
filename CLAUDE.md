@@ -87,7 +87,7 @@ Always delegate work to the specialized roster agents instead of making changes 
 - **frontend-rust-webtransport-and-websocket** — All Dioxus/Yew UI changes (components, pages, styling, state management)
 - **backend-rust-streaming** — All backend/API changes (Axum routes, DB queries, server logic)
 - **code-reviewer** — Review all code changes before committing
-- **web-security-auditor** — Review code touching auth, user input, API endpoints
+- **web-security-auditor** — Full-scope application security: backend auth/authz, API endpoints, input validation, XSS/injection, CSRF, UI trust indicators (e.g. host badges, role icons, permission displays), identity comparison logic, token handling, phishing vectors, architectural security review. Must audit both server-side AND client-side code — rendering code that conveys trust or authority is security-critical.
 - **database-reviewer** — Review schema, migration, and query changes
 - **integration-test-writer** — Write integration tests for new or changed features
 - **deploy-sync-expert** — Update Docker/K8s configs when services or dependencies change

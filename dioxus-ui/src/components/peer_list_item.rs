@@ -23,15 +23,21 @@ use dioxus::prelude::*;
 #[component]
 pub fn PeerListItem(
     name: String,
+    #[props(default)] tooltip: String,
     #[props(default)] is_host: bool,
     #[props(default)] is_self: bool,
     #[props(default = true)] muted: bool,
     #[props(default = false)] speaking: bool,
 ) -> Element {
-    let title = if is_host {
-        format!("Host: {name}")
-    } else {
+    let effective_tooltip = if tooltip.is_empty() {
         name.clone()
+    } else {
+        tooltip.clone()
+    };
+    let title = if is_host {
+        format!("Host: {effective_tooltip}")
+    } else {
+        effective_tooltip
     };
 
     let mic_class = if speaking {

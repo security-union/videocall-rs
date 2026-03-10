@@ -22,5 +22,5 @@ pub mod session_logic;
 pub mod transports;
 
 // Re-export commonly used types
-pub use session_logic::{Email, RoomId, SessionId};
+pub use session_logic::{RoomId, SessionId, UserId};
 pub use transports::{WsChatSession, WtChatSession};

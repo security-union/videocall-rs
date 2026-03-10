@@ -299,7 +299,7 @@ impl ConnectionManager {
             }
 
             // Handle RTT responses internally
-            if packet.email == userid {
+            if packet.user_id[..] == *userid.as_bytes() {
                 let reception_time = js_sys::Date::now();
                 if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
@@ -330,6 +330,16 @@ impl ConnectionManager {
                         "Rejecting packet from same session_id: {}",
                         packet.session_id
                     );
+                    return;
+                }
+            }
+
+            // Only forward packets from the elected connection.
+            // During the election period (active_connection_id is None), all
+            // connections forward packets so that RTT probes work and the
+            // first SESSION_ASSIGNED can be processed.
+            if let Some(ref elected_id) = *active_connection_id.borrow() {
+                if *elected_id != connection_id {
                     return;
                 }
             }
@@ -410,7 +420,7 @@ impl ConnectionManager {
     fn create_rtt_packet(&self, timestamp: f64) -> Result<PacketWrapper> {
         let media_packet = MediaPacket {
             media_type: MediaType::RTT.into(),
-            email: self.options.userid.clone(),
+            user_id: self.options.userid.as_bytes().to_vec(),
             timestamp,
             ..Default::default()
         };
@@ -418,7 +428,7 @@ impl ConnectionManager {
         let data = self.aes.encrypt(&media_packet.write_to_bytes()?)?;
         Ok(PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
-            email: self.options.userid.clone(),
+            user_id: self.options.userid.as_bytes().to_vec(),
             data,
             ..Default::default()
         })

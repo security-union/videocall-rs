@@ -45,7 +45,7 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
 use videocall_types::Callback;
-use videocall_types::SYSTEM_USER_EMAIL;
+use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
 
 /// Configuration options for creating a [`VideoCallClient`].
@@ -62,7 +62,7 @@ pub struct VideoCallClientOptions {
     pub on_peer_removed: Option<Callback<String>>,
     pub get_peer_video_canvas_id: Callback<String, String>,
     pub get_peer_screen_canvas_id: Callback<String, String>,
-    pub userid: String,
+    pub user_id: String,
     pub meeting_id: String,
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
@@ -100,12 +100,20 @@ pub struct VideoCallClientOptions {
 
     /// Callback triggered when the waiting room participant list changes (optional)
     pub on_waiting_room_updated: Option<Callback<()>>,
+
+    /// Callback triggered when a remote participant leaves the meeting.
+    /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
+    pub on_peer_left: Option<Callback<(String, String)>>,
+
+    /// Callback triggered when a remote participant joins the meeting.
+    /// Emits `(display_name, user_id)` from the PARTICIPANT_JOINED meeting event.
+    pub on_peer_joined: Option<Callback<(String, String)>>,
 }
 
 #[derive(Debug)]
 struct InnerOptions {
     enable_e2ee: bool,
-    userid: String,
+    user_id: String,
     on_peer_added: Callback<String>,
     on_meeting_info: Option<Callback<f64>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
@@ -113,6 +121,8 @@ struct InnerOptions {
     on_participant_admitted: Option<Callback<()>>,
     on_participant_rejected: Option<Callback<()>>,
     on_waiting_room_updated: Option<Callback<()>>,
+    on_peer_left: Option<Callback<(String, String)>>,
+    on_peer_joined: Option<Callback<(String, String)>>,
 }
 
 #[derive(Debug)]
@@ -127,6 +137,12 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
+    /// Recently processed peer events for deduplication.
+    /// Both WebSocket and WebTransport connections receive the same NATS system
+    /// messages, so we deduplicate by (event_type, target_user_id) within a
+    /// short time window to avoid firing duplicate toast notifications.
+    /// Key: (event_type_str, target_user_id), Value: timestamp_ms
+    recent_peer_events: HashMap<(String, String), f64>,
 }
 
 /// The main client handle for a video call session.
@@ -160,10 +176,10 @@ impl VideoCallClient {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
 
         let diagnostics = if options.enable_diagnostics {
-            let diagnostics = Rc::new(DiagnosticManager::new(options.userid.clone()));
+            let diagnostics = Rc::new(DiagnosticManager::new(options.user_id.clone()));
 
             if let Some(interval) = options.diagnostics_update_interval_ms {
-                let mut diag = DiagnosticManager::new(options.userid.clone());
+                let mut diag = DiagnosticManager::new(options.user_id.clone());
                 diag.set_reporting_interval(interval);
                 let diagnostics = Rc::new(diag);
 
@@ -176,7 +192,7 @@ impl VideoCallClient {
         };
 
         let sender_diagnostics = if options.enable_diagnostics {
-            let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.userid.clone()));
+            let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.user_id.clone()));
 
             if let Some(interval) = options.diagnostics_update_interval_ms {
                 sender_diagnostics.set_reporting_interval(interval);
@@ -198,7 +214,7 @@ impl VideoCallClient {
 
             let mut reporter = HealthReporter::new(
                 session_id,
-                options.userid.clone(),
+                options.user_id.clone(),
                 options.health_reporting_interval_ms.unwrap_or(5000),
             );
 
@@ -221,7 +237,7 @@ impl VideoCallClient {
             inner: Rc::new(RefCell::new(Inner {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
-                    userid: options.userid.clone(),
+                    user_id: options.user_id.clone(),
                     on_peer_added: options.on_peer_added.clone(),
                     on_meeting_ended: options.on_meeting_ended.clone(),
                     on_meeting_info: options.on_meeting_info.clone(),
@@ -229,6 +245,8 @@ impl VideoCallClient {
                     on_participant_admitted: options.on_participant_admitted.clone(),
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
+                    on_peer_left: options.on_peer_left.clone(),
+                    on_peer_joined: options.on_peer_joined.clone(),
                 },
                 connection_controller: connection_controller.clone(),
                 connection_state: ConnectionState::Failed {
@@ -245,6 +263,7 @@ impl VideoCallClient {
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
+                recent_peer_events: HashMap::new(),
             })),
             connection_controller,
             aes,
@@ -303,7 +322,7 @@ impl VideoCallClient {
             } else {
                 Vec::new()
             },
-            userid: self.options.userid.clone(),
+            userid: self.options.user_id.clone(),
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {
@@ -430,9 +449,7 @@ impl VideoCallClient {
                 }
             }
             Err(_) => {
-                error!(
-                    "Unable to borrow connection_controller -- dropping {packet_type:?} packet"
-                )
+                error!("Unable to borrow connection_controller -- dropping {packet_type:?} packet")
             }
         }
     }
@@ -485,16 +502,31 @@ impl VideoCallClient {
         }
     }
 
-    pub fn get_peer_email(&self, session_id: &str) -> Option<String> {
+    pub fn get_peer_user_id(&self, session_id: &str) -> Option<String> {
         let sid: u64 = session_id.parse().ok()?;
         match self.inner.try_borrow() {
             Ok(inner) => inner
                 .peer_decode_manager
                 .get(&sid)
-                .map(|peer| peer.email.clone()),
+                .map(|peer| peer.user_id.clone()),
             Err(_) => {
                 warn!(
-                    "Failed to borrow inner in get_peer_email for session_id: {}",
+                    "Failed to borrow inner in get_peer_user_id for session_id: {}",
+                    session_id
+                );
+                None
+            }
+        }
+    }
+
+    /// Get the display name for a peer by session_id string.
+    /// Returns `None` if the peer doesn't exist or no display name has been set.
+    pub fn get_peer_display_name(&self, session_id: &str) -> Option<String> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get_peer_display_name(session_id),
+            Err(_) => {
+                warn!(
+                    "Failed to borrow inner in get_peer_display_name for session_id: {}",
                     session_id
                 );
                 None
@@ -572,8 +604,8 @@ impl VideoCallClient {
         self.aes.clone()
     }
 
-    pub fn userid(&self) -> &String {
-        &self.options.userid
+    pub fn user_id(&self) -> &String {
+        &self.options.user_id
     }
 
     pub fn get_connection_state(&self) -> Option<ConnectionState> {
@@ -665,7 +697,7 @@ impl VideoCallClient {
     pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
         let wrapper = PacketWrapper {
             packet_type: PacketType::DIAGNOSTICS.into(),
-            email: self.options.userid.clone(),
+            user_id: self.options.user_id.as_bytes().to_vec(),
             data: packet.write_to_bytes().unwrap(),
             ..Default::default()
         };
@@ -789,28 +821,54 @@ impl VideoCallClient {
 }
 
 impl Inner {
+    /// Returns `true` if this peer event was already seen recently (within 5 s).
+    ///
+    /// Both WebSocket and WebTransport connections receive the same NATS system
+    /// messages, so the same PARTICIPANT_JOINED / PARTICIPANT_LEFT event can
+    /// arrive twice.  This helper deduplicates them so the UI only fires one
+    /// toast notification per actual event.
+    fn is_duplicate_peer_event(&mut self, event_type: &str, target_user_id: &str) -> bool {
+        let now = js_sys::Date::now();
+        let key = (event_type.to_string(), target_user_id.to_string());
+
+        // Evict stale entries (older than 5 seconds).
+        self.recent_peer_events.retain(|_, ts| now - *ts < 5000.0);
+
+        if self.recent_peer_events.contains_key(&key) {
+            true // duplicate
+        } else {
+            self.recent_peer_events.insert(key, now);
+            false // first occurrence
+        }
+    }
+
     fn on_inbound_media(&mut self, response: PacketWrapper) {
         debug!(
             "<< Received {:?} from {} (session: {})",
             response.packet_type.enum_value(),
-            response.email,
+            String::from_utf8_lossy(&response.user_id),
             response.session_id
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let peer_status = if response.email == SYSTEM_USER_EMAIL || response.session_id == 0 {
-            PeerStatus::NoChange
-        } else {
-            self.peer_decode_manager
-                .ensure_peer(response.session_id, &response.email)
-        };
+        let peer_status =
+            if response.user_id == SYSTEM_USER_ID.as_bytes() || response.session_id == 0 {
+                PeerStatus::NoChange
+            } else {
+                let peer_user_id = String::from_utf8_lossy(&response.user_id);
+                self.peer_decode_manager
+                    .ensure_peer(response.session_id, &peer_user_id)
+            };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 if !self.options.enable_e2ee {
                     return;
                 }
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                    debug!("Decrypted AES_KEY from {}", response.email);
+                    debug!(
+                        "Decrypted AES_KEY from {}",
+                        String::from_utf8_lossy(&response.user_id)
+                    );
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
                             if let Err(e) = self.peer_decode_manager.set_peer_aes(
@@ -846,14 +904,14 @@ impl Inner {
 
                 match encrypted_aes_packet {
                     Ok(data) => {
-                        debug!(">> {} sending AES key", self.options.userid);
+                        debug!(">> {} sending AES key", self.options.user_id);
 
                         // Send AES key packet via ConnectionController
                         if let Ok(cc) = self.connection_controller.try_borrow() {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::AES_KEY.into(),
-                                    email: self.options.userid.clone(),
+                                    user_id: self.options.user_id.as_bytes().to_vec(),
                                     data,
                                     ..Default::default()
                                 };
@@ -876,7 +934,7 @@ impl Inner {
 
                 if let Err(e) = self
                     .peer_decode_manager
-                    .decode(response, &self.options.userid)
+                    .decode(response, &self.options.user_id)
                 {
                     error!("error decoding packet: {e}");
                     match e {
@@ -907,7 +965,7 @@ impl Inner {
             Ok(PacketType::HEALTH) => {
                 debug!(
                     "Received unexpected health packet from {}, ignoring",
-                    response.email
+                    String::from_utf8_lossy(&response.user_id)
                 );
             }
             Ok(PacketType::SESSION_ASSIGNED) => {
@@ -926,96 +984,152 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEETING) => match MeetingPacket::parse_from_bytes(&response.data) {
-                Ok(meeting_packet) => match meeting_packet.event_type.enum_value() {
-                    Ok(MeetingEventType::MEETING_STARTED) => {
-                        info!(
-                            "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
-                            meeting_packet.room_id,
-                            meeting_packet.start_time_ms,
-                            meeting_packet.creator_id,
-                        );
+                Ok(meeting_packet) => {
+                    info!(
+                        "Received MEETING packet: event_type={:?}, room={}, target={}, creator={}, display_name={}, session={}",
+                        meeting_packet.event_type.enum_value(),
+                        meeting_packet.room_id,
+                        String::from_utf8_lossy(&meeting_packet.target_user_id),
+                        String::from_utf8_lossy(&meeting_packet.creator_id),
+                        String::from_utf8_lossy(&meeting_packet.display_name),
+                        meeting_packet.session_id,
+                    );
+                    match meeting_packet.event_type.enum_value() {
+                        Ok(MeetingEventType::MEETING_STARTED) => {
+                            info!(
+                                "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
+                                meeting_packet.room_id,
+                                meeting_packet.start_time_ms,
+                                String::from_utf8_lossy(&meeting_packet.creator_id),
+                            );
 
-                        if let Some(callback) = &self.options.on_meeting_info {
-                            callback.emit(meeting_packet.start_time_ms as f64);
+                            if let Some(callback) = &self.options.on_meeting_info {
+                                callback.emit(meeting_packet.start_time_ms as f64);
+                            }
                         }
-                    }
-                    Ok(MeetingEventType::MEETING_ENDED) => {
-                        info!(
-                            "Received MEETING_ENDED: room={}, message={}",
-                            meeting_packet.room_id, meeting_packet.message
-                        );
-                        if let Some(callback) = &self.options.on_meeting_ended {
-                            let end_time_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_millis() as f64)
-                                .unwrap_or(0.0);
-                            callback.emit((end_time_ms, meeting_packet.message));
+                        Ok(MeetingEventType::MEETING_ENDED) => {
+                            info!(
+                                "Received MEETING_ENDED: room={}, message={}",
+                                meeting_packet.room_id, meeting_packet.message
+                            );
+                            if let Some(callback) = &self.options.on_meeting_ended {
+                                let end_time_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as f64)
+                                    .unwrap_or(0.0);
+                                callback.emit((end_time_ms, meeting_packet.message));
+                            }
                         }
-                    }
-                    Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                        debug!(
-                            "Received PARTICIPANT_JOINED: room={}, count={}",
-                            meeting_packet.room_id, meeting_packet.participant_count
-                        );
-                    }
-                    Ok(MeetingEventType::PARTICIPANT_LEFT) => {
-                        info!(
-                            "Received PARTICIPANT_LEFT: room={}, count={}",
-                            meeting_packet.room_id, meeting_packet.participant_count
-                        );
-                    }
-                    Ok(MeetingEventType::MEETING_ACTIVATED) => {
-                        info!(
-                            "Received MEETING_ACTIVATED: room={}",
-                            meeting_packet.room_id
-                        );
-                        if let Some(callback) = &self.options.on_meeting_activated {
-                            callback.emit(());
+                        Ok(MeetingEventType::PARTICIPANT_JOINED) => {
+                            // Check dedup before borrowing self.options to avoid
+                            // overlapping mutable/immutable borrows.
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            let display_name = if meeting_packet.display_name.is_empty() {
+                                target_str.clone()
+                            } else {
+                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
+                            };
+                            // Store the display name on the peer so the UI can
+                            // show it on tiles instead of the raw user_id/email.
+                            self.peer_decode_manager.set_peer_display_name_by_user_id(
+                                &target_str,
+                                display_name.clone(),
+                            );
+                            let should_emit = !meeting_packet.target_user_id.is_empty()
+                                && meeting_packet.target_user_id[..]
+                                    != *self.options.user_id.as_bytes()
+                                && !self.is_duplicate_peer_event("joined", &target_str);
+                            if should_emit {
+                                info!("Peer joined: {}", target_str);
+                                if let Some(ref cb) = self.options.on_peer_joined {
+                                    cb.emit((display_name, target_str));
+                                }
+                            } else {
+                                debug!("Suppressed PARTICIPANT_JOINED for target={}", target_str,);
+                            }
                         }
-                    }
-                    Ok(MeetingEventType::PARTICIPANT_ADMITTED) => {
-                        info!(
-                            "Received PARTICIPANT_ADMITTED: room={}, target={}",
-                            meeting_packet.room_id, meeting_packet.target_email
-                        );
-                        // Only fire callback if this event is targeted at us
-                        if meeting_packet.target_email == self.options.userid {
-                            if let Some(callback) = &self.options.on_participant_admitted {
+                        Ok(MeetingEventType::PARTICIPANT_LEFT) => {
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager
+                                    .delete_peer(meeting_packet.session_id);
+                            }
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            let should_emit = !meeting_packet.target_user_id.is_empty()
+                                && meeting_packet.target_user_id[..]
+                                    != *self.options.user_id.as_bytes()
+                                && !self.is_duplicate_peer_event("left", &target_str);
+                            if should_emit {
+                                info!("Peer left: {}", target_str);
+                                if let Some(ref cb) = self.options.on_peer_left {
+                                    let display_name = if meeting_packet.display_name.is_empty() {
+                                        target_str.clone()
+                                    } else {
+                                        String::from_utf8_lossy(&meeting_packet.display_name)
+                                            .to_string()
+                                    };
+                                    cb.emit((display_name, target_str));
+                                }
+                            }
+                        }
+                        Ok(MeetingEventType::MEETING_ACTIVATED) => {
+                            info!(
+                                "Received MEETING_ACTIVATED: room={}",
+                                meeting_packet.room_id
+                            );
+                            if let Some(callback) = &self.options.on_meeting_activated {
                                 callback.emit(());
                             }
                         }
-                    }
-                    Ok(MeetingEventType::PARTICIPANT_REJECTED) => {
-                        info!(
-                            "Received PARTICIPANT_REJECTED: room={}, target={}",
-                            meeting_packet.room_id, meeting_packet.target_email
-                        );
-                        // Only fire callback if this event is targeted at us
-                        if meeting_packet.target_email == self.options.userid {
-                            if let Some(callback) = &self.options.on_participant_rejected {
+                        Ok(MeetingEventType::PARTICIPANT_ADMITTED) => {
+                            info!(
+                                "Received PARTICIPANT_ADMITTED: room={}, target={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(&meeting_packet.target_user_id)
+                            );
+                            // Only fire callback if this event is targeted at us
+                            if meeting_packet.target_user_id[..] == *self.options.user_id.as_bytes()
+                            {
+                                if let Some(callback) = &self.options.on_participant_admitted {
+                                    callback.emit(());
+                                }
+                            }
+                        }
+                        Ok(MeetingEventType::PARTICIPANT_REJECTED) => {
+                            info!(
+                                "Received PARTICIPANT_REJECTED: room={}, target={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(&meeting_packet.target_user_id)
+                            );
+                            // Only fire callback if this event is targeted at us
+                            if meeting_packet.target_user_id[..] == *self.options.user_id.as_bytes()
+                            {
+                                if let Some(callback) = &self.options.on_participant_rejected {
+                                    callback.emit(());
+                                }
+                            }
+                        }
+                        Ok(MeetingEventType::WAITING_ROOM_UPDATED) => {
+                            info!(
+                                "Received WAITING_ROOM_UPDATED: room={}",
+                                meeting_packet.room_id
+                            );
+                            if let Some(callback) = &self.options.on_waiting_room_updated {
                                 callback.emit(());
                             }
                         }
-                    }
-                    Ok(MeetingEventType::WAITING_ROOM_UPDATED) => {
-                        info!(
-                            "Received WAITING_ROOM_UPDATED: room={}",
-                            meeting_packet.room_id
-                        );
-                        if let Some(callback) = &self.options.on_waiting_room_updated {
-                            callback.emit(());
+                        Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
+                            error!(
+                                "Received meeting packet with unknown event type: room={}",
+                                meeting_packet.room_id
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to parse MeetingEventType: {e}");
                         }
                     }
-                    Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
-                        error!(
-                            "Received meeting packet with unknown event type: room={}",
-                            meeting_packet.room_id
-                        );
-                    }
-                    Err(e) => {
-                        error!("Failed to parse MeetingEventType: {e}");
-                    }
-                },
+                }
                 Err(e) => {
                     error!("Failed to parse MeetingPacket: {e}");
                 }
@@ -1023,7 +1137,7 @@ impl Inner {
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",
-                    response.email
+                    String::from_utf8_lossy(&response.user_id)
                 );
             }
             Err(e) => {
@@ -1040,12 +1154,12 @@ impl Inner {
         if !self.options.enable_e2ee {
             return;
         }
-        let userid = self.options.userid.clone();
+        let userid = self.options.user_id.clone();
         let rsa = &*self.rsa;
         match rsa.pub_key.to_public_key_der() {
             Ok(public_key_der) => {
                 let packet = RsaPacket {
-                    username: userid.clone(),
+                    user_id: userid.as_bytes().to_vec(),
                     public_key_der: public_key_der.to_vec(),
                     ..Default::default()
                 };
@@ -1058,7 +1172,7 @@ impl Inner {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::RSA_PUB_KEY.into(),
-                                    email: userid,
+                                    user_id: userid.as_bytes().to_vec(),
                                     data,
                                     ..Default::default()
                                 };
@@ -1088,8 +1202,8 @@ impl Inner {
             iv: self.aes.iv.to_vec(),
             ..Default::default()
         }
-            .write_to_bytes()
-            .map_err(|e| anyhow!("Failed to serialize aes packet: {e}"))
+        .write_to_bytes()
+        .map_err(|e| anyhow!("Failed to serialize aes packet: {e}"))
     }
 
     fn encrypt_aes_packet(&self, aes_packet: &[u8], pub_key: &RsaPublicKey) -> Result<Vec<u8>> {

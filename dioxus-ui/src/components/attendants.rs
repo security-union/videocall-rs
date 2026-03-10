@@ -47,7 +47,6 @@ use videocall_client::Callback as VcCallback;
 use videocall_client::{
     MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
-use web_sys::HtmlAudioElement;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
@@ -64,12 +63,12 @@ impl ScreenShareState {
 
 /// Build the WebSocket and WebTransport lobby URLs for the media server.
 #[allow(unused_variables)]
-fn build_lobby_urls(token: &str, email: &str, id: &str) -> (Vec<String>, Vec<String>) {
+fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<String>) {
     #[cfg(feature = "media-server-jwt-auth")]
     let lobby_url = |base: &str| format!("{base}/lobby?token={token}");
 
     #[cfg(not(feature = "media-server-jwt-auth"))]
-    let lobby_url = |base: &str| format!("{base}/lobby/{email}/{id}");
+    let lobby_url = |base: &str| format!("{base}/lobby/{user_id}/{id}");
 
     let websocket_urls = actix_websocket_base()
         .unwrap_or_default()
@@ -86,14 +85,64 @@ fn build_lobby_urls(token: &str, email: &str, id: &str) -> (Vec<String>, Vec<Str
 }
 
 fn play_user_joined() {
-    if let Some(_window) = web_sys::window() {
-        if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
-            audio.set_volume(0.4);
-            if let Err(e) = audio.play() {
-                log::warn!("Failed to play notification sound: {e:?}");
-            }
-        }
+    // Ascending two-tone chime: C5 -> E5 (pleasant, welcoming)
+    play_tone_pair(523.25, 659.25, 0.12, 0.35);
+}
+
+fn play_user_left() {
+    // Descending two-tone: E5 -> A4 (subtle, muted)
+    play_tone_pair(659.25, 440.0, 0.12, 0.25);
+}
+
+/// Play two short sine-wave tones in sequence using the Web Audio API.
+/// `freq1` / `freq2` are the frequencies in Hz, `duration` is how long each
+/// tone lasts (seconds), and `volume` is the peak gain (0.0 – 1.0).
+fn play_tone_pair(freq1: f64, freq2: f64, duration: f64, volume: f64) {
+    let Some(_window) = web_sys::window() else {
+        return;
+    };
+    let ctx = match web_sys::AudioContext::new() {
+        Ok(ctx) => ctx,
+        Err(_) => return,
+    };
+    let now = ctx.current_time();
+
+    // First tone
+    if let (Ok(osc), Ok(gain)) = (ctx.create_oscillator(), ctx.create_gain()) {
+        let _ = osc.connect_with_audio_node(&gain);
+        let _ = gain.connect_with_audio_node(&ctx.destination());
+        osc.set_type(web_sys::OscillatorType::Triangle);
+        let _ = osc.frequency().set_value_at_time(freq1 as f32, now);
+        let _ = gain.gain().set_value_at_time(volume as f32, now);
+        let _ = gain
+            .gain()
+            .exponential_ramp_to_value_at_time(0.01, now + duration);
+        let _ = osc.start();
+        let _ = osc.stop_with_when(now + duration);
     }
+
+    // Second tone (starts after first ends)
+    if let (Ok(osc), Ok(gain)) = (ctx.create_oscillator(), ctx.create_gain()) {
+        let _ = osc.connect_with_audio_node(&gain);
+        let _ = gain.connect_with_audio_node(&ctx.destination());
+        osc.set_type(web_sys::OscillatorType::Triangle);
+        let _ = osc
+            .frequency()
+            .set_value_at_time(freq2 as f32, now + duration);
+        let _ = gain.gain().set_value_at_time(volume as f32, now + duration);
+        let _ = gain
+            .gain()
+            .exponential_ramp_to_value_at_time(0.01, now + duration * 2.0);
+        let _ = osc.start_with_when(now + duration);
+        let _ = osc.stop_with_when(now + duration * 2.0);
+    }
+
+    // Close the AudioContext after playback completes to avoid resource leaks.
+    let duration_ms = (duration * 2.0 * 1000.0) as u32 + 100;
+    Timeout::new(duration_ms, move || {
+        let _ = ctx.close();
+    })
+    .forget();
 }
 
 /// Maximum number of reconnection attempts before giving up.
@@ -120,7 +169,7 @@ fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
 fn schedule_reconnect(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
     meeting_id: String,
-    email: String,
+    display_name: String,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
     attempt: u32,
@@ -128,19 +177,26 @@ fn schedule_reconnect(
     let delay_ms = match reconnect_delay_ms(attempt) {
         Some(d) => d,
         None => {
-            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            connection_error.set(Some(
+                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+            ));
             return;
         }
     };
 
-    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
+    log::info!(
+        "Scheduling reconnect attempt {}/{} in {}ms",
+        attempt + 1,
+        MAX_RECONNECT_ATTEMPTS,
+        delay_ms
+    );
 
     Timeout::new(delay_ms, move || {
         wasm_bindgen_futures::spawn_local(async move {
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
-                    let (ws, wt) = build_lobby_urls(&new_token, &email, &meeting_id);
+                    let (ws, wt) = build_lobby_urls(&new_token, &display_name, &meeting_id);
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
                         if let Err(e) = client.connect() {
@@ -157,7 +213,7 @@ fn schedule_reconnect(
                     schedule_reconnect(
                         client_cell,
                         meeting_id,
-                        email,
+                        display_name,
                         connection_error,
                         meeting_ended_message,
                         attempt + 1,
@@ -182,12 +238,19 @@ fn schedule_reconnect_no_jwt(
     let delay_ms = match reconnect_delay_ms(attempt) {
         Some(d) => d,
         None => {
-            connection_error.set(Some("Unable to reconnect after multiple attempts. Please refresh the page.".into()));
+            connection_error.set(Some(
+                "Unable to reconnect after multiple attempts. Please refresh the page.".into(),
+            ));
             return;
         }
     };
 
-    log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, MAX_RECONNECT_ATTEMPTS, delay_ms);
+    log::info!(
+        "Scheduling reconnect attempt {}/{} in {}ms",
+        attempt + 1,
+        MAX_RECONNECT_ATTEMPTS,
+        delay_ms
+    );
 
     Timeout::new(delay_ms, move || {
         let reconnect_needed = {
@@ -283,13 +346,14 @@ fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) 
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
-    #[props(default)] email: String,
+    #[props(default)] display_name: String,
     e2ee_enabled: bool,
     webtransport_enabled: bool,
     #[props(default)] user_name: Option<String>,
-    #[props(default)] user_email: Option<String>,
+    #[props(default)] user_id: Option<String>,
     #[props(default)] on_logout: Option<EventHandler<()>>,
     #[props(default)] host_display_name: Option<String>,
+    #[props(default)] host_user_id: Option<String>,
     #[props(default)] auto_join: bool,
     #[props(default)] is_owner: bool,
     #[props(default)] room_token: String,
@@ -322,6 +386,9 @@ pub fn AttendantsComponent(
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
+    let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
+    let toast_counter: Signal<u64> = use_signal(|| 0);
+    let toast_version: Signal<u32> = use_signal(|| 0);
 
     // Container dimensions — updated on every window resize so compute_grid
     // reacts to viewport changes without any JS ResizeObserver boilerplate.
@@ -359,11 +426,11 @@ pub fn AttendantsComponent(
         #[cfg(not(feature = "media-server-jwt-auth"))]
         let token = String::new();
 
-        let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &email, &id);
+        let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &display_name, &id);
 
         log::info!(
             "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
-            email,
+            display_name,
             id
         );
 
@@ -371,7 +438,7 @@ pub fn AttendantsComponent(
             Rc::new(RefCell::new(None));
 
         let opts = VideoCallClientOptions {
-            userid: email.clone(),
+            user_id: user_id.clone().unwrap_or_else(|| display_name.clone()),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -386,7 +453,7 @@ pub fn AttendantsComponent(
             }),
             on_connection_lost: {
                 let id = id.clone();
-                let email = email.clone();
+                let display_name = display_name.clone();
                 let client_cell = client_for_reconnect.clone();
                 VcCallback::from(move |_| {
                     log::warn!("DIOXUS-UI: Connection lost");
@@ -398,11 +465,11 @@ pub fn AttendantsComponent(
                     {
                         let client_cell = client_cell.clone();
                         let meeting_id = id.clone();
-                        let email = email.clone();
+                        let display_name = display_name.clone();
                         schedule_reconnect(
                             client_cell,
                             meeting_id,
-                            email,
+                            display_name,
                             connection_error,
                             meeting_ended_message,
                             0,
@@ -418,7 +485,7 @@ pub fn AttendantsComponent(
             },
             on_peer_added: VcCallback::from(move |session_id: String| {
                 log::info!("New user joined: {session_id}");
-                play_user_joined();
+                // Sound is played by on_peer_joined which has display name context.
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             }),
@@ -439,8 +506,8 @@ pub fn AttendantsComponent(
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
-            get_peer_video_canvas_id: VcCallback::from(|email| email),
-            get_peer_screen_canvas_id: VcCallback::from(|email| format!("screen-share-{}", &email)),
+            get_peer_video_canvas_id: VcCallback::from(|id| id),
+            get_peer_screen_canvas_id: VcCallback::from(|id| format!("screen-share-{}", &id)),
             enable_diagnostics: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
@@ -475,6 +542,86 @@ pub fn AttendantsComponent(
                 let mut v = waiting_room_version;
                 v.set(v() + 1);
             })),
+            on_peer_left: Some(VcCallback::from(
+                move |(display_name, user_id): (String, String)| {
+                    log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+                    let mut toast_counter = toast_counter;
+                    let mut peer_toasts = peer_toasts;
+                    let mut toast_version = toast_version;
+                    let id = *toast_counter.peek();
+                    toast_counter.set(id + 1);
+                    let mut current = peer_toasts.peek().clone();
+                    current.push((id, display_name, user_id, false));
+                    peer_toasts.set(current);
+                    {
+                        let v = *toast_version.peek();
+                        toast_version.set(v + 1);
+                    }
+                    // Defer the leave sound: only play if the toast still exists
+                    // after 500ms (i.e. no join event cancelled it).
+                    Timeout::new(500, move || {
+                        if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
+                            play_user_left();
+                        }
+                    })
+                    .forget();
+                    // Schedule toast removal after 8 seconds.
+                    Timeout::new(8_000, move || {
+                        let updated: Vec<_> = peer_toasts
+                            .peek()
+                            .iter()
+                            .filter(|(tid, _, _, _)| *tid != id)
+                            .cloned()
+                            .collect();
+                        peer_toasts.set(updated);
+                        {
+                            let v = *toast_version.peek();
+                            toast_version.set(v + 1);
+                        }
+                    })
+                    .forget();
+                },
+            )),
+            on_peer_joined: Some(VcCallback::from(
+                move |(display_name, user_id): (String, String)| {
+                    log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                    let mut toast_counter = toast_counter;
+                    let mut peer_toasts = peer_toasts;
+                    let mut toast_version = toast_version;
+                    // Remove any pending "left" toast for this user (waiting room admission).
+                    let mut current = peer_toasts.peek().clone();
+                    current.retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
+                    play_user_joined();
+                    let id = *toast_counter.peek();
+                    toast_counter.set(id + 1);
+                    current.push((id, display_name, user_id, true));
+                    peer_toasts.set(current);
+                    {
+                        let v = *toast_version.peek();
+                        toast_version.set(v + 1);
+                    }
+                    // Force tile re-render so display names appear.
+                    {
+                        let mut v = peer_list_version;
+                        v.set(v() + 1);
+                    }
+                    // Schedule toast removal after 8 seconds.
+                    Timeout::new(8_000, move || {
+                        let updated: Vec<_> = peer_toasts
+                            .peek()
+                            .iter()
+                            .filter(|(tid, _, _, _)| *tid != id)
+                            .cloned()
+                            .collect();
+                        peer_toasts.set(updated);
+                        {
+                            let v = *toast_version.peek();
+                            toast_version.set(v + 1);
+                        }
+                    })
+                    .forget();
+                },
+            )),
         };
 
         let client = VideoCallClient::new(opts);
@@ -615,12 +762,13 @@ pub fn AttendantsComponent(
 
     // --- Derived values ---
     let _ = peer_list_version(); // subscribe to trigger re-renders when peers change
+    let _ = toast_version(); // subscribe to trigger re-renders when toasts change
     let display_peers = client.sorted_peer_keys();
     let peers_for_display: Vec<String> = display_peers
         .iter()
         .map(|session_id| {
             client
-                .get_peer_email(session_id)
+                .get_peer_user_id(session_id)
                 .unwrap_or_else(|| session_id.clone())
         })
         .collect();
@@ -648,7 +796,9 @@ pub fn AttendantsComponent(
     };
 
     let is_allowed = users_allowed_to_stream().unwrap_or_default();
-    let can_stream = is_allowed.is_empty() || is_allowed.iter().any(|host| host == &email);
+    let effective_user_id = user_id.as_deref().unwrap_or(&display_name);
+    let can_stream =
+        is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
 
     // --- Pre-join screen ---
     if !meeting_joined() {
@@ -747,6 +897,61 @@ pub fn AttendantsComponent(
                 id: "main-container",
                 class: "meeting-page",
                 BrowserCompatibility {}
+
+                // "participant joined/left" toast notifications
+                if !peer_toasts().is_empty() {
+                    div {
+                        class: "peer-toasts",
+                        for (id, display_name, uid, is_joined) in peer_toasts().iter().cloned() {
+                            {
+                                let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
+                                let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
+                                rsx! {
+                                    div { key: "{id}", class: "{variant_class}",
+                                        span { class: "toast-icon",
+                                            if is_joined {
+                                                svg {
+                                                    width: "16",
+                                                    height: "16",
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
+                                                    circle { cx: "9", cy: "7", r: "4" }
+                                                    line { x1: "19", y1: "8", x2: "19", y2: "14" }
+                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
+                                                }
+                                            } else {
+                                                svg {
+                                                    width: "16",
+                                                    height: "16",
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
+                                                    circle { cx: "9", cy: "7", r: "4" }
+                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
+                                                }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name", "{display_name}" }
+                                            br {}
+                                            span { class: "toast-action", "{action_text}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 div {
                     id: "grid-container",
                     style: "{container_style}",
@@ -761,7 +966,7 @@ pub fn AttendantsComponent(
                                     key: "tile-{i}-{peer_id}",
                                     peer_id: peer_id.clone(),
                                     full_bleed: full_bleed,
-                                    host_display_name: host_display_name.clone(),
+                                    host_user_id: host_user_id.clone(),
                                 }
                             }
                         }
@@ -1052,6 +1257,7 @@ pub fn AttendantsComponent(
                                 }
                             },
                             host_display_name: host_display_name.clone(),
+                            host_user_id: host_user_id.clone(),
                         }
                     }
                 }
@@ -1156,7 +1362,10 @@ mod tests {
     /// attempt=10 exceeds MAX_RECONNECT_ATTEMPTS and should return None.
     #[wasm_bindgen_test]
     fn reconnect_delay_attempt_10_returns_none() {
-        assert!(reconnect_delay_ms(10).is_none(), "attempt 10 should return None");
+        assert!(
+            reconnect_delay_ms(10).is_none(),
+            "attempt 10 should return None"
+        );
     }
 
     /// Attempts beyond 10 should also return None.
@@ -1175,7 +1384,8 @@ mod tests {
         // Collect many samples per attempt and check the average is near the expected base.
         let samples = 200;
         for attempt in 0..4u32 {
-            let expected_base = (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
+            let expected_base =
+                (1000u32.saturating_mul(2u32.saturating_pow(attempt))).min(16_000) as f64;
             let sum: f64 = (0..samples)
                 .map(|_| reconnect_delay_ms(attempt).unwrap() as f64)
                 .sum();

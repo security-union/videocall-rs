@@ -38,7 +38,7 @@ pub enum TokenError {
         token_room: String,
         requested_room: String,
     },
-    /// The `sub` claim does not match the email/identity in the connection URL.
+    /// The `sub` claim does not match the user ID/identity in the connection URL.
     IdentityMismatch {
         token_identity: String,
         requested_identity: String,
@@ -118,7 +118,7 @@ impl TokenError {
 /// Decode and validate a JWT room access token, extracting claims.
 ///
 /// This is the primary validation function for the **token-based** connection
-/// endpoint (`GET /lobby?token=<JWT>`). The identity (email) and room are
+/// endpoint (`GET /lobby?token=<JWT>`). The identity (user_id) and room are
 /// extracted from the token claims themselves -- there are no URL path
 /// parameters to cross-check.
 ///
@@ -160,7 +160,7 @@ pub fn decode_room_token(secret: &str, token: &str) -> Result<RoomAccessTokenCla
 ///
 /// Validate a JWT room access token against expected room and identity.
 ///
-/// **DEPRECATED**: This function is used by the legacy `GET /lobby/{email}/{room}`
+/// **DEPRECATED**: This function is used by the legacy `GET /lobby/{user_id}/{room}`
 /// endpoint. Prefer [`decode_room_token`] for the new token-based endpoint where
 /// identity and room are extracted from the JWT claims directly.
 ///

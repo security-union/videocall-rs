@@ -46,7 +46,7 @@ pub struct MeetingsList {
     unauthenticated: bool,
     expanded: bool,
     total: i64,
-    current_user_email: Option<String>,
+    current_user_id: Option<String>,
 }
 
 #[derive(Properties, Clone, PartialEq)]
@@ -54,9 +54,9 @@ pub struct MeetingsListProps {
     /// Callback when a meeting is selected for joining
     #[prop_or_default]
     pub on_select_meeting: Option<Callback<String>>,
-    /// Current user's email for determining ownership
+    /// Current user's ID for determining ownership
     #[prop_or_default]
-    pub user_email: Option<String>,
+    pub user_id: Option<String>,
 }
 
 impl Component for MeetingsList {
@@ -69,7 +69,7 @@ impl Component for MeetingsList {
 
         // The meetings list API returns only meetings owned by the current user,
         // so all meetings in the response belong to us. No need to check ownership.
-        let current_user_email = ctx.props().user_email.clone();
+        let current_user_id = ctx.props().user_id.clone();
 
         Self {
             meetings: Vec::new(),
@@ -78,14 +78,14 @@ impl Component for MeetingsList {
             unauthenticated: false,
             expanded: true,
             total: 0,
-            current_user_email,
+            current_user_id,
         }
     }
 
     fn changed(&mut self, ctx: &Context<Self>, _old_props: &Self::Properties) -> bool {
-        // Update email if prop changes
-        if let Some(email) = &ctx.props().user_email {
-            self.current_user_email = Some(email.clone());
+        // Update user ID if prop changes
+        if let Some(id) = &ctx.props().user_id {
+            self.current_user_id = Some(id.clone());
         }
         true
     }

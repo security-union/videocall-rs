@@ -28,7 +28,8 @@ const POLL_INTERVAL_MS: i32 = 5000;
 #[component]
 pub fn WaitingRoom(
     meeting_id: String,
-    email: String,
+    user_id: String,
+    display_name: String,
     observer_token: String,
     on_admitted: EventHandler<ParticipantStatus>,
     on_rejected: EventHandler<()>,
@@ -48,7 +49,7 @@ pub fn WaitingRoom(
     {
         let observer_token = observer_token.clone();
         let meeting_id = meeting_id.clone();
-        let email = email.clone();
+        let user_id = user_id.clone();
         let observer_connected = observer_connected.clone();
         use_effect(move || {
             if observer_token.is_empty() {
@@ -58,8 +59,7 @@ pub fn WaitingRoom(
                 return;
             }
 
-            let lobby_url =
-                |base: &str| format!("{base}/lobby?token={observer_token}");
+            let lobby_url = |base: &str| format!("{base}/lobby?token={observer_token}");
             let websocket_urls: Vec<String> = actix_websocket_base()
                 .unwrap_or_default()
                 .split(',')
@@ -72,11 +72,12 @@ pub fn WaitingRoom(
                 .collect();
 
             let meeting_id_for_fetch = meeting_id.clone();
+            let meeting_id_for_post_connect = meeting_id.clone();
             let obs_conn_on_connect = observer_connected.clone();
             let obs_conn_on_lost = observer_connected.clone();
 
             let opts = VideoCallClientOptions {
-                userid: email.clone(),
+                user_id: user_id.clone(),
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,
@@ -85,9 +86,38 @@ pub fn WaitingRoom(
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting room)");
                     obs_conn_on_connect.set(true);
+                    // Poll once immediately after connection is established.
+                    // This catches admissions that occurred during the WebSocket
+                    // handshake window (NATS event already published but observer
+                    // wasn't subscribed yet).
+                    let mid = meeting_id_for_post_connect.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match check_status(&mid).await {
+                            Ok(status) => match status.status.as_str() {
+                                "admitted" if status.room_token.is_some() => {
+                                    log::info!("Post-connect poll: participant already admitted");
+                                    on_admitted.call(status);
+                                }
+                                "rejected" => {
+                                    log::info!("Post-connect poll: participant rejected");
+                                    on_rejected.call(());
+                                }
+                                other => {
+                                    log::debug!(
+                                        "Post-connect poll: status={other}, waiting for push"
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                log::warn!("Post-connect poll: status check failed: {e}");
+                            }
+                        }
+                    });
                 }),
                 on_connection_lost: VcCallback::from(move |_| {
-                    log::warn!("Observer connection lost (waiting room); polling fallback will activate");
+                    log::warn!(
+                        "Observer connection lost (waiting room); polling fallback will activate"
+                    );
                     obs_conn_on_lost.set(false);
                 }),
                 on_peer_added: VcCallback::noop(),
@@ -105,36 +135,32 @@ pub fn WaitingRoom(
                 on_meeting_info: None,
                 on_meeting_ended: None,
                 on_meeting_activated: None,
-                on_participant_admitted: Some(VcCallback::from(
-                    move |_: ()| {
-                        log::info!("Participant admitted push received, fetching room token via HTTP");
-                        let mid = meeting_id_for_fetch.clone();
-                        // Use spawn_local instead of dioxus::spawn because
-                        // this callback fires from a WebSocket message
-                        // handler which runs outside any Dioxus runtime
-                        // context. Calling dioxus::spawn() here would panic.
-                        wasm_bindgen_futures::spawn_local(async move {
-                            match check_status(&mid).await {
-                                Ok(status) => {
-                                    if status.room_token.is_some() {
-                                        on_admitted.call(status);
-                                    } else {
-                                        log::error!("Admitted but check_status returned no room_token");
-                                        error.set(Some(
-                                            "Admitted but failed to obtain room token".to_string(),
-                                        ));
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to fetch room token after admission: {e}");
-                                    error.set(Some(format!(
-                                        "Failed to fetch room token: {e}"
-                                    )));
+                on_participant_admitted: Some(VcCallback::from(move |_: ()| {
+                    log::info!("Participant admitted push received, fetching room token via HTTP");
+                    let mid = meeting_id_for_fetch.clone();
+                    // Use spawn_local instead of dioxus::spawn because
+                    // this callback fires from a WebSocket message
+                    // handler which runs outside any Dioxus runtime
+                    // context. Calling dioxus::spawn() here would panic.
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match check_status(&mid).await {
+                            Ok(status) => {
+                                if status.room_token.is_some() {
+                                    on_admitted.call(status);
+                                } else {
+                                    log::error!("Admitted but check_status returned no room_token");
+                                    error.set(Some(
+                                        "Admitted but failed to obtain room token".to_string(),
+                                    ));
                                 }
                             }
-                        });
-                    },
-                )),
+                            Err(e) => {
+                                log::error!("Failed to fetch room token after admission: {e}");
+                                error.set(Some(format!("Failed to fetch room token: {e}")));
+                            }
+                        }
+                    });
+                })),
                 on_participant_rejected: Some(VcCallback::from(move |_| {
                     log::info!("Participant rejected push received");
                     on_rejected.call(());
@@ -142,6 +168,8 @@ pub fn WaitingRoom(
                 on_waiting_room_updated: None,
                 on_speaking_changed: None,
                 vad_threshold: None,
+                on_peer_left: None,
+                on_peer_joined: None,
             };
 
             let mut client = VideoCallClient::new(opts);
@@ -156,21 +184,16 @@ pub fn WaitingRoom(
         });
     }
 
-    // Polling fallback: always start a setInterval timer that checks
-    // participant status every POLL_INTERVAL_MS. On each tick, if the
-    // observer WebSocket is connected (checked via Rc<Cell<bool>>), the
-    // tick is a no-op. This avoids the complexity of reactively
-    // starting/stopping the timer and covers three failure modes:
-    //   1. Empty observer token (old server, no push support)
-    //   2. WebSocket connection failed or was rejected
-    //   3. WebSocket disconnected (e.g. token expired after 30 min)
+    // Polling safety net: always poll participant status every
+    // POLL_INTERVAL_MS regardless of observer WebSocket state. The push
+    // path provides instant notification when it works, but polling
+    // ensures we never miss an admission/rejection if a NATS event is lost.
     //
     // The interval_id is stored in an Rc<Cell<i32>> so use_drop can
     // clear it when the component unmounts, preventing leaked timers.
     let poll_interval_id: Rc<Cell<i32>> = use_hook(|| Rc::new(Cell::new(-1)));
     {
         let meeting_id = meeting_id.clone();
-        let observer_connected = observer_connected.clone();
         let poll_interval_id = poll_interval_id.clone();
         use_effect(move || {
             let window = match web_sys::window() {
@@ -178,17 +201,41 @@ pub fn WaitingRoom(
                 None => return,
             };
 
-            log::info!("WaitingRoom: starting polling fallback timer (every {POLL_INTERVAL_MS}ms, skips when observer connected)");
+            log::info!(
+                "WaitingRoom: starting polling safety net timer (every {POLL_INTERVAL_MS}ms)"
+            );
+
+            // Poll once immediately on mount to catch admissions that
+            // occurred before any connection was established (host admitted
+            // during the join -> connect gap).
+            {
+                let meeting_id = meeting_id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match check_status(&meeting_id).await {
+                        Ok(status) => match status.status.as_str() {
+                            "admitted" if status.room_token.is_some() => {
+                                log::info!("Immediate mount poll: participant already admitted");
+                                on_admitted.call(status);
+                            }
+                            "rejected" => {
+                                log::info!("Immediate mount poll: participant rejected");
+                                on_rejected.call(());
+                            }
+                            other => {
+                                log::debug!(
+                                    "Immediate mount poll: status={other}, will continue polling"
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("Immediate mount poll: status check failed: {e}");
+                        }
+                    }
+                });
+            }
 
             let meeting_id = meeting_id.clone();
-            let observer_connected = observer_connected.clone();
             let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                if observer_connected.get() {
-                    // Observer WebSocket is connected; push notifications
-                    // are handling admission/rejection. Skip this poll.
-                    return;
-                }
-
                 let meeting_id = meeting_id.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     match check_status(&meeting_id).await {
@@ -199,7 +246,9 @@ pub fn WaitingRoom(
                                     on_admitted.call(status);
                                 } else {
                                     // Admitted but no token yet -- keep polling.
-                                    log::warn!("Polling fallback: admitted but no room_token, will retry");
+                                    log::warn!(
+                                        "Polling fallback: admitted but no room_token, will retry"
+                                    );
                                 }
                             }
                             "rejected" => {
@@ -260,6 +309,9 @@ pub fn WaitingRoom(
                     }
                 }
                 h2 { "Waiting to be admitted" }
+                if !display_name.trim().is_empty() {
+                    p { class: "waiting-room-identity", "Joining as {display_name}" }
+                }
                 p { class: "waiting-room-message",
                     "The meeting host will let you in soon."
                 }

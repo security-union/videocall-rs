@@ -34,7 +34,7 @@ use crate::error::AppError;
 /// Claims embedded in a session JWT (stored in an HttpOnly cookie).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionTokenClaims {
-    /// User email (the identity principal).
+    /// User ID (the identity principal).
     pub sub: String,
     /// Display name.
     pub name: String,
@@ -56,13 +56,13 @@ impl SessionTokenClaims {
 /// handler so that the browser sends it automatically with every request.
 pub fn generate_session_token(
     secret: &str,
-    email: &str,
+    user_id: &str,
     name: &str,
     ttl_secs: i64,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = SessionTokenClaims {
-        sub: email.to_string(),
+        sub: user_id.to_string(),
         name: name.to_string(),
         exp: now + ttl_secs,
         iat: now,
@@ -105,14 +105,14 @@ pub fn decode_session_token(secret: &str, token: &str) -> Result<SessionTokenCla
 pub fn generate_room_token(
     secret: &str,
     ttl_secs: i64,
-    email: &str,
+    user_id: &str,
     room: &str,
     is_host: bool,
     display_name: &str,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = RoomAccessTokenClaims {
-        sub: email.to_string(),
+        sub: user_id.to_string(),
         room: room.to_string(),
         room_join: true,
         is_host,
@@ -143,13 +143,13 @@ const OBSERVER_TOKEN_TTL_SECS: i64 = 1800;
 /// (e.g. MEETING_ACTIVATED, PARTICIPANT_ADMITTED) without polling.
 pub fn generate_observer_token(
     secret: &str,
-    email: &str,
+    user_id: &str,
     room: &str,
     display_name: &str,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = RoomAccessTokenClaims {
-        sub: email.to_string(),
+        sub: user_id.to_string(),
         room: room.to_string(),
         room_join: false,
         is_host: false,

@@ -628,7 +628,7 @@ pub fn Diagnostics(
     let client = use_context::<VideoCallClient>();
     let peer_display_name = move |session_id: &str| -> String {
         client
-            .get_peer_email(session_id)
+            .get_peer_user_id(session_id)
             .unwrap_or_else(|| session_id.to_string())
     };
 

@@ -188,7 +188,7 @@ impl CameraEncoder {
         // 2. setup WebCodecs, in particular
         // 3. send encoded video frames and raw audio to the server.
         let client = self.client.clone();
-        let userid = client.userid().clone();
+        let userid = client.user_id().clone();
         let aes = client.aes();
         let video_elem_id = self.video_elem_id.clone();
         let EncoderState {

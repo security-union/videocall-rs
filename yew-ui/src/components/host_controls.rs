@@ -23,7 +23,11 @@
 
 use crate::constants::meeting_api_client;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
+use wasm_bindgen::JsCast;
 use yew::prelude::*;
+
+/// Polling interval in milliseconds for the safety-net timer.
+const POLL_INTERVAL_MS: i32 = 10_000;
 
 /// Type alias for waiting participant (uses shared type)
 pub type WaitingParticipant = ParticipantStatusResponse;
@@ -58,6 +62,8 @@ pub struct HostControls {
     expanded: bool,
     /// Track the last version we fetched for, so we re-fetch when it changes.
     last_fetched_version: u32,
+    /// Interval ID for the polling safety net timer.
+    poll_interval_id: Option<i32>,
 }
 
 impl Component for HostControls {
@@ -70,23 +76,45 @@ impl Component for HostControls {
             ctx.link().send_message(HostControlsMsg::FetchWaiting);
         }
 
+        // Start a polling safety net timer that fetches the waiting list
+        // every POLL_INTERVAL_MS. This catches attendees who joined the
+        // waiting room before the host's observer WebSocket was connected.
+        let poll_interval_id = if ctx.props().is_admitted {
+            Self::start_poll_timer(ctx)
+        } else {
+            None
+        };
+
         Self {
             waiting: Vec::new(),
             error: None,
             expanded: true,
             last_fetched_version: ctx.props().waiting_room_version,
+            poll_interval_id,
+        }
+    }
+
+    fn destroy(&mut self, _ctx: &Context<Self>) {
+        // Clean up the polling interval on unmount.
+        if let Some(id) = self.poll_interval_id.take() {
+            if let Some(window) = web_sys::window() {
+                window.clear_interval_with_handle(id);
+                log::debug!("HostControls: cleared polling interval {id} on destroy");
+            }
         }
     }
 
     fn changed(&mut self, ctx: &Context<Self>, old_props: &Self::Properties) -> bool {
-        // If we became admitted, fetch immediately
+        // If we became admitted, fetch immediately and start polling
         if ctx.props().is_admitted && !old_props.is_admitted {
             ctx.link().send_message(HostControlsMsg::FetchWaiting);
+            if self.poll_interval_id.is_none() {
+                self.poll_interval_id = Self::start_poll_timer(ctx);
+            }
         }
 
         // If waiting_room_version changed, re-fetch the waiting list
-        if ctx.props().waiting_room_version != self.last_fetched_version
-            && ctx.props().is_admitted
+        if ctx.props().waiting_room_version != self.last_fetched_version && ctx.props().is_admitted
         {
             self.last_fetched_version = ctx.props().waiting_room_version;
             ctx.link().send_message(HostControlsMsg::FetchWaiting);
@@ -124,20 +152,20 @@ impl Component for HostControls {
                 self.error = Some(error);
                 true
             }
-            HostControlsMsg::Admit(email) => {
+            HostControlsMsg::Admit(peer_user_id) => {
                 let meeting_id = ctx.props().meeting_id.clone();
                 let link = ctx.link().clone();
-                let email_for_api = email.clone();
+                let user_id_for_admit = peer_user_id.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    match admit_participant(&meeting_id, &email_for_api).await {
+                    match admit_participant(&meeting_id, &user_id_for_admit).await {
                         Ok(_) => link.send_message(HostControlsMsg::ActionComplete),
                         Err(e) => link.send_message(HostControlsMsg::ActionError(e)),
                     }
                 });
 
                 // Remove from local list immediately for responsiveness
-                self.waiting.retain(|p| p.email != email);
+                self.waiting.retain(|p| p.user_id != peer_user_id);
                 true
             }
             HostControlsMsg::AdmitAll => {
@@ -155,20 +183,20 @@ impl Component for HostControls {
                 self.waiting.clear();
                 true
             }
-            HostControlsMsg::Reject(email) => {
+            HostControlsMsg::Reject(peer_user_id) => {
                 let meeting_id = ctx.props().meeting_id.clone();
                 let link = ctx.link().clone();
-                let email_for_api = email.clone();
+                let user_id_for_reject = peer_user_id.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    match reject_participant(&meeting_id, &email_for_api).await {
+                    match reject_participant(&meeting_id, &user_id_for_reject).await {
                         Ok(_) => link.send_message(HostControlsMsg::ActionComplete),
                         Err(e) => link.send_message(HostControlsMsg::ActionError(e)),
                     }
                 });
 
                 // Remove from local list immediately for responsiveness
-                self.waiting.retain(|p| p.email != email);
+                self.waiting.retain(|p| p.user_id != peer_user_id);
                 true
             }
             HostControlsMsg::ActionComplete => {
@@ -242,20 +270,41 @@ impl Component for HostControls {
                                     }
                                 }
                                 { for self.waiting.iter().map(|participant| {
-                                    let email = participant.email.clone();
-                                    let email_for_admit = email.clone();
-                                    let email_for_reject = email.clone();
+                                    let peer_user_id = participant.user_id.clone();
+                                    let user_id_for_admit = peer_user_id.clone();
+                                    let user_id_for_reject = peer_user_id.clone();
 
                                     let on_admit = ctx.link().callback(move |_| {
-                                        HostControlsMsg::Admit(email_for_admit.clone())
+                                        HostControlsMsg::Admit(user_id_for_admit.clone())
                                     });
                                     let on_reject = ctx.link().callback(move |_| {
-                                        HostControlsMsg::Reject(email_for_reject.clone())
+                                        HostControlsMsg::Reject(user_id_for_reject.clone())
                                     });
 
                                     html! {
                                         <div class="waiting-participant">
-                                            <span class="participant-email">{&email}</span>
+                                            <div class="participant-info">
+                                                {
+                                                    if let Some(ref name) = participant.display_name {
+                                                        if !name.trim().is_empty() {
+                                                            html! {
+                                                                <>
+                                                                    <div class="participant-name">{name}</div>
+                                                                    <div class="participant-email">{&peer_user_id}</div>
+                                                                </>
+                                                            }
+                                                        } else {
+                                                            html! {
+                                                                <div class="participant-name">{&peer_user_id}</div>
+                                                            }
+                                                        }
+                                                    } else {
+                                                        html! {
+                                                            <div class="participant-name">{&peer_user_id}</div>
+                                                        }
+                                                    }
+                                                }
+                                            </div>
                                             <div class="participant-actions">
                                                 <button
                                                     class="btn-admit"
@@ -291,6 +340,31 @@ impl Component for HostControls {
     }
 }
 
+impl HostControls {
+    /// Start a setInterval timer that sends `FetchWaiting` every `POLL_INTERVAL_MS`.
+    fn start_poll_timer(ctx: &Context<Self>) -> Option<i32> {
+        let window = web_sys::window()?;
+        let link = ctx.link().clone();
+
+        log::info!("HostControls: starting polling safety net (every {POLL_INTERVAL_MS}ms)");
+
+        let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+            link.send_message(HostControlsMsg::FetchWaiting);
+        });
+
+        let id = window
+            .set_interval_with_callback_and_timeout_and_arguments_0(
+                poll_closure.as_ref().unchecked_ref(),
+                POLL_INTERVAL_MS,
+            )
+            .ok()?;
+
+        // Prevent the closure from being dropped while the interval is active.
+        poll_closure.forget();
+        Some(id)
+    }
+}
+
 async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     match client.get_waiting_room(meeting_id).await {
@@ -300,19 +374,19 @@ async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, Stri
     }
 }
 
-async fn admit_participant(meeting_id: &str, email: &str) -> Result<(), String> {
+async fn admit_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     client
-        .admit_participant(meeting_id, email)
+        .admit_participant(meeting_id, user_id)
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))
 }
 
-async fn reject_participant(meeting_id: &str, email: &str) -> Result<(), String> {
+async fn reject_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     client
-        .reject_participant(meeting_id, email)
+        .reject_participant(meeting_id, user_id)
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))

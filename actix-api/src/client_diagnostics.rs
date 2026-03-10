@@ -27,12 +27,15 @@ pub mod health_processor {
     // Health data structure matching RFC design
     // Use protobuf HealthPacket on the wire; keep simple structs only if needed internally.
     use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
+    use videocall_types::user_id_bytes_to_string;
 
     /// Process a health packet and update Prometheus metrics
     pub fn process_health_packet(health_data: &PbHealthPacket, client: async_nats::client::Client) {
         debug!(
             "Publishing health report from {} in session {} for meeting {} to NATS",
-            health_data.reporting_peer, health_data.session_id, health_data.meeting_id
+            user_id_bytes_to_string(&health_data.reporting_user_id),
+            health_data.session_id,
+            health_data.meeting_id
         );
 
         // Publish to NATS instead of processing locally

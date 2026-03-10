@@ -37,9 +37,11 @@ const POLL_INTERVAL_MS: i32 = 5000;
 #[derive(Properties, Clone, PartialEq)]
 pub struct WaitingRoomProps {
     pub meeting_id: String,
-    /// The authenticated user's email, used as the observer `userid` so
-    /// the server can match push-notification `target_email` to this client.
-    pub email: String,
+    /// The authenticated user's ID, used as the observer `userid` so
+    /// the server can match push notifications to this client.
+    pub user_id: String,
+    /// The display name to show on the waiting screen.
+    pub display_name: String,
     /// Observer JWT token for receiving push notifications.
     #[prop_or_default]
     pub observer_token: Option<String>,
@@ -64,7 +66,7 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
     {
         let observer_token = props.observer_token.clone();
         let meeting_id = props.meeting_id.clone();
-        let email = props.email.clone();
+        let user_id = props.user_id.clone();
         let on_admitted = props.on_admitted.clone();
         let on_rejected = props.on_rejected.clone();
         let observer_connected = observer_connected.clone();
@@ -91,7 +93,7 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                 let obs_connected_on_lost = observer_connected.clone();
 
                 let opts = VideoCallClientOptions {
-                    userid: email.clone(),
+                    user_id: user_id.clone(),
                     meeting_id: meeting_id.clone(),
                     websocket_urls: observer_ws_urls,
                     webtransport_urls: observer_wt_urls,
@@ -146,6 +148,8 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                     on_waiting_room_updated: None,
                     on_speaking_changed: None,
                     vad_threshold: None,
+                    on_peer_left: None,
+                    on_peer_joined: None,
                 };
 
                 let mut client = VideoCallClient::new(opts);
@@ -168,88 +172,68 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
         });
     }
 
-    // Polling fallback: when the observer WebSocket is NOT connected,
-    // poll the participant status endpoint every POLL_INTERVAL_MS to
-    // detect admission/rejection. This covers three failure modes:
-    //   1. Empty/None observer token (old server, no push support)
-    //   2. WebSocket connection failed or was rejected
-    //   3. WebSocket disconnected (e.g. token expired after 30 min)
+    // Polling safety net: always poll participant status every
+    // POLL_INTERVAL_MS regardless of observer WebSocket state. The push
+    // path provides instant notification when it works, but polling
+    // ensures we never miss an admission/rejection if a NATS event is lost.
     {
-        let is_connected = *observer_connected;
         let meeting_id = props.meeting_id.clone();
         let on_admitted = props.on_admitted.clone();
         let on_rejected = props.on_rejected.clone();
         let poll_interval_id = poll_interval_id.clone();
 
-        use_effect_with(is_connected, move |is_connected| {
-            // Always clear any previous polling interval first.
-            if let Some(prev_id) = *poll_interval_id {
-                if let Some(w) = web_sys::window() {
-                    w.clear_interval_with_handle(prev_id);
-                }
-                poll_interval_id.set(None);
-                log::debug!("WaitingRoom: cleared previous polling interval");
-            }
-
-            // Start polling only when the observer WebSocket is NOT connected.
+        use_effect_with((), move |_| {
             let mut cleanup_id: Option<i32> = None;
-            if !*is_connected {
-                log::info!(
-                    "WaitingRoom: observer not connected, starting polling fallback (every {}ms)",
-                    POLL_INTERVAL_MS
-                );
 
-                if let Some(window) = web_sys::window() {
-                    let poll_closure =
-                        wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                            let meeting_id = meeting_id.clone();
-                            let on_admitted = on_admitted.clone();
-                            let on_rejected = on_rejected.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                match crate::meeting_api::check_status(&meeting_id).await {
-                                    Ok(status) => match status.status.as_str() {
-                                        "admitted" => {
-                                            if status.room_token.is_some() {
-                                                log::info!(
-                                                    "Polling fallback: participant admitted"
-                                                );
-                                                on_admitted.emit(status);
-                                            } else {
-                                                log::warn!("Polling fallback: admitted but no room_token, will retry");
-                                            }
-                                        }
-                                        "rejected" => {
-                                            log::info!("Polling fallback: participant rejected");
-                                            on_rejected.emit(());
-                                        }
-                                        other => {
-                                            log::debug!(
-                                                "Polling fallback: status={other}, continuing to poll"
-                                            );
-                                        }
-                                    },
-                                    Err(e) => {
-                                        log::warn!("Polling fallback: status check failed: {e}");
+            log::info!("WaitingRoom: starting polling safety net (every {POLL_INTERVAL_MS}ms)");
+
+            if let Some(window) = web_sys::window() {
+                let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    let meeting_id = meeting_id.clone();
+                    let on_admitted = on_admitted.clone();
+                    let on_rejected = on_rejected.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match crate::meeting_api::check_status(&meeting_id).await {
+                            Ok(status) => match status.status.as_str() {
+                                "admitted" => {
+                                    if status.room_token.is_some() {
+                                        log::info!("Polling safety net: participant admitted");
+                                        on_admitted.emit(status);
+                                    } else {
+                                        log::warn!("Polling safety net: admitted but no room_token, will retry");
                                     }
                                 }
-                            });
-                        });
+                                "rejected" => {
+                                    log::info!("Polling safety net: participant rejected");
+                                    on_rejected.emit(());
+                                }
+                                other => {
+                                    log::debug!(
+                                        "Polling safety net: status={other}, continuing to poll"
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                log::warn!("Polling safety net: status check failed: {e}");
+                            }
+                        }
+                    });
+                });
 
-                    let id = window
-                        .set_interval_with_callback_and_timeout_and_arguments_0(
-                            poll_closure.as_ref().unchecked_ref(),
-                            POLL_INTERVAL_MS,
-                        )
-                        .unwrap_or(-1);
+                let id = window
+                    .set_interval_with_callback_and_timeout_and_arguments_0(
+                        poll_closure.as_ref().unchecked_ref(),
+                        POLL_INTERVAL_MS,
+                    )
+                    .unwrap_or(-1);
 
-                    // Prevent the closure from being dropped while the interval is active.
-                    poll_closure.forget();
-                    poll_interval_id.set(Some(id));
-                    cleanup_id = Some(id);
-                }
+                // Prevent the closure from being dropped while the interval is active.
+                poll_closure.forget();
+                poll_interval_id.set(Some(id));
+                cleanup_id = Some(id);
             }
 
-            // Cleanup: clear interval when the effect re-runs or component unmounts.
+            // Cleanup: clear interval when component unmounts.
             move || {
                 if let Some(id) = cleanup_id {
                     if let Some(w) = web_sys::window() {
@@ -270,6 +254,17 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                     </svg>
                 </div>
                 <h2>{"Waiting to be admitted"}</h2>
+                {
+                    if !props.display_name.trim().is_empty() {
+                        html! {
+                            <p class="waiting-room-identity">
+                                {format!("Joining as {}", props.display_name)}
+                            </p>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
                 <p class="waiting-room-message">
                     {"The meeting host will let you in soon."}
                 </p>

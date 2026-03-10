@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::SYSTEM_USER_EMAIL;
+use videocall_types::SYSTEM_USER_ID;
 
 use super::session_logic::{ConnectionState, SessionId};
 
@@ -45,6 +45,7 @@ use super::session_logic::{ConnectionState, SessionId};
 #[rtype(result = "()")]
 struct CleanupFailedJoin {
     session: SessionId,
+    room: String,
 }
 
 pub struct ChatServer {
@@ -53,6 +54,9 @@ pub struct ChatServer {
     active_subs: HashMap<SessionId, JoinHandle<()>>,
     session_manager: SessionManager,
     connection_states: HashMap<SessionId, ConnectionState>,
+    /// Track which sessions are in which room, with their user_id and display_name.
+    /// Used to send PARTICIPANT_JOINED for existing peers to new joiners.
+    room_members: HashMap<String, Vec<(SessionId, String, String)>>,
 }
 
 impl ChatServer {
@@ -63,6 +67,7 @@ impl ChatServer {
             sessions: HashMap::new(),
             session_manager: SessionManager::new(),
             connection_states: HashMap::new(),
+            room_members: HashMap::new(),
         }
     }
 
@@ -71,18 +76,47 @@ impl ChatServer {
         session_id: &SessionId,
         room: Option<&str>,
         user_id: Option<&str>,
+        display_name: Option<&str>,
+        observer: bool,
     ) {
         // Remove the subscription task if it exists
         if let Some(task) = self.active_subs.remove(session_id) {
             task.abort();
         }
 
+        // Remove from room_members tracking
+        if let Some(room_id) = room {
+            if let Some(members) = self.room_members.get_mut(room_id) {
+                members.retain(|(sid, _, _)| sid != session_id);
+                if members.is_empty() {
+                    self.room_members.remove(room_id);
+                }
+            }
+        }
+
         // End session using SessionManager
         if let (Some(room_id), Some(uid)) = (room, user_id) {
             let room_id = room_id.to_string();
             let user_id = uid.to_string();
+            let display_name = display_name.unwrap_or(uid).to_string();
             let session_manager = self.session_manager.clone();
             let nc = self.nats_connection.clone();
+            let session_id_val = *session_id;
+
+            // Observer sessions (waiting room) should not publish PARTICIPANT_LEFT
+            // since they were never real participants in the meeting.
+            if observer {
+                info!(
+                    "Observer session {} for {} leaving room {} - skipping PARTICIPANT_LEFT",
+                    session_id_val, user_id, room_id
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = session_manager.end_session(&room_id, &user_id).await {
+                        error!("Error ending observer session for room {}: {}", room_id, e);
+                    }
+                });
+                return;
+            }
 
             tokio::spawn(async move {
                 match session_manager.end_session(&room_id, &user_id).await {
@@ -109,6 +143,17 @@ impl ChatServer {
                             "Participant {} left room {}, {} remaining",
                             user_id, room_id, remaining_count
                         );
+                        // Notify remaining peers about the departed session
+                        let bytes = SessionManager::build_peer_left_packet(
+                            &room_id,
+                            &user_id,
+                            session_id_val,
+                            &display_name,
+                        );
+                        let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                        if let Err(e) = nc.publish(subject, bytes.into()).await {
+                            error!("Error publishing PARTICIPANT_LEFT: {}", e);
+                        }
                     }
                     Err(e) => {
                         error!("Error ending session for room {}: {}", room_id, e);
@@ -147,10 +192,18 @@ impl Handler<Disconnect> for ChatServer {
             session,
             room,
             user_id,
+            display_name,
+            observer,
         }: Disconnect,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
-        self.leave_rooms(&session, Some(&room), Some(&user_id));
+        self.leave_rooms(
+            &session,
+            Some(&room),
+            Some(&user_id),
+            Some(&display_name),
+            observer,
+        );
         let _ = self.sessions.remove(&session);
         let _ = self.connection_states.remove(&session);
     }
@@ -168,7 +221,10 @@ impl Handler<Leave> for ChatServer {
         }: Leave,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
-        self.leave_rooms(&session, Some(&room), Some(&user_id));
+        // Leave is always a real participant, never an observer.
+        // No display_name available from Leave message; leave_rooms will
+        // fall back to user_id.
+        self.leave_rooms(&session, Some(&room), Some(&user_id), None, false);
     }
 }
 
@@ -261,14 +317,16 @@ impl Handler<JoinRoom> for ChatServer {
             session,
             room,
             user_id,
+            display_name,
+            observer,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
         // Validate user_id synchronously BEFORE spawning async task.
         // This ensures we return an error to the client if validation fails,
         // rather than returning Ok and silently failing in the spawned task.
-        if user_id == SYSTEM_USER_EMAIL {
-            return MessageResult(Err("Cannot use reserved system email as user ID".into()));
+        if user_id == SYSTEM_USER_ID {
+            return MessageResult(Err("Cannot use reserved system user ID".into()));
         }
 
         if self.active_subs.contains_key(&session) {
@@ -278,6 +336,7 @@ impl Handler<JoinRoom> for ChatServer {
         let session_manager = self.session_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
+        let display_name_clone = display_name.clone();
         let session_id = session;
         let nc = self.nats_connection.clone();
 
@@ -289,6 +348,25 @@ impl Handler<JoinRoom> for ChatServer {
                 return MessageResult(Err("Session not found".into()));
             }
         };
+
+        // Collect existing non-observer room members for notifying the new joiner
+        let existing_members: Vec<(SessionId, String, String)> = if !observer {
+            self.room_members.get(&room).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Track this session in room_members (only for non-observers)
+        if !observer {
+            self.room_members.entry(room.clone()).or_default().push((
+                session,
+                user_id.clone(),
+                display_name.clone(),
+            ));
+        }
+
+        // Clone the recipient so we can send existing member info directly to the new joiner
+        let new_joiner_recipient = session_recipient.clone();
 
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
@@ -318,6 +396,60 @@ impl Handler<JoinRoom> for ChatServer {
 
                     send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
                         .await;
+
+                    // Notify existing participants about the new joiner.
+                    // Observer sessions (waiting room) should NOT trigger this.
+                    if !observer {
+                        let bytes = SessionManager::build_peer_joined_packet(
+                            &room_clone,
+                            &user_id_clone,
+                            session_id,
+                            &display_name_clone,
+                        );
+                        let subject = format!("room.{}.system", room_clone.replace(' ', "_"));
+                        info!(
+                            "Publishing PARTICIPANT_JOINED for {} (display={}) to {}",
+                            user_id_clone, display_name_clone, subject
+                        );
+                        let subject_for_log = subject.clone();
+                        if let Err(e) = nc.publish(subject, bytes.into()).await {
+                            error!("Error publishing PARTICIPANT_JOINED: {}", e);
+                        } else {
+                            info!(
+                                "Successfully published PARTICIPANT_JOINED for {} to {}",
+                                user_id_clone, subject_for_log
+                            );
+                        }
+                    } else {
+                        info!(
+                            "Skipping PARTICIPANT_JOINED for observer {} in room {}",
+                            user_id_clone, room_clone
+                        );
+                    }
+
+                    // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
+                    // This ensures the new joiner learns about all participants already in the room.
+                    for (existing_sid, existing_uid, existing_display_name) in &existing_members {
+                        let existing_bytes = SessionManager::build_peer_joined_packet(
+                            &room_clone,
+                            existing_uid,
+                            *existing_sid,
+                            existing_display_name,
+                        );
+                        info!(
+                            "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
+                            existing_uid, existing_display_name, user_id_clone
+                        );
+                        if let Err(e) = new_joiner_recipient.try_send(Message {
+                            msg: existing_bytes,
+                            session: *existing_sid,
+                        }) {
+                            warn!(
+                                "Failed to send existing PARTICIPANT_JOINED for {} to new joiner {}: {}",
+                                existing_uid, user_id_clone, e
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -329,6 +461,7 @@ impl Handler<JoinRoom> for ChatServer {
                     // leave a stale entry in active_subs, blocking future join attempts.
                     let _ = chat_server_addr.try_send(CleanupFailedJoin {
                         session: session_for_cleanup,
+                        room: room_clone.clone(),
                     });
                     return;
                 }
@@ -374,6 +507,13 @@ impl Handler<CleanupFailedJoin> for ChatServer {
                 "Cleaned up failed join for session {} from active_subs",
                 msg.session
             );
+        }
+        // Also remove from room_members since the join failed
+        if let Some(members) = self.room_members.get_mut(&msg.room) {
+            members.retain(|(sid, _, _)| *sid != msg.session);
+            if members.is_empty() {
+                self.room_members.remove(&msg.room);
+            }
         }
     }
 }
@@ -436,14 +576,14 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: JoinRoom rejects reserved system email synchronously
+    // TEST: JoinRoom rejects reserved system user ID synchronously
     // ==========================================================================
     // This test verifies the fix for the race condition where JoinRoom would
     // spawn an async task and immediately return Ok(()), even if validation
     // would fail inside the task. Now validation happens synchronously.
     #[actix_rt::test]
     #[serial]
-    async fn test_join_room_rejects_system_email_synchronously() {
+    async fn test_join_room_rejects_system_user_id_synchronously() {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
@@ -475,13 +615,15 @@ mod tests {
             .await
             .expect("Connect should succeed");
 
-        // Attempt to join with the reserved system email
+        // Attempt to join with the reserved system user ID
         // This should return an error SYNCHRONOUSLY (not Ok then fail async)
         let result = chat_server
             .send(JoinRoom {
                 session: session_id,
                 room: "test-room".to_string(),
-                user_id: SYSTEM_USER_EMAIL.to_string(),
+                user_id: SYSTEM_USER_ID.to_string(),
+                display_name: SYSTEM_USER_ID.to_string(),
+                observer: false,
             })
             .await
             .expect("Message delivery should succeed");
@@ -489,13 +631,13 @@ mod tests {
         // The key assertion: JoinRoom should return Err immediately
         assert!(
             result.is_err(),
-            "JoinRoom with system email should return Err, not Ok"
+            "JoinRoom with system user ID should return Err, not Ok"
         );
 
         let error_msg = result.unwrap_err();
         assert!(
-            error_msg.contains("reserved system email"),
-            "Error should mention reserved system email, got: {error_msg}"
+            error_msg.contains("reserved system user ID"),
+            "Error should mention reserved system user ID, got: {error_msg}"
         );
     }
 
@@ -539,6 +681,8 @@ mod tests {
                 session: session_id,
                 room: "test-room-valid".to_string(),
                 user_id: "valid-user@example.com".to_string(),
+                display_name: "valid-user@example.com".to_string(),
+                observer: false,
             })
             .await
             .expect("Message delivery should succeed");
@@ -568,6 +712,8 @@ mod tests {
                 session: 9999u64,
                 room: "test-room".to_string(),
                 user_id: "valid-user@example.com".to_string(),
+                display_name: "valid-user@example.com".to_string(),
+                observer: false,
             })
             .await
             .expect("Message delivery should succeed");
@@ -626,6 +772,8 @@ mod tests {
                 session: session_id,
                 room: "test-room-cleanup".to_string(),
                 user_id: "valid-user@example.com".to_string(),
+                display_name: "valid-user@example.com".to_string(),
+                observer: false,
             })
             .await
             .expect("Message delivery should succeed");
@@ -639,6 +787,8 @@ mod tests {
                 session: session_id,
                 room: "test-room-cleanup".to_string(),
                 user_id: "valid-user@example.com".to_string(),
+                display_name: "valid-user@example.com".to_string(),
+                observer: false,
             })
             .await
             .expect("Message delivery should succeed");
@@ -650,11 +800,11 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: Two clients with same email get unique session_id values
+    // TEST: Two clients with same user_id get unique session_id values
     // ==========================================================================
     #[actix_rt::test]
     #[serial]
-    async fn test_same_email_unique_session_ids() {
+    async fn test_same_user_id_unique_session_ids() {
         use crate::actors::session_logic::SessionLogic;
         use crate::server_diagnostics::{TrackerMessage, TrackerSender};
         use crate::session_manager::SessionManager;
@@ -672,14 +822,15 @@ mod tests {
         let tracker_sender: TrackerSender = tx;
         let session_manager = SessionManager::new();
 
-        // Create two sessions with the same email
-        let email = "same-user@example.com".to_string();
+        // Create two sessions with the same user_id
+        let user_id = "same-user@example.com".to_string();
         let room = "test-room-unique".to_string();
 
         let session1 = SessionLogic::new(
             chat_server.clone(),
             room.clone(),
-            email.clone(),
+            user_id.clone(),
+            user_id.clone(), // display_name fallback
             nats_client.clone(),
             tracker_sender.clone(),
             session_manager.clone(),
@@ -689,7 +840,8 @@ mod tests {
         let session2 = SessionLogic::new(
             chat_server.clone(),
             room.clone(),
-            email.clone(),
+            user_id.clone(),
+            user_id.clone(), // display_name fallback
             nats_client.clone(),
             tracker_sender.clone(),
             session_manager.clone(),
@@ -699,7 +851,7 @@ mod tests {
         // Verify they have different session IDs
         assert_ne!(
             session1.id, session2.id,
-            "Two sessions with same email should have different session_id values"
+            "Two sessions with same user_id should have different session_id values"
         );
         assert!(session1.id != 0, "Session ID should not be zero");
         assert!(session2.id != 0, "Session ID should not be zero");
@@ -1002,6 +1154,8 @@ mod tests {
                 session: session_id,
                 room: "test-room-broadcast".to_string(),
                 user_id: "alice@example.com".to_string(),
+                display_name: "alice@example.com".to_string(),
+                observer: false,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1030,6 +1184,486 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ==========================================================================
+    // TEST: Observer JoinRoom does NOT publish PARTICIPANT_JOINED
+    // ==========================================================================
+    // When an observer (waiting room user) joins a room, the server should NOT
+    // publish a PARTICIPANT_JOINED event to NATS. Only real participants trigger
+    // this notification.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_observer_join_does_not_publish_participant_joined() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 2001u64;
+        let room = "test-room-observer-join";
+
+        // Subscribe to the system subject for this room BEFORE join
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let participant_joined_received = Arc::new(AtomicBool::new(false));
+        let flag = participant_joined_received.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        tokio::spawn(async move {
+            use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+            use videocall_types::protos::meeting_packet::MeetingPacket;
+
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(1500), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Register session
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Join as observer - should NOT publish PARTICIPANT_JOINED
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "observer-user@example.com".to_string(),
+                display_name: "observer-user@example.com".to_string(),
+                observer: true,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(result.is_ok(), "Observer JoinRoom should succeed");
+
+        // Wait long enough for any NATS publish to arrive
+        sleep(Duration::from_millis(1000)).await;
+
+        assert!(
+            !participant_joined_received.load(Ordering::Relaxed),
+            "Observer join should NOT publish PARTICIPANT_JOINED to NATS"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: Non-observer JoinRoom DOES publish PARTICIPANT_JOINED
+    // ==========================================================================
+    // When a real participant joins a room, the server should publish a
+    // PARTICIPANT_JOINED event to NATS so other peers are notified.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_non_observer_join_publishes_participant_joined() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 2002u64;
+        let room = "test-room-non-observer-join";
+
+        // Subscribe to the system subject for this room BEFORE join
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let participant_joined_received = Arc::new(AtomicBool::new(false));
+        let flag = participant_joined_received.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        tokio::spawn(async move {
+            use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+            use videocall_types::protos::meeting_packet::MeetingPacket;
+
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(1500), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Register session
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Join as non-observer - SHOULD publish PARTICIPANT_JOINED
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "real-user@example.com".to_string(),
+                display_name: "real-user@example.com".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(result.is_ok(), "Non-observer JoinRoom should succeed");
+
+        // Wait for the spawned async task to publish PARTICIPANT_JOINED
+        sleep(Duration::from_millis(1000)).await;
+
+        assert!(
+            participant_joined_received.load(Ordering::Relaxed),
+            "Non-observer join SHOULD publish PARTICIPANT_JOINED to NATS"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: Observer Disconnect does NOT publish PARTICIPANT_LEFT
+    // ==========================================================================
+    // When an observer session disconnects (e.g., waiting room user admitted),
+    // the server should NOT publish a PARTICIPANT_LEFT event. The user was never
+    // a real participant in the meeting.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_observer_disconnect_does_not_publish_participant_left() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 2003u64;
+        let room = "test-room-observer-disconnect";
+
+        // Register and join as observer first
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "observer-dc@example.com".to_string(),
+                display_name: "observer-dc@example.com".to_string(),
+                observer: true,
+            })
+            .await
+            .expect("Message delivery should succeed");
+        assert!(result.is_ok(), "Observer JoinRoom should succeed");
+
+        // Wait for session to be fully set up
+        sleep(Duration::from_millis(300)).await;
+
+        // Now subscribe to system subject to watch for PARTICIPANT_LEFT
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let participant_left_received = Arc::new(AtomicBool::new(false));
+        let flag = participant_left_received.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        tokio::spawn(async move {
+            use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+            use videocall_types::protos::meeting_packet::MeetingPacket;
+
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(1500), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Disconnect as observer - should NOT publish PARTICIPANT_LEFT
+        chat_server
+            .send(Disconnect {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "observer-dc@example.com".to_string(),
+                display_name: "observer-dc@example.com".to_string(),
+                observer: true,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Wait long enough for any NATS publish to arrive
+        sleep(Duration::from_millis(1000)).await;
+
+        assert!(
+            !participant_left_received.load(Ordering::Relaxed),
+            "Observer disconnect should NOT publish PARTICIPANT_LEFT to NATS"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: Non-observer Disconnect publishes PARTICIPANT_LEFT (or meeting event)
+    // ==========================================================================
+    // When a real participant disconnects, the server should invoke the full
+    // leave_rooms flow which may publish PARTICIPANT_LEFT for MeetingContinues,
+    // MEETING_ENDED for HostEndedMeeting, or nothing for LastParticipantLeft.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_non_observer_disconnect_publishes_event() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 2004u64;
+        let room = "test-room-non-observer-disconnect";
+
+        // Register and join as real participant
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "real-dc@example.com".to_string(),
+                display_name: "real-dc@example.com".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+        assert!(result.is_ok(), "Non-observer JoinRoom should succeed");
+
+        // Wait for session setup
+        sleep(Duration::from_millis(300)).await;
+
+        // Subscribe to system subject to watch for any meeting events
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let meeting_event_received = Arc::new(AtomicBool::new(false));
+        let flag = meeting_event_received.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        tokio::spawn(async move {
+            use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+            use videocall_types::protos::meeting_packet::MeetingPacket;
+
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(1500), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        // Accept any meeting lifecycle event (PARTICIPANT_LEFT or MEETING_ENDED)
+                        // depending on how end_session categorizes this session
+                        if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into()
+                            || inner.event_type == MeetingEventType::MEETING_ENDED.into()
+                        {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Disconnect as non-observer - should invoke the full leave flow
+        chat_server
+            .send(Disconnect {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "real-dc@example.com".to_string(),
+                display_name: "real-dc@example.com".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Wait for the leave flow to complete
+        // Note: depending on SessionManager::end_session result, a meeting event
+        // may or may not be published. The key assertion is that the code PATH
+        // for non-observer is exercised (it does not early-return like observer).
+        // With the current SessionManager returning MeetingContinues { remaining_count: 0 },
+        // this actually maps to the MeetingContinues branch which publishes PARTICIPANT_LEFT.
+        sleep(Duration::from_millis(1000)).await;
+
+        // The non-observer path should have attempted to publish via the full
+        // end_session flow (not the observer early-return path).
+        // Current SessionManager returns MeetingContinues { remaining_count: 0 }
+        // which triggers PARTICIPANT_LEFT publish.
+        assert!(
+            meeting_event_received.load(Ordering::Relaxed),
+            "Non-observer disconnect should publish a meeting event (PARTICIPANT_LEFT or MEETING_ENDED)"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: Observer JoinRoom succeeds and session is tracked
+    // ==========================================================================
+    // Verify that observer sessions are accepted and registered just like normal
+    // sessions - the only difference is in event publishing behavior.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_observer_join_room_succeeds() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 2005u64;
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Join as observer - should succeed (same as non-observer)
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: "test-room-observer-ok".to_string(),
+                user_id: "observer@example.com".to_string(),
+                display_name: "observer@example.com".to_string(),
+                observer: true,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result.is_ok(),
+            "Observer JoinRoom should succeed, got: {result:?}"
+        );
+
+        // Joining again with same session should return Ok (already in active_subs)
+        let result2 = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: "test-room-observer-ok".to_string(),
+                user_id: "observer@example.com".to_string(),
+                display_name: "observer@example.com".to_string(),
+                observer: true,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result2.is_ok(),
+            "Second observer JoinRoom should return Ok (already active)"
+        );
     }
 
     // Helper message to get connection state for testing

@@ -11,10 +11,17 @@
 //! `VideoCallClient`. The `use_effect` reacts to changes in this counter
 //! and fetches the waiting room list once per notification.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use crate::constants::meeting_api_client;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
+use wasm_bindgen::JsCast;
 use web_sys::HtmlAudioElement;
+
+/// Polling interval in milliseconds for the safety-net timer.
+const POLL_INTERVAL_MS: i32 = 10_000;
 
 pub type WaitingParticipant = ParticipantStatusResponse;
 
@@ -86,6 +93,73 @@ pub fn HostControls(
         });
     }
 
+    // Polling safety net: fetch the waiting list every POLL_INTERVAL_MS
+    // regardless of whether push notifications are working. This catches
+    // attendees who joined the waiting room before the host's observer
+    // WebSocket was connected (NATS event lost).
+    let poll_interval_id: Rc<Cell<i32>> = use_hook(|| Rc::new(Cell::new(-1)));
+    {
+        let meeting_id = meeting_id.clone();
+        let poll_interval_id = poll_interval_id.clone();
+        use_effect(move || {
+            if !is_admitted {
+                return;
+            }
+            let window = match web_sys::window() {
+                Some(w) => w,
+                None => return,
+            };
+
+            log::info!("HostControls: starting polling safety net (every {POLL_INTERVAL_MS}ms)");
+
+            let meeting_id = meeting_id.clone();
+            let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                let meeting_id = meeting_id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match fetch_waiting(&meeting_id).await {
+                        Ok(w) => {
+                            let new_count = w.len();
+                            let old_count = *prev_waiting_count.peek();
+                            if new_count > old_count {
+                                play_knock_sound();
+                            }
+                            prev_waiting_count.set(new_count);
+                            waiting.set(w);
+                            error.set(None);
+                        }
+                        Err(e) => {
+                            log::warn!("HostControls poll: failed to fetch waiting room: {e}");
+                        }
+                    }
+                });
+            });
+
+            let interval_id = window
+                .set_interval_with_callback_and_timeout_and_arguments_0(
+                    poll_closure.as_ref().unchecked_ref(),
+                    POLL_INTERVAL_MS,
+                )
+                .unwrap_or(-1);
+
+            poll_closure.forget();
+            poll_interval_id.set(interval_id);
+        });
+    }
+
+    // Clean up the polling interval when the component unmounts.
+    {
+        let poll_interval_id = poll_interval_id.clone();
+        use_drop(move || {
+            let id = poll_interval_id.get();
+            if id >= 0 {
+                if let Some(window) = web_sys::window() {
+                    window.clear_interval_with_handle(id);
+                    log::debug!("HostControls: cleared polling interval {id} on unmount");
+                }
+            }
+        });
+    }
+
     if !is_admitted || waiting().is_empty() {
         return rsx! {};
     }
@@ -144,13 +218,13 @@ pub fn HostControls(
                     }
                     for participant in waiting().iter() {
                         {
-                            let email = participant.email.clone();
+                            let peer_user_id = participant.user_id.clone();
                             let display_name = participant.display_name.clone();
 
-                            let email_for_key = email.clone();
-                            let email_for_view = email.clone();
-                            let email_admit = email.clone();
-                            let email_reject = email.clone();
+                            let uid_for_key = peer_user_id.clone();
+                            let uid_for_view = peer_user_id.clone();
+                            let uid_admit = peer_user_id.clone();
+                            let uid_reject = peer_user_id.clone();
 
                             let meeting_id_admit = meeting_id.clone();
                             let meeting_id_reject = meeting_id.clone();
@@ -165,17 +239,17 @@ pub fn HostControls(
                             let mut error_reject = error.clone();
 
                             rsx! {
-                                div { key: "{email_for_key}", class: "waiting-participant",
+                                div { key: "{uid_for_key}", class: "waiting-participant",
                                     div { class: "participant-info",
                                         if let Some(name) = display_name.clone() {
                                             if !name.trim().is_empty() {
                                                 div { class: "participant-name", "{name}" }
-                                                div { class: "participant-email", "{email_for_view}" }
+                                                div { class: "participant-email", "{uid_for_view}" }
                                             } else {
-                                                div { class: "participant-name", "{email_for_view}" }
+                                                div { class: "participant-name", "{uid_for_view}" }
                                             }
                                         } else {
-                                            div { class: "participant-name", "{email_for_view}" }
+                                            div { class: "participant-name", "{uid_for_view}" }
                                         }
                                     }
                                     div { class: "participant-actions",
@@ -183,14 +257,14 @@ pub fn HostControls(
                                             class: "btn-admit",
                                             title: "Admit",
                                             onclick: move |_| {
-                                                waiting_admit.write().retain(|p| p.email != email_admit);
-                                                let email = email_admit.clone();
+                                                waiting_admit.write().retain(|p| p.user_id != uid_admit);
+                                                let uid = uid_admit.clone();
                                                 let meeting_id = meeting_id_admit.clone();
                                                 let fetch = fetch_admit.clone();
                                                 let mut error = error_admit.clone();
 
                                                 spawn(async move {
-                                                    match admit_participant(&meeting_id, &email).await {
+                                                    match admit_participant(&meeting_id, &uid).await {
                                                         Ok(_) => fetch(),
                                                         Err(e) => {
                                                             error.set(Some(e));
@@ -210,14 +284,14 @@ pub fn HostControls(
                                             class: "btn-reject",
                                             title: "Reject",
                                             onclick: move |_| {
-                                                waiting_reject.write().retain(|p| p.email != email_reject);
-                                                let email = email_reject.clone();
+                                                waiting_reject.write().retain(|p| p.user_id != uid_reject);
+                                                let uid = uid_reject.clone();
                                                 let meeting_id = meeting_id_reject.clone();
                                                 let fetch = fetch_reject.clone();
                                                 let mut error = error_reject.clone();
 
                                                 spawn(async move {
-                                                    match reject_participant(&meeting_id, &email).await {
+                                                    match reject_participant(&meeting_id, &uid).await {
                                                         Ok(_) => fetch(),
                                                         Err(e) => {
                                                             error.set(Some(e));
@@ -263,19 +337,19 @@ async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, Stri
     }
 }
 
-async fn admit_participant(meeting_id: &str, email: &str) -> Result<(), String> {
+async fn admit_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     client
-        .admit_participant(meeting_id, email)
+        .admit_participant(meeting_id, user_id)
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))
 }
 
-async fn reject_participant(meeting_id: &str, email: &str) -> Result<(), String> {
+async fn reject_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
     let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
     client
-        .reject_participant(meeting_id, email)
+        .reject_participant(meeting_id, user_id)
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))

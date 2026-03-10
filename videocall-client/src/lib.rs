@@ -50,7 +50,7 @@
 //!     on_peer_first_frame: Callback::noop(),
 //!     get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
 //!     get_peer_screen_canvas_id: Callback::from(|_| "screen-canvas".to_string()),
-//!     userid: "user123".to_string(),
+//!     user_id: "user123".to_string(),
 //!     meeting_id: "room456".to_string(),
 //!     websocket_urls: vec!["ws://localhost:8080".to_string()],
 //!     webtransport_urls: vec!["https://localhost:8443".to_string()],
@@ -72,6 +72,8 @@
 //!     on_participant_admitted: None,
 //!     on_participant_rejected: None,
 //!     on_waiting_room_updated: None,
+//!     on_peer_left: None,    // Option<Callback<(String, String)>> -- (display_name, user_id)
+//!     on_peer_joined: None,  // Option<Callback<(String, String)>> -- (display_name, user_id)
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -87,7 +89,7 @@
 //! # let options = VideoCallClientOptions {
 //! #     enable_e2ee: false, enable_webtransport: false, on_peer_added: Callback::noop(),
 //! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
-//! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), userid: "user".to_string(),
+//! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), user_id: "user".to_string(),
 //! #     meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],
 //! #     on_connected: Callback::noop(), on_connection_lost: Callback::noop(), enable_diagnostics: false, diagnostics_update_interval_ms: None,
 //! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
@@ -101,6 +103,8 @@
 //! #     on_participant_admitted: None,
 //! #     on_participant_rejected: None,
 //! #     on_waiting_room_updated: None,
+//! #     on_peer_left: None,
+//! #     on_peer_joined: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(

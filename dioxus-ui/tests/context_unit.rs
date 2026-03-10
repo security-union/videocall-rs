@@ -11,8 +11,8 @@
 use wasm_bindgen_test::*;
 
 use dioxus_ui::context::{
-    clear_username_from_storage, email_to_display_name, load_username_from_storage,
-    normalize_spaces, save_username_to_storage, validate_display_name, DISPLAY_NAME_MAX_LEN,
+    clear_display_name_from_storage, email_to_display_name, load_display_name_from_storage,
+    normalize_spaces, save_display_name_to_storage, validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -151,51 +151,57 @@ fn email_to_display_name_produces_valid_display_names() {
 fn storage_round_trip() {
     // Clear any previous value
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.remove_item("vc_username");
+        let _ = storage.remove_item("vc_display_name");
     }
 
     // Initially empty
-    assert_eq!(load_username_from_storage(), None);
+    assert_eq!(load_display_name_from_storage(), None);
 
     // Save and reload
-    save_username_to_storage("test_user");
-    assert_eq!(load_username_from_storage(), Some("test_user".to_string()));
+    save_display_name_to_storage("test_user");
+    assert_eq!(
+        load_display_name_from_storage(),
+        Some("test_user".to_string())
+    );
 
     // Overwrite
-    save_username_to_storage("new_user");
-    assert_eq!(load_username_from_storage(), Some("new_user".to_string()));
+    save_display_name_to_storage("new_user");
+    assert_eq!(
+        load_display_name_from_storage(),
+        Some("new_user".to_string())
+    );
 
     // Cleanup
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.remove_item("vc_username");
+        let _ = storage.remove_item("vc_display_name");
     }
 }
 
 #[wasm_bindgen_test]
-fn clear_username_from_storage_removes_key() {
+fn clear_display_name_from_storage_removes_key() {
     // Ensure there is a value first.
-    save_username_to_storage("to_be_cleared");
+    save_display_name_to_storage("to_be_cleared");
     assert_eq!(
-        load_username_from_storage(),
+        load_display_name_from_storage(),
         Some("to_be_cleared".to_string())
     );
 
     // Clear and verify it is gone.
-    clear_username_from_storage();
-    assert_eq!(load_username_from_storage(), None);
+    clear_display_name_from_storage();
+    assert_eq!(load_display_name_from_storage(), None);
 }
 
 #[wasm_bindgen_test]
-fn clear_username_from_storage_is_idempotent() {
+fn clear_display_name_from_storage_is_idempotent() {
     // Clearing when there is nothing stored should not panic or error.
-    clear_username_from_storage();
-    assert_eq!(load_username_from_storage(), None);
+    clear_display_name_from_storage();
+    assert_eq!(load_display_name_from_storage(), None);
 
     // Clearing twice in a row should also be fine.
-    save_username_to_storage("temp");
-    clear_username_from_storage();
-    clear_username_from_storage();
-    assert_eq!(load_username_from_storage(), None);
+    save_display_name_to_storage("temp");
+    clear_display_name_from_storage();
+    clear_display_name_from_storage();
+    assert_eq!(load_display_name_from_storage(), None);
 }
 
 // ---------------------------------------------------------------------------

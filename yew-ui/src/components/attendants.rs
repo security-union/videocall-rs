@@ -36,8 +36,8 @@ use crate::constants::{
 use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
-use std::collections::HashMap;
 use log::{error, warn};
+use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
@@ -124,6 +124,14 @@ pub enum Msg {
     TokenRefreshFailed(String),
     /// The waiting room participant list changed (push notification from server).
     WaitingRoomUpdated,
+    /// A remote participant left the meeting. Carries (display_name, user_id).
+    OnPeerLeft((String, String)),
+    /// A remote participant joined the meeting. Carries (display_name, user_id).
+    OnPeerJoined((String, String)),
+    /// Remove an expired toast by its monotonic ID.
+    RemovePeerToast(u64),
+    /// Play the leave sound only if the toast still exists (not cancelled by a join).
+    PlayLeftSoundIfStillActive(u64),
 }
 
 impl From<WsAction> for Msg {
@@ -150,7 +158,7 @@ pub struct AttendantsComponentProps {
     pub id: String,
 
     #[prop_or_default]
-    pub email: String,
+    pub display_name: String,
 
     pub e2ee_enabled: bool,
 
@@ -160,7 +168,7 @@ pub struct AttendantsComponentProps {
     pub user_name: Option<String>,
 
     #[prop_or_default]
-    pub user_email: Option<String>,
+    pub user_id: Option<String>,
 
     #[prop_or_default]
     pub on_logout: Option<Callback<()>>,
@@ -168,6 +176,11 @@ pub struct AttendantsComponentProps {
     /// Display name (username) of the meeting host/owner (for displaying crown icon)
     #[prop_or_default]
     pub host_display_name: Option<String>,
+
+    /// Authenticated user_id of the meeting host (for host identity comparison).
+    /// Compared against each peer's user_id to prevent display-name spoofing.
+    #[prop_or_default]
+    pub host_user_id: Option<String>,
 
     /// If true, automatically join the meeting without showing the "Join Meeting" button.
     /// Used when user was admitted from the waiting room.
@@ -220,20 +233,24 @@ pub struct AttendantsComponent {
     /// the non-JWT path manages its own attempt counter inside the recursive
     /// `schedule_reconnect_no_jwt` closure chain.
     reconnect_attempt: u32,
+    /// Active "participant join/leave" toast messages: (toast_id, display_name, user_id, is_joined).
+    peer_toasts: Vec<(u64, String, String, bool)>,
+    /// Monotonic counter for toast IDs.
+    toast_counter: u64,
 }
 
 impl AttendantsComponent {
     /// Build the WebSocket and WebTransport lobby URLs for the media server.
     ///
     /// When `media-server-jwt-auth` is enabled, the token is embedded as a query
-    /// parameter. When disabled, the legacy `/{email}/{room}` path is used.
+    /// parameter. When disabled, the legacy `/{user_id}/{room}` path is used.
     #[allow(unused_variables)]
-    fn build_lobby_urls(token: &str, email: &str, id: &str) -> (Vec<String>, Vec<String>) {
+    fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<String>) {
         #[cfg(feature = "media-server-jwt-auth")]
         let lobby_url = |base: &str| format!("{base}/lobby?token={token}");
 
         #[cfg(not(feature = "media-server-jwt-auth"))]
-        let lobby_url = |base: &str| format!("{base}/lobby/{email}/{id}");
+        let lobby_url = |base: &str| format!("{base}/lobby/{user_id}/{id}");
 
         let websocket_urls = actix_websocket_base()
             .unwrap_or_default()
@@ -250,7 +267,7 @@ impl AttendantsComponent {
     }
 
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
-        let email = ctx.props().email.clone();
+        let display_name = ctx.props().display_name.clone();
         let id = ctx.props().id.clone();
 
         #[cfg(feature = "media-server-jwt-auth")]
@@ -267,11 +284,12 @@ impl AttendantsComponent {
         #[cfg(not(feature = "media-server-jwt-auth"))]
         let token = String::new();
 
-        let (websocket_urls, webtransport_urls) = Self::build_lobby_urls(&token, &email, &id);
+        let (websocket_urls, webtransport_urls) =
+            Self::build_lobby_urls(&token, &display_name, &id);
 
         log::info!(
             "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}, jwt_auth={}",
-            email,
+            display_name,
             id,
             ctx.props().webtransport_enabled,
             cfg!(feature = "media-server-jwt-auth"),
@@ -283,7 +301,11 @@ impl AttendantsComponent {
         log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
 
         let opts = VideoCallClientOptions {
-            userid: email.clone(),
+            user_id: ctx
+                .props()
+                .user_id
+                .clone()
+                .unwrap_or_else(|| display_name.clone()),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -311,12 +333,12 @@ impl AttendantsComponent {
             },
             on_peer_added: {
                 let link = ctx.link().clone();
-                VcCallback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
+                VcCallback::from(move |peer_id| link.send_message(Msg::OnPeerAdded(peer_id)))
             },
             on_peer_first_frame: {
                 let link = ctx.link().clone();
-                VcCallback::from(move |(email, media_type)| {
-                    link.send_message(Msg::OnFirstFrame((email, media_type)))
+                VcCallback::from(move |(peer_id, media_type)| {
+                    link.send_message(Msg::OnFirstFrame((peer_id, media_type)))
                 })
             },
             on_peer_removed: Some({
@@ -376,6 +398,18 @@ impl AttendantsComponent {
                 VcCallback::from(move |_| {
                     log::info!("Waiting room updated via push notification");
                     link.send_message(Msg::WaitingRoomUpdated);
+                })
+            }),
+            on_peer_left: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |pair: (String, String)| {
+                    link.send_message(Msg::OnPeerLeft(pair));
+                })
+            }),
+            on_peer_joined: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |pair: (String, String)| {
+                    link.send_message(Msg::OnPeerJoined(pair));
                 })
             }),
         };
@@ -492,7 +526,12 @@ impl AttendantsComponent {
             }
         };
 
-        log::info!("Scheduling token refresh attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+        log::info!(
+            "Scheduling token refresh attempt {}/{} in {}ms",
+            attempt + 1,
+            Self::MAX_RECONNECT_ATTEMPTS,
+            delay_ms
+        );
 
         Timeout::new(delay_ms, move || {
             wasm_bindgen_futures::spawn_local(async move {
@@ -507,7 +546,7 @@ impl AttendantsComponent {
                 }
             });
         })
-            .forget();
+        .forget();
     }
 
     /// Schedule a reconnection attempt with exponential backoff (non-JWT path).
@@ -526,7 +565,12 @@ impl AttendantsComponent {
             }
         };
 
-        log::info!("Scheduling reconnect attempt {}/{} in {}ms", attempt + 1, Self::MAX_RECONNECT_ATTEMPTS, delay_ms);
+        log::info!(
+            "Scheduling reconnect attempt {}/{} in {}ms",
+            attempt + 1,
+            Self::MAX_RECONNECT_ATTEMPTS,
+            delay_ms
+        );
 
         Timeout::new(delay_ms, move || {
             link.send_message(WsAction::Connect);
@@ -535,16 +579,62 @@ impl AttendantsComponent {
     }
 
     fn play_user_joined() {
-        if let Some(_window) = web_sys::window() {
-            if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
-                audio.set_volume(0.4);
-                if let Err(e) = audio.play() {
-                    log::warn!("Failed to play notification sound: {e:?}");
-                }
-            } else {
-                log::warn!("Failed to create audio element for notification sound");
-            }
+        // Ascending two-tone chime: C5 -> E5 (pleasant, welcoming)
+        Self::play_tone_pair(523.25, 659.25, 0.12, 0.35);
+    }
+
+    fn play_user_left() {
+        // Descending two-tone: E5 -> A4 (subtle, muted)
+        Self::play_tone_pair(659.25, 440.0, 0.12, 0.25);
+    }
+
+    /// Play two short sine-wave tones in sequence using the Web Audio API.
+    fn play_tone_pair(freq1: f64, freq2: f64, duration: f64, volume: f64) {
+        let Some(_window) = web_sys::window() else {
+            return;
+        };
+        let ctx = match web_sys::AudioContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let now = ctx.current_time();
+
+        // First tone
+        if let (Ok(osc), Ok(gain)) = (ctx.create_oscillator(), ctx.create_gain()) {
+            let _ = osc.connect_with_audio_node(&gain);
+            let _ = gain.connect_with_audio_node(&ctx.destination());
+            osc.set_type(web_sys::OscillatorType::Triangle);
+            let _ = osc.frequency().set_value_at_time(freq1 as f32, now);
+            let _ = gain.gain().set_value_at_time(volume as f32, now);
+            let _ = gain
+                .gain()
+                .exponential_ramp_to_value_at_time(0.01, now + duration);
+            let _ = osc.start();
+            let _ = osc.stop_with_when(now + duration);
         }
+
+        // Second tone (starts after first ends)
+        if let (Ok(osc), Ok(gain)) = (ctx.create_oscillator(), ctx.create_gain()) {
+            let _ = osc.connect_with_audio_node(&gain);
+            let _ = gain.connect_with_audio_node(&ctx.destination());
+            osc.set_type(web_sys::OscillatorType::Triangle);
+            let _ = osc
+                .frequency()
+                .set_value_at_time(freq2 as f32, now + duration);
+            let _ = gain.gain().set_value_at_time(volume as f32, now + duration);
+            let _ = gain
+                .gain()
+                .exponential_ramp_to_value_at_time(0.01, now + duration * 2.0);
+            let _ = osc.start_with_when(now + duration);
+            let _ = osc.stop_with_when(now + duration * 2.0);
+        }
+
+        // Close the AudioContext after playback completes to avoid resource leaks.
+        let duration_ms = (duration * 2.0 * 1000.0) as u32 + 100;
+        Timeout::new(duration_ms, move || {
+            let _ = ctx.close();
+        })
+        .forget();
     }
 }
 
@@ -584,6 +674,8 @@ impl Component for AttendantsComponent {
             local_speaking: false,
             waiting_room_version: 0,
             reconnect_attempt: 0,
+            peer_toasts: Vec::new(),
+            toast_counter: 0,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -690,16 +782,13 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(email) => {
-                log::info!("New user joined: {email}");
-                Self::play_user_joined();
-
+            Msg::OnPeerAdded(peer_id) => {
+                log::info!("New user joined: {peer_id}");
+                // Sound is played by OnPeerJoined which has display name context.
                 true
             }
-            Msg::OnPeerRemoved(_peer_id) => {
-                true
-            }
-            Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
+            Msg::OnPeerRemoved(_peer_id) => true,
+            Msg::OnFirstFrame((_peer_id, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::OnMicrophoneError(err) => {
                 log::error!("Microphone error (full): {err}");
                 self.mic_enabled = false;
@@ -828,7 +917,7 @@ impl Component for AttendantsComponent {
                     Timeout::new(1640, move || {
                         link.send_message(Msg::ShowCopyToast(false));
                     })
-                        .forget();
+                    .forget();
                 }
                 true
             }
@@ -891,7 +980,7 @@ impl Component for AttendantsComponent {
                 self.error = None;
                 self.reconnect_attempt = 0;
                 let (ws_urls, wt_urls) =
-                    Self::build_lobby_urls(&new_token, &ctx.props().email, &ctx.props().id);
+                    Self::build_lobby_urls(&new_token, &ctx.props().display_name, &ctx.props().id);
                 self.client.update_server_urls(ws_urls, wt_urls);
                 if let Err(e) = self.client.connect() {
                     ctx.link().send_message(WsAction::Log(format!(
@@ -918,11 +1007,76 @@ impl Component for AttendantsComponent {
                 self.waiting_room_version = self.waiting_room_version.wrapping_add(1);
                 true
             }
+            Msg::OnPeerLeft((display_name, user_id)) => {
+                log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+                // Don't play sound immediately -- defer it so a rapid
+                // join event (waiting-room admission) can cancel it.
+                let id = self.toast_counter;
+                self.toast_counter += 1;
+                self.peer_toasts.push((id, display_name, user_id, false));
+                // Defer the leave sound: only play if the toast still exists
+                // after 500ms (i.e. no join event cancelled it).
+                let link_sound = ctx.link().clone();
+                Timeout::new(500, move || {
+                    link_sound.send_message(Msg::PlayLeftSoundIfStillActive(id));
+                })
+                .forget();
+                // Schedule toast removal after 8 seconds.
+                let link = ctx.link().clone();
+                Timeout::new(8_000, move || {
+                    link.send_message(Msg::RemovePeerToast(id));
+                })
+                .forget();
+                true
+            }
+            Msg::OnPeerJoined((display_name, user_id)) => {
+                log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                // When an observer is admitted from the waiting room, the
+                // observer connection closes (PARTICIPANT_LEFT) and the user
+                // reconnects as a real participant (PARTICIPANT_JOINED). If
+                // there is a pending "left" toast for this user, remove it
+                // (the deferred leave sound will also be suppressed because
+                // it checks whether the toast still exists).
+                self.peer_toasts
+                    .retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
+
+                // Always show the join toast and play the join sound.
+                Self::play_user_joined();
+                let id = self.toast_counter;
+                self.toast_counter += 1;
+                self.peer_toasts.push((id, display_name, user_id, true));
+                let link = ctx.link().clone();
+                Timeout::new(8_000, move || {
+                    link.send_message(Msg::RemovePeerToast(id));
+                })
+                .forget();
+                true
+            }
+            Msg::RemovePeerToast(toast_id) => {
+                let before = self.peer_toasts.len();
+                self.peer_toasts.retain(|(id, _, _, _)| *id != toast_id);
+                self.peer_toasts.len() != before
+            }
+            Msg::PlayLeftSoundIfStillActive(toast_id) => {
+                if self.peer_toasts.iter().any(|(id, _, _, _)| *id == toast_id) {
+                    Self::play_user_left();
+                }
+                false // no re-render needed
+            }
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let email = ctx.props().email.clone();
+        let display_name = ctx.props().display_name.clone();
+        let effective_user_id = ctx
+            .props()
+            .user_id
+            .as_deref()
+            .unwrap_or(&display_name)
+            .to_string();
+        let is_allowed = users_allowed_to_stream().unwrap_or_default();
+        let can_stream =
+            is_allowed.is_empty() || is_allowed.iter().any(|host| host == &effective_user_id);
         let media_access_granted = self.media_device_access.is_granted();
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
@@ -939,7 +1093,6 @@ impl Component for AttendantsComponent {
 
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
-        let host_display_name = ctx.props().host_display_name.clone();
         let rows: Vec<Html> = display_peers_vec
             .iter()
             .take(CANVAS_LIMIT)
@@ -947,7 +1100,7 @@ impl Component for AttendantsComponent {
             .map(|(i, peer_id)| {
                 let full_bleed = display_peers_vec.len() == 1
                     && !self.client.is_screen_share_enabled_for_peer(peer_id);
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_display_name={host_display_name.clone()} /> }
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_user_id={ctx.props().host_user_id.clone()} /> }
             })
             .collect();
 
@@ -1017,6 +1170,55 @@ impl Component for AttendantsComponent {
             <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
+
+                    // "participant joined/left" toast notifications
+                    if !self.peer_toasts.is_empty() {
+                        <div class="peer-toasts">
+                            { for self.peer_toasts.iter().map(|(id, display_name, uid, is_joined)| {
+                                let key = id.to_string();
+                                let is_joined = *is_joined;
+                                let variant_class = if is_joined {
+                                    "peer-toast toast-joined"
+                                } else {
+                                    "peer-toast toast-left"
+                                };
+                                let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
+                                let icon_svg = if is_joined {
+                                    html! {
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                                             stroke="currentColor" stroke-width="2"
+                                             stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+                                            <circle cx="9" cy="7" r="4"/>
+                                            <line x1="19" y1="8" x2="19" y2="14"/>
+                                            <line x1="22" y1="11" x2="16" y2="11"/>
+                                        </svg>
+                                    }
+                                } else {
+                                    html! {
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                                             stroke="currentColor" stroke-width="2"
+                                             stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+                                            <circle cx="9" cy="7" r="4"/>
+                                            <line x1="22" y1="11" x2="16" y2="11"/>
+                                        </svg>
+                                    }
+                                };
+                                html! {
+                                    <div {key} class={variant_class}>
+                                        <span class="toast-icon">{ icon_svg }</span>
+                                        <span class="toast-text">
+                                            <span class="toast-name">{ display_name.clone() }</span>
+                                            <br/>
+                                            <span class="toast-action">{ action_text }</span>
+                                        </span>
+                                    </div>
+                                }
+                            })}
+                        </div>
+                    }
+
                 <div id="grid-container"
                     class={grid_container_classes}
                     data-peers={num_peers_for_styling.to_string()}
@@ -1072,7 +1274,7 @@ impl Component for AttendantsComponent {
                     }
 
                     {
-                        if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty() {
+                        if can_stream {
                             html! {
                                 <nav class="host">
                                     <div class="controls">
@@ -1196,6 +1398,7 @@ impl Component for AttendantsComponent {
                                     is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
                                     on_toggle_meeting_info={toggle_meeting_info}
                                     host_display_name={ctx.props().host_display_name.clone()}
+                                    host_user_id={ctx.props().host_user_id.clone()}
                                 />
                             }
                         } else {

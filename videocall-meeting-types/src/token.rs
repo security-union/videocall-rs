@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RoomAccessTokenClaims {
-    /// Participant's email (unique identity).
+    /// Participant's user_id (unique identity).
     pub sub: String,
 
     /// The room/meeting ID the participant is authorized to join.

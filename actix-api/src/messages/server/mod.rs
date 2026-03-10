@@ -38,6 +38,12 @@ pub struct JoinRoom {
     pub session: SessionId,
     pub room: RoomId,
     pub user_id: String,
+    /// Participant's chosen display name (from JWT claims).
+    /// Falls back to `user_id` when no display name is available.
+    pub display_name: String,
+    /// When true, this is an observer session (waiting room) and should NOT
+    /// trigger PARTICIPANT_JOINED notifications.
+    pub observer: bool,
 }
 
 #[derive(ActixMessage)]
@@ -59,6 +65,12 @@ pub struct Disconnect {
     pub session: SessionId,
     pub room: RoomId,
     pub user_id: String,
+    /// Participant's chosen display name (from JWT claims).
+    /// Falls back to `user_id` when no display name is available.
+    pub display_name: String,
+    /// When true, the disconnecting session is an observer (waiting room)
+    /// and should NOT trigger PARTICIPANT_LEFT notifications.
+    pub observer: bool,
 }
 
 #[derive(ActixMessage)]

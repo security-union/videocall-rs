@@ -217,7 +217,7 @@ async fn test_leave_meeting_success() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"attendee@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
@@ -264,7 +264,7 @@ async fn test_get_my_status_success() {
 
     let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
     assert!(body.success);
-    assert_eq!(body.result.email, "host@example.com");
+    assert_eq!(body.result.user_id, "host@example.com");
     assert!(body.result.is_host);
     assert_eq!(body.result.status, "admitted");
     assert!(
@@ -303,7 +303,7 @@ async fn test_status_refused_after_meeting_ends() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"attendee@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
@@ -431,7 +431,7 @@ async fn test_get_participants_success() {
         "host@example.com",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"email":"attendee@example.com"}"#))
+    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 

@@ -86,10 +86,10 @@ impl AppError {
         Self::new(StatusCode::FORBIDDEN, APIError::not_owner())
     }
 
-    pub fn participant_not_found(email: &str) -> Self {
+    pub fn participant_not_found(user_id: &str) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
-            APIError::participant_not_found(email),
+            APIError::participant_not_found(user_id),
         )
     }
 

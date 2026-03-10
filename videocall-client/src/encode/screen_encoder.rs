@@ -220,7 +220,7 @@ impl ScreenEncoder {
         let client = self.client.clone();
         let client_for_onended = client.clone();
         let client_for_state = client.clone();
-        let userid = client.userid().clone();
+        let userid = client.user_id().clone();
         let aes = client.aes();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();

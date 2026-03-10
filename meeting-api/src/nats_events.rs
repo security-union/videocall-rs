@@ -21,15 +21,13 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-
-/// System email used as the sender for server-generated NATS packets.
-const SYSTEM_EMAIL: &str = "system-&^%$#@!";
+use videocall_types::SYSTEM_USER_ID;
 
 /// Build a `PacketWrapper` containing a serialized `MeetingPacket`.
 fn build_meeting_wrapper(meeting_packet: &MeetingPacket) -> Vec<u8> {
     let wrapper = PacketWrapper {
         packet_type: PacketType::MEETING.into(),
-        email: SYSTEM_EMAIL.to_string(),
+        user_id: SYSTEM_USER_ID.as_bytes().to_vec(),
         data: meeting_packet.write_to_bytes().unwrap_or_default(),
         ..Default::default()
     };
@@ -79,36 +77,36 @@ pub async fn publish_meeting_activated(nats: Option<&async_nats::Client>, room_i
 pub async fn publish_participant_admitted(
     nats: Option<&async_nats::Client>,
     room_id: &str,
-    target_email: &str,
+    target_user_id: &str,
 ) {
     let Some(nats) = nats else { return };
     let packet = MeetingPacket {
         event_type: MeetingEventType::PARTICIPANT_ADMITTED.into(),
         room_id: room_id.to_string(),
-        target_email: target_email.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
     publish(nats, room_system_subject(room_id), bytes).await;
-    tracing::debug!("Published PARTICIPANT_ADMITTED for {target_email} in room {room_id}");
+    tracing::debug!("Published PARTICIPANT_ADMITTED for {target_user_id} in room {room_id}");
 }
 
 /// Publish `PARTICIPANT_REJECTED` when a participant is rejected from the waiting room.
 pub async fn publish_participant_rejected(
     nats: Option<&async_nats::Client>,
     room_id: &str,
-    target_email: &str,
+    target_user_id: &str,
 ) {
     let Some(nats) = nats else { return };
     let packet = MeetingPacket {
         event_type: MeetingEventType::PARTICIPANT_REJECTED.into(),
         room_id: room_id.to_string(),
-        target_email: target_email.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
     publish(nats, room_system_subject(room_id), bytes).await;
-    tracing::debug!("Published PARTICIPANT_REJECTED for {target_email} in room {room_id}");
+    tracing::debug!("Published PARTICIPANT_REJECTED for {target_user_id} in room {room_id}");
 }
 
 /// Publish `WAITING_ROOM_UPDATED` when the waiting room list changes.
@@ -150,7 +148,7 @@ mod tests {
         let packet = MeetingPacket {
             event_type: MeetingEventType::PARTICIPANT_ADMITTED.into(),
             room_id: "test-room".to_string(),
-            target_email: "alice@example.com".to_string(),
+            target_user_id: "alice@example.com".as_bytes().to_vec(),
             ..Default::default()
         };
         let bytes = build_meeting_wrapper(&packet);
@@ -160,8 +158,14 @@ mod tests {
             inner.event_type,
             MeetingEventType::PARTICIPANT_ADMITTED.into()
         );
-        assert_eq!(inner.target_email, "alice@example.com");
-        assert!(inner.room_token.is_empty(), "room_token must not be broadcast via NATS");
+        assert_eq!(
+            inner.target_user_id,
+            "alice@example.com".as_bytes().to_vec()
+        );
+        assert!(
+            inner.room_token.is_empty(),
+            "room_token must not be broadcast via NATS"
+        );
     }
 
     #[test]
@@ -169,7 +173,7 @@ mod tests {
         let packet = MeetingPacket {
             event_type: MeetingEventType::PARTICIPANT_REJECTED.into(),
             room_id: "test-room".to_string(),
-            target_email: "bob@example.com".to_string(),
+            target_user_id: "bob@example.com".as_bytes().to_vec(),
             ..Default::default()
         };
         let bytes = build_meeting_wrapper(&packet);
@@ -179,7 +183,7 @@ mod tests {
             inner.event_type,
             MeetingEventType::PARTICIPANT_REJECTED.into()
         );
-        assert_eq!(inner.target_email, "bob@example.com");
+        assert_eq!(inner.target_user_id, "bob@example.com".as_bytes().to_vec());
     }
 
     #[test]

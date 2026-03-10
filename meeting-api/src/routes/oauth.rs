@@ -283,10 +283,12 @@ pub async fn check_session(AuthUser { .. }: AuthUser) -> StatusCode {
 /// GET /profile -- returns the authenticated user's profile from the session
 /// JWT claims.
 ///
-/// Because the session JWT embeds both email and display name, this endpoint
+/// Because the session JWT embeds both user ID and display name, this endpoint
 /// does not need a database query.
-pub async fn get_profile(AuthUser { email, name }: AuthUser) -> Json<APIResponse<ProfileResponse>> {
-    Json(APIResponse::ok(ProfileResponse { email, name }))
+pub async fn get_profile(
+    AuthUser { user_id, name }: AuthUser,
+) -> Json<APIResponse<ProfileResponse>> {
+    Json(APIResponse::ok(ProfileResponse { user_id, name }))
 }
 
 /// GET /logout -- clears the session cookie.

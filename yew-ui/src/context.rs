@@ -122,19 +122,19 @@ pub fn get_or_create_local_user_id() -> String {
                 return id;
             }
         }
-        let id = generate_uuid();
+        let id = generate_local_id();
         let _ = storage.set_item(USER_ID_STORAGE_KEY, &id);
         id
     } else {
         // localStorage unavailable — generate an ephemeral ID.
-        generate_uuid()
+        generate_local_id()
     }
 }
 
 /// Generate a unique identifier from the current timestamp and a random
 /// component.  We intentionally avoid pulling in the `uuid` crate to keep
 /// the WASM binary small.
-fn generate_uuid() -> String {
+fn generate_local_id() -> String {
     use js_sys::Math;
     let millis = web_time::SystemTime::now()
         .duration_since(web_time::SystemTime::UNIX_EPOCH)

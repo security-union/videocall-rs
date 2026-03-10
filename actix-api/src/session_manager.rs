@@ -24,6 +24,7 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::user_id::to_user_id_bytes;
 use videocall_types::SYSTEM_USER_ID;
 
 /// Error type for session management operations
@@ -125,7 +126,7 @@ impl SessionManager {
     pub fn build_session_assigned_packet(session_id: u64) -> Vec<u8> {
         let wrapper = PacketWrapper {
             packet_type: PacketType::SESSION_ASSIGNED.into(),
-            user_id: SYSTEM_USER_ID.as_bytes().to_vec(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
             session_id,
             ..Default::default()
         };
@@ -142,13 +143,13 @@ impl SessionManager {
             event_type: MeetingEventType::MEETING_STARTED.into(),
             room_id: room_id.to_string(),
             start_time_ms,
-            creator_id: creator_id.as_bytes().to_vec(),
+            creator_id: to_user_id_bytes(creator_id),
             ..Default::default()
         };
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            user_id: SYSTEM_USER_ID.as_bytes().to_vec(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -170,7 +171,7 @@ impl SessionManager {
             event_type: MeetingEventType::PARTICIPANT_JOINED.into(),
             room_id: room_id.to_string(),
             message: format!("{} has joined the meeting", user_id),
-            target_user_id: user_id.as_bytes().to_vec(),
+            target_user_id: to_user_id_bytes(user_id),
             session_id,
             display_name: display_name.as_bytes().to_vec(),
             ..Default::default()
@@ -178,7 +179,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            user_id: SYSTEM_USER_ID.as_bytes().to_vec(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -197,7 +198,7 @@ impl SessionManager {
             event_type: MeetingEventType::PARTICIPANT_LEFT.into(),
             room_id: room_id.to_string(),
             message: format!("{} has left the meeting", user_id),
-            target_user_id: user_id.as_bytes().to_vec(),
+            target_user_id: to_user_id_bytes(user_id),
             session_id,
             display_name: display_name.as_bytes().to_vec(),
             ..Default::default()
@@ -205,7 +206,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            user_id: SYSTEM_USER_ID.as_bytes().to_vec(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -224,7 +225,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            user_id: SYSTEM_USER_ID.as_bytes().to_vec(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -290,7 +291,7 @@ mod tests {
         assert_eq!(inner.event_type, MeetingEventType::MEETING_STARTED.into());
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.start_time_ms, 1234567890);
-        assert_eq!(inner.creator_id, "alice".as_bytes().to_vec());
+        assert_eq!(inner.creator_id, to_user_id_bytes("alice"));
 
         let meeting_ended = SessionManager::build_meeting_ended_packet("my-room", "Host left");
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_ended).unwrap();
@@ -309,7 +310,7 @@ mod tests {
         let packet = SessionManager::build_peer_joined_packet("my-room", "bob", 42, "Bob Smith");
         let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
-        assert_eq!(wrapper.user_id, SYSTEM_USER_ID.as_bytes().to_vec());
+        assert_eq!(wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
 
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
         assert_eq!(
@@ -317,7 +318,7 @@ mod tests {
             MeetingEventType::PARTICIPANT_JOINED.into()
         );
         assert_eq!(inner.room_id, "my-room");
-        assert_eq!(inner.target_user_id, "bob".as_bytes().to_vec());
+        assert_eq!(inner.target_user_id, to_user_id_bytes("bob"));
         assert_eq!(inner.session_id, 42);
         assert!(inner.message.contains("bob"));
         assert_eq!(inner.display_name, "Bob Smith".as_bytes().to_vec());
@@ -335,7 +336,7 @@ mod tests {
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
         assert_eq!(inner.event_type, MeetingEventType::PARTICIPANT_LEFT.into());
         assert_eq!(inner.room_id, "my-room");
-        assert_eq!(inner.target_user_id, "alice".as_bytes().to_vec());
+        assert_eq!(inner.target_user_id, to_user_id_bytes("alice"));
         assert_eq!(inner.session_id, 99);
     }
 
@@ -367,8 +368,8 @@ mod tests {
             left_wrapper.session_id, 0,
             "PARTICIPANT_LEFT wrapper session_id should be 0"
         );
-        assert_eq!(joined_wrapper.user_id, SYSTEM_USER_ID.as_bytes().to_vec());
-        assert_eq!(left_wrapper.user_id, SYSTEM_USER_ID.as_bytes().to_vec());
+        assert_eq!(joined_wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
+        assert_eq!(left_wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
         assert_eq!(joined_wrapper.packet_type, left_wrapper.packet_type);
 
         let joined_inner = MeetingPacket::parse_from_bytes(&joined_wrapper.data).unwrap();

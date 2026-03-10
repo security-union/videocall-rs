@@ -1003,7 +1003,7 @@ impl Component for AttendantsComponent {
                 true
             }
             Msg::OnPeerLeft((display_name, user_id)) => {
-                log::info!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+                log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
                 // Don't play sound immediately -- defer it so a rapid
                 // join event (waiting-room admission) can cancel it.
                 let id = self.toast_counter;
@@ -1025,7 +1025,7 @@ impl Component for AttendantsComponent {
                 true
             }
             Msg::OnPeerJoined((display_name, user_id)) => {
-                log::info!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
                 // When an observer is admitted from the waiting room, the
                 // observer connection closes (PARTICIPANT_LEFT) and the user
                 // reconnects as a real participant (PARTICIPANT_JOINED). If

@@ -458,7 +458,7 @@ pub fn AttendantsComponent(
             })),
             on_peer_left: Some(VcCallback::from(
                 move |(display_name, user_id): (String, String)| {
-                    log::info!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+                    log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
                     let mut toast_counter = toast_counter;
                     let mut peer_toasts = peer_toasts;
                     let mut toast_version = toast_version;
@@ -498,7 +498,7 @@ pub fn AttendantsComponent(
             )),
             on_peer_joined: Some(VcCallback::from(
                 move |(display_name, user_id): (String, String)| {
-                    log::info!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                    log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
                     let mut toast_counter = toast_counter;
                     let mut peer_toasts = peer_toasts;
                     let mut toast_version = toast_version;

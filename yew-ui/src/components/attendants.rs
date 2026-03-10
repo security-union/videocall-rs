@@ -1170,7 +1170,7 @@ impl Component for AttendantsComponent {
                     // "participant joined/left" toast notifications
                     if !self.peer_toasts.is_empty() {
                         <div class="peer-toasts">
-                            { for self.peer_toasts.iter().map(|(id, _display_name, uid, is_joined)| {
+                            { for self.peer_toasts.iter().map(|(id, display_name, uid, is_joined)| {
                                 let key = id.to_string();
                                 let is_joined = *is_joined;
                                 let variant_class = if is_joined {
@@ -1205,7 +1205,7 @@ impl Component for AttendantsComponent {
                                     <div {key} class={variant_class}>
                                         <span class="toast-icon">{ icon_svg }</span>
                                         <span class="toast-text">
-                                            <span class="toast-name">{ uid.clone() }</span>
+                                            <span class="toast-name">{ display_name.clone() }</span>
                                             <br/>
                                             <span class="toast-action">{ action_text }</span>
                                         </span>

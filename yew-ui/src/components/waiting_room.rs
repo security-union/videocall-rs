@@ -40,6 +40,8 @@ pub struct WaitingRoomProps {
     /// The authenticated user's ID, used as the observer `userid` so
     /// the server can match push notifications to this client.
     pub user_id: String,
+    /// The display name to show on the waiting screen.
+    pub display_name: String,
     /// Observer JWT token for receiving push notifications.
     #[prop_or_default]
     pub observer_token: Option<String>,
@@ -269,6 +271,17 @@ pub fn waiting_room(props: &WaitingRoomProps) -> Html {
                     </svg>
                 </div>
                 <h2>{"Waiting to be admitted"}</h2>
+                {
+                    if !props.display_name.trim().is_empty() {
+                        html! {
+                            <p class="waiting-room-identity">
+                                {format!("Joining as {}", props.display_name)}
+                            </p>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
                 <p class="waiting-room-message">
                     {"The meeting host will let you in soon."}
                 </p>

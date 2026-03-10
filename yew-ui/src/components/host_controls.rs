@@ -254,7 +254,28 @@ impl Component for HostControls {
 
                                     html! {
                                         <div class="waiting-participant">
-                                            <span class="participant-email">{&peer_user_id}</span>
+                                            <div class="participant-info">
+                                                {
+                                                    if let Some(ref name) = participant.display_name {
+                                                        if !name.trim().is_empty() {
+                                                            html! {
+                                                                <>
+                                                                    <div class="participant-name">{name}</div>
+                                                                    <div class="participant-email">{&peer_user_id}</div>
+                                                                </>
+                                                            }
+                                                        } else {
+                                                            html! {
+                                                                <div class="participant-name">{&peer_user_id}</div>
+                                                            }
+                                                        }
+                                                    } else {
+                                                        html! {
+                                                            <div class="participant-name">{&peer_user_id}</div>
+                                                        }
+                                                    }
+                                                }
+                                            </div>
                                             <div class="participant-actions">
                                                 <button
                                                     class="btn-admit"

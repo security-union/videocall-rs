@@ -203,6 +203,7 @@ test.describe("Two users in a meeting", () => {
       // ---- ASSERT: peer tile shows display_name as text, user_id as tooltip ----
       // The floating name overlay on each peer tile should show the display name,
       // with the user_id (email) available as a tooltip via the title attribute.
+      // The host tile includes a "Host: " prefix in the title attribute.
       const guestNameOnHost = hostPage.locator(".floating-name", {
         hasText: "GuestUser",
       });
@@ -210,16 +211,42 @@ test.describe("Two users in a meeting", () => {
         hasText: "HostUser",
       });
 
-      // Check that the guest's display name is visible on the host side
+      // Check that the guest's display name is visible on the host side.
+      // The guest is not the host, so the title is just the user_id.
       await expect(guestNameOnHost.first()).toBeVisible({ timeout: 10_000 });
       await expect(guestNameOnHost.first()).toHaveAttribute("title", "guest@videocall.rs");
 
-      // Check that the host's display name is visible on the guest side
+      // Check that the host's display name is visible on the guest side.
+      // The host tile has a "Host: " prefix in the title attribute.
       await expect(hostNameOnGuest.first()).toBeVisible({ timeout: 10_000 });
-      await expect(hostNameOnGuest.first()).toHaveAttribute("title", "host@videocall.rs");
+      await expect(hostNameOnGuest.first()).toHaveAttribute(
+        "title",
+        /^(Host: )?host@videocall\.rs$/,
+      );
+
+      // ---- ASSERT: floating-name shows display_name NOT email ----
+      // Verify the floating name text does NOT contain email addresses.
+      // This guards against a regression where user_id/email was shown
+      // instead of display_name as the visible tile label.
+      const allHostFloatingNames = hostPage.locator(".floating-name");
+      const allGuestFloatingNames = guestPage.locator(".floating-name");
+
+      // On host side: no floating name should contain an '@' sign
+      const hostFloatingCount = await allHostFloatingNames.count();
+      for (let i = 0; i < hostFloatingCount; i++) {
+        const text = await allHostFloatingNames.nth(i).textContent();
+        expect(text).not.toContain("@");
+      }
+
+      // On guest side: no floating name should contain an '@' sign
+      const guestFloatingCount = await allGuestFloatingNames.count();
+      for (let i = 0; i < guestFloatingCount; i++) {
+        const text = await allGuestFloatingNames.nth(i).textContent();
+        expect(text).not.toContain("@");
+      }
 
       // ---- ASSERT: "joined the meeting" toast notifications ----
-      // Toast format: Line 1 = user_id (email), Line 2 = "joined the meeting"
+      // Toast format: Line 1 = display name, Line 2 = "joined the meeting"
       // Toasts auto-dismiss after ~8 seconds, so we check within a generous
       // timeout but also accept that the toast may have already appeared
       // and disappeared during the peer discovery wait above.
@@ -248,16 +275,16 @@ test.describe("Two users in a meeting", () => {
       console.log(`Host saw "joined" toast: ${hostSawToast}`);
       console.log(`Guest saw "joined" toast: ${guestSawToast}`);
 
-      // If either side still has a visible toast, verify the new two-line format:
-      // Line 1: user_id (email), Line 2: "joined the meeting"
+      // If either side still has a visible toast, verify the two-line format:
+      // Line 1: display name, Line 2: "joined the meeting"
       if (hostSawToast) {
         const toast = hostJoinedToast.first();
-        await expect(toast.locator(".toast-name")).toContainText("guest@videocall.rs");
+        await expect(toast.locator(".toast-name")).toContainText("GuestUser");
         await expect(toast.locator(".toast-action")).toContainText("joined the meeting");
       }
       if (guestSawToast) {
         const toast = guestJoinedToast.first();
-        await expect(toast.locator(".toast-name")).toContainText("host@videocall.rs");
+        await expect(toast.locator(".toast-name")).toContainText("HostUser");
         await expect(toast.locator(".toast-action")).toContainText("joined the meeting");
       }
 

@@ -29,6 +29,7 @@ const POLL_INTERVAL_MS: i32 = 5000;
 pub fn WaitingRoom(
     meeting_id: String,
     user_id: String,
+    display_name: String,
     observer_token: String,
     on_admitted: EventHandler<ParticipantStatus>,
     on_rejected: EventHandler<()>,
@@ -318,6 +319,9 @@ pub fn WaitingRoom(
                     }
                 }
                 h2 { "Waiting to be admitted" }
+                if !display_name.trim().is_empty() {
+                    p { class: "waiting-room-identity", "Joining as {display_name}" }
+                }
                 p { class: "waiting-room-message",
                     "The meeting host will let you in soon."
                 }

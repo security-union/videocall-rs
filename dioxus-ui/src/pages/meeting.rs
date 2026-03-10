@@ -469,6 +469,7 @@ pub fn MeetingPage(id: String) -> Element {
                 WaitingRoom {
                     meeting_id: id.clone(),
                     user_id: current_user_id().unwrap_or_default(),
+                    display_name: input_value_state(),
                     observer_token: observer_token.clone(),
                     on_admitted: on_admitted,
                     on_rejected: on_rejected,

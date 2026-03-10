@@ -504,6 +504,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                             <WaitingRoom
                                 meeting_id={props.id.clone()}
                                 user_id={(*current_user_id).clone().unwrap_or_default()}
+                                display_name={(*input_value_state).clone()}
                                 observer_token={observer_token.clone()}
                                 on_admitted={on_admitted}
                                 on_rejected={on_rejected}

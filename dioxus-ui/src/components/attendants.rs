@@ -514,6 +514,11 @@ pub fn AttendantsComponent(
                         let v = *toast_version.peek();
                         toast_version.set(v + 1);
                     }
+                    // Force tile re-render so display names appear.
+                    {
+                        let mut v = peer_list_version;
+                        v.set(v() + 1);
+                    }
                     // Schedule toast removal after 8 seconds.
                     Timeout::new(8_000, move || {
                         let updated: Vec<_> = peer_toasts
@@ -771,7 +776,7 @@ pub fn AttendantsComponent(
                 if !peer_toasts().is_empty() {
                     div {
                         class: "peer-toasts",
-                        for (id, _display_name, uid, is_joined) in peer_toasts().iter().cloned() {
+                        for (id, display_name, uid, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
                                 let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
@@ -810,7 +815,7 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                         span { class: "toast-text",
-                                            span { class: "toast-name", "{uid}" }
+                                            span { class: "toast-name", "{display_name}" }
                                             br {}
                                             span { class: "toast-action", "{action_text}" }
                                         }

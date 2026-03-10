@@ -2046,6 +2046,13 @@ select {
   font-weight: 600;
 }
 
+.waiting-room-identity {
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
 .waiting-room-message {
   color: rgba(255, 255, 255, 0.7);
   margin-bottom: 2rem;
@@ -2162,6 +2169,22 @@ select {
 
 .waiting-participant:last-child {
   border-bottom: none;
+}
+
+.participant-info {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.participant-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .participant-email {

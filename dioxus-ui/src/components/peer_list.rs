@@ -72,9 +72,29 @@ pub fn PeerList(
         });
     });
 
+    // Get client from context to convert session_id to user_id for display
+    let client_ctx = use_context::<VideoCallClientCtx>();
+    let audio_states = peer_audio_states();
+    let speaking_states = peer_speaking_states();
+
+    // Build reverse lookup (user_id -> session_id) once, to avoid O(N^2) scanning inside the loop.
+    let user_id_to_sid: HashMap<String, String> = client_ctx
+        .sorted_peer_keys()
+        .into_iter()
+        .filter_map(|sid| client_ctx.get_peer_user_id(&sid).map(|uid| (uid, sid)))
+        .collect();
+
     let filtered_peers: Vec<String> = peers
         .iter()
-        .filter(|peer| peer.to_lowercase().contains(&search_query().to_lowercase()))
+        .filter(|peer| {
+            let peer_display_name = user_id_to_sid
+                .get(peer.as_str())
+                .and_then(|sid| client_ctx.get_peer_display_name(sid))
+                .unwrap_or_else(|| peer.to_string());
+            let query = search_query().to_lowercase();
+            peer.to_lowercase().contains(&query)
+                || peer_display_name.to_lowercase().contains(&query)
+        })
         .cloned()
         .collect();
 
@@ -89,18 +109,6 @@ pub fn PeerList(
         .as_ref()
         .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
         .unwrap_or(false);
-
-    // Get client from context to convert session_id to user_id for display
-    let client_ctx = use_context::<VideoCallClientCtx>();
-    let audio_states = peer_audio_states();
-    let speaking_states = peer_speaking_states();
-
-    // Build reverse lookup (user_id -> session_id) once, to avoid O(N^2) scanning inside the loop.
-    let user_id_to_sid: HashMap<String, String> = client_ctx
-        .sorted_peer_keys()
-        .into_iter()
-        .filter_map(|sid| client_ctx.get_peer_user_id(&sid).map(|uid| (uid, sid)))
-        .collect();
 
     rsx! {
         div {
@@ -197,6 +205,13 @@ pub fn PeerList(
                                     // peer is the display user_id; we need the session_id to look up states.
                                     // Use the pre-built reverse map for O(1) lookup instead of scanning all peers.
                                     let peer_session_id = user_id_to_sid.get(peer.as_str());
+                                    let peer_display_name = peer_session_id
+                                        .and_then(|sid| client_ctx.get_peer_display_name(sid))
+                                        .unwrap_or_else(|| peer.clone());
+                                    let is_peer_host = host_display_name
+                                        .as_ref()
+                                        .map(|h| h == &peer_display_name)
+                                        .unwrap_or(false);
                                     let muted = peer_session_id
                                         .and_then(|sid| audio_states.get(sid).copied())
                                         .map(|enabled| !enabled)
@@ -208,8 +223,9 @@ pub fn PeerList(
                                         li {
                                             key: "{peer}",
                                             PeerListItem {
-                                                name: peer.clone(),
-                                                is_host: host_display_name.as_ref().map(|h| h == peer).unwrap_or(false),
+                                                name: peer_display_name,
+                                                tooltip: peer.clone(),
+                                                is_host: is_peer_host,
                                                 muted: muted,
                                                 speaking: speaking,
                                             }
@@ -245,13 +261,19 @@ fn handle_peer_list_diagnostics(
             }
             if let Some(peer) = to_peer {
                 if let Some(audio) = audio_enabled {
-                    let current = peer_audio_states.peek().get(&peer).copied();
+                    let current = match peer_audio_states.try_peek() {
+                        Ok(map) => map.get(&peer).copied(),
+                        Err(_) => return,
+                    };
                     if current != Some(audio) {
                         peer_audio_states.write().insert(peer.clone(), audio);
                     }
                 }
                 if let Some(speaking) = is_speaking {
-                    let current = peer_speaking_states.peek().get(&peer).copied();
+                    let current = match peer_speaking_states.try_peek() {
+                        Ok(map) => map.get(&peer).copied(),
+                        Err(_) => return,
+                    };
                     if current != Some(speaking) {
                         peer_speaking_states.write().insert(peer, speaking);
                     }
@@ -269,7 +291,10 @@ fn handle_peer_list_diagnostics(
                 }
             }
             if let (Some(peer), Some(speaking_val)) = (to_peer, speaking) {
-                let current = peer_speaking_states.peek().get(&peer).copied();
+                let current = match peer_speaking_states.try_peek() {
+                    Ok(map) => map.get(&peer).copied(),
+                    Err(_) => return,
+                };
                 if current != Some(speaking_val) {
                     peer_speaking_states.write().insert(peer, speaking_val);
                 }

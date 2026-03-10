@@ -209,17 +209,24 @@ impl Component for PeerList {
             .peers
             .iter()
             .filter(|peer| {
-                // Resolve session_id to display name for search filtering
-                let display_name = if let Some(ref client) = client_ctx {
+                // Resolve session_id to user_id and display_name for search filtering
+                let user_id = if let Some(ref client) = client_ctx {
                     client
                         .get_peer_user_id(peer)
                         .unwrap_or_else(|| (*peer).clone())
                 } else {
                     (*peer).clone()
                 };
-                display_name
-                    .to_lowercase()
-                    .contains(&self.search_query.to_lowercase())
+                let display_name = if let Some(ref client) = client_ctx {
+                    client
+                        .get_peer_display_name(peer)
+                        .unwrap_or_else(|| user_id.clone())
+                } else {
+                    user_id.clone()
+                };
+                let query = self.search_query.to_lowercase();
+                display_name.to_lowercase().contains(&query)
+                    || user_id.to_lowercase().contains(&query)
             })
             .cloned()
             .collect();
@@ -335,11 +342,16 @@ impl Component for PeerList {
                                 <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} muted={ctx.props().self_muted} speaking={self.local_speaking} /></li>
 
                                 { for filtered_peers.iter().map(|peer_id| {
-                                    // peer_id is session_id, get email for display
-                                    let display_name = if let Some(ref client) = client_ctx {
+                                    // peer_id is session_id; resolve user_id and display_name
+                                    let user_id = if let Some(ref client) = client_ctx {
                                         client.get_peer_user_id(peer_id).unwrap_or_else(|| peer_id.clone())
                                     } else {
                                         peer_id.clone()
+                                    };
+                                    let display_name = if let Some(ref client) = client_ctx {
+                                        client.get_peer_display_name(peer_id).unwrap_or_else(|| user_id.clone())
+                                    } else {
+                                        user_id.clone()
                                     };
 
                                     let is_peer_host = host_display_name.as_ref()
@@ -348,7 +360,7 @@ impl Component for PeerList {
                                     let muted = !self.peer_audio_states.get(peer_id).copied().unwrap_or(false);
                                     let speaking = self.peer_speaking_states.get(peer_id).copied().unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={display_name} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
+                                        <li><PeerListItem name={display_name} tooltip={user_id} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
                                     }
                                 })}
                             </ul>

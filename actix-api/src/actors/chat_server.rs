@@ -45,6 +45,7 @@ use super::session_logic::{ConnectionState, SessionId};
 #[rtype(result = "()")]
 struct CleanupFailedJoin {
     session: SessionId,
+    room: String,
 }
 
 pub struct ChatServer {
@@ -53,6 +54,9 @@ pub struct ChatServer {
     active_subs: HashMap<SessionId, JoinHandle<()>>,
     session_manager: SessionManager,
     connection_states: HashMap<SessionId, ConnectionState>,
+    /// Track which sessions are in which room, with their user_id and display_name.
+    /// Used to send PARTICIPANT_JOINED for existing peers to new joiners.
+    room_members: HashMap<String, Vec<(SessionId, String, String)>>,
 }
 
 impl ChatServer {
@@ -63,6 +67,7 @@ impl ChatServer {
             sessions: HashMap::new(),
             session_manager: SessionManager::new(),
             connection_states: HashMap::new(),
+            room_members: HashMap::new(),
         }
     }
 
@@ -77,6 +82,16 @@ impl ChatServer {
         // Remove the subscription task if it exists
         if let Some(task) = self.active_subs.remove(session_id) {
             task.abort();
+        }
+
+        // Remove from room_members tracking
+        if let Some(room_id) = room {
+            if let Some(members) = self.room_members.get_mut(room_id) {
+                members.retain(|(sid, _, _)| sid != session_id);
+                if members.is_empty() {
+                    self.room_members.remove(room_id);
+                }
+            }
         }
 
         // End session using SessionManager
@@ -334,6 +349,25 @@ impl Handler<JoinRoom> for ChatServer {
             }
         };
 
+        // Collect existing non-observer room members for notifying the new joiner
+        let existing_members: Vec<(SessionId, String, String)> = if !observer {
+            self.room_members.get(&room).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Track this session in room_members (only for non-observers)
+        if !observer {
+            self.room_members.entry(room.clone()).or_default().push((
+                session,
+                user_id.clone(),
+                display_name.clone(),
+            ));
+        }
+
+        // Clone the recipient so we can send existing member info directly to the new joiner
+        let new_joiner_recipient = session_recipient.clone();
+
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
 
@@ -392,6 +426,30 @@ impl Handler<JoinRoom> for ChatServer {
                             user_id_clone, room_clone
                         );
                     }
+
+                    // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
+                    // This ensures the new joiner learns about all participants already in the room.
+                    for (existing_sid, existing_uid, existing_display_name) in &existing_members {
+                        let existing_bytes = SessionManager::build_peer_joined_packet(
+                            &room_clone,
+                            existing_uid,
+                            *existing_sid,
+                            existing_display_name,
+                        );
+                        info!(
+                            "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
+                            existing_uid, existing_display_name, user_id_clone
+                        );
+                        if let Err(e) = new_joiner_recipient.try_send(Message {
+                            msg: existing_bytes,
+                            session: *existing_sid,
+                        }) {
+                            warn!(
+                                "Failed to send existing PARTICIPANT_JOINED for {} to new joiner {}: {}",
+                                existing_uid, user_id_clone, e
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -403,6 +461,7 @@ impl Handler<JoinRoom> for ChatServer {
                     // leave a stale entry in active_subs, blocking future join attempts.
                     let _ = chat_server_addr.try_send(CleanupFailedJoin {
                         session: session_for_cleanup,
+                        room: room_clone.clone(),
                     });
                     return;
                 }
@@ -448,6 +507,13 @@ impl Handler<CleanupFailedJoin> for ChatServer {
                 "Cleaned up failed join for session {} from active_subs",
                 msg.session
             );
+        }
+        // Also remove from room_members since the join failed
+        if let Some(members) = self.room_members.get_mut(&msg.room) {
+            members.retain(|(sid, _, _)| *sid != msg.session);
+            if members.is_empty() {
+                self.room_members.remove(&msg.room);
+            }
         }
     }
 }

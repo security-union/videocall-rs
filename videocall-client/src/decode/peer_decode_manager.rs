@@ -25,6 +25,7 @@ use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
 use log::debug;
 use protobuf::Message;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::{fmt::Display, sync::Arc};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
@@ -427,6 +428,11 @@ fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> 
 #[derive(Debug)]
 pub struct PeerDecodeManager {
     connected_peers: HashMapWithOrderedKeys<u64, Peer>,
+    /// Cache of user_id -> display_name, populated from PARTICIPANT_JOINED events.
+    /// This persists independently of the peer list so that when `ensure_peer()`
+    /// creates a peer later (after the first media packet arrives), the display
+    /// name is immediately available and does not fall back to user_id/email.
+    display_name_cache: HashMap<String, String>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -445,6 +451,7 @@ impl PeerDecodeManager {
     pub fn new() -> Self {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
+            display_name_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -457,6 +464,7 @@ impl PeerDecodeManager {
     pub fn new_with_diagnostics(diagnostics: Rc<DiagnosticManager>) -> Self {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
+            display_name_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -561,17 +569,24 @@ impl PeerDecodeManager {
     ) -> Result<(), JsValue> {
         let sid_str = session_id.to_string();
         debug!("Adding peer {user_id} with session_id {sid_str}");
-        self.connected_peers.insert(
+        let mut peer = Peer::new(
+            self.get_video_canvas_id.emit(sid_str.clone()),
+            self.get_screen_canvas_id.emit(sid_str),
             session_id,
-            Peer::new(
-                self.get_video_canvas_id.emit(sid_str.clone()),
-                self.get_screen_canvas_id.emit(sid_str),
-                session_id,
-                user_id.to_owned(),
-                aes,
-                self.vad_threshold,
-            )?,
-        );
+            user_id.to_owned(),
+            aes,
+            self.vad_threshold,
+        )?;
+        // Apply cached display name if PARTICIPANT_JOINED arrived before
+        // the first media packet created this peer entry.
+        if let Some(cached_name) = self.display_name_cache.get(user_id) {
+            debug!(
+                "Applying cached display_name '{}' for peer {} (user_id={})",
+                cached_name, session_id, user_id
+            );
+            peer.display_name = Some(cached_name.clone());
+        }
+        self.connected_peers.insert(session_id, peer);
         Ok(())
     }
 
@@ -590,6 +605,9 @@ impl PeerDecodeManager {
         for (_session_id, peer) in removed {
             self.on_peer_removed.emit(peer.sid_str);
         }
+        // Clear the display name cache so stale names don't persist
+        // across reconnections.
+        self.display_name_cache.clear();
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
@@ -642,7 +660,19 @@ impl PeerDecodeManager {
 
     /// Set the display name for a peer identified by user_id (email).
     /// This is called when a PARTICIPANT_JOINED event provides the display name.
+    ///
+    /// The display name is stored in both the per-peer entry (if the peer
+    /// already exists) AND a persistent cache keyed by user_id. This way,
+    /// if the PARTICIPANT_JOINED event arrives before the first media packet
+    /// creates the peer entry via `ensure_peer()`, the display name is
+    /// still available when the peer is created later.
     pub fn set_peer_display_name_by_user_id(&mut self, user_id: &str, display_name: String) {
+        // Always persist in the cache so that future `add_peer()` calls
+        // can pick it up even if no peer entry exists yet.
+        self.display_name_cache
+            .insert(user_id.to_string(), display_name.clone());
+
+        // Also update any existing peer entries with this user_id.
         let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
         for key in keys {
             if let Some(peer) = self.connected_peers.get_mut(&key) {

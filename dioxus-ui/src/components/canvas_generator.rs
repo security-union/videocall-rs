@@ -34,15 +34,17 @@ use web_sys::{window, HtmlCanvasElement};
 fn speak_style(audio_level: f32) -> String {
     if audio_level <= 0.0 {
         // Explicitly force off — no reliance on CSS class removal
-        return "border-color: transparent; box-shadow: none; transition: border-color 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
+        return "border: 1.5px solid transparent; box-shadow: none; transition: border 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
     }
     let i = audio_level.clamp(0.0, 1.0);
-    // More dramatic glow that scales aggressively with intensity
+    // More dramatic glow that scales aggressively with intensity.
+    // Uses full `border` shorthand because the glow overlay div does not
+    // inherit the container's border — it needs its own.
     format!(
-        "border-color: rgba(0, 255, 65, {:.2}); \
+        "border: 1.5px solid rgba(0, 255, 65, {:.2}); \
          box-shadow: inset 0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}), \
                      0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}); \
-         transition: border-color 0.15s ease-in, box-shadow 0.15s ease-in;",
+         transition: border 0.15s ease-in, box-shadow 0.15s ease-in;",
         0.4 + i * 0.6,   // border alpha: 0.4–1.0 (more visible)
         15.0 + i * 25.0, // inset blur: 15–40 (bigger glow)
         5.0 + i * 10.0,  // inset spread: 5–15 (wider)
@@ -131,7 +133,6 @@ pub fn generate_for_peer(
                 id: "{peer_video_div_id}",
                 div {
                     class: "{full_bleed_class}",
-                    style: "{tile_style}",
                     onclick: move |_| {
                         if is_mobile_viewport() {
                             toggle_pinned_div(&div_id_mobile);
@@ -172,6 +173,12 @@ pub fn generate_for_peer(
                         onclick: move |_| toggle_pinned_div(&div_id_pin),
                         class: "pin-icon",
                         PushPinIcon {}
+                    }
+                    // Glow overlay renders ON TOP of video content so the
+                    // inset box-shadow is not hidden behind the canvas element.
+                    div {
+                        style: "{tile_style}",
+                        class: "glow-overlay",
                     }
                 }
             }
@@ -251,7 +258,6 @@ pub fn generate_for_peer(
                     // One canvas for the User Video
                     div {
                         class: "{grid_class}",
-                        style: "{grid_tile_style}",
                         onclick: move |_| {
                             if is_mobile_viewport() {
                                 toggle_pinned_div(&pv_div_mobile);
@@ -288,6 +294,11 @@ pub fn generate_for_peer(
                             onclick: move |_| toggle_pinned_div(&pv_div_pin),
                             class: "pin-icon",
                             PushPinIcon {}
+                        }
+                        // Glow overlay renders ON TOP of video content
+                        div {
+                            style: "{grid_tile_style}",
+                            class: "glow-overlay",
                         }
                     }
                 }

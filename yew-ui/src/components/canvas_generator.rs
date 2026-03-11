@@ -35,15 +35,17 @@ use yew::{html, Html};
 fn speak_style(audio_level: f32) -> String {
     if audio_level <= 0.0 {
         // Explicitly force off — no reliance on CSS class removal
-        return "border-color: transparent; box-shadow: none; transition: border-color 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
+        return "border: 1.5px solid transparent; box-shadow: none; transition: border 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
     }
     let i = audio_level.clamp(0.0, 1.0);
-    // More dramatic glow that scales aggressively with intensity
+    // More dramatic glow that scales aggressively with intensity.
+    // Uses full `border` shorthand because the glow overlay div does not
+    // inherit the container's border — it needs its own.
     format!(
-        "border-color: rgba(0, 255, 65, {:.2}); \
+        "border: 1.5px solid rgba(0, 255, 65, {:.2}); \
          box-shadow: inset 0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}), \
                      0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}); \
-         transition: border-color 0.15s ease-in, box-shadow 0.15s ease-in;",
+         transition: border 0.15s ease-in, box-shadow 0.15s ease-in;",
         0.4 + i * 0.6,   // border alpha: 0.4–1.0 (more visible)
         15.0 + i * 25.0, // inset blur: 15–40 (bigger glow)
         5.0 + i * 10.0,  // inset spread: 5–15 (wider)
@@ -110,7 +112,6 @@ pub fn generate_for_peer(
         return html! {
             <div class="grid-item full-bleed" id={(*peer_video_div_id).clone()}>
                 <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
-                    style={tile_style.clone()}
                     onclick={Callback::from({
                         let div_id = (*peer_video_div_id).clone();
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
@@ -124,6 +125,8 @@ pub fn generate_for_peer(
                     <div class={classes!("audio-indicator", if is_speaking { "speaking" } else { "" })} style={mic_inline_style.clone()}><MicIcon muted={!is_audio_enabled_for_peer}/></div>
                     <button onclick={Callback::from({ let canvas_id = key.clone(); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon"><CropIcon/></button>
                     <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon"><PushPinIcon/></button>
+                    // Glow overlay renders ON TOP of video content
+                    <div class="glow-overlay" style={tile_style.clone()}></div>
                 </div>
             </div>
         };
@@ -163,7 +166,6 @@ pub fn generate_for_peer(
             <div class="grid-item" id={(*peer_video_div_id).clone()}>
                 // One canvas for the User Video
                 <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
-                    style={tile_style}
                     onclick={Callback::from({
                         let div_id = (*peer_video_div_id).clone();
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
@@ -190,6 +192,8 @@ pub fn generate_for_peer(
                     <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon">
                         <PushPinIcon/>
                     </button>
+                    // Glow overlay renders ON TOP of video content
+                    <div class="glow-overlay" style={tile_style}></div>
                 </div>
             </div>
         </>

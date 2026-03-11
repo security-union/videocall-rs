@@ -554,6 +554,16 @@ h3 {
   box-shadow: none;
 }
 
+/* Transparent overlay that sits on top of the video canvas so the speaking
+   glow (border + inset box-shadow) is not hidden behind the video element. */
+.glow-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+  border-radius: inherit;
+}
+
 /* Sits between controls (above) and LED (below) inside .host — no rounded corners */
 .host-video-wrapper {
   border-radius: 0;

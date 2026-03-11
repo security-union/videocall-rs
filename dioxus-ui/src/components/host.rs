@@ -44,14 +44,14 @@ const VIDEO_ELEMENT_ID: &str = "webcam";
 /// Always returns explicit values so the glow is fully self-contained.
 fn speak_style(audio_level: f32) -> String {
     if audio_level <= 0.0 {
-        return "border-color: transparent; box-shadow: none; transition: border-color 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
+        return "border: 1.5px solid transparent; box-shadow: none; transition: border 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
     }
     let i = audio_level.clamp(0.0, 1.0);
     format!(
-        "border-color: rgba(0, 255, 65, {:.2}); \
+        "border: 1.5px solid rgba(0, 255, 65, {:.2}); \
          box-shadow: inset 0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}), \
                      0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}); \
-         transition: border-color 0.15s ease-in, box-shadow 0.15s ease-in;",
+         transition: border 0.15s ease-in, box-shadow 0.15s ease-in;",
         0.4 + i * 0.6,
         15.0 + i * 25.0,
         5.0 + i * 10.0,
@@ -480,7 +480,7 @@ pub fn Host(
         div {
             class: "host-video-wrapper",
             style: if video_enabled {
-                format!("position:relative; width:auto; height:auto; opacity:1; overflow:hidden; pointer-events:auto; {glow}")
+                "position:relative; width:auto; height:auto; opacity:1; overflow:hidden; pointer-events:auto;".to_string()
             } else {
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;".to_string()
             },
@@ -498,10 +498,17 @@ pub fn Host(
                     path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
                 }
             }
+            // Glow overlay renders ON TOP of the video element
+            if video_enabled {
+                div {
+                    style: "{glow}",
+                    class: "glow-overlay",
+                }
+            }
         }
         if !video_enabled {
             div {
-                style: format!("padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent; {glow}"),
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
@@ -521,6 +528,11 @@ pub fn Host(
                         path { d: "M12 20h9" }
                         path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
                     }
+                }
+                // Glow overlay renders ON TOP of content
+                div {
+                    style: "{glow}",
+                    class: "glow-overlay",
                 }
             }
         }

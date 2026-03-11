@@ -62,7 +62,7 @@ const DEFAULT_VAD_THRESHOLD: f32 = 0.002;
 /// RMS ceiling used to normalize audio intensity to 0.0–1.0.
 /// Normal conversational speech typically peaks around 0.05–0.15;
 /// anything above this ceiling is clamped to 1.0.
-const RMS_LOUD_SPEECH_CEILING: f32 = 0.02;
+const RMS_LOUD_SPEECH_CEILING: f32 = 0.10;
 
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
 #[derive(Debug)]
@@ -196,15 +196,15 @@ impl NetEqAudioPeerDecoder {
 
         // Normalize RMS to a 0.0–1.0 intensity range.
         // Below the VAD threshold the intensity is 0; above it we scale
-        // up to a ceiling of RMS_LOUD_SPEECH_CEILING, then apply a cbrt
+        // up to a ceiling of RMS_LOUD_SPEECH_CEILING, then apply a sqrt
         // curve for perceptual uniformity (human hearing is logarithmic,
-        // so cbrt aggressively boosts soft sounds into a visible range).
+        // so sqrt gives a good balance between dynamic range and visibility).
         let range = (RMS_LOUD_SPEECH_CEILING - vad_threshold).max(f32::EPSILON);
         let intensity = if rms < vad_threshold {
             0.0_f32
         } else {
             let linear = ((rms - vad_threshold) / range).clamp(0.0, 1.0);
-            linear.cbrt()
+            linear.sqrt()
         };
 
         // Emit a diagnostics event when the speaking boolean toggles OR

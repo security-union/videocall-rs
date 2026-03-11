@@ -486,13 +486,13 @@ impl MicrophoneEncoder {
                 // Compute normalized intensity (same formula as decoder-side
                 // in neteq_audio_decoder.rs) so the host tile can show a
                 // smooth, intensity-driven glow instead of binary on/off.
-                const RMS_LOUD_SPEECH_CEILING: f32 = 0.02;
+                const RMS_LOUD_SPEECH_CEILING: f32 = 0.10;
                 let range = (RMS_LOUD_SPEECH_CEILING - vad_threshold).max(f32::EPSILON);
                 let intensity = if rms < vad_threshold {
                     0.0_f32
                 } else {
                     let linear = ((rms - vad_threshold) / range).clamp(0.0, 1.0);
-                    linear.cbrt() // perceptual curve: aggressively boosts soft sounds
+                    linear.sqrt() // perceptual curve: balanced dynamic range
                 };
 
                 // Emit audio level when it changes meaningfully.

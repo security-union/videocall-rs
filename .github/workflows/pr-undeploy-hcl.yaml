@@ -1,4 +1,4 @@
-name: Undeploy PR Preview
+name: Undeploy PR Preview (HCL)
 
 on:
   issue_comment:

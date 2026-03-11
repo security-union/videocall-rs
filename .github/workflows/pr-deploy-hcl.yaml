@@ -1,4 +1,4 @@
-name: Deploy PR Preview
+name: Deploy PR Preview (HCL)
 
 on:
   issue_comment:

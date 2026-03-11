@@ -1,4 +1,4 @@
-name: PR Preview Cleanup on Close
+name: PR Preview Cleanup (HCL)
 
 on:
   pull_request:

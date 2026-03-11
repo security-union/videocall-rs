@@ -469,6 +469,19 @@ jobs:
           echo ""
           echo "=================================================="
 
+      - name: Notify Google Chat
+        if: success()
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+
+          # Send notification to Google Chat
+          curl -X POST \
+            'https://chat.googleapis.com/v1/spaces/AAQASkMZ_-E/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=6S5dBAiPJ4qvM-grSUnyz2G8Ggx9cnQt__gqvSOG06U' \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"text\": \"✅ *Production Deployment Complete*\n\n📦 Tag: \`${TAG}\`\n🌐 URL: https://app-dx.videocall.fnxlabs.com\n\n_Deployed to videocall namespace_\"
+            }" || echo "Failed to send Google Chat notification (non-fatal)"
+
       - name: Post deployment summary
         if: always()
         run: |

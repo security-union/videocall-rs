@@ -156,7 +156,7 @@ jobs:
 
       - name: Upload image tag artifact
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: image-tag
           path: /tmp/image-tag.txt

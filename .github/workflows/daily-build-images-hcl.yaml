@@ -163,7 +163,22 @@ jobs:
           echo ""
           echo "Images pushed to Harbor registry: hclcr.io"
           echo ""
-          echo "To deploy these images, the daily deploy workflow will be automatically triggered."
+          echo "Triggering deployment workflow..."
+
+      - name: Trigger deploy workflow
+        if: success()
+        run: |
+          TAG=${{ steps.generate-tag.outputs.tag }}
+          echo "Triggering daily deploy workflow with tag: ${TAG}"
+
+          # Use GitHub API to trigger workflow_dispatch
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/daily-deploy-hcl.yaml/dispatches" \
+            -d "{\"ref\":\"hcl-main\",\"inputs\":{\"image_tag\":\"${TAG}\"}}"
+
+          echo "✅ Deploy workflow triggered"
 
       - name: Cleanup build directory
         if: always()

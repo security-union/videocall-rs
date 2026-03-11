@@ -485,23 +485,9 @@ jobs:
           WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           if [ "${{ job.status }}" = "success" ]; then
-            MESSAGE="✅ *Production Deployment Complete*
-
-📦 Tag: \`${TAG}\`
-🌐 URL: https://app-dx.videocall.fnxlabs.com
-🌿 Branch: \`${BRANCH}\`
-📝 Commit: \`${SHORT_SHA}\`
-
-_Deployed to videocall namespace_"
+            MESSAGE="✅ *Production Deployment Complete*\n\n📦 Tag: \`${TAG}\`\n🌐 URL: https://app-dx.videocall.fnxlabs.com\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n\n_Deployed to videocall namespace_"
           else
-            MESSAGE="❌ *Production Deployment Failed*
-
-📦 Tag: \`${TAG}\`
-🌿 Branch: \`${BRANCH}\`
-📝 Commit: \`${SHORT_SHA}\`
-🔗 Logs: ${WORKFLOW_URL}
-
-_Check workflow logs for details_"
+            MESSAGE="❌ *Production Deployment Failed*\n\n📦 Tag: \`${TAG}\`\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n🔗 Logs: ${WORKFLOW_URL}\n\n_Check workflow logs for details_"
           fi
 
           # Send notification to Google Chat

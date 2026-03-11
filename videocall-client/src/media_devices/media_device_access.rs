@@ -99,6 +99,7 @@ impl MediaDeviceAccess {
     /// callback will be called.
     pub fn request(&self) {
         let on_result = self.on_result.clone();
+
         wasm_bindgen_futures::spawn_local(async move {
             let perm_result = Self::request_media_permission().await;
             on_result.emit(perm_result);

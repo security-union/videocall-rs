@@ -147,21 +147,6 @@ jobs:
             echo "   Logs will be automatically cleaned after 24 hours"
           fi
 
-      - name: Save image tag for deploy workflow
-        if: success()
-        run: |
-          TAG=${{ steps.generate-tag.outputs.tag }}
-          echo "$TAG" > /tmp/image-tag.txt
-          echo "Saved tag for deployment: $TAG"
-
-      - name: Upload image tag artifact
-        if: success()
-        uses: actions/upload-artifact@v3
-        with:
-          name: image-tag
-          path: /tmp/image-tag.txt
-          retention-days: 1
-
       - name: Display built images
         if: success()
         run: |

@@ -1,4 +1,4 @@
-name: Daily Deploy to Production
+name: Daily Deploy to Production (HCL)
 
 on:
   workflow_run:

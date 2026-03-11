@@ -1,4 +1,4 @@
-name: Build PR Images
+name: Build PR Images (HCL)
 
 on:
   issue_comment:

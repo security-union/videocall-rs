@@ -1,4 +1,4 @@
-name: Deploy PR Preview (Reusable) - HCL
+name: Deploy PR Preview (Reusable) (HCL)
 
 on:
   workflow_call:

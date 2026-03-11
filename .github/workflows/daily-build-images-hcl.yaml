@@ -1,4 +1,4 @@
-name: Daily Build Images
+name: Daily Build Images (HCL)
 
 on:
   schedule:

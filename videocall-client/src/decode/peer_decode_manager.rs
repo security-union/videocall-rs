@@ -96,6 +96,7 @@ pub struct Peer {
     pub audio_enabled: bool,
     pub screen_enabled: bool,
     pub is_speaking: bool,
+    pub audio_level: f32,
     pub display_name: Option<String>,
     context_initialized: bool,
     vad_threshold: Option<f32>,
@@ -145,6 +146,7 @@ impl Peer {
             audio_enabled: false,
             screen_enabled: false,
             is_speaking: false,
+            audio_level: 0.0,
             display_name: None,
             context_initialized: false,
             vad_threshold,
@@ -241,6 +243,7 @@ impl Peer {
                     if self.screen_enabled { 1u64 } else { 0u64 }
                 ),
                 metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
+                metric!("audio_level", self.audio_level as f64),
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -363,6 +366,9 @@ impl Peer {
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
                     self.is_speaking = metadata.is_speaking;
+                    if !metadata.is_speaking {
+                        self.audio_level = 0.0;
+                    }
 
                     // Flush video decoder when video is turned off
                     if video_turned_off {
@@ -701,6 +707,17 @@ impl PeerDecodeManager {
         }
         false
     }
+
+    pub fn peer_audio_level(&self, key: &String) -> f32 {
+        let sid: u64 = match key.parse() {
+            Ok(v) => v,
+            Err(_) => return 0.0,
+        };
+        if let Some(peer) = self.connected_peers.get(&sid) {
+            return peer.audio_level;
+        }
+        0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -839,6 +856,7 @@ mod tests {
             context_initialized: false,
             has_received_heartbeat: false,
             is_speaking: false,
+            audio_level: 0.0,
             vad_threshold: None,
         };
         (peer, muted_handle)

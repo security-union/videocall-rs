@@ -37,6 +37,29 @@ use crate::context::{
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
+/// Compute inline CSS for the speaking glow on host tile.
+/// Mirrors the logic in `canvas_generator.rs` for consistency.
+/// Always returns explicit values so the glow is fully self-contained.
+fn speak_style(audio_level: f32) -> String {
+    if audio_level <= 0.0 {
+        return "border-color: transparent; box-shadow: none; transition: border-color 0.5s ease-out, box-shadow 0.5s ease-out;".to_string();
+    }
+    let i = audio_level.clamp(0.0, 1.0);
+    format!(
+        "border-color: rgba(0, 255, 65, {:.2}); \
+         box-shadow: inset 0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}), \
+                     0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}); \
+         transition: border-color 0.15s ease-in, box-shadow 0.15s ease-in;",
+        0.4 + i * 0.6,
+        15.0 + i * 25.0,
+        5.0 + i * 10.0,
+        0.3 + i * 0.5,
+        15.0 + i * 35.0,
+        3.0 + i * 10.0,
+        0.2 + i * 0.4
+    )
+}
+
 #[derive(Debug)]
 pub enum Msg {
     Start,
@@ -113,7 +136,7 @@ pub struct MeetingProps {
     pub video_enabled: bool,
 
     #[prop_or_default]
-    pub is_speaking: bool,
+    pub audio_level: f32,
 
     pub on_encoder_settings_update: Callback<String>,
 
@@ -541,18 +564,16 @@ impl Component for Host {
         let selected_camera_id = self.media_devices.video_inputs.selected();
         let selected_speaker_id = self.media_devices.audio_outputs.selected();
 
-        let speaking_class = if ctx.props().is_speaking {
-            "speaking-tile"
-        } else {
-            ""
-        };
+        let audio_level = ctx.props().audio_level;
+        let glow = speak_style(audio_level);
 
         html! {
             <>
                 {
                     if ctx.props().video_enabled {
+                        let video_style = format!("position:relative; {glow}");
                         html! {
-                            <div class={classes!("host-video-wrapper", speaking_class)} style="position:relative;">
+                            <div class="host-video-wrapper" style={video_style}>
                                 <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
                                 <button class="change-name-fab" title="Change name"
                                     onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
@@ -561,8 +582,9 @@ impl Component for Host {
                             </div>
                         }
                     } else {
+                        let cam_off_style = format!("padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent; {glow}");
                         html! {
-                            <div class={classes!("", speaking_class)} style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative;">
+                            <div style={cam_off_style}>
                                 <div class="placeholder-content">
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                         <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>

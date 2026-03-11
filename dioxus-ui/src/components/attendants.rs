@@ -380,6 +380,7 @@ pub fn AttendantsComponent(
     let peer_list_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
     let local_speaking = use_signal(|| false);
+    let local_audio_level = use_signal(|| 0.0f32);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
@@ -532,6 +533,10 @@ pub fn AttendantsComponent(
             on_speaking_changed: Some(VcCallback::from(move |speaking: bool| {
                 let mut s = local_speaking;
                 s.set(speaking);
+            })),
+            on_audio_level_changed: Some(VcCallback::from(move |level: f32| {
+                let mut s = local_audio_level;
+                s.set(level);
             })),
             vad_threshold: crate::constants::vad_threshold().ok(),
             on_meeting_activated: None,
@@ -734,10 +739,8 @@ pub fn AttendantsComponent(
         }) as Box<dyn FnMut()>);
 
         if let Some(win) = web_sys::window() {
-            let _ = win.add_event_listener_with_callback(
-                "resize",
-                closure.as_ref().unchecked_ref(),
-            );
+            let _ =
+                win.add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref());
         }
         closure.forget();
     });
@@ -1192,7 +1195,7 @@ pub fn AttendantsComponent(
                                     share_screen: screen_share_state().is_sharing(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
-                                    is_speaking: local_speaking(),
+                                    audio_level: local_audio_level(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {

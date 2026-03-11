@@ -32,7 +32,7 @@ use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::Uint8Array;
 use protobuf::Message;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -101,7 +101,7 @@ pub struct MicrophoneEncoder {
     vad_threshold: f32,
 }
 
-const DEFAULT_VAD_THRESHOLD: f32 = 0.02;
+const DEFAULT_VAD_THRESHOLD: f32 = 0.005;
 
 impl MicrophoneEncoder {
     pub fn new(
@@ -156,9 +156,10 @@ impl MicrophoneEncoder {
                 if let Some(interval) = self.vad_interval.borrow_mut().take() {
                     drop(interval);
                 }
-                // Reset speaking state when mic is disabled
+                // Reset speaking state and audio level when mic is disabled
                 self.is_speaking.store(false, Ordering::Relaxed);
                 self.client.set_speaking(false);
+                self.client.set_audio_level(0.0);
             };
         }
         is_changed
@@ -173,9 +174,10 @@ impl MicrophoneEncoder {
         if let Some(interval) = self.vad_interval.borrow_mut().take() {
             drop(interval);
         }
-        // Reset speaking state when encoder stops
+        // Reset speaking state and audio level when encoder stops
         self.is_speaking.store(false, Ordering::Relaxed);
         self.client.set_speaking(false);
+        self.client.set_audio_level(0.0);
     }
 
     pub fn start(&mut self) {
@@ -449,6 +451,9 @@ impl MicrophoneEncoder {
             let is_speaking_clone = is_speaking_for_vad.clone();
             let client_clone = client_for_vad.clone();
 
+            let prev_audio_level = Rc::new(Cell::new(0.0f32));
+            let prev_level_clone = prev_audio_level.clone();
+
             // LOCAL user Voice Activity Detection (VAD) via AnalyserNode.
             //
             // This runs every 100ms and computes the RMS energy of the
@@ -458,6 +463,12 @@ impl MicrophoneEncoder {
             let vad_interval = Interval::new(100, move || {
                 if !enabled_check.load(Ordering::Acquire) || switching_check.load(Ordering::Acquire)
                 {
+                    // Reset audio level to zero when mic is disabled/switching
+                    let prev_lvl = prev_level_clone.get();
+                    if prev_lvl > 0.0 {
+                        prev_level_clone.set(0.0);
+                        client_clone.set_audio_level(0.0);
+                    }
                     return;
                 }
 
@@ -471,6 +482,25 @@ impl MicrophoneEncoder {
                 let rms = (sum / array.len() as f32).sqrt();
 
                 let speaking = rms > vad_threshold;
+
+                // Compute normalized intensity (same formula as decoder-side
+                // in neteq_audio_decoder.rs) so the host tile can show a
+                // smooth, intensity-driven glow instead of binary on/off.
+                const RMS_LOUD_SPEECH_CEILING: f32 = 0.04;
+                let range = (RMS_LOUD_SPEECH_CEILING - vad_threshold).max(f32::EPSILON);
+                let intensity = if rms < vad_threshold {
+                    0.0_f32
+                } else {
+                    let linear = ((rms - vad_threshold) / range).clamp(0.0, 1.0);
+                    linear.cbrt() // perceptual curve: aggressively boosts soft sounds
+                };
+
+                // Emit audio level when it changes meaningfully.
+                let prev_lvl = prev_level_clone.get();
+                if (intensity - prev_lvl).abs() > 0.02 {
+                    prev_level_clone.set(intensity);
+                    client_clone.set_audio_level(intensity);
+                }
 
                 log::trace!("VAD: RMS={:.4}, speaking={}", rms, speaking);
 
@@ -511,6 +541,7 @@ impl MicrophoneEncoder {
 
                     is_speaking_for_vad.store(false, Ordering::Relaxed);
                     client_for_vad.set_speaking(false);
+                    client_for_vad.set_audio_level(0.0);
 
                     if let Some(interval) = vad_interval_holder.borrow_mut().take() {
                         drop(interval);

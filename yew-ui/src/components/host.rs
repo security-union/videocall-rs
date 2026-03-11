@@ -42,7 +42,7 @@ const VIDEO_ELEMENT_ID: &str = "webcam";
 /// Always returns explicit values so the glow is fully self-contained.
 fn speak_style(audio_level: f32) -> String {
     if audio_level <= 0.0 {
-        return "border-color: transparent; box-shadow: none; transition: border-color 0.5s ease-out, box-shadow 0.5s ease-out;".to_string();
+        return "border-color: transparent; box-shadow: none; transition: border-color 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
     }
     let i = audio_level.clamp(0.0, 1.0);
     format!(

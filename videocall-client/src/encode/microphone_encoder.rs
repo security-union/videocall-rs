@@ -101,7 +101,7 @@ pub struct MicrophoneEncoder {
     vad_threshold: f32,
 }
 
-const DEFAULT_VAD_THRESHOLD: f32 = 0.005;
+const DEFAULT_VAD_THRESHOLD: f32 = 0.002;
 
 impl MicrophoneEncoder {
     pub fn new(
@@ -486,7 +486,7 @@ impl MicrophoneEncoder {
                 // Compute normalized intensity (same formula as decoder-side
                 // in neteq_audio_decoder.rs) so the host tile can show a
                 // smooth, intensity-driven glow instead of binary on/off.
-                const RMS_LOUD_SPEECH_CEILING: f32 = 0.04;
+                const RMS_LOUD_SPEECH_CEILING: f32 = 0.02;
                 let range = (RMS_LOUD_SPEECH_CEILING - vad_threshold).max(f32::EPSILON);
                 let intensity = if rms < vad_threshold {
                     0.0_f32

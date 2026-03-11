@@ -35,7 +35,7 @@ use yew::{html, Html};
 fn speak_style(audio_level: f32) -> String {
     if audio_level <= 0.0 {
         // Explicitly force off — no reliance on CSS class removal
-        return "border-color: transparent; box-shadow: none; transition: border-color 0.5s ease-out, box-shadow 0.5s ease-out;".to_string();
+        return "border-color: transparent; box-shadow: none; transition: border-color 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
     }
     let i = audio_level.clamp(0.0, 1.0);
     // More dramatic glow that scales aggressively with intensity
@@ -58,7 +58,7 @@ fn speak_style(audio_level: f32) -> String {
 /// Always returns explicit values — no reliance on CSS class for glow reset.
 fn mic_style(audio_level: f32) -> String {
     if audio_level <= 0.0 {
-        return "color: inherit; filter: none; transition: color 0.5s ease-out, filter 0.5s ease-out;".to_string();
+        return "color: inherit; filter: none; transition: color 1.5s ease-out, filter 1.5s ease-out;".to_string();
     }
     let i = audio_level.clamp(0.0, 1.0);
     format!(

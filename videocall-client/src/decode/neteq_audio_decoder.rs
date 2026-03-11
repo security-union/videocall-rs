@@ -57,12 +57,12 @@ enum WorkerResponse {
 /// Default threshold for voice activity detection (RMS level)
 /// Values typically range from 0.0 to 1.0 for normalized audio
 /// 0.01 is quite sensitive, 0.05 filters out most background noise
-const DEFAULT_VAD_THRESHOLD: f32 = 0.005;
+const DEFAULT_VAD_THRESHOLD: f32 = 0.002;
 
 /// RMS ceiling used to normalize audio intensity to 0.0–1.0.
 /// Normal conversational speech typically peaks around 0.05–0.15;
 /// anything above this ceiling is clamped to 1.0.
-const RMS_LOUD_SPEECH_CEILING: f32 = 0.04;
+const RMS_LOUD_SPEECH_CEILING: f32 = 0.02;
 
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
 #[derive(Debug)]

@@ -476,17 +476,39 @@ jobs:
           echo "=================================================="
 
       - name: Notify Google Chat
-        if: success()
+        if: always()
         run: |
           TAG=${{ steps.determine-tag.outputs.tag }}
+          COMMIT_SHA=${{ github.sha }}
+          SHORT_SHA=$(echo ${COMMIT_SHA} | cut -c1-7)
+          BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "${{ job.status }}" = "success" ]; then
+            MESSAGE="✅ *Production Deployment Complete*
+
+📦 Tag: \`${TAG}\`
+🌐 URL: https://app-dx.videocall.fnxlabs.com
+🌿 Branch: \`${BRANCH}\`
+📝 Commit: \`${SHORT_SHA}\`
+
+_Deployed to videocall namespace_"
+          else
+            MESSAGE="❌ *Production Deployment Failed*
+
+📦 Tag: \`${TAG}\`
+🌿 Branch: \`${BRANCH}\`
+📝 Commit: \`${SHORT_SHA}\`
+🔗 Logs: ${WORKFLOW_URL}
+
+_Check workflow logs for details_"
+          fi
 
           # Send notification to Google Chat
           curl -X POST \
             'https://chat.googleapis.com/v1/spaces/AAQASkMZ_-E/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=6S5dBAiPJ4qvM-grSUnyz2G8Ggx9cnQt__gqvSOG06U' \
             -H 'Content-Type: application/json' \
-            -d "{
-              \"text\": \"✅ *Production Deployment Complete*\n\n📦 Tag: \`${TAG}\`\n🌐 URL: https://app-dx.videocall.fnxlabs.com\n\n_Deployed to videocall namespace_\"
-            }" || echo "Failed to send Google Chat notification (non-fatal)"
+            -d "{\"text\": \"${MESSAGE}\"}" || echo "Failed to send Google Chat notification (non-fatal)"
 
       - name: Post deployment summary
         if: always()

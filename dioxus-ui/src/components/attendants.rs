@@ -720,7 +720,16 @@ pub fn AttendantsComponent(
                 _ => {}
             }
 
-            if (mic_error.read().is_some() || video_error.read().is_some()) && !session_loaded() {
+            if session_loaded() {
+                if mic_error.read().is_some() {
+                    mic_enabled.set(false);
+                    pending_mic_enable.set(false);
+                }
+                if video_error.read().is_some() {
+                    video_enabled.set(false);
+                    pending_video_enable.set(false);
+                }
+            } else if mic_error.read().is_some() || video_error.read().is_some() {
                 show_device_warning.set(true);
                 meeting_joined.set(false);
             } else {

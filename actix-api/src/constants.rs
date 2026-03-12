@@ -43,3 +43,16 @@ pub const CONGESTION_WINDOW: Duration = Duration::from_millis(1000);
 /// session. Prevents flooding the sender with congestion signals when many
 /// packets are dropped in quick succession.
 pub const CONGESTION_NOTIFY_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+
+// ---------------------------------------------------------------------------
+// KEYFRAME_REQUEST Rate Limiting
+// ---------------------------------------------------------------------------
+
+/// Maximum number of KEYFRAME_REQUEST packets allowed per session within
+/// [`KEYFRAME_REQUEST_WINDOW_MS`]. Excess requests are silently dropped to
+/// prevent a malicious client from forcing senders to continuously generate
+/// expensive keyframes (5-10x larger than delta frames).
+pub const KEYFRAME_REQUEST_MAX_PER_SEC: u32 = 2;
+
+/// Time window (in milliseconds) for KEYFRAME_REQUEST rate limiting.
+pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;

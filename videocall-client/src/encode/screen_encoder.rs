@@ -632,8 +632,11 @@ impl ScreenEncoder {
                         // Check if a keyframe was requested via PLI.
                         let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
                         // Use tier-controlled keyframe interval.
+                        // Using `%` instead of `.is_multiple_of()` for compatibility
+                        // with Rust toolchains older than 1.87.
+                        #[allow(clippy::manual_is_multiple_of)]
                         let is_periodic_keyframe = local_keyframe_interval > 0
-                            && screen_frame_counter.is_multiple_of(local_keyframe_interval);
+                            && screen_frame_counter % local_keyframe_interval == 0;
                         opts.set_key_frame(is_periodic_keyframe || pli_requested);
                         if pli_requested {
                             log::info!(

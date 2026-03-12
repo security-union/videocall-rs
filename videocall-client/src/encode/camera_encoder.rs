@@ -676,8 +676,11 @@ impl CameraEncoder {
                         let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
                         // Use tier-controlled keyframe interval instead of the
                         // static constant, allowing adaptive quality to adjust it.
+                        // Using `%` instead of `.is_multiple_of()` for compatibility
+                        // with Rust toolchains older than 1.87.
+                        #[allow(clippy::manual_is_multiple_of)]
                         let is_periodic_keyframe = local_keyframe_interval > 0
-                            && video_frame_counter.is_multiple_of(local_keyframe_interval);
+                            && video_frame_counter % local_keyframe_interval == 0;
                         video_encoder_encode_options
                             .set_key_frame(is_periodic_keyframe || pli_requested);
                         if pli_requested {

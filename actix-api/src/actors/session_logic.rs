@@ -23,7 +23,9 @@
 //! adapters while all business logic lives here.
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::packet_handler::{classify_packet, PacketKind};
+use crate::actors::packet_handler::{
+    classify_packet, is_keyframe_request, KeyframeRequestLimiter, PacketKind,
+};
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
     CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
@@ -173,6 +175,8 @@ pub struct SessionLogic {
     pub observer: bool,
     /// Tracks outbound packet drops per sender to generate CONGESTION feedback.
     pub congestion_tracker: CongestionTracker,
+    /// Per-session rate limiter for KEYFRAME_REQUEST packets.
+    pub keyframe_limiter: KeyframeRequestLimiter,
 }
 
 impl SessionLogic {
@@ -205,6 +209,7 @@ impl SessionLogic {
             session_manager,
             observer,
             congestion_tracker: CongestionTracker::new(),
+            keyframe_limiter: KeyframeRequestLimiter::new(),
         }
     }
 
@@ -322,13 +327,20 @@ impl SessionLogic {
     /// Returns the action the transport should take.
     /// Observer sessions can still send RTT and health packets but all media
     /// data packets are silently dropped.
-    pub fn handle_inbound(&self, data: &[u8]) -> InboundAction {
+    pub fn handle_inbound(&mut self, data: &[u8]) -> InboundAction {
         // Track received data
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_received(self.id, data.len() as u64);
 
         // Classify and handle
         match classify_packet(data) {
+            PacketKind::Dropped => {
+                warn!(
+                    "Dropping disallowed packet from session {} (user {})",
+                    self.id, self.user_id
+                );
+                InboundAction::Processed
+            }
             PacketKind::Rtt => {
                 trace!("RTT packet from {}, echoing back", self.user_id);
                 let data_tracker = DataTracker::new(self.tracker_sender.clone());
@@ -347,10 +359,21 @@ impl SessionLogic {
                         self.id,
                         self.user_id
                     );
-                    InboundAction::Processed
-                } else {
-                    InboundAction::Forward(Arc::new(data.to_vec()))
+                    return InboundAction::Processed;
                 }
+
+                // Rate-limit KEYFRAME_REQUEST packets to prevent abuse.
+                // A malicious client could flood these to force senders to
+                // continuously generate expensive keyframes.
+                if is_keyframe_request(data) && !self.keyframe_limiter.allow() {
+                    warn!(
+                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {})",
+                        self.id, self.user_id
+                    );
+                    return InboundAction::Processed;
+                }
+
+                InboundAction::Forward(Arc::new(data.to_vec()))
             }
         }
     }
@@ -394,12 +417,11 @@ impl SessionLogic {
 
             match congestion_packet.write_to_bytes() {
                 Ok(bytes) => {
-                    // Publish to the room's NATS subject. The sender's
-                    // subscription filter (`room.{room}.*`) will pick this up.
-                    // We use `room.{room}.congestion.{sender_sid}` as the
-                    // subject, which matches the wildcard `room.{room}.*`
-                    // that all sessions subscribe to.
-                    let subject = format!("room.{}.congestion", self.room.replace(' ', "_"),);
+                    // Publish to the sender's NATS subject so only the
+                    // targeted sender receives the CONGESTION signal.
+                    // The sender's subscription filter (`room.{room}.*`)
+                    // matches `room.{room}.{sender_sid}`.
+                    let subject = format!("room.{}.{}", self.room.replace(' ', "_"), sender_sid);
                     let nc = self.nats_client.clone();
                     let bytes = bytes::Bytes::from(bytes);
                     tokio::spawn(async move {

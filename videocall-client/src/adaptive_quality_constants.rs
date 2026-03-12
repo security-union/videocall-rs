@@ -301,6 +301,12 @@ pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
 /// Maximum number of reconnection attempts before giving up.
 pub const RECONNECT_MAX_ATTEMPTS: u32 = 10;
 
+/// Stop reconnection if this many consecutive attempts yield zero successful
+/// connections (no server responds at all). This catches auth failures and
+/// server rejections early, avoiding futile retries that waste resources and
+/// may trigger server-side rate limiting.
+pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 3;
+
 /// RTT degradation multiplier to trigger connection re-election.
 /// If current RTT > election_rtt * this multiplier, re-elect.
 pub const REELECTION_RTT_MULTIPLIER: f64 = 2.0;

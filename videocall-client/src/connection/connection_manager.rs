@@ -19,8 +19,9 @@
 use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::adaptive_quality_constants::{
-    RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_ATTEMPTS,
-    RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
+    RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
+    RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES,
+    REELECTION_RTT_MULTIPLIER,
 };
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
@@ -29,7 +30,7 @@ use log::{debug, error, info, warn};
 use protobuf::Message;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -130,6 +131,11 @@ pub struct ConnectionManager {
     // --- Reconnection state ---
     reconnection_phase: Rc<RefCell<ReconnectionPhase>>,
 
+    /// Weak self-reference set by `ConnectionController` after construction.
+    /// Used by the reconnection loop to call `reset_and_start_election` on the
+    /// real manager instance instead of creating a throwaway one.
+    manager_ref: Weak<RefCell<ConnectionManager>>,
+
     // --- Re-election state (RTT quality monitoring) ---
     /// The average RTT of the elected connection at the time of election.
     baseline_rtt: Option<f64>,
@@ -169,6 +175,7 @@ impl ConnectionManager {
             own_session_id: Rc::new(RefCell::new(None)),
             pending_session_ids: Rc::new(RefCell::new(HashMap::new())),
             reconnection_phase: Rc::new(RefCell::new(ReconnectionPhase::Idle)),
+            manager_ref: Weak::new(),
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
@@ -178,6 +185,57 @@ impl ConnectionManager {
         manager.start_election()?;
 
         Ok(manager)
+    }
+
+    /// Store a weak self-reference so that reconnection callbacks can access
+    /// the real manager instance. Called by `ConnectionController` after construction.
+    pub fn set_manager_ref(&mut self, weak: Weak<RefCell<ConnectionManager>>) {
+        self.manager_ref = weak;
+    }
+
+    /// Reset all connection state and start a fresh election on the same manager
+    /// instance. This preserves the shared `Rc` state (callbacks, session info,
+    /// `active_connection_id`, etc.) so that inbound packet handlers, heartbeats,
+    /// and the `ConnectionController` timers keep working correctly.
+    ///
+    /// Called by the reconnection loop instead of creating a throwaway
+    /// `ConnectionManager`.
+    pub fn reset_and_start_election(&mut self) -> Result<()> {
+        info!("Resetting connections and starting fresh election for reconnection");
+
+        // Drop all existing connections (stops heartbeats, closes transports).
+        self.connections.clear();
+
+        // Clear RTT measurements so the new election starts clean.
+        self.rtt_measurements.clear();
+
+        // Drain any stale RTT responses from the previous connections.
+        if let Ok(mut responses) = self.rtt_responses.try_borrow_mut() {
+            responses.clear();
+        }
+
+        // Clear pending session IDs from previous connections.
+        if let Ok(mut pending) = self.pending_session_ids.try_borrow_mut() {
+            pending.clear();
+        }
+
+        // Reset active connection — the election will set a new one.
+        *self.active_connection_id.borrow_mut() = None;
+
+        // Reset re-election monitoring state.
+        self.baseline_rtt = None;
+        self.degradation_counter = 0;
+        self.reelection_in_progress = false;
+
+        // Cancel any lingering timers from the previous election.
+        if let ElectionState::Testing { probe_timer, .. } = &mut self.election_state {
+            if let Some(timer) = probe_timer.take() {
+                timer.cancel();
+            }
+        }
+
+        // Start fresh election — creates new connections and begins RTT probing.
+        self.start_election()
     }
 
     /// Start the election process by creating all connections upfront
@@ -389,8 +447,9 @@ impl ConnectionManager {
     ///
     /// When the active connection is lost, this triggers the automatic reconnection
     /// state machine instead of simply emitting a `Failed` state. The reconnection
-    /// logic runs asynchronously with exponential backoff, re-creating connections
-    /// and re-running server election on each attempt.
+    /// logic runs asynchronously with exponential backoff, calling
+    /// `reset_and_start_election` on the **same** manager instance so that
+    /// packet pipelines, callbacks, and session state remain intact.
     fn create_connection_lost_callback(
         &self,
         connection_id: String,
@@ -399,11 +458,8 @@ impl ConnectionManager {
         let on_state_changed = self.options.on_state_changed.clone();
         let active_connection_id = self.active_connection_id.clone();
         let reconnection_phase = self.reconnection_phase.clone();
-
-        // Capture everything needed to rebuild connections during reconnection.
-        let options = self.options.clone();
-        let aes = self.aes.clone();
-        let own_session_id = self.own_session_id.clone();
+        let manager_ref = self.manager_ref.clone();
+        let election_period_ms = self.options.election_period_ms;
 
         Callback::from(move |error| {
             warn!("Connection {connection_id} lost: {error:?}");
@@ -451,9 +507,7 @@ impl ConnectionManager {
             let active_connection_id_clone = active_connection_id.clone();
             let on_state_changed_clone = on_state_changed.clone();
             let server_url_clone = server_url.clone();
-            let options_clone = options.clone();
-            let aes_clone = aes.clone();
-            let own_session_id_clone = own_session_id.clone();
+            let manager_ref_clone = manager_ref.clone();
 
             wasm_bindgen_futures::spawn_local(async move {
                 ConnectionManager::run_reconnection_loop(
@@ -461,9 +515,8 @@ impl ConnectionManager {
                     active_connection_id_clone,
                     on_state_changed_clone,
                     server_url_clone,
-                    options_clone,
-                    aes_clone,
-                    own_session_id_clone,
+                    manager_ref_clone,
+                    election_period_ms,
                 )
                 .await;
             });
@@ -697,20 +750,26 @@ impl ConnectionManager {
 
     /// Asynchronous reconnection loop with exponential backoff.
     ///
-    /// This is a standalone async function launched via `spawn_local` so it does not
-    /// require `&mut self`. It communicates with the rest of the system through shared
-    /// `Rc<RefCell<…>>` state and callbacks.
+    /// Uses a `Weak` reference to the real `ConnectionManager` (held by the
+    /// `ConnectionController`) so that `reset_and_start_election` operates on
+    /// the same instance. This ensures the new connections' inbound-media
+    /// callbacks, heartbeat timers, and RTT probes all reference the same
+    /// shared state used by the `ConnectionController` timers and the
+    /// `VideoCallClient`'s packet pipeline.
     async fn run_reconnection_loop(
         reconnection_phase: Rc<RefCell<ReconnectionPhase>>,
         active_connection_id: Rc<RefCell<Option<String>>>,
         on_state_changed: Callback<ConnectionState>,
         last_server_url: String,
-        options: ConnectionManagerOptions,
-        aes: Rc<Aes128State>,
-        own_session_id: Rc<RefCell<Option<u64>>>,
+        manager_ref: Weak<RefCell<ConnectionManager>>,
+        election_period_ms: u64,
     ) {
         let mut attempt: u32 = 0;
         let mut delay_ms: u64 = RECONNECT_INITIAL_DELAY_MS;
+        // Track consecutive attempts where zero servers respond. If this counter
+        // reaches RECONNECT_CONSECUTIVE_ZERO_LIMIT we treat it as a likely
+        // auth/server rejection and stop reconnecting immediately.
+        let mut consecutive_zero_connections: u32 = 0;
 
         loop {
             attempt += 1;
@@ -744,44 +803,85 @@ impl ConnectionManager {
                 return;
             }
 
-            // Try to create a fresh ConnectionManager and run election.
-            match ConnectionManager::new(options.clone(), aes.clone()) {
-                Ok(mut fresh_manager) => {
-                    // Restore preserved session state.
-                    if let Some(sid) = *own_session_id.borrow() {
-                        fresh_manager.set_own_session_id(sid);
-                    }
+            // Upgrade the weak reference to access the real manager.
+            let manager_rc = match manager_ref.upgrade() {
+                Some(rc) => rc,
+                None => {
+                    warn!("ConnectionManager was dropped during reconnection — aborting");
+                    *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
+                    on_state_changed.emit(ConnectionState::Failed {
+                        error: "Connection manager destroyed during reconnection".to_string(),
+                        last_known_server: Some(last_server_url),
+                    });
+                    return;
+                }
+            };
 
-                    // Give the fresh manager its election period to complete.
-                    let election_ms = options.election_period_ms;
-                    gloo_timers::future::sleep(std::time::Duration::from_millis(election_ms + 500))
-                        .await;
-
-                    // Drive election completion manually.
-                    fresh_manager.process_queued_rtt_responses();
-                    fresh_manager.check_and_complete_election();
-
-                    if fresh_manager.is_connected() {
-                        info!("Reconnection successful on attempt {attempt}");
-
-                        // Copy the elected connection id into the shared state.
-                        if let Some(new_id) = fresh_manager.active_connection_id.borrow().clone() {
-                            *active_connection_id.borrow_mut() = Some(new_id);
+            // Reset connections and start a fresh election on the SAME manager.
+            // The borrow is scoped so it is released before the async sleep below.
+            {
+                match manager_rc.try_borrow_mut() {
+                    Ok(mut mgr) => {
+                        if let Err(e) = mgr.reset_and_start_election() {
+                            warn!(
+                                "Reconnection attempt {attempt} failed to reset connections: {e}"
+                            );
+                            // Fall through to backoff and retry.
                         }
-
-                        *reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
-
-                        // Emit Connected state so the UI updates.
-                        let state = fresh_manager.get_connection_state();
-                        on_state_changed.emit(state);
-                        return;
                     }
+                    Err(_) => {
+                        warn!("Reconnection attempt {attempt}: could not borrow manager (busy)");
+                    }
+                }
+            }
 
-                    warn!("Reconnection attempt {attempt} failed — election did not succeed");
+            // Give the election period time to complete. The ConnectionController's
+            // existing 200ms RTT probe timer and 100ms election-check timer will
+            // drive the election automatically on the same manager instance.
+            gloo_timers::future::sleep(std::time::Duration::from_millis(election_period_ms + 500))
+                .await;
+
+            // Check the result. Again scope the borrow tightly.
+            let connected = {
+                match manager_rc.try_borrow() {
+                    Ok(mgr) => mgr.is_connected(),
+                    Err(_) => false,
                 }
-                Err(e) => {
-                    warn!("Reconnection attempt {attempt} failed to create manager: {e}");
+            };
+
+            if connected {
+                info!("Reconnection successful on attempt {attempt}");
+                *reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
+
+                // Emit the current Connected state so the UI updates.
+                if let Ok(mgr) = manager_rc.try_borrow() {
+                    on_state_changed.emit(mgr.get_connection_state());
                 }
+                return;
+            }
+
+            warn!("Reconnection attempt {attempt} failed — election did not succeed");
+
+            // Track consecutive total failures (no server responded at all).
+            // This pattern indicates auth rejection or server-side blocking
+            // rather than a transient network issue.
+            consecutive_zero_connections += 1;
+            if consecutive_zero_connections >= RECONNECT_CONSECUTIVE_ZERO_LIMIT {
+                error!(
+                    "Reconnection aborted: {} consecutive attempts with zero successful connections \
+                     — likely auth failure or server rejection",
+                    consecutive_zero_connections
+                );
+
+                *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
+                on_state_changed.emit(ConnectionState::Failed {
+                    error: format!(
+                        "Server rejected connection ({} consecutive failures — possible auth/session error)",
+                        consecutive_zero_connections
+                    ),
+                    last_known_server: Some(last_server_url),
+                });
+                return;
             }
 
             // Exponential backoff for next attempt.

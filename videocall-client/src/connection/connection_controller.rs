@@ -27,13 +27,8 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 #[derive(Debug)]
 pub struct ConnectionController {
-    inner: Rc<RefCell<ConnectionControllerInner>>,
+    manager: Rc<RefCell<ConnectionManager>>,
     _timers: Vec<Interval>, // Keep timers alive
-}
-
-#[derive(Debug)]
-struct ConnectionControllerInner {
-    connection_manager: ConnectionManager,
 }
 
 impl ConnectionController {
@@ -41,46 +36,52 @@ impl ConnectionController {
     pub fn new(options: ConnectionManagerOptions, aes: Rc<Aes128State>) -> Result<Self> {
         info!("Creating ConnectionController with timer management");
 
-        let connection_manager = ConnectionManager::new(options.clone(), aes.clone())?;
+        let manager = Rc::new(RefCell::new(ConnectionManager::new(
+            options.clone(),
+            aes.clone(),
+        )?));
 
-        let inner = Rc::new(RefCell::new(ConnectionControllerInner {
-            connection_manager,
-        }));
+        // Provide the manager with a weak self-reference so its reconnection
+        // callbacks can call `reset_and_start_election` on the real instance
+        // instead of creating a throwaway manager.
+        manager
+            .borrow_mut()
+            .set_manager_ref(Rc::downgrade(&manager));
 
-        let timers = Self::start_timers(Rc::downgrade(&inner));
+        let timers = Self::start_timers(Rc::downgrade(&manager));
 
         info!("ConnectionController created with all timers started");
         Ok(Self {
-            inner,
+            manager,
             _timers: timers,
         })
     }
 
     /// Start all necessary timers for connection management
-    fn start_timers(inner_weak: Weak<RefCell<ConnectionControllerInner>>) -> Vec<Interval> {
+    fn start_timers(mgr_weak: Weak<RefCell<ConnectionManager>>) -> Vec<Interval> {
         let mut timers = Vec::new();
 
         // 1Hz diagnostics reporting timer + RTT degradation monitoring
-        let inner_ref = inner_weak.clone();
+        let mgr_ref = mgr_weak.clone();
         timers.push(Interval::new(1000, move || {
-            if let Some(inner) = inner_ref.upgrade() {
-                if let Ok(mut inner) = inner.try_borrow_mut() {
+            if let Some(mgr) = mgr_ref.upgrade() {
+                if let Ok(mut mgr) = mgr.try_borrow_mut() {
                     // Always drive diagnostics once per second
-                    inner.connection_manager.trigger_diagnostics_report();
+                    mgr.trigger_diagnostics_report();
 
                     // After election, probe RTT at 1 Hz and check for degradation
                     if matches!(
-                        inner.connection_manager.get_connection_state(),
+                        mgr.get_connection_state(),
                         ConnectionState::Connected { .. }
                     ) {
-                        if let Err(e) = inner.connection_manager.send_rtt_probes() {
+                        if let Err(e) = mgr.send_rtt_probes() {
                             debug!("Failed to send 1Hz RTT probe post-election: {e}");
                         }
 
                         // Check whether the active connection's RTT has degraded
                         // enough to warrant a quality re-election.
-                        if inner.connection_manager.check_rtt_degradation() {
-                            if let Err(e) = inner.connection_manager.start_reelection() {
+                        if mgr.check_rtt_degradation() {
+                            if let Err(e) = mgr.start_reelection() {
                                 log::error!("Failed to start re-election: {e}");
                             }
                         }
@@ -90,15 +91,12 @@ impl ConnectionController {
         }));
 
         // RTT probing timer (200ms intervals) - only during election (Testing)
-        let inner_ref = inner_weak.clone();
+        let mgr_ref = mgr_weak.clone();
         timers.push(Interval::new(200, move || {
-            if let Some(inner) = inner_ref.upgrade() {
-                if let Ok(mut inner) = inner.try_borrow_mut() {
-                    if matches!(
-                        inner.connection_manager.get_connection_state(),
-                        ConnectionState::Testing { .. }
-                    ) {
-                        if let Err(e) = inner.connection_manager.send_rtt_probes() {
+            if let Some(mgr) = mgr_ref.upgrade() {
+                if let Ok(mut mgr) = mgr.try_borrow_mut() {
+                    if matches!(mgr.get_connection_state(), ConnectionState::Testing { .. }) {
+                        if let Err(e) = mgr.send_rtt_probes() {
                             debug!("Failed to send RTT probes during election: {e}");
                         }
                     }
@@ -107,11 +105,11 @@ impl ConnectionController {
         }));
 
         // Election completion checking timer (100ms intervals)
-        let inner_ref = inner_weak.clone();
+        let mgr_ref = mgr_weak.clone();
         timers.push(Interval::new(100, move || {
-            if let Some(inner) = inner_ref.upgrade() {
-                if let Ok(mut inner) = inner.try_borrow_mut() {
-                    inner.connection_manager.check_and_complete_election();
+            if let Some(mgr) = mgr_ref.upgrade() {
+                if let Ok(mut mgr) = mgr.try_borrow_mut() {
+                    mgr.check_and_complete_election();
                 }
             }
         }));
@@ -124,11 +122,11 @@ impl ConnectionController {
 
     /// Send packet through active connection via reliable stream.
     pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
-        let inner = self
-            .inner
+        let mgr = self
+            .manager
             .try_borrow()
-            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
-        inner.connection_manager.send_packet(packet)
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.send_packet(packet)
     }
 
     /// Send packet through active connection via datagram (unreliable, low-latency).
@@ -137,61 +135,61 @@ impl ConnectionController {
     /// more than guaranteed delivery. Falls back to reliable stream for
     /// WebSocket connections or oversized packets.
     pub fn send_packet_datagram(&self, packet: PacketWrapper) -> Result<()> {
-        let inner = self
-            .inner
+        let mgr = self
+            .manager
             .try_borrow()
-            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
-        inner.connection_manager.send_packet_datagram(packet)
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.send_packet_datagram(packet)
     }
 
     /// Set video enabled on active connection
     pub fn set_video_enabled(&self, enabled: bool) -> Result<()> {
-        let inner = self
-            .inner
+        let mgr = self
+            .manager
             .try_borrow()
-            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
-        inner.connection_manager.set_video_enabled(enabled)
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.set_video_enabled(enabled)
     }
 
     /// Set audio enabled on active connection
     pub fn set_audio_enabled(&self, enabled: bool) -> Result<()> {
-        let inner = self
-            .inner
+        let mgr = self
+            .manager
             .try_borrow()
-            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
-        inner.connection_manager.set_audio_enabled(enabled)
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.set_audio_enabled(enabled)
     }
 
     /// Set screen enabled on active connection
     pub fn set_screen_enabled(&self, enabled: bool) -> Result<()> {
-        let inner = self
-            .inner
+        let mgr = self
+            .manager
             .try_borrow()
-            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
-        inner.connection_manager.set_screen_enabled(enabled)
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.set_screen_enabled(enabled)
     }
 
     /// Set speaking state on active connection
     pub fn set_speaking(&self, speaking: bool) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            inner.connection_manager.set_speaking(speaking);
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.set_speaking(speaking);
         }
     }
 
     /// Set own session_id for filtering self-packets
     pub fn set_own_session_id(&self, session_id: u64) -> Result<()> {
-        let inner = self
-            .inner
+        let mgr = self
+            .manager
             .try_borrow()
-            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
-        inner.connection_manager.set_own_session_id(session_id);
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.set_own_session_id(session_id);
         Ok(())
     }
 
     /// Check if manager has an active connection
     pub fn is_connected(&self) -> bool {
-        if let Ok(inner) = self.inner.try_borrow() {
-            inner.connection_manager.is_connected()
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.is_connected()
         } else {
             false
         }
@@ -199,20 +197,20 @@ impl ConnectionController {
 
     /// Disconnect from the current connection and clean up resources
     pub fn disconnect(&self) -> anyhow::Result<()> {
-        let mut inner = self
-            .inner
+        let mut mgr = self
+            .manager
             .try_borrow_mut()
-            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
-        inner.connection_manager.disconnect()
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.disconnect()
     }
 
     /// Get current connection state for UI
     pub fn get_connection_state(&self) -> ConnectionState {
-        if let Ok(inner) = self.inner.try_borrow() {
-            inner.connection_manager.get_connection_state()
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.get_connection_state()
         } else {
             ConnectionState::Failed {
-                error: "Failed to borrow ConnectionController inner".to_string(),
+                error: "Failed to borrow ConnectionManager".to_string(),
                 last_known_server: None,
             }
         }
@@ -222,8 +220,8 @@ impl ConnectionController {
     pub fn get_rtt_measurements_clone(
         &self,
     ) -> std::collections::HashMap<String, super::connection_manager::ServerRttMeasurement> {
-        if let Ok(inner) = self.inner.try_borrow() {
-            inner.connection_manager.get_rtt_measurements().clone()
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.get_rtt_measurements().clone()
         } else {
             std::collections::HashMap::new()
         }

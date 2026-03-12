@@ -26,7 +26,8 @@ use log::error;
 use log::info;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -51,9 +52,7 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
-use crate::adaptive_quality_constants::{
-    BITRATE_CHANGE_THRESHOLD, SCREEN_KEYFRAME_INTERVAL_FRAMES, SCREEN_QUALITY_TIERS,
-};
+use crate::adaptive_quality_constants::{BITRATE_CHANGE_THRESHOLD, SCREEN_QUALITY_TIERS};
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
 
@@ -96,6 +95,9 @@ pub struct ScreenEncoder {
     tier_max_height: Rc<AtomicU32>,
     /// Tier-controlled keyframe interval (frames).
     tier_keyframe_interval: Rc<AtomicU32>,
+    /// When set to `true`, the next encoded frame will be forced as a keyframe.
+    /// Used by the PLI (Picture Loss Indication) mechanism.
+    force_keyframe: Arc<AtomicBool>,
 }
 
 impl ScreenEncoder {
@@ -124,9 +126,8 @@ impl ScreenEncoder {
             screen_stream: Rc::new(RefCell::new(None)),
             tier_max_width: Rc::new(AtomicU32::new(default_tier.max_width)),
             tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
-            tier_keyframe_interval: Rc::new(AtomicU32::new(
-                default_tier.keyframe_interval_frames,
-            )),
+            tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
+            force_keyframe: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -172,8 +173,7 @@ impl ScreenEncoder {
                     let tier = encoder_control.current_video_tier();
                     tier_max_width.store(tier.max_width, Ordering::Relaxed);
                     tier_max_height.store(tier.max_height, Ordering::Relaxed);
-                    tier_keyframe_interval
-                        .store(tier.keyframe_interval_frames, Ordering::Relaxed);
+                    tier_keyframe_interval.store(tier.keyframe_interval_frames, Ordering::Relaxed);
                     log::info!(
                         "ScreenEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
                         tier.label,
@@ -190,6 +190,28 @@ impl ScreenEncoder {
     /// Gets the current encoder output frame rate
     pub fn get_current_fps(&self) -> u32 {
         self.current_fps.load(Ordering::Relaxed)
+    }
+
+    /// Returns a shared reference to the force-keyframe flag.
+    ///
+    /// The `VideoCallClient` stores this and sets it to `true` when a
+    /// `KEYFRAME_REQUEST` packet arrives from a remote peer.
+    pub fn force_keyframe_flag(&self) -> Arc<AtomicBool> {
+        self.force_keyframe.clone()
+    }
+
+    /// Request the encoder to produce a keyframe on the next frame.
+    pub fn request_keyframe(&self) {
+        self.force_keyframe.store(true, Ordering::Release);
+        log::info!("ScreenEncoder: keyframe requested (PLI)");
+    }
+
+    /// Replace the internal force-keyframe flag with an externally-owned one.
+    ///
+    /// Call this after construction to share the flag with `VideoCallClient`,
+    /// which sets it when a remote peer sends a KEYFRAME_REQUEST.
+    pub fn set_force_keyframe_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.force_keyframe = flag;
     }
 
     /// Allows setting a callback to receive encoder settings updates
@@ -262,6 +284,7 @@ impl ScreenEncoder {
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
+        let force_keyframe = self.force_keyframe.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -606,11 +629,18 @@ impl ScreenEncoder {
                         }
 
                         let opts = VideoEncoderEncodeOptions::new();
+                        // Check if a keyframe was requested via PLI.
+                        let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
                         // Use tier-controlled keyframe interval.
-                        opts.set_key_frame(
-                            local_keyframe_interval > 0
-                                && screen_frame_counter % local_keyframe_interval == 0,
-                        );
+                        let is_periodic_keyframe = local_keyframe_interval > 0
+                            && screen_frame_counter.is_multiple_of(local_keyframe_interval);
+                        opts.set_key_frame(is_periodic_keyframe || pli_requested);
+                        if pli_requested {
+                            log::info!(
+                                "ScreenEncoder: forcing keyframe at frame {} (PLI)",
+                                screen_frame_counter
+                            );
+                        }
 
                         if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
                             error!("Error encoding screen frame: {e:?}");

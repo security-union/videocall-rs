@@ -24,8 +24,10 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -53,9 +55,7 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
-use crate::adaptive_quality_constants::{
-    BITRATE_CHANGE_THRESHOLD, CAMERA_KEYFRAME_INTERVAL_FRAMES, VIDEO_QUALITY_TIERS,
-};
+use crate::adaptive_quality_constants::{BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS};
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
 
@@ -86,6 +86,11 @@ pub struct CameraEncoder {
     tier_max_height: Rc<AtomicU32>,
     /// Tier-controlled keyframe interval (frames).
     tier_keyframe_interval: Rc<AtomicU32>,
+    /// When set to `true`, the next encoded frame will be forced as a keyframe.
+    /// Used by the PLI (Picture Loss Indication) mechanism: when a remote peer
+    /// detects missing frames and sends a KEYFRAME_REQUEST, the VideoCallClient
+    /// sets this flag so the encoder produces an immediate keyframe.
+    force_keyframe: Arc<AtomicBool>,
 }
 
 impl CameraEncoder {
@@ -119,9 +124,8 @@ impl CameraEncoder {
             on_error: Some(on_error),
             tier_max_width: Rc::new(AtomicU32::new(default_tier.max_width)),
             tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
-            tier_keyframe_interval: Rc::new(AtomicU32::new(
-                default_tier.keyframe_interval_frames,
-            )),
+            tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
+            force_keyframe: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -166,8 +170,7 @@ impl CameraEncoder {
                     let tier = encoder_control.current_video_tier();
                     tier_max_width.store(tier.max_width, Ordering::Relaxed);
                     tier_max_height.store(tier.max_height, Ordering::Relaxed);
-                    tier_keyframe_interval
-                        .store(tier.keyframe_interval_frames, Ordering::Relaxed);
+                    tier_keyframe_interval.store(tier.keyframe_interval_frames, Ordering::Relaxed);
                     log::info!(
                         "CameraEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
                         tier.label,
@@ -184,6 +187,29 @@ impl CameraEncoder {
     /// Gets the current encoder output frame rate
     pub fn get_current_fps(&self) -> u32 {
         self.current_fps.load(Ordering::Relaxed)
+    }
+
+    /// Returns a shared reference to the force-keyframe flag.
+    ///
+    /// The `VideoCallClient` stores this and sets it to `true` when a
+    /// `KEYFRAME_REQUEST` packet arrives from a remote peer. The encoding
+    /// loop checks this flag on every frame and forces a keyframe when set.
+    pub fn force_keyframe_flag(&self) -> Arc<AtomicBool> {
+        self.force_keyframe.clone()
+    }
+
+    /// Request the encoder to produce a keyframe on the next frame.
+    pub fn request_keyframe(&self) {
+        self.force_keyframe.store(true, Ordering::Release);
+        log::info!("CameraEncoder: keyframe requested (PLI)");
+    }
+
+    /// Replace the internal force-keyframe flag with an externally-owned one.
+    ///
+    /// Call this after construction to share the flag with `VideoCallClient`,
+    /// which sets it when a remote peer sends a KEYFRAME_REQUEST.
+    pub fn set_force_keyframe_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.force_keyframe = flag;
     }
 
     // The next three methods delegate to self.state
@@ -234,6 +260,7 @@ impl CameraEncoder {
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
+        let force_keyframe = self.force_keyframe.clone();
         let video_output_handler = {
             let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
             let mut sequence_number = 0;
@@ -619,12 +646,21 @@ impl CameraEncoder {
                         }
 
                         let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
+                        // Check if a keyframe was requested via PLI (Picture Loss Indication).
+                        // The flag is cleared after producing the keyframe.
+                        let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
                         // Use tier-controlled keyframe interval instead of the
                         // static constant, allowing adaptive quality to adjust it.
-                        video_encoder_encode_options.set_key_frame(
-                            local_keyframe_interval > 0
-                                && video_frame_counter % local_keyframe_interval == 0,
-                        );
+                        let is_periodic_keyframe = local_keyframe_interval > 0
+                            && video_frame_counter.is_multiple_of(local_keyframe_interval);
+                        video_encoder_encode_options
+                            .set_key_frame(is_periodic_keyframe || pli_requested);
+                        if pli_requested {
+                            log::info!(
+                                "CameraEncoder: forcing keyframe at frame {} (PLI)",
+                                video_frame_counter
+                            );
+                        }
                         if let Err(e) = video_encoder
                             .encode_with_options(&video_frame, &video_encoder_encode_options)
                         {

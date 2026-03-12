@@ -199,20 +199,14 @@ impl AdaptiveQualityManager {
     ///
     /// Audio only degrades when video is already at the lowest tier.
     /// Audio recovers first (before video steps up).
-    fn update_audio_tier(
-        &mut self,
-        fps_ratio: f64,
-        now_ms: f64,
-        can_transition: bool,
-    ) -> bool {
+    fn update_audio_tier(&mut self, fps_ratio: f64, now_ms: f64, can_transition: bool) -> bool {
         let max_video_index = self.video_tiers.len().saturating_sub(1);
         let max_audio_index = AUDIO_QUALITY_TIERS.len().saturating_sub(1);
         let video_at_lowest = self.video_tier_index >= max_video_index;
 
         // --- Audio step DOWN ---
         // Only degrade audio when video is already at the lowest tier.
-        let should_degrade_audio =
-            video_at_lowest && fps_ratio < AUDIO_TIER_DEGRADE_FPS_RATIO;
+        let should_degrade_audio = video_at_lowest && fps_ratio < AUDIO_TIER_DEGRADE_FPS_RATIO;
 
         if should_degrade_audio && self.audio_tier_index < max_audio_index {
             let degrade_start = *self.audio_degrade_start_ms.get_or_insert(now_ms);
@@ -447,7 +441,10 @@ mod tests {
         // Conditions improve before reaction time
         let changed = mgr.update(28.0, 30.0, 1500.0, 1500.0, base + 1000.0);
         assert!(!changed);
-        assert!(mgr.degrade_start_ms.is_none(), "Timer should reset on good conditions");
+        assert!(
+            mgr.degrade_start_ms.is_none(),
+            "Timer should reset on good conditions"
+        );
     }
 
     #[wasm_bindgen_test]

@@ -19,6 +19,9 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
+use crate::adaptive_quality_constants::{
+    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
+};
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
@@ -101,6 +104,18 @@ pub struct Peer {
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
+    /// Last seen video sequence number for gap detection.
+    last_video_seq: Option<u64>,
+    /// Last seen screen sequence number for gap detection.
+    last_screen_seq: Option<u64>,
+    /// Timestamp (ms) when a video gap was first detected. `None` if no gap.
+    video_gap_detected_at_ms: Option<u64>,
+    /// Timestamp (ms) when a screen gap was first detected. `None` if no gap.
+    screen_gap_detected_at_ms: Option<u64>,
+    /// Last time a video keyframe request was sent (ms). Used for rate-limiting.
+    last_video_keyframe_request_ms: u64,
+    /// Last time a screen keyframe request was sent (ms). Used for rate-limiting.
+    last_screen_keyframe_request_ms: u64,
 }
 
 use std::fmt::Debug;
@@ -151,6 +166,12 @@ impl Peer {
             context_initialized: false,
             vad_threshold,
             has_received_heartbeat: false,
+            last_video_seq: None,
+            last_screen_seq: None,
+            video_gap_detected_at_ms: None,
+            screen_gap_detected_at_ms: None,
+            last_video_keyframe_request_ms: 0,
+            last_screen_keyframe_request_ms: 0,
         })
     }
 
@@ -249,10 +270,16 @@ impl Peer {
         let _ = global_sender().try_broadcast(evt);
     }
 
+    /// Decode a packet and return `(media_type, decode_status, keyframe_request)`.
+    ///
+    /// The third element is `Some(media_type)` when a sequence gap has been
+    /// detected and enough time has elapsed to warrant sending a
+    /// KEYFRAME_REQUEST to this peer. The caller is responsible for
+    /// actually sending the request packet.
     fn decode(
         &mut self,
         packet: &Arc<PacketWrapper>,
-    ) -> Result<(MediaType, DecodeStatus), PeerDecodeError> {
+    ) -> Result<(MediaType, DecodeStatus, Option<MediaType>), PeerDecodeError> {
         if packet
             .packet_type
             .enum_value()
@@ -278,6 +305,9 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
+                // Track sequence numbers for gap detection (PLI).
+                let kf_request = self.track_sequence(media_type, &packet);
+
                 if !self.video_enabled {
                     if !self.has_received_heartbeat {
                         // No heartbeat yet — infer video_enabled from the actual frame.
@@ -285,7 +315,7 @@ impl Peer {
                         self.broadcast_peer_status();
                     } else {
                         // Peer has video off per heartbeat; drop straggler frame.
-                        return Ok((media_type, DecodeStatus::SKIPPED));
+                        return Ok((media_type, DecodeStatus::SKIPPED, None));
                     }
                 }
                 let video_status = self
@@ -298,6 +328,7 @@ impl Peer {
                         rendered: video_status._rendered,
                         first_frame: video_status.first_frame,
                     },
+                    kf_request,
                 ))
             }
             MediaType::AUDIO => {
@@ -309,7 +340,7 @@ impl Peer {
                         self.broadcast_peer_status();
                     } else {
                         // Peer is muted per heartbeat; drop straggler audio to avoid audible glitch.
-                        return Ok((media_type, DecodeStatus::SKIPPED));
+                        return Ok((media_type, DecodeStatus::SKIPPED, None));
                     }
                 }
                 Ok((
@@ -317,9 +348,13 @@ impl Peer {
                     self.audio
                         .decode(&packet)
                         .map_err(|_| PeerDecodeError::AudioDecodeError)?,
+                    None,
                 ))
             }
             MediaType::SCREEN => {
+                // Track sequence numbers for gap detection (PLI).
+                let kf_request = self.track_sequence(media_type, &packet);
+
                 if !self.screen_enabled {
                     if !self.has_received_heartbeat {
                         // No heartbeat yet — infer screen_enabled from the actual frame.
@@ -327,7 +362,7 @@ impl Peer {
                         self.broadcast_peer_status();
                     } else {
                         // Peer has screen off per heartbeat; drop straggler frame.
-                        return Ok((media_type, DecodeStatus::SKIPPED));
+                        return Ok((media_type, DecodeStatus::SKIPPED, None));
                     }
                 }
                 let screen_status = self
@@ -340,6 +375,7 @@ impl Peer {
                         rendered: screen_status._rendered,
                         first_frame: screen_status.first_frame,
                     },
+                    kf_request,
                 ))
             }
             MediaType::HEARTBEAT => {
@@ -391,7 +427,7 @@ impl Peer {
 
                     self.broadcast_peer_status();
                 }
-                Ok((media_type, DecodeStatus::SKIPPED))
+                Ok((media_type, DecodeStatus::SKIPPED, None))
             }
             MediaType::RTT => {
                 // RTT packets are handled by ConnectionManager, not by peer decoders
@@ -399,7 +435,15 @@ impl Peer {
                     "Received RTT packet for peer {} - ignoring in peer decoder",
                     self.session_id
                 );
-                Ok((media_type, DecodeStatus::SKIPPED))
+                Ok((media_type, DecodeStatus::SKIPPED, None))
+            }
+            MediaType::KEYFRAME_REQUEST => {
+                // Keyframe requests are handled by encoders, not by peer decoders.
+                debug!(
+                    "Received KEYFRAME_REQUEST for peer {} - ignoring in peer decoder",
+                    self.session_id
+                );
+                Ok((media_type, DecodeStatus::SKIPPED, None))
             }
             MediaType::MEDIA_TYPE_UNKNOWN => {
                 log::error!(
@@ -409,6 +453,79 @@ impl Peer {
                 Err(PeerDecodeError::UnknownMediaType)
             }
         }
+    }
+
+    /// Track the sequence number of an incoming video/screen packet and detect
+    /// gaps. Returns `Some(media_type)` if a KEYFRAME_REQUEST should be sent
+    /// for this peer, or `None` if no request is needed.
+    ///
+    /// Gap detection logic:
+    /// 1. When a gap is detected (seq > last_seq + 1), record the time.
+    /// 2. After `KEYFRAME_REQUEST_TIMEOUT_MS` with the gap still present,
+    ///    return the media type to request a keyframe for.
+    /// 3. Rate-limit to one request per `KEYFRAME_REQUEST_MIN_INTERVAL_MS`.
+    /// 4. When a keyframe arrives (frame_type == "key"), clear the gap state.
+    fn track_sequence(&mut self, media_type: MediaType, packet: &MediaPacket) -> Option<MediaType> {
+        let (seq, frame_type_str) = if let Some(vm) = packet.video_metadata.as_ref() {
+            (vm.sequence, packet.frame_type.as_str())
+        } else {
+            return None;
+        };
+
+        let (last_seq, gap_at, last_req) = match media_type {
+            MediaType::VIDEO => (
+                &mut self.last_video_seq,
+                &mut self.video_gap_detected_at_ms,
+                &mut self.last_video_keyframe_request_ms,
+            ),
+            MediaType::SCREEN => (
+                &mut self.last_screen_seq,
+                &mut self.screen_gap_detected_at_ms,
+                &mut self.last_screen_keyframe_request_ms,
+            ),
+            _ => return None,
+        };
+
+        let now = now_ms();
+
+        // If this is a keyframe, clear the gap state -- we recovered.
+        if frame_type_str == "key" {
+            *gap_at = None;
+        }
+
+        if let Some(prev) = *last_seq {
+            if seq > prev + 1 {
+                // Gap detected. Record the time of first detection.
+                if gap_at.is_none() {
+                    *gap_at = Some(now);
+                    debug!(
+                        "Sequence gap detected for peer {} {:?}: expected {}, got {}",
+                        self.session_id,
+                        media_type,
+                        prev + 1,
+                        seq
+                    );
+                }
+            }
+        }
+
+        // Update the last seen sequence number.
+        *last_seq = Some(seq);
+
+        // Check if enough time has passed since gap detection to send a request.
+        if let Some(gap_time) = *gap_at {
+            let elapsed_since_gap = now.saturating_sub(gap_time);
+            let elapsed_since_last_req = now.saturating_sub(*last_req);
+
+            if elapsed_since_gap >= KEYFRAME_REQUEST_TIMEOUT_MS
+                && elapsed_since_last_req >= KEYFRAME_REQUEST_MIN_INTERVAL_MS
+            {
+                *last_req = now;
+                return Some(media_type);
+            }
+        }
+
+        None
     }
 
     fn on_heartbeat(&mut self) {
@@ -445,6 +562,11 @@ pub struct PeerDecodeManager {
     diagnostics: Option<Rc<DiagnosticManager>>,
     pub on_peer_removed: Callback<String>,
     vad_threshold: Option<f32>,
+    /// Callback for sending packets back through the connection (used for
+    /// KEYFRAME_REQUEST). Set by `VideoCallClient` after construction.
+    send_packet: Option<Callback<PacketWrapper>>,
+    /// The local user_id, needed to construct outgoing KEYFRAME_REQUEST packets.
+    local_user_id: String,
 }
 
 impl Default for PeerDecodeManager {
@@ -464,6 +586,8 @@ impl PeerDecodeManager {
             diagnostics: None,
             on_peer_removed: Callback::noop(),
             vad_threshold: None,
+            send_packet: None,
+            local_user_id: String::new(),
         }
     }
 
@@ -477,7 +601,16 @@ impl PeerDecodeManager {
             diagnostics: Some(diagnostics),
             on_peer_removed: Callback::noop(),
             vad_threshold: None,
+            send_packet: None,
+            local_user_id: String::new(),
         }
+    }
+
+    /// Set the callback used to send packets back through the connection.
+    /// This is required for the PLI (keyframe request) mechanism.
+    pub fn set_send_packet_callback(&mut self, callback: Callback<PacketWrapper>, user_id: String) {
+        self.send_packet = Some(callback);
+        self.local_user_id = user_id;
     }
 
     pub fn set_vad_threshold(&mut self, threshold: Option<f32>) {
@@ -540,11 +673,11 @@ impl PeerDecodeManager {
                 peer.context_initialized = true;
             }
             match peer.decode(&packet) {
-                Ok((MediaType::HEARTBEAT, _)) => {
+                Ok((MediaType::HEARTBEAT, _, _)) => {
                     peer.on_heartbeat();
                     Ok(())
                 }
-                Ok((media_type, decode_status)) => {
+                Ok((media_type, decode_status, keyframe_request)) => {
                     if let Some(diagnostics) = &self.diagnostics {
                         diagnostics.track_frame(
                             &peer.sid_str,
@@ -558,6 +691,15 @@ impl PeerDecodeManager {
                         self.on_first_frame.emit((sid_str, media_type));
                     }
 
+                    // If gap detection triggered a keyframe request, clone
+                    // the peer's user_id before releasing the mutable borrow.
+                    let kf_info = keyframe_request.map(|mt| (peer.user_id.clone(), mt));
+
+                    // Now we can immutably borrow self for sending.
+                    if let Some((peer_uid, requested_media_type)) = kf_info {
+                        self.send_keyframe_request(&peer_uid, requested_media_type);
+                    }
+
                     Ok(())
                 }
                 Err(e) => peer.reset().map_err(|_| e),
@@ -565,6 +707,45 @@ impl PeerDecodeManager {
         } else {
             Err(PeerDecodeError::NoSuchPeer(peer_session_id))
         }
+    }
+
+    /// Send a KEYFRAME_REQUEST packet to a specific peer.
+    ///
+    /// The packet is a `MediaPacket` with `media_type = KEYFRAME_REQUEST`
+    /// and `user_id` set to the target peer. The `data` field encodes
+    /// which stream (VIDEO or SCREEN) needs the keyframe.
+    fn send_keyframe_request(&self, peer_user_id: &str, requested_media_type: MediaType) {
+        let Some(send_packet) = &self.send_packet else {
+            debug!("Cannot send KEYFRAME_REQUEST: no send_packet callback");
+            return;
+        };
+
+        let media_type_byte = match requested_media_type {
+            MediaType::VIDEO => b"VIDEO".to_vec(),
+            MediaType::SCREEN => b"SCREEN".to_vec(),
+            _ => return,
+        };
+
+        let media_packet = MediaPacket {
+            media_type: MediaType::KEYFRAME_REQUEST.into(),
+            user_id: peer_user_id.as_bytes().to_vec(),
+            data: media_type_byte,
+            ..Default::default()
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: self.local_user_id.as_bytes().to_vec(),
+            data: media_packet.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        log::info!(
+            "Sending KEYFRAME_REQUEST to {} for {:?}",
+            peer_user_id,
+            requested_media_type
+        );
+        send_packet.emit(wrapper);
     }
 
     fn add_peer(

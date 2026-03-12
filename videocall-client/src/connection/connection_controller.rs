@@ -60,7 +60,7 @@ impl ConnectionController {
     fn start_timers(inner_weak: Weak<RefCell<ConnectionControllerInner>>) -> Vec<Interval> {
         let mut timers = Vec::new();
 
-        // 1Hz diagnostics reporting timer
+        // 1Hz diagnostics reporting timer + RTT degradation monitoring
         let inner_ref = inner_weak.clone();
         timers.push(Interval::new(1000, move || {
             if let Some(inner) = inner_ref.upgrade() {
@@ -68,13 +68,21 @@ impl ConnectionController {
                     // Always drive diagnostics once per second
                     inner.connection_manager.trigger_diagnostics_report();
 
-                    // After election, probe RTT at 1 Hz
+                    // After election, probe RTT at 1 Hz and check for degradation
                     if matches!(
                         inner.connection_manager.get_connection_state(),
                         ConnectionState::Connected { .. }
                     ) {
                         if let Err(e) = inner.connection_manager.send_rtt_probes() {
                             debug!("Failed to send 1Hz RTT probe post-election: {e}");
+                        }
+
+                        // Check whether the active connection's RTT has degraded
+                        // enough to warrant a quality re-election.
+                        if inner.connection_manager.check_rtt_degradation() {
+                            if let Err(e) = inner.connection_manager.start_reelection() {
+                                log::error!("Failed to start re-election: {e}");
+                            }
                         }
                     }
                 }

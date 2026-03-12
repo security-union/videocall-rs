@@ -16,10 +16,10 @@
  * conditions.
  */
 
-use crate::adaptive_quality_constants::AUDIO_QUALITY_TIERS;
+use crate::adaptive_quality_constants::{AUDIO_QUALITY_TIERS, VAD_POLL_INTERVAL_MS};
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
-    VAD_POLL_INTERVAL_MS, VAD_SMOOTHING_TIME_CONSTANT,
+    VAD_SMOOTHING_TIME_CONSTANT,
 };
 use crate::audio_worklet_codec::EncoderInitOptions;
 use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};

@@ -18,6 +18,10 @@
 
 use super::connection::Connection;
 use super::webmedia::ConnectOptions;
+use crate::adaptive_quality_constants::{
+    RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_ATTEMPTS,
+    RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
+};
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
@@ -96,6 +100,17 @@ pub struct ConnectionManagerOptions {
     pub election_period_ms: u64,
 }
 
+/// Tracks the state of automatic reconnection after connection loss.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReconnectionPhase {
+    /// No reconnection in progress; the connection is healthy or has not been established.
+    Idle,
+    /// Actively attempting to reconnect after a connection loss.
+    Reconnecting { attempt: u32, next_delay_ms: u64 },
+    /// All reconnection attempts exhausted; the connection is permanently failed.
+    Failed,
+}
+
 #[derive(Debug)]
 pub struct ConnectionManager {
     connections: HashMap<String, Connection>,
@@ -111,6 +126,17 @@ pub struct ConnectionManager {
     own_session_id: Rc<RefCell<Option<u64>>>,
     /// Per-connection session_ids received via SESSION_ASSIGNED before election completes.
     pending_session_ids: Rc<RefCell<HashMap<String, u64>>>,
+
+    // --- Reconnection state ---
+    reconnection_phase: Rc<RefCell<ReconnectionPhase>>,
+
+    // --- Re-election state (RTT quality monitoring) ---
+    /// The average RTT of the elected connection at the time of election.
+    baseline_rtt: Option<f64>,
+    /// Number of consecutive 1-Hz RTT samples that exceeded the degradation threshold.
+    degradation_counter: u32,
+    /// Whether a re-election is currently in progress (prevents overlapping re-elections).
+    reelection_in_progress: bool,
 }
 
 impl ConnectionManager {
@@ -142,6 +168,10 @@ impl ConnectionManager {
             aes,
             own_session_id: Rc::new(RefCell::new(None)),
             pending_session_ids: Rc::new(RefCell::new(HashMap::new())),
+            reconnection_phase: Rc::new(RefCell::new(ReconnectionPhase::Idle)),
+            baseline_rtt: None,
+            degradation_counter: 0,
+            reelection_in_progress: false,
         };
 
         // Immediately start creating connections and testing
@@ -355,7 +385,12 @@ impl ConnectionManager {
         })
     }
 
-    /// Create callback for connection lost
+    /// Create callback for connection lost.
+    ///
+    /// When the active connection is lost, this triggers the automatic reconnection
+    /// state machine instead of simply emitting a `Failed` state. The reconnection
+    /// logic runs asynchronously with exponential backoff, re-creating connections
+    /// and re-running server election on each attempt.
     fn create_connection_lost_callback(
         &self,
         connection_id: String,
@@ -363,32 +398,75 @@ impl ConnectionManager {
     ) -> Callback<JsValue> {
         let on_state_changed = self.options.on_state_changed.clone();
         let active_connection_id = self.active_connection_id.clone();
+        let reconnection_phase = self.reconnection_phase.clone();
 
-        // We need a way to update the manager's internal state, but we can't move `self` into the callback
-        // The 1Hz timer in ConnectionController will handle updating internal state
-        // This callback focuses on immediate UI notification
+        // Capture everything needed to rebuild connections during reconnection.
+        let options = self.options.clone();
+        let aes = self.aes.clone();
+        let own_session_id = self.own_session_id.clone();
 
         Callback::from(move |error| {
             warn!("Connection {connection_id} lost: {error:?}");
 
-            // If this was the active connection, report failure to trigger UI reconnection
-            if Some(connection_id.as_str()) == active_connection_id.borrow().as_deref() {
-                // Clear the active connection ID so is_connected() returns false
-                *active_connection_id.borrow_mut() = None;
-
-                let failure_state = ConnectionState::Failed {
-                    error: format!("Active connection {connection_id} lost"),
-                    last_known_server: Some(server_url.clone()),
-                };
-
-                info!("Active connection lost, clearing internal state and emitting Failed state to trigger UI reconnection");
-                on_state_changed.emit(failure_state);
-            } else {
+            // Only react if this was the active connection.
+            if Some(connection_id.as_str()) != active_connection_id.borrow().as_deref() {
                 info!(
                     "Non-active connection lost: {connection_id}, current active: {:?}",
                     active_connection_id.borrow()
                 );
+                return;
             }
+
+            // Clear the active connection so is_connected() returns false immediately.
+            *active_connection_id.borrow_mut() = None;
+
+            // If a reconnection is already in progress, do not start another one.
+            {
+                let phase = reconnection_phase.borrow();
+                if matches!(*phase, ReconnectionPhase::Reconnecting { .. }) {
+                    info!("Reconnection already in progress, ignoring duplicate connection-lost event");
+                    return;
+                }
+            }
+
+            // Transition to Reconnecting and notify the UI.
+            *reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+                attempt: 0,
+                next_delay_ms: RECONNECT_INITIAL_DELAY_MS,
+            };
+
+            on_state_changed.emit(ConnectionState::Reconnecting {
+                server_url: server_url.clone(),
+                attempt: 1,
+                max_attempts: RECONNECT_MAX_ATTEMPTS,
+            });
+
+            info!(
+                "Active connection lost, starting automatic reconnection (max {} attempts)",
+                RECONNECT_MAX_ATTEMPTS
+            );
+
+            // Launch the async reconnection loop.
+            let reconnection_phase_clone = reconnection_phase.clone();
+            let active_connection_id_clone = active_connection_id.clone();
+            let on_state_changed_clone = on_state_changed.clone();
+            let server_url_clone = server_url.clone();
+            let options_clone = options.clone();
+            let aes_clone = aes.clone();
+            let own_session_id_clone = own_session_id.clone();
+
+            wasm_bindgen_futures::spawn_local(async move {
+                ConnectionManager::run_reconnection_loop(
+                    reconnection_phase_clone,
+                    active_connection_id_clone,
+                    on_state_changed_clone,
+                    server_url_clone,
+                    options_clone,
+                    aes_clone,
+                    own_session_id_clone,
+                )
+                .await;
+            });
         })
     }
 
@@ -526,6 +604,15 @@ impl ConnectionManager {
                     info!("Started heartbeat on elected connection {}", connection_id);
                 }
 
+                // Store baseline RTT for re-election quality monitoring.
+                self.baseline_rtt = measurement.average_rtt;
+                self.degradation_counter = 0;
+                self.reelection_in_progress = false;
+
+                if let Some(rtt) = self.baseline_rtt {
+                    info!("Baseline RTT for re-election monitoring: {rtt:.1}ms");
+                }
+
                 // Close unused connections
                 self.close_unused_connections();
 
@@ -602,6 +689,230 @@ impl ConnectionManager {
             self.connections.remove(&connection_id);
             info!("Closed unused connection: {connection_id}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Automatic Reconnection
+    // -----------------------------------------------------------------------
+
+    /// Asynchronous reconnection loop with exponential backoff.
+    ///
+    /// This is a standalone async function launched via `spawn_local` so it does not
+    /// require `&mut self`. It communicates with the rest of the system through shared
+    /// `Rc<RefCell<…>>` state and callbacks.
+    async fn run_reconnection_loop(
+        reconnection_phase: Rc<RefCell<ReconnectionPhase>>,
+        active_connection_id: Rc<RefCell<Option<String>>>,
+        on_state_changed: Callback<ConnectionState>,
+        last_server_url: String,
+        options: ConnectionManagerOptions,
+        aes: Rc<Aes128State>,
+        own_session_id: Rc<RefCell<Option<u64>>>,
+    ) {
+        let mut attempt: u32 = 0;
+        let mut delay_ms: u64 = RECONNECT_INITIAL_DELAY_MS;
+
+        loop {
+            attempt += 1;
+            if attempt > RECONNECT_MAX_ATTEMPTS {
+                break;
+            }
+
+            info!(
+                "Reconnection attempt {}/{} — waiting {}ms",
+                attempt, RECONNECT_MAX_ATTEMPTS, delay_ms
+            );
+
+            // Update phase and emit state so the UI can show progress.
+            *reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+                attempt,
+                next_delay_ms: delay_ms,
+            };
+            on_state_changed.emit(ConnectionState::Reconnecting {
+                server_url: last_server_url.clone(),
+                attempt,
+                max_attempts: RECONNECT_MAX_ATTEMPTS,
+            });
+
+            // Wait with exponential backoff.
+            gloo_timers::future::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+            // Check if something else already reconnected us (e.g. re-election).
+            if active_connection_id.borrow().is_some() {
+                info!("Connection restored externally during reconnection wait — aborting loop");
+                *reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
+                return;
+            }
+
+            // Try to create a fresh ConnectionManager and run election.
+            match ConnectionManager::new(options.clone(), aes.clone()) {
+                Ok(mut fresh_manager) => {
+                    // Restore preserved session state.
+                    if let Some(sid) = *own_session_id.borrow() {
+                        fresh_manager.set_own_session_id(sid);
+                    }
+
+                    // Give the fresh manager its election period to complete.
+                    let election_ms = options.election_period_ms;
+                    gloo_timers::future::sleep(std::time::Duration::from_millis(election_ms + 500))
+                        .await;
+
+                    // Drive election completion manually.
+                    fresh_manager.process_queued_rtt_responses();
+                    fresh_manager.check_and_complete_election();
+
+                    if fresh_manager.is_connected() {
+                        info!("Reconnection successful on attempt {attempt}");
+
+                        // Copy the elected connection id into the shared state.
+                        if let Some(new_id) = fresh_manager.active_connection_id.borrow().clone() {
+                            *active_connection_id.borrow_mut() = Some(new_id);
+                        }
+
+                        *reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
+
+                        // Emit Connected state so the UI updates.
+                        let state = fresh_manager.get_connection_state();
+                        on_state_changed.emit(state);
+                        return;
+                    }
+
+                    warn!("Reconnection attempt {attempt} failed — election did not succeed");
+                }
+                Err(e) => {
+                    warn!("Reconnection attempt {attempt} failed to create manager: {e}");
+                }
+            }
+
+            // Exponential backoff for next attempt.
+            delay_ms = ((delay_ms as f64 * RECONNECT_BACKOFF_MULTIPLIER) as u64)
+                .min(RECONNECT_MAX_DELAY_MS);
+        }
+
+        // All attempts exhausted.
+        error!(
+            "Reconnection failed after {} attempts — giving up",
+            RECONNECT_MAX_ATTEMPTS
+        );
+
+        *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
+        on_state_changed.emit(ConnectionState::Failed {
+            error: format!(
+                "Reconnection failed after {} attempts",
+                RECONNECT_MAX_ATTEMPTS
+            ),
+            last_known_server: Some(last_server_url),
+        });
+    }
+
+    /// Returns the current reconnection phase.
+    /// Used by ConnectionController and UI consumers to display reconnection status.
+    #[allow(dead_code)]
+    pub fn reconnection_phase(&self) -> ReconnectionPhase {
+        self.reconnection_phase.borrow().clone()
+    }
+
+    // -----------------------------------------------------------------------
+    // Connection Quality Re-election
+    // -----------------------------------------------------------------------
+
+    /// Called at 1 Hz (from ConnectionController) after election, to check whether
+    /// the active connection's RTT has degraded enough to warrant a new election.
+    ///
+    /// Returns `true` if a re-election should be triggered.
+    pub fn check_rtt_degradation(&mut self) -> bool {
+        // Only check when we have a baseline and are in Elected state.
+        let baseline = match self.baseline_rtt {
+            Some(b) if b > 0.0 => b,
+            _ => return false,
+        };
+
+        if self.reelection_in_progress {
+            return false;
+        }
+
+        let active_id = match self.active_connection_id.borrow().clone() {
+            Some(id) => id,
+            None => return false,
+        };
+
+        let current_rtt = self
+            .rtt_measurements
+            .get(&active_id)
+            .and_then(|m| m.average_rtt);
+
+        let current_rtt = match current_rtt {
+            Some(rtt) => rtt,
+            None => return false,
+        };
+
+        let threshold = baseline * REELECTION_RTT_MULTIPLIER;
+
+        if current_rtt > threshold {
+            self.degradation_counter += 1;
+            info!(
+                "RTT degradation: current={:.1}ms baseline={:.1}ms threshold={:.1}ms (count={}/{})",
+                current_rtt,
+                baseline,
+                threshold,
+                self.degradation_counter,
+                REELECTION_CONSECUTIVE_SAMPLES,
+            );
+
+            if self.degradation_counter >= REELECTION_CONSECUTIVE_SAMPLES {
+                info!(
+                    "RTT degradation threshold reached ({} consecutive samples) — triggering re-election",
+                    REELECTION_CONSECUTIVE_SAMPLES
+                );
+                return true;
+            }
+        } else {
+            // RTT is acceptable — reset counter.
+            if self.degradation_counter > 0 {
+                debug!(
+                    "RTT recovered: current={:.1}ms baseline={:.1}ms — resetting degradation counter",
+                    current_rtt, baseline
+                );
+                self.degradation_counter = 0;
+            }
+        }
+
+        false
+    }
+
+    /// Begin a re-election: create new connections to all servers while keeping the
+    /// current active connection alive. Once election completes, switch to the new
+    /// best server seamlessly.
+    pub fn start_reelection(&mut self) -> Result<()> {
+        if self.reelection_in_progress {
+            info!("Re-election already in progress, skipping");
+            return Ok(());
+        }
+
+        info!("Starting connection quality re-election");
+        self.reelection_in_progress = true;
+        self.degradation_counter = 0;
+
+        // Preserve the current active connection — do NOT close it yet.
+        // Create fresh connections to all servers for testing.
+        self.create_all_connections()?;
+
+        // Reset election state to Testing so the normal election flow runs.
+        let start_time = js_sys::Date::now();
+        self.election_state = ElectionState::Testing {
+            start_time,
+            duration_ms: self.options.election_period_ms,
+            probe_timer: None,
+        };
+
+        Ok(())
+    }
+
+    /// Returns whether a re-election is currently in progress.
+    /// Used by ConnectionController and UI consumers to check re-election status.
+    #[allow(dead_code)]
+    pub fn is_reelection_in_progress(&self) -> bool {
+        self.reelection_in_progress
     }
 
     /// Start 1Hz diagnostics reporting

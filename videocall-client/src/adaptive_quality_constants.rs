@@ -312,20 +312,20 @@ pub const REELECTION_CONSECUTIVE_SAMPLES: u32 = 5;
 // Heartbeat & Polling
 // ---------------------------------------------------------------------------
 
-/// Heartbeat interval (milliseconds).
+/// Heartbeat keepalive interval (milliseconds).
 ///
-/// Currently used as a fixed 1-second heartbeat. A future phase will switch
-/// to event-driven heartbeats with this value serving as a keepalive-only
-/// interval at 5000ms. For now, this constant preserves the existing 1000ms
-/// behavior.
-pub const HEARTBEAT_INTERVAL_MS: u32 = 1000;
-
-/// Heartbeat interval when using event-driven mode (keepalive only).
-/// State changes trigger immediate heartbeats outside this interval.
-pub const HEARTBEAT_KEEPALIVE_INTERVAL_MS: u64 = 5000;
+/// In event-driven mode, state changes (mute/unmute, camera on/off, speaking
+/// transitions) trigger an immediate heartbeat. This keepalive interval is
+/// only for liveness detection -- ensuring the server knows the client is
+/// still connected even when nothing changes. The server's CLIENT_TIMEOUT
+/// is 10 seconds, so 5-second keepalives provide at least 2 heartbeats per
+/// timeout window.
+pub const HEARTBEAT_KEEPALIVE_INTERVAL_MS: u32 = 5000;
 
 /// VAD polling interval (milliseconds). Only active when mic is unmuted.
-pub const VAD_POLL_INTERVAL_MS: u64 = 50;
+/// The VAD callback checks the muted/enabled flag and returns early if the
+/// microphone is disabled, avoiding unnecessary audio analysis work.
+pub const VAD_POLL_INTERVAL_MS: u32 = 50;
 
 /// Diagnostics reporting interval (milliseconds).
 pub const DIAGNOSTICS_REPORT_INTERVAL_MS: u64 = 1000;

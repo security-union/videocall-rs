@@ -26,5 +26,7 @@ mod websocket;
 mod webtransport;
 
 pub use connection_controller::ConnectionController;
+#[allow(unused_imports)]
+pub use connection_manager::ReconnectionPhase;
 pub use connection_manager::{ConnectionManagerOptions, ConnectionState};
 pub use webmedia::ConnectOptions;

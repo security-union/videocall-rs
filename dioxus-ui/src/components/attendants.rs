@@ -734,10 +734,8 @@ pub fn AttendantsComponent(
         }) as Box<dyn FnMut()>);
 
         if let Some(win) = web_sys::window() {
-            let _ = win.add_event_listener_with_callback(
-                "resize",
-                closure.as_ref().unchecked_ref(),
-            );
+            let _ =
+                win.add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref());
         }
         closure.forget();
     });

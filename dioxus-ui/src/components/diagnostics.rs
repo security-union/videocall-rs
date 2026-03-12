@@ -712,9 +712,6 @@ pub fn Diagnostics(
     let screen_str = if share_screen { "Enabled" } else { "Disabled" };
     let media_status =
         format!("Video: {video_str}\nAudio: {audio_str}\nScreen Share: {screen_str}");
-    let version = env!("CARGO_PKG_VERSION");
-    let git_sha = env!("GIT_SHA");
-    let git_branch = env!("GIT_BRANCH");
     let current_peer_display = if current_peer == "All Peers" {
         "All Peers".to_string()
     } else {
@@ -738,11 +735,6 @@ pub fn Diagnostics(
                             span { class: "build-info-cell", "Component" }
                             span { class: "build-info-cell", "Commit" }
                             span { class: "build-info-cell", "Branch" }
-                        }
-                        div { class: "build-info-row",
-                            span { class: "build-info-cell build-info-service", "UI ({version})" }
-                            span { class: "build-info-cell monospace", "{git_sha}" }
-                            span { class: "build-info-cell", "{git_branch}" }
                         }
                         for comp in backend_versions() {
                             {

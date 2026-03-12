@@ -180,6 +180,7 @@
 //!
 //! ```
 
+pub mod adaptive_quality_constants;
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;

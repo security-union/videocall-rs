@@ -22,6 +22,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use js_sys::Date;
 
+use crate::adaptive_quality_constants::{
+    PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
+    PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN,
+};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -234,12 +238,12 @@ impl EncoderBitrateController {
         // Configure PID: setpoint = target FPS, process_value = received FPS.
         // The controller computes error = setpoint − process_value internally.
         let controller_config = pidgeon::ControllerConfig::builder()
-            .with_kp(0.2)
-            .with_ki(0.05)
-            .with_kd(0.02)
+            .with_kp(PID_KP)
+            .with_ki(PID_KI)
+            .with_kd(PID_KD)
             .with_setpoint(initial_target)
-            .with_deadband(0.5)
-            .with_output_limits(0.0, 50.0)
+            .with_deadband(PID_DEADBAND_FPS)
+            .with_output_limits(PID_OUTPUT_MIN, PID_OUTPUT_MAX)
             .with_anti_windup(true)
             .build()
             .expect("PID controller config is valid");
@@ -252,12 +256,12 @@ impl EncoderBitrateController {
             last_update: Date::now(),
             ideal_bitrate_kbps,
             target_fps,
-            fps_history: std::collections::VecDeque::with_capacity(10),
-            max_history_size: 10,
+            fps_history: std::collections::VecDeque::with_capacity(PID_FPS_HISTORY_SIZE),
+            max_history_size: PID_FPS_HISTORY_SIZE,
             initialization_complete: false,
             diagnostic_packets,
             last_correction_time: 0.0,
-            correction_throttle_ms: 1000.0,
+            correction_throttle_ms: PID_CORRECTION_THROTTLE_MS,
         }
     }
 
@@ -350,7 +354,7 @@ impl EncoderBitrateController {
         // The PID integral never decays on its own when error is within deadband.
         // Reset the controller when conditions are good so bitrate can recover.
         let current_error = target_fps - fps_received;
-        if current_error.abs() <= 0.5 && pid_output > 0.0 {
+        if current_error.abs() <= PID_DEADBAND_FPS && pid_output > 0.0 {
             self.pid.reset();
         }
 
@@ -358,14 +362,14 @@ impl EncoderBitrateController {
         let min_bitrate = base_bitrate * 0.1;
         let max_bitrate = base_bitrate * 1.5;
 
-        // Map PID output [0, 50] → bitrate reduction [0%, 90%].
-        let reduction_pct = pid_output / 50.0 * 0.9;
+        // Map PID output [0, PID_OUTPUT_MAX] -> bitrate reduction [0%, 90%].
+        let reduction_pct = pid_output / PID_OUTPUT_MAX * 0.9;
         let after_pid = base_bitrate * (1.0 - reduction_pct);
 
-        // Additional jitter penalty: up to 30% reduction at maximum jitter.
+        // Additional jitter penalty: up to PID_MAX_JITTER_PENALTY reduction at maximum jitter.
         let normalized_jitter = jitter / target_fps;
         let jitter_factor = (normalized_jitter * 5.0).min(1.0);
-        let jitter_reduction = after_pid * (jitter_factor * 0.3);
+        let jitter_reduction = after_pid * (jitter_factor * PID_MAX_JITTER_PENALTY);
         let corrected_bitrate = after_pid - jitter_reduction;
 
         let current_error = target_fps - fps_received;

@@ -51,11 +51,11 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
+use crate::adaptive_quality_constants::{
+    BITRATE_CHANGE_THRESHOLD, SCREEN_KEYFRAME_INTERVAL_FRAMES,
+};
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
-
-// Threshold for bitrate changes, represents 20% (0.2)
-const BITRATE_CHANGE_THRESHOLD: f64 = 0.2;
 
 /// Events emitted by [ScreenEncoder] to notify about screen share state changes.
 ///
@@ -518,13 +518,15 @@ impl ScreenEncoder {
                         }
 
                         let opts = VideoEncoderEncodeOptions::new();
-                        screen_frame_counter = (screen_frame_counter + 1) % 50;
-                        opts.set_key_frame(screen_frame_counter == 0);
+                        opts.set_key_frame(
+                            screen_frame_counter % SCREEN_KEYFRAME_INTERVAL_FRAMES == 0,
+                        );
 
                         if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
                             error!("Error encoding screen frame: {e:?}");
                         }
                         video_frame.close();
+                        screen_frame_counter += 1;
                     }
                     Err(e) => {
                         error!("Error reading screen frame: {e:?}");

@@ -53,14 +53,14 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
+use crate::adaptive_quality_constants::{
+    BITRATE_CHANGE_THRESHOLD, CAMERA_KEYFRAME_INTERVAL_FRAMES,
+};
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
-
-// Threshold for bitrate changes, represents 20% (0.2)
-const BITRATE_CHANGE_THRESHOLD: f64 = 0.20;
 
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
@@ -515,7 +515,9 @@ impl CameraEncoder {
                         }
 
                         let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
-                        video_encoder_encode_options.set_key_frame(video_frame_counter % 150 == 0);
+                        video_encoder_encode_options.set_key_frame(
+                            video_frame_counter % CAMERA_KEYFRAME_INTERVAL_FRAMES == 0,
+                        );
                         if let Err(e) = video_encoder
                             .encode_with_options(&video_frame, &video_encoder_encode_options)
                         {

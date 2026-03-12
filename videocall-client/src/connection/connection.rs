@@ -22,6 +22,7 @@
 ///
 use super::task::Task;
 use super::ConnectOptions;
+use crate::adaptive_quality_constants::HEARTBEAT_INTERVAL_MS;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
 use protobuf::Message;
@@ -124,7 +125,7 @@ impl Connection {
         let is_speaking = Rc::clone(&self.is_speaking);
         let session_id = Rc::clone(&self.session_id);
 
-        self.heartbeat = Some(Interval::new(1000, move || {
+        self.heartbeat = Some(Interval::new(HEARTBEAT_INTERVAL_MS, move || {
             if let Some(packet_wrapper) = build_heartbeat_packet(
                 &userid,
                 &video_enabled,

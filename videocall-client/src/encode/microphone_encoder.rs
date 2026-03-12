@@ -17,7 +17,7 @@
  */
 
 use crate::audio_constants::{
-    AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, RMS_LOUD_SPEECH_CEILING, VAD_FFT_SIZE,
+    rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
     VAD_POLL_INTERVAL_MS, VAD_SMOOTHING_TIME_CONSTANT,
 };
 use crate::audio_worklet_codec::EncoderInitOptions;
@@ -287,7 +287,7 @@ impl MicrophoneEncoder {
                 media_info.set_device_id(&exact.into());
                 constraints.set_audio(&media_info.into());
             }
-            
+
             constraints.set_video(&Boolean::from(false));
             let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
                 Ok(p) => p,
@@ -490,16 +490,9 @@ impl MicrophoneEncoder {
 
                 let speaking = rms > vad_threshold;
 
-                // Compute normalized intensity (same formula as decoder-side
-                // in neteq_audio_decoder.rs) so the host tile can show a
-                // smooth, intensity-driven glow instead of binary on/off.
-                let range = (RMS_LOUD_SPEECH_CEILING - vad_threshold).max(f32::EPSILON);
-                let intensity = if rms < vad_threshold {
-                    0.0_f32
-                } else {
-                    let linear = ((rms - vad_threshold) / range).clamp(0.0, 1.0);
-                    linear.sqrt() // perceptual curve: balanced dynamic range
-                };
+                // Compute normalized intensity using the shared perceptual
+                // curve so the host tile shows a smooth, intensity-driven glow.
+                let intensity = rms_to_intensity(rms, vad_threshold);
 
                 // Emit audio level when it changes meaningfully.
                 let prev_lvl = prev_level_clone.get();

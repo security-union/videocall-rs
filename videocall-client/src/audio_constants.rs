@@ -34,6 +34,11 @@ pub const RMS_LOUD_SPEECH_CEILING: f32 = 0.10;
 /// Prevents excessive event emissions while maintaining smooth visual updates.
 pub const AUDIO_LEVEL_DELTA_THRESHOLD: f32 = 0.02;
 
+/// Minimum change in audio level before triggering a UI re-render.
+/// Tighter than `AUDIO_LEVEL_DELTA_THRESHOLD` (used codec-side) to ensure
+/// smooth visual transitions while still suppressing no-op updates.
+pub const UI_AUDIO_LEVEL_DELTA: f32 = 0.01;
+
 /// How often (in ms) the local microphone VAD analysis runs.
 pub const VAD_POLL_INTERVAL_MS: u32 = 100;
 
@@ -42,3 +47,15 @@ pub const VAD_FFT_SIZE: u32 = 2048;
 
 /// Smoothing time constant for the Web Audio AnalyserNode (0.0–1.0).
 pub const VAD_SMOOTHING_TIME_CONSTANT: f64 = 0.8;
+
+/// Convert raw RMS energy to a perceptual intensity value (0.0–1.0).
+/// Uses sqrt curve for perceptual loudness mapping.
+pub fn rms_to_intensity(rms: f32, vad_threshold: f32) -> f32 {
+    let range = (RMS_LOUD_SPEECH_CEILING - vad_threshold).max(f32::EPSILON);
+    let linear = if rms < vad_threshold {
+        0.0_f32
+    } else {
+        ((rms - vad_threshold) / range).clamp(0.0, 1.0)
+    };
+    linear.sqrt()
+}

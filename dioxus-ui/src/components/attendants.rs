@@ -44,11 +44,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
-use wasm_bindgen::{closure::Closure, JsCast};
 use videocall_client::{
     MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
     PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
+use wasm_bindgen::{closure::Closure, JsCast};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
@@ -748,7 +748,6 @@ pub fn AttendantsComponent(
     {
         let mda = mda.clone();
         use_effect(move || {
-
             let value = mda.clone();
             let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
                 let mic_denied = matches!(
@@ -767,10 +766,8 @@ pub fn AttendantsComponent(
             }) as Box<dyn FnMut(_)>);
 
             if let Some(win) = web_sys::window() {
-                let _ = win.add_event_listener_with_callback(
-                    "focus",
-                    closure.as_ref().unchecked_ref(),
-                );
+                let _ =
+                    win.add_event_listener_with_callback("focus", closure.as_ref().unchecked_ref());
             }
             closure.forget();
         });

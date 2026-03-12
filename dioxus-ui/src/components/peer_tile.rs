@@ -24,6 +24,7 @@ use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
+use videocall_client::audio_constants::UI_AUDIO_LEVEL_DELTA;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 
 #[component]
@@ -139,7 +140,7 @@ fn handle_diagnostics_event(
             // Prefer the float audio_level metric; fall back to boolean is_speaking
             if let Some(lvl) = audio_lvl {
                 let prev = *audio_level.peek();
-                if lvl == 0.0 || (lvl - prev).abs() > 0.01 {
+                if (lvl == 0.0 && prev != 0.0) || (lvl - prev).abs() > UI_AUDIO_LEVEL_DELTA {
                     audio_level.set(lvl);
                 }
             } else if let Some(s) = speaking {
@@ -164,7 +165,7 @@ fn handle_diagnostics_event(
             }
             if let Some(lvl) = audio_lvl {
                 let prev = *audio_level.peek();
-                if lvl == 0.0 || (lvl - prev).abs() > 0.01 {
+                if (lvl == 0.0 && prev != 0.0) || (lvl - prev).abs() > UI_AUDIO_LEVEL_DELTA {
                     audio_level.set(lvl);
                 }
             } else if let Some(s) = speaking {

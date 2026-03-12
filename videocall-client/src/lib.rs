@@ -202,6 +202,8 @@ pub use encode::{
     create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
     ScreenShareEvent,
 };
-pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices, MediaAccessKind, MediaPermission, PermissionState,
-                        MediaPermissionsErrorState};
+pub use media_devices::{
+    MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,
+    MediaPermissionsErrorState, PermissionState, SelectableDevices,
+};
 pub use videocall_types::Callback;

@@ -183,12 +183,16 @@ impl Component for Host {
             let link = ctx.link().clone();
             move |s: String| link.send_message(Msg::MicrophoneError(s))
         });
-        let mut microphone = create_microphone_encoder(
+        // Microphone encoder is created after camera so it can share the
+        // camera's audio tier atomics (avoiding a duplicate quality manager).
+        let microphone = create_microphone_encoder(
             client.clone(),
             audio_bitrate,
             microphone_callback,
             microphone_error_cb.clone(),
             vad_threshold().ok(),
+            Some(camera.shared_audio_tier_bitrate()),
+            Some(camera.shared_audio_tier_fec()),
         );
 
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
@@ -212,13 +216,12 @@ impl Component for Host {
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
 
+        // Wire up encoder controls. The microphone encoder no longer needs
+        // its own diagnostics channel — it reads audio tier settings from
+        // the camera encoder's shared atomics.
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
         camera.set_encoder_control(rx);
-
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
-        microphone.set_encoder_control(rx);
 
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
@@ -515,30 +518,6 @@ impl Component for Host {
                     .context::<VideoCallClientCtx>(Callback::noop())
                     .expect("VideoCallClient context missing");
 
-                if audio_id_str == "" {
-                    let microphone_callback = VcCallback::from({
-                        let link = ctx.link().clone();
-                        move |s: String| link.send_message(Msg::MicrophoneEncoderSettingsUpdated(s))
-                    });
-                    let microphone_error_cb = VcCallback::from({
-                        let link = ctx.link().clone();
-                        move |s: String| link.send_message(Msg::MicrophoneError(s))
-                    });
-
-                    let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
-                    self.microphone = create_microphone_encoder(
-                        client.clone(),
-                        audio_bitrate,
-                        microphone_callback,
-                        microphone_error_cb.clone(),
-                        vad_threshold().ok(),
-                    );
-
-                    let (tx, rx) = mpsc::unbounded();
-                    client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
-                    self.microphone.set_encoder_control(rx);
-                }
-
                 if video_id_str == "" {
                     let camera_callback = VcCallback::from({
                         let link = ctx.link().clone();
@@ -565,6 +544,30 @@ impl Component for Host {
                     let (tx, rx) = mpsc::unbounded();
                     client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
                     self.camera.set_encoder_control(rx);
+                }
+
+                // Recreate microphone AFTER camera so it can share the
+                // camera's audio tier atomics.
+                if audio_id_str == "" {
+                    let microphone_callback = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::MicrophoneEncoderSettingsUpdated(s))
+                    });
+                    let microphone_error_cb = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::MicrophoneError(s))
+                    });
+
+                    let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
+                    self.microphone = create_microphone_encoder(
+                        client.clone(),
+                        audio_bitrate,
+                        microphone_callback,
+                        microphone_error_cb.clone(),
+                        vad_threshold().ok(),
+                        Some(self.camera.shared_audio_tier_bitrate()),
+                        Some(self.camera.shared_audio_tier_fec()),
+                    );
                 }
 
                 let audio_device_id = self.media_devices.audio_inputs.selected();

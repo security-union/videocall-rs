@@ -118,8 +118,19 @@ impl CongestionTracker {
     /// Returns `Some(sender_session_id)` when the drop threshold has been
     /// exceeded and a CONGESTION notification should be sent. Returns `None`
     /// if the threshold has not been met or the notification is rate-limited.
+    ///
+    /// Also performs opportunistic cleanup of stale entries: any sender whose
+    /// `window_start` is older than `CONGESTION_WINDOW * 10` (10 seconds of
+    /// inactivity) is removed. This prevents unbounded growth when transient
+    /// participants leave.
     pub fn record_drop(&mut self, sender_session_id: u64) -> Option<u64> {
         let now = Instant::now();
+
+        // Opportunistic cleanup of stale sender entries.
+        let stale_threshold = CONGESTION_WINDOW * 10;
+        self.senders
+            .retain(|_, state| now.duration_since(state.window_start) <= stale_threshold);
+
         let state = self
             .senders
             .entry(sender_session_id)
@@ -446,5 +457,66 @@ mod tests {
     fn test_inbound_action_debug() {
         let action = InboundAction::KeepAlive;
         assert_eq!(format!("{action:?}"), "KeepAlive");
+    }
+
+    #[test]
+    fn test_congestion_tracker_cleans_stale_entries() {
+        let mut tracker = CongestionTracker::new();
+
+        // Insert a stale entry by manually inserting with an old window_start.
+        let stale_id = 1000;
+        tracker.senders.insert(
+            stale_id,
+            SenderDropState {
+                drop_count: 0,
+                // 20 seconds ago — well past the 10 * CONGESTION_WINDOW threshold
+                window_start: Instant::now() - (CONGESTION_WINDOW * 20),
+                last_notify: None,
+            },
+        );
+
+        // Insert a fresh entry.
+        let fresh_id = 2000;
+        tracker.senders.insert(
+            fresh_id,
+            SenderDropState {
+                drop_count: 0,
+                window_start: Instant::now(),
+                last_notify: None,
+            },
+        );
+
+        assert_eq!(tracker.senders.len(), 2);
+
+        // Recording a drop for a new sender should trigger cleanup.
+        let trigger_id = 3000;
+        tracker.record_drop(trigger_id);
+
+        // The stale entry should have been removed.
+        assert!(
+            !tracker.senders.contains_key(&stale_id),
+            "stale sender entry should be cleaned up"
+        );
+        // Fresh and trigger entries should remain.
+        assert!(tracker.senders.contains_key(&fresh_id));
+        assert!(tracker.senders.contains_key(&trigger_id));
+    }
+
+    #[test]
+    fn test_congestion_tracker_retains_active_entries() {
+        let mut tracker = CongestionTracker::new();
+
+        // Record drops for two senders.
+        tracker.record_drop(100);
+        tracker.record_drop(200);
+
+        assert_eq!(tracker.senders.len(), 2);
+
+        // Record another drop — both entries are fresh, nothing should be cleaned.
+        tracker.record_drop(100);
+
+        assert_eq!(tracker.senders.len(), 2);
+        assert!(tracker.senders.contains_key(&100));
+        assert!(tracker.senders.contains_key(&200));
     }
 }

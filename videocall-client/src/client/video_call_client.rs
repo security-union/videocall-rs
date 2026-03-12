@@ -675,13 +675,7 @@ impl VideoCallClient {
     /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets
     /// can force the encoder to produce an immediate keyframe.
     pub fn force_camera_keyframe_flag(&self) -> Arc<AtomicBool> {
-        if let Ok(inner) = self.inner.try_borrow() {
-            inner.force_camera_keyframe.clone()
-        } else {
-            // Fallback: return a new flag that will never be set.
-            // This should not happen in practice.
-            Arc::new(AtomicBool::new(false))
-        }
+        self.inner.borrow().force_camera_keyframe.clone()
     }
 
     /// Returns a shared reference to the screen force-keyframe flag.
@@ -689,11 +683,7 @@ impl VideoCallClient {
     /// Pass this to `ScreenEncoder` so that incoming KEYFRAME_REQUEST packets
     /// can force the encoder to produce an immediate keyframe.
     pub fn force_screen_keyframe_flag(&self) -> Arc<AtomicBool> {
-        if let Ok(inner) = self.inner.try_borrow() {
-            inner.force_screen_keyframe.clone()
-        } else {
-            Arc::new(AtomicBool::new(false))
-        }
+        self.inner.borrow().force_screen_keyframe.clone()
     }
 
     /// Returns a shared reference to the congestion step-down flag.
@@ -702,11 +692,7 @@ impl VideoCallClient {
     /// the server trigger an immediate quality tier step-down via the
     /// `EncoderBitrateController`.
     pub fn congestion_step_down_flag(&self) -> Arc<AtomicBool> {
-        if let Ok(inner) = self.inner.try_borrow() {
-            inner.congestion_step_down_requested.clone()
-        } else {
-            Arc::new(AtomicBool::new(false))
-        }
+        self.inner.borrow().congestion_step_down_requested.clone()
     }
 
     pub(crate) fn aes(&self) -> Rc<Aes128State> {

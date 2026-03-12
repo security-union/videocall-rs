@@ -55,7 +55,9 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
-use crate::adaptive_quality_constants::{BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS};
+use crate::adaptive_quality_constants::{
+    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
+};
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
 
@@ -95,6 +97,14 @@ pub struct CameraEncoder {
     /// `force_video_step_down()` on the next iteration. Set by the
     /// `VideoCallClient` when a CONGESTION signal arrives from the server.
     congestion_step_down: Arc<AtomicBool>,
+    /// Shared audio tier bitrate (bps). Written by the camera encoder's
+    /// quality manager when the audio tier changes. The microphone encoder
+    /// reads this to know the current audio bitrate, avoiding a duplicate
+    /// `EncoderBitrateController`.
+    shared_audio_tier_bitrate: Rc<AtomicU32>,
+    /// Shared audio tier FEC flag. Written by the camera encoder's quality
+    /// manager alongside `shared_audio_tier_bitrate`.
+    shared_audio_tier_fec: Rc<AtomicBool>,
 }
 
 impl CameraEncoder {
@@ -118,6 +128,7 @@ impl CameraEncoder {
         on_error: Callback<String>,
     ) -> Self {
         let default_tier = &VIDEO_QUALITY_TIERS[0];
+        let default_audio_tier = &AUDIO_QUALITY_TIERS[0];
         Self {
             client,
             video_elem_id: video_elem_id.to_string(),
@@ -131,6 +142,10 @@ impl CameraEncoder {
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
             congestion_step_down: Arc::new(AtomicBool::new(false)),
+            shared_audio_tier_bitrate: Rc::new(AtomicU32::new(
+                default_audio_tier.bitrate_kbps * 1000,
+            )),
+            shared_audio_tier_fec: Rc::new(AtomicBool::new(default_audio_tier.enable_fec)),
         }
     }
 
@@ -146,6 +161,8 @@ impl CameraEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let congestion_flag = self.congestion_step_down.clone();
+        let shared_audio_bitrate = self.shared_audio_tier_bitrate.clone();
+        let shared_audio_fec = self.shared_audio_tier_fec.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -196,6 +213,19 @@ impl CameraEncoder {
                         tier.target_fps,
                         tier.keyframe_interval_frames,
                     );
+
+                    // Also update shared audio tier atomics so the microphone
+                    // encoder picks up the new audio quality settings without
+                    // needing its own EncoderBitrateController.
+                    let audio_tier = encoder_control.current_audio_tier();
+                    shared_audio_bitrate.store(audio_tier.bitrate_kbps * 1000, Ordering::Relaxed);
+                    shared_audio_fec.store(audio_tier.enable_fec, Ordering::Relaxed);
+                    log::info!(
+                        "CameraEncoder: audio tier updated to '{}' ({}kbps, fec={})",
+                        audio_tier.label,
+                        audio_tier.bitrate_kbps,
+                        audio_tier.enable_fec,
+                    );
                 }
             }
         });
@@ -204,6 +234,22 @@ impl CameraEncoder {
     /// Gets the current encoder output frame rate
     pub fn get_current_fps(&self) -> u32 {
         self.current_fps.load(Ordering::Relaxed)
+    }
+
+    /// Returns the shared audio tier bitrate atomic (bps).
+    ///
+    /// The microphone encoder reads this to track the current audio quality
+    /// tier without needing its own `EncoderBitrateController`.
+    pub fn shared_audio_tier_bitrate(&self) -> Rc<AtomicU32> {
+        self.shared_audio_tier_bitrate.clone()
+    }
+
+    /// Returns the shared audio tier FEC flag.
+    ///
+    /// The microphone encoder reads this to decide whether to include
+    /// RED-style redundancy in audio packets.
+    pub fn shared_audio_tier_fec(&self) -> Rc<AtomicBool> {
+        self.shared_audio_tier_fec.clone()
     }
 
     /// Returns a shared reference to the force-keyframe flag.

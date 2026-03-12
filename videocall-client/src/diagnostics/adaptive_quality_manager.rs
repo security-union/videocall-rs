@@ -320,17 +320,22 @@ mod tests {
     use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]
-    fn test_starts_at_highest_tier() {
+    fn test_starts_at_default_tier() {
         let mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
-        assert_eq!(mgr.video_tier_index(), 0);
+        assert_eq!(mgr.video_tier_index(), DEFAULT_VIDEO_TIER_INDEX);
         assert_eq!(mgr.audio_tier_index(), 0);
-        assert_eq!(mgr.current_video_tier().label, "high");
+        assert_eq!(
+            mgr.current_video_tier().label,
+            VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX].label
+        );
         assert_eq!(mgr.current_audio_tier().label, "high");
     }
 
     #[wasm_bindgen_test]
     fn test_no_change_under_good_conditions() {
         let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        // Start from a known state for this test
+        mgr.video_tier_index = 0;
         // fps_ratio=1.0, bitrate_ratio=1.0 -- perfect conditions
         let changed = mgr.update(30.0, 30.0, 1500.0, 1500.0, 10000.0);
         assert!(!changed);
@@ -340,6 +345,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_video_step_down_after_reaction_time() {
         let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        // Start at highest tier to test step-down
+        mgr.video_tier_index = 0;
         let base = 10000.0;
 
         // fps_ratio = 0.3 (below 0.50 threshold)
@@ -360,6 +367,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_video_step_down_on_bitrate_ratio() {
         let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        // Start at highest tier to test step-down
+        mgr.video_tier_index = 0;
         let base = 10000.0;
 
         // Good FPS but bitrate_ratio = 0.3 (below 0.40 threshold)
@@ -396,6 +405,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_min_transition_interval_enforced() {
         let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        // Start at highest tier to test step-down behavior
+        mgr.video_tier_index = 0;
         let base = 10000.0;
 
         // Step down once

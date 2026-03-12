@@ -28,12 +28,9 @@ use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::crypto::aes::Aes128State;
-use crate::diagnostics::EncoderBitrateController;
 use crate::encode::encoder_state::EncoderState;
 use crate::wrappers::EncodedAudioChunkTypeWrapper;
 use crate::VideoCallClient;
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
 use gloo::timers::callback::Interval;
 use gloo_utils::window;
 use js_sys::Array;
@@ -43,7 +40,6 @@ use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::{
     media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
@@ -144,7 +140,11 @@ pub struct MicrophoneEncoder {
     vad_interval: Rc<RefCell<Option<Interval>>>,
     vad_threshold: f32,
     /// Tier-controlled audio bitrate in bps (e.g. 50000 for 50 kbps).
-    /// Updated by the diagnostics loop when the audio tier changes.
+    /// Shared with the camera encoder's quality manager.
+    /// Currently not read at runtime because the AudioWorklet does not
+    /// support dynamic bitrate reconfiguration. Kept for forward-
+    /// compatibility when the worklet gains that capability.
+    #[allow(dead_code)]
     tier_audio_bitrate: Rc<AtomicU32>,
     /// Whether the current audio tier has FEC enabled.
     /// When true AND `AUDIO_REDUNDANCY_ENABLED`, each packet carries the
@@ -153,12 +153,22 @@ pub struct MicrophoneEncoder {
 }
 
 impl MicrophoneEncoder {
+    /// Construct a microphone encoder.
+    ///
+    /// `shared_audio_tier_bitrate` and `shared_audio_tier_fec` are shared
+    /// atomics owned by the `CameraEncoder`. The camera encoder's quality
+    /// manager writes to these when the audio tier changes, and the
+    /// microphone encoder reads them to apply the current audio settings.
+    /// This avoids creating a duplicate `EncoderBitrateController` that
+    /// would redundantly process the same diagnostics packets.
     pub fn new(
         client: VideoCallClient,
         _bitrate_kbps: u32,
         on_encoder_settings_update: Callback<String>,
         on_error: Callback<String>,
         vad_threshold: Option<f32>,
+        shared_audio_tier_bitrate: Option<Rc<AtomicU32>>,
+        shared_audio_tier_fec: Option<Rc<AtomicBool>>,
     ) -> Self {
         let default_audio_bitrate_bps = AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000;
         let default_enable_fec = AUDIO_QUALITY_TIERS[0].enable_fec;
@@ -171,54 +181,15 @@ impl MicrophoneEncoder {
             is_speaking: Rc::new(AtomicBool::new(false)),
             vad_interval: Rc::new(RefCell::new(None)),
             vad_threshold: vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD),
-            tier_audio_bitrate: Rc::new(AtomicU32::new(default_audio_bitrate_bps)),
-            tier_enable_fec: Rc::new(AtomicBool::new(default_enable_fec)),
+            tier_audio_bitrate: shared_audio_tier_bitrate
+                .unwrap_or_else(|| Rc::new(AtomicU32::new(default_audio_bitrate_bps))),
+            tier_enable_fec: shared_audio_tier_fec
+                .unwrap_or_else(|| Rc::new(AtomicBool::new(default_enable_fec))),
         }
     }
 
     pub fn set_error_callback(&mut self, on_error: Callback<String>) {
         self.on_error = Some(on_error);
-    }
-
-    pub fn set_encoder_control(
-        &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-    ) {
-        let tier_audio_bitrate = self.tier_audio_bitrate.clone();
-        let tier_enable_fec = self.tier_enable_fec.clone();
-        // We create a bitrate controller here to feed the adaptive quality manager.
-        // The audio encoder does not do PID-based bitrate control itself, but we need
-        // the quality manager to track conditions and select audio tiers.
-        wasm_bindgen_futures::spawn_local(async move {
-            // Use a dummy FPS target for the PID -- the audio encoder doesn't use PID output,
-            // but the quality manager inside EncoderBitrateController needs to process packets.
-            let dummy_fps = Rc::new(AtomicU32::new(50)); // ~50 audio frames/sec at 20ms
-            let initial_bitrate = AUDIO_QUALITY_TIERS[0].bitrate_kbps;
-            let mut encoder_control = EncoderBitrateController::new(initial_bitrate, dummy_fps);
-
-            while let Some(packet) = diagnostics_receiver.next().await {
-                // Feed the packet to get the quality manager to process it.
-                let _ = encoder_control.process_diagnostics_packet(packet);
-
-                // Check if audio tier changed and update the shared bitrate and FEC atomics.
-                if encoder_control.take_tier_changed() {
-                    let audio_tier = encoder_control.current_audio_tier();
-                    let new_bitrate_bps = audio_tier.bitrate_kbps * 1000;
-                    tier_audio_bitrate.store(new_bitrate_bps, Ordering::Relaxed);
-                    tier_enable_fec.store(audio_tier.enable_fec, Ordering::Relaxed);
-                    log::info!(
-                        "MicrophoneEncoder: audio tier changed to '{}' ({}kbps, fec={})",
-                        audio_tier.label,
-                        audio_tier.bitrate_kbps,
-                        audio_tier.enable_fec,
-                    );
-                    // TODO: Apply enable_dtx dynamically when the AudioWorklet
-                    // (encoderWorker.min.js) is updated to handle runtime
-                    // reconfiguration messages. The enable_fec flag is now used
-                    // for application-layer RED redundancy (see audio output handler).
-                }
-            }
-        });
     }
 
     // delegates to self.state

@@ -1,4 +1,6 @@
-use crate::adaptive_quality_constants::{AUDIO_RED_FORMAT, AUDIO_RED_SEQ_HISTORY_SIZE};
+use crate::adaptive_quality_constants::{
+    AUDIO_RED_FORMAT, AUDIO_RED_SEQ_HISTORY_SIZE, OPUS_FRAME_DURATION_MS,
+};
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD,
@@ -620,6 +622,12 @@ impl NetEqAudioPeerDecoder {
 
         let primary_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
+        // Sanity check: an individual Opus audio frame should never exceed 10KB.
+        // Reject clearly malformed or corrupt packets early.
+        if primary_len > 10_000 {
+            return None;
+        }
+
         // Validate: primary_len + 4 (itself) + 4 (redundant_seq) must not exceed total
         let redundant_seq_offset = 4 + primary_len;
         if redundant_seq_offset + 4 > data.len() {
@@ -675,11 +683,11 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                             );
                             self.record_sequence(redundant_seq as u64);
                             // Inject the recovered frame with its original sequence and
-                            // an earlier timestamp (20ms before the primary, matching
-                            // the Opus frame duration).
+                            // an earlier timestamp (one Opus frame before the primary).
                             let recovered_insert = WorkerMsg::Insert {
                                 seq: redundant_seq as u16,
-                                timestamp: (packet.timestamp as u32).saturating_sub(20),
+                                timestamp: (packet.timestamp as u32)
+                                    .saturating_sub(OPUS_FRAME_DURATION_MS),
                                 payload: redundant_data,
                             };
                             self.send_worker_message(recovered_insert);

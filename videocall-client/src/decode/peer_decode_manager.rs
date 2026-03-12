@@ -486,6 +486,11 @@ impl Peer {
     /// 3. Rate-limit to one request per `KEYFRAME_REQUEST_MIN_INTERVAL_MS`.
     /// 4. When a keyframe arrives (frame_type == "key"), clear the gap state.
     fn track_sequence(&mut self, media_type: MediaType, packet: &MediaPacket) -> Option<MediaType> {
+        // Both VIDEO and SCREEN packets use `video_metadata` for sequence
+        // tracking. This is correct: `transform_screen_chunk` in
+        // `encode/transform.rs` populates `VideoMetadata { sequence, .. }`
+        // for SCREEN packets the same way `transform_video_chunk` does for
+        // VIDEO packets.
         let (seq, frame_type_str) = if let Some(vm) = packet.video_metadata.as_ref() {
             (vm.sequence, packet.frame_type.as_str())
         } else {
@@ -754,6 +759,14 @@ impl PeerDecodeManager {
     /// The packet is a `MediaPacket` with `media_type = KEYFRAME_REQUEST`
     /// and `user_id` set to the target peer. The `data` field encodes
     /// which stream (VIDEO or SCREEN) needs the keyframe.
+    ///
+    /// IMPORTANT: This uses `send_packet` (reliable stream), NOT
+    /// `send_media_packet` (datagrams). KEYFRAME_REQUEST is a control
+    /// message that MUST be delivered reliably.
+    ///
+    /// The packet is sent unencrypted (raw MediaPacket, not AES-encrypted)
+    /// because this is a signaling/control packet, not user media data.
+    /// The server needs to read the target `user_id` to route it correctly.
     fn send_keyframe_request(&self, peer_user_id: &str, requested_media_type: MediaType) {
         let Some(send_packet) = &self.send_packet else {
             debug!("Cannot send KEYFRAME_REQUEST: no send_packet callback");

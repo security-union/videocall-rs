@@ -117,7 +117,12 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 ];
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 0; // "high"
+///
+/// Starting at "medium" (480p/25fps/600kbps) avoids wasting ~1.5 seconds of
+/// high-quality encoding on constrained devices before the first step-down.
+/// Medium is a safe starting point that can quickly step up on good
+/// connections or step down on bad ones.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "medium"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
@@ -362,6 +367,12 @@ pub const DATAGRAM_MAX_SIZE: usize = 1200;
 /// Each audio packet carries the previous frame as redundancy.
 /// Increases audio bandwidth by ~2x but provides loss recovery.
 pub const AUDIO_REDUNDANCY_ENABLED: bool = true;
+
+/// Default Opus frame duration in milliseconds.
+///
+/// Standard Opus frames are 20ms, which gives ~50 frames/second.
+/// Used by RED unpacking to compute the recovered frame's timestamp.
+pub const OPUS_FRAME_DURATION_MS: u32 = 20;
 
 /// Audio format string signaling that a packet contains redundant data.
 /// When this value appears in `AudioMetadata.audio_format`, the `data` field

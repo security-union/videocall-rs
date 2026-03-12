@@ -351,7 +351,16 @@ fn UserVideo(id: String, hidden: bool) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let id_for_effect = id.clone();
 
+    // Store the IntersectionObserver so we can disconnect it when the effect
+    // re-runs (preventing accumulation) and on component unmount.
+    let mut observer_signal: Signal<Option<IntersectionObserver>> = use_signal(|| None);
+
     use_effect(move || {
+        // Disconnect any previous observer before creating a new one.
+        if let Some(old_observer) = observer_signal.write().take() {
+            old_observer.disconnect();
+        }
+
         if let Some(elem) = gloo_utils::document().get_element_by_id(&id_for_effect) {
             if let Ok(canvas) = elem.dyn_into::<HtmlCanvasElement>() {
                 let client_ref = client.clone();
@@ -377,14 +386,19 @@ fn UserVideo(id: String, hidden: bool) -> Element {
 
                 if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
                     observer.observe(&canvas);
-                    // Store observer to prevent GC — it will be disconnected
-                    // when the closure is dropped (component unmount).
-                    // For Dioxus, we leak the observer since there's no
-                    // direct unmount cleanup hook that returns a destructor.
-                    std::mem::forget(observer);
+                    observer_signal.set(Some(observer));
                 }
+                // The Closure must outlive the observer; forget it so it is
+                // not dropped when this scope exits.
                 callback.forget();
             }
+        }
+    });
+
+    // Disconnect the observer when the component unmounts.
+    use_drop(move || {
+        if let Some(obs) = observer_signal.write().take() {
+            obs.disconnect();
         }
     });
 
@@ -404,7 +418,16 @@ fn ScreenCanvas(peer_id: String) -> Element {
     let canvas_id_for_effect = canvas_id.clone();
     let peer_id_for_effect = peer_id.clone();
 
+    // Store the IntersectionObserver so we can disconnect it when the effect
+    // re-runs (preventing accumulation) and on component unmount.
+    let mut observer_signal: Signal<Option<IntersectionObserver>> = use_signal(|| None);
+
     use_effect(move || {
+        // Disconnect any previous observer before creating a new one.
+        if let Some(old_observer) = observer_signal.write().take() {
+            old_observer.disconnect();
+        }
+
         if let Some(elem) = gloo_utils::document().get_element_by_id(&canvas_id_for_effect) {
             if let Ok(canvas) = elem.dyn_into::<HtmlCanvasElement>() {
                 let client_ref = client.clone();
@@ -430,10 +453,19 @@ fn ScreenCanvas(peer_id: String) -> Element {
 
                 if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
                     observer.observe(&canvas);
-                    std::mem::forget(observer);
+                    observer_signal.set(Some(observer));
                 }
+                // The Closure must outlive the observer; forget it so it is
+                // not dropped when this scope exits.
                 callback.forget();
             }
+        }
+    });
+
+    // Disconnect the observer when the component unmounts.
+    use_drop(move || {
+        if let Some(obs) = observer_signal.write().take() {
+            obs.disconnect();
         }
     });
 

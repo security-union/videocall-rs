@@ -37,7 +37,7 @@ pub fn PeerTile(
     let mut audio_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
     let mut screen_enabled = use_signal(|| false);
-    let mut is_speaking = use_signal(|| false);
+    let mut audio_level = use_signal(|| 0.0_f32);
 
     // Initialize from client snapshot and subscribe to diagnostics
     let peer_id_owned = peer_id.clone();
@@ -53,7 +53,7 @@ pub fn PeerTile(
         audio_enabled.set(effect_client.is_audio_enabled_for_peer(&peer_id_owned));
         video_enabled.set(effect_client.is_video_enabled_for_peer(&peer_id_owned));
         screen_enabled.set(effect_client.is_screen_share_enabled_for_peer(&peer_id_owned));
-        is_speaking.set(effect_client.is_speaking_for_peer(&peer_id_owned));
+        audio_level.set(effect_client.audio_level_for_peer(&peer_id_owned));
 
         let peer_id_inner = peer_id_owned.clone();
 
@@ -70,7 +70,7 @@ pub fn PeerTile(
                     &mut audio_enabled,
                     &mut video_enabled,
                     &mut screen_enabled,
-                    &mut is_speaking,
+                    &mut audio_level,
                 );
             }
         };
@@ -86,9 +86,9 @@ pub fn PeerTile(
     let _ = audio_enabled();
     let _ = video_enabled();
     let _ = screen_enabled();
-    let speaking = is_speaking();
+    let level = audio_level();
 
-    generate_for_peer(&client, &peer_id, full_bleed, speaking, host_uid)
+    generate_for_peer(&client, &peer_id, full_bleed, level, host_uid)
 }
 
 fn handle_diagnostics_event(
@@ -97,7 +97,7 @@ fn handle_diagnostics_event(
     audio_enabled: &mut Signal<bool>,
     video_enabled: &mut Signal<bool>,
     screen_enabled: &mut Signal<bool>,
-    is_speaking: &mut Signal<bool>,
+    audio_level: &mut Signal<f32>,
 ) {
     match evt.subsystem {
         "peer_status" => {
@@ -105,6 +105,7 @@ fn handle_diagnostics_event(
             let mut audio: Option<bool> = None;
             let mut video: Option<bool> = None;
             let mut screen: Option<bool> = None;
+            let mut audio_lvl: Option<f32> = None;
             let mut speaking: Option<bool> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
@@ -112,6 +113,7 @@ fn handle_diagnostics_event(
                     ("audio_enabled", MetricValue::U64(v)) => audio = Some(*v != 0),
                     ("video_enabled", MetricValue::U64(v)) => video = Some(*v != 0),
                     ("screen_enabled", MetricValue::U64(v)) => screen = Some(*v != 0),
+                    ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v as f32),
                     ("is_speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
                     _ => {}
                 }
@@ -134,19 +136,25 @@ fn handle_diagnostics_event(
                     screen_enabled.set(s);
                 }
             }
-            if let Some(s) = speaking {
-                if s != *is_speaking.peek() {
-                    is_speaking.set(s);
+            // Prefer the float audio_level metric; fall back to boolean is_speaking
+            if let Some(lvl) = audio_lvl {
+                let prev = *audio_level.peek();
+                if lvl == 0.0 || (lvl - prev).abs() > 0.01 {
+                    audio_level.set(lvl);
                 }
+            } else if let Some(s) = speaking {
+                audio_level.set(if s { 1.0 } else { 0.0 });
             }
         }
         "peer_speaking" => {
             // Fast-path speaking updates from decoded audio frames
             let mut to_peer: Option<String> = None;
+            let mut audio_lvl: Option<f32> = None;
             let mut speaking: Option<bool> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
                     ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v as f32),
                     ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
                     _ => {}
                 }
@@ -154,10 +162,13 @@ fn handle_diagnostics_event(
             if to_peer.as_deref() != Some(peer_id) {
                 return;
             }
-            if let Some(s) = speaking {
-                if s != *is_speaking.peek() {
-                    is_speaking.set(s);
+            if let Some(lvl) = audio_lvl {
+                let prev = *audio_level.peek();
+                if lvl == 0.0 || (lvl - prev).abs() > 0.01 {
+                    audio_level.set(lvl);
                 }
+            } else if let Some(s) = speaking {
+                audio_level.set(if s { 1.0 } else { 0.0 });
             }
         }
         _ => {}

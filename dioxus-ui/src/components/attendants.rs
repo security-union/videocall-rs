@@ -412,6 +412,7 @@ pub fn AttendantsComponent(
     let mut device_was_denied = use_signal(|| false);
     let session_loaded = use_signal(|| false);
     let local_speaking = use_signal(|| false);
+    let local_audio_level = use_signal(|| 0.0f32);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
@@ -566,6 +567,10 @@ pub fn AttendantsComponent(
             on_speaking_changed: Some(VcCallback::from(move |speaking: bool| {
                 let mut s = local_speaking;
                 s.set(speaking);
+            })),
+            on_audio_level_changed: Some(VcCallback::from(move |level: f32| {
+                let mut s = local_audio_level;
+                s.set(level);
             })),
             vad_threshold: crate::constants::vad_threshold().ok(),
             on_meeting_activated: None,
@@ -1325,10 +1330,8 @@ pub fn AttendantsComponent(
                                     share_screen: screen_share_state().is_sharing(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
-                                    is_speaking: local_speaking(),
-                                    on_encoder_settings_update: move |s: String| {
-                                        encoder_settings.set(Some(s));
-                                    },
+                                    audio_level: local_audio_level(),
+                                    on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {
                                         device_settings_open.set(!device_settings_open());

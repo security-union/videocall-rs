@@ -1,4 +1,7 @@
 use crate::audio::shared_audio_context::SharedAudioContext;
+use crate::audio_constants::{
+    AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, RMS_LOUD_SPEECH_CEILING,
+};
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
 use js_sys::Float32Array;
@@ -54,11 +57,6 @@ enum WorkerResponse {
     },
 }
 
-/// Default threshold for voice activity detection (RMS level)
-/// Values typically range from 0.0 to 1.0 for normalized audio
-/// 0.01 is quite sensitive, 0.05 filters out most background noise
-const DEFAULT_VAD_THRESHOLD: f32 = 0.02;
-
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
 #[derive(Debug)]
 pub struct NetEqAudioPeerDecoder {
@@ -74,6 +72,7 @@ pub struct NetEqAudioPeerDecoder {
 
     // Voice activity detection state
     speaking: Rc<RefCell<bool>>,
+    audio_level: Rc<RefCell<f32>>,
 }
 
 impl NetEqAudioPeerDecoder {
@@ -181,18 +180,37 @@ impl NetEqAudioPeerDecoder {
         speaker_device_id: Option<String>,
         peer_id: String,
         speaking: Rc<RefCell<bool>>,
+        audio_level: Rc<RefCell<f32>>,
         vad_threshold: f32,
     ) {
         // Calculate RMS for voice activity detection
         let rms = Self::calculate_rms(&pcm);
         let is_speaking = rms > vad_threshold;
 
-        // Check if speaking state changed
-        let prev_speaking = *speaking.borrow();
-        if is_speaking != prev_speaking {
-            *speaking.borrow_mut() = is_speaking;
+        // Normalize RMS to a 0.0–1.0 intensity range.
+        // Below the VAD threshold the intensity is 0; above it we scale
+        // up to a ceiling of RMS_LOUD_SPEECH_CEILING, then apply a sqrt
+        // curve for perceptual uniformity (human hearing is logarithmic,
+        // so sqrt gives a good balance between dynamic range and visibility).
+        let range = (RMS_LOUD_SPEECH_CEILING - vad_threshold).max(f32::EPSILON);
+        let intensity = if rms < vad_threshold {
+            0.0_f32
+        } else {
+            let linear = ((rms - vad_threshold) / range).clamp(0.0, 1.0);
+            linear.sqrt()
+        };
 
-            // Emit diagnostics event for speaking state change
+        // Emit a diagnostics event when the speaking boolean toggles OR
+        // when the audio level changes by more than 0.02.  This keeps the
+        // event rate reasonable while giving the UI smooth level updates.
+        let prev_speaking = *speaking.borrow();
+        let prev_level = *audio_level.borrow();
+        let level_changed = (intensity - prev_level).abs() > AUDIO_LEVEL_DELTA_THRESHOLD;
+
+        if is_speaking != prev_speaking || level_changed {
+            *speaking.borrow_mut() = is_speaking;
+            *audio_level.borrow_mut() = intensity;
+
             let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "peer_speaking",
                 stream_id: Some(format!("speaking->{peer_id}")),
@@ -200,6 +218,7 @@ impl NetEqAudioPeerDecoder {
                 metrics: vec![
                     metric!("to_peer", peer_id.clone()),
                     metric!("speaking", if is_speaking { 1u64 } else { 0u64 }),
+                    metric!("audio_level", intensity as f64),
                 ],
             });
         }
@@ -398,6 +417,7 @@ impl NetEqAudioPeerDecoder {
         pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
         worker: Worker,
         speaking: Rc<RefCell<bool>>,
+        audio_level: Rc<RefCell<f32>>,
         vad_threshold: f32,
     ) -> Closure<dyn FnMut(MessageEvent)> {
         Closure::wrap(Box::new(move |event: MessageEvent| {
@@ -413,6 +433,7 @@ impl NetEqAudioPeerDecoder {
                     speaker_device_id.clone(),
                     peer_id.clone(),
                     speaking.clone(),
+                    audio_level.clone(),
                     vad_threshold,
                 );
             } else if data.is_object() {
@@ -504,6 +525,7 @@ impl NetEqAudioPeerDecoder {
 
             // Voice activity detection state
             speaking: Rc::new(RefCell::new(false)),
+            audio_level: Rc::new(RefCell::new(0.0)),
         };
 
         // Set up worker message handling with decoder's queue references
@@ -516,6 +538,7 @@ impl NetEqAudioPeerDecoder {
             decoder.pending_messages.clone(),
             worker.clone(),
             decoder.speaking.clone(),
+            decoder.audio_level.clone(),
             threshold,
         );
 

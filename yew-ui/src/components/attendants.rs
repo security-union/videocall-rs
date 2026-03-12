@@ -113,6 +113,7 @@ pub enum Msg {
     OnPeerRemoved(String),
     OnFirstFrame((String, MediaType)),
     OnSpeakingChanged(bool),
+    OnAudioLevelChanged(f32),
     OnMicrophoneError(String),
     OnCameraError(String),
     DismissUserError,
@@ -235,6 +236,7 @@ pub struct AttendantsComponent {
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
     local_speaking: bool,
+    local_audio_level: f32,
     /// Monotonically increasing counter bumped when a `WaitingRoomUpdated`
     /// push notification arrives. Passed as a prop to `HostControls` so it
     /// knows to re-fetch the waiting list.
@@ -402,6 +404,12 @@ impl AttendantsComponent {
                 let link = ctx.link().clone();
                 VcCallback::from(move |speaking: bool| {
                     link.send_message(Msg::OnSpeakingChanged(speaking));
+                })
+            }),
+            on_audio_level_changed: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |level: f32| {
+                    link.send_message(Msg::OnAudioLevelChanged(level));
                 })
             }),
             vad_threshold: crate::constants::vad_threshold().ok(),
@@ -727,6 +735,7 @@ impl Component for AttendantsComponent {
             meeting_ended_message: None,
             meeting_info_open: false,
             local_speaking: false,
+            local_audio_level: 0.0,
             waiting_room_version: 0,
             reconnect_attempt: 0,
             peer_toasts: Vec::new(),
@@ -757,6 +766,10 @@ impl Component for AttendantsComponent {
             Msg::OnSpeakingChanged(speaking) => {
                 log::trace!("LOCAL Speaking state changed to: {}", speaking);
                 self.local_speaking = speaking;
+                true
+            }
+            Msg::OnAudioLevelChanged(level) => {
+                self.local_audio_level = level;
                 true
             }
             Msg::WsAction(action) => match action {
@@ -1494,7 +1507,7 @@ impl Component for AttendantsComponent {
                                                  share_screen={self.screen_share_state.is_sharing()}
                                                  mic_enabled={self.mic_enabled}
                                                  video_enabled={self.video_enabled}
-                                                 is_speaking={self.local_speaking}
+                                                 audio_level={self.local_audio_level}
                                                  on_encoder_settings_update={on_encoder_settings_update}
                                                  device_settings_open={self.device_settings_open}
                                                  on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}

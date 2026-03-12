@@ -11,6 +11,10 @@ on:
         description: 'PR commit SHA'
         required: true
         type: string
+      pr_base_ref:
+        description: 'PR target branch (e.g. hcl-main)'
+        required: true
+        type: string
     secrets:
       HARBOR_USERNAME:
         required: true
@@ -29,7 +33,7 @@ jobs:
       - name: Setup PATH
         run: echo "/home/jenkins/bin" >> $GITHUB_PATH
 
-      - name: Checkout code
+      - name: Checkout code (merge PR into target branch)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -37,7 +41,18 @@ jobs:
           mkdir -p /tmp/build-${{ inputs.pr_number }}
           cd /tmp/build-${{ inputs.pr_number }}
           git clone https://oauth2:${GH_TOKEN}@github01.hclpnp.com/labs-projects/videocall.git .
-          git checkout ${{ inputs.pr_sha }}
+
+          # Checkout the target branch, then merge the PR head into it.
+          # This builds the merge result (what the repo will look like post-merge),
+          # matching github.com's default pull_request CI behavior.
+          git checkout ${{ inputs.pr_base_ref }}
+          echo "Merging PR #${{ inputs.pr_number }} (${{ inputs.pr_sha }}) into ${{ inputs.pr_base_ref }}..."
+          if ! git merge --no-edit ${{ inputs.pr_sha }}; then
+            echo "❌ Merge conflict: PR #${{ inputs.pr_number }} cannot be cleanly merged into ${{ inputs.pr_base_ref }}"
+            echo "Please rebase or resolve conflicts before building."
+            exit 1
+          fi
+          echo "✅ Merge successful — building the merged result"
 
       - name: Login to Harbor
         env:

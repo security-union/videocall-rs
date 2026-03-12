@@ -98,6 +98,7 @@ pub struct Host {
     show_change_name: bool,
     pending_name: String,
     change_name_error: Option<String>,
+    last_reload_counter: u32,
 }
 
 pub struct EncoderSettings {
@@ -157,6 +158,7 @@ pub struct MeetingProps {
     /// Called when screen share state changes (started, cancelled, stopped).
     /// This allows the parent component to react to screen share lifecycle events.
     pub on_screen_share_state: Callback<ScreenShareEvent>,
+    pub reload_devices_counter: u32,
 }
 
 impl Component for Host {
@@ -271,10 +273,15 @@ impl Component for Host {
             show_change_name: false,
             pending_name: String::new(),
             change_name_error: None,
+            last_reload_counter: 0,
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if ctx.props().reload_devices_counter != self.last_reload_counter {     
+            self.media_devices.load();
+            self.last_reload_counter = ctx.props().reload_devices_counter;
+        }
         if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
             self.share_screen = ctx.props().share_screen;
             let link = ctx.link().clone();
@@ -513,6 +520,62 @@ impl Component for Host {
                 }
             }
             Msg::DevicesLoaded => {
+                let audio_id_str = self.media_devices.audio_inputs.selected();
+                let video_id_str = self.media_devices.video_inputs.selected();
+
+                let (client, _) = ctx
+                    .link()
+                    .context::<VideoCallClientCtx>(Callback::noop())
+                    .expect("VideoCallClient context missing");
+                
+                if audio_id_str == "" {
+                    let microphone_callback = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::MicrophoneEncoderSettingsUpdated(s))
+                    });
+                    let microphone_error_cb = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::MicrophoneError(s))
+                    });
+        
+                    let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
+                    self.microphone = create_microphone_encoder(
+                        client.clone(),
+                        audio_bitrate,
+                        microphone_callback,
+                        microphone_error_cb.clone(),
+                        vad_threshold().ok(),
+                    );
+
+                    let (tx, rx) = mpsc::unbounded();
+                    client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
+                    self.microphone.set_encoder_control(rx);
+                }
+
+                if video_id_str == "" {
+                    let camera_callback = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::CameraEncoderSettingsUpdated(s))
+                    });
+                    let camera_error_cb = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::CameraError(s))
+                    });
+
+                    let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
+                    self.camera = CameraEncoder::new(
+                        client.clone(),
+                        VIDEO_ELEMENT_ID,
+                        video_bitrate,
+                        camera_callback,
+                        camera_error_cb,
+                    );
+
+                    let (tx, rx) = mpsc::unbounded();
+                    client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
+                    self.camera.set_encoder_control(rx);
+               }
+
                 let audio_device_id = self.media_devices.audio_inputs.selected();
                 let video_device_id = self.media_devices.video_inputs.selected();
                 let speaker_device_id = self.media_devices.audio_outputs.selected();

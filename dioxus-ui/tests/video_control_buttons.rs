@@ -34,7 +34,7 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 async fn mic_button_enabled_shows_mute_tooltip() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { MicButton { enabled: true, onclick: move |_| {} } }
+        rsx! { MicButton { enabled: true, available: true, onclick: move |_| {} } }
     }
     render_into(&mount, wrapper);
     yield_now().await;
@@ -60,7 +60,7 @@ async fn mic_button_enabled_shows_mute_tooltip() {
 async fn mic_button_disabled_shows_unmute_tooltip() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { MicButton { enabled: false, onclick: move |_| {} } }
+        rsx! { MicButton { enabled: false, available: true, onclick: move |_| {} } }
     }
     render_into(&mount, wrapper);
     yield_now().await;
@@ -90,7 +90,7 @@ async fn mic_button_disabled_shows_unmute_tooltip() {
 async fn camera_button_enabled_shows_stop_video_tooltip() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { CameraButton { enabled: true, onclick: move |_| {} } }
+        rsx! { CameraButton { enabled: true, available: true, onclick: move |_| {} } }
     }
     render_into(&mount, wrapper);
     yield_now().await;
@@ -105,7 +105,7 @@ async fn camera_button_enabled_shows_stop_video_tooltip() {
 async fn camera_button_disabled_shows_start_video_tooltip() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
-        rsx! { CameraButton { enabled: false, onclick: move |_| {} } }
+        rsx! { CameraButton { enabled: false, available: true, onclick: move |_| {} } }
     }
     render_into(&mount, wrapper);
     yield_now().await;

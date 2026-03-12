@@ -41,8 +41,7 @@ screen.stop();
 
 ```rust
 let media_device_access = MediaDeviceAccess::new();
-media_device_access.on_granted = ...; // callback
-media_device_access.on_denied = ...; // callback
+media_device_access.on_result = ...; // callback with audio and video state
 media_device_access.request();
 ```
 

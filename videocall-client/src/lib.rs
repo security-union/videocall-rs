@@ -184,6 +184,7 @@
 //! ```
 
 pub mod audio;
+pub mod audio_constants;
 pub mod audio_worklet_codec;
 mod client;
 mod connection;

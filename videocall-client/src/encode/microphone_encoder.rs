@@ -16,6 +16,10 @@
  * conditions.
  */
 
+use crate::audio_constants::{
+    AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, RMS_LOUD_SPEECH_CEILING, VAD_FFT_SIZE,
+    VAD_POLL_INTERVAL_MS, VAD_SMOOTHING_TIME_CONSTANT,
+};
 use crate::audio_worklet_codec::EncoderInitOptions;
 use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
 use crate::constants::AUDIO_CHANNELS;
@@ -100,8 +104,6 @@ pub struct MicrophoneEncoder {
     vad_interval: Rc<RefCell<Option<Interval>>>,
     vad_threshold: f32,
 }
-
-const DEFAULT_VAD_THRESHOLD: f32 = 0.002;
 
 impl MicrophoneEncoder {
     pub fn new(
@@ -373,8 +375,8 @@ impl MicrophoneEncoder {
                     return;
                 }
             };
-            analyser.set_fft_size(2048);
-            analyser.set_smoothing_time_constant(0.8);
+            analyser.set_fft_size(VAD_FFT_SIZE);
+            analyser.set_smoothing_time_constant(VAD_SMOOTHING_TIME_CONSTANT);
 
             let worklet = match codec
                 .create_node(
@@ -460,7 +462,7 @@ impl MicrophoneEncoder {
             // microphone's time-domain signal.  The resulting `is_speaking`
             // flag is included in the 1Hz heartbeat so that *remote* peers
             // can show a speaking indicator for this user.
-            let vad_interval = Interval::new(100, move || {
+            let vad_interval = Interval::new(VAD_POLL_INTERVAL_MS, move || {
                 if !enabled_check.load(Ordering::Acquire) || switching_check.load(Ordering::Acquire)
                 {
                     // Reset audio level to zero when mic is disabled/switching
@@ -486,7 +488,6 @@ impl MicrophoneEncoder {
                 // Compute normalized intensity (same formula as decoder-side
                 // in neteq_audio_decoder.rs) so the host tile can show a
                 // smooth, intensity-driven glow instead of binary on/off.
-                const RMS_LOUD_SPEECH_CEILING: f32 = 0.10;
                 let range = (RMS_LOUD_SPEECH_CEILING - vad_threshold).max(f32::EPSILON);
                 let intensity = if rms < vad_threshold {
                     0.0_f32
@@ -497,7 +498,7 @@ impl MicrophoneEncoder {
 
                 // Emit audio level when it changes meaningfully.
                 let prev_lvl = prev_level_clone.get();
-                if (intensity - prev_lvl).abs() > 0.02 {
+                if (intensity - prev_lvl).abs() > AUDIO_LEVEL_DELTA_THRESHOLD {
                     prev_level_clone.set(intensity);
                     client_clone.set_audio_level(intensity);
                 }
@@ -516,7 +517,7 @@ impl MicrophoneEncoder {
             *vad_interval_holder.borrow_mut() = Some(vad_interval);
 
             // Monitor for stop conditions and clean up when needed
-            let check_interval = 100; // Check every 100ms
+            let check_interval = VAD_POLL_INTERVAL_MS as i32; // Check every VAD_POLL_INTERVAL_MS
             let enabled_check_monitor = enabled.clone();
             let switching_check_monitor = switching.clone();
             loop {

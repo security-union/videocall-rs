@@ -1,4 +1,7 @@
 use crate::audio::shared_audio_context::SharedAudioContext;
+use crate::audio_constants::{
+    AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, RMS_LOUD_SPEECH_CEILING,
+};
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
 use js_sys::Float32Array;
@@ -53,16 +56,6 @@ enum WorkerResponse {
         stats: JsValue, // Will be processed manually
     },
 }
-
-/// Default threshold for voice activity detection (RMS level)
-/// Values typically range from 0.0 to 1.0 for normalized audio
-/// 0.01 is quite sensitive, 0.05 filters out most background noise
-const DEFAULT_VAD_THRESHOLD: f32 = 0.002;
-
-/// RMS ceiling used to normalize audio intensity to 0.0–1.0.
-/// Normal conversational speech typically peaks around 0.05–0.15;
-/// anything above this ceiling is clamped to 1.0.
-const RMS_LOUD_SPEECH_CEILING: f32 = 0.10;
 
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
 #[derive(Debug)]
@@ -212,7 +205,7 @@ impl NetEqAudioPeerDecoder {
         // event rate reasonable while giving the UI smooth level updates.
         let prev_speaking = *speaking.borrow();
         let prev_level = *audio_level.borrow();
-        let level_changed = (intensity - prev_level).abs() > 0.02;
+        let level_changed = (intensity - prev_level).abs() > AUDIO_LEVEL_DELTA_THRESHOLD;
 
         if is_speaking != prev_speaking || level_changed {
             *speaking.borrow_mut() = is_speaking;

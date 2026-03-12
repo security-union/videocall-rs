@@ -146,11 +146,8 @@
 //! use videocall_client::Callback;
 //!
 //! let mut media_device_access = MediaDeviceAccess::new();
-//! media_device_access.on_granted = Callback::from(|_| {
-//!     web_sys::console::log_1(&"Access granted!".into());
-//! });
-//! media_device_access.on_denied = Callback::from(|error| {
-//!     web_sys::console::log_2(&"Access denied:".into(), &error);
+//! media_device_access.on_result = Callback::from(|_| {
+//!     web_sys::console::log_1(&"Status of access".into());
 //! });
 //! media_device_access.request();
 //! ```
@@ -202,5 +199,6 @@ pub use encode::{
     create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
     ScreenShareEvent,
 };
-pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};
+pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices, MediaAccessKind, MediaPermission, PermissionState,
+                        MediaPermissionsErrorState};
 pub use videocall_types::Callback;

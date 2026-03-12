@@ -30,6 +30,7 @@ jobs:
       pr_number: ${{ steps.get-pr.outputs.pr_number }}
       pr_sha: ${{ steps.get-pr.outputs.pr_sha }}
       pr_ref: ${{ steps.get-pr.outputs.pr_ref }}
+      pr_base_ref: ${{ steps.get-pr.outputs.pr_base_ref }}
       is_build_and_deploy: ${{ steps.check-command.outputs.is_build_and_deploy }}
       comment_id: ${{ github.event.comment.id }}
     steps:
@@ -49,6 +50,7 @@ jobs:
             core.setOutput('pr_number', context.issue.number);
             core.setOutput('pr_sha', pr.data.head.sha);
             core.setOutput('pr_ref', pr.data.head.ref);
+            core.setOutput('pr_base_ref', pr.data.base.ref);
             return pr.data;
 
       - name: Check command
@@ -168,6 +170,7 @@ jobs:
     with:
       pr_number: ${{ needs.check-permissions.outputs.pr_number }}
       pr_sha: ${{ needs.check-permissions.outputs.pr_sha }}
+      pr_base_ref: ${{ needs.check-permissions.outputs.pr_base_ref }}
     secrets:
       HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
       HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}

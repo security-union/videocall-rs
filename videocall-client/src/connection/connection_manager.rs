@@ -1151,11 +1151,27 @@ impl ConnectionManager {
         self.options.on_state_changed.emit(state);
     }
 
-    /// Send packet through active connection
+    /// Send packet through active connection via reliable stream.
     pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {
                 connection.send_packet(packet);
+                return Ok(());
+            }
+        }
+
+        Err(anyhow!("No active connection available"))
+    }
+
+    /// Send packet through active connection via datagram (unreliable, low-latency).
+    ///
+    /// Used for media packets (VIDEO, AUDIO, SCREEN) where low latency matters
+    /// more than guaranteed delivery. Falls back to reliable stream for
+    /// WebSocket connections or oversized packets.
+    pub fn send_packet_datagram(&self, packet: PacketWrapper) -> Result<()> {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            if let Some(connection) = self.connections.get(active_id) {
+                connection.send_packet_datagram(packet);
                 return Ok(());
             }
         }

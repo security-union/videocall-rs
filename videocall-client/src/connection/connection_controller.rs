@@ -122,13 +122,26 @@ impl ConnectionController {
 
     // Delegate methods to ConnectionManager
 
-    /// Send packet through active connection
+    /// Send packet through active connection via reliable stream.
     pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
         let inner = self
             .inner
             .try_borrow()
             .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
         inner.connection_manager.send_packet(packet)
+    }
+
+    /// Send packet through active connection via datagram (unreliable, low-latency).
+    ///
+    /// Used for media packets (VIDEO, AUDIO, SCREEN) where low latency matters
+    /// more than guaranteed delivery. Falls back to reliable stream for
+    /// WebSocket connections or oversized packets.
+    pub fn send_packet_datagram(&self, packet: PacketWrapper) -> Result<()> {
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
+        inner.connection_manager.send_packet_datagram(packet)
     }
 
     /// Set video enabled on active connection

@@ -77,6 +77,44 @@ pub fn is_rtt_packet(data: &[u8]) -> bool {
     false
 }
 
+/// Maximum payload size for WebTransport datagrams (bytes).
+///
+/// Must match the client-side `DATAGRAM_MAX_SIZE` constant. Packets larger
+/// than this are sent via reliable unidirectional streams instead.
+pub const DATAGRAM_MAX_SIZE: usize = 1200;
+
+/// Check if a packet contains real-time media data (VIDEO, AUDIO, or SCREEN)
+/// that benefits from low-latency datagram delivery.
+///
+/// Control packets (HEARTBEAT, RTT, KEYFRAME_REQUEST, DIAGNOSTICS, HEALTH)
+/// are NOT considered media for this purpose because they require reliable
+/// delivery.
+///
+/// Note: the inner `MediaPacket` is AES-encrypted, so we cannot inspect the
+/// `media_type` field without decryption. However, the `PacketWrapper` still
+/// has the unencrypted `packet_type` field. Since only MEDIA packet types
+/// contain real-time audio/video/screen data, we use a size-based heuristic:
+/// MEDIA packets that are small enough for datagrams are sent unreliably.
+/// Large MEDIA packets (e.g., keyframes) fall back to streams.
+///
+/// This conservative approach means some control-type MEDIA packets (like
+/// HEARTBEAT) that happen to be small could be sent via datagram, but since
+/// heartbeats are also sent periodically, occasional loss is acceptable.
+pub fn should_use_datagram(data: &[u8]) -> bool {
+    if data.len() > DATAGRAM_MAX_SIZE {
+        return false;
+    }
+
+    // Only use datagrams for MEDIA packet type.
+    // Other types (RSA_PUB_KEY, AES_KEY, CONNECTION, DIAGNOSTICS, HEALTH,
+    // MEETING, SESSION_ASSIGNED) must use reliable streams.
+    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+        return packet_wrapper.packet_type == PacketType::MEDIA.into();
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +137,74 @@ mod tests {
     #[test]
     fn test_is_rtt_packet_with_empty() {
         assert!(!is_rtt_packet(&[]));
+    }
+
+    #[test]
+    fn test_should_use_datagram_empty() {
+        assert!(!should_use_datagram(&[]));
+    }
+
+    #[test]
+    fn test_should_use_datagram_garbage() {
+        assert!(!should_use_datagram(&[1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn test_should_use_datagram_media_packet() {
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: vec![1, 2, 3], // small payload
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert!(bytes.len() <= DATAGRAM_MAX_SIZE);
+        assert!(should_use_datagram(&bytes));
+    }
+
+    #[test]
+    fn test_should_use_datagram_oversized_media_packet() {
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: vec![0u8; DATAGRAM_MAX_SIZE + 100], // exceeds MTU
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert!(!should_use_datagram(&bytes));
+    }
+
+    #[test]
+    fn test_should_use_datagram_non_media_packet() {
+        // AES_KEY packets should always use reliable stream
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::AES_KEY.into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert!(!should_use_datagram(&bytes));
+    }
+
+    #[test]
+    fn test_should_use_datagram_diagnostics_packet() {
+        // DIAGNOSTICS packets should always use reliable stream
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::DIAGNOSTICS.into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert!(!should_use_datagram(&bytes));
+    }
+
+    #[test]
+    fn test_should_use_datagram_health_packet() {
+        // HEALTH packets should always use reliable stream
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::HEALTH.into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert!(!should_use_datagram(&bytes));
     }
 }

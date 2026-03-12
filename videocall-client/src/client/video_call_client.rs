@@ -485,6 +485,32 @@ impl VideoCallClient {
         }
     }
 
+    /// Send a media packet via datagram (unreliable, low-latency) when supported.
+    ///
+    /// Used for VIDEO, AUDIO, and SCREEN packets where low latency is more
+    /// important than guaranteed delivery. The existing jitter buffer handles
+    /// out-of-order and missing packets gracefully. Falls back to reliable
+    /// stream for WebSocket connections or oversized packets (e.g., keyframes).
+    pub(crate) fn send_media_packet(&self, media: PacketWrapper) {
+        let packet_type = media.packet_type.enum_value();
+        match self.connection_controller.try_borrow() {
+            Ok(cc) => {
+                if let Some(controller) = cc.as_ref() {
+                    if let Err(e) = controller.send_packet_datagram(media) {
+                        debug!("Failed to send {packet_type:?} media packet via datagram: {e}");
+                    }
+                } else {
+                    error!("No connection manager available for {packet_type:?} media packet");
+                }
+            }
+            Err(_) => {
+                error!(
+                    "Unable to borrow connection_controller -- dropping {packet_type:?} media packet"
+                )
+            }
+        }
+    }
+
     /// Returns `true` if the client has an active, elected connection.
     pub fn is_connected(&self) -> bool {
         if let Ok(cc) = self.connection_controller.try_borrow() {
@@ -748,6 +774,22 @@ impl VideoCallClient {
                 .set_peer_screen_canvas(sid, canvas)
         } else {
             Err(JsValue::from_str("Failed to borrow inner state"))
+        }
+    }
+
+    /// Update the visibility state for a peer. When `visible` is `false`,
+    /// video and screen decoding is paused to save CPU. Audio is always
+    /// decoded regardless of visibility.
+    ///
+    /// Called by the UI layer when an `IntersectionObserver` detects that a
+    /// peer's canvas element has scrolled in or out of the viewport.
+    pub fn set_peer_visibility(&self, peer_id: &str, visible: bool) {
+        let sid: u64 = match peer_id.parse() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.peer_decode_manager.set_peer_visibility(sid, visible);
         }
     }
 

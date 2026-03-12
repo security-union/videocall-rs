@@ -157,6 +157,17 @@ impl Connection {
         }
     }
 
+    /// Send a packet via datagram (unreliable, low-latency) when supported.
+    ///
+    /// Used for media packets (VIDEO, AUDIO, SCREEN) where low latency matters
+    /// more than guaranteed delivery. Falls back to reliable stream for
+    /// WebSocket connections or oversized packets.
+    pub fn send_packet_datagram(&self, packet: PacketWrapper) {
+        if let Status::Connected = self.status.get() {
+            self.task.send_packet_datagram(packet);
+        }
+    }
+
     pub fn set_video_enabled(&self, enabled: bool) {
         let prev = self
             .video_enabled

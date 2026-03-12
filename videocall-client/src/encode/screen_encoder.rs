@@ -402,7 +402,7 @@ impl ScreenEncoder {
                         &userid,
                         aes.clone(),
                     );
-                    client.send_packet(packet);
+                    client.send_media_packet(packet);
                     sequence_number += 1;
                 })
             };

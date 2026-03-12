@@ -271,7 +271,7 @@ impl MicrophoneEncoder {
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
                     let packet: PacketWrapper =
                         transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
-                    client_for_send.send_packet(packet);
+                    client_for_send.send_media_packet(packet);
                     sequence_number += 1;
                 } else {
                     log::error!("Received non-MessageEvent: {chunk:?}");

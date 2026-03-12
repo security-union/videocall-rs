@@ -335,3 +335,15 @@ pub const RTT_PROBE_ELECTION_INTERVAL_MS: u64 = 200;
 
 /// RTT probe interval after server election (milliseconds).
 pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
+
+// ---------------------------------------------------------------------------
+// WebTransport Datagram Configuration
+// ---------------------------------------------------------------------------
+
+/// Maximum payload size for WebTransport datagrams (bytes).
+///
+/// QUIC datagrams are limited by the path MTU. The typical minimum is ~1200
+/// bytes after QUIC header overhead. We use a conservative value to avoid
+/// fragmentation across diverse network paths. Packets larger than this
+/// threshold fall back to reliable unidirectional streams.
+pub const DATAGRAM_MAX_SIZE: usize = 1200;

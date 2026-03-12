@@ -22,6 +22,7 @@
 //! to `SessionLogic`. It handles WebTransport-specific I/O via channels.
 
 use crate::actors::chat_server::ChatServer;
+use crate::actors::packet_handler::should_use_datagram;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
 use crate::messages::server::{ActivateConnection, Packet};
@@ -124,13 +125,44 @@ impl WtChatSession {
         }
     }
 
-    /// Send outbound message via the channel.
+    /// Send outbound message via the channel (reliable unidirectional stream).
     /// Returns false if the channel is closed (connection dead).
     fn send(&self, data: Vec<u8>) -> bool {
         match self
             .outbound_tx
             .try_send(WtOutbound::UniStream(data.into()))
         {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!(
+                    "Outbound channel closed for session {}, connection dead",
+                    self.logic.id
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                error!(
+                    "Outbound channel full for session {}, dropping message",
+                    self.logic.id
+                );
+                true // Channel still open, just full
+            }
+        }
+    }
+
+    /// Send outbound message, automatically choosing datagram or stream.
+    ///
+    /// Media packets (VIDEO, AUDIO, SCREEN) that fit within the datagram MTU
+    /// are sent via unreliable datagrams for lower latency. Control packets
+    /// and oversized media packets use reliable unidirectional streams.
+    fn send_auto(&self, data: Vec<u8>) -> bool {
+        let outbound = if should_use_datagram(&data) {
+            WtOutbound::Datagram(data.into())
+        } else {
+            WtOutbound::UniStream(data.into())
+        };
+
+        match self.outbound_tx.try_send(outbound) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!(
@@ -254,13 +286,17 @@ impl Actor for WtChatSession {
 // Message Handlers
 // =============================================================================
 
-/// Handle outbound messages from ChatServer
+/// Handle outbound messages from ChatServer.
+///
+/// Uses `send_auto` to route media packets via datagrams (low latency)
+/// and control packets via reliable streams. This mirrors the client-side
+/// routing where VIDEO/AUDIO/SCREEN go through datagrams.
 impl Handler<Message> for WtChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         let bytes = self.logic.handle_outbound(&msg);
-        if !self.send(bytes) {
+        if !self.send_auto(bytes) {
             // Channel closed - connection is dead, stop the actor
             ctx.stop();
         }

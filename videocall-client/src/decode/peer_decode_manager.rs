@@ -101,6 +101,11 @@ pub struct Peer {
     pub is_speaking: bool,
     pub audio_level: f32,
     pub display_name: Option<String>,
+    /// Whether this peer's video/screen tiles are currently visible in the
+    /// viewport (tracked via IntersectionObserver in the UI layer). When
+    /// `false`, video and screen decoding is skipped to save CPU. Audio is
+    /// always decoded regardless of visibility.
+    pub visible: bool,
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
@@ -163,6 +168,7 @@ impl Peer {
             is_speaking: false,
             audio_level: 0.0,
             display_name: None,
+            visible: true,
             context_initialized: false,
             vad_threshold,
             has_received_heartbeat: false,
@@ -318,6 +324,14 @@ impl Peer {
                         return Ok((media_type, DecodeStatus::SKIPPED, None));
                     }
                 }
+
+                // Skip video decoding when the peer tile is not visible in the
+                // viewport. The next keyframe after visibility is restored will
+                // allow the decoder to recover naturally.
+                if !self.visible {
+                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                }
+
                 let video_status = self
                     .video
                     .decode(&packet)
@@ -365,6 +379,12 @@ impl Peer {
                         return Ok((media_type, DecodeStatus::SKIPPED, None));
                     }
                 }
+
+                // Skip screen decoding when the peer tile is not visible.
+                if !self.visible {
+                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                }
+
                 let screen_status = self
                     .screen
                     .decode(&packet)
@@ -615,6 +635,26 @@ impl PeerDecodeManager {
 
     pub fn set_vad_threshold(&mut self, threshold: Option<f32>) {
         self.vad_threshold = threshold;
+    }
+
+    /// Update the visibility state for a peer identified by session_id.
+    ///
+    /// When `visible` is `false`, video and screen decoding is paused for this
+    /// peer to save CPU. Audio is always decoded regardless of visibility so
+    /// that off-screen participants can still be heard.
+    ///
+    /// Called by the UI layer when an `IntersectionObserver` detects that a
+    /// peer's canvas element has scrolled in or out of the viewport.
+    pub fn set_peer_visibility(&mut self, session_id: u64, visible: bool) {
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            if peer.visible != visible {
+                debug!(
+                    "Peer {} visibility changed: {} -> {}",
+                    session_id, peer.visible, visible
+                );
+                peer.visible = visible;
+            }
+        }
     }
 
     pub fn sorted_keys(&self) -> &Vec<u64> {
@@ -1034,11 +1074,18 @@ mod tests {
             audio_enabled: false,
             screen_enabled: false,
             display_name: None,
+            visible: true,
             context_initialized: false,
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
             vad_threshold: None,
+            last_video_seq: None,
+            last_screen_seq: None,
+            video_gap_detected_at_ms: None,
+            screen_gap_detected_at_ms: None,
+            last_video_keyframe_request_ms: 0,
+            last_screen_keyframe_request_ms: 0,
         };
         (peer, muted_handle)
     }
@@ -1076,7 +1123,7 @@ mod tests {
         let packet = video_frame_packet(2);
         let result = peer.decode(&packet);
         assert!(result.is_ok());
-        let (_media_type, status) = result.unwrap();
+        let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
         assert!(!status.first_frame, "straggler must not be a first frame");
         assert!(
@@ -1116,7 +1163,7 @@ mod tests {
         let packet = audio_frame_packet(4);
         let result = peer.decode(&packet);
         assert!(result.is_ok());
-        let (_media_type, status) = result.unwrap();
+        let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
         assert!(!status.first_frame, "straggler must not be a first frame");
         assert!(
@@ -1153,7 +1200,7 @@ mod tests {
         let packet = screen_frame_packet(6);
         let result = peer.decode(&packet);
         assert!(result.is_ok());
-        let (_media_type, status) = result.unwrap();
+        let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
         assert!(!status.first_frame, "straggler must not be a first frame");
         assert!(
@@ -1199,7 +1246,7 @@ mod tests {
         let packet = video_frame_packet(8);
         let result = peer.decode(&packet);
         assert!(result.is_ok());
-        let (_media_type, status) = result.unwrap();
+        let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
         assert!(
             !peer.video_enabled,
@@ -1301,7 +1348,7 @@ mod tests {
         let straggler = video_frame_packet(9);
         let result = peer.decode(&straggler);
         assert!(result.is_ok());
-        let (_media_type, status) = result.unwrap();
+        let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
         assert!(!status.first_frame, "straggler must not be a first frame");
         assert!(

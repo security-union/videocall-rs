@@ -267,18 +267,23 @@ impl MicrophoneEncoder {
             let media_info = web_sys::MediaTrackConstraints::new();
 
             // Force exact deviceId match (avoids falling back to the default mic).
-            let exact = js_sys::Object::new();
-            js_sys::Reflect::set(
-                &exact,
-                &JsValue::from_str("exact"),
-                &JsValue::from_str(&device_id),
-            )
-            .unwrap();
+            if device_id.is_empty() {
+                log::warn!("Microphone device_id is empty, using default constraint");
+                constraints.set_audio(&JsValue::TRUE);
+            } else {
+                let exact = js_sys::Object::new();
+                js_sys::Reflect::set(
+                    &exact,
+                    &JsValue::from_str("exact"),
+                    &JsValue::from_str(&device_id),
+                )
+                .unwrap();
 
-            log::info!("MicrophoneEncoder: deviceId.exact = {}", device_id);
-            media_info.set_device_id(&exact.into());
-
-            constraints.set_audio(&media_info.into());
+                log::info!("MicrophoneEncoder: deviceId.exact = {}", device_id);
+                media_info.set_device_id(&exact.into());
+                constraints.set_audio(&media_info.into());
+            }
+            
             constraints.set_video(&Boolean::from(false));
             let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
                 Ok(p) => p,

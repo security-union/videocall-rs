@@ -393,6 +393,7 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    let mut encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
@@ -1325,7 +1326,9 @@ pub fn AttendantsComponent(
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
                                     is_speaking: local_speaking(),
-                                    on_encoder_settings_update: move |_s: String| {},
+                                    on_encoder_settings_update: move |s: String| {
+                                        encoder_settings.set(Some(s));
+                                    },
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {
                                         device_settings_open.set(!device_settings_open());
@@ -1417,6 +1420,7 @@ pub fn AttendantsComponent(
                         video_enabled: video_enabled(),
                         mic_enabled: mic_enabled(),
                         share_screen: screen_share_state().is_sharing(),
+                        encoder_settings: encoder_settings(),
                     }
                 }
             }

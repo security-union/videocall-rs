@@ -35,6 +35,16 @@ pub struct PeerTileProps {
     pub host_user_id: Option<String>,
 }
 
+/// Extract the audio level from a diagnostics event, falling back to
+/// the boolean `is_speaking` flag when the float metric is absent.
+fn resolve_audio_level(audio_lvl: Option<f32>, speaking: Option<bool>) -> Option<f32> {
+    if let Some(lvl) = audio_lvl {
+        Some(lvl)
+    } else {
+        speaking.map(|s| if s { 1.0 } else { 0.0 })
+    }
+}
+
 pub enum Msg {
     Diagnostics(DiagEvent),
     /// Fired by the 1-second hold timer to clear the mic icon back to silent.
@@ -164,11 +174,7 @@ impl Component for PeerTile {
                             }
                         }
                         // Prefer the float audio_level; fall back to boolean
-                        let resolved_level = if let Some(lvl) = audio_lvl {
-                            Some(lvl)
-                        } else {
-                            speaking.map(|s| if s { 1.0 } else { 0.0 })
-                        };
+                        let resolved_level = resolve_audio_level(audio_lvl, speaking);
                         if let Some(lvl) = resolved_level {
                             if (lvl == 0.0 && self.audio_level != 0.0)
                                 || (lvl - self.audio_level).abs() > UI_AUDIO_LEVEL_DELTA
@@ -198,11 +204,7 @@ impl Component for PeerTile {
                             return false;
                         }
 
-                        let resolved_level = if let Some(lvl) = audio_lvl {
-                            Some(lvl)
-                        } else {
-                            speaking.map(|s| if s { 1.0 } else { 0.0 })
-                        };
+                        let resolved_level = resolve_audio_level(audio_lvl, speaking);
                         if let Some(lvl) = resolved_level {
                             let mut changed = false;
                             if (lvl == 0.0 && self.audio_level != 0.0)

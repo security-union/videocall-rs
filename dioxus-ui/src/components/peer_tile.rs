@@ -105,6 +105,16 @@ pub fn PeerTile(
     generate_for_peer(&client, &peer_id, full_bleed, level, mic_level, host_uid)
 }
 
+/// Extract the audio level from a diagnostics event, falling back to
+/// the boolean `is_speaking` flag when the float metric is absent.
+fn resolve_audio_level(audio_lvl: Option<f32>, speaking: Option<bool>) -> Option<f32> {
+    if let Some(lvl) = audio_lvl {
+        Some(lvl)
+    } else {
+        speaking.map(|s| if s { 1.0 } else { 0.0 })
+    }
+}
+
 fn handle_diagnostics_event(
     evt: &DiagEvent,
     peer_id: &str,
@@ -153,11 +163,7 @@ fn handle_diagnostics_event(
                 }
             }
             // Prefer the float audio_level metric; fall back to boolean is_speaking
-            let resolved_level = if let Some(lvl) = audio_lvl {
-                Some(lvl)
-            } else {
-                speaking.map(|s| if s { 1.0 } else { 0.0 })
-            };
+            let resolved_level = resolve_audio_level(audio_lvl, speaking);
             if let Some(lvl) = resolved_level {
                 let prev = *audio_level.peek();
                 if (lvl == 0.0 && prev != 0.0) || (lvl - prev).abs() > UI_AUDIO_LEVEL_DELTA {
@@ -182,11 +188,7 @@ fn handle_diagnostics_event(
             if to_peer.as_deref() != Some(peer_id) {
                 return;
             }
-            let resolved_level = if let Some(lvl) = audio_lvl {
-                Some(lvl)
-            } else {
-                speaking.map(|s| if s { 1.0 } else { 0.0 })
-            };
+            let resolved_level = resolve_audio_level(audio_lvl, speaking);
             if let Some(lvl) = resolved_level {
                 let prev = *audio_level.peek();
                 if (lvl == 0.0 && prev != 0.0) || (lvl - prev).abs() > UI_AUDIO_LEVEL_DELTA {

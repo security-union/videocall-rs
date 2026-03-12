@@ -69,6 +69,23 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32) -> String {
         // Fully silent: fade out both color and filter
         return "color: inherit; filter: none; transition: color 5.0s ease-out, filter 1.5s ease-out;".to_string();
     }
+    // Unreachable in practice: the mic hold timer guarantees mic_audio_level
+    // stays positive at least as long as glow_audio_level. Handle defensively
+    // by showing only the glow without the green icon color.
+    if mic_audio_level <= 0.0 && glow_audio_level > 0.0 {
+        let clamped = glow_audio_level.clamp(0.0, 1.0);
+        let glow_i = clamped.sqrt();
+        return format!(
+            "color: inherit; \
+             filter: drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})) \
+                     drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})); \
+             transition: color 5.0s ease-out, filter 0.15s ease-in;",
+            8.0 + glow_i * 16.0,
+            0.7 + glow_i * 0.3,
+            3.0 + glow_i * 8.0,
+            0.8 + glow_i * 0.2,
+        );
+    }
     if mic_audio_level > 0.0 && glow_audio_level <= 0.0 {
         // Held color (still green) but raw glow has faded — no drop-shadow
         return "color: #00ff41; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;".to_string();

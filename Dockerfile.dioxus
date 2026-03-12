@@ -26,10 +26,11 @@ RUN nix develop .#yew-ui --command bash -c "\
     tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify && \
     trunk build --release"
 
-# Generate a static version.json so nginx can serve it at /version.json
-RUN printf '{"service":"dioxus-ui","version":"%s","git_sha":"%s","git_branch":"%s","build_timestamp":"%s"}\n' \
-    "$(grep '^version' dioxus-ui/Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')" \
-    "$(echo "${GIT_SHA}" | cut -c1-8)" "${GIT_BRANCH}" "${BUILD_TIMESTAMP}" \
+# Generate a static version.json so nginx can serve it at /version.json.
+# Note: sed is not available in the nix base image, so use shell parameter expansion.
+RUN v=$(grep '^version' dioxus-ui/Cargo.toml | head -1) && v="${v#*\"}" && v="${v%\"*}" && \
+    printf '{"service":"dioxus-ui","version":"%s","git_sha":"%s","git_branch":"%s","build_timestamp":"%s"}\n' \
+    "$v" "$(echo "${GIT_SHA}" | cut -c1-8)" "${GIT_BRANCH}" "${BUILD_TIMESTAMP}" \
     > dioxus-ui/dist/version.json
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,11 @@ pub const RMS_LOUD_SPEECH_CEILING: f32 = 0.10;
 /// Prevents excessive event emissions while maintaining smooth visual updates.
 pub const AUDIO_LEVEL_DELTA_THRESHOLD: f32 = 0.02;
 
+/// Minimum change in audio level before triggering a UI re-render.
+/// Tighter than `AUDIO_LEVEL_DELTA_THRESHOLD` (used codec-side) to ensure
+/// smooth visual transitions while still suppressing no-op updates.
+pub const UI_AUDIO_LEVEL_DELTA: f32 = 0.01;
+
 /// How often (in ms) the local microphone VAD analysis runs.
 pub const VAD_POLL_INTERVAL_MS: u32 = 100;
 

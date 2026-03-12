@@ -16,6 +16,10 @@
  * conditions.
  */
 
+use crate::audio_constants::{
+    rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
+    VAD_POLL_INTERVAL_MS, VAD_SMOOTHING_TIME_CONSTANT,
+};
 use crate::audio_worklet_codec::EncoderInitOptions;
 use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
 use crate::constants::AUDIO_CHANNELS;
@@ -32,7 +36,7 @@ use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::Uint8Array;
 use protobuf::Message;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -101,8 +105,6 @@ pub struct MicrophoneEncoder {
     vad_threshold: f32,
 }
 
-const DEFAULT_VAD_THRESHOLD: f32 = 0.02;
-
 impl MicrophoneEncoder {
     pub fn new(
         client: VideoCallClient,
@@ -156,9 +158,10 @@ impl MicrophoneEncoder {
                 if let Some(interval) = self.vad_interval.borrow_mut().take() {
                     drop(interval);
                 }
-                // Reset speaking state when mic is disabled
+                // Reset speaking state and audio level when mic is disabled
                 self.is_speaking.store(false, Ordering::Relaxed);
                 self.client.set_speaking(false);
+                self.client.set_audio_level(0.0);
             };
         }
         is_changed
@@ -173,9 +176,10 @@ impl MicrophoneEncoder {
         if let Some(interval) = self.vad_interval.borrow_mut().take() {
             drop(interval);
         }
-        // Reset speaking state when encoder stops
+        // Reset speaking state and audio level when encoder stops
         self.is_speaking.store(false, Ordering::Relaxed);
         self.client.set_speaking(false);
+        self.client.set_audio_level(0.0);
     }
 
     pub fn start(&mut self) {
@@ -267,18 +271,23 @@ impl MicrophoneEncoder {
             let media_info = web_sys::MediaTrackConstraints::new();
 
             // Force exact deviceId match (avoids falling back to the default mic).
-            let exact = js_sys::Object::new();
-            js_sys::Reflect::set(
-                &exact,
-                &JsValue::from_str("exact"),
-                &JsValue::from_str(&device_id),
-            )
-            .unwrap();
+            if device_id.is_empty() {
+                log::warn!("Microphone device_id is empty, using default constraint");
+                constraints.set_audio(&JsValue::TRUE);
+            } else {
+                let exact = js_sys::Object::new();
+                js_sys::Reflect::set(
+                    &exact,
+                    &JsValue::from_str("exact"),
+                    &JsValue::from_str(&device_id),
+                )
+                .unwrap();
 
-            log::info!("MicrophoneEncoder: deviceId.exact = {}", device_id);
-            media_info.set_device_id(&exact.into());
+                log::info!("MicrophoneEncoder: deviceId.exact = {}", device_id);
+                media_info.set_device_id(&exact.into());
+                constraints.set_audio(&media_info.into());
+            }
 
-            constraints.set_audio(&media_info.into());
             constraints.set_video(&Boolean::from(false));
             let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
                 Ok(p) => p,
@@ -371,8 +380,8 @@ impl MicrophoneEncoder {
                     return;
                 }
             };
-            analyser.set_fft_size(2048);
-            analyser.set_smoothing_time_constant(0.8);
+            analyser.set_fft_size(VAD_FFT_SIZE);
+            analyser.set_smoothing_time_constant(VAD_SMOOTHING_TIME_CONSTANT);
 
             let worklet = match codec
                 .create_node(
@@ -449,15 +458,24 @@ impl MicrophoneEncoder {
             let is_speaking_clone = is_speaking_for_vad.clone();
             let client_clone = client_for_vad.clone();
 
+            let prev_audio_level = Rc::new(Cell::new(0.0f32));
+            let prev_level_clone = prev_audio_level.clone();
+
             // LOCAL user Voice Activity Detection (VAD) via AnalyserNode.
             //
             // This runs every 100ms and computes the RMS energy of the
             // microphone's time-domain signal.  The resulting `is_speaking`
             // flag is included in the 1Hz heartbeat so that *remote* peers
             // can show a speaking indicator for this user.
-            let vad_interval = Interval::new(100, move || {
+            let vad_interval = Interval::new(VAD_POLL_INTERVAL_MS, move || {
                 if !enabled_check.load(Ordering::Acquire) || switching_check.load(Ordering::Acquire)
                 {
+                    // Reset audio level to zero when mic is disabled/switching
+                    let prev_lvl = prev_level_clone.get();
+                    if prev_lvl > 0.0 {
+                        prev_level_clone.set(0.0);
+                        client_clone.set_audio_level(0.0);
+                    }
                     return;
                 }
 
@@ -471,6 +489,17 @@ impl MicrophoneEncoder {
                 let rms = (sum / array.len() as f32).sqrt();
 
                 let speaking = rms > vad_threshold;
+
+                // Compute normalized intensity using the shared perceptual
+                // curve so the host tile shows a smooth, intensity-driven glow.
+                let intensity = rms_to_intensity(rms, vad_threshold);
+
+                // Emit audio level when it changes meaningfully.
+                let prev_lvl = prev_level_clone.get();
+                if (intensity - prev_lvl).abs() > AUDIO_LEVEL_DELTA_THRESHOLD {
+                    prev_level_clone.set(intensity);
+                    client_clone.set_audio_level(intensity);
+                }
 
                 log::trace!("VAD: RMS={:.4}, speaking={}", rms, speaking);
 
@@ -486,7 +515,7 @@ impl MicrophoneEncoder {
             *vad_interval_holder.borrow_mut() = Some(vad_interval);
 
             // Monitor for stop conditions and clean up when needed
-            let check_interval = 100; // Check every 100ms
+            let check_interval = VAD_POLL_INTERVAL_MS as i32; // Check every VAD_POLL_INTERVAL_MS
             let enabled_check_monitor = enabled.clone();
             let switching_check_monitor = switching.clone();
             loop {
@@ -511,6 +540,7 @@ impl MicrophoneEncoder {
 
                     is_speaking_for_vad.store(false, Ordering::Relaxed);
                     client_for_vad.set_speaking(false);
+                    client_for_vad.set_audio_level(0.0);
 
                     if let Some(interval) = vad_interval_holder.borrow_mut().take() {
                         drop(interval);

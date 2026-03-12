@@ -41,7 +41,10 @@
       "Bash(WASM_BINDGEN_TEST_NO_HEADLESS=1 CHROMEDRIVER=/opt/homebrew/bin/chromedriver cargo test:*)",
       "WebFetch(domain:dioxuslabs.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:docs.rs)"
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:crates.io)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo test:*)"
     ]
   }
 }

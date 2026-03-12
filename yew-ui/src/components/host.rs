@@ -28,7 +28,8 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
 use crate::components::{
-    device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
+    canvas_generator::speak_style, device_selector::DeviceSelector,
+    device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
@@ -75,6 +76,7 @@ pub struct Host {
     show_change_name: bool,
     pending_name: String,
     change_name_error: Option<String>,
+    last_reload_counter: u32,
 }
 
 pub struct EncoderSettings {
@@ -113,7 +115,7 @@ pub struct MeetingProps {
     pub video_enabled: bool,
 
     #[prop_or_default]
-    pub is_speaking: bool,
+    pub audio_level: f32,
 
     pub on_encoder_settings_update: Callback<String>,
 
@@ -134,6 +136,7 @@ pub struct MeetingProps {
     /// Called when screen share state changes (started, cancelled, stopped).
     /// This allows the parent component to react to screen share lifecycle events.
     pub on_screen_share_state: Callback<ScreenShareEvent>,
+    pub reload_devices_counter: u32,
 }
 
 impl Component for Host {
@@ -248,10 +251,15 @@ impl Component for Host {
             show_change_name: false,
             pending_name: String::new(),
             change_name_error: None,
+            last_reload_counter: 0,
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if ctx.props().reload_devices_counter != self.last_reload_counter {
+            self.media_devices.load();
+            self.last_reload_counter = ctx.props().reload_devices_counter;
+        }
         if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
             self.share_screen = ctx.props().share_screen;
             let link = ctx.link().clone();
@@ -490,6 +498,62 @@ impl Component for Host {
                 }
             }
             Msg::DevicesLoaded => {
+                let audio_id_str = self.media_devices.audio_inputs.selected();
+                let video_id_str = self.media_devices.video_inputs.selected();
+
+                let (client, _) = ctx
+                    .link()
+                    .context::<VideoCallClientCtx>(Callback::noop())
+                    .expect("VideoCallClient context missing");
+
+                if audio_id_str == "" {
+                    let microphone_callback = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::MicrophoneEncoderSettingsUpdated(s))
+                    });
+                    let microphone_error_cb = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::MicrophoneError(s))
+                    });
+
+                    let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
+                    self.microphone = create_microphone_encoder(
+                        client.clone(),
+                        audio_bitrate,
+                        microphone_callback,
+                        microphone_error_cb.clone(),
+                        vad_threshold().ok(),
+                    );
+
+                    let (tx, rx) = mpsc::unbounded();
+                    client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
+                    self.microphone.set_encoder_control(rx);
+                }
+
+                if video_id_str == "" {
+                    let camera_callback = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::CameraEncoderSettingsUpdated(s))
+                    });
+                    let camera_error_cb = VcCallback::from({
+                        let link = ctx.link().clone();
+                        move |s: String| link.send_message(Msg::CameraError(s))
+                    });
+
+                    let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
+                    self.camera = CameraEncoder::new(
+                        client.clone(),
+                        VIDEO_ELEMENT_ID,
+                        video_bitrate,
+                        camera_callback,
+                        camera_error_cb,
+                    );
+
+                    let (tx, rx) = mpsc::unbounded();
+                    client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
+                    self.camera.set_encoder_control(rx);
+                }
+
                 let audio_device_id = self.media_devices.audio_inputs.selected();
                 let video_device_id = self.media_devices.video_inputs.selected();
                 let speaker_device_id = self.media_devices.audio_outputs.selected();
@@ -541,28 +605,27 @@ impl Component for Host {
         let selected_camera_id = self.media_devices.video_inputs.selected();
         let selected_speaker_id = self.media_devices.audio_outputs.selected();
 
-        let speaking_class = if ctx.props().is_speaking {
-            "speaking-tile"
-        } else {
-            ""
-        };
+        let audio_level = ctx.props().audio_level;
+        let glow = speak_style(audio_level);
 
         html! {
             <>
                 {
                     if ctx.props().video_enabled {
                         html! {
-                            <div class={classes!("host-video-wrapper", speaking_class)} style="position:relative;">
+                            <div class="host-video-wrapper" style="position:relative;">
                                 <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
                                 <button class="change-name-fab" title="Change name"
                                     onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
                                 </button>
+                                // Glow overlay renders ON TOP of the video element
+                                <div class="glow-overlay" style={glow.clone()}></div>
                             </div>
                         }
                     } else {
                         html! {
-                            <div class={classes!("", speaking_class)} style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative;">
+                            <div style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent;">
                                 <div class="placeholder-content">
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                         <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
@@ -574,6 +637,8 @@ impl Component for Host {
                                     onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
                                 </button>
+                                // Glow overlay renders ON TOP of content
+                                <div class="glow-overlay" style={glow}></div>
                             </div>
                         }
                     }

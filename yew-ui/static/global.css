@@ -339,6 +339,26 @@ body {
     inset 0 1px 0 var(--glass-highlight);
 }
 
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+}
+
+.modal-content {
+  background: #1C1C1E;
+  padding: 2rem;
+  border-radius: 16px;
+  text-align: center;
+  color: white;
+  max-width: 400px;
+  width: 90%;
+}
+
 @media (max-width: 768px) {
   .hero-container { padding: 1rem 0; }
   .hero-content {
@@ -573,6 +593,27 @@ body {
     0 8px 20px -3px rgba(121, 40, 202, 0.5),
     0 0 0 1px rgba(121, 40, 202, 0.5),
     inset 0 1px rgba(255, 255, 255, 0.15);
+}
+
+.video-control-button .device-warning {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #FF453A;
+  color: #FFFFFF;
+  font-size: 12px;
+  font-weight: 700;
+  border-radius: 50%;
+  box-shadow: 
+    0 0 0 2px #1C1C1E,
+    0 0 10px rgba(255, 69, 58, 0.6);
+  z-index: 2;
+  pointer-events: none;
 }
 
 .video-control-button.danger {

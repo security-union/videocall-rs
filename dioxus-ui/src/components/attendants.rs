@@ -45,14 +45,39 @@ use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
-    MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+    MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
+    PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
+use wasm_bindgen::{closure::Closure, JsCast};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
     Idle,
     Requesting,
     Active,
+}
+
+pub enum MediaErrorState {
+    NoDevice,
+    PermissionDenied,
+    Other,
+}
+
+fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
+    match err {
+        MediaErrorState::NoDevice => rsx! {
+            p { " {device} not found on this device." }
+        },
+        MediaErrorState::Other => rsx! {
+            p { " {device} has an unexpected problem." }
+        },
+        MediaErrorState::PermissionDenied => rsx! {
+            p { " {device} is blocked in your browser." }
+            p { style: "front-size: 0.9rem; opacity: 0.8;",
+                "Please click the lock icon in your browser's address bar and allow access if you want to use it."
+            }
+        },
+    }
 }
 
 impl ScreenShareState {
@@ -368,6 +393,7 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    let mut encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
@@ -379,7 +405,14 @@ pub fn AttendantsComponent(
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
+    let mic_error = use_signal(|| None::<MediaErrorState>);
+    let video_error = use_signal(|| None::<MediaErrorState>);
+    let mut show_device_warning = use_signal(|| false);
+    let reload_devices_counter = use_signal(|| 0u32);
+    let mut device_was_denied = use_signal(|| false);
+    let session_loaded = use_signal(|| false);
     let local_speaking = use_signal(|| false);
+    let local_audio_level = use_signal(|| 0.0f32);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
@@ -448,8 +481,10 @@ pub fn AttendantsComponent(
                 log::info!("DIOXUS-UI: Connection established");
                 let mut connection_error = connection_error;
                 let mut call_start_time = call_start_time;
+                let mut session_loaded = session_loaded;
                 connection_error.set(None);
                 call_start_time.set(Some(js_sys::Date::now()));
+                session_loaded.set(true);
             }),
             on_connection_lost: {
                 let id = id.clone();
@@ -532,6 +567,10 @@ pub fn AttendantsComponent(
             on_speaking_changed: Some(VcCallback::from(move |speaking: bool| {
                 let mut s = local_speaking;
                 s.set(speaking);
+            })),
+            on_audio_level_changed: Some(VcCallback::from(move |level: f32| {
+                let mut s = local_audio_level;
+                s.set(level);
             })),
             vad_threshold: crate::constants::vad_threshold().ok(),
             on_meeting_activated: None,
@@ -632,41 +671,107 @@ pub fn AttendantsComponent(
     let mda = use_hook(|| {
         let mut mda = MediaDeviceAccess::new();
         let client_cell = RefCell::new(client.clone());
-        mda.on_granted = VcCallback::from(move |_| {
+        mda.on_result = VcCallback::from(move |permit: MediaPermission| {
+            let mut connection_error = connection_error;
             let mut media_access_granted = media_access_granted;
             let mut meeting_joined = meeting_joined;
             let mut mic_enabled = mic_enabled;
             let mut video_enabled = video_enabled;
             let mut pending_mic_enable = pending_mic_enable;
             let mut pending_video_enable = pending_video_enable;
+            let mut mic_error = mic_error;
+            let mut video_error = video_error;
+            let mut show_device_warning = show_device_warning;
+            let mut reload_devices_counter = reload_devices_counter;
+            let mut device_was_denied = device_was_denied;
+
+            connection_error.set(None);
+            mic_error.set(None);
+            video_error.set(None);
             media_access_granted.set(true);
 
             // Fulfil any pending mic/camera enables that triggered the permission request.
-            if pending_mic_enable() {
+            if matches!(permit.audio, PermissionState::Granted) && pending_mic_enable() {
                 mic_enabled.set(true);
                 pending_mic_enable.set(false);
             }
-            if pending_video_enable() {
+            if matches!(permit.video, PermissionState::Granted) && pending_video_enable() {
                 video_enabled.set(true);
                 pending_video_enable.set(false);
             }
 
-            // Connect after permissions granted
-            if let Err(e) = client_cell.borrow_mut().connect() {
-                log::error!("Connection failed: {e:?}");
+            match &permit.audio {
+                PermissionState::Denied(MediaPermissionsErrorState::NoDevice) => {
+                    mic_error.set(Some(MediaErrorState::NoDevice));
+                }
+                PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied) => {
+                    mic_error.set(Some(MediaErrorState::PermissionDenied));
+                }
+                PermissionState::Denied(MediaPermissionsErrorState::Other(_)) => {
+                    mic_error.set(Some(MediaErrorState::Other));
+                }
+                _ => {}
             }
-            meeting_joined.set(true);
-        });
-        mda.on_denied = VcCallback::from(move |e| {
-            let mut connection_error = connection_error;
-            let mut meeting_joined = meeting_joined;
-            let complete_error = format!("Error requesting permissions: Please make sure to allow access to both camera and microphone. ({e:?})");
-            error!("{complete_error}");
-            connection_error.set(Some(complete_error));
-            meeting_joined.set(false);
+
+            match &permit.video {
+                PermissionState::Denied(MediaPermissionsErrorState::NoDevice) => {
+                    video_error.set(Some(MediaErrorState::NoDevice));
+                }
+                PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied) => {
+                    video_error.set(Some(MediaErrorState::PermissionDenied));
+                }
+                PermissionState::Denied(MediaPermissionsErrorState::Other(_)) => {
+                    video_error.set(Some(MediaErrorState::Other));
+                }
+                _ => {}
+            }
+
+            if (mic_error.read().is_some() || video_error.read().is_some()) && !session_loaded() {
+                show_device_warning.set(true);
+                meeting_joined.set(false);
+            } else {
+                if let Err(e) = client_cell.borrow_mut().connect() {
+                    log::error!("Connection failed: {e:?}");
+                }
+                meeting_joined.set(true);
+            }
+
+            if device_was_denied() {
+                device_was_denied.set(false);
+                reload_devices_counter.set(reload_devices_counter() + 1);
+            }
         });
         Rc::new(RefCell::new(mda))
     });
+
+    // Re-check permissions when the window regains focus, mirroring Yew behavior.
+    {
+        let mda = mda.clone();
+        use_effect(move || {
+            let value = mda.clone();
+            let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+                let mic_denied = matches!(
+                    mic_error.read().as_ref(),
+                    Some(MediaErrorState::PermissionDenied)
+                );
+                let video_denied = matches!(
+                    video_error.read().as_ref(),
+                    Some(MediaErrorState::PermissionDenied)
+                );
+
+                if mic_denied || video_denied {
+                    device_was_denied.set(true);
+                }
+                value.borrow().request();
+            }) as Box<dyn FnMut(_)>);
+
+            if let Some(win) = web_sys::window() {
+                let _ =
+                    win.add_event_listener_with_callback("focus", closure.as_ref().unchecked_ref());
+            }
+            closure.forget();
+        });
+    }
 
     // Provide contexts for child components
     use_context_provider(|| client.clone());
@@ -734,10 +839,8 @@ pub fn AttendantsComponent(
         }) as Box<dyn FnMut()>);
 
         if let Some(win) = web_sys::window() {
-            let _ = win.add_event_listener_with_callback(
-                "resize",
-                closure.as_ref().unchecked_ref(),
-            );
+            let _ =
+                win.add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref());
         }
         closure.forget();
     });
@@ -876,6 +979,36 @@ pub fn AttendantsComponent(
                             mda.borrow().request();
                         },
                         if is_owner { "Start Meeting" } else { "Join Meeting" }
+                    }
+                    if show_device_warning() {
+                        div { class: "modal-overlay",
+                            div { class: "modal-window",
+                                h3 { "Device access problem" }
+                                if let Some(err) = mic_error.read().as_ref() {
+                                    { render_single_device_error("Microphone", err) }
+                                }
+                                if let Some(err) = video_error.read().as_ref() {
+                                    { render_single_device_error("Camera", err) }
+                                }
+                                {
+                                    let mut client = client.clone();
+                                    rsx! {
+                                        button {
+                                            class: "btn-apple btn-primary",
+                                            style: "margin-top: 1.5rem;",
+                                            onclick: move |_| {
+                                                show_device_warning.set(false);
+                                                if let Err(e) = client.connect() {
+                                                    error!("Connection failed: {e:?}");
+                                                }
+                                                meeting_joined.set(true);
+                                            },
+                                            "Ok"
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1038,9 +1171,10 @@ pub fn AttendantsComponent(
                                         rsx! {
                                             MicButton {
                                                 enabled: mic_enabled(),
+                                                available: mic_error.read().is_none(),
                                                 onclick: move |_| {
                                                     if !mic_enabled() {
-                                                        if media_access_granted() {
+                                                        if mda_mic.borrow().is_granted(MediaAccessKind::AudioCheck) {
                                                             mic_enabled.set(true);
                                                         } else {
                                                             pending_mic_enable.set(true);
@@ -1058,9 +1192,10 @@ pub fn AttendantsComponent(
                                         rsx! {
                                             CameraButton {
                                                 enabled: video_enabled(),
+                                                available: video_error.read().is_none(),
                                                 onclick: move |_| {
                                                     if !video_enabled() {
-                                                        if media_access_granted() {
+                                                        if mda_cam.borrow().is_granted(MediaAccessKind::VideoCheck) {
                                                             video_enabled.set(true);
                                                             // "Warm up" the video element in this user-gesture
                                                             // call stack.  Safari blocks play() outside user
@@ -1192,7 +1327,7 @@ pub fn AttendantsComponent(
                                     share_screen: screen_share_state().is_sharing(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
-                                    is_speaking: local_speaking(),
+                                    audio_level: local_audio_level(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {
@@ -1220,6 +1355,7 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     },
+                                    reload_devices_counter: reload_devices_counter(),
                                 }
                             }
                             {
@@ -1284,6 +1420,7 @@ pub fn AttendantsComponent(
                         video_enabled: video_enabled(),
                         mic_enabled: mic_enabled(),
                         share_screen: screen_share_state().is_sharing(),
+                        encoder_settings: encoder_settings(),
                     }
                 }
             }

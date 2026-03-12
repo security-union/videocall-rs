@@ -27,7 +27,8 @@ use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShar
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use crate::components::{
-    device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
+    canvas_generator::speak_style, device_selector::DeviceSelector,
+    device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
@@ -66,13 +67,14 @@ pub fn Host(
     share_screen: bool,
     mic_enabled: bool,
     video_enabled: bool,
-    #[props(default)] is_speaking: bool,
+    #[props(default)] audio_level: f32,
     on_encoder_settings_update: EventHandler<String>,
     device_settings_open: bool,
     on_device_settings_toggle: EventHandler<MouseEvent>,
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
+    reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -185,6 +187,7 @@ pub fn Host(
             prev_mic_enabled: false,
             prev_video_enabled: false,
             initialized: false,
+            last_reload_counter: 0,
         }))
     });
 
@@ -200,6 +203,7 @@ pub fn Host(
     // Initialize devices once
     {
         let state = state.clone();
+        let value = client.clone();
         use_effect(move || {
             let state_for_loaded = state.clone();
             let mut s = state.borrow_mut();
@@ -283,7 +287,53 @@ pub fn Host(
                         .forget();
                     }
                 });
-                s.media_devices.on_devices_changed = VcCallback::noop();
+                let state_for_devices_changed = state.clone();
+                let client_for_devices_changed = value.clone();
+                s.media_devices.on_devices_changed = VcCallback::from(move |_| {
+                    let mut s = state_for_devices_changed.borrow_mut();
+
+                    let audio_device_id = s.media_devices.audio_inputs.selected();
+                    let video_device_id = s.media_devices.video_inputs.selected();
+                    let speaker_device_id = s.media_devices.audio_outputs.selected();
+
+                    let mut mic_needs_start = false;
+                    if !audio_device_id.is_empty() {
+                        s.media_devices.audio_inputs.select(&audio_device_id);
+                        mic_needs_start = s.microphone.select(audio_device_id);
+                    }
+
+                    let mut cam_needs_start = false;
+                    if !video_device_id.is_empty() {
+                        s.media_devices.video_inputs.select(&video_device_id);
+                        cam_needs_start = s.camera.select(video_device_id);
+                    }
+
+                    if !speaker_device_id.is_empty() {
+                        s.media_devices.audio_outputs.select(&speaker_device_id);
+                        if let Err(e) = client_for_devices_changed
+                            .update_speaker_device(Some(speaker_device_id))
+                        {
+                            log::error!("Failed to update speaker device: {e:?}");
+                        }
+                    }
+
+                    drop(s);
+
+                    if mic_needs_start {
+                        let sc = state_for_devices_changed.clone();
+                        Timeout::new(1000, move || {
+                            sc.borrow_mut().microphone.start();
+                        })
+                        .forget();
+                    }
+                    if cam_needs_start {
+                        let sc = state_for_devices_changed.clone();
+                        Timeout::new(1000, move || {
+                            sc.borrow_mut().camera.start();
+                        })
+                        .forget();
+                    }
+                });
                 s.media_devices.load();
                 s.initialized = true;
             }
@@ -296,6 +346,11 @@ pub fn Host(
     // function itself re-runs whenever the parent passes new prop values.
     {
         let mut s = state.borrow_mut();
+
+        if s.last_reload_counter != reload_devices_counter {
+            s.media_devices.load();
+            s.last_reload_counter = reload_devices_counter;
+        }
 
         log::info!(
             "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
@@ -446,6 +501,8 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
+    let glow = speak_style(audio_level);
+
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
         // The camera encoder attaches srcObject via JS; if Dioxus recreates
@@ -453,11 +510,11 @@ pub fn Host(
         // Dioxus patches individual CSS properties (doesn't replace the whole
         // style attribute), so both branches must set ALL properties explicitly.
         div {
-            class: if is_speaking && video_enabled { "host-video-wrapper speaking-tile" } else { "host-video-wrapper" },
+            class: "host-video-wrapper",
             style: if video_enabled {
-                "position:relative; width:auto; height:auto; opacity:1; overflow:hidden; pointer-events:auto;"
+                "position:relative; width:auto; height:auto; opacity:1; overflow:hidden; pointer-events:auto;".to_string()
             } else {
-                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
+                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;".to_string()
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
             button {
@@ -473,11 +530,17 @@ pub fn Host(
                     path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
                 }
             }
+            // Glow overlay renders ON TOP of the video element
+            if video_enabled {
+                div {
+                    style: "{glow}",
+                    class: "glow-overlay",
+                }
+            }
         }
         if !video_enabled {
             div {
-                class: if is_speaking { "speaking-tile" } else { "" },
-                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative;",
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
@@ -497,6 +560,11 @@ pub fn Host(
                         path { d: "M12 20h9" }
                         path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
                     }
+                }
+                // Glow overlay renders ON TOP of content
+                div {
+                    style: "{glow}",
+                    class: "glow-overlay",
                 }
             }
         }
@@ -639,4 +707,5 @@ struct HostState {
     prev_mic_enabled: bool,
     prev_video_enabled: bool,
     initialized: bool,
+    last_reload_counter: u32,
 }

@@ -276,6 +276,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     on_participant_rejected: None,
                     on_waiting_room_updated: None,
                     on_speaking_changed: None,
+                    on_audio_level_changed: None,
                     vad_threshold: None,
                     on_peer_left: None,
                     on_peer_joined: None,

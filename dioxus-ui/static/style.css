@@ -832,6 +832,41 @@ select {
   text-align: center;
 }
 
+/* Build Info Styles */
+.build-info-table {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 2px 10px;
+  font-size: 0.85em;
+}
+.build-info-header {
+  display: contents;
+}
+.build-info-header .build-info-cell {
+  color: #888;
+  font-weight: 600;
+  border-bottom: 1px solid #444;
+  padding-bottom: 4px;
+  margin-bottom: 2px;
+}
+.build-info-row {
+  display: contents;
+}
+.build-info-cell {
+  color: #fff;
+  padding: 2px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.build-info-cell.monospace {
+  font-family: monospace;
+  color: #4fc3f7;
+}
+.build-info-cell.build-info-service {
+  color: #ccc;
+}
+
 /* NetEQ Chart Styles */
 .neteq-chart {
   display: flex;

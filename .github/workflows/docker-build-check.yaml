@@ -50,6 +50,10 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.event.pull_request.head.sha }}
+            GIT_BRANCH=${{ github.head_ref }}
+            BUILD_TIMESTAMP=${{ github.event.pull_request.updated_at }}
 
   build-meeting-api:
     name: Build Meeting API Docker image
@@ -69,6 +73,10 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.event.pull_request.head.sha }}
+            GIT_BRANCH=${{ github.head_ref }}
+            BUILD_TIMESTAMP=${{ github.event.pull_request.updated_at }}
 
   build-ui:
     name: Build UI Docker image
@@ -88,6 +96,10 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.event.pull_request.head.sha }}
+            GIT_BRANCH=${{ github.head_ref }}
+            BUILD_TIMESTAMP=${{ github.event.pull_request.updated_at }}
 
   build-website:
     name: Build Website Docker image

@@ -25,7 +25,7 @@ use dioxus::prelude::*;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
 use gloo_timers::callback::Timeout;
-use videocall_client::audio_constants::UI_AUDIO_LEVEL_DELTA;
+use videocall_client::audio_constants::{MIC_HOLD_DURATION_MS, UI_AUDIO_LEVEL_DELTA};
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 
 #[component]
@@ -224,7 +224,7 @@ fn update_mic_audio_level(
             return;
         }
         let mut sig = *mic_audio_level;
-        let timeout = Timeout::new(1_000, move || {
+        let timeout = Timeout::new(MIC_HOLD_DURATION_MS, move || {
             sig.set(0.0);
         });
         *mic_hold_timeout.borrow_mut() = Some(timeout);

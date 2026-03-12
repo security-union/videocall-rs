@@ -20,7 +20,7 @@ use crate::components::canvas_generator::generate_for_peer;
 use crate::context::VideoCallClientCtx;
 use futures::future::{AbortHandle, Abortable};
 use gloo_timers::callback::Timeout;
-use videocall_client::audio_constants::UI_AUDIO_LEVEL_DELTA;
+use videocall_client::audio_constants::{MIC_HOLD_DURATION_MS, UI_AUDIO_LEVEL_DELTA};
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use yew::prelude::*;
 
@@ -267,7 +267,7 @@ impl PeerTile {
                 return false;
             }
             let link = ctx.link().clone();
-            let timeout = Timeout::new(1_000, move || {
+            let timeout = Timeout::new(MIC_HOLD_DURATION_MS, move || {
                 link.send_message(Msg::MicHoldExpired);
             });
             self.mic_hold_timeout = Some(timeout);

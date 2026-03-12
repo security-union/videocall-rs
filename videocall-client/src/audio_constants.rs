@@ -48,6 +48,11 @@ pub const VAD_FFT_SIZE: u32 = 2048;
 /// Smoothing time constant for the Web Audio AnalyserNode (0.0–1.0).
 pub const VAD_SMOOTHING_TIME_CONSTANT: f64 = 0.8;
 
+/// How long (in ms) the mic icon stays green after audio drops to zero.
+/// The border glow fades immediately; the mic icon holds to give a clear
+/// visual indication that the participant was recently speaking.
+pub const MIC_HOLD_DURATION_MS: u32 = 1_000;
+
 /// Convert raw RMS energy to a perceptual intensity value (0.0–1.0).
 /// Uses sqrt curve for perceptual loudness mapping.
 pub fn rms_to_intensity(rms: f32, vad_threshold: f32) -> f32 {

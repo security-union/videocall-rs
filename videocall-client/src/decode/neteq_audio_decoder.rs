@@ -1,3 +1,4 @@
+use crate::adaptive_quality_constants::{AUDIO_RED_FORMAT, AUDIO_RED_SEQ_HISTORY_SIZE};
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD,
@@ -73,6 +74,11 @@ pub struct NetEqAudioPeerDecoder {
     // Voice activity detection state
     speaking: Rc<RefCell<bool>>,
     audio_level: Rc<RefCell<f32>>,
+
+    /// Ring buffer of recently received audio sequence numbers.
+    /// Used to detect whether a redundant frame carried in a RED packet
+    /// was already received, avoiding duplicate injection.
+    received_sequences: VecDeque<u64>,
 }
 
 impl NetEqAudioPeerDecoder {
@@ -517,6 +523,9 @@ impl NetEqAudioPeerDecoder {
             // Voice activity detection state
             speaking: Rc::new(RefCell::new(false)),
             audio_level: Rc::new(RefCell::new(0.0)),
+
+            // RED redundancy: track recently received sequence numbers
+            received_sequences: VecDeque::with_capacity(AUDIO_RED_SEQ_HISTORY_SIZE),
         };
 
         // Set up worker message handling with decoder's queue references
@@ -582,6 +591,54 @@ impl NetEqAudioPeerDecoder {
 
         Ok(Box::new(decoder))
     }
+
+    /// Record a sequence number as received for RED deduplication.
+    fn record_sequence(&mut self, seq: u64) {
+        if self.received_sequences.len() >= AUDIO_RED_SEQ_HISTORY_SIZE {
+            self.received_sequences.pop_front();
+        }
+        self.received_sequences.push_back(seq);
+    }
+
+    /// Check whether a sequence number was already received.
+    fn has_sequence(&self, seq: u64) -> bool {
+        self.received_sequences.contains(&seq)
+    }
+
+    /// Unpack a RED-encoded audio data buffer.
+    ///
+    /// Expected format:
+    /// `[4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]`
+    ///
+    /// Returns `(primary_data, redundant_sequence, redundant_data)` or `None` if
+    /// the buffer is too short or malformed.
+    fn unpack_red_audio(data: &[u8]) -> Option<(Vec<u8>, u32, Vec<u8>)> {
+        // Minimum: 4 (primary_len) + 0 (primary) + 4 (redundant_seq) + 0 (redundant)
+        if data.len() < 8 {
+            return None;
+        }
+
+        let primary_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+        // Validate: primary_len + 4 (itself) + 4 (redundant_seq) must not exceed total
+        let redundant_seq_offset = 4 + primary_len;
+        if redundant_seq_offset + 4 > data.len() {
+            return None;
+        }
+
+        let primary_data = data[4..4 + primary_len].to_vec();
+
+        let redundant_seq = u32::from_le_bytes([
+            data[redundant_seq_offset],
+            data[redundant_seq_offset + 1],
+            data[redundant_seq_offset + 2],
+            data[redundant_seq_offset + 3],
+        ]);
+
+        let redundant_data = data[redundant_seq_offset + 4..].to_vec();
+
+        Some((primary_data, redundant_seq, redundant_data))
+    }
 }
 
 impl Drop for NetEqAudioPeerDecoder {
@@ -594,15 +651,71 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         match packet.audio_metadata.as_ref() {
             Some(audio_meta) => {
-                // Normal path – send the packet to the NetEq worker through queue
-                let insert = WorkerMsg::Insert {
-                    seq: audio_meta.sequence as u16,
-                    timestamp: packet.timestamp as u32,
-                    payload: packet.data.clone(),
-                };
+                let seq = audio_meta.sequence;
 
-                // Send through queue (will be immediate if worker ready, queued otherwise)
-                self.send_worker_message(insert);
+                // Track this sequence number so we can detect duplicates from
+                // redundancy payloads later.
+                self.record_sequence(seq);
+
+                // Check whether the packet carries RED-style redundancy.
+                let is_red = audio_meta.audio_format == AUDIO_RED_FORMAT;
+
+                if is_red {
+                    // Unpack the RED payload:
+                    // [4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]
+                    if let Some((primary, redundant_seq, redundant_data)) =
+                        Self::unpack_red_audio(&packet.data)
+                    {
+                        // First, check if the redundant frame was lost (not yet received).
+                        if !self.has_sequence(redundant_seq as u64) {
+                            log::debug!(
+                                "RED recovery: injecting lost audio seq {} for peer {}",
+                                redundant_seq,
+                                self.peer_id
+                            );
+                            self.record_sequence(redundant_seq as u64);
+                            // Inject the recovered frame with its original sequence and
+                            // an earlier timestamp (20ms before the primary, matching
+                            // the Opus frame duration).
+                            let recovered_insert = WorkerMsg::Insert {
+                                seq: redundant_seq as u16,
+                                timestamp: (packet.timestamp as u32).saturating_sub(20),
+                                payload: redundant_data,
+                            };
+                            self.send_worker_message(recovered_insert);
+                        }
+
+                        // Now send the primary frame.
+                        let insert = WorkerMsg::Insert {
+                            seq: seq as u16,
+                            timestamp: packet.timestamp as u32,
+                            payload: primary,
+                        };
+                        self.send_worker_message(insert);
+                    } else {
+                        // RED unpack failed -- fall back to treating the whole
+                        // data blob as a single frame.
+                        log::warn!(
+                            "RED unpack failed for peer {} seq {}, falling back to raw",
+                            self.peer_id,
+                            seq
+                        );
+                        let insert = WorkerMsg::Insert {
+                            seq: seq as u16,
+                            timestamp: packet.timestamp as u32,
+                            payload: packet.data.clone(),
+                        };
+                        self.send_worker_message(insert);
+                    }
+                } else {
+                    // Standard (non-RED) audio packet.
+                    let insert = WorkerMsg::Insert {
+                        seq: seq as u16,
+                        timestamp: packet.timestamp as u32,
+                        payload: packet.data.clone(),
+                    };
+                    self.send_worker_message(insert);
+                }
 
                 let first_frame = !self.decoded;
                 self.decoded = true;

@@ -157,6 +157,11 @@ pub fn Host(
             screen_state_cb,
         );
 
+        // Wire up congestion step-down and PLI keyframe flags
+        camera.set_congestion_step_down_flag(client.congestion_step_down_flag());
+        camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
+        screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
+
         // Wire up encoder controls
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);

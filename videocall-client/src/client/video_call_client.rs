@@ -155,6 +155,10 @@ struct Inner {
     force_camera_keyframe: Arc<AtomicBool>,
     /// Flag set by incoming KEYFRAME_REQUEST for screen share.
     force_screen_keyframe: Arc<AtomicBool>,
+    /// Flag set when a CONGESTION signal is received from the server.
+    /// The camera encoder's diagnostics loop checks this flag and calls
+    /// `force_video_step_down()` on the `EncoderBitrateController`.
+    congestion_step_down_requested: Arc<AtomicBool>,
 }
 
 /// The main client handle for a video call session.
@@ -246,6 +250,7 @@ impl VideoCallClient {
 
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
+        let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
 
         let client = Self {
             options: options.clone(),
@@ -281,6 +286,7 @@ impl VideoCallClient {
                 recent_peer_events: HashMap::new(),
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
+                congestion_step_down_requested: congestion_step_down_requested.clone(),
             })),
             connection_controller,
             aes,
@@ -685,6 +691,19 @@ impl VideoCallClient {
     pub fn force_screen_keyframe_flag(&self) -> Arc<AtomicBool> {
         if let Ok(inner) = self.inner.try_borrow() {
             inner.force_screen_keyframe.clone()
+        } else {
+            Arc::new(AtomicBool::new(false))
+        }
+    }
+
+    /// Returns a shared reference to the congestion step-down flag.
+    ///
+    /// Pass this to `CameraEncoder` so that incoming CONGESTION signals from
+    /// the server trigger an immediate quality tier step-down via the
+    /// `EncoderBitrateController`.
+    pub fn congestion_step_down_flag(&self) -> Arc<AtomicBool> {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner.congestion_step_down_requested.clone()
         } else {
             Arc::new(AtomicBool::new(false))
         }
@@ -1293,6 +1312,24 @@ impl Inner {
                     error!("Failed to parse MeetingPacket: {e}");
                 }
             },
+            Ok(PacketType::CONGESTION) => {
+                // Server-side congestion feedback: the server is dropping
+                // packets destined for a receiver because the outbound channel
+                // is full. Only act on it if the target session matches ours.
+                if self.own_session_id == Some(response.session_id) {
+                    warn!(
+                        "Received CONGESTION signal from server (receiver: {}), requesting quality step-down",
+                        String::from_utf8_lossy(&response.user_id),
+                    );
+                    self.congestion_step_down_requested
+                        .store(true, Ordering::Release);
+                } else {
+                    debug!(
+                        "Ignoring CONGESTION signal targeted at session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
+                    );
+                }
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

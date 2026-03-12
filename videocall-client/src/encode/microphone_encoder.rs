@@ -16,7 +16,9 @@
  * conditions.
  */
 
-use crate::adaptive_quality_constants::{AUDIO_QUALITY_TIERS, VAD_POLL_INTERVAL_MS};
+use crate::adaptive_quality_constants::{
+    AUDIO_QUALITY_TIERS, AUDIO_REDUNDANCY_ENABLED, AUDIO_RED_FORMAT, VAD_POLL_INTERVAL_MS,
+};
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
     VAD_SMOOTHING_TIME_CONSTANT,
@@ -61,26 +63,62 @@ use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
 use web_time::SystemTime;
 
+/// Holds the previous audio frame for RED-style redundancy.
+pub(crate) struct PreviousAudioFrame {
+    data: Vec<u8>,
+    sequence: u64,
+}
+
+/// Pack primary and redundant audio frames into a single data buffer.
+///
+/// Format: `[4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]`
+///
+/// The receiver uses `primary_len` to split the buffer and `redundant_seq`
+/// to check whether the redundant frame was already received.
+fn pack_redundant_audio(primary: &[u8], redundant: &PreviousAudioFrame) -> Vec<u8> {
+    let primary_len = primary.len() as u32;
+    let redundant_seq = redundant.sequence as u32;
+    let total_len = 4 + primary.len() + 4 + redundant.data.len();
+    let mut buf = Vec::with_capacity(total_len);
+    buf.extend_from_slice(&primary_len.to_le_bytes());
+    buf.extend_from_slice(primary);
+    buf.extend_from_slice(&redundant_seq.to_le_bytes());
+    buf.extend_from_slice(&redundant.data);
+    buf
+}
+
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,
     user_id: &str,
     sequence: u64,
     aes: Rc<Aes128State>,
+    previous_frame: Option<&PreviousAudioFrame>,
 ) -> PacketWrapper {
     let now_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_millis() as f64;
-    // chunk length in bytes
+
+    let primary_data = chunk.to_vec();
+
+    // Determine whether to include redundancy.
+    let (data, audio_format) = match previous_frame {
+        Some(prev) => {
+            let packed = pack_redundant_audio(&primary_data, prev);
+            (packed, AUDIO_RED_FORMAT.to_string())
+        }
+        None => (primary_data, String::new()),
+    };
 
     let media_packet: MediaPacket = MediaPacket {
         user_id: Vec::new(),
         media_type: MediaType::AUDIO.into(),
         frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
-        data: chunk.to_vec(),
+        data,
         timestamp: now_ms,
         audio_metadata: Some(AudioMetadata {
             sequence,
+            audio_format,
             ..Default::default()
         })
         .into(),
@@ -108,6 +146,10 @@ pub struct MicrophoneEncoder {
     /// Tier-controlled audio bitrate in bps (e.g. 50000 for 50 kbps).
     /// Updated by the diagnostics loop when the audio tier changes.
     tier_audio_bitrate: Rc<AtomicU32>,
+    /// Whether the current audio tier has FEC enabled.
+    /// When true AND `AUDIO_REDUNDANCY_ENABLED`, each packet carries the
+    /// previous frame as redundant data for loss recovery.
+    tier_enable_fec: Rc<AtomicBool>,
 }
 
 impl MicrophoneEncoder {
@@ -119,6 +161,7 @@ impl MicrophoneEncoder {
         vad_threshold: Option<f32>,
     ) -> Self {
         let default_audio_bitrate_bps = AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000;
+        let default_enable_fec = AUDIO_QUALITY_TIERS[0].enable_fec;
         Self {
             client,
             state: EncoderState::new(),
@@ -129,6 +172,7 @@ impl MicrophoneEncoder {
             vad_interval: Rc::new(RefCell::new(None)),
             vad_threshold: vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD),
             tier_audio_bitrate: Rc::new(AtomicU32::new(default_audio_bitrate_bps)),
+            tier_enable_fec: Rc::new(AtomicBool::new(default_enable_fec)),
         }
     }
 
@@ -141,6 +185,7 @@ impl MicrophoneEncoder {
         mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
     ) {
         let tier_audio_bitrate = self.tier_audio_bitrate.clone();
+        let tier_enable_fec = self.tier_enable_fec.clone();
         // We create a bitrate controller here to feed the adaptive quality manager.
         // The audio encoder does not do PID-based bitrate control itself, but we need
         // the quality manager to track conditions and select audio tiers.
@@ -155,19 +200,22 @@ impl MicrophoneEncoder {
                 // Feed the packet to get the quality manager to process it.
                 let _ = encoder_control.process_diagnostics_packet(packet);
 
-                // Check if audio tier changed and update the shared bitrate atomic.
+                // Check if audio tier changed and update the shared bitrate and FEC atomics.
                 if encoder_control.take_tier_changed() {
                     let audio_tier = encoder_control.current_audio_tier();
                     let new_bitrate_bps = audio_tier.bitrate_kbps * 1000;
                     tier_audio_bitrate.store(new_bitrate_bps, Ordering::Relaxed);
+                    tier_enable_fec.store(audio_tier.enable_fec, Ordering::Relaxed);
                     log::info!(
-                        "MicrophoneEncoder: audio tier changed to '{}' ({}kbps)",
+                        "MicrophoneEncoder: audio tier changed to '{}' ({}kbps, fec={})",
                         audio_tier.label,
                         audio_tier.bitrate_kbps,
+                        audio_tier.enable_fec,
                     );
-                    // TODO: Apply enable_dtx and enable_fec when WebCodecs AudioEncoder
-                    // supports dynamic reconfiguration of these parameters. Currently
-                    // the Opus encoder worklet only accepts bitrate changes via Init.
+                    // TODO: Apply enable_dtx dynamically when the AudioWorklet
+                    // (encoderWorker.min.js) is updated to handle runtime
+                    // reconfiguration messages. The enable_fec flag is now used
+                    // for application-layer RED redundancy (see audio output handler).
                 }
             }
         });
@@ -240,11 +288,16 @@ impl MicrophoneEncoder {
 
         // Clone atomic values for use in different closures
         let enabled_for_handler = enabled.clone();
+        let enable_fec_for_handler = self.tier_enable_fec.clone();
 
         let audio_output_handler = {
             log::info!("Starting Microphone audio encoder with AnalyserNode VAD");
-            let mut sequence_number = 0;
+            let mut sequence_number: u64 = 0;
             let client_for_send = client.clone();
+            // Buffer for RED-style redundancy: stores the previous frame's
+            // encoded data and sequence number so it can be included in the
+            // next packet for loss recovery.
+            let mut previous_frame: Option<PreviousAudioFrame> = None;
 
             Box::new(move |chunk: MessageEvent| {
                 // Check if encoder should stop
@@ -269,9 +322,34 @@ impl MicrophoneEncoder {
 
                 let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
-                    let packet: PacketWrapper =
-                        transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
+                    // Decide whether to include redundancy based on the
+                    // AUDIO_REDUNDANCY_ENABLED constant and the current tier's
+                    // enable_fec flag.
+                    let use_redundancy = AUDIO_REDUNDANCY_ENABLED
+                        && enable_fec_for_handler.load(Ordering::Relaxed)
+                        && previous_frame.is_some();
+
+                    let red_ref = if use_redundancy {
+                        previous_frame.as_ref()
+                    } else {
+                        None
+                    };
+
+                    let packet: PacketWrapper = transform_audio_chunk(
+                        &data,
+                        &user_id,
+                        sequence_number,
+                        aes.clone(),
+                        red_ref,
+                    );
                     client_for_send.send_media_packet(packet);
+
+                    // Store current frame as the previous frame for the next
+                    // iteration's redundancy payload.
+                    previous_frame = Some(PreviousAudioFrame {
+                        data: data.to_vec(),
+                        sequence: sequence_number,
+                    });
                     sequence_number += 1;
                 } else {
                     log::error!("Received non-MessageEvent: {chunk:?}");
@@ -436,12 +514,20 @@ impl MicrophoneEncoder {
             codec.set_onmessage(output_handler.as_ref().unchecked_ref());
             output_handler.forget();
 
+            // Use the tier-controlled bitrate (defaults to AUDIO_QUALITY_TIERS[0]),
+            // and pass FEC/DTX settings from the initial audio tier.
+            // NOTE: FEC and DTX require AudioWorklet support; the fields are
+            // serialized here for forward-compatibility but the worklet currently
+            // ignores them.  See audio_worklet_codec.rs for details.
+            let initial_tier = &AUDIO_QUALITY_TIERS[0];
             let _ = codec.send_message(&CodecMessages::Init {
                 options: Some(EncoderInitOptions {
                     encoder_frame_size: Some(20), // 20ms frames for 50Hz rate
                     original_sample_rate: Some(input_rate),
-                    encoder_bit_rate: Some(50_000_u32),
+                    encoder_bit_rate: Some(initial_tier.bitrate_kbps * 1000),
                     encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
+                    encoder_fec: Some(initial_tier.enable_fec),
+                    encoder_dtx: Some(initial_tier.enable_dtx),
                     ..Default::default()
                 }),
             });

@@ -26,3 +26,20 @@ pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Regex pattern for validating usernames and room IDs
 /// Allows alphanumeric characters, underscores, and hyphens
 pub const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]*$";
+
+// ---------------------------------------------------------------------------
+// Server Congestion Feedback
+// ---------------------------------------------------------------------------
+
+/// Number of dropped outbound packets within [`CONGESTION_WINDOW`] that triggers
+/// a CONGESTION notification back to the sender whose packets are being dropped.
+pub const CONGESTION_DROP_THRESHOLD: u32 = 5;
+
+/// Time window over which drops are counted. Drop counters reset after this
+/// window elapses without new drops.
+pub const CONGESTION_WINDOW: Duration = Duration::from_millis(1000);
+
+/// Minimum interval between CONGESTION notifications sent to the same sender
+/// session. Prevents flooding the sender with congestion signals when many
+/// packets are dropped in quick succession.
+pub const CONGESTION_NOTIFY_MIN_INTERVAL: Duration = Duration::from_millis(1000);

@@ -107,7 +107,7 @@ pub fn should_use_datagram(data: &[u8]) -> bool {
 
     // Only use datagrams for MEDIA packet type.
     // Other types (RSA_PUB_KEY, AES_KEY, CONNECTION, DIAGNOSTICS, HEALTH,
-    // MEETING, SESSION_ASSIGNED) must use reliable streams.
+    // MEETING, SESSION_ASSIGNED, CONGESTION) must use reliable streams.
     if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
         return packet_wrapper.packet_type == PacketType::MEDIA.into();
     }

@@ -275,6 +275,42 @@ impl AdaptiveQualityManager {
     pub fn audio_tier_index(&self) -> usize {
         self.audio_tier_index
     }
+
+    /// Force an immediate step-down of the video quality tier.
+    ///
+    /// Used when the server sends a CONGESTION signal indicating that outbound
+    /// packets to a receiver are being dropped. This bypasses the normal
+    /// reaction-time delay and hysteresis, but still respects the minimum
+    /// transition interval to avoid cascading step-downs.
+    ///
+    /// Returns `true` if the tier actually changed (not already at the lowest).
+    pub fn force_video_step_down(&mut self, now_ms: f64) -> bool {
+        let max_video_index = self.video_tiers.len().saturating_sub(1);
+        if self.video_tier_index >= max_video_index {
+            return false;
+        }
+
+        let time_since_last = now_ms - self.last_transition_time_ms;
+        if time_since_last < MIN_TIER_TRANSITION_INTERVAL_MS as f64 {
+            log::debug!(
+                "AdaptiveQuality: congestion step-down blocked by min transition interval ({:.0}ms < {}ms)",
+                time_since_last,
+                MIN_TIER_TRANSITION_INTERVAL_MS,
+            );
+            return false;
+        }
+
+        self.video_tier_index += 1;
+        self.last_transition_time_ms = now_ms;
+        self.degrade_start_ms = None;
+        self.recover_start_ms = None;
+        log::warn!(
+            "AdaptiveQuality: CONGESTION forced video step-down to tier '{}' (index {})",
+            self.video_tiers[self.video_tier_index].label,
+            self.video_tier_index,
+        );
+        true
+    }
 }
 
 #[cfg(test)]

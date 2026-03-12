@@ -25,6 +25,9 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::{classify_packet, PacketKind};
 use crate::client_diagnostics::health_processor;
+use crate::constants::{
+    CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
+};
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::{
@@ -32,9 +35,14 @@ use crate::server_diagnostics::{
 };
 use crate::session_manager::SessionManager;
 use actix::Addr;
+use protobuf::Message as ProtobufMessage;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info, trace};
+use std::time::Instant;
+use tracing::{error, info, trace, warn};
 use uuid::Uuid;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub type SessionId = u64;
 pub type RoomId = String;
@@ -62,6 +70,88 @@ pub enum InboundAction {
     KeepAlive,
 }
 
+// =========================================================================
+// Congestion Tracking
+// =========================================================================
+
+/// Per-sender drop tracking state for congestion feedback.
+struct SenderDropState {
+    /// Number of drops in the current window.
+    drop_count: u32,
+    /// Start of the current counting window.
+    window_start: Instant,
+    /// Last time a CONGESTION notification was sent for this sender.
+    last_notify: Option<Instant>,
+}
+
+/// Tracks outbound packet drops per sender and generates CONGESTION feedback
+/// when the drop rate exceeds the configured threshold.
+///
+/// Each receiver session has its own `CongestionTracker`. When the receiver's
+/// outbound channel is full, the transport layer calls
+/// [`CongestionTracker::record_drop`] with the sender's session ID. If enough
+/// drops accumulate within the configured window, a CONGESTION `PacketWrapper`
+/// is generated for publication to NATS so the sender can step down its
+/// quality tier.
+pub struct CongestionTracker {
+    /// Drop state keyed by sender session ID.
+    senders: HashMap<u64, SenderDropState>,
+}
+
+impl Default for CongestionTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CongestionTracker {
+    pub fn new() -> Self {
+        Self {
+            senders: HashMap::new(),
+        }
+    }
+
+    /// Record a dropped outbound packet from the given sender.
+    ///
+    /// Returns `Some(sender_session_id)` when the drop threshold has been
+    /// exceeded and a CONGESTION notification should be sent. Returns `None`
+    /// if the threshold has not been met or the notification is rate-limited.
+    pub fn record_drop(&mut self, sender_session_id: u64) -> Option<u64> {
+        let now = Instant::now();
+        let state = self
+            .senders
+            .entry(sender_session_id)
+            .or_insert_with(|| SenderDropState {
+                drop_count: 0,
+                window_start: now,
+                last_notify: None,
+            });
+
+        // Reset window if it has elapsed.
+        if now.duration_since(state.window_start) > CONGESTION_WINDOW {
+            state.drop_count = 0;
+            state.window_start = now;
+        }
+
+        state.drop_count += 1;
+
+        if state.drop_count >= CONGESTION_DROP_THRESHOLD {
+            // Rate-limit notifications.
+            if let Some(last) = state.last_notify {
+                if now.duration_since(last) < CONGESTION_NOTIFY_MIN_INTERVAL {
+                    return None;
+                }
+            }
+            state.last_notify = Some(now);
+            state.drop_count = 0;
+            state.window_start = now;
+            Some(sender_session_id)
+        } else {
+            None
+        }
+    }
+}
+
 /// Shared session logic, transport-agnostic.
 ///
 /// This struct contains all the business logic for a chat session.
@@ -81,6 +171,8 @@ pub struct SessionLogic {
     /// When true, this session is observer-only: it can receive messages
     /// but cannot publish media to the room.
     pub observer: bool,
+    /// Tracks outbound packet drops per sender to generate CONGESTION feedback.
+    pub congestion_tracker: CongestionTracker,
 }
 
 impl SessionLogic {
@@ -112,6 +204,7 @@ impl SessionLogic {
             tracker_sender,
             session_manager,
             observer,
+            congestion_tracker: CongestionTracker::new(),
         }
     }
 
@@ -269,6 +362,57 @@ impl SessionLogic {
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_sent(self.id, msg.msg.len() as u64);
         msg.msg.clone()
+    }
+
+    // =========================================================================
+    // Congestion Feedback
+    // =========================================================================
+
+    /// Record that an outbound packet from `sender_session_id` was dropped
+    /// because the outbound channel to this receiver was full.
+    ///
+    /// If the drop threshold is exceeded, a CONGESTION `PacketWrapper` is
+    /// published to NATS so the sender's client can step down its quality
+    /// tier. The notification is rate-limited per sender session.
+    pub fn on_outbound_drop(&mut self, sender_session_id: u64) {
+        if let Some(sender_sid) = self.congestion_tracker.record_drop(sender_session_id) {
+            warn!(
+                "Congestion: session {} dropping packets from sender {}, sending CONGESTION signal",
+                self.id, sender_sid,
+            );
+
+            // Build a CONGESTION PacketWrapper targeted at the sender.
+            // The `user_id` is set to our session's user_id so the sender
+            // knows which receiver is congested. The `session_id` is set to
+            // the sender's session_id so NATS routing delivers it there.
+            let congestion_packet = PacketWrapper {
+                packet_type: PacketType::CONGESTION.into(),
+                user_id: self.user_id.as_bytes().to_vec(),
+                session_id: sender_sid,
+                ..Default::default()
+            };
+
+            match congestion_packet.write_to_bytes() {
+                Ok(bytes) => {
+                    // Publish to the room's NATS subject. The sender's
+                    // subscription filter (`room.{room}.*`) will pick this up.
+                    // We use `room.{room}.congestion.{sender_sid}` as the
+                    // subject, which matches the wildcard `room.{room}.*`
+                    // that all sessions subscribe to.
+                    let subject = format!("room.{}.congestion", self.room.replace(' ', "_"),);
+                    let nc = self.nats_client.clone();
+                    let bytes = bytes::Bytes::from(bytes);
+                    tokio::spawn(async move {
+                        if let Err(e) = nc.publish(subject, bytes).await {
+                            error!("Failed to publish CONGESTION signal: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to serialize CONGESTION packet: {}", e);
+                }
+            }
+        }
     }
 }
 

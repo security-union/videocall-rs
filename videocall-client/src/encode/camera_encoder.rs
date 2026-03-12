@@ -91,6 +91,10 @@ pub struct CameraEncoder {
     /// detects missing frames and sends a KEYFRAME_REQUEST, the VideoCallClient
     /// sets this flag so the encoder produces an immediate keyframe.
     force_keyframe: Arc<AtomicBool>,
+    /// When set to `true`, the encoder control loop calls
+    /// `force_video_step_down()` on the next iteration. Set by the
+    /// `VideoCallClient` when a CONGESTION signal arrives from the server.
+    congestion_step_down: Arc<AtomicBool>,
 }
 
 impl CameraEncoder {
@@ -126,6 +130,7 @@ impl CameraEncoder {
             tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
+            congestion_step_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -140,12 +145,23 @@ impl CameraEncoder {
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
+        let congestion_flag = self.congestion_step_down.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
                 current_fps.clone(),
             );
             while let Some(event) = diagnostics_receiver.next().await {
+                // Check for server congestion step-down request before
+                // processing the diagnostics packet so the forced step-down
+                // takes effect immediately.
+                if congestion_flag.swap(false, Ordering::AcqRel) {
+                    log::warn!(
+                        "CameraEncoder: server CONGESTION signal received, forcing video step-down"
+                    );
+                    encoder_control.force_video_step_down();
+                }
+
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
                     if enabled.load(Ordering::Acquire) {
@@ -163,9 +179,10 @@ impl CameraEncoder {
                     }
                 }
 
-                // Check if the quality manager triggered a tier change.
-                // If so, update the shared atomics so the encoding loop picks
-                // up the new resolution and keyframe interval.
+                // Check if the quality manager triggered a tier change
+                // (either from regular adaptation OR from the forced congestion
+                // step-down above). Update shared atomics so the encoding loop
+                // picks up the new resolution and keyframe interval.
                 if encoder_control.take_tier_changed() {
                     let tier = encoder_control.current_video_tier();
                     tier_max_width.store(tier.max_width, Ordering::Relaxed);
@@ -210,6 +227,14 @@ impl CameraEncoder {
     /// which sets it when a remote peer sends a KEYFRAME_REQUEST.
     pub fn set_force_keyframe_flag(&mut self, flag: Arc<AtomicBool>) {
         self.force_keyframe = flag;
+    }
+
+    /// Replace the internal congestion step-down flag with an externally-owned one.
+    ///
+    /// Call this after construction to share the flag with `VideoCallClient`,
+    /// which sets it when a server CONGESTION signal is received.
+    pub fn set_congestion_step_down_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.congestion_step_down = flag;
     }
 
     // The next three methods delegate to self.state

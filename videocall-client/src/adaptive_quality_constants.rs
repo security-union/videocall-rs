@@ -347,3 +347,39 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 /// fragmentation across diverse network paths. Packets larger than this
 /// threshold fall back to reliable unidirectional streams.
 pub const DATAGRAM_MAX_SIZE: usize = 1200;
+
+// ---------------------------------------------------------------------------
+// Audio Redundancy (RED-style encoding)
+// ---------------------------------------------------------------------------
+
+/// Enable redundant audio when FEC flag is set in AudioQualityTier.
+/// Each audio packet carries the previous frame as redundancy.
+/// Increases audio bandwidth by ~2x but provides loss recovery.
+pub const AUDIO_REDUNDANCY_ENABLED: bool = true;
+
+/// Audio format string signaling that a packet contains redundant data.
+/// When this value appears in `AudioMetadata.audio_format`, the `data` field
+/// uses the packed format: `[4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]`.
+pub const AUDIO_RED_FORMAT: &str = "opus-red";
+
+/// Number of recent audio sequence numbers to track on the receiver side
+/// for deduplication of redundant frames. A small window suffices because
+/// redundancy only covers the immediately previous frame.
+pub const AUDIO_RED_SEQ_HISTORY_SIZE: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Server Congestion Feedback
+// ---------------------------------------------------------------------------
+
+/// Number of dropped packets within `CONGESTION_WINDOW_MS` that triggers a
+/// CONGESTION notification back to the sender.
+pub const CONGESTION_DROP_THRESHOLD: u32 = 5;
+
+/// Time window (milliseconds) over which drops are counted. Drop counters
+/// reset after this window elapses without new drops.
+pub const CONGESTION_WINDOW_MS: u64 = 1000;
+
+/// Minimum interval between CONGESTION notifications sent to the same sender
+/// (milliseconds). Prevents flooding the sender with congestion signals when
+/// many packets are dropped in quick succession.
+pub const CONGESTION_NOTIFY_MIN_INTERVAL_MS: u64 = 1000;

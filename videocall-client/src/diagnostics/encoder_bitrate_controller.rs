@@ -484,6 +484,21 @@ impl EncoderBitrateController {
     pub fn audio_tier_index(&self) -> usize {
         self.quality_manager.audio_tier_index()
     }
+
+    /// Force an immediate video quality step-down due to server congestion.
+    ///
+    /// Delegates to [`AdaptiveQualityManager::force_video_step_down`].
+    /// Returns `true` if the tier actually changed.
+    pub fn force_video_step_down(&mut self) -> bool {
+        let now = Date::now();
+        let changed = self.quality_manager.force_video_step_down(now);
+        if changed {
+            self.tier_changed = true;
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+        }
+        changed
+    }
 }
 
 #[cfg(test)]

@@ -55,6 +55,16 @@ pub enum WtOutbound {
     Datagram(Bytes),
 }
 
+/// Result of attempting to send an outbound message to the WebTransport channel.
+enum WtSendResult {
+    /// Message sent successfully.
+    Sent,
+    /// Channel is full; message was dropped.
+    Dropped,
+    /// Channel is closed; connection is dead.
+    Dead,
+}
+
 /// Source of inbound data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WtInboundSource {
@@ -155,7 +165,7 @@ impl WtChatSession {
     /// Media packets (VIDEO, AUDIO, SCREEN) that fit within the datagram MTU
     /// are sent via unreliable datagrams for lower latency. Control packets
     /// and oversized media packets use reliable unidirectional streams.
-    fn send_auto(&self, data: Vec<u8>) -> bool {
+    fn send_auto(&self, data: Vec<u8>) -> WtSendResult {
         let outbound = if should_use_datagram(&data) {
             WtOutbound::Datagram(data.into())
         } else {
@@ -163,20 +173,20 @@ impl WtChatSession {
         };
 
         match self.outbound_tx.try_send(outbound) {
-            Ok(()) => true,
+            Ok(()) => WtSendResult::Sent,
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!(
                     "Outbound channel closed for session {}, connection dead",
                     self.logic.id
                 );
-                false
+                WtSendResult::Dead
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 error!(
                     "Outbound channel full for session {}, dropping message",
                     self.logic.id
                 );
-                true // Channel still open, just full
+                WtSendResult::Dropped
             }
         }
     }
@@ -295,10 +305,18 @@ impl Handler<Message> for WtChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
+        let sender_session = msg.session;
         let bytes = self.logic.handle_outbound(&msg);
-        if !self.send_auto(bytes) {
-            // Channel closed - connection is dead, stop the actor
-            ctx.stop();
+        match self.send_auto(bytes) {
+            WtSendResult::Sent => {}
+            WtSendResult::Dead => {
+                ctx.stop();
+            }
+            WtSendResult::Dropped => {
+                // Outbound channel full -- record the drop for this sender
+                // so we can send CONGESTION feedback when the threshold is exceeded.
+                self.logic.on_outbound_drop(sender_session);
+            }
         }
     }
 }

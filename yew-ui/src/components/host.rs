@@ -203,6 +203,15 @@ impl Component for Host {
             screen_state_callback,
         );
 
+        // Wire up the congestion step-down flag so that server CONGESTION
+        // signals trigger an immediate video quality tier step-down.
+        camera.set_congestion_step_down_flag(client.congestion_step_down_flag());
+
+        // Wire up PLI keyframe flags so KEYFRAME_REQUEST packets from
+        // remote peers force an immediate keyframe from our encoders.
+        camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
+        screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
+
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
         camera.set_encoder_control(rx);
@@ -548,6 +557,10 @@ impl Component for Host {
                         camera_callback,
                         camera_error_cb,
                     );
+                    self.camera
+                        .set_congestion_step_down_flag(client.congestion_step_down_flag());
+                    self.camera
+                        .set_force_keyframe_flag(client.force_camera_keyframe_flag());
 
                     let (tx, rx) = mpsc::unbounded();
                     client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);

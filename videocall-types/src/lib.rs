@@ -48,6 +48,9 @@ impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
             protos::media_packet::media_packet::MediaType::SCREEN => write!(f, "screen"),
             protos::media_packet::media_packet::MediaType::HEARTBEAT => write!(f, "heartbeat"),
             protos::media_packet::media_packet::MediaType::RTT => write!(f, "rtt"),
+            protos::media_packet::media_packet::MediaType::KEYFRAME_REQUEST => {
+                write!(f, "keyframe_request")
+            }
         }
     }
 }

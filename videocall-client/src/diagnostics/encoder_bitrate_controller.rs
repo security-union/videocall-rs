@@ -23,9 +23,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use js_sys::Date;
 
 use crate::adaptive_quality_constants::{
-    PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
-    PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN,
+    AudioQualityTier, VideoQualityTier, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
+    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
+    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
+use crate::diagnostics::adaptive_quality_manager::AdaptiveQualityManager;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -229,10 +231,26 @@ pub struct EncoderBitrateController {
     diagnostic_packets: DiagnosticPackets,
     last_correction_time: f64,
     correction_throttle_ms: f64,
+    /// Adaptive quality state machine for tier selection.
+    quality_manager: AdaptiveQualityManager,
+    /// Set to `true` after any tier transition, cleared by the caller via
+    /// [`Self::take_tier_changed`].
+    tier_changed: bool,
 }
 
 impl EncoderBitrateController {
+    /// Create a new bitrate controller using the default `VIDEO_QUALITY_TIERS`.
     pub fn new(ideal_bitrate_kbps: u32, target_fps: Rc<AtomicU32>) -> Self {
+        Self::new_with_tiers(ideal_bitrate_kbps, target_fps, VIDEO_QUALITY_TIERS)
+    }
+
+    /// Create a new bitrate controller using a custom video tier array
+    /// (e.g., `SCREEN_QUALITY_TIERS` for screen share).
+    pub fn new_with_tiers(
+        ideal_bitrate_kbps: u32,
+        target_fps: Rc<AtomicU32>,
+        video_tiers: &'static [VideoQualityTier],
+    ) -> Self {
         let initial_target = target_fps.load(Ordering::Relaxed) as f64;
 
         // Configure PID: setpoint = target FPS, process_value = received FPS.
@@ -262,6 +280,8 @@ impl EncoderBitrateController {
             diagnostic_packets,
             last_correction_time: 0.0,
             correction_throttle_ms: PID_CORRECTION_THROTTLE_MS,
+            quality_manager: AdaptiveQualityManager::new(video_tiers),
+            tier_changed: false,
         }
     }
 
@@ -395,8 +415,33 @@ impl EncoderBitrateController {
             corrected_bitrate.clamp(min_bitrate, max_bitrate)
         };
 
+        // --- Adaptive quality manager: tier selection ---
+        // Feed the same signals to the quality manager for tier transitions.
+        let tier = self.quality_manager.current_video_tier();
+        let ideal_for_tier = tier.ideal_bitrate_kbps as f64;
+        let tier_changed = self.quality_manager.update(
+            fps_received,
+            target_fps,
+            final_bitrate,
+            ideal_for_tier,
+            now,
+        );
+        if tier_changed {
+            self.tier_changed = true;
+            // Update internal ideal bitrate to match the new tier so PID
+            // operates within the new tier's range going forward.
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+        }
+
+        // Clamp the PID output to the current tier's bitrate bounds.
+        let tier = self.quality_manager.current_video_tier();
+        let tier_min = tier.min_bitrate_kbps as f64;
+        let tier_max = tier.max_bitrate_kbps as f64;
+        let tier_clamped = final_bitrate.clamp(tier_min, tier_max);
+
         self.last_correction_time = now;
-        Some(final_bitrate)
+        Some(tier_clamped)
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
@@ -411,6 +456,33 @@ impl EncoderBitrateController {
     // Get all active peer IDs
     pub fn peer_ids(&self) -> Vec<String> {
         self.diagnostic_packets.get_peer_ids()
+    }
+
+    /// Returns `true` if a tier transition occurred since the last call to this
+    /// method, then resets the flag. Callers should use this to detect when
+    /// encoder settings (resolution, fps, keyframe interval) need updating.
+    pub fn take_tier_changed(&mut self) -> bool {
+        std::mem::take(&mut self.tier_changed)
+    }
+
+    /// Get the current video quality tier recommendation.
+    pub fn current_video_tier(&self) -> &'static VideoQualityTier {
+        self.quality_manager.current_video_tier()
+    }
+
+    /// Get the current audio quality tier recommendation.
+    pub fn current_audio_tier(&self) -> &'static AudioQualityTier {
+        self.quality_manager.current_audio_tier()
+    }
+
+    /// Get the current video tier index.
+    pub fn video_tier_index(&self) -> usize {
+        self.quality_manager.video_tier_index()
+    }
+
+    /// Get the current audio tier index.
+    pub fn audio_tier_index(&self) -> usize {
+        self.quality_manager.audio_tier_index()
     }
 }
 

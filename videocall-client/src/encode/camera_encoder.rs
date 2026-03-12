@@ -54,7 +54,7 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    BITRATE_CHANGE_THRESHOLD, CAMERA_KEYFRAME_INTERVAL_FRAMES,
+    BITRATE_CHANGE_THRESHOLD, CAMERA_KEYFRAME_INTERVAL_FRAMES, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
@@ -79,6 +79,13 @@ pub struct CameraEncoder {
     current_fps: Rc<AtomicU32>,
     on_encoder_settings_update: Callback<String>,
     on_error: Option<Callback<String>>,
+    /// Tier-controlled max width. The encoding loop checks this and reconfigures
+    /// the encoder when it changes. 0 means "use camera native resolution".
+    tier_max_width: Rc<AtomicU32>,
+    /// Tier-controlled max height.
+    tier_max_height: Rc<AtomicU32>,
+    /// Tier-controlled keyframe interval (frames).
+    tier_keyframe_interval: Rc<AtomicU32>,
 }
 
 impl CameraEncoder {
@@ -101,6 +108,7 @@ impl CameraEncoder {
         on_encoder_settings_update: Callback<String>,
         on_error: Callback<String>,
     ) -> Self {
+        let default_tier = &VIDEO_QUALITY_TIERS[0];
         Self {
             client,
             video_elem_id: video_elem_id.to_string(),
@@ -109,6 +117,11 @@ impl CameraEncoder {
             current_fps: Rc::new(AtomicU32::new(0)),
             on_encoder_settings_update,
             on_error: Some(on_error),
+            tier_max_width: Rc::new(AtomicU32::new(default_tier.max_width)),
+            tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
+            tier_keyframe_interval: Rc::new(AtomicU32::new(
+                default_tier.keyframe_interval_frames,
+            )),
         }
     }
 
@@ -120,6 +133,9 @@ impl CameraEncoder {
         let current_fps = self.current_fps.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
+        let tier_max_width = self.tier_max_width.clone();
+        let tier_max_height = self.tier_max_height.clone();
+        let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -141,6 +157,25 @@ impl CameraEncoder {
                     } else {
                         on_encoder_settings_update.emit("Disabled".to_string());
                     }
+                }
+
+                // Check if the quality manager triggered a tier change.
+                // If so, update the shared atomics so the encoding loop picks
+                // up the new resolution and keyframe interval.
+                if encoder_control.take_tier_changed() {
+                    let tier = encoder_control.current_video_tier();
+                    tier_max_width.store(tier.max_width, Ordering::Relaxed);
+                    tier_max_height.store(tier.max_height, Ordering::Relaxed);
+                    tier_keyframe_interval
+                        .store(tier.keyframe_interval_frames, Ordering::Relaxed);
+                    log::info!(
+                        "CameraEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
+                        tier.label,
+                        tier.max_width,
+                        tier.max_height,
+                        tier.target_fps,
+                        tier.keyframe_interval_frames,
+                    );
                 }
             }
         });
@@ -196,6 +231,9 @@ impl CameraEncoder {
         } = self.state.clone();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let tier_max_width = self.tier_max_width.clone();
+        let tier_max_height = self.tier_max_height.clone();
+        let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let video_output_handler = {
             let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
             let mut sequence_number = 0;
@@ -448,7 +486,7 @@ impl CameraEncoder {
                 .unchecked_into::<ReadableStreamDefaultReader>();
 
             // Start encoding video and audio.
-            let mut video_frame_counter = 0;
+            let mut video_frame_counter: u32 = 0;
 
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
@@ -456,6 +494,11 @@ impl CameraEncoder {
             // Track current encoder dimensions for dynamic reconfiguration
             let mut current_encoder_width = width as u32;
             let mut current_encoder_height = height as u32;
+
+            // Cache tier-controlled values
+            let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
+            let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
+            let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
 
             loop {
                 if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
@@ -469,15 +512,65 @@ impl CameraEncoder {
                     return;
                 }
 
+                // Check for tier-driven dimension changes (adaptive quality).
+                // When the tier changes max_width/max_height, we reconfigure
+                // the encoder to downscale (WebCodecs handles the scaling).
+                let new_tier_w = tier_max_width.load(Ordering::Relaxed);
+                let new_tier_h = tier_max_height.load(Ordering::Relaxed);
+                let new_kf = tier_keyframe_interval.load(Ordering::Relaxed);
+
+                let tier_dims_changed =
+                    new_tier_w != local_tier_max_width || new_tier_h != local_tier_max_height;
+                if tier_dims_changed {
+                    local_tier_max_width = new_tier_w;
+                    local_tier_max_height = new_tier_h;
+
+                    // Constrain current encoder dimensions to the tier max.
+                    let constrained_w = current_encoder_width.min(local_tier_max_width);
+                    let constrained_h = current_encoder_height.min(local_tier_max_height);
+
+                    log::info!(
+                        "CameraEncoder: tier dimension change -> {}x{} (was {}x{})",
+                        constrained_w,
+                        constrained_h,
+                        current_encoder_width,
+                        current_encoder_height,
+                    );
+                    current_encoder_width = constrained_w;
+                    current_encoder_height = constrained_h;
+
+                    let new_config = VideoEncoderConfig::new(
+                        get_video_codec_string(),
+                        current_encoder_height,
+                        current_encoder_width,
+                    );
+                    new_config.set_bitrate(local_bitrate as f64);
+                    new_config.set_latency_mode(LatencyMode::Realtime);
+                    if let Err(e) = video_encoder.configure(&new_config) {
+                        error!("Error reconfiguring camera encoder for tier change: {e:?}");
+                    }
+                }
+
+                if new_kf != local_keyframe_interval {
+                    local_keyframe_interval = new_kf;
+                    log::info!(
+                        "CameraEncoder: keyframe interval changed to {}",
+                        local_keyframe_interval
+                    );
+                }
+
                 // Update the bitrate if it has changed more than the threshold percentage
                 let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                if new_current_bitrate != local_bitrate {
+                if new_current_bitrate != local_bitrate && !tier_dims_changed {
                     log::info!("Updating video bitrate to {new_current_bitrate}");
                     local_bitrate = new_current_bitrate;
                     video_encoder_config.set_bitrate(local_bitrate as f64);
                     if let Err(e) = video_encoder.configure(&video_encoder_config) {
                         error!("Error configuring video encoder: {e:?}");
                     }
+                } else if new_current_bitrate != local_bitrate {
+                    // Bitrate also changed alongside tier dims -- already applied above.
+                    local_bitrate = new_current_bitrate;
                 }
 
                 match JsFuture::from(video_reader.read()).await {
@@ -486,19 +579,30 @@ impl CameraEncoder {
                             .unwrap()
                             .unchecked_into::<VideoFrame>();
 
-                        // Check for dimension changes (rotation, camera switch)
+                        // Check for dimension changes (rotation, camera switch).
+                        // Also constrain to current tier max dimensions.
                         let frame_width = video_frame.display_width();
                         let frame_height = video_frame.display_height();
+                        let clamped_width = if frame_width > 0 {
+                            frame_width.min(local_tier_max_width)
+                        } else {
+                            frame_width
+                        };
+                        let clamped_height = if frame_height > 0 {
+                            frame_height.min(local_tier_max_height)
+                        } else {
+                            frame_height
+                        };
 
-                        if frame_width > 0
-                            && frame_height > 0
-                            && (frame_width != current_encoder_width
-                                || frame_height != current_encoder_height)
+                        if clamped_width > 0
+                            && clamped_height > 0
+                            && (clamped_width != current_encoder_width
+                                || clamped_height != current_encoder_height)
                         {
-                            log::info!("Camera dimensions changed from {current_encoder_width}x{current_encoder_height} to {frame_width}x{frame_height}, reconfiguring encoder");
+                            log::info!("Camera dimensions changed from {current_encoder_width}x{current_encoder_height} to {clamped_width}x{clamped_height}, reconfiguring encoder");
 
-                            current_encoder_width = frame_width;
-                            current_encoder_height = frame_height;
+                            current_encoder_width = clamped_width;
+                            current_encoder_height = clamped_height;
 
                             let new_config = VideoEncoderConfig::new(
                                 get_video_codec_string(),
@@ -515,8 +619,11 @@ impl CameraEncoder {
                         }
 
                         let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
+                        // Use tier-controlled keyframe interval instead of the
+                        // static constant, allowing adaptive quality to adjust it.
                         video_encoder_encode_options.set_key_frame(
-                            video_frame_counter % CAMERA_KEYFRAME_INTERVAL_FRAMES == 0,
+                            local_keyframe_interval > 0
+                                && video_frame_counter % local_keyframe_interval == 0,
                         );
                         if let Err(e) = video_encoder
                             .encode_with_options(&video_frame, &video_encoder_encode_options)

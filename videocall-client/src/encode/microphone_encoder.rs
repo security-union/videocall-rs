@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::adaptive_quality_constants::AUDIO_QUALITY_TIERS;
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
     VAD_POLL_INTERVAL_MS, VAD_SMOOTHING_TIME_CONSTANT,
@@ -25,6 +26,7 @@ use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::crypto::aes::Aes128State;
+use crate::diagnostics::EncoderBitrateController;
 use crate::encode::encoder_state::EncoderState;
 use crate::wrappers::EncodedAudioChunkTypeWrapper;
 use crate::VideoCallClient;
@@ -38,7 +40,7 @@ use js_sys::Uint8Array;
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::{
@@ -103,6 +105,9 @@ pub struct MicrophoneEncoder {
     is_speaking: Rc<AtomicBool>,
     vad_interval: Rc<RefCell<Option<Interval>>>,
     vad_threshold: f32,
+    /// Tier-controlled audio bitrate in bps (e.g. 50000 for 50 kbps).
+    /// Updated by the diagnostics loop when the audio tier changes.
+    tier_audio_bitrate: Rc<AtomicU32>,
 }
 
 impl MicrophoneEncoder {
@@ -113,6 +118,7 @@ impl MicrophoneEncoder {
         on_error: Callback<String>,
         vad_threshold: Option<f32>,
     ) -> Self {
+        let default_audio_bitrate_bps = AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000;
         Self {
             client,
             state: EncoderState::new(),
@@ -122,6 +128,7 @@ impl MicrophoneEncoder {
             is_speaking: Rc::new(AtomicBool::new(false)),
             vad_interval: Rc::new(RefCell::new(None)),
             vad_threshold: vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD),
+            tier_audio_bitrate: Rc::new(AtomicU32::new(default_audio_bitrate_bps)),
         }
     }
 
@@ -133,13 +140,35 @@ impl MicrophoneEncoder {
         &mut self,
         mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
     ) {
-        // Consume the diagnostics receiver in an async task to prevent "receiver is gone" errors
-        // For Microphone encoder, we'll just consume the packets without processing them for now
-        // since Microphone encoder doesn't support dynamic bitrate control yet
+        let tier_audio_bitrate = self.tier_audio_bitrate.clone();
+        // We create a bitrate controller here to feed the adaptive quality manager.
+        // The audio encoder does not do PID-based bitrate control itself, but we need
+        // the quality manager to track conditions and select audio tiers.
         wasm_bindgen_futures::spawn_local(async move {
-            while let Some(_packet) = diagnostics_receiver.next().await {
-                // TODO: Implement bitrate control for Microphone encoder if needed
-                // For now, just consume the packets to prevent the "receiver is gone" error
+            // Use a dummy FPS target for the PID -- the audio encoder doesn't use PID output,
+            // but the quality manager inside EncoderBitrateController needs to process packets.
+            let dummy_fps = Rc::new(AtomicU32::new(50)); // ~50 audio frames/sec at 20ms
+            let initial_bitrate = AUDIO_QUALITY_TIERS[0].bitrate_kbps;
+            let mut encoder_control = EncoderBitrateController::new(initial_bitrate, dummy_fps);
+
+            while let Some(packet) = diagnostics_receiver.next().await {
+                // Feed the packet to get the quality manager to process it.
+                let _ = encoder_control.process_diagnostics_packet(packet);
+
+                // Check if audio tier changed and update the shared bitrate atomic.
+                if encoder_control.take_tier_changed() {
+                    let audio_tier = encoder_control.current_audio_tier();
+                    let new_bitrate_bps = audio_tier.bitrate_kbps * 1000;
+                    tier_audio_bitrate.store(new_bitrate_bps, Ordering::Relaxed);
+                    log::info!(
+                        "MicrophoneEncoder: audio tier changed to '{}' ({}kbps)",
+                        audio_tier.label,
+                        audio_tier.bitrate_kbps,
+                    );
+                    // TODO: Apply enable_dtx and enable_fec when WebCodecs AudioEncoder
+                    // supports dynamic reconfiguration of these parameters. Currently
+                    // the Opus encoder worklet only accepts bitrate changes via Init.
+                }
             }
         });
     }

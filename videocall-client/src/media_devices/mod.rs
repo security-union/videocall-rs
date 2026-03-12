@@ -19,5 +19,9 @@
 mod media_device_access;
 mod media_device_list;
 
+pub use media_device_access::MediaAccessKind;
 pub use media_device_access::MediaDeviceAccess;
+pub use media_device_access::MediaPermission;
+pub use media_device_access::MediaPermissionsErrorState;
+pub use media_device_access::PermissionState;
 pub use media_device_list::{MediaDeviceList, SelectableDevices};

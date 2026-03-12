@@ -74,6 +74,7 @@ pub fn Host(
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
+    reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -186,6 +187,7 @@ pub fn Host(
             prev_mic_enabled: false,
             prev_video_enabled: false,
             initialized: false,
+            last_reload_counter: 0,
         }))
     });
 
@@ -201,6 +203,7 @@ pub fn Host(
     // Initialize devices once
     {
         let state = state.clone();
+        let value = client.clone();
         use_effect(move || {
             let state_for_loaded = state.clone();
             let mut s = state.borrow_mut();
@@ -284,7 +287,53 @@ pub fn Host(
                         .forget();
                     }
                 });
-                s.media_devices.on_devices_changed = VcCallback::noop();
+                let state_for_devices_changed = state.clone();
+                let client_for_devices_changed = value.clone();
+                s.media_devices.on_devices_changed = VcCallback::from(move |_| {
+                    let mut s = state_for_devices_changed.borrow_mut();
+
+                    let audio_device_id = s.media_devices.audio_inputs.selected();
+                    let video_device_id = s.media_devices.video_inputs.selected();
+                    let speaker_device_id = s.media_devices.audio_outputs.selected();
+
+                    let mut mic_needs_start = false;
+                    if !audio_device_id.is_empty() {
+                        s.media_devices.audio_inputs.select(&audio_device_id);
+                        mic_needs_start = s.microphone.select(audio_device_id);
+                    }
+
+                    let mut cam_needs_start = false;
+                    if !video_device_id.is_empty() {
+                        s.media_devices.video_inputs.select(&video_device_id);
+                        cam_needs_start = s.camera.select(video_device_id);
+                    }
+
+                    if !speaker_device_id.is_empty() {
+                        s.media_devices.audio_outputs.select(&speaker_device_id);
+                        if let Err(e) = client_for_devices_changed
+                            .update_speaker_device(Some(speaker_device_id))
+                        {
+                            log::error!("Failed to update speaker device: {e:?}");
+                        }
+                    }
+
+                    drop(s);
+
+                    if mic_needs_start {
+                        let sc = state_for_devices_changed.clone();
+                        Timeout::new(1000, move || {
+                            sc.borrow_mut().microphone.start();
+                        })
+                        .forget();
+                    }
+                    if cam_needs_start {
+                        let sc = state_for_devices_changed.clone();
+                        Timeout::new(1000, move || {
+                            sc.borrow_mut().camera.start();
+                        })
+                        .forget();
+                    }
+                });
                 s.media_devices.load();
                 s.initialized = true;
             }
@@ -297,6 +346,11 @@ pub fn Host(
     // function itself re-runs whenever the parent passes new prop values.
     {
         let mut s = state.borrow_mut();
+
+        if s.last_reload_counter != reload_devices_counter {
+            s.media_devices.load();
+            s.last_reload_counter = reload_devices_counter;
+        }
 
         log::info!(
             "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
@@ -653,4 +707,5 @@ struct HostState {
     prev_mic_enabled: bool,
     prev_video_enabled: bool,
     initialized: bool,
+    last_reload_counter: u32,
 }

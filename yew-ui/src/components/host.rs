@@ -28,7 +28,8 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
 use crate::components::{
-    device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
+    canvas_generator::speak_style, device_selector::DeviceSelector,
+    device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
@@ -36,29 +37,6 @@ use crate::context::{
 };
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
-
-/// Compute inline CSS for the speaking glow on host tile.
-/// Mirrors the logic in `canvas_generator.rs` for consistency.
-/// Always returns explicit values so the glow is fully self-contained.
-fn speak_style(audio_level: f32) -> String {
-    if audio_level <= 0.0 {
-        return "border: 1.5px solid transparent; box-shadow: none; transition: border 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
-    }
-    let i = audio_level.clamp(0.0, 1.0);
-    format!(
-        "border: 1.5px solid rgba(0, 255, 65, {:.2}); \
-         box-shadow: inset 0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}), \
-                     0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}); \
-         transition: border 0.15s ease-in, box-shadow 0.15s ease-in;",
-        0.4 + i * 0.6,
-        15.0 + i * 25.0,
-        5.0 + i * 10.0,
-        0.3 + i * 0.5,
-        15.0 + i * 35.0,
-        3.0 + i * 10.0,
-        0.2 + i * 0.4
-    )
-}
 
 #[derive(Debug)]
 pub enum Msg {

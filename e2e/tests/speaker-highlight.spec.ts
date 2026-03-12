@@ -161,9 +161,12 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const peerTile = hostPage.locator("#grid-container .canvas-container");
       await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
 
-      // The peer tile should have inline styles indicating silent state.
+      // The glow inline style lives on the child .glow-overlay div.
+      const glowOverlay = peerTile.first().locator(".glow-overlay");
+      await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
+
       // When silent: border-color is transparent, box-shadow is none.
-      const style = await peerTile.first().getAttribute("style");
+      const style = await glowOverlay.getAttribute("style");
       expect(style).toBeTruthy();
       expect(style).toContain("border-color: transparent");
       expect(style).toContain("box-shadow: none");
@@ -212,9 +215,13 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const peerTile = hostPage.locator("#grid-container .canvas-container");
       await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
 
+      // The glow inline style lives on the child .glow-overlay div.
+      const glowOverlay = peerTile.first().locator(".glow-overlay");
+      await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
+
       // The inline style should contain a transition property for the
       // smooth fade-in/fade-out of the glow border.
-      const style = await peerTile.first().getAttribute("style");
+      const style = await glowOverlay.getAttribute("style");
       expect(style).toBeTruthy();
       expect(style).toContain("transition:");
     } finally {
@@ -249,8 +256,12 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const hostWrapper = page.locator(".host-video-wrapper");
       await expect(hostWrapper.first()).toBeVisible({ timeout: 15_000 });
 
+      // The glow inline style lives on the child .glow-overlay div.
+      const glowOverlay = hostWrapper.first().locator(".glow-overlay");
+      await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
+
       // The host's own tile should also have silent-state inline styles.
-      const style = await hostWrapper.first().getAttribute("style");
+      const style = await glowOverlay.getAttribute("style");
       expect(style).toBeTruthy();
       expect(style).toContain("border-color: transparent");
     } finally {

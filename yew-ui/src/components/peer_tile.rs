@@ -146,13 +146,17 @@ impl Component for PeerTile {
                         }
                         // Prefer the float audio_level; fall back to boolean
                         if let Some(lvl) = audio_lvl {
-                            if lvl == 0.0 || (lvl - self.audio_level).abs() > 0.01 {
+                            if (lvl == 0.0 && self.audio_level != 0.0)
+                                || (lvl - self.audio_level).abs() > 0.01
+                            {
                                 self.audio_level = lvl;
                                 changed = true;
                             }
                         } else if let Some(s) = speaking {
                             let new_level = if s { 1.0 } else { 0.0 };
-                            if new_level == 0.0 || (new_level - self.audio_level).abs() > 0.01 {
+                            if (new_level == 0.0 && self.audio_level != 0.0)
+                                || (new_level - self.audio_level).abs() > 0.01
+                            {
                                 self.audio_level = new_level;
                                 changed = true;
                             }
@@ -178,13 +182,17 @@ impl Component for PeerTile {
                         }
 
                         if let Some(lvl) = audio_lvl {
-                            if lvl == 0.0 || (lvl - self.audio_level).abs() > 0.01 {
+                            if (lvl == 0.0 && self.audio_level != 0.0)
+                                || (lvl - self.audio_level).abs() > 0.01
+                            {
                                 self.audio_level = lvl;
                                 return true;
                             }
                         } else if let Some(s) = speaking {
                             let new_level = if s { 1.0 } else { 0.0 };
-                            if new_level == 0.0 || (new_level - self.audio_level).abs() > 0.01 {
+                            if (new_level == 0.0 && self.audio_level != 0.0)
+                                || (new_level - self.audio_level).abs() > 0.01
+                            {
                                 self.audio_level = new_level;
                                 return true;
                             }

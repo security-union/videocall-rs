@@ -1,6 +1,6 @@
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::audio_constants::{
-    AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, RMS_LOUD_SPEECH_CEILING,
+    rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD,
 };
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
@@ -187,18 +187,9 @@ impl NetEqAudioPeerDecoder {
         let rms = Self::calculate_rms(&pcm);
         let is_speaking = rms > vad_threshold;
 
-        // Normalize RMS to a 0.0–1.0 intensity range.
-        // Below the VAD threshold the intensity is 0; above it we scale
-        // up to a ceiling of RMS_LOUD_SPEECH_CEILING, then apply a sqrt
-        // curve for perceptual uniformity (human hearing is logarithmic,
-        // so sqrt gives a good balance between dynamic range and visibility).
-        let range = (RMS_LOUD_SPEECH_CEILING - vad_threshold).max(f32::EPSILON);
-        let intensity = if rms < vad_threshold {
-            0.0_f32
-        } else {
-            let linear = ((rms - vad_threshold) / range).clamp(0.0, 1.0);
-            linear.sqrt()
-        };
+        // Normalize RMS to a 0.0–1.0 intensity range using the shared
+        // perceptual curve (sqrt for human hearing).
+        let intensity = rms_to_intensity(rms, vad_threshold);
 
         // Emit a diagnostics event when the speaking boolean toggles OR
         // when the audio level changes by more than 0.02.  This keeps the

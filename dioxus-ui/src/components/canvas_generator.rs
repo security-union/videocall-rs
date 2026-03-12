@@ -31,7 +31,7 @@ use web_sys::{window, HtmlCanvasElement};
 /// Compute the inline CSS for the speaking glow on the canvas container.
 /// Always returns explicit values so the glow is fully self-contained in the
 /// inline style with zero dependency on CSS classes.
-fn speak_style(audio_level: f32) -> String {
+pub(crate) fn speak_style(audio_level: f32) -> String {
     if audio_level <= 0.0 {
         // Explicitly force off — no reliance on CSS class removal
         return "border: 1.5px solid transparent; box-shadow: none; transition: border 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();

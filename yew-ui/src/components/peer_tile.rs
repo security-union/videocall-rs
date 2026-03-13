@@ -19,6 +19,8 @@
 use crate::components::canvas_generator::generate_for_peer;
 use crate::context::VideoCallClientCtx;
 use futures::future::{AbortHandle, Abortable};
+use gloo_timers::callback::Timeout;
+use videocall_client::audio_constants::{MIC_HOLD_DURATION_MS, UI_AUDIO_LEVEL_DELTA};
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use yew::prelude::*;
 
@@ -33,8 +35,20 @@ pub struct PeerTileProps {
     pub host_user_id: Option<String>,
 }
 
+/// Extract the audio level from a diagnostics event, falling back to
+/// the boolean `is_speaking` flag when the float metric is absent.
+fn resolve_audio_level(audio_lvl: Option<f32>, speaking: Option<bool>) -> Option<f32> {
+    if let Some(lvl) = audio_lvl {
+        Some(lvl)
+    } else {
+        speaking.map(|s| if s { 1.0 } else { 0.0 })
+    }
+}
+
 pub enum Msg {
     Diagnostics(DiagEvent),
+    /// Fired by the 1-second hold timer to clear the mic icon back to silent.
+    MicHoldExpired,
 }
 
 pub struct PeerTile {
@@ -42,7 +56,11 @@ pub struct PeerTile {
     audio_enabled: bool,
     video_enabled: bool,
     screen_enabled: bool,
-    is_speaking: bool,
+    audio_level: f32,
+    /// Separate level for the mic icon — held positive for 1 s after silence.
+    mic_audio_level: f32,
+    /// Pending timeout that will clear `mic_audio_level` to 0.
+    mic_hold_timeout: Option<Timeout>,
     abort_handle: Option<AbortHandle>,
 }
 
@@ -61,7 +79,9 @@ impl Component for PeerTile {
             audio_enabled: false,
             video_enabled: false,
             screen_enabled: false,
-            is_speaking: false,
+            audio_level: 0.0,
+            mic_audio_level: 0.0,
+            mic_hold_timeout: None,
             abort_handle: None,
         }
     }
@@ -73,7 +93,8 @@ impl Component for PeerTile {
             self.screen_enabled = self
                 .client
                 .is_screen_share_enabled_for_peer(&ctx.props().peer_id);
-            self.is_speaking = self.client.is_speaking_for_peer(&ctx.props().peer_id);
+            self.audio_level = self.client.audio_level_for_peer(&ctx.props().peer_id);
+            self.mic_audio_level = self.audio_level;
 
             let link = ctx.link().clone();
             let (abort_handle, abort_reg) = AbortHandle::new_pair();
@@ -93,6 +114,14 @@ impl Component for PeerTile {
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
+            Msg::MicHoldExpired => {
+                self.mic_hold_timeout = None;
+                if self.mic_audio_level != 0.0 {
+                    self.mic_audio_level = 0.0;
+                    return true;
+                }
+                false
+            }
             Msg::Diagnostics(evt) => {
                 match evt.subsystem {
                     "peer_status" => {
@@ -101,7 +130,8 @@ impl Component for PeerTile {
                         let mut audio_enabled: Option<bool> = None;
                         let mut video_enabled: Option<bool> = None;
                         let mut screen_enabled: Option<bool> = None;
-                        let mut is_speaking: Option<bool> = None;
+                        let mut audio_lvl: Option<f32> = None;
+                        let mut speaking: Option<bool> = None;
                         for m in &evt.metrics {
                             match (m.name, &m.value) {
                                 ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
@@ -114,7 +144,8 @@ impl Component for PeerTile {
                                 ("screen_enabled", MetricValue::U64(v)) => {
                                     screen_enabled = Some(*v != 0)
                                 }
-                                ("is_speaking", MetricValue::U64(v)) => is_speaking = Some(*v != 0),
+                                ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v as f32),
+                                ("is_speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
                                 _ => {}
                             }
                         }
@@ -142,21 +173,28 @@ impl Component for PeerTile {
                                 changed = true;
                             }
                         }
-                        if let Some(s) = is_speaking {
-                            if s != self.is_speaking {
-                                self.is_speaking = s;
+                        // Prefer the float audio_level; fall back to boolean
+                        let resolved_level = resolve_audio_level(audio_lvl, speaking);
+                        if let Some(lvl) = resolved_level {
+                            if (lvl == 0.0 && self.audio_level != 0.0)
+                                || (lvl - self.audio_level).abs() > UI_AUDIO_LEVEL_DELTA
+                            {
+                                self.audio_level = lvl;
                                 changed = true;
                             }
+                            changed |= self.update_mic_audio_level(ctx, lvl);
                         }
                         changed
                     }
                     "peer_speaking" => {
                         // Fast-path speaking updates from decoded audio frames
                         let mut to_peer: Option<String> = None;
+                        let mut audio_lvl: Option<f32> = None;
                         let mut speaking: Option<bool> = None;
                         for m in &evt.metrics {
                             match (m.name, &m.value) {
                                 ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v as f32),
                                 ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
                                 _ => {}
                             }
@@ -166,11 +204,17 @@ impl Component for PeerTile {
                             return false;
                         }
 
-                        if let Some(s) = speaking {
-                            if s != self.is_speaking {
-                                self.is_speaking = s;
-                                return true;
+                        let resolved_level = resolve_audio_level(audio_lvl, speaking);
+                        if let Some(lvl) = resolved_level {
+                            let mut changed = false;
+                            if (lvl == 0.0 && self.audio_level != 0.0)
+                                || (lvl - self.audio_level).abs() > UI_AUDIO_LEVEL_DELTA
+                            {
+                                self.audio_level = lvl;
+                                changed = true;
                             }
+                            changed |= self.update_mic_audio_level(ctx, lvl);
+                            return changed;
                         }
                         false
                     }
@@ -189,7 +233,8 @@ impl Component for PeerTile {
             &self.client,
             &ctx.props().peer_id,
             ctx.props().full_bleed,
-            self.is_speaking,
+            self.audio_level,
+            self.mic_audio_level,
             host_user_id,
         )
     }
@@ -197,6 +242,38 @@ impl Component for PeerTile {
     fn destroy(&mut self, _ctx: &Context<Self>) {
         if let Some(handle) = self.abort_handle.take() {
             handle.abort();
+        }
+    }
+}
+
+impl PeerTile {
+    /// Update `mic_audio_level` with a 1-second hold: when audio drops to zero
+    /// the mic signal keeps its last positive value for 1 s so the icon stays
+    /// green. Returns true if `mic_audio_level` was changed (needs re-render).
+    fn update_mic_audio_level(&mut self, ctx: &Context<Self>, level: f32) -> bool {
+        if level > 0.0 {
+            // Cancel any pending silence timeout — speaker is still active.
+            self.mic_hold_timeout = None;
+            if (level - self.mic_audio_level).abs() > UI_AUDIO_LEVEL_DELTA {
+                self.mic_audio_level = level;
+                return true;
+            }
+            false
+        } else {
+            // Audio dropped to zero.
+            if self.mic_audio_level == 0.0 {
+                return false;
+            }
+            if self.mic_hold_timeout.is_some() {
+                // A timeout is already queued — let it fire.
+                return false;
+            }
+            let link = ctx.link().clone();
+            let timeout = Timeout::new(MIC_HOLD_DURATION_MS, move || {
+                link.send_message(Msg::MicHoldExpired);
+            });
+            self.mic_hold_timeout = Some(timeout);
+            false
         }
     }
 }

@@ -85,11 +85,14 @@ impl MediaDeviceAccess {
     /// Returns true if permission has been granted
     pub fn is_granted(&self, device: MediaAccessKind) -> bool {
         match device {
-            MediaAccessKind::AudioCheck => matches!(self.current_permission.audio, PermissionState::Granted),
-            MediaAccessKind::VideoCheck => matches!(self.current_permission.video, PermissionState::Granted),
-            MediaAccessKind::BothCheck =>  true,
+            MediaAccessKind::AudioCheck => {
+                matches!(self.current_permission.audio, PermissionState::Granted)
+            }
+            MediaAccessKind::VideoCheck => {
+                matches!(self.current_permission.video, PermissionState::Granted)
+            }
+            MediaAccessKind::BothCheck => true,
         }
-
     }
 
     /// Causes the browser to request the user's permission to access the microphone and camera.
@@ -128,7 +131,9 @@ impl MediaDeviceAccess {
 
     async fn request_audio_permissions() -> Result<(), MediaPermissionsErrorState> {
         let navigator = window().navigator();
-        let media_devices = navigator.media_devices().map_err(MediaPermissionsErrorState::Other)?;
+        let media_devices = navigator
+            .media_devices()
+            .map_err(MediaPermissionsErrorState::Other)?;
 
         let constraints = MediaStreamConstraints::new();
 
@@ -143,7 +148,7 @@ impl MediaDeviceAccess {
             Ok(_) => Ok(()),
 
             Err(err) => {
-                let name =js_sys::Reflect::get(&err, &JsValue::from_str("name"))
+                let name = js_sys::Reflect::get(&err, &JsValue::from_str("name"))
                     .ok()
                     .and_then(|v| v.as_string());
 
@@ -158,7 +163,9 @@ impl MediaDeviceAccess {
 
     async fn request_video_permissions() -> Result<(), MediaPermissionsErrorState> {
         let navigator = window().navigator();
-        let media_devices = navigator.media_devices().map_err(MediaPermissionsErrorState::Other)?;
+        let media_devices = navigator
+            .media_devices()
+            .map_err(MediaPermissionsErrorState::Other)?;
 
         let constraints = MediaStreamConstraints::new();
 
@@ -173,7 +180,7 @@ impl MediaDeviceAccess {
             Ok(_) => Ok(()),
 
             Err(err) => {
-                let name =js_sys::Reflect::get(&err, &JsValue::from_str("name"))
+                let name = js_sys::Reflect::get(&err, &JsValue::from_str("name"))
                     .ok()
                     .and_then(|v| v.as_string());
 

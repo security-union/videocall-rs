@@ -83,6 +83,10 @@ pub struct VideoCallClientOptions {
     /// participant's tile.
     pub on_speaking_changed: Option<Callback<bool>>,
 
+    /// Callback fired with the local user's normalized audio level (0.0–1.0)
+    /// from encoder-side VAD.  Fires when the level changes by more than 0.02.
+    pub on_audio_level_changed: Option<Callback<f32>>,
+
     /// RMS threshold for voice activity detection.  Values typically range
     /// from 0.0 to 1.0; the default is 0.02.  Lower values are more
     /// sensitive; higher values filter out more background noise.
@@ -600,6 +604,13 @@ impl VideoCallClient {
         false
     }
 
+    pub fn audio_level_for_peer(&self, key: &String) -> f32 {
+        if let Ok(inner) = self.inner.try_borrow() {
+            return inner.peer_decode_manager.peer_audio_level(key);
+        }
+        0.0
+    }
+
     pub(crate) fn aes(&self) -> Rc<Aes128State> {
         self.aes.clone()
     }
@@ -802,6 +813,12 @@ impl VideoCallClient {
 
         if let Some(callback) = &self.options.on_speaking_changed {
             callback.emit(speaking);
+        }
+    }
+
+    pub fn set_audio_level(&self, level: f32) {
+        if let Some(callback) = &self.options.on_audio_level_changed {
+            callback.emit(level);
         }
     }
 

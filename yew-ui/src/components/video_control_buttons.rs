@@ -28,7 +28,11 @@ pub struct MicButtonProps {
 
 #[function_component(MicButton)]
 pub fn mic_button(props: &MicButtonProps) -> Html {
-    let class = classes!("video-control-button", props.enabled.then_some("active"),(!props.available).then_some("error"));
+    let class = classes!(
+        "video-control-button",
+        props.enabled.then_some("active"),
+        (!props.available).then_some("error")
+    );
 
     html! {
         <button {class} onclick={props.onclick.clone()} disabled={!props.available}>
@@ -84,7 +88,11 @@ pub struct CameraButtonProps {
 
 #[function_component(CameraButton)]
 pub fn camera_button(props: &CameraButtonProps) -> Html {
-    let class = classes!("video-control-button", props.enabled.then_some("active"),(!props.available).then_some("error"));
+    let class = classes!(
+        "video-control-button",
+        props.enabled.then_some("active"),
+        (!props.available).then_some("error")
+    );
 
     html! {
         <button {class} onclick={props.onclick.clone()} disabled={!props.available}>

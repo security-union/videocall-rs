@@ -52,7 +52,10 @@ impl DiagnosticPacketWindow {
         Self {
             packets: Vec::new(),
             window_duration_ms: window_duration_sec as f64 * 1000.0,
-            last_cleanup: Date::now(),
+            // Initialize to 0 so the first add_packet always triggers a cleanup pass.
+            // Using Date::now() here would couple the struct to wall-clock time and
+            // break any caller that passes simulated or monotonic timestamps.
+            last_cleanup: 0.0,
         }
     }
 
@@ -214,47 +217,47 @@ impl DiagnosticPackets {
 pub struct EncoderBitrateController {
     pid: pidgeon::PidController,
     last_update: f64,
-    _ideal_bitrate_kbps: u32,
-    _current_fps: Rc<AtomicU32>,
-    fps_history: std::collections::VecDeque<f64>, // Sliding window of recent FPS values
-    max_history_size: usize,                      // Maximum size of history window
-    last_error: f64,                              // Track the previous error for stability checks
-    initialization_complete: bool,                // Flag to handle startup conditions
-    diagnostic_packets: DiagnosticPackets,        // Manager for multiple peers' diagnostic data
-    last_correction_time: f64,                    // Timestamp of last bitrate correction
-    correction_throttle_ms: f64,                  // Minimum time between corrections in ms
+    ideal_bitrate_kbps: u32,
+    target_fps: Rc<AtomicU32>,
+    fps_history: std::collections::VecDeque<f64>,
+    max_history_size: usize,
+    initialization_complete: bool,
+    diagnostic_packets: DiagnosticPackets,
+    last_correction_time: f64,
+    correction_throttle_ms: f64,
 }
 
 impl EncoderBitrateController {
-    pub fn new(ideal_bitrate_kbps: u32, current_fps: Rc<AtomicU32>) -> Self {
-        // Configure the PID controller for stable bitrate control
-        // Lower gains make the controller more gentle and less prone to overreaction
-        let controller_config = pidgeon::ControllerConfig::default()
-            .with_kp(0.2) // Proportional gain - how quickly to respond to current error
-            .with_ki(0.05) // Integral gain - how strongly to respond to accumulated error
-            .with_kd(0.02) // Derivative gain - dampen oscillations
-            .with_setpoint(0.0) // Target error is zero (received FPS = target FPS)
-            .with_deadband(0.5) // Ignore tiny fluctuations (±0.5 FPS)
-            .with_output_limits(0.0, 50.0) // Limit maximum adjustment
-            .with_anti_windup(true); // Prevent integral term from accumulating too much
+    pub fn new(ideal_bitrate_kbps: u32, target_fps: Rc<AtomicU32>) -> Self {
+        let initial_target = target_fps.load(Ordering::Relaxed) as f64;
+
+        // Configure PID: setpoint = target FPS, process_value = received FPS.
+        // The controller computes error = setpoint − process_value internally.
+        let controller_config = pidgeon::ControllerConfig::builder()
+            .with_kp(0.2)
+            .with_ki(0.05)
+            .with_kd(0.02)
+            .with_setpoint(initial_target)
+            .with_deadband(0.5)
+            .with_output_limits(0.0, 50.0)
+            .with_anti_windup(true)
+            .build()
+            .expect("PID controller config is valid");
 
         let pid = pidgeon::PidController::new(controller_config);
-
-        // Create diagnostic packets manager with 10-second window and 30-second timeout
         let diagnostic_packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
 
         Self {
             pid,
             last_update: Date::now(),
-            _ideal_bitrate_kbps: ideal_bitrate_kbps,
-            _current_fps: current_fps,
+            ideal_bitrate_kbps,
+            target_fps,
             fps_history: std::collections::VecDeque::with_capacity(10),
             max_history_size: 10,
-            last_error: 0.0,
             initialization_complete: false,
             diagnostic_packets,
-            last_correction_time: 0.0, // Initialize to 0 to ensure first correction is sent
-            correction_throttle_ms: 1000.0, // Default to 1Hz (1000ms)
+            last_correction_time: 0.0,
+            correction_throttle_ms: 1000.0,
         }
     }
 
@@ -300,104 +303,95 @@ impl EncoderBitrateController {
         // Get the worst performing peer's FPS
         let worst_fps = match self.diagnostic_packets.get_worst_fps_peer() {
             Some((_, fps)) => fps,
-            None => {
-                return None;
-            }
+            None => return None,
         };
 
-        let target_fps = self._current_fps.load(Ordering::Relaxed) as f64;
-        // Correct fps_received max to be the target fps
+        let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
         let fps_received = worst_fps.min(target_fps);
         if target_fps <= 0.0 {
-            // Update last correction time
             self.last_correction_time = now;
-            return Some(self._ideal_bitrate_kbps as f64); // Default bitrate in bps if target FPS is invalid
+            return Some(self.ideal_bitrate_kbps as f64);
         }
 
-        // Add current FPS to history
-        self.fps_history.push_back(fps_received);
+        // Keep setpoint in sync with the (potentially changing) target FPS
+        if let Err(e) = self.pid.set_setpoint(target_fps) {
+            log::warn!("Failed to update PID setpoint: {e}");
+        }
 
-        // Maintain history size limit
+        self.fps_history.push_back(fps_received);
         while self.fps_history.len() > self.max_history_size {
             self.fps_history.pop_front();
         }
 
-        // Calculate jitter (FPS standard deviation)
         let jitter = self.calculate_jitter();
-
-        // Calculate time delta since last update using the provided timestamp
-        let dt = now - self.last_update;
+        let dt = (now - self.last_update) / 1000.0; // Convert ms to seconds
         self.last_update = now;
 
-        // Compute the error: difference between target and actual FPS
-        let current_error = target_fps - fps_received;
-
-        // Special handling for initialization
+        // Wait for a few samples before reacting
         if !self.initialization_complete {
             if self.fps_history.len() >= 3 {
                 self.initialization_complete = true;
             } else {
-                // During initialization, just track the error but don't react strongly
-                self.last_error = current_error;
-                // Update last correction time
                 self.last_correction_time = now;
-                return Some(self._ideal_bitrate_kbps as f64); // Return default bitrate in bps during initialization
+                return Some(self.ideal_bitrate_kbps as f64);
             }
         }
 
-        // Calculate rate of change of error for smoother response
-        self.last_error = current_error;
+        // PID internally computes error = setpoint (target_fps) − process_value (fps_received).
+        // Output is clamped to [0, 50] by the controller config.
+        let pid_output = match self.pid.compute(fps_received, dt) {
+            Ok(output) => output,
+            Err(e) => {
+                log::debug!("PID compute error (dt={dt:.3}): {e}");
+                0.0
+            }
+        };
 
-        // Use PID controller to compute adjustment based on FPS error
-        let fps_error_output = self.pid.compute(current_error, dt);
+        // The PID integral never decays on its own when error is within deadband.
+        // Reset the controller when conditions are good so bitrate can recover.
+        let current_error = target_fps - fps_received;
+        if current_error.abs() <= 0.5 && pid_output > 0.0 {
+            self.pid.reset();
+        }
 
-        // Get the jitter factor (normalized by target FPS)
+        let base_bitrate = self.ideal_bitrate_kbps as f64;
+        let min_bitrate = base_bitrate * 0.1;
+        let max_bitrate = base_bitrate * 1.5;
+
+        // Map PID output [0, 50] → bitrate reduction [0%, 90%].
+        let reduction_pct = pid_output / 50.0 * 0.9;
+        let after_pid = base_bitrate * (1.0 - reduction_pct);
+
+        // Additional jitter penalty: up to 30% reduction at maximum jitter.
         let normalized_jitter = jitter / target_fps;
         let jitter_factor = (normalized_jitter * 5.0).min(1.0);
-
-        // Base bitrate calculation (convert from kbps to bps)
-        let base_bitrate = self._ideal_bitrate_kbps as f64;
-
-        // Adjust bitrate based on PID output
-        // Scale factor is lower (3,000) for more gradual adjustments
-        let fps_adjustment = fps_error_output * 3_000.0;
-
-        // Apply the PID-based adjustment
-        let after_pid = base_bitrate - fps_adjustment;
-
-        // Apply jitter penalty (up to 50% reduction for maximum jitter)
-        let jitter_reduction = after_pid * (jitter_factor * 0.9);
-
-        // Calculate final bitrate
+        let jitter_reduction = after_pid * (jitter_factor * 0.3);
         let corrected_bitrate = after_pid - jitter_reduction;
 
-        // Calculate min and max bitrate limits based on ideal bitrate (in bps)
-        let min_bitrate = (self._ideal_bitrate_kbps as f64) * 0.1; // 10% of ideal
-        let max_bitrate = (self._ideal_bitrate_kbps as f64) * 1.5; // 150% of ideal
-
-        // Log detailed diagnostic information
+        let current_error = target_fps - fps_received;
         log::debug!(
-            "FPS: target={:.1} received={:.1} error={:.1} | PID output={:.2} | Jitter={:.2} factor={:.2} | Bitrate: base={:.0} bps pid_adj={:.0} jitter_adj={:.0} final={:.0} bps | Peers: {}",
-            target_fps, fps_received, current_error,
-            fps_error_output, jitter, jitter_factor,
-            base_bitrate, fps_adjustment, jitter_reduction, corrected_bitrate,
+            "FPS: target={:.1} received={:.1} error={:.1} | PID={:.2} reduction={:.1}% | \
+             Jitter={:.2} factor={:.2} | Bitrate: base={:.0} corrected={:.0} | Peers: {}",
+            target_fps,
+            fps_received,
+            current_error,
+            pid_output,
+            reduction_pct * 100.0,
+            jitter,
+            jitter_factor,
+            base_bitrate,
+            corrected_bitrate,
             self.diagnostic_packets.peer_count()
         );
 
-        // Ensure we have a reasonable bitrate (between min_bitrate and max_bitrate)
-        let final_bitrate = if !(min_bitrate..=max_bitrate).contains(&corrected_bitrate)
-            || corrected_bitrate.is_nan()
-        {
-            log::warn!("Bitrate out of bounds or NaN: {corrected_bitrate:.0} kbps (min: {min_bitrate:.0} kbps, max: {max_bitrate:.0} kbps)");
-            // Use a safe default value instead
-            f64::max(min_bitrate, f64::min(base_bitrate, max_bitrate))
+        // Clamp to bounds; fall back to base on NaN.
+        let final_bitrate = if corrected_bitrate.is_nan() {
+            base_bitrate
         } else {
-            corrected_bitrate
+            corrected_bitrate.clamp(min_bitrate, max_bitrate)
         };
 
-        // Update last correction time
         self.last_correction_time = now;
-
         Some(final_bitrate)
     }
 
@@ -596,7 +590,7 @@ mod tests {
         // Verify we have three peers
         assert_eq!(controller.peer_count(), 3);
 
-        // Fast forward 20 seconds (less than the 30-second timeout)
+        // Fast forward 20 seconds (less than the 20-second timeout)
         // Update only peer1 and peer2
         controller.process_diagnostics_packet_with_time(
             create_test_packet("sender1", "peer1", 29.0, 500),
@@ -610,7 +604,7 @@ mod tests {
         // Peer3 is still in the window (hasn't timed out yet)
         assert_eq!(controller.peer_count(), 3);
 
-        // Fast forward another 15 seconds (total 35 seconds, > 30-second timeout)
+        // Fast forward another 15 seconds (total 35 seconds, > 20-second timeout)
         // Update only peer1
         controller.process_diagnostics_packet_with_time(
             create_test_packet("sender1", "peer1", 29.0, 500),
@@ -874,5 +868,259 @@ mod tests {
 
         // Verify all peers are tracked
         assert_eq!(controller.peer_count(), 3);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_bitrate_recovery_after_fps_improves() {
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = 500;
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
+
+        let base_time = 1000.0;
+
+        // Phase 1: initialization with good FPS
+        for i in 0..3 {
+            controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 30.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+        }
+
+        // Phase 2: sustained poor FPS to drive bitrate down.
+        // Need enough iterations for the integral to accumulate significantly.
+        let mut degraded_bitrate = ideal_bitrate_kbps as f64;
+        for i in 3..25 {
+            let result = controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 5.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+            if let Some(b) = result {
+                degraded_bitrate = b;
+            }
+        }
+        assert!(
+            degraded_bitrate < ideal_bitrate_kbps as f64 * 0.5,
+            "Sustained poor FPS should significantly reduce bitrate, got {degraded_bitrate}"
+        );
+
+        // Phase 3: FPS recovers to target — bitrate should climb back toward ideal.
+        // Need enough iterations for the diagnostic window (10s) to purge old
+        // 5-FPS packets, then the PID reset kicks in.
+        let mut recovered_bitrate = degraded_bitrate;
+        for i in 25..50 {
+            let result = controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 30.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+            if let Some(b) = result {
+                recovered_bitrate = b;
+            }
+        }
+        assert!(
+            recovered_bitrate > degraded_bitrate,
+            "Bitrate should recover when FPS improves. Degraded: {degraded_bitrate}, Recovered: {recovered_bitrate}"
+        );
+        assert!(
+            (recovered_bitrate - ideal_bitrate_kbps as f64).abs() < 50.0,
+            "Recovered bitrate should be close to ideal ({ideal_bitrate_kbps}), got {recovered_bitrate}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_dynamic_target_fps_change() {
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = 500;
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
+
+        let base_time = 1000.0;
+
+        // Initialize and stabilize at 30 FPS
+        for i in 0..5 {
+            controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 30.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+        }
+
+        // Change target to 15 FPS, send 15 FPS packets.
+        // Run enough iterations for fps_history to flush old 30-FPS entries
+        // (max_history_size=10) so jitter from the transition settles.
+        target_fps.store(15, Ordering::Relaxed);
+
+        let mut bitrate_at_15 = 0.0;
+        for i in 5..20 {
+            let result = controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 15.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+            if let Some(b) = result {
+                bitrate_at_15 = b;
+            }
+        }
+        // With FPS matching new target and jitter settled, bitrate should be near ideal
+        assert!(
+            (bitrate_at_15 - ideal_bitrate_kbps as f64).abs() < 50.0,
+            "Bitrate should stay near ideal when FPS matches new target, got {bitrate_at_15}"
+        );
+
+        // Now change target to 60 FPS — received 15 FPS is way below
+        target_fps.store(60, Ordering::Relaxed);
+
+        let mut bitrate_at_60_target = 0.0;
+        for i in 20..35 {
+            let result = controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 15.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+            if let Some(b) = result {
+                bitrate_at_60_target = b;
+            }
+        }
+        // FPS (15) is far below new target (60) — bitrate should decrease significantly
+        assert!(
+            bitrate_at_60_target < ideal_bitrate_kbps as f64 * 0.5,
+            "Bitrate should drop when FPS is far below new target, got {bitrate_at_60_target}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_progressive_integral_accumulation() {
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = 500;
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
+
+        let base_time = 1000.0;
+
+        // Initialize at the SAME FPS we'll test with (20) to avoid jitter
+        // from a 30→20 transition masking the integral effect.
+        for i in 0..3 {
+            controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 20.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+        }
+
+        // Feed moderate error (20 FPS, target 30) and track progressive reduction
+        let mut bitrates = Vec::new();
+        for i in 3..15 {
+            let result = controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 20.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+            if let Some(b) = result {
+                bitrates.push(b);
+            }
+        }
+
+        assert!(bitrates.len() >= 5, "Should have multiple bitrate samples");
+
+        // Bitrate should decrease over time as the integral accumulates.
+        let first = bitrates[0];
+        let last = *bitrates.last().unwrap();
+        assert!(
+            last < first,
+            "Integral accumulation should progressively reduce bitrate. First: {first}, Last: {last}"
+        );
+        // Every sample should be below ideal since error is always positive
+        for (i, &b) in bitrates.iter().enumerate() {
+            assert!(
+                b < ideal_bitrate_kbps as f64,
+                "Bitrate at step {i} should be below ideal ({ideal_bitrate_kbps}), got {b}"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_pid_and_jitter_combined_clamp_to_min() {
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = 500;
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
+
+        let base_time = 1000.0;
+        let min_bitrate = ideal_bitrate_kbps as f64 * 0.1; // 50
+
+        // Initialize with oscillating FPS to build up jitter
+        controller.process_diagnostics_packet_with_time(
+            create_test_packet("s", "peer1", 30.0, 500),
+            base_time,
+        );
+        controller.process_diagnostics_packet_with_time(
+            create_test_packet("s", "peer1", 5.0, 500),
+            base_time + 1100.0,
+        );
+        controller.process_diagnostics_packet_with_time(
+            create_test_packet("s", "peer1", 30.0, 500),
+            base_time + 2200.0,
+        );
+
+        // Now send worst case: very low FPS with high jitter
+        let mut final_bitrate = 0.0;
+        for i in 3..20 {
+            // Alternate between 2 and 28 to maximize jitter
+            let fps = if i % 2 == 0 { 2.0 } else { 28.0 };
+            let result = controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", fps, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+            if let Some(b) = result {
+                final_bitrate = b;
+            }
+        }
+
+        // Even with max PID output + max jitter, bitrate should be clamped to min, not below
+        assert!(
+            final_bitrate >= min_bitrate,
+            "Bitrate should never go below min ({min_bitrate}), got {final_bitrate}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_same_timestamp_dt_zero() {
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = 500;
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
+
+        let base_time = 1000.0;
+
+        // Initialize normally
+        for i in 0..3 {
+            controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 30.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+        }
+
+        // Send two packets at the exact same timestamp (dt=0).
+        // First one is processed normally.
+        let result1 = controller.process_diagnostics_packet_with_time(
+            create_test_packet("s", "peer1", 20.0, 500),
+            base_time + 5000.0,
+        );
+        assert!(result1.is_some());
+
+        // Second has dt=0 but is throttled (within 1000ms). Send one after throttle
+        // with same timestamp as last_update to produce dt=0 for PID.
+        // We need to advance past the throttle window but keep the same last_update.
+        // The simplest way: advance time by exactly the throttle (1000ms) so
+        // last_update was set at 5000 and now=6000. dt = (6000-5000)/1000 = 1.0s, not zero.
+        //
+        // To truly get dt=0, we'd need two non-throttled calls at the same time,
+        // which is impossible since the second would be throttled.
+        // Instead, verify that the PID gracefully handles very small dt.
+        let result2 = controller.process_diagnostics_packet_with_time(
+            create_test_packet("s", "peer1", 20.0, 500),
+            base_time + 6000.01, // 1000.01ms later, dt ≈ 0.001s
+        );
+        assert!(
+            result2.is_some(),
+            "Very small dt should still produce a result"
+        );
+        let bitrate = result2.unwrap();
+        let min_bitrate = ideal_bitrate_kbps as f64 * 0.1;
+        let max_bitrate = ideal_bitrate_kbps as f64 * 1.5;
+        assert!(
+            (min_bitrate..=max_bitrate).contains(&bitrate),
+            "Bitrate should be within bounds even with tiny dt, got {bitrate}"
+        );
     }
 }

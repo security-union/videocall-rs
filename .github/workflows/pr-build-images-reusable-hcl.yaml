@@ -41,6 +41,8 @@ jobs:
           mkdir -p /tmp/build-${{ inputs.pr_number }}
           cd /tmp/build-${{ inputs.pr_number }}
           git clone https://oauth2:${GH_TOKEN}@github01.hclpnp.com/labs-projects/videocall.git .
+          git config user.email "ci@hclpnp.com"
+          git config user.name "CI Bot"
 
           # Checkout the target branch, then merge the PR head into it.
           # This builds the merge result (what the repo will look like post-merge),

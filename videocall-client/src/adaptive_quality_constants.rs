@@ -385,6 +385,331 @@ pub const AUDIO_RED_FORMAT: &str = "opus-red";
 pub const AUDIO_RED_SEQ_HISTORY_SIZE: usize = 64;
 
 // ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =====================================================================
+    // Video Quality Tier validation
+    // =====================================================================
+
+    #[test]
+    fn test_video_tiers_not_empty() {
+        assert!(
+            !VIDEO_QUALITY_TIERS.is_empty(),
+            "VIDEO_QUALITY_TIERS must have at least one tier"
+        );
+    }
+
+    #[test]
+    fn test_video_tier_bitrate_ordering() {
+        for tier in VIDEO_QUALITY_TIERS {
+            assert!(
+                tier.min_bitrate_kbps < tier.max_bitrate_kbps,
+                "tier '{}': min_bitrate ({}) must be less than max_bitrate ({})",
+                tier.label,
+                tier.min_bitrate_kbps,
+                tier.max_bitrate_kbps,
+            );
+            assert!(
+                tier.ideal_bitrate_kbps >= tier.min_bitrate_kbps,
+                "tier '{}': ideal_bitrate ({}) must be >= min_bitrate ({})",
+                tier.label,
+                tier.ideal_bitrate_kbps,
+                tier.min_bitrate_kbps,
+            );
+            assert!(
+                tier.ideal_bitrate_kbps <= tier.max_bitrate_kbps,
+                "tier '{}': ideal_bitrate ({}) must be <= max_bitrate ({})",
+                tier.label,
+                tier.ideal_bitrate_kbps,
+                tier.max_bitrate_kbps,
+            );
+        }
+    }
+
+    #[test]
+    fn test_video_tier_resolutions_positive() {
+        for tier in VIDEO_QUALITY_TIERS {
+            assert!(
+                tier.max_width > 0 && tier.max_height > 0,
+                "tier '{}': resolution must be positive ({}x{})",
+                tier.label,
+                tier.max_width,
+                tier.max_height,
+            );
+        }
+    }
+
+    #[test]
+    fn test_video_tier_fps_positive() {
+        for tier in VIDEO_QUALITY_TIERS {
+            assert!(
+                tier.target_fps > 0,
+                "tier '{}': target_fps must be positive",
+                tier.label,
+            );
+        }
+    }
+
+    #[test]
+    fn test_video_tier_keyframe_interval_positive() {
+        for tier in VIDEO_QUALITY_TIERS {
+            assert!(
+                tier.keyframe_interval_frames > 0,
+                "tier '{}': keyframe_interval_frames must be positive",
+                tier.label,
+            );
+        }
+    }
+
+    #[test]
+    fn test_video_tiers_descending_resolution() {
+        // Tiers are ordered highest to lowest. Each tier should have
+        // resolution <= the previous tier.
+        for window in VIDEO_QUALITY_TIERS.windows(2) {
+            let higher = &window[0];
+            let lower = &window[1];
+            let higher_pixels = higher.max_width as u64 * higher.max_height as u64;
+            let lower_pixels = lower.max_width as u64 * lower.max_height as u64;
+            assert!(
+                higher_pixels >= lower_pixels,
+                "tier '{}' ({}px) should have >= pixels than tier '{}' ({}px)",
+                higher.label,
+                higher_pixels,
+                lower.label,
+                lower_pixels,
+            );
+        }
+    }
+
+    #[test]
+    fn test_video_tiers_descending_fps() {
+        for window in VIDEO_QUALITY_TIERS.windows(2) {
+            let higher = &window[0];
+            let lower = &window[1];
+            assert!(
+                higher.target_fps >= lower.target_fps,
+                "tier '{}' ({}fps) should have >= fps than tier '{}' ({}fps)",
+                higher.label,
+                higher.target_fps,
+                lower.label,
+                lower.target_fps,
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_video_tier_index_in_bounds() {
+        assert!(
+            DEFAULT_VIDEO_TIER_INDEX < VIDEO_QUALITY_TIERS.len(),
+            "DEFAULT_VIDEO_TIER_INDEX ({}) out of bounds (len={})",
+            DEFAULT_VIDEO_TIER_INDEX,
+            VIDEO_QUALITY_TIERS.len(),
+        );
+    }
+
+    // =====================================================================
+    // Screen Share Quality Tier validation
+    // =====================================================================
+
+    #[test]
+    fn test_screen_tiers_not_empty() {
+        assert!(
+            !SCREEN_QUALITY_TIERS.is_empty(),
+            "SCREEN_QUALITY_TIERS must have at least one tier"
+        );
+    }
+
+    #[test]
+    fn test_screen_tier_bitrate_ordering() {
+        for tier in SCREEN_QUALITY_TIERS {
+            assert!(
+                tier.min_bitrate_kbps < tier.max_bitrate_kbps,
+                "screen tier '{}': min_bitrate ({}) must be < max_bitrate ({})",
+                tier.label,
+                tier.min_bitrate_kbps,
+                tier.max_bitrate_kbps,
+            );
+            assert!(
+                tier.ideal_bitrate_kbps >= tier.min_bitrate_kbps
+                    && tier.ideal_bitrate_kbps <= tier.max_bitrate_kbps,
+                "screen tier '{}': ideal_bitrate ({}) must be within [{}, {}]",
+                tier.label,
+                tier.ideal_bitrate_kbps,
+                tier.min_bitrate_kbps,
+                tier.max_bitrate_kbps,
+            );
+        }
+    }
+
+    #[test]
+    fn test_screen_tiers_descending_resolution() {
+        for window in SCREEN_QUALITY_TIERS.windows(2) {
+            let higher = &window[0];
+            let lower = &window[1];
+            let h_px = higher.max_width as u64 * higher.max_height as u64;
+            let l_px = lower.max_width as u64 * lower.max_height as u64;
+            assert!(
+                h_px >= l_px,
+                "screen tier '{}' should have >= pixels than '{}'",
+                higher.label,
+                lower.label,
+            );
+        }
+    }
+
+    // =====================================================================
+    // Audio Quality Tier validation
+    // =====================================================================
+
+    #[test]
+    fn test_audio_tiers_not_empty() {
+        assert!(
+            !AUDIO_QUALITY_TIERS.is_empty(),
+            "AUDIO_QUALITY_TIERS must have at least one tier"
+        );
+    }
+
+    #[test]
+    fn test_audio_tier_bitrate_positive() {
+        for tier in AUDIO_QUALITY_TIERS {
+            assert!(
+                tier.bitrate_kbps > 0,
+                "audio tier '{}': bitrate must be positive",
+                tier.label,
+            );
+        }
+    }
+
+    #[test]
+    fn test_audio_tiers_descending_bitrate() {
+        for window in AUDIO_QUALITY_TIERS.windows(2) {
+            let higher = &window[0];
+            let lower = &window[1];
+            assert!(
+                higher.bitrate_kbps >= lower.bitrate_kbps,
+                "audio tier '{}' ({}kbps) should have >= bitrate than '{}' ({}kbps)",
+                higher.label,
+                higher.bitrate_kbps,
+                lower.label,
+                lower.bitrate_kbps,
+            );
+        }
+    }
+
+    // =====================================================================
+    // Tier transition threshold validation
+    // =====================================================================
+
+    #[test]
+    fn test_hysteresis_gap_video() {
+        // Recovery threshold must be higher than degrade threshold to prevent oscillation.
+        assert!(
+            VIDEO_TIER_RECOVER_FPS_RATIO > VIDEO_TIER_DEGRADE_FPS_RATIO,
+            "recover FPS ratio ({}) must be > degrade FPS ratio ({})",
+            VIDEO_TIER_RECOVER_FPS_RATIO,
+            VIDEO_TIER_DEGRADE_FPS_RATIO,
+        );
+        assert!(
+            VIDEO_TIER_RECOVER_BITRATE_RATIO > VIDEO_TIER_DEGRADE_BITRATE_RATIO,
+            "recover bitrate ratio ({}) must be > degrade bitrate ratio ({})",
+            VIDEO_TIER_RECOVER_BITRATE_RATIO,
+            VIDEO_TIER_DEGRADE_BITRATE_RATIO,
+        );
+    }
+
+    #[test]
+    fn test_hysteresis_gap_audio() {
+        assert!(
+            AUDIO_TIER_RECOVER_FPS_RATIO > AUDIO_TIER_DEGRADE_FPS_RATIO,
+            "audio recover FPS ratio ({}) must be > degrade FPS ratio ({})",
+            AUDIO_TIER_RECOVER_FPS_RATIO,
+            AUDIO_TIER_DEGRADE_FPS_RATIO,
+        );
+    }
+
+    #[test]
+    fn test_step_up_slower_than_step_down() {
+        assert!(
+            STEP_UP_STABILIZATION_WINDOW_MS > STEP_DOWN_REACTION_TIME_MS,
+            "step-up window ({}) should be > step-down reaction time ({})",
+            STEP_UP_STABILIZATION_WINDOW_MS,
+            STEP_DOWN_REACTION_TIME_MS,
+        );
+    }
+
+    // =====================================================================
+    // PID controller constant validation
+    // =====================================================================
+
+    #[test]
+    fn test_pid_gains_non_negative() {
+        assert!(PID_KP >= 0.0, "PID_KP must be non-negative");
+        assert!(PID_KI >= 0.0, "PID_KI must be non-negative");
+        assert!(PID_KD >= 0.0, "PID_KD must be non-negative");
+    }
+
+    #[test]
+    fn test_pid_output_limits() {
+        assert!(
+            PID_OUTPUT_MIN < PID_OUTPUT_MAX,
+            "PID output min ({}) must be < max ({})",
+            PID_OUTPUT_MIN,
+            PID_OUTPUT_MAX,
+        );
+    }
+
+    // =====================================================================
+    // Congestion feedback constant validation
+    // =====================================================================
+
+    #[test]
+    fn test_congestion_constants_positive() {
+        assert!(CONGESTION_DROP_THRESHOLD > 0);
+        assert!(CONGESTION_WINDOW_MS > 0);
+        assert!(CONGESTION_NOTIFY_MIN_INTERVAL_MS > 0);
+    }
+
+    // =====================================================================
+    // Tier index lookup
+    // =====================================================================
+
+    #[test]
+    fn test_video_tier_lookup_by_index() {
+        let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
+        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
+    }
+
+    #[test]
+    fn test_all_video_tiers_have_unique_labels() {
+        let labels: Vec<&str> = VIDEO_QUALITY_TIERS.iter().map(|t| t.label).collect();
+        for (i, label) in labels.iter().enumerate() {
+            for (j, other) in labels.iter().enumerate() {
+                if i != j {
+                    assert_ne!(label, other, "duplicate video tier label: {}", label);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_audio_tiers_have_unique_labels() {
+        let labels: Vec<&str> = AUDIO_QUALITY_TIERS.iter().map(|t| t.label).collect();
+        for (i, label) in labels.iter().enumerate() {
+            for (j, other) in labels.iter().enumerate() {
+                if i != j {
+                    assert_ne!(label, other, "duplicate audio tier label: {}", label);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server Congestion Feedback
 // ---------------------------------------------------------------------------
 

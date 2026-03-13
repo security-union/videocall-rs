@@ -1463,43 +1463,6 @@ mod tests {
 
     // -- PLI gap detection tests -------------------------------------------
 
-    /// Helper: create a MediaPacket with VIDEO type, a given sequence number,
-    /// and an optional frame_type string (e.g. "key" or "delta").
-    fn video_packet_with_seq(session_id: u64, seq: u64, frame_type: &str) -> Arc<PacketWrapper> {
-        use videocall_types::protos::media_packet::VideoMetadata;
-        let media = MediaPacket {
-            media_type: MediaType::VIDEO.into(),
-            user_id: "test@test.com".into(),
-            data: vec![0u8; 10],
-            video_metadata: Some(VideoMetadata {
-                sequence: seq,
-                ..Default::default()
-            })
-            .into(),
-            frame_type: frame_type.to_string(),
-            ..Default::default()
-        };
-        wrap(&media, session_id)
-    }
-
-    /// Helper: create a MediaPacket with SCREEN type and a given sequence number.
-    fn screen_packet_with_seq(session_id: u64, seq: u64, frame_type: &str) -> Arc<PacketWrapper> {
-        use videocall_types::protos::media_packet::VideoMetadata;
-        let media = MediaPacket {
-            media_type: MediaType::SCREEN.into(),
-            user_id: "test@test.com".into(),
-            data: vec![0u8; 10],
-            video_metadata: Some(VideoMetadata {
-                sequence: seq,
-                ..Default::default()
-            })
-            .into(),
-            frame_type: frame_type.to_string(),
-            ..Default::default()
-        };
-        wrap(&media, session_id)
-    }
-
     /// Sequential VIDEO packets (no gap) should NOT trigger a keyframe request.
     #[wasm_bindgen_test]
     fn sequential_video_packets_no_keyframe_request() {

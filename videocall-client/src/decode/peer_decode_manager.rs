@@ -96,6 +96,7 @@ pub struct Peer {
     pub audio_enabled: bool,
     pub screen_enabled: bool,
     pub is_speaking: bool,
+    pub audio_level: f32,
     pub display_name: Option<String>,
     context_initialized: bool,
     vad_threshold: Option<f32>,
@@ -145,6 +146,7 @@ impl Peer {
             audio_enabled: false,
             screen_enabled: false,
             is_speaking: false,
+            audio_level: 0.0,
             display_name: None,
             context_initialized: false,
             vad_threshold,
@@ -241,6 +243,7 @@ impl Peer {
                     if self.screen_enabled { 1u64 } else { 0u64 }
                 ),
                 metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
+                metric!("audio_level", self.audio_level as f64),
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -363,6 +366,9 @@ impl Peer {
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
                     self.is_speaking = metadata.is_speaking;
+                    if !metadata.is_speaking {
+                        self.audio_level = 0.0;
+                    }
 
                     // Flush video decoder when video is turned off
                     if video_turned_off {
@@ -701,6 +707,17 @@ impl PeerDecodeManager {
         }
         false
     }
+
+    pub fn peer_audio_level(&self, key: &String) -> f32 {
+        let sid: u64 = match key.parse() {
+            Ok(v) => v,
+            Err(_) => return 0.0,
+        };
+        if let Some(peer) = self.connected_peers.get(&sid) {
+            return peer.audio_level;
+        }
+        0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -839,6 +856,7 @@ mod tests {
             context_initialized: false,
             has_received_heartbeat: false,
             is_speaking: false,
+            audio_level: 0.0,
             vad_threshold: None,
         };
         (peer, muted_handle)
@@ -1005,6 +1023,76 @@ mod tests {
         assert!(
             !peer.video_enabled,
             "straggler after disable must not re-enable"
+        );
+    }
+
+    // -- audio_level tests -------------------------------------------------
+
+    /// A freshly created peer should have audio_level == 0.0.
+    #[wasm_bindgen_test]
+    fn test_peer_audio_level_default_zero() {
+        let (peer, _muted) = make_test_peer(100);
+        assert!(
+            (peer.audio_level - 0.0).abs() < f32::EPSILON,
+            "new peer should have audio_level == 0.0, got {}",
+            peer.audio_level
+        );
+    }
+
+    /// Insert a peer into a PeerDecodeManager, set its audio_level, then
+    /// verify `peer_audio_level()` returns the expected value.
+    #[wasm_bindgen_test]
+    fn test_peer_audio_level_accessor() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(101);
+        peer.audio_level = 0.75;
+        manager.connected_peers.insert(101, peer);
+
+        let level = manager.peer_audio_level(&"101".to_string());
+        assert!(
+            (level - 0.75).abs() < f32::EPSILON,
+            "peer_audio_level should return 0.75, got {level}"
+        );
+    }
+
+    /// Calling `peer_audio_level()` for a non-existent peer should return 0.0.
+    #[wasm_bindgen_test]
+    fn test_peer_audio_level_unknown_peer_returns_zero() {
+        let manager = PeerDecodeManager::new();
+        let level = manager.peer_audio_level(&"99999".to_string());
+        assert!(
+            (level - 0.0).abs() < f32::EPSILON,
+            "peer_audio_level for unknown peer should return 0.0, got {level}"
+        );
+    }
+
+    /// Calling `peer_audio_level()` with a non-numeric key should return 0.0.
+    #[wasm_bindgen_test]
+    fn test_peer_audio_level_invalid_key_returns_zero() {
+        let manager = PeerDecodeManager::new();
+        let level = manager.peer_audio_level(&"not-a-number".to_string());
+        assert!(
+            (level - 0.0).abs() < f32::EPSILON,
+            "peer_audio_level for invalid key should return 0.0, got {level}"
+        );
+    }
+
+    /// After a heartbeat with is_speaking=false, audio_level should be reset to 0.0.
+    #[wasm_bindgen_test]
+    fn test_peer_audio_level_reset_on_not_speaking_heartbeat() {
+        let (mut peer, _muted) = make_test_peer(102);
+        // Simulate audio level being set during active speech
+        peer.audio_level = 0.5;
+        peer.is_speaking = true;
+
+        // Heartbeat with all disabled (is_speaking defaults to false)
+        let hb = heartbeat_packet(102, false, false, false);
+        let _ = peer.decode(&hb);
+
+        assert!(
+            (peer.audio_level - 0.0).abs() < f32::EPSILON,
+            "audio_level should be reset to 0.0 when heartbeat says not speaking, got {}",
+            peer.audio_level
         );
     }
 

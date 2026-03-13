@@ -440,6 +440,7 @@ pub fn Diagnostics(
     video_enabled: bool,
     mic_enabled: bool,
     share_screen: bool,
+    encoder_settings: Option<String>,
 ) -> Element {
     let mut selected_peer = use_signal(|| "All Peers".to_string());
     let mut diagnostics_data = use_signal(|| None::<String>);
@@ -448,7 +449,6 @@ pub fn Diagnostics(
     let mut neteq_stats_per_peer = use_signal(HashMap::<String, Vec<String>>::new);
     let mut neteq_buffer_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut neteq_jitter_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
-    let mut encoder_settings = use_signal(|| None::<String>);
     let mut diag_task = use_signal(|| None::<Task>);
 
     // Subscribe to diagnostics events using Dioxus `spawn`.
@@ -464,7 +464,6 @@ pub fn Diagnostics(
         if !is_open {
             diagnostics_data.set(None);
             sender_stats.set(None);
-            encoder_settings.set(None);
             connection_manager_state.set(None);
             neteq_stats_per_peer.set(HashMap::new());
             neteq_buffer_per_peer.set(HashMap::new());
@@ -686,7 +685,7 @@ pub fn Diagnostics(
     let conn_state = connection_manager_state();
     let diag_data = diagnostics_data();
     let send_stats = sender_stats();
-    let enc_settings = encoder_settings();
+    let enc_settings = encoder_settings;
     let video_str = if video_enabled { "Enabled" } else { "Disabled" };
     let audio_str = if mic_enabled { "Enabled" } else { "Disabled" };
     let screen_str = if share_screen { "Enabled" } else { "Disabled" };

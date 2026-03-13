@@ -67,6 +67,7 @@
 //!     on_meeting_info: None,
 //!     on_meeting_ended: None,
 //!     on_speaking_changed: None,
+//!     on_audio_level_changed: None,
 //!     vad_threshold: None,
 //!     on_meeting_activated: None,
 //!     on_participant_admitted: None,
@@ -98,6 +99,7 @@
 //! #     on_meeting_info: None,
 //! #     on_meeting_ended: None,
 //! #     on_speaking_changed: None,
+//! #     on_audio_level_changed: None,
 //! #     vad_threshold: None,
 //! #     on_meeting_activated: None,
 //! #     on_participant_admitted: None,
@@ -179,6 +181,7 @@
 //! ```
 
 pub mod audio;
+pub mod audio_constants;
 pub mod audio_worklet_codec;
 mod client;
 mod connection;
@@ -199,6 +202,8 @@ pub use encode::{
     create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
     ScreenShareEvent,
 };
-pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices, MediaAccessKind, MediaPermission, PermissionState,
-                        MediaPermissionsErrorState};
+pub use media_devices::{
+    MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,
+    MediaPermissionsErrorState, PermissionState, SelectableDevices,
+};
 pub use videocall_types::Callback;

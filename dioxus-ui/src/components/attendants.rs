@@ -44,11 +44,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
-use wasm_bindgen::{closure::Closure, JsCast};
 use videocall_client::{
     MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
     PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
+use wasm_bindgen::{closure::Closure, JsCast};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
@@ -393,6 +393,7 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    let mut encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
@@ -411,6 +412,7 @@ pub fn AttendantsComponent(
     let mut device_was_denied = use_signal(|| false);
     let session_loaded = use_signal(|| false);
     let local_speaking = use_signal(|| false);
+    let local_audio_level = use_signal(|| 0.0f32);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
@@ -565,6 +567,10 @@ pub fn AttendantsComponent(
             on_speaking_changed: Some(VcCallback::from(move |speaking: bool| {
                 let mut s = local_speaking;
                 s.set(speaking);
+            })),
+            on_audio_level_changed: Some(VcCallback::from(move |level: f32| {
+                let mut s = local_audio_level;
+                s.set(level);
             })),
             vad_threshold: crate::constants::vad_threshold().ok(),
             on_meeting_activated: None,
@@ -751,7 +757,6 @@ pub fn AttendantsComponent(
     {
         let mda = mda.clone();
         use_effect(move || {
-
             let value = mda.clone();
             let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
                 let mic_denied = matches!(
@@ -845,10 +850,8 @@ pub fn AttendantsComponent(
         }) as Box<dyn FnMut()>);
 
         if let Some(win) = web_sys::window() {
-            let _ = win.add_event_listener_with_callback(
-                "resize",
-                closure.as_ref().unchecked_ref(),
-            );
+            let _ =
+                win.add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref());
         }
         closure.forget();
     });
@@ -1335,7 +1338,7 @@ pub fn AttendantsComponent(
                                     share_screen: screen_share_state().is_sharing(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
-                                    is_speaking: local_speaking(),
+                                    audio_level: local_audio_level(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {
@@ -1428,6 +1431,7 @@ pub fn AttendantsComponent(
                         video_enabled: video_enabled(),
                         mic_enabled: mic_enabled(),
                         share_screen: screen_share_state().is_sharing(),
+                        encoder_settings: encoder_settings(),
                     }
                 }
             }

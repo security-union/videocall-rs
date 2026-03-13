@@ -36,17 +36,19 @@ use crate::constants::{
 use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
-use std::collections::HashMap;
 use log::{error, warn};
-use videocall_client::{MediaAccessKind, MediaPermission, MediaPermissionsErrorState, PermissionState, utils::is_ios};
+use std::collections::HashMap;
 use videocall_client::Callback as VcCallback;
+use videocall_client::{
+    utils::is_ios, MediaAccessKind, MediaPermission, MediaPermissionsErrorState, PermissionState,
+};
 use videocall_client::{
     MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use wasm_bindgen::{JsValue, JsCast, prelude::*};
-use web_sys::*;
+use wasm_bindgen::{prelude::*, JsCast, JsValue};
 use web_sys::Event;
+use web_sys::*;
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
 
@@ -113,6 +115,7 @@ pub enum Msg {
     OnPeerRemoved(String),
     OnFirstFrame((String, MediaType)),
     OnSpeakingChanged(bool),
+    OnAudioLevelChanged(f32),
     OnMicrophoneError(String),
     OnCameraError(String),
     DismissUserError,
@@ -235,6 +238,7 @@ pub struct AttendantsComponent {
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
     local_speaking: bool,
+    local_audio_level: f32,
     /// Monotonically increasing counter bumped when a `WaitingRoomUpdated`
     /// push notification arrives. Passed as a prop to `HostControls` so it
     /// knows to re-fetch the waiting list.
@@ -404,6 +408,12 @@ impl AttendantsComponent {
                     link.send_message(Msg::OnSpeakingChanged(speaking));
                 })
             }),
+            on_audio_level_changed: Some({
+                let link = ctx.link().clone();
+                VcCallback::from(move |level: f32| {
+                    link.send_message(Msg::OnAudioLevelChanged(level));
+                })
+            }),
             vad_threshold: crate::constants::vad_threshold().ok(),
             on_meeting_activated: None,
             on_participant_admitted: None,
@@ -437,7 +447,8 @@ impl AttendantsComponent {
         let link = ctx.link().clone();
         media_device_access.on_result = {
             VcCallback::from(move |permission: MediaPermission| {
-                link.send_message(WsAction::MediaPermissionsUpdated(permission))})
+                link.send_message(WsAction::MediaPermissionsUpdated(permission))
+            })
         };
         media_device_access
     }
@@ -656,10 +667,10 @@ impl AttendantsComponent {
             messages.push(self.render_single_error("Camera", err));
         }
 
-        html!{ for messages}
+        html! { for messages}
     }
 
-    fn render_single_error(&self, device: &str, error:&MediaErrorState) -> Html {
+    fn render_single_error(&self, device: &str, error: &MediaErrorState) -> Html {
         match error {
             MediaErrorState::NoDevice => html! {
                 <p>{ format!(" {} not found on this device.",device)}</p>
@@ -687,7 +698,7 @@ impl Component for AttendantsComponent {
         let link = ctx.link().clone();
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
-       
+
         let window = web_sys::window().expect("no global window exist");
         let closure = Closure::wrap(Box::new(move |_event: Event| {
             link.send_message(WsAction::WindowFocused);
@@ -727,6 +738,7 @@ impl Component for AttendantsComponent {
             meeting_ended_message: None,
             meeting_info_open: false,
             local_speaking: false,
+            local_audio_level: 0.0,
             waiting_room_version: 0,
             reconnect_attempt: 0,
             peer_toasts: Vec::new(),
@@ -757,6 +769,10 @@ impl Component for AttendantsComponent {
             Msg::OnSpeakingChanged(speaking) => {
                 log::trace!("LOCAL Speaking state changed to: {}", speaking);
                 self.local_speaking = speaking;
+                true
+            }
+            Msg::OnAudioLevelChanged(level) => {
+                self.local_audio_level = level;
                 true
             }
             Msg::WsAction(action) => match action {
@@ -811,8 +827,9 @@ impl Component for AttendantsComponent {
                     false
                 }
                 WsAction::WindowFocused => {
-                    if matches!(self.mic_error, Some(MediaErrorState::PermissionDenied)) ||
-                       matches!(self.video_error, Some(MediaErrorState::PermissionDenied)) {
+                    if matches!(self.mic_error, Some(MediaErrorState::PermissionDenied))
+                        || matches!(self.video_error, Some(MediaErrorState::PermissionDenied))
+                    {
                         ctx.link().send_message(WsAction::ReloadDevices);
                     } else {
                         ctx.link().send_message(WsAction::RequestMediaPermissions);
@@ -831,44 +848,62 @@ impl Component for AttendantsComponent {
 
                     if let PermissionState::Granted = &permit.audio {
                         if self.pending_mic_enable {
-                               self.mic_enabled = true;
-                               self.pending_mic_enable = false;
+                            self.mic_enabled = true;
+                            self.pending_mic_enable = false;
                         }
                     };
 
                     if let PermissionState::Granted = &permit.video {
                         if self.pending_video_enable {
-                               self.video_enabled = true;
-                               self.pending_video_enable = false;
+                            self.video_enabled = true;
+                            self.pending_video_enable = false;
                         }
                     }
 
-                    if let PermissionState::Denied(MediaPermissionsErrorState::Other(_)) = &permit.audio {
+                    if let PermissionState::Denied(MediaPermissionsErrorState::Other(_)) =
+                        &permit.audio
+                    {
                         self.mic_error = Some(MediaErrorState::Other);
                     }
 
-                    if let PermissionState::Denied(MediaPermissionsErrorState::Other(_)) = &permit.video {
+                    if let PermissionState::Denied(MediaPermissionsErrorState::Other(_)) =
+                        &permit.video
+                    {
                         self.video_error = Some(MediaErrorState::Other);
                     }
 
-                    if permit.audio == PermissionState::Denied(MediaPermissionsErrorState::NoDevice) {
+                    if permit.audio == PermissionState::Denied(MediaPermissionsErrorState::NoDevice)
+                    {
                         self.mic_error = Some(MediaErrorState::NoDevice);
                     }
 
-                    if permit.video == PermissionState::Denied(MediaPermissionsErrorState::NoDevice) {
+                    if permit.video == PermissionState::Denied(MediaPermissionsErrorState::NoDevice)
+                    {
                         self.video_error = Some(MediaErrorState::NoDevice);
                     }
 
-                    if permit.audio == PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied) {
+                    if permit.audio
+                        == PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied)
+                    {
                         self.mic_error = Some(MediaErrorState::PermissionDenied);
                     }
 
-                    if permit.video == PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied) {
+                    if permit.video
+                        == PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied)
+                    {
                         self.video_error = Some(MediaErrorState::PermissionDenied);
                     }
 
-                    if (self.mic_error.is_some() || self.video_error.is_some()) &&
-                        !self.session_loaded {
+                    if self.session_loaded {
+                        if self.mic_error.is_some() {
+                            self.mic_enabled = false;
+                            self.pending_mic_enable = false;
+                        }
+                        if self.video_error.is_some() {
+                            self.video_enabled = false;
+                            self.pending_video_enable = false;
+                        }
+                    } else if self.mic_error.is_some() || self.video_error.is_some() {
                         self.show_device_warning = true;
                     } else {
                         ctx.link().send_message(WsAction::Connect);
@@ -934,7 +969,10 @@ impl Component for AttendantsComponent {
                     }
                     MeetingAction::ToggleMicMute => {
                         if !self.mic_enabled {
-                            if self.media_device_access.is_granted(MediaAccessKind::AudioCheck) {
+                            if self
+                                .media_device_access
+                                .is_granted(MediaAccessKind::AudioCheck)
+                            {
                                 self.mic_enabled = true;
                             } else {
                                 self.pending_mic_enable = true;
@@ -946,7 +984,10 @@ impl Component for AttendantsComponent {
                     }
                     MeetingAction::ToggleVideoOnOff => {
                         if !self.video_enabled {
-                            if self.media_device_access.is_granted(MediaAccessKind::VideoCheck) {
+                            if self
+                                .media_device_access
+                                .is_granted(MediaAccessKind::VideoCheck)
+                            {
                                 self.video_enabled = true;
                             } else {
                                 self.pending_video_enable = true;
@@ -1191,7 +1232,9 @@ impl Component for AttendantsComponent {
         let is_allowed = users_allowed_to_stream().unwrap_or_default();
         let can_stream =
             is_allowed.is_empty() || is_allowed.iter().any(|host| host == &effective_user_id);
-        let media_access_granted = self.media_device_access.is_granted(MediaAccessKind::BothCheck);
+        let media_access_granted = self
+            .media_device_access
+            .is_granted(MediaAccessKind::BothCheck);
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
         let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
@@ -1494,7 +1537,7 @@ impl Component for AttendantsComponent {
                                                  share_screen={self.screen_share_state.is_sharing()}
                                                  mic_enabled={self.mic_enabled}
                                                  video_enabled={self.video_enabled}
-                                                 is_speaking={self.local_speaking}
+                                                 audio_level={self.local_audio_level}
                                                  on_encoder_settings_update={on_encoder_settings_update}
                                                  device_settings_open={self.device_settings_open}
                                                  on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}

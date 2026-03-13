@@ -5430,11 +5430,10 @@ dependencies = [
 
 [[package]]
 name = "pidgeon"
-version = "0.2.2"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ec750a75bbf6247f4acc9788aa982e50dd1fcd743809dfb6ff4953ec2fc31d6"
+checksum = "3210f720702ba922bc92ac75a912c32d31f304c54a7301323d3a93e637e1fb06"
 dependencies = [
- "rand 0.8.5",
  "web-time",
 ]
 

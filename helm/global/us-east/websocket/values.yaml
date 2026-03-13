@@ -45,8 +45,8 @@ rustlemania-websocket:
       cpu: "2200m"
       memory: "4000Mi"
     requests:
-      cpu: "2200m"
-      memory: "4000Mi"
+      cpu: "100m"
+      memory: "128Mi"
 
   service:
     type: ClusterIP  # Changed to ClusterIP for ingress
@@ -73,6 +73,11 @@ rustlemania-websocket:
         hosts:
           - websocket-us-east.webtransport.video
           - webtransport-us-east.webtransport.video
+
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
 
   autoscaling:
     enabled: false

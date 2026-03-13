@@ -58,16 +58,51 @@ pub(crate) fn speak_style(audio_level: f32) -> String {
 
 /// Compute the inline CSS for the mic icon glow.
 /// Always returns explicit values — no reliance on CSS class for glow reset.
-fn mic_style(audio_level: f32) -> String {
-    if audio_level <= 0.0 {
-        return "color: inherit; filter: none; transition: color 1.5s ease-out, filter 1.5s ease-out;".to_string();
+///
+/// Two separate signals control different visual properties:
+/// - `mic_audio_level` (held 1s after silence) controls the icon COLOR (green)
+/// - `glow_audio_level` (raw, same as border) controls the drop-shadow GLOW
+///
+/// This way the icon stays green briefly after speech stops (via the held signal)
+/// while the drop-shadow glow tracks the border glow exactly.
+fn mic_style(mic_audio_level: f32, glow_audio_level: f32) -> String {
+    if mic_audio_level <= 0.0 && glow_audio_level <= 0.0 {
+        // Fully silent: fade out both color and filter
+        return "color: inherit; filter: none; transition: color 5.0s ease-out, filter 1.5s ease-out;".to_string();
     }
-    let i = audio_level.clamp(0.0, 1.0);
+    // Unreachable in practice: the mic hold timer guarantees mic_audio_level
+    // stays positive at least as long as glow_audio_level. Handle defensively
+    // by showing only the glow without the green icon color.
+    if mic_audio_level <= 0.0 && glow_audio_level > 0.0 {
+        let clamped = glow_audio_level.clamp(0.0, 1.0);
+        let glow_i = clamped.sqrt();
+        return format!(
+            "color: inherit; \
+             filter: drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})) \
+                     drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})); \
+             transition: color 5.0s ease-out, filter 0.15s ease-in;",
+            8.0 + glow_i * 16.0,
+            0.7 + glow_i * 0.3,
+            3.0 + glow_i * 8.0,
+            0.8 + glow_i * 0.2,
+        );
+    }
+    if mic_audio_level > 0.0 && glow_audio_level <= 0.0 {
+        // Held color (still green) but raw glow has faded — no drop-shadow
+        return "color: #00ff41; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;".to_string();
+    }
+    // Both positive: green color + scaled drop-shadow glow
+    let clamped = glow_audio_level.clamp(0.0, 1.0);
+    let glow_i = clamped.sqrt();
     format!(
-        "color: #00ff41; filter: drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})); \
-         transition: color 0.15s ease-in, filter 0.15s ease-in;",
-        6.0 + i * 10.0, // drop-shadow radius: 6–16
-        0.6 + i * 0.4   // drop-shadow alpha: 0.6–1.0
+        "color: #00ff41; \
+         filter: drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})) \
+                 drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})); \
+         transition: color 0.05s ease-in, filter 0.15s ease-in;",
+        8.0 + glow_i * 16.0, // primary drop-shadow blur: 8–24px
+        0.7 + glow_i * 0.3,  // primary drop-shadow alpha: 0.7–1.0
+        3.0 + glow_i * 8.0,  // secondary (tight) glow blur: 3–11px
+        0.8 + glow_i * 0.2,  // secondary glow alpha: 0.8–1.0
     )
 }
 
@@ -80,6 +115,7 @@ pub fn generate_for_peer(
     key: &String,
     full_bleed: bool,
     audio_level: f32,
+    mic_audio_level: f32,
     host_user_id: Option<&str>,
 ) -> Html {
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
@@ -99,11 +135,12 @@ pub fn generate_for_peer(
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
 
-    let is_speaking = audio_level > 0.0;
+    let is_speaking = mic_audio_level > 0.0;
 
-    // Compute inline styles that scale with audio_level
+    // Compute inline styles: border glow uses raw audio_level,
+    // mic icon uses mic_audio_level (held for 1s after silence in Rust)
     let tile_style = speak_style(audio_level);
-    let mic_inline_style = mic_style(audio_level);
+    let mic_inline_style = mic_style(mic_audio_level, audio_level);
 
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {

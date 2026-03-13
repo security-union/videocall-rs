@@ -647,6 +647,12 @@ impl NetEqAudioPeerDecoder {
 
         Some((primary_data, redundant_seq, redundant_data))
     }
+
+    /// Public wrapper around `unpack_red_audio` for cross-module tests.
+    #[cfg(test)]
+    pub fn unpack_red_audio_public(data: &[u8]) -> Option<(Vec<u8>, u32, Vec<u8>)> {
+        Self::unpack_red_audio(data)
+    }
 }
 
 impl Drop for NetEqAudioPeerDecoder {
@@ -791,5 +797,230 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
             muted,
             now
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    fn unpack_valid_red_data() {
+        // Manually build a RED buffer:
+        // [4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]
+        let primary = b"primary_frame";
+        let redundant = b"redundant_frame";
+        let primary_len = (primary.len() as u32).to_le_bytes();
+        let redundant_seq = 42u32.to_le_bytes();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&primary_len);
+        data.extend_from_slice(primary);
+        data.extend_from_slice(&redundant_seq);
+        data.extend_from_slice(redundant);
+
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&data);
+        assert!(result.is_some());
+
+        let (p, seq, r) = result.unwrap();
+        assert_eq!(p, primary);
+        assert_eq!(seq, 42);
+        assert_eq!(r, redundant);
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_empty_input() {
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&[]);
+        assert!(result.is_none(), "empty input should return None");
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_too_short_input() {
+        // Less than 8 bytes (minimum: 4 primary_len + 0 primary + 4 redundant_seq)
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&[0, 0, 0]);
+        assert!(result.is_none(), "3 bytes should return None");
+
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&[0, 0, 0, 0, 0, 0, 0]);
+        assert!(result.is_none(), "7 bytes should return None");
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_exactly_8_bytes_zero_length_frames() {
+        // primary_len=0, redundant_seq=0, no primary data, no redundant data
+        let data = [0u8; 8];
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&data);
+        assert!(result.is_some());
+
+        let (p, seq, r) = result.unwrap();
+        assert!(p.is_empty());
+        assert_eq!(seq, 0);
+        assert!(r.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_primary_len_exceeds_sanity_limit() {
+        // primary_len > 10,000 should return None
+        let primary_len = 10_001u32.to_le_bytes();
+        let mut data = Vec::new();
+        data.extend_from_slice(&primary_len);
+        data.extend_from_slice(&[0u8; 8]); // some filler
+
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&data);
+        assert!(result.is_none(), "primary_len > 10000 should be rejected");
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_primary_len_at_sanity_limit() {
+        // primary_len == 10,000 should be accepted (boundary)
+        let primary_len = 10_000u32.to_le_bytes();
+        let primary_data = vec![0xAA; 10_000];
+        let redundant_seq = 5u32.to_le_bytes();
+        let redundant_data = b"red";
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&primary_len);
+        data.extend_from_slice(&primary_data);
+        data.extend_from_slice(&redundant_seq);
+        data.extend_from_slice(redundant_data);
+
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&data);
+        assert!(result.is_some(), "primary_len == 10000 should be accepted");
+
+        let (p, seq, r) = result.unwrap();
+        assert_eq!(p.len(), 10_000);
+        assert_eq!(seq, 5);
+        assert_eq!(r, redundant_data);
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_primary_len_exceeds_data_length() {
+        // primary_len claims 100 bytes but total data is only 20 bytes
+        let primary_len = 100u32.to_le_bytes();
+        let mut data = Vec::new();
+        data.extend_from_slice(&primary_len);
+        data.extend_from_slice(&[0u8; 16]); // only 16 bytes after primary_len header
+
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&data);
+        assert!(
+            result.is_none(),
+            "malformed packet with primary_len > remaining data should return None"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_no_room_for_redundant_seq() {
+        // primary_len = 10, but data only has 4 (header) + 10 (primary) + 3 (not enough for seq)
+        let primary_len = 10u32.to_le_bytes();
+        let mut data = Vec::new();
+        data.extend_from_slice(&primary_len);
+        data.extend_from_slice(&[0xBB; 10]); // primary data
+        data.extend_from_slice(&[0, 0, 0]); // only 3 bytes, need 4 for seq
+
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&data);
+        assert!(
+            result.is_none(),
+            "not enough room for redundant_seq should return None"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_no_redundant_data_after_seq() {
+        // Valid format but zero-length redundant data
+        let primary_len = 5u32.to_le_bytes();
+        let redundant_seq = 99u32.to_le_bytes();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&primary_len);
+        data.extend_from_slice(b"AUDIO");
+        data.extend_from_slice(&redundant_seq);
+        // No redundant data after seq
+
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&data);
+        assert!(result.is_some());
+
+        let (p, seq, r) = result.unwrap();
+        assert_eq!(p, b"AUDIO");
+        assert_eq!(seq, 99);
+        assert!(r.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_preserves_binary_data() {
+        // Ensure all byte values 0x00-0xFF are preserved correctly
+        let primary: Vec<u8> = (0..=255).collect();
+        let redundant: Vec<u8> = (0..=255).rev().collect();
+        let primary_len = (primary.len() as u32).to_le_bytes();
+        let redundant_seq = 1000u32.to_le_bytes();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&primary_len);
+        data.extend_from_slice(&primary);
+        data.extend_from_slice(&redundant_seq);
+        data.extend_from_slice(&redundant);
+
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&data);
+        assert!(result.is_some());
+
+        let (p, seq, r) = result.unwrap();
+        assert_eq!(p, primary);
+        assert_eq!(seq, 1000);
+        assert_eq!(r, redundant);
+    }
+
+    #[wasm_bindgen_test]
+    fn unpack_max_valid_sequence_number() {
+        let primary_len = 1u32.to_le_bytes();
+        let redundant_seq = u32::MAX.to_le_bytes();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&primary_len);
+        data.push(0xFF); // 1 byte primary
+        data.extend_from_slice(&redundant_seq);
+        data.push(0xAA); // 1 byte redundant
+
+        let result = NetEqAudioPeerDecoder::unpack_red_audio(&data);
+        assert!(result.is_some());
+
+        let (_, seq, _) = result.unwrap();
+        assert_eq!(seq, u32::MAX);
+    }
+
+    #[wasm_bindgen_test]
+    fn record_and_has_sequence() {
+        // Test the sequence tracking ring buffer used for RED deduplication.
+        // We can't construct a full NetEqAudioPeerDecoder without browser APIs,
+        // so we test the VecDeque logic directly.
+        use std::collections::VecDeque;
+
+        let capacity = crate::adaptive_quality_constants::AUDIO_RED_SEQ_HISTORY_SIZE;
+        let mut received: VecDeque<u64> = VecDeque::with_capacity(capacity);
+
+        // Helper: mirrors record_sequence logic
+        let record = |buf: &mut VecDeque<u64>, seq: u64| {
+            if buf.len() >= capacity {
+                buf.pop_front();
+            }
+            buf.push_back(seq);
+        };
+
+        // Record some sequences
+        record(&mut received, 10);
+        record(&mut received, 11);
+        record(&mut received, 12);
+
+        assert!(received.contains(&10));
+        assert!(received.contains(&11));
+        assert!(received.contains(&12));
+        assert!(!received.contains(&13));
+
+        // Fill to capacity and verify eviction
+        for i in 13..(13 + capacity as u64) {
+            record(&mut received, i);
+        }
+
+        // Sequence 10 should have been evicted
+        assert!(!received.contains(&10));
+        assert_eq!(received.len(), capacity);
     }
 }

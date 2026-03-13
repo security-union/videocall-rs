@@ -650,3 +650,168 @@ impl MicrophoneEncoder {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::neteq_audio_decoder::NetEqAudioPeerDecoder;
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    fn pack_normal_primary_and_redundant() {
+        let primary = b"hello_primary";
+        let redundant = PreviousAudioFrame {
+            data: b"prev_frame".to_vec(),
+            sequence: 42,
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        // Verify total length: 4 + primary.len() + 4 + redundant.len()
+        assert_eq!(packed.len(), 4 + 13 + 4 + 10);
+
+        // Verify primary_len field (first 4 bytes, little-endian)
+        let primary_len = u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+        assert_eq!(primary_len, 13);
+
+        // Verify primary data
+        assert_eq!(&packed[4..4 + 13], b"hello_primary");
+
+        // Verify redundant_seq field
+        let redundant_seq = u32::from_le_bytes([packed[17], packed[18], packed[19], packed[20]]);
+        assert_eq!(redundant_seq, 42);
+
+        // Verify redundant data
+        assert_eq!(&packed[21..], b"prev_frame");
+    }
+
+    #[wasm_bindgen_test]
+    fn pack_empty_primary() {
+        let primary = b"";
+        let redundant = PreviousAudioFrame {
+            data: b"redundant_data".to_vec(),
+            sequence: 0,
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        // 4 (primary_len) + 0 (primary) + 4 (redundant_seq) + 14 (redundant)
+        assert_eq!(packed.len(), 22);
+
+        let primary_len = u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+        assert_eq!(primary_len, 0);
+
+        // Redundant seq starts immediately after primary_len + 0 bytes of data
+        let redundant_seq = u32::from_le_bytes([packed[4], packed[5], packed[6], packed[7]]);
+        assert_eq!(redundant_seq, 0);
+
+        assert_eq!(&packed[8..], b"redundant_data");
+    }
+
+    #[wasm_bindgen_test]
+    fn pack_empty_redundant_data() {
+        let primary = b"some_audio";
+        let redundant = PreviousAudioFrame {
+            data: vec![],
+            sequence: 100,
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        // 4 (primary_len) + 10 (primary) + 4 (redundant_seq) + 0 (redundant)
+        assert_eq!(packed.len(), 18);
+
+        let primary_len = u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+        assert_eq!(primary_len, 10);
+
+        assert_eq!(&packed[4..14], b"some_audio");
+
+        let redundant_seq = u32::from_le_bytes([packed[14], packed[15], packed[16], packed[17]]);
+        assert_eq!(redundant_seq, 100);
+
+        // No redundant data after the seq
+        assert_eq!(packed.len(), 18);
+    }
+
+    #[wasm_bindgen_test]
+    fn pack_typical_opus_frame_size() {
+        // Typical Opus frame at 50kbps, 20ms = ~125 bytes
+        let primary: Vec<u8> = (0..120).collect();
+        let redundant = PreviousAudioFrame {
+            data: (0..100).collect(),
+            sequence: 9999,
+        };
+
+        let packed = pack_redundant_audio(&primary, &redundant);
+
+        assert_eq!(packed.len(), 4 + 120 + 4 + 100);
+
+        let primary_len = u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+        assert_eq!(primary_len, 120);
+
+        assert_eq!(&packed[4..124], primary.as_slice());
+
+        let redundant_seq =
+            u32::from_le_bytes([packed[124], packed[125], packed[126], packed[127]]);
+        assert_eq!(redundant_seq, 9999);
+
+        assert_eq!(&packed[128..], redundant.data.as_slice());
+    }
+
+    #[wasm_bindgen_test]
+    fn pack_large_sequence_number_truncation() {
+        // Sequence number > u32::MAX should be truncated to lower 32 bits
+        let primary = b"data";
+        let redundant = PreviousAudioFrame {
+            data: b"red".to_vec(),
+            sequence: (u32::MAX as u64) + 5, // 0x1_0000_0004
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        let redundant_seq = u32::from_le_bytes([packed[8], packed[9], packed[10], packed[11]]);
+        // u64 0x1_0000_0004 cast to u32 = 4
+        assert_eq!(redundant_seq, 4);
+    }
+
+    #[wasm_bindgen_test]
+    fn round_trip_pack_then_unpack() {
+        let primary = b"primary_audio_frame_data";
+        let redundant = PreviousAudioFrame {
+            data: b"redundant_audio_frame".to_vec(),
+            sequence: 77,
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        // Unpack using the decoder's function
+        let result = NetEqAudioPeerDecoder::unpack_red_audio_public(&packed);
+        assert!(
+            result.is_some(),
+            "unpack should succeed for valid packed data"
+        );
+
+        let (unpacked_primary, unpacked_seq, unpacked_redundant) = result.unwrap();
+        assert_eq!(unpacked_primary, primary);
+        assert_eq!(unpacked_seq, 77);
+        assert_eq!(unpacked_redundant, redundant.data);
+    }
+
+    #[wasm_bindgen_test]
+    fn round_trip_with_typical_opus_sizes() {
+        let primary: Vec<u8> = (0..80).collect();
+        let redundant = PreviousAudioFrame {
+            data: (0..60).collect(),
+            sequence: 12345,
+        };
+
+        let packed = pack_redundant_audio(&primary, &redundant);
+        let result = NetEqAudioPeerDecoder::unpack_red_audio_public(&packed);
+        assert!(result.is_some());
+
+        let (unpacked_primary, unpacked_seq, unpacked_redundant) = result.unwrap();
+        assert_eq!(unpacked_primary, primary);
+        assert_eq!(unpacked_seq, 12345);
+        assert_eq!(unpacked_redundant, redundant.data);
+    }
+}

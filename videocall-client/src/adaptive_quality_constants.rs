@@ -124,6 +124,14 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 /// connections or step down on bad ones.
 pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "medium"
 
+/// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
+///
+/// Screen share starts at the highest tier (1080p/15fps/1500kbps) because
+/// screen content is resolution-sensitive -- text and fine UI details become
+/// unreadable at lower resolutions. The system can still step down if
+/// network conditions require it.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0; // "high"
+
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
 // ---------------------------------------------------------------------------
@@ -509,6 +517,16 @@ mod tests {
             "DEFAULT_VIDEO_TIER_INDEX ({}) out of bounds (len={})",
             DEFAULT_VIDEO_TIER_INDEX,
             VIDEO_QUALITY_TIERS.len(),
+        );
+    }
+
+    #[test]
+    fn test_default_screen_tier_index_in_bounds() {
+        assert!(
+            DEFAULT_SCREEN_TIER_INDEX < SCREEN_QUALITY_TIERS.len(),
+            "DEFAULT_SCREEN_TIER_INDEX ({}) out of bounds (len={})",
+            DEFAULT_SCREEN_TIER_INDEX,
+            SCREEN_QUALITY_TIERS.len(),
         );
     }
 

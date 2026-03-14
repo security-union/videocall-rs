@@ -23,6 +23,8 @@ use videocall_meeting_types::{
     responses::{APIResponse, ParticipantStatusResponse},
 };
 
+use videocall_types::parse_user_id;
+
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
@@ -41,6 +43,9 @@ pub async fn join_meeting(
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let display_name = body.as_ref().and_then(|b| b.display_name.as_deref());
 
     let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
@@ -48,11 +53,11 @@ pub async fn join_meeting(
         None => {
             // Auto-create meeting with this user as host.
             let attendees = serde_json::Value::Array(vec![]);
-            db_meetings::create(&state.db, &meeting_id, &user_id, None, &attendees).await?
+            db_meetings::create(&state.db, &meeting_id, &user_uuid, None, &attendees).await?
         }
     };
 
-    let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
+    let is_host = meeting.creator_id == Some(user_uuid);
 
     if is_host {
         // Activate the meeting if it's idle or ended.
@@ -67,7 +72,7 @@ pub async fn join_meeting(
         }
 
         let row =
-            db_participants::upsert_host(&state.db, meeting.id, &user_id, display_name).await?;
+            db_participants::upsert_host(&state.db, meeting.id, &user_uuid, display_name).await?;
 
         let token = generate_room_token(
             &state.jwt_secret,
@@ -81,7 +86,7 @@ pub async fn join_meeting(
         let mut resp = row.into_participant_status(Some(token));
         resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
         resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
-        resp.host_user_id = meeting.creator_id;
+        resp.host_user_id = meeting.creator_id.map(|u| u.to_string());
         Ok(Json(APIResponse::ok(resp)))
     } else {
         // Attendee: must wait for admission if meeting is active.
@@ -103,7 +108,7 @@ pub async fn join_meeting(
                 observer_token: Some(observer),
                 waiting_room_enabled: Some(meeting.waiting_room_enabled),
                 host_display_name: meeting.host_display_name,
-                host_user_id: meeting.creator_id,
+                host_user_id: meeting.creator_id.map(|u| u.to_string()),
             };
             return Ok(Json(APIResponse::ok(resp)));
         }
@@ -111,7 +116,7 @@ pub async fn join_meeting(
         // Atomically check waiting_room_enabled and insert participant in one
         // transaction, using FOR UPDATE to serialize against concurrent toggles.
         let (auto_admitted, row, waiting_room_enabled) =
-            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name).await?;
+            db_participants::join_attendee(&state.db, meeting.id, &user_uuid, display_name).await?;
 
         let token = if auto_admitted {
             Some(generate_room_token(
@@ -142,7 +147,7 @@ pub async fn join_meeting(
         }
         resp.waiting_room_enabled = Some(waiting_room_enabled);
         resp.host_display_name = meeting.host_display_name;
-        resp.host_user_id = meeting.creator_id;
+        resp.host_user_id = meeting.creator_id.map(|u| u.to_string());
         Ok(Json(APIResponse::ok(resp)))
     }
 }
@@ -155,6 +160,9 @@ pub async fn get_my_status(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
@@ -164,7 +172,7 @@ pub async fn get_my_status(
         return Err(AppError::meeting_not_active(&meeting_id));
     }
 
-    let row = db_participants::get_status(&state.db, meeting.id, &user_id)
+    let row = db_participants::get_status(&state.db, meeting.id, &user_uuid)
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 
@@ -184,7 +192,7 @@ pub async fn get_my_status(
     let mut resp = row.into_participant_status(token);
     resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
     resp.host_display_name = meeting.host_display_name;
-    resp.host_user_id = meeting.creator_id;
+    resp.host_user_id = meeting.creator_id.map(|u| u.to_string());
     Ok(Json(APIResponse::ok(resp)))
 }
 
@@ -194,16 +202,19 @@ pub async fn leave_meeting(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    let row = db_participants::leave(&state.db, meeting.id, &user_id)
+    let row = db_participants::leave(&state.db, meeting.id, &user_uuid)
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 
     // If host left or no admitted participants remain, end the meeting.
-    let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
+    let is_host = meeting.creator_id == Some(user_uuid);
     if is_host {
         db_meetings::end_meeting(&state.db, meeting.id).await?;
     } else {
@@ -224,12 +235,15 @@ pub async fn get_participants(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<Vec<ParticipantStatusResponse>>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
     // Verify the requester is actually a participant in this meeting.
-    db_participants::get_status(&state.db, meeting.id, &user_id)
+    db_participants::get_status(&state.db, meeting.id, &user_uuid)
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 

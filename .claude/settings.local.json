@@ -44,7 +44,11 @@
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:crates.io)",
       "Bash(cargo fmt:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(echo \"=== Missing from meeting-api ===\" && for f in meeting-api/src/db/participants.rs meeting-api/src/routes/meetings.rs meeting-api/src/routes/participants.rs meeting-api/src/routes/waiting_room.rs meeting-api/src/nats_events.rs meeting-api/src/token.rs; do git diff --stat -- \"$f\" 2>/dev/null; done && echo \"=== Missing from actix-api ===\" && for f in actix-api/src/server_diagnostics.rs actix-api/src/client_diagnostics.rs actix-api/src/actors/session_logic.rs actix-api/src/bin/metrics_server.rs actix-api/src/lobby.rs; do git diff --stat -- \"$f\" 2>/dev/null; done && echo \"=== Missing from videocall-client ===\" && for f in videocall-client/Cargo.toml videocall-client/src/client/video_call_client.rs videocall-client/src/encode/transform.rs videocall-client/src/encode/microphone_encoder.rs videocall-client/src/health_reporter.rs videocall-client/src/diagnostics/diagnostics_manager.rs videocall-client/src/diagnostics/encoder_bitrate_controller.rs; do git diff --stat -- \"$f\" 2>/dev/null; done)",
+      "Bash(cd /Users/darioalessandro/Documents/videocall-rs/e2e && npx prettier --write helpers/auth.ts tests/toast-notifications.spec.ts tests/two-users-meeting.spec.ts tests/waiting-for-meeting.spec.ts tests/speaker-highlight.spec.ts 2>&1 | tail -5)",
+      "Bash(npx eslint:*)"
     ]
   }
 }

@@ -28,6 +28,8 @@ use videocall_meeting_types::{
     },
 };
 
+use videocall_types::parse_user_id;
+
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
@@ -69,6 +71,9 @@ pub async fn create_meeting(
     AuthUser { user_id, .. }: AuthUser,
     Json(body): Json<CreateMeetingRequest>,
 ) -> Result<(StatusCode, Json<APIResponse<CreateMeetingResponse>>), AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let meeting_id = match &body.meeting_id {
         Some(id) => {
             validate_meeting_id(id)?;
@@ -104,7 +109,7 @@ pub async fn create_meeting(
     let row = db_meetings::create_with_options(
         &state.db,
         &meeting_id,
-        &user_id,
+        &user_uuid,
         password_hash.as_deref(),
         &attendees_json,
         waiting_room_enabled,
@@ -136,11 +141,14 @@ pub async fn list_meetings(
     AuthUser { user_id, .. }: AuthUser,
     Query(params): Query<ListMeetingsQuery>,
 ) -> Result<Json<APIResponse<ListMeetingsResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let limit = params.limit.clamp(1, 100);
     let offset = params.offset.max(0);
 
-    let rows = db_meetings::list_by_owner(&state.db, &user_id, limit, offset).await?;
-    let total = db_meetings::count_by_owner(&state.db, &user_id).await?;
+    let rows = db_meetings::list_by_owner(&state.db, &user_uuid, limit, offset).await?;
+    let total = db_meetings::count_by_owner(&state.db, &user_uuid).await?;
 
     let mut meetings = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -149,7 +157,7 @@ pub async fn list_meetings(
 
         meetings.push(MeetingSummary {
             meeting_id: row.room_id.clone(),
-            host: row.creator_id.clone(),
+            host: row.creator_id.map(|u| u.to_string()),
             state: row.state.clone().unwrap_or_else(|| "idle".to_string()),
             has_password: row.password_hash.is_some(),
             created_at: row.created_at.timestamp(),
@@ -175,11 +183,14 @@ pub async fn get_meeting(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
+    let your_status = db_participants::get_status(&state.db, row.id, &user_uuid).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
     let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
@@ -188,9 +199,9 @@ pub async fn get_meeting(
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
         state: row.state.unwrap_or_else(|| "idle".to_string()),
-        host: row.creator_id.clone().unwrap_or_default(),
+        host: row.creator_id.map(|u| u.to_string()).unwrap_or_default(),
         host_display_name: row.host_display_name,
-        host_user_id: row.creator_id,
+        host_user_id: row.creator_id.map(|u| u.to_string()),
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         participant_count,
@@ -207,16 +218,19 @@ pub async fn delete_meeting(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<DeleteMeetingResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     // Check the meeting exists first to distinguish 404 from 403.
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    if row.creator_id.as_deref() != Some(user_id.as_str()) {
+    if row.creator_id != Some(user_uuid) {
         return Err(AppError::not_owner());
     }
 
-    db_meetings::soft_delete(&state.db, &meeting_id, &user_id).await?;
+    db_meetings::soft_delete(&state.db, &meeting_id, &user_uuid).await?;
 
     Ok(Json(APIResponse::ok(DeleteMeetingResponse {
         message: format!("Meeting '{meeting_id}' has been deleted"),
@@ -229,17 +243,20 @@ pub async fn end_meeting_handler(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    if meeting.creator_id.as_deref() != Some(user_id.as_str()) {
+    if meeting.creator_id != Some(user_uuid) {
         return Err(AppError::not_owner());
     }
 
     // Idempotent: if already ended, return the current state.
     if meeting.state.as_deref() == Some("ended") {
-        let your_status = db_participants::get_status(&state.db, meeting.id, &user_id).await?;
+        let your_status = db_participants::get_status(&state.db, meeting.id, &user_uuid).await?;
         let your_status = your_status.map(|p| p.into_participant_status(None));
 
         let participant_count = db_participants::count_admitted(&state.db, meeting.id).await?;
@@ -248,9 +265,12 @@ pub async fn end_meeting_handler(
         return Ok(Json(APIResponse::ok(MeetingInfoResponse {
             meeting_id: meeting.room_id,
             state: "ended".to_string(),
-            host: meeting.creator_id.clone().unwrap_or_default(),
+            host: meeting
+                .creator_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
             host_display_name: meeting.host_display_name,
-            host_user_id: meeting.creator_id,
+            host_user_id: meeting.creator_id.map(|u| u.to_string()),
             has_password: meeting.password_hash.is_some(),
             waiting_room_enabled: meeting.waiting_room_enabled,
             participant_count,
@@ -267,7 +287,7 @@ pub async fn end_meeting_handler(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
+    let your_status = db_participants::get_status(&state.db, row.id, &user_uuid).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
     let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
@@ -276,9 +296,9 @@ pub async fn end_meeting_handler(
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
         state: row.state.unwrap_or_else(|| "idle".to_string()),
-        host: row.creator_id.clone().unwrap_or_default(),
+        host: row.creator_id.map(|u| u.to_string()).unwrap_or_default(),
         host_display_name: row.host_display_name,
-        host_user_id: row.creator_id,
+        host_user_id: row.creator_id.map(|u| u.to_string()),
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         participant_count,
@@ -296,12 +316,15 @@ pub async fn update_meeting(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let row = if let Some(enabled) = body.waiting_room_enabled {
         // Atomically updates the setting and, when disabling, auto-admits
         // all waiting participants within a single transaction.
-        // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
+        // The UPDATE ... WHERE creator_id = $2 folds in the ownership check,
         // so we only fetch separately on failure to distinguish 404 vs 403.
-        match db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &user_id, enabled)
+        match db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &user_uuid, enabled)
             .await?
         {
             Some(row) => row,
@@ -315,17 +338,17 @@ pub async fn update_meeting(
             }
         }
     } else {
-        // No changes requested — fetch and verify ownership.
+        // No changes requested -- fetch and verify ownership.
         let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
             .await?
             .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
-        if row.creator_id.as_deref() != Some(user_id.as_str()) {
+        if row.creator_id != Some(user_uuid) {
             return Err(AppError::not_owner());
         }
         row
     };
 
-    let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
+    let your_status = db_participants::get_status(&state.db, row.id, &user_uuid).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
     let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
@@ -334,9 +357,9 @@ pub async fn update_meeting(
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
         state: row.state.unwrap_or_else(|| "idle".to_string()),
-        host: row.creator_id.clone().unwrap_or_default(),
+        host: row.creator_id.map(|u| u.to_string()).unwrap_or_default(),
         host_display_name: row.host_display_name,
-        host_user_id: row.creator_id,
+        host_user_id: row.creator_id.map(|u| u.to_string()),
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         participant_count,

@@ -192,7 +192,12 @@ impl ServerDiagnostics {
     ) -> ConnectionMetadata {
         let mut metadata = ConnectionMetadata::new();
         metadata.session_id = session_id.to_string();
-        metadata.user_id = user_id.as_bytes().to_vec();
+        metadata.user_id = videocall_types::parse_user_id(user_id)
+            .map(|u| videocall_types::to_user_id_bytes(&u))
+            .unwrap_or_else(|e| {
+                tracing::warn!("user_id is not a valid UUID ({}): {}", user_id, e);
+                user_id.as_bytes().to_vec()
+            });
         metadata.meeting_id = meeting_id.to_string();
         metadata.protocol = protocol.to_string();
         metadata.server_instance = self.server_instance.clone();

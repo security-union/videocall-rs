@@ -20,18 +20,21 @@
 use protobuf::Message as ProtoMessage;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
+use uuid::Uuid;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::user_id::to_user_id_bytes;
-use videocall_types::SYSTEM_USER_ID;
+use videocall_types::{parse_user_id, SYSTEM_USER_ID};
 
 /// Error type for session management operations
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionError {
     /// User tried to use the reserved system user ID
     ReservedUserId,
+    /// User ID is not a valid UUID
+    InvalidUserId,
 }
 
 impl std::fmt::Display for SessionError {
@@ -39,6 +42,9 @@ impl std::fmt::Display for SessionError {
         match self {
             SessionError::ReservedUserId => {
                 write!(f, "Cannot use reserved system user ID")
+            }
+            SessionError::InvalidUserId => {
+                write!(f, "User ID is not a valid UUID")
             }
         }
     }
@@ -51,8 +57,8 @@ impl std::error::Error for SessionError {}
 pub struct SessionStartResult {
     pub start_time_ms: u64,
     pub is_first_participant: bool,
-    /// The user_id of the connecting user (host/creator info comes from JWT)
-    pub creator_id: String,
+    /// The validated UUID of the connecting user
+    pub creator_id: Uuid,
     pub session_id: u64,
 }
 
@@ -92,7 +98,8 @@ impl SessionManager {
         user_id: &str,
         id: u64,
     ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
-        if user_id == SYSTEM_USER_ID {
+        let uuid = parse_user_id(user_id).map_err(|_| SessionError::InvalidUserId)?;
+        if uuid == SYSTEM_USER_ID {
             return Err(Box::new(SessionError::ReservedUserId));
         }
 
@@ -106,7 +113,7 @@ impl SessionManager {
         Ok(SessionStartResult {
             start_time_ms: now_ms,
             is_first_participant: true,
-            creator_id: user_id.to_string(),
+            creator_id: uuid,
             session_id: id,
         })
     }
@@ -126,7 +133,7 @@ impl SessionManager {
     pub fn build_session_assigned_packet(session_id: u64) -> Vec<u8> {
         let wrapper = PacketWrapper {
             packet_type: PacketType::SESSION_ASSIGNED.into(),
-            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            user_id: to_user_id_bytes(&SYSTEM_USER_ID),
             session_id,
             ..Default::default()
         };
@@ -137,7 +144,7 @@ impl SessionManager {
     pub fn build_meeting_started_packet(
         room_id: &str,
         start_time_ms: u64,
-        creator_id: &str,
+        creator_id: &Uuid,
     ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::MEETING_STARTED.into(),
@@ -149,7 +156,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            user_id: to_user_id_bytes(&SYSTEM_USER_ID),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -163,7 +170,7 @@ impl SessionManager {
     /// client can show friendly toast messages.
     pub fn build_peer_joined_packet(
         room_id: &str,
-        user_id: &str,
+        user_id: &Uuid,
         session_id: u64,
         display_name: &str,
     ) -> Vec<u8> {
@@ -179,7 +186,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            user_id: to_user_id_bytes(&SYSTEM_USER_ID),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -190,7 +197,7 @@ impl SessionManager {
     /// Build PARTICIPANT_LEFT packet to notify remaining peers about a departed session.
     pub fn build_peer_left_packet(
         room_id: &str,
-        user_id: &str,
+        user_id: &Uuid,
         session_id: u64,
         display_name: &str,
     ) -> Vec<u8> {
@@ -206,7 +213,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            user_id: to_user_id_bytes(&SYSTEM_USER_ID),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -225,7 +232,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            user_id: to_user_id_bytes(&SYSTEM_USER_ID),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -244,23 +251,30 @@ impl Default for SessionManager {
 mod tests {
     use super::*;
 
+    /// Test UUID strings for alice, bob, and charlie.
+    const ALICE_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const BOB_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    const CHARLIE_UUID: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+
     #[tokio::test]
     async fn test_start_session_returns_result() {
         let manager = SessionManager::new();
         let result = manager
-            .start_session("room-1", "alice", 12345)
+            .start_session("room-1", ALICE_UUID, 12345)
             .await
             .unwrap();
         assert!(result.start_time_ms > 0);
         assert!(result.is_first_participant);
-        assert_eq!(result.creator_id, "alice");
+        assert_eq!(result.creator_id, parse_user_id(ALICE_UUID).unwrap());
         assert_eq!(result.session_id, 12345);
     }
 
     #[tokio::test]
     async fn test_system_user_id_rejected() {
         let manager = SessionManager::new();
-        let result = manager.start_session("room-1", SYSTEM_USER_ID, 0).await;
+        let result = manager
+            .start_session("room-1", &SYSTEM_USER_ID.to_string(), 0)
+            .await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -271,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn test_end_session_returns_result() {
         let manager = SessionManager::new();
-        let result = manager.end_session("room-1", "alice").await.unwrap();
+        let result = manager.end_session("room-1", ALICE_UUID).await.unwrap();
         assert_eq!(
             result,
             SessionEndResult::MeetingContinues { remaining_count: 0 }
@@ -283,15 +297,16 @@ mod tests {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
+        let alice_uuid = parse_user_id(ALICE_UUID).unwrap();
         let meeting_started =
-            SessionManager::build_meeting_started_packet("my-room", 1234567890, "alice");
+            SessionManager::build_meeting_started_packet("my-room", 1234567890, &alice_uuid);
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_started).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
         assert_eq!(inner.event_type, MeetingEventType::MEETING_STARTED.into());
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.start_time_ms, 1234567890);
-        assert_eq!(inner.creator_id, to_user_id_bytes("alice"));
+        assert_eq!(inner.creator_id, to_user_id_bytes(&alice_uuid));
 
         let meeting_ended = SessionManager::build_meeting_ended_packet("my-room", "Host left");
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_ended).unwrap();
@@ -307,10 +322,12 @@ mod tests {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-        let packet = SessionManager::build_peer_joined_packet("my-room", "bob", 42, "Bob Smith");
+        let bob_uuid = parse_user_id(BOB_UUID).unwrap();
+        let packet =
+            SessionManager::build_peer_joined_packet("my-room", &bob_uuid, 42, "Bob Smith");
         let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
-        assert_eq!(wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
+        assert_eq!(wrapper.user_id, to_user_id_bytes(&SYSTEM_USER_ID));
 
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
         assert_eq!(
@@ -318,9 +335,9 @@ mod tests {
             MeetingEventType::PARTICIPANT_JOINED.into()
         );
         assert_eq!(inner.room_id, "my-room");
-        assert_eq!(inner.target_user_id, to_user_id_bytes("bob"));
+        assert_eq!(inner.target_user_id, to_user_id_bytes(&bob_uuid));
         assert_eq!(inner.session_id, 42);
-        assert!(inner.message.contains("bob"));
+        assert!(inner.message.contains(BOB_UUID));
         assert_eq!(inner.display_name, "Bob Smith".as_bytes().to_vec());
     }
 
@@ -329,14 +346,16 @@ mod tests {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-        let packet = SessionManager::build_peer_left_packet("my-room", "alice", 99, "Alice Jones");
+        let alice_uuid = parse_user_id(ALICE_UUID).unwrap();
+        let packet =
+            SessionManager::build_peer_left_packet("my-room", &alice_uuid, 99, "Alice Jones");
         let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
 
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
         assert_eq!(inner.event_type, MeetingEventType::PARTICIPANT_LEFT.into());
         assert_eq!(inner.room_id, "my-room");
-        assert_eq!(inner.target_user_id, to_user_id_bytes("alice"));
+        assert_eq!(inner.target_user_id, to_user_id_bytes(&alice_uuid));
         assert_eq!(inner.session_id, 99);
     }
 
@@ -349,12 +368,12 @@ mod tests {
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
         let room = "symmetry-room";
-        let user = "charlie";
+        let user = parse_user_id(CHARLIE_UUID).unwrap();
         let sid = 77u64;
         let display = "Charlie Brown";
 
-        let joined_bytes = SessionManager::build_peer_joined_packet(room, user, sid, display);
-        let left_bytes = SessionManager::build_peer_left_packet(room, user, sid, display);
+        let joined_bytes = SessionManager::build_peer_joined_packet(room, &user, sid, display);
+        let left_bytes = SessionManager::build_peer_left_packet(room, &user, sid, display);
 
         let joined_wrapper = PacketWrapper::parse_from_bytes(&joined_bytes).unwrap();
         let left_wrapper = PacketWrapper::parse_from_bytes(&left_bytes).unwrap();
@@ -368,8 +387,8 @@ mod tests {
             left_wrapper.session_id, 0,
             "PARTICIPANT_LEFT wrapper session_id should be 0"
         );
-        assert_eq!(joined_wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
-        assert_eq!(left_wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
+        assert_eq!(joined_wrapper.user_id, to_user_id_bytes(&SYSTEM_USER_ID));
+        assert_eq!(left_wrapper.user_id, to_user_id_bytes(&SYSTEM_USER_ID));
         assert_eq!(joined_wrapper.packet_type, left_wrapper.packet_type);
 
         let joined_inner = MeetingPacket::parse_from_bytes(&joined_wrapper.data).unwrap();

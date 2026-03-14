@@ -32,6 +32,7 @@ use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
+use videocall_types::{parse_user_id, to_user_id_bytes};
 use wasm_bindgen::JsValue;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -299,7 +300,9 @@ impl ConnectionManager {
             }
 
             // Handle RTT responses internally
-            if packet.user_id[..] == *userid.as_bytes() {
+            let uid_bytes =
+                to_user_id_bytes(&parse_user_id(&userid).expect("userid must be a valid UUID"));
+            if packet.user_id == uid_bytes {
                 let reception_time = js_sys::Date::now();
                 if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
@@ -418,9 +421,12 @@ impl ConnectionManager {
 
     /// Create an RTT probe packet
     fn create_rtt_packet(&self, timestamp: f64) -> Result<PacketWrapper> {
+        let uid_bytes = to_user_id_bytes(
+            &parse_user_id(&self.options.userid).expect("userid must be a valid UUID"),
+        );
         let media_packet = MediaPacket {
             media_type: MediaType::RTT.into(),
-            user_id: self.options.userid.as_bytes().to_vec(),
+            user_id: Vec::new(), // user_id on inner MediaPacket is unused for RTT probes
             timestamp,
             ..Default::default()
         };
@@ -428,7 +434,7 @@ impl ConnectionManager {
         let data = self.aes.encrypt(&media_packet.write_to_bytes()?)?;
         Ok(PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
-            user_id: self.options.userid.as_bytes().to_vec(),
+            user_id: uid_bytes,
             data,
             ..Default::default()
         })

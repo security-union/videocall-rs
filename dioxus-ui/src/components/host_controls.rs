@@ -222,7 +222,6 @@ pub fn HostControls(
                             let display_name = participant.display_name.clone();
 
                             let uid_for_key = peer_user_id.clone();
-                            let uid_for_view = peer_user_id.clone();
                             let uid_admit = peer_user_id.clone();
                             let uid_reject = peer_user_id.clone();
 
@@ -244,12 +243,11 @@ pub fn HostControls(
                                         if let Some(name) = display_name.clone() {
                                             if !name.trim().is_empty() {
                                                 div { class: "participant-name", "{name}" }
-                                                div { class: "participant-email", "{uid_for_view}" }
                                             } else {
-                                                div { class: "participant-name", "{uid_for_view}" }
+                                                div { class: "participant-name", "Unknown participant" }
                                             }
                                         } else {
-                                            div { class: "participant-name", "{uid_for_view}" }
+                                            div { class: "participant-name", "Unknown participant" }
                                         }
                                     }
                                     div { class: "participant-actions",

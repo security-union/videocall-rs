@@ -46,6 +46,7 @@ use videocall_types::protos::{
     packet_wrapper::packet_wrapper::PacketType,
 };
 use videocall_types::Callback;
+use videocall_types::{parse_user_id, to_user_id_bytes};
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -86,9 +87,11 @@ pub fn transform_audio_chunk(
     };
     let data = media_packet.write_to_bytes().unwrap();
     let data = aes.encrypt(&data).unwrap();
+    let uid_bytes =
+        to_user_id_bytes(&parse_user_id(user_id).expect("user_id must be a valid UUID"));
     PacketWrapper {
         data,
-        user_id: user_id.as_bytes().to_vec(),
+        user_id: uid_bytes,
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }

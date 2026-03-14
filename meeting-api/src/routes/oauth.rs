@@ -210,7 +210,7 @@ pub async fn callback(
 
     let display_name = claims.display_name();
 
-    db_oauth::upsert_user(
+    let user_uuid = db_oauth::upsert_user(
         &state.db,
         &email,
         &display_name,
@@ -220,9 +220,10 @@ pub async fn callback(
     .await?;
 
     // --- Issue signed session JWT inside an HttpOnly cookie ---
+    // The JWT `sub` claim carries the user's UUID (not the email).
     let session_jwt = token::generate_session_token(
         &state.jwt_secret,
-        &email,
+        &user_uuid.to_string(),
         &display_name,
         state.session_ttl_secs,
     )?;

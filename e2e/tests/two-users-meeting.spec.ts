@@ -14,7 +14,7 @@ const BROWSER_ARGS = [
 
 async function createAuthenticatedContext(
   browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
-  email: string,
+  userId: string,
   name: string,
   uiURL: string,
 ) {
@@ -22,7 +22,7 @@ async function createAuthenticatedContext(
     baseURL: uiURL,
     ignoreHTTPSErrors: true,
   });
-  const token = generateSessionToken(email, name);
+  const token = generateSessionToken(userId, name);
   const url = new URL(uiURL);
   await context.addCookies([
     {
@@ -52,7 +52,7 @@ async function createAuthenticatedContext(
  *   - "Waiting to be admitted" (waiting room)
  *   - "Waiting for meeting to start" (host hasn't started yet)
  *
- * Auth dropdown (user name/email, sign-out) is only shown on the home
+ * Auth dropdown (user name, sign-out) is only shown on the home
  * page -- it no longer appears on this pre-meeting screen.
  */
 async function joinMeetingFromPage(
@@ -103,13 +103,13 @@ test.describe("Two users in a meeting", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host@videocall.rs",
+        "00000000-0000-4000-8000-000000000011",
         "HostUser",
         uiURL,
       );
       const guestCtx = await createAuthenticatedContext(
         browser2,
-        "guest@videocall.rs",
+        "00000000-0000-4000-8000-000000000012",
         "GuestUser",
         uiURL,
       );
@@ -202,7 +202,7 @@ test.describe("Two users in a meeting", () => {
 
       // ---- ASSERT: peer tile shows display_name as text, user_id as tooltip ----
       // The floating name overlay on each peer tile should show the display name,
-      // with the user_id (email) available as a tooltip via the title attribute.
+      // with the user_id (UUID) available as a tooltip via the title attribute.
       // The host tile includes a "Host: " prefix in the title attribute.
       const guestNameOnHost = hostPage.locator(".floating-name", {
         hasText: "GuestUser",
@@ -214,35 +214,38 @@ test.describe("Two users in a meeting", () => {
       // Check that the guest's display name is visible on the host side.
       // The guest is not the host, so the title is just the user_id.
       await expect(guestNameOnHost.first()).toBeVisible({ timeout: 10_000 });
-      await expect(guestNameOnHost.first()).toHaveAttribute("title", "guest@videocall.rs");
+      await expect(guestNameOnHost.first()).toHaveAttribute(
+        "title",
+        "00000000-0000-4000-8000-000000000012",
+      );
 
       // Check that the host's display name is visible on the guest side.
       // The host tile has a "Host: " prefix in the title attribute.
       await expect(hostNameOnGuest.first()).toBeVisible({ timeout: 10_000 });
       await expect(hostNameOnGuest.first()).toHaveAttribute(
         "title",
-        /^(Host: )?host@videocall\.rs$/,
+        /^(Host: )?00000000-0000-4000-8000-000000000011$/,
       );
 
-      // ---- ASSERT: floating-name shows display_name NOT email ----
-      // Verify the floating name text does NOT contain email addresses.
-      // This guards against a regression where user_id/email was shown
+      // ---- ASSERT: floating-name shows display_name NOT user_id ----
+      // Verify the floating name text does NOT contain UUIDs.
+      // This guards against a regression where user_id was shown
       // instead of display_name as the visible tile label.
       const allHostFloatingNames = hostPage.locator(".floating-name");
       const allGuestFloatingNames = guestPage.locator(".floating-name");
 
-      // On host side: no floating name should contain an '@' sign
+      // On host side: no floating name should contain a UUID pattern
       const hostFloatingCount = await allHostFloatingNames.count();
       for (let i = 0; i < hostFloatingCount; i++) {
         const text = await allHostFloatingNames.nth(i).textContent();
-        expect(text).not.toContain("@");
+        expect(text).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/);
       }
 
-      // On guest side: no floating name should contain an '@' sign
+      // On guest side: no floating name should contain a UUID pattern
       const guestFloatingCount = await allGuestFloatingNames.count();
       for (let i = 0; i < guestFloatingCount; i++) {
         const text = await allGuestFloatingNames.nth(i).textContent();
-        expect(text).not.toContain("@");
+        expect(text).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/);
       }
 
       // ---- ASSERT: "joined the meeting" toast notifications ----

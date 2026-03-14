@@ -184,18 +184,29 @@ mod tests {
 
     #[test]
     fn session_token_round_trips() {
-        let token = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600)
-            .expect("should sign");
+        let token = generate_session_token(
+            TEST_SECRET,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Alice",
+            3600,
+        )
+        .expect("should sign");
         let claims = decode_session_token(TEST_SECRET, &token).expect("should decode");
 
-        assert_eq!(claims.sub, "alice@test.com");
+        assert_eq!(claims.sub, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(claims.name, "Alice");
         assert_eq!(claims.iss, SessionTokenClaims::ISSUER);
     }
 
     #[test]
     fn session_token_wrong_secret_fails() {
-        let token = generate_session_token(TEST_SECRET, "a@b.com", "A", 3600).expect("should sign");
+        let token = generate_session_token(
+            TEST_SECRET,
+            "770e8400-e29b-41d4-a716-446655440002",
+            "A",
+            3600,
+        )
+        .expect("should sign");
         let err = decode_session_token("wrong-secret", &token);
         assert!(err.is_err());
     }
@@ -203,7 +214,13 @@ mod tests {
     #[test]
     fn session_token_expired_fails() {
         // Use a TTL of -120s to exceed jsonwebtoken's default 60s leeway.
-        let token = generate_session_token(TEST_SECRET, "a@b.com", "A", -120).expect("should sign");
+        let token = generate_session_token(
+            TEST_SECRET,
+            "770e8400-e29b-41d4-a716-446655440002",
+            "A",
+            -120,
+        )
+        .expect("should sign");
         let err = decode_session_token(TEST_SECRET, &token);
         assert!(err.is_err());
     }
@@ -211,7 +228,13 @@ mod tests {
     #[test]
     fn session_token_has_iat() {
         let before = Utc::now().timestamp();
-        let token = generate_session_token(TEST_SECRET, "a@b.com", "A", 3600).expect("should sign");
+        let token = generate_session_token(
+            TEST_SECRET,
+            "770e8400-e29b-41d4-a716-446655440002",
+            "A",
+            3600,
+        )
+        .expect("should sign");
         let after = Utc::now().timestamp();
 
         let claims = decode_session_token(TEST_SECRET, &token).expect("should decode");
@@ -225,9 +248,15 @@ mod tests {
 
     #[test]
     fn token_round_trips_with_correct_claims() {
-        let token =
-            generate_room_token(TEST_SECRET, 600, "user@test.com", "room-42", true, "Alice")
-                .expect("should sign");
+        let token = generate_room_token(
+            TEST_SECRET,
+            600,
+            "660e8400-e29b-41d4-a716-446655440001",
+            "room-42",
+            true,
+            "Alice",
+        )
+        .expect("should sign");
 
         let mut validation = Validation::default();
         validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
@@ -238,7 +267,7 @@ mod tests {
         )
         .expect("should decode");
 
-        assert_eq!(data.claims.sub, "user@test.com");
+        assert_eq!(data.claims.sub, "660e8400-e29b-41d4-a716-446655440001");
         assert_eq!(data.claims.room, "room-42");
         assert!(data.claims.is_host);
         assert_eq!(data.claims.display_name, "Alice");
@@ -247,8 +276,15 @@ mod tests {
 
     #[test]
     fn issuer_is_videocall_meeting_backend() {
-        let token = generate_room_token(TEST_SECRET, 300, "a@b.com", "r", false, "Bob")
-            .expect("should sign");
+        let token = generate_room_token(
+            TEST_SECRET,
+            300,
+            "770e8400-e29b-41d4-a716-446655440002",
+            "r",
+            false,
+            "Bob",
+        )
+        .expect("should sign");
 
         let mut validation = Validation::default();
         validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
@@ -266,8 +302,15 @@ mod tests {
     fn exp_is_now_plus_ttl() {
         let ttl = 900_i64;
         let before = Utc::now().timestamp();
-        let token =
-            generate_room_token(TEST_SECRET, ttl, "a@b.com", "r", false, "X").expect("should sign");
+        let token = generate_room_token(
+            TEST_SECRET,
+            ttl,
+            "770e8400-e29b-41d4-a716-446655440002",
+            "r",
+            false,
+            "X",
+        )
+        .expect("should sign");
         let after = Utc::now().timestamp();
 
         let mut validation = Validation::default();
@@ -286,8 +329,15 @@ mod tests {
 
     #[test]
     fn room_join_is_always_true() {
-        let token =
-            generate_room_token(TEST_SECRET, 60, "a@b.com", "r", false, "X").expect("should sign");
+        let token = generate_room_token(
+            TEST_SECRET,
+            60,
+            "880e8400-e29b-41d4-a716-446655440003",
+            "r",
+            false,
+            "X",
+        )
+        .expect("should sign");
 
         let mut validation = Validation::default();
         validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);

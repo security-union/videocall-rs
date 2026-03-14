@@ -25,7 +25,10 @@ pub mod validation;
 pub use callback::Callback;
 pub use feature_flags::FeatureFlags;
 use protobuf::Message;
-pub use user_id::{is_system_user, to_user_id_bytes, user_id_bytes_to_string};
+pub use user_id::{
+    is_system_user, parse_user_id, to_user_id_bytes, user_id_bytes_to_string, user_id_bytes_to_uuid,
+};
+pub use uuid::Uuid;
 
 /// A representation of a value which can be stored and restored as a text.
 pub type Text = Result<String, anyhow::Error>;
@@ -34,8 +37,8 @@ pub type Text = Result<String, anyhow::Error>;
 pub type Binary = Result<Vec<u8>, anyhow::Error>;
 
 /// System user ID used for server-generated messages (meeting info, meeting started/ended).
-/// This is not a real user and should be filtered out in UI/peer management.
-pub const SYSTEM_USER_ID: &str = "system-&^%$#@!";
+/// This is the nil UUID (all-zero bytes), not a real user.
+pub const SYSTEM_USER_ID: Uuid = Uuid::nil();
 
 impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {

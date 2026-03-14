@@ -22,6 +22,8 @@ use videocall_meeting_types::{
     responses::{APIResponse, AdmitAllResponse, ParticipantStatusResponse, WaitingRoomResponse},
 };
 
+use videocall_types::parse_user_id;
+
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
@@ -29,7 +31,11 @@ use crate::nats_events;
 use crate::state::AppState;
 
 /// Verify that the requester is the meeting host (authorization check).
-async fn require_host(state: &AppState, meeting_id: i32, user_id: &str) -> Result<(), AppError> {
+async fn require_host(
+    state: &AppState,
+    meeting_id: i32,
+    user_id: &uuid::Uuid,
+) -> Result<(), AppError> {
     let row = db_participants::get_status(&state.db, meeting_id, user_id)
         .await?
         .ok_or_else(AppError::not_host)?;
@@ -46,11 +52,14 @@ pub async fn get_waiting_room(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<WaitingRoomResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host(&state, meeting.id, &user_uuid).await?;
 
     let rows = db_participants::get_waiting(&state.db, meeting.id).await?;
     let waiting: Vec<ParticipantStatusResponse> = rows
@@ -71,20 +80,24 @@ pub async fn admit_participant(
     Path(meeting_id): Path<String>,
     Json(body): Json<AdmitRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let target_uuid = parse_user_id(&body.user_id)
+        .map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host(&state, meeting.id, &user_uuid).await?;
 
-    let row = db_participants::admit(&state.db, meeting.id, &body.user_id)
+    let row = db_participants::admit(&state.db, meeting.id, &target_uuid)
         .await?
         .ok_or_else(|| AppError::participant_not_found(&body.user_id))?;
 
     // Notify the admitted participant via NATS. The client will fetch its room
     // token via HTTP after receiving this notification.
-    nats_events::publish_participant_admitted(state.nats.as_ref(), &meeting_id, &body.user_id)
-        .await;
+    nats_events::publish_participant_admitted(state.nats.as_ref(), &meeting_id, &target_uuid).await;
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }
@@ -95,11 +108,14 @@ pub async fn admit_all(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<AdmitAllResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host(&state, meeting.id, &user_uuid).await?;
 
     let rows = db_participants::admit_all(&state.db, meeting.id).await?;
     let admitted_count = rows.len();
@@ -129,18 +145,22 @@ pub async fn reject_participant(
     Path(meeting_id): Path<String>,
     Json(body): Json<AdmitRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let user_uuid =
+        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let target_uuid = parse_user_id(&body.user_id)
+        .map_err(|_| AppError::bad_request("invalid user_id format"))?;
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host(&state, meeting.id, &user_uuid).await?;
 
-    let row = db_participants::reject(&state.db, meeting.id, &body.user_id)
+    let row = db_participants::reject(&state.db, meeting.id, &target_uuid)
         .await?
         .ok_or_else(|| AppError::participant_not_found(&body.user_id))?;
 
-    nats_events::publish_participant_rejected(state.nats.as_ref(), &meeting_id, &body.user_id)
-        .await;
+    nats_events::publish_participant_rejected(state.nats.as_ref(), &meeting_id, &target_uuid).await;
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }

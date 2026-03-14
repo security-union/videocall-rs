@@ -373,7 +373,7 @@ impl Component for PeerList {
                                     let muted = !self.peer_audio_states.get(peer_id).copied().unwrap_or(false);
                                     let speaking = self.peer_speaking_states.get(peer_id).copied().unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={display_name} tooltip={user_id} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
+                                        <li><PeerListItem name={display_name.clone()} tooltip={display_name} is_host={is_peer_host} muted={muted} speaking={speaking} /></li>
                                     }
                                 })}
                             </ul>

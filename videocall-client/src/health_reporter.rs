@@ -31,6 +31,7 @@ use videocall_types::protos::health_packet::{
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
+use videocall_types::{parse_user_id, to_user_id_bytes};
 use wasm_bindgen_futures::spawn_local;
 use web_time::{SystemTime, UNIX_EPOCH};
 
@@ -511,7 +512,9 @@ impl HealthReporter {
         let mut pb = PbHealthPacket::new();
         pb.session_id = session_id.to_string();
         pb.meeting_id = meeting_id.to_string();
-        pb.reporting_user_id = reporting_peer.as_bytes().to_vec();
+        pb.reporting_user_id = to_user_id_bytes(
+            &parse_user_id(reporting_peer).expect("reporting_peer must be a valid UUID"),
+        );
         pb.timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -626,9 +629,12 @@ impl HealthReporter {
         }
 
         let bytes = pb.write_to_bytes().unwrap_or_default();
+        let uid_bytes = to_user_id_bytes(
+            &parse_user_id(reporting_peer).expect("reporting_peer must be a valid UUID"),
+        );
         Some(PacketWrapper {
             packet_type: PacketType::HEALTH.into(),
-            user_id: reporting_peer.as_bytes().to_vec(),
+            user_id: uid_bytes,
             data: bytes,
             ..Default::default()
         })

@@ -16,6 +16,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Row returned from the `meetings` table.
 #[derive(Debug, sqlx::FromRow)]
@@ -28,7 +29,7 @@ pub struct MeetingRow {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
-    pub creator_id: Option<String>,
+    pub creator_id: Option<Uuid>,
     pub password_hash: Option<String>,
     pub state: Option<String>,
     pub attendees: Option<JsonValue>,
@@ -40,7 +41,7 @@ pub struct MeetingRow {
 pub async fn create(
     pool: &PgPool,
     room_id: &str,
-    creator_id: &str,
+    creator_id: &Uuid,
     password_hash: Option<&str>,
     attendees: &JsonValue,
 ) -> Result<MeetingRow, sqlx::Error> {
@@ -51,7 +52,7 @@ pub async fn create(
 pub async fn create_with_options(
     pool: &PgPool,
     room_id: &str,
-    creator_id: &str,
+    creator_id: &Uuid,
     password_hash: Option<&str>,
     attendees: &JsonValue,
     waiting_room_enabled: bool,
@@ -96,7 +97,7 @@ pub async fn get_by_room_id(
 /// List meetings owned by `creator_id` (non-deleted), ordered by created_at DESC.
 pub async fn list_by_owner(
     pool: &PgPool,
-    creator_id: &str,
+    creator_id: &Uuid,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<MeetingRow>, sqlx::Error> {
@@ -119,7 +120,7 @@ pub async fn list_by_owner(
 }
 
 /// Count meetings owned by `creator_id` (non-deleted).
-pub async fn count_by_owner(pool: &PgPool, creator_id: &str) -> Result<i64, sqlx::Error> {
+pub async fn count_by_owner(pool: &PgPool, creator_id: &Uuid) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM meetings WHERE deleted_at IS NULL AND creator_id = $1",
     )
@@ -133,7 +134,7 @@ pub async fn count_by_owner(pool: &PgPool, creator_id: &str) -> Result<i64, sqlx
 pub async fn soft_delete(
     pool: &PgPool,
     room_id: &str,
-    creator_id: &str,
+    creator_id: &Uuid,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
     sqlx::query_as::<_, MeetingRow>(
         r#"
@@ -189,7 +190,7 @@ pub async fn set_host_display_name(
 pub async fn update_waiting_room_enabled(
     pool: &PgPool,
     room_id: &str,
-    creator_id: &str,
+    creator_id: &Uuid,
     enabled: bool,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;

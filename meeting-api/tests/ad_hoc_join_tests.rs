@@ -39,7 +39,7 @@ async fn test_ad_hoc_join_creates_meeting() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "pioneer@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"display_name":"Pioneer"}"#))
@@ -62,7 +62,7 @@ async fn test_ad_hoc_join_creates_meeting() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}"),
-        "pioneer@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -73,7 +73,7 @@ async fn test_ad_hoc_join_creates_meeting() {
     let meeting: APIResponse<MeetingInfoResponse> = response_json(resp).await;
     assert_eq!(meeting.result.meeting_id, room_id);
     assert_eq!(meeting.result.state, "active");
-    assert_eq!(meeting.result.host, "pioneer@example.com");
+    assert_eq!(meeting.result.host, "550e8400-e29b-41d4-a716-446655440000");
 
     cleanup_test_data(&pool, room_id).await;
 }
@@ -90,7 +90,7 @@ async fn test_ad_hoc_join_token_is_valid_jwt() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "host@example.com",
+        "660e8400-e29b-41d4-a716-446655440001",
     )
     .body(Body::empty())
     .unwrap();
@@ -116,7 +116,7 @@ async fn test_ad_hoc_join_token_is_valid_jwt() {
     )
     .expect("token should be a valid JWT signed with test secret");
 
-    assert_eq!(data.claims.sub, "host@example.com");
+    assert_eq!(data.claims.sub, "660e8400-e29b-41d4-a716-446655440001");
     assert_eq!(data.claims.room, room_id);
     assert!(data.claims.is_host);
     assert!(data.claims.room_join);

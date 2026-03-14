@@ -173,6 +173,7 @@ impl NetEqAudioPeerDecoder {
     /// This gives the UI a faster speaking indicator for remote peers than
     /// the 1Hz heartbeat, which only reflects the remote user's own
     /// encoder-side VAD result.
+    #[allow(clippy::too_many_arguments)]
     fn handle_pcm_data(
         pcm: Float32Array,
         pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
@@ -399,6 +400,7 @@ impl NetEqAudioPeerDecoder {
     }
 
     /// Create message handler for NetEq worker
+    #[allow(clippy::too_many_arguments)]
     fn create_message_handler(
         pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
         audio_context: AudioContext,

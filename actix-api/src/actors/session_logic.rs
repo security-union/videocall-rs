@@ -131,7 +131,7 @@ impl SessionLogic {
     }
 
     /// Build MEETING_STARTED packet
-    pub fn build_meeting_started(&self, start_time_ms: u64, creator_id: &str) -> Vec<u8> {
+    pub fn build_meeting_started(&self, start_time_ms: u64, creator_id: &uuid::Uuid) -> Vec<u8> {
         SessionManager::build_meeting_started_packet(&self.room, start_time_ms, creator_id)
     }
 

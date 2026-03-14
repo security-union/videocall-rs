@@ -26,6 +26,7 @@ use videocall_types::protos::{
     media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
+use videocall_types::{parse_user_id, to_user_id_bytes};
 use web_sys::EncodedVideoChunk;
 
 pub fn buffer_to_uint8array(buf: &mut [u8]) -> Uint8Array {
@@ -63,9 +64,11 @@ pub fn transform_video_chunk(
     }
     let data = media_packet.write_to_bytes().unwrap();
     let data = aes.encrypt(&data).unwrap();
+    let uid_bytes =
+        to_user_id_bytes(&parse_user_id(user_id).expect("user_id must be a valid UUID"));
     PacketWrapper {
         data,
-        user_id: user_id.as_bytes().to_vec(),
+        user_id: uid_bytes,
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }
@@ -101,9 +104,11 @@ pub fn transform_screen_chunk(
     }
     let data = media_packet.write_to_bytes().unwrap();
     let data = aes.encrypt(&data).unwrap();
+    let uid_bytes =
+        to_user_id_bytes(&parse_user_id(user_id).expect("user_id must be a valid UUID"));
     PacketWrapper {
         data,
-        user_id: user_id.as_bytes().to_vec(),
+        user_id: uid_bytes,
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }

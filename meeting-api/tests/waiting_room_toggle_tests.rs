@@ -36,23 +36,27 @@ async fn setup_active_meeting(pool: &sqlx::PgPool, room_id: &str) {
     cleanup_test_data(pool, room_id).await;
 
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     let app = build_app(pool.clone());
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -64,24 +68,28 @@ async fn setup_active_meeting_no_waiting_room(pool: &sqlx::PgPool, room_id: &str
     cleanup_test_data(pool, room_id).await;
 
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": [],
-                "waiting_room_enabled": false
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": [],
+            "waiting_room_enabled": false
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     let app = build_app(pool.clone());
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -102,7 +110,7 @@ async fn test_update_meeting_toggle_waiting_room_off() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"waiting_room_enabled":false}"#))
@@ -127,17 +135,21 @@ async fn test_update_meeting_toggle_waiting_room_on() {
 
     // Create with waiting room OFF.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": [],
-                "waiting_room_enabled": false
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": [],
+            "waiting_room_enabled": false
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Toggle waiting room ON.
@@ -145,7 +157,7 @@ async fn test_update_meeting_toggle_waiting_room_on() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"waiting_room_enabled":true}"#))
@@ -173,7 +185,7 @@ async fn test_update_meeting_non_owner_forbidden() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "other@example.com",
+        "660e8400-e29b-41d4-a716-446655440001",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"waiting_room_enabled":false}"#))
@@ -195,7 +207,7 @@ async fn test_update_meeting_not_found() {
     let req = request_with_cookie(
         "PATCH",
         "/api/v1/meetings/nonexistent-toggle",
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"waiting_room_enabled":false}"#))
@@ -218,16 +230,20 @@ async fn test_create_meeting_defaults_waiting_room_enabled() {
     cleanup_test_data(&pool, room_id).await;
 
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -250,17 +266,21 @@ async fn test_create_meeting_with_waiting_room_disabled() {
     cleanup_test_data(&pool, room_id).await;
 
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": [],
-                "waiting_room_enabled": false
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": [],
+            "waiting_room_enabled": false
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -286,17 +306,21 @@ async fn test_get_meeting_returns_waiting_room_enabled() {
 
     // Create with waiting room OFF.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": [],
-                "waiting_room_enabled": false
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": [],
+            "waiting_room_enabled": false
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // GET the meeting and check the field.
@@ -304,7 +328,7 @@ async fn test_get_meeting_returns_waiting_room_enabled() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -333,17 +357,21 @@ async fn test_list_meetings_returns_waiting_room_enabled() {
 
     // Create with waiting room OFF.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": [],
-                "waiting_room_enabled": false
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": [],
+            "waiting_room_enabled": false
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // List meetings.
@@ -351,7 +379,7 @@ async fn test_list_meetings_returns_waiting_room_enabled() {
     let req = request_with_cookie(
         "GET",
         "/api/v1/meetings?limit=100&offset=0",
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -389,7 +417,7 @@ async fn test_attendee_auto_admitted_when_waiting_room_off() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"display_name":"Auto Attendee"}"#))
@@ -425,7 +453,7 @@ async fn test_attendee_waits_when_waiting_room_on() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -457,10 +485,14 @@ async fn test_toggle_waiting_room_off_admits_waiting_participants() {
     setup_active_meeting(&pool, room_id).await;
 
     // 3 attendees join (enter waiting room).
-    for i in 1..=3 {
+    let attendee_uuids = [
+        "ee0e8400-e29b-41d4-a716-446655440009",
+        "ff0e8400-e29b-41d4-a716-44665544000a",
+        "00111111-e29b-41d4-a716-44665544000b",
+    ];
+    for uuid in &attendee_uuids {
         let app = build_app(pool.clone());
-        let email = format!("attendee{i}@example.com");
-        let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/join"), &email)
+        let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/join"), uuid)
             .body(Body::empty())
             .unwrap();
         let _ = app.oneshot(req).await.unwrap();
@@ -471,7 +503,7 @@ async fn test_toggle_waiting_room_off_admits_waiting_participants() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}/waiting"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -484,7 +516,7 @@ async fn test_toggle_waiting_room_off_admits_waiting_participants() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"waiting_room_enabled":false}"#))
@@ -497,7 +529,7 @@ async fn test_toggle_waiting_room_off_admits_waiting_participants() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}/waiting"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -514,7 +546,7 @@ async fn test_toggle_waiting_room_off_admits_waiting_participants() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}/status"),
-        "attendee1@example.com",
+        "ee0e8400-e29b-41d4-a716-446655440009",
     )
     .body(Body::empty())
     .unwrap();
@@ -544,7 +576,7 @@ async fn test_new_attendee_auto_admitted_after_toggle_off() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"waiting_room_enabled":false}"#))
@@ -556,7 +588,7 @@ async fn test_new_attendee_auto_admitted_after_toggle_off() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "late-joiner@example.com",
+        "bb0e8400-e29b-41d4-a716-446655440006",
     )
     .body(Body::empty())
     .unwrap();
@@ -588,7 +620,7 @@ async fn test_toggle_waiting_room_back_on_restores_waiting() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"waiting_room_enabled":false}"#))
@@ -600,7 +632,7 @@ async fn test_toggle_waiting_room_back_on_restores_waiting() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"waiting_room_enabled":true}"#))
@@ -615,7 +647,7 @@ async fn test_toggle_waiting_room_back_on_restores_waiting() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee-after-reon@example.com",
+        "cc0e8400-e29b-41d4-a716-446655440007",
     )
     .body(Body::empty())
     .unwrap();
@@ -644,16 +676,20 @@ async fn test_update_meeting_unauthenticated() {
 
     // Create a meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // PATCH without session cookie.
@@ -682,16 +718,20 @@ async fn test_update_meeting_empty_body_noop() {
 
     // Create a meeting with waiting room enabled (default).
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // PATCH with empty body — should be a no-op returning current state.
@@ -699,7 +739,7 @@ async fn test_update_meeting_empty_body_noop() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{}"#))
@@ -730,23 +770,27 @@ async fn test_update_meeting_soft_deleted_returns_404() {
 
     // Create and delete a meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     let app = build_app(pool.clone());
     let req = request_with_cookie(
         "DELETE",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -757,7 +801,7 @@ async fn test_update_meeting_soft_deleted_returns_404() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"waiting_room_enabled":false}"#))

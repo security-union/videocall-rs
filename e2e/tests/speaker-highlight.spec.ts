@@ -14,7 +14,7 @@ const BROWSER_ARGS = [
 
 async function createAuthenticatedContext(
   browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
-  email: string,
+  userId: string,
   name: string,
   uiURL: string,
 ) {
@@ -22,7 +22,7 @@ async function createAuthenticatedContext(
     baseURL: uiURL,
     ignoreHTTPSErrors: true,
   });
-  const token = generateSessionToken(email, name);
+  const token = generateSessionToken(userId, name);
   const url = new URL(uiURL);
   await context.addCookies([
     {
@@ -133,13 +133,13 @@ test.describe("Speaker highlight glow on video tiles", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host-glow@videocall.rs",
+        "00000000-0000-4000-8000-000000000801",
         "GlowHost",
         uiURL,
       );
       const guestCtx = await createAuthenticatedContext(
         browser2,
-        "guest-glow@videocall.rs",
+        "00000000-0000-4000-8000-000000000802",
         "GlowGuest",
         uiURL,
       );
@@ -187,13 +187,13 @@ test.describe("Speaker highlight glow on video tiles", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host-trans@videocall.rs",
+        "00000000-0000-4000-8000-000000000901",
         "TransHost",
         uiURL,
       );
       const guestCtx = await createAuthenticatedContext(
         browser2,
-        "guest-trans@videocall.rs",
+        "00000000-0000-4000-8000-000000000902",
         "TransGuest",
         uiURL,
       );
@@ -240,7 +240,7 @@ test.describe("Speaker highlight glow on video tiles", () => {
     try {
       const ctx = await createAuthenticatedContext(
         browser,
-        "host-self@videocall.rs",
+        "00000000-0000-4000-8000-000000001001",
         "SelfHost",
         uiURL,
       );
@@ -280,13 +280,13 @@ test.describe("Speaker highlight glow on video tiles", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host-mic@videocall.rs",
+        "00000000-0000-4000-8000-000000001101",
         "MicHost",
         uiURL,
       );
       const guestCtx = await createAuthenticatedContext(
         browser2,
-        "guest-mic@videocall.rs",
+        "00000000-0000-4000-8000-000000001102",
         "MicGuest",
         uiURL,
       );

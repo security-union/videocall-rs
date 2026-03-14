@@ -24,6 +24,7 @@ use js_sys::Date;
 
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::user_id_bytes_to_string;
 
 const WINDOW_DURATION_SEC: u32 = 10;
 const INACTIVE_TIMEOUT_SEC: u32 = 20;
@@ -156,7 +157,7 @@ impl DiagnosticPackets {
 
     /// Process a new diagnostic packet
     pub fn process_packet(&mut self, packet: DiagnosticsPacket, now: f64) {
-        let target_id = packet.target_id.clone();
+        let target_id = user_id_bytes_to_string(&packet.target_id);
 
         // Add packet to the corresponding window
         let window = self
@@ -423,15 +424,38 @@ mod tests {
     // Remove browser-only configuration and make tests run in any environment
     // wasm_bindgen_test_configure!(run_in_browser);
 
+    use videocall_types::{parse_user_id, to_user_id_bytes};
+
+    // Fixed UUID strings for target user IDs (diagnostic targets)
+    const PEER1_UUID: &str = "00000000-0000-0000-0000-000000000001";
+    const PEER2_UUID: &str = "00000000-0000-0000-0000-000000000002";
+    const PEER3_UUID: &str = "00000000-0000-0000-0000-000000000003";
+    const SELF_UUID: &str = "20000000-0000-0000-0000-000000000001";
+    const TEST_TARGET_UUID: &str = "40000000-0000-0000-0000-000000000002";
+    const TEST_PEER_UUID: &str = "40000000-0000-0000-0000-000000000003";
+
+    // Fixed session IDs for senders (numeric u64)
+    const SENDER1_SID: u64 = 1001;
+    const SENDER2_SID: u64 = 1002;
+    const SENDER3_SID: u64 = 1003;
+    const GOOD_SENDER_SID: u64 = 2001;
+    const AVG_SENDER_SID: u64 = 2002;
+    const POOR_SENDER_SID: u64 = 2003;
+    const TEST_SENDER_SID: u64 = 3001;
+
+    fn uuid_bytes(s: &str) -> Vec<u8> {
+        to_user_id_bytes(&parse_user_id(s).expect("test UUID must be valid"))
+    }
+
     fn create_test_packet(
-        sender_id: &str,
+        sender_session_id: u64,
         target_id: &str,
         fps: f32,
         bitrate_kbps: u32,
     ) -> DiagnosticsPacket {
         let mut packet = DiagnosticsPacket::new();
-        packet.sender_id = sender_id.to_string();
-        packet.target_id = target_id.to_string();
+        packet.sender_session_id = sender_session_id;
+        packet.target_id = uuid_bytes(target_id);
         packet.timestamp_ms = js_sys::Date::now() as u64;
         packet.media_type =
             videocall_types::protos::media_packet::media_packet::MediaType::VIDEO.into();
@@ -445,14 +469,14 @@ mod tests {
     }
 
     fn create_test_audio_packet(
-        sender_id: &str,
+        sender_session_id: u64,
         target_id: &str,
         fps: f32,
         bitrate_kbps: u32,
     ) -> DiagnosticsPacket {
         let mut packet = DiagnosticsPacket::new();
-        packet.sender_id = sender_id.to_string();
-        packet.target_id = target_id.to_string();
+        packet.sender_session_id = sender_session_id;
+        packet.target_id = uuid_bytes(target_id);
         packet.timestamp_ms = js_sys::Date::now() as u64;
         packet.media_type =
             videocall_types::protos::media_packet::media_packet::MediaType::AUDIO.into();
@@ -479,7 +503,7 @@ mod tests {
         // Generate a series of packets with perfect conditions
         // FPS matches the target exactly, no jitter
         for i in 0..10 {
-            let packet = create_test_packet("peer1", "self", 30.0, 500);
+            let packet = create_test_packet(SENDER1_SID, SELF_UUID, 30.0, 500);
             // Each packet is sent 1100ms apart to avoid throttling
             let result = controller
                 .process_diagnostics_packet_with_time(packet, base_time + (i as f64 * 1100.0));
@@ -506,7 +530,7 @@ mod tests {
 
         // Verify we have exactly one peer
         assert_eq!(controller.peer_count(), 1);
-        assert_eq!(controller.peer_ids(), vec!["self"]);
+        assert_eq!(controller.peer_ids(), vec![SELF_UUID]);
     }
 
     #[wasm_bindgen_test]
@@ -520,34 +544,34 @@ mod tests {
         let base_time = 1000.0;
 
         // First peer with good FPS (30 fps) - should get a result
-        let good_peer_packet = create_test_packet("good_sender", "peer1", 30.0, 500);
+        let good_peer_packet = create_test_packet(GOOD_SENDER_SID, PEER1_UUID, 30.0, 500);
         let result1 = controller.process_diagnostics_packet_with_time(good_peer_packet, base_time);
         assert!(result1.is_some(), "First packet should return a bitrate");
 
         // Send packets from other peers spaced out beyond throttle period
 
         // Second peer with average FPS (20 fps)
-        let avg_peer_packet = create_test_packet("avg_sender", "peer2", 20.0, 500);
+        let avg_peer_packet = create_test_packet(AVG_SENDER_SID, PEER2_UUID, 20.0, 500);
         let result2 =
             controller.process_diagnostics_packet_with_time(avg_peer_packet, base_time + 1100.0);
         assert!(result2.is_some(), "Second packet should return a bitrate");
 
         // Third peer with poor FPS (5 fps)
-        let poor_peer_packet = create_test_packet("poor_sender", "peer3", 5.0, 500);
+        let poor_peer_packet = create_test_packet(POOR_SENDER_SID, PEER3_UUID, 5.0, 500);
         let result3 =
             controller.process_diagnostics_packet_with_time(poor_peer_packet, base_time + 2200.0);
         assert!(result3.is_some(), "Third packet should return a bitrate");
 
         // Verify we have three peers
         assert_eq!(controller.peer_count(), 3);
-        assert!(controller.peer_ids().contains(&"peer1".to_string()));
-        assert!(controller.peer_ids().contains(&"peer2".to_string()));
-        assert!(controller.peer_ids().contains(&"peer3".to_string()));
+        assert!(controller.peer_ids().contains(&PEER1_UUID.to_string()));
+        assert!(controller.peer_ids().contains(&PEER2_UUID.to_string()));
+        assert!(controller.peer_ids().contains(&PEER3_UUID.to_string()));
 
         // The controller should adjust bitrate based on the worst peer (peer3)
         // Process one more packet to check the behavior
         let result4 = controller.process_diagnostics_packet_with_time(
-            create_test_packet("test_sender", "test_target", 30.0, 500),
+            create_test_packet(TEST_SENDER_SID, TEST_TARGET_UUID, 30.0, 500),
             base_time + 3300.0,
         );
 
@@ -575,15 +599,15 @@ mod tests {
 
         // Add three peers, spacing packets to avoid throttling
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("sender1", "peer1", 30.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 30.0, 500),
             base_time,
         );
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("sender2", "peer2", 28.0, 500),
+            create_test_packet(SENDER2_SID, PEER2_UUID, 28.0, 500),
             base_time + 1100.0,
         );
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("sender3", "peer3", 25.0, 500),
+            create_test_packet(SENDER3_SID, PEER3_UUID, 25.0, 500),
             base_time + 2200.0,
         );
 
@@ -593,11 +617,11 @@ mod tests {
         // Fast forward 20 seconds (less than the 20-second timeout)
         // Update only peer1 and peer2
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("sender1", "peer1", 29.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 29.0, 500),
             base_time + 20_000.0,
         );
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("sender2", "peer2", 27.0, 500),
+            create_test_packet(SENDER2_SID, PEER2_UUID, 27.0, 500),
             base_time + 21_100.0, // Add 1100ms to avoid throttling
         );
 
@@ -607,27 +631,27 @@ mod tests {
         // Fast forward another 15 seconds (total 35 seconds, > 20-second timeout)
         // Update only peer1
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("sender1", "peer1", 29.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 29.0, 500),
             base_time + 35_000.0,
         );
 
         // Peer3 should be removed (no updates for 35 seconds)
         // Peer2 should still be there (last update was 15 seconds ago)
         assert_eq!(controller.peer_count(), 2);
-        assert!(controller.peer_ids().contains(&"peer1".to_string()));
-        assert!(controller.peer_ids().contains(&"peer2".to_string()));
-        assert!(!controller.peer_ids().contains(&"peer3".to_string()));
+        assert!(controller.peer_ids().contains(&PEER1_UUID.to_string()));
+        assert!(controller.peer_ids().contains(&PEER2_UUID.to_string()));
+        assert!(!controller.peer_ids().contains(&PEER3_UUID.to_string()));
 
         // Fast forward another 20 seconds (total 55 seconds)
         // At this point peer2 should time out as well
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("sender1", "peer1", 29.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 29.0, 500),
             base_time + 55_000.0,
         );
 
         // Only peer1 should remain
         assert_eq!(controller.peer_count(), 1);
-        assert!(controller.peer_ids().contains(&"peer1".to_string()));
+        assert!(controller.peer_ids().contains(&PEER1_UUID.to_string()));
     }
 
     #[wasm_bindgen_test]
@@ -639,14 +663,17 @@ mod tests {
         let base_time = 1000.0;
 
         // Add packets at different times
-        window.add_packet(base_time, create_test_packet("sender1", "peer1", 30.0, 500));
+        window.add_packet(
+            base_time,
+            create_test_packet(SENDER1_SID, PEER1_UUID, 30.0, 500),
+        );
         window.add_packet(
             base_time + 1000.0,
-            create_test_packet("sender1", "peer1", 25.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 25.0, 500),
         );
         window.add_packet(
             base_time + 2000.0,
-            create_test_packet("sender1", "peer1", 20.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 20.0, 500),
         );
 
         // Check length and latest timestamp
@@ -683,14 +710,14 @@ mod tests {
         // Mix of video and audio packets, spaced out to avoid throttling
         // First packet (video)
         let result1 = controller.process_diagnostics_packet_with_time(
-            create_test_packet("sender1", "peer1", 30.0, 500), // Video
+            create_test_packet(SENDER1_SID, PEER1_UUID, 30.0, 500), // Video
             base_time,
         );
         assert!(result1.is_some(), "First packet should return a bitrate");
 
         // Second packet (audio), beyond throttle period
         let result2 = controller.process_diagnostics_packet_with_time(
-            create_test_audio_packet("sender2", "peer2", 40.0, 100), // Audio
+            create_test_audio_packet(SENDER2_SID, PEER2_UUID, 40.0, 100), // Audio
             base_time + 1100.0,
         );
         assert!(result2.is_some(), "Second packet should return a bitrate");
@@ -700,7 +727,7 @@ mod tests {
 
         // Process a new packet and verify the result
         let result3 = controller.process_diagnostics_packet_with_time(
-            create_test_packet("sender3", "peer3", 25.0, 400),
+            create_test_packet(SENDER3_SID, PEER3_UUID, 25.0, 400),
             base_time + 2200.0,
         );
 
@@ -720,7 +747,7 @@ mod tests {
         let base_time = 1000.0;
 
         // First get a baseline with perfect conditions
-        let good_packet = create_test_packet("good_sender", "peer1", 30.0, 500); // Perfect FPS
+        let good_packet = create_test_packet(GOOD_SENDER_SID, PEER1_UUID, 30.0, 500); // Perfect FPS
         let good_result = controller.process_diagnostics_packet_with_time(good_packet, base_time);
         assert!(
             good_result.is_some(),
@@ -731,14 +758,14 @@ mod tests {
         // Now simulate a significant drop in FPS, spacing packets to avoid throttling
         for i in 0..5 {
             // Feed multiple poor FPS packets to build up effect
-            let bad_packet = create_test_packet("poor_sender", "peer2", 5.0, 500); // Very low FPS
+            let bad_packet = create_test_packet(POOR_SENDER_SID, PEER2_UUID, 5.0, 500); // Very low FPS
             let time = base_time + 1100.0 * (i as f64 + 1.0);
             let result = controller.process_diagnostics_packet_with_time(bad_packet, time);
             assert!(result.is_some(), "Packet should return a bitrate");
         }
 
         // One more poor FPS packet and get the resulting bitrate
-        let final_packet = create_test_packet("test_sender", "test_peer", 15.0, 500);
+        let final_packet = create_test_packet(TEST_SENDER_SID, TEST_PEER_UUID, 15.0, 500);
         let final_result =
             controller.process_diagnostics_packet_with_time(final_packet, base_time + 6600.0);
         assert!(
@@ -841,12 +868,12 @@ mod tests {
         let base_time = 1000.0;
 
         // First packet should produce a result (no throttling yet)
-        let packet1 = create_test_packet("sender1", "peer1", 25.0, 500);
+        let packet1 = create_test_packet(SENDER1_SID, PEER1_UUID, 25.0, 500);
         let result1 = controller.process_diagnostics_packet_with_time(packet1, base_time);
         assert!(result1.is_some(), "First packet should return a bitrate");
 
         // Add a second peer to make sure peer tracking still works during throttling
-        let packet2 = create_test_packet("sender2", "peer2", 20.0, 500);
+        let packet2 = create_test_packet(SENDER2_SID, PEER2_UUID, 20.0, 500);
 
         // Second packet within throttle period should not produce a result
         let result2 = controller.process_diagnostics_packet_with_time(packet2, base_time + 500.0);
@@ -859,7 +886,7 @@ mod tests {
         assert_eq!(controller.peer_count(), 2);
 
         // Third packet after throttle period should produce a result
-        let packet3 = create_test_packet("sender3", "peer3", 15.0, 500);
+        let packet3 = create_test_packet(SENDER3_SID, PEER3_UUID, 15.0, 500);
         let result3 = controller.process_diagnostics_packet_with_time(packet3, base_time + 1100.0);
         assert!(
             result3.is_some(),
@@ -881,7 +908,7 @@ mod tests {
         // Phase 1: initialization with good FPS
         for i in 0..3 {
             controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", 30.0, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, 30.0, 500),
                 base_time + (i as f64 * 1100.0),
             );
         }
@@ -891,7 +918,7 @@ mod tests {
         let mut degraded_bitrate = ideal_bitrate_kbps as f64;
         for i in 3..25 {
             let result = controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", 5.0, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, 5.0, 500),
                 base_time + (i as f64 * 1100.0),
             );
             if let Some(b) = result {
@@ -909,7 +936,7 @@ mod tests {
         let mut recovered_bitrate = degraded_bitrate;
         for i in 25..50 {
             let result = controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", 30.0, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, 30.0, 500),
                 base_time + (i as f64 * 1100.0),
             );
             if let Some(b) = result {
@@ -937,7 +964,7 @@ mod tests {
         // Initialize and stabilize at 30 FPS
         for i in 0..5 {
             controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", 30.0, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, 30.0, 500),
                 base_time + (i as f64 * 1100.0),
             );
         }
@@ -950,7 +977,7 @@ mod tests {
         let mut bitrate_at_15 = 0.0;
         for i in 5..20 {
             let result = controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", 15.0, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, 15.0, 500),
                 base_time + (i as f64 * 1100.0),
             );
             if let Some(b) = result {
@@ -969,7 +996,7 @@ mod tests {
         let mut bitrate_at_60_target = 0.0;
         for i in 20..35 {
             let result = controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", 15.0, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, 15.0, 500),
                 base_time + (i as f64 * 1100.0),
             );
             if let Some(b) = result {
@@ -995,7 +1022,7 @@ mod tests {
         // from a 30→20 transition masking the integral effect.
         for i in 0..3 {
             controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", 20.0, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, 20.0, 500),
                 base_time + (i as f64 * 1100.0),
             );
         }
@@ -1004,7 +1031,7 @@ mod tests {
         let mut bitrates = Vec::new();
         for i in 3..15 {
             let result = controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", 20.0, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, 20.0, 500),
                 base_time + (i as f64 * 1100.0),
             );
             if let Some(b) = result {
@@ -1041,15 +1068,15 @@ mod tests {
 
         // Initialize with oscillating FPS to build up jitter
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("s", "peer1", 30.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 30.0, 500),
             base_time,
         );
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("s", "peer1", 5.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 5.0, 500),
             base_time + 1100.0,
         );
         controller.process_diagnostics_packet_with_time(
-            create_test_packet("s", "peer1", 30.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 30.0, 500),
             base_time + 2200.0,
         );
 
@@ -1059,7 +1086,7 @@ mod tests {
             // Alternate between 2 and 28 to maximize jitter
             let fps = if i % 2 == 0 { 2.0 } else { 28.0 };
             let result = controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", fps, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, fps, 500),
                 base_time + (i as f64 * 1100.0),
             );
             if let Some(b) = result {
@@ -1085,7 +1112,7 @@ mod tests {
         // Initialize normally
         for i in 0..3 {
             controller.process_diagnostics_packet_with_time(
-                create_test_packet("s", "peer1", 30.0, 500),
+                create_test_packet(SENDER1_SID, PEER1_UUID, 30.0, 500),
                 base_time + (i as f64 * 1100.0),
             );
         }
@@ -1093,7 +1120,7 @@ mod tests {
         // Send two packets at the exact same timestamp (dt=0).
         // First one is processed normally.
         let result1 = controller.process_diagnostics_packet_with_time(
-            create_test_packet("s", "peer1", 20.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 20.0, 500),
             base_time + 5000.0,
         );
         assert!(result1.is_some());
@@ -1108,7 +1135,7 @@ mod tests {
         // which is impossible since the second would be throttled.
         // Instead, verify that the PID gracefully handles very small dt.
         let result2 = controller.process_diagnostics_packet_with_time(
-            create_test_packet("s", "peer1", 20.0, 500),
+            create_test_packet(SENDER1_SID, PEER1_UUID, 20.0, 500),
             base_time + 6000.01, // 1000.01ms later, dt ≈ 0.001s
         );
         assert!(

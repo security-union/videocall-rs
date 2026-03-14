@@ -547,7 +547,7 @@ impl PeerDecodeManager {
                 Ok((media_type, decode_status)) => {
                     if let Some(diagnostics) = &self.diagnostics {
                         diagnostics.track_frame(
-                            &peer.sid_str,
+                            peer.session_id,
                             media_type,
                             packet.data.len() as u64,
                         );
@@ -697,7 +697,7 @@ impl PeerDecodeManager {
             .and_then(|peer| peer.display_name.clone())
     }
 
-    pub fn is_peer_speaking(&self, key: &String) -> bool {
+    pub fn is_peer_speaking(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,
@@ -708,7 +708,7 @@ impl PeerDecodeManager {
         false
     }
 
-    pub fn peer_audio_level(&self, key: &String) -> f32 {
+    pub fn peer_audio_level(&self, key: &str) -> f32 {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return 0.0,
@@ -1137,10 +1137,15 @@ mod tests {
     fn meeting_packet_participant_admitted_deserializes_correctly() {
         use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
         use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::{parse_user_id, to_user_id_bytes};
+
+        let alice_uuid = "550e8400-e29b-41d4-a716-446655440001";
+        let alice_bytes = to_user_id_bytes(&parse_user_id(alice_uuid).expect("valid UUID"));
+
         let mut packet = MeetingPacket::new();
         packet.event_type = MeetingEventType::PARTICIPANT_ADMITTED.into();
         packet.room_id = "room-123".into();
-        packet.target_user_id = "alice@example.com".as_bytes().to_vec();
+        packet.target_user_id = alice_bytes.clone();
         packet.message = "Welcome".into();
 
         let bytes = packet.write_to_bytes().expect("serialize MeetingPacket");
@@ -1152,7 +1157,7 @@ mod tests {
             "event_type should be PARTICIPANT_ADMITTED"
         );
         assert_eq!(parsed.room_id, "room-123");
-        assert_eq!(parsed.target_user_id[..], *"alice@example.com".as_bytes());
+        assert_eq!(parsed.target_user_id, alice_bytes);
         assert_eq!(parsed.message, "Welcome");
     }
 
@@ -1161,23 +1166,25 @@ mod tests {
     #[wasm_bindgen_test]
     fn meeting_packet_target_user_id_matching_logic() {
         use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::{parse_user_id, to_user_id_bytes};
+
+        let alice_uuid = "550e8400-e29b-41d4-a716-446655440001";
+        let alice_bytes = to_user_id_bytes(&parse_user_id(alice_uuid).expect("valid UUID"));
+        let observer_uuid = "550e8400-e29b-41d4-a716-446655440099";
+        let observer_bytes = to_user_id_bytes(&parse_user_id(observer_uuid).expect("valid UUID"));
 
         let mut packet = MeetingPacket::new();
-        packet.target_user_id = "alice@example.com".as_bytes().to_vec();
+        packet.target_user_id = alice_bytes.clone();
 
-        // Matching case: target_user_id equals userid converted to bytes
-        let userid_bytes = "alice@example.com".as_bytes();
+        // Matching case: target_user_id equals userid UUID bytes
         assert_eq!(
-            packet.target_user_id[..],
-            *userid_bytes,
+            packet.target_user_id, alice_bytes,
             "target_user_id should match the local userid"
         );
 
         // Non-matching case: target_user_id does not equal a different userid
-        let observer_bytes = "observer".as_bytes();
         assert_ne!(
-            packet.target_user_id[..],
-            *observer_bytes,
+            packet.target_user_id, observer_bytes,
             "target_user_id should NOT match a different userid"
         );
     }
@@ -1187,10 +1194,14 @@ mod tests {
     fn meeting_packet_participant_rejected_has_target_user_id() {
         use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
         use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::{parse_user_id, to_user_id_bytes};
+
+        let bob_uuid = "550e8400-e29b-41d4-a716-446655440002";
+        let bob_bytes = to_user_id_bytes(&parse_user_id(bob_uuid).expect("valid UUID"));
 
         let mut packet = MeetingPacket::new();
         packet.event_type = MeetingEventType::PARTICIPANT_REJECTED.into();
-        packet.target_user_id = "bob@example.com".as_bytes().to_vec();
+        packet.target_user_id = bob_bytes.clone();
         packet.room_id = "room-456".into();
 
         let bytes = packet.write_to_bytes().expect("serialize");
@@ -1200,7 +1211,7 @@ mod tests {
             parsed.event_type.enum_value(),
             Ok(MeetingEventType::PARTICIPANT_REJECTED)
         );
-        assert_eq!(parsed.target_user_id[..], *"bob@example.com".as_bytes());
+        assert_eq!(parsed.target_user_id, bob_bytes);
         assert_eq!(parsed.room_id, "room-456");
     }
 
@@ -1208,14 +1219,15 @@ mod tests {
     #[wasm_bindgen_test]
     fn meeting_packet_empty_target_user_id_does_not_match() {
         use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::{parse_user_id, to_user_id_bytes};
 
         let packet = MeetingPacket::new();
         assert!(packet.target_user_id.is_empty());
 
-        let userid_bytes = "alice@example.com".as_bytes();
+        let alice_uuid = "550e8400-e29b-41d4-a716-446655440001";
+        let alice_bytes = to_user_id_bytes(&parse_user_id(alice_uuid).expect("valid UUID"));
         assert_ne!(
-            packet.target_user_id[..],
-            *userid_bytes,
+            packet.target_user_id, alice_bytes,
             "empty target_user_id should not match any userid"
         );
     }
@@ -1226,10 +1238,17 @@ mod tests {
     fn meeting_packet_in_packet_wrapper_round_trip() {
         use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
         use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::{parse_user_id, to_user_id_bytes, Uuid};
+
+        let charlie_uuid = "550e8400-e29b-41d4-a716-446655440003";
+        let charlie_bytes = to_user_id_bytes(&parse_user_id(charlie_uuid).expect("valid UUID"));
+        let observer_uuid = "550e8400-e29b-41d4-a716-446655440099";
+        let observer_bytes = to_user_id_bytes(&parse_user_id(observer_uuid).expect("valid UUID"));
+        let server_bytes = to_user_id_bytes(&Uuid::nil());
 
         let mut meeting = MeetingPacket::new();
         meeting.event_type = MeetingEventType::PARTICIPANT_ADMITTED.into();
-        meeting.target_user_id = "charlie@example.com".as_bytes().to_vec();
+        meeting.target_user_id = charlie_bytes.clone();
         meeting.room_id = "room-789".into();
 
         let meeting_bytes = meeting.write_to_bytes().expect("serialize MeetingPacket");
@@ -1237,7 +1256,7 @@ mod tests {
         // Wrap in a PacketWrapper like the real code path does
         let wrapper = PacketWrapper {
             data: meeting_bytes,
-            user_id: "server".as_bytes().to_vec(),
+            user_id: server_bytes,
             packet_type: PacketType::MEETING.into(),
             ..Default::default()
         };
@@ -1246,22 +1265,20 @@ mod tests {
         assert_eq!(wrapper.packet_type.enum_value(), Ok(PacketType::MEETING));
         let parsed =
             MeetingPacket::parse_from_bytes(&wrapper.data).expect("parse from wrapper data");
-        assert_eq!(parsed.target_user_id[..], *"charlie@example.com".as_bytes());
+        assert_eq!(parsed.target_user_id, charlie_bytes);
         assert_eq!(
             parsed.event_type.enum_value(),
             Ok(MeetingEventType::PARTICIPANT_ADMITTED)
         );
 
         // Simulate the userid check from video_call_client.rs
-        let my_userid_bytes = "charlie@example.com".as_bytes();
-        let should_fire_callback = parsed.target_user_id[..] == *my_userid_bytes;
+        let should_fire_callback = parsed.target_user_id == charlie_bytes;
         assert!(
             should_fire_callback,
             "callback should fire for matching userid"
         );
 
-        let other_userid_bytes = "observer@example.com".as_bytes();
-        let should_not_fire = parsed.target_user_id[..] == *other_userid_bytes;
+        let should_not_fire = parsed.target_user_id == observer_bytes;
         assert!(
             !should_not_fire,
             "callback should NOT fire for non-matching userid"

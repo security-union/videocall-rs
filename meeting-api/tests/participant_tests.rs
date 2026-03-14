@@ -31,16 +31,20 @@ async fn setup_active_meeting(pool: &sqlx::PgPool, room_id: &str) {
 
     // Create meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Host joins (activates).
@@ -48,7 +52,7 @@ async fn setup_active_meeting(pool: &sqlx::PgPool, room_id: &str) {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"display_name":"Host User"}"#))
@@ -67,13 +71,17 @@ async fn test_join_meeting_host_activates() {
 
     // Create meeting (idle state).
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({ "meeting_id": room_id, "attendees": [] }))
-                .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({ "meeting_id": room_id, "attendees": [] }))
+            .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Host joins.
@@ -81,7 +89,7 @@ async fn test_join_meeting_host_activates() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"display_name":"Host User"}"#))
@@ -116,7 +124,7 @@ async fn test_join_meeting_attendee_waits() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(r#"{"display_name":"Attendee"}"#))
@@ -147,13 +155,17 @@ async fn test_join_meeting_not_active_returns_waiting_for_meeting() {
 
     // Create meeting but do NOT have the host join (still idle).
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({ "meeting_id": room_id, "attendees": [] }))
-                .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({ "meeting_id": room_id, "attendees": [] }))
+            .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Non-host tries to join an idle meeting -- now returns waiting_for_meeting
@@ -162,7 +174,7 @@ async fn test_join_meeting_not_active_returns_waiting_for_meeting() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -203,7 +215,7 @@ async fn test_leave_meeting_success() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -214,10 +226,12 @@ async fn test_leave_meeting_success() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/admit"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
+    .body(Body::from(
+        r#"{"user_id":"880e8400-e29b-41d4-a716-446655440003"}"#,
+    ))
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
@@ -226,7 +240,7 @@ async fn test_leave_meeting_success() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/leave"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -254,7 +268,7 @@ async fn test_get_my_status_success() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}/status"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -264,7 +278,7 @@ async fn test_get_my_status_success() {
 
     let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
     assert!(body.success);
-    assert_eq!(body.result.user_id, "host@example.com");
+    assert_eq!(body.result.user_id, "550e8400-e29b-41d4-a716-446655440000");
     assert!(body.result.is_host);
     assert_eq!(body.result.status, "admitted");
     assert!(
@@ -289,7 +303,7 @@ async fn test_status_refused_after_meeting_ends() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -300,10 +314,12 @@ async fn test_status_refused_after_meeting_ends() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/admit"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
+    .body(Body::from(
+        r#"{"user_id":"880e8400-e29b-41d4-a716-446655440003"}"#,
+    ))
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
@@ -312,7 +328,7 @@ async fn test_status_refused_after_meeting_ends() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}/status"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -329,7 +345,7 @@ async fn test_status_refused_after_meeting_ends() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/leave"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -340,7 +356,7 @@ async fn test_status_refused_after_meeting_ends() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}/status"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -365,7 +381,7 @@ async fn test_attendee_rejoin_ended_meeting_gets_waiting_for_meeting() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/leave"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -376,7 +392,7 @@ async fn test_attendee_rejoin_ended_meeting_gets_waiting_for_meeting() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -418,7 +434,7 @@ async fn test_get_participants_success() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -428,10 +444,12 @@ async fn test_get_participants_success() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/admit"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
+    .body(Body::from(
+        r#"{"user_id":"880e8400-e29b-41d4-a716-446655440003"}"#,
+    ))
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
@@ -440,7 +458,7 @@ async fn test_get_participants_success() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}/participants"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();

@@ -70,10 +70,10 @@ pub fn build_app(pool: PgPool) -> Router {
 
 /// Build an HTTP request with a signed session JWT in the `Cookie: session=<jwt>` header.
 ///
-/// This replaces the old `Cookie: email=<email>` pattern. The JWT is signed
-/// with [`TEST_JWT_SECRET`] and contains the email in the `sub` claim.
-pub fn request_with_cookie(method: &str, uri: &str, email: &str) -> http::request::Builder {
-    let session_jwt = generate_session_token(TEST_JWT_SECRET, email, email, TEST_SESSION_TTL)
+/// The JWT is signed with [`TEST_JWT_SECRET`] and contains the user_id (UUID string)
+/// in the `sub` claim.
+pub fn request_with_cookie(method: &str, uri: &str, user_id: &str) -> http::request::Builder {
+    let session_jwt = generate_session_token(TEST_JWT_SECRET, user_id, user_id, TEST_SESSION_TTL)
         .expect("signing session JWT for test should not fail");
     http::Request::builder()
         .method(method)

@@ -31,16 +31,20 @@ async fn setup_with_waiting_attendee(pool: &sqlx::PgPool, room_id: &str) {
 
     // Create meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Host joins (activates).
@@ -48,7 +52,7 @@ async fn setup_with_waiting_attendee(pool: &sqlx::PgPool, room_id: &str) {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -59,7 +63,7 @@ async fn setup_with_waiting_attendee(pool: &sqlx::PgPool, room_id: &str) {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "attendee@example.com",
+        "880e8400-e29b-41d4-a716-446655440003",
     )
     .body(Body::empty())
     .unwrap();
@@ -79,7 +83,7 @@ async fn test_get_waiting_room_success() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}/waiting"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -91,7 +95,10 @@ async fn test_get_waiting_room_success() {
     assert!(body.success);
     assert_eq!(body.result.meeting_id, room_id);
     assert_eq!(body.result.waiting.len(), 1);
-    assert_eq!(body.result.waiting[0].user_id, "attendee@example.com");
+    assert_eq!(
+        body.result.waiting[0].user_id,
+        "880e8400-e29b-41d4-a716-446655440003"
+    );
 
     cleanup_test_data(&pool, room_id).await;
 }
@@ -109,10 +116,12 @@ async fn test_admit_participant_success() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/admit"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
+    .body(Body::from(
+        r#"{"user_id":"880e8400-e29b-41d4-a716-446655440003"}"#,
+    ))
     .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -135,23 +144,27 @@ async fn test_admit_participant_not_found() {
 
     // Create meeting, host joins (no attendee in waiting room).
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     let app = build_app(pool.clone());
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -162,10 +175,12 @@ async fn test_admit_participant_not_found() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/admit"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"user_id":"nonexistent@example.com"}"#))
+    .body(Body::from(
+        r#"{"user_id":"dd0e8400-e29b-41d4-a716-446655440008"}"#,
+    ))
     .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -188,33 +203,41 @@ async fn test_admit_all_participants() {
 
     // Create meeting, host joins.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     let app = build_app(pool.clone());
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/join"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Add 3 attendees to waiting room.
-    for i in 1..=3 {
+    let attendee_uuids = [
+        "ee0e8400-e29b-41d4-a716-446655440009",
+        "ff0e8400-e29b-41d4-a716-44665544000a",
+        "00111111-e29b-41d4-a716-44665544000b",
+    ];
+    for uuid in &attendee_uuids {
         let app = build_app(pool.clone());
-        let email = format!("attendee{i}@example.com");
-        let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/join"), &email)
+        let req = request_with_cookie("POST", &format!("/api/v1/meetings/{room_id}/join"), uuid)
             .body(Body::empty())
             .unwrap();
         let _ = app.oneshot(req).await.unwrap();
@@ -225,7 +248,7 @@ async fn test_admit_all_participants() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/admit-all"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -254,10 +277,12 @@ async fn test_reject_participant_success() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/reject"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
-    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
+    .body(Body::from(
+        r#"{"user_id":"880e8400-e29b-41d4-a716-446655440003"}"#,
+    ))
     .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();

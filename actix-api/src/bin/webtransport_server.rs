@@ -25,6 +25,7 @@ use tracing::{error, info};
 use sec_api::actors::chat_server::ChatServer;
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
+use sec_api::version;
 use sec_api::webtransport::{self, Certs};
 
 async fn health_responder() -> impl Responder {
@@ -98,8 +99,11 @@ async fn main() {
     // Start health server
     actix_rt::spawn(async move {
         info!("Starting health/metrics HTTP server: {:?}", health_listen);
-        let server =
-            HttpServer::new(|| App::new().route("/healthz", web::get().to(health_responder)));
+        let server = HttpServer::new(|| {
+            App::new()
+                .route("/healthz", web::get().to(health_responder))
+                .route("/version", web::get().to(version::webtransport_version))
+        });
 
         match server.bind(&health_listen) {
             Ok(server) => {

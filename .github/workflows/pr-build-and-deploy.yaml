@@ -167,6 +167,10 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:pr-${{ needs.check-permissions.outputs.pr_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ needs.check-permissions.outputs.pr_sha }}
+            GIT_BRANCH=${{ needs.check-permissions.outputs.pr_ref }}
+            BUILD_TIMESTAMP=${{ github.event.comment.created_at }}
 
   comment-build-complete:
     name: Comment build complete

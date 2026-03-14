@@ -78,6 +78,10 @@ env:
     value: "https://app.videocall.rs"
   - name: ALLOWED_REDIRECT_URLS
     value: "https://app.videocall.rs,https://app-dx.videocall.rs"
+  # Comma-separated internal URLs for the aggregated /api/v1/versions endpoint.
+  # Adjust service names per region/deployment.
+  - name: SERVICE_VERSION_URLS
+    value: ""
 resources:
   limits:
     cpu: "200m"

@@ -1151,6 +1151,15 @@ impl Inner {
                     error!("Failed to parse MeetingPacket: {e}");
                 }
             },
+            Ok(PacketType::CONGESTION) => {
+                // Server-side congestion feedback. Full handling (quality
+                // step-down via shared atomic flag) is wired in the encoder
+                // adaptation PR.
+                debug!(
+                    "Received CONGESTION packet from server for session {}",
+                    response.session_id,
+                );
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

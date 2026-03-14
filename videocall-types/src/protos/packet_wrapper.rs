@@ -223,6 +223,8 @@ pub mod packet_wrapper {
         MEETING = 7,
         // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.SESSION_ASSIGNED)
         SESSION_ASSIGNED = 8,
+        // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.CONGESTION)
+        CONGESTION = 9,
     }
 
     impl ::protobuf::Enum for PacketType {
@@ -243,6 +245,7 @@ pub mod packet_wrapper {
                 6 => ::std::option::Option::Some(PacketType::HEALTH),
                 7 => ::std::option::Option::Some(PacketType::MEETING),
                 8 => ::std::option::Option::Some(PacketType::SESSION_ASSIGNED),
+                9 => ::std::option::Option::Some(PacketType::CONGESTION),
                 _ => ::std::option::Option::None
             }
         }
@@ -258,6 +261,7 @@ pub mod packet_wrapper {
                 "HEALTH" => ::std::option::Option::Some(PacketType::HEALTH),
                 "MEETING" => ::std::option::Option::Some(PacketType::MEETING),
                 "SESSION_ASSIGNED" => ::std::option::Option::Some(PacketType::SESSION_ASSIGNED),
+                "CONGESTION" => ::std::option::Option::Some(PacketType::CONGESTION),
                 _ => ::std::option::Option::None
             }
         }
@@ -272,6 +276,7 @@ pub mod packet_wrapper {
             PacketType::HEALTH,
             PacketType::MEETING,
             PacketType::SESSION_ASSIGNED,
+            PacketType::CONGESTION,
         ];
     }
 

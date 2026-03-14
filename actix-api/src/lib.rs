@@ -28,4 +28,5 @@ pub mod models;
 pub mod server_diagnostics;
 pub mod session_manager;
 pub mod token_validator;
+pub mod version;
 pub mod webtransport;

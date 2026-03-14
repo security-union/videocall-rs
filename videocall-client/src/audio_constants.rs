@@ -39,6 +39,9 @@ pub const AUDIO_LEVEL_DELTA_THRESHOLD: f32 = 0.02;
 /// smooth visual transitions while still suppressing no-op updates.
 pub const UI_AUDIO_LEVEL_DELTA: f32 = 0.01;
 
+/// How often (in ms) the local microphone VAD analysis runs.
+pub const VAD_POLL_INTERVAL_MS: u32 = 100;
+
 /// FFT size for the Web Audio AnalyserNode used in local microphone VAD.
 pub const VAD_FFT_SIZE: u32 = 2048;
 

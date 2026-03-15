@@ -143,6 +143,9 @@ pub struct ConnectionManager {
     degradation_counter: u32,
     /// Whether a re-election is currently in progress (prevents overlapping re-elections).
     reelection_in_progress: bool,
+    /// Set to `true` when the user explicitly calls `disconnect()`. Checked by
+    /// the reconnection loop to prevent reconnecting after an intentional leave.
+    intentionally_disconnected: Rc<RefCell<bool>>,
 }
 
 impl ConnectionManager {
@@ -179,6 +182,7 @@ impl ConnectionManager {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
+            intentionally_disconnected: Rc::new(RefCell::new(false)),
         };
 
         // Immediately start creating connections and testing
@@ -460,9 +464,16 @@ impl ConnectionManager {
         let reconnection_phase = self.reconnection_phase.clone();
         let manager_ref = self.manager_ref.clone();
         let election_period_ms = self.options.election_period_ms;
+        let intentionally_disconnected = self.intentionally_disconnected.clone();
 
         Callback::from(move |error| {
             warn!("Connection {connection_id} lost: {error:?}");
+
+            // If the user explicitly called disconnect(), do not attempt reconnection.
+            if *intentionally_disconnected.borrow() {
+                info!("Connection lost after intentional disconnect — not reconnecting");
+                return;
+            }
 
             // Only react if this was the active connection.
             if Some(connection_id.as_str()) != active_connection_id.borrow().as_deref() {
@@ -508,6 +519,7 @@ impl ConnectionManager {
             let on_state_changed_clone = on_state_changed.clone();
             let server_url_clone = server_url.clone();
             let manager_ref_clone = manager_ref.clone();
+            let intentionally_disconnected_clone = intentionally_disconnected.clone();
 
             wasm_bindgen_futures::spawn_local(async move {
                 ConnectionManager::run_reconnection_loop(
@@ -517,6 +529,7 @@ impl ConnectionManager {
                     server_url_clone,
                     manager_ref_clone,
                     election_period_ms,
+                    intentionally_disconnected_clone,
                 )
                 .await;
             });
@@ -763,6 +776,7 @@ impl ConnectionManager {
         last_server_url: String,
         manager_ref: Weak<RefCell<ConnectionManager>>,
         election_period_ms: u64,
+        intentionally_disconnected: Rc<RefCell<bool>>,
     ) {
         let mut attempt: u32 = 0;
         let mut delay_ms: u64 = RECONNECT_INITIAL_DELAY_MS;
@@ -772,6 +786,13 @@ impl ConnectionManager {
         let mut consecutive_zero_connections: u32 = 0;
 
         loop {
+            // Check if user intentionally disconnected (e.g. left the meeting).
+            if *intentionally_disconnected.borrow() {
+                info!("Reconnection loop cancelled — user disconnected intentionally");
+                *reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
+                return;
+            }
+
             attempt += 1;
             if attempt > RECONNECT_MAX_ATTEMPTS {
                 break;
@@ -795,6 +816,16 @@ impl ConnectionManager {
 
             // Wait with exponential backoff.
             gloo_timers::future::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+            // Re-check intentional disconnect after the sleep — user may have
+            // left the meeting while we were waiting.
+            if *intentionally_disconnected.borrow() {
+                info!(
+                    "Reconnection loop cancelled during backoff — user disconnected intentionally"
+                );
+                *reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
+                return;
+            }
 
             // Check if something else already reconnected us (e.g. re-election).
             if active_connection_id.borrow().is_some() {
@@ -865,7 +896,24 @@ impl ConnectionManager {
             // Track consecutive total failures (no server responded at all).
             // This pattern indicates auth rejection or server-side blocking
             // rather than a transient network issue.
-            consecutive_zero_connections += 1;
+            //
+            // Check whether any connections were established during this attempt.
+            // Only increment the zero-connection counter when the server truly did
+            // not respond at all (likely auth rejection). If some connections were
+            // made but election still failed (e.g. poor RTT), reset the counter.
+            let any_connections = {
+                match manager_rc.try_borrow() {
+                    Ok(mgr) => mgr.connections.values().any(|c| c.is_connected()),
+                    Err(_) => false,
+                }
+            };
+
+            if any_connections {
+                // Some servers responded — reset the zero-connection counter.
+                consecutive_zero_connections = 0;
+            } else {
+                consecutive_zero_connections += 1;
+            }
             if consecutive_zero_connections >= RECONNECT_CONSECUTIVE_ZERO_LIMIT {
                 error!(
                     "Reconnection aborted: {} consecutive attempts with zero successful connections \
@@ -885,8 +933,11 @@ impl ConnectionManager {
             }
 
             // Exponential backoff for next attempt.
-            delay_ms = ((delay_ms as f64 * RECONNECT_BACKOFF_MULTIPLIER) as u64)
-                .min(RECONNECT_MAX_DELAY_MS);
+            delay_ms = next_backoff_delay(
+                delay_ms,
+                RECONNECT_BACKOFF_MULTIPLIER,
+                RECONNECT_MAX_DELAY_MS,
+            );
         }
 
         // All attempts exhausted.
@@ -993,7 +1044,30 @@ impl ConnectionManager {
         self.reelection_in_progress = true;
         self.degradation_counter = 0;
 
-        // Preserve the current active connection — do NOT close it yet.
+        // Close the old active connection before creating new ones.
+        // `create_all_connections` reuses the same connection IDs (ws_0, wt_0, ...),
+        // so inserting into the HashMap would silently drop the old Connection.
+        // We close explicitly here to ensure proper WebTransport session teardown
+        // and to avoid leaking resources.
+        let old_active_id = self.active_connection_id.borrow().clone();
+        if let Some(ref id) = old_active_id {
+            if let Some(old_conn) = self.connections.remove(id) {
+                info!("Re-election: closing old active connection {id}");
+                drop(old_conn);
+            }
+        }
+        // Clear any remaining non-active connections too (from a previous election).
+        self.connections.clear();
+        *self.active_connection_id.borrow_mut() = None;
+
+        // Clear stale RTT measurements so the new election starts clean.
+        self.rtt_measurements.clear();
+
+        // Drain stale RTT responses from the previous connections.
+        if let Ok(mut responses) = self.rtt_responses.try_borrow_mut() {
+            responses.clear();
+        }
+
         // Create fresh connections to all servers for testing.
         self.create_all_connections()?;
 
@@ -1343,6 +1417,17 @@ impl ConnectionManager {
     }
 
     pub fn disconnect(&mut self) -> anyhow::Result<()> {
+        // Signal that this is an intentional disconnect so that any in-flight
+        // or future reconnection attempts are cancelled.
+        *self.intentionally_disconnected.borrow_mut() = true;
+
+        // Cancel any pending reconnection.
+        *self.reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
+
+        // Clear the active connection id so is_connected() returns false.
+        *self.active_connection_id.borrow_mut() = None;
+
+        // Drop all connections (stops heartbeats, closes transports).
         self.connections.clear();
         self.get_connection_state();
         Ok(())
@@ -1429,7 +1514,6 @@ impl ConnectionManager {
 
 /// Calculate the next backoff delay given the current delay and multiplier,
 /// capped at `max_delay_ms`.
-#[cfg(test)]
 fn next_backoff_delay(current_delay_ms: u64, multiplier: f64, max_delay_ms: u64) -> u64 {
     ((current_delay_ms as f64 * multiplier) as u64).min(max_delay_ms)
 }
@@ -1507,6 +1591,7 @@ mod tests {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
+            intentionally_disconnected: Rc::new(RefCell::new(false)),
         }
     }
 

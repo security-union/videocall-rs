@@ -54,7 +54,10 @@ impl WebTransportClient {
         };
         let packet = PacketWrapper {
             packet_type: PacketType::CONNECTION.into(),
-            user_id: self.options.user_id.as_bytes().to_vec(),
+            user_id: videocall_types::to_user_id_bytes(
+                &videocall_types::parse_user_id(&self.options.user_id)
+                    .expect("user_id must be valid UUID"),
+            ),
             data: connection_packet.write_to_bytes()?,
             ..Default::default()
         };
@@ -82,7 +85,9 @@ impl WebTransportClient {
 
     async fn start_heartbeat(&self, session: web_transport_quinn::Session, options: &Stream) {
         let interval = time::interval(Duration::from_secs(1));
-        let email = options.user_id.clone();
+        let user_id_bytes = videocall_types::to_user_id_bytes(
+            &videocall_types::parse_user_id(&options.user_id).expect("user_id must be valid UUID"),
+        );
         tokio::spawn(async move {
             let mut interval = interval;
             loop {
@@ -93,7 +98,7 @@ impl WebTransportClient {
                 interval.tick().await;
                 let actual_heartbeat = MediaPacket {
                     media_type: MediaType::HEARTBEAT.into(),
-                    user_id: email.as_bytes().to_vec(),
+                    user_id: user_id_bytes.clone(),
                     timestamp: now_ms as f64,
                     heartbeat_metadata: Some(HeartbeatMetadata {
                         video_enabled: true,
@@ -104,7 +109,7 @@ impl WebTransportClient {
                 };
 
                 let packet = PacketWrapper {
-                    user_id: email.as_bytes().to_vec(),
+                    user_id: user_id_bytes.clone(),
                     packet_type: PacketType::MEDIA.into(),
                     data: actual_heartbeat.write_to_bytes().unwrap(),
                     ..Default::default()

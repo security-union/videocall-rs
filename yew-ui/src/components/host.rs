@@ -506,7 +506,7 @@ impl Component for Host {
                     .context::<VideoCallClientCtx>(Callback::noop())
                     .expect("VideoCallClient context missing");
 
-                if audio_id_str == "" {
+                if audio_id_str.is_empty() {
                     let microphone_callback = VcCallback::from({
                         let link = ctx.link().clone();
                         move |s: String| link.send_message(Msg::MicrophoneEncoderSettingsUpdated(s))
@@ -530,7 +530,7 @@ impl Component for Host {
                     self.microphone.set_encoder_control(rx);
                 }
 
-                if video_id_str == "" {
+                if video_id_str.is_empty() {
                     let camera_callback = VcCallback::from({
                         let link = ctx.link().clone();
                         move |s: String| link.send_message(Msg::CameraEncoderSettingsUpdated(s))

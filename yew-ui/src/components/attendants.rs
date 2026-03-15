@@ -1455,8 +1455,8 @@ impl Component for AttendantsComponent {
 
                     {
                         if can_stream {
-                            let mic_available = matches!(self.mic_error, None);
-                            let video_available = matches!(self.video_error, None);
+                            let mic_available = self.mic_error.is_none();
+                            let video_available = self.video_error.is_none();
                             html! {
                                 <nav class="host">
                                     <div class="controls">

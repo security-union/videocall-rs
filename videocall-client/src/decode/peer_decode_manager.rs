@@ -786,10 +786,18 @@ impl PeerDecodeManager {
             ..Default::default()
         };
 
+        let media_data = match media_packet.write_to_bytes() {
+            Ok(data) => data,
+            Err(e) => {
+                log::warn!("Failed to serialize keyframe request: {}", e);
+                return;
+            }
+        };
+
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
             user_id: self.local_user_id.as_bytes().to_vec(),
-            data: media_packet.write_to_bytes().unwrap_or_default(),
+            data: media_data,
             ..Default::default()
         };
 

@@ -629,7 +629,7 @@ pub fn AttendantsComponent(
                     let mut toast_version = toast_version;
                     // Remove any pending "left" toast for this user (waiting room admission).
                     let mut current = peer_toasts.peek().clone();
-                    current.retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
+                    current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
                     play_user_joined();
                     let id = *toast_counter.peek();
                     toast_counter.set(id + 1);
@@ -1044,7 +1044,7 @@ pub fn AttendantsComponent(
                 if !peer_toasts().is_empty() {
                     div {
                         class: "peer-toasts",
-                        for (id, display_name, uid, is_joined) in peer_toasts().iter().cloned() {
+                        for (id, display_name, _uid, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
                                 let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };

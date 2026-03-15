@@ -204,14 +204,19 @@ mod tests {
 
     const TEST_SECRET: &str = "test-secret-for-unit-tests";
 
-    fn make_token(email: &str, room: &str, room_join: bool, exp_offset_secs: i64) -> String {
+    /// Test UUID strings for token tests.
+    const ALICE_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const BOB_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    const OBSERVER_UUID: &str = "01010101-0202-0303-0404-050505050505";
+
+    fn make_token(user_id: &str, room: &str, room_join: bool, exp_offset_secs: i64) -> String {
         let now = Utc::now().timestamp();
         let claims = RoomAccessTokenClaims {
-            sub: email.to_string(),
+            sub: user_id.to_string(),
             room: room.to_string(),
             room_join,
             is_host: false,
-            display_name: email.to_string(),
+            display_name: user_id.to_string(),
             observer: false,
             exp: now + exp_offset_secs,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
@@ -228,11 +233,11 @@ mod tests {
 
     #[test]
     fn decode_valid_token_extracts_claims() {
-        let token = make_token("alice@test.com", "room-1", true, 600);
+        let token = make_token(ALICE_UUID, "room-1", true, 600);
         let result = decode_room_token(TEST_SECRET, &token);
         assert!(result.is_ok());
         let claims = result.unwrap();
-        assert_eq!(claims.sub, "alice@test.com");
+        assert_eq!(claims.sub, ALICE_UUID);
         assert_eq!(claims.room, "room-1");
         assert!(claims.room_join);
     }
@@ -240,21 +245,21 @@ mod tests {
     #[test]
     fn decode_expired_token_fails() {
         // Use -120 to exceed jsonwebtoken's default 60-second leeway
-        let token = make_token("alice@test.com", "room-1", true, -120);
+        let token = make_token(ALICE_UUID, "room-1", true, -120);
         let result = decode_room_token(TEST_SECRET, &token);
         assert!(matches!(result, Err(TokenError::Expired)));
     }
 
     #[test]
     fn decode_wrong_secret_fails() {
-        let token = make_token("alice@test.com", "room-1", true, 600);
+        let token = make_token(ALICE_UUID, "room-1", true, 600);
         let result = decode_room_token("wrong-secret", &token);
         assert!(matches!(result, Err(TokenError::Invalid(_))));
     }
 
     #[test]
     fn decode_room_join_false_non_observer_fails() {
-        let token = make_token("alice@test.com", "room-1", false, 600);
+        let token = make_token(ALICE_UUID, "room-1", false, 600);
         let result = decode_room_token(TEST_SECRET, &token);
         assert!(matches!(result, Err(TokenError::RoomJoinDenied)));
     }
@@ -263,7 +268,7 @@ mod tests {
     fn decode_observer_token_with_room_join_false_succeeds() {
         let now = Utc::now().timestamp();
         let claims = RoomAccessTokenClaims {
-            sub: "observer@test.com".to_string(),
+            sub: OBSERVER_UUID.to_string(),
             room: "room-1".to_string(),
             room_join: false,
             is_host: false,
@@ -295,26 +300,26 @@ mod tests {
 
     #[test]
     fn valid_token_succeeds() {
-        let token = make_token("alice@test.com", "room-1", true, 600);
-        let result = validate_room_token(TEST_SECRET, &token, "room-1", "alice@test.com");
+        let token = make_token(ALICE_UUID, "room-1", true, 600);
+        let result = validate_room_token(TEST_SECRET, &token, "room-1", ALICE_UUID);
         assert!(result.is_ok());
         let claims = result.unwrap();
-        assert_eq!(claims.sub, "alice@test.com");
+        assert_eq!(claims.sub, ALICE_UUID);
         assert_eq!(claims.room, "room-1");
         assert!(claims.room_join);
     }
 
     #[test]
     fn room_mismatch_fails() {
-        let token = make_token("alice@test.com", "room-A", true, 600);
-        let result = validate_room_token(TEST_SECRET, &token, "room-B", "alice@test.com");
+        let token = make_token(ALICE_UUID, "room-A", true, 600);
+        let result = validate_room_token(TEST_SECRET, &token, "room-B", ALICE_UUID);
         assert!(matches!(result, Err(TokenError::RoomMismatch { .. })));
     }
 
     #[test]
     fn identity_mismatch_fails() {
-        let token = make_token("alice@test.com", "room-1", true, 600);
-        let result = validate_room_token(TEST_SECRET, &token, "room-1", "bob@test.com");
+        let token = make_token(ALICE_UUID, "room-1", true, 600);
+        let result = validate_room_token(TEST_SECRET, &token, "room-1", BOB_UUID);
         assert!(matches!(result, Err(TokenError::IdentityMismatch { .. })));
     }
 
@@ -368,8 +373,8 @@ mod tests {
     #[test]
     fn identity_mismatch_is_not_retryable_and_not_suspicious() {
         let err = TokenError::IdentityMismatch {
-            token_identity: "a@test.com".to_string(),
-            requested_identity: "b@test.com".to_string(),
+            token_identity: ALICE_UUID.to_string(),
+            requested_identity: BOB_UUID.to_string(),
         };
         assert!(!err.is_retryable());
         assert!(!err.is_suspicious());
@@ -379,7 +384,7 @@ mod tests {
 
     #[test]
     fn expired_token_error_is_retryable() {
-        let token = make_token("alice@test.com", "room-1", true, -120);
+        let token = make_token(ALICE_UUID, "room-1", true, -120);
         let err = decode_room_token(TEST_SECRET, &token).unwrap_err();
         assert!(err.is_retryable());
         assert!(!err.is_suspicious());
@@ -387,7 +392,7 @@ mod tests {
 
     #[test]
     fn wrong_secret_error_is_suspicious() {
-        let token = make_token("alice@test.com", "room-1", true, 600);
+        let token = make_token(ALICE_UUID, "room-1", true, 600);
         let err = decode_room_token("wrong-secret", &token).unwrap_err();
         assert!(err.is_suspicious());
         assert!(!err.is_retryable());

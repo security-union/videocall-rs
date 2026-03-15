@@ -14,7 +14,7 @@ const BROWSER_ARGS = [
 
 async function createAuthenticatedContext(
   browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
-  email: string,
+  userId: string,
   name: string,
   uiURL: string,
 ) {
@@ -22,7 +22,7 @@ async function createAuthenticatedContext(
     baseURL: uiURL,
     ignoreHTTPSErrors: true,
   });
-  const token = generateSessionToken(email, name);
+  const token = generateSessionToken(userId, name);
   const url = new URL(uiURL);
   await context.addCookies([
     {
@@ -142,13 +142,13 @@ test.describe("Toast notifications for participant join/leave", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host-toast@videocall.rs",
+        "00000000-0000-4000-8000-000000000101",
         "ToastHost",
         uiURL,
       );
       const guestCtx = await createAuthenticatedContext(
         browser2,
-        "guest-toast@videocall.rs",
+        "00000000-0000-4000-8000-000000000102",
         "ToastGuest",
         uiURL,
       );
@@ -189,15 +189,20 @@ test.describe("Toast notifications for participant join/leave", () => {
       });
       await expect(guestFloatingName.first()).toBeVisible({ timeout: 10_000 });
 
-      // The title attribute (tooltip) should contain the user_id (email)
-      await expect(guestFloatingName.first()).toHaveAttribute("title", "guest-toast@videocall.rs");
+      // The title attribute (tooltip) should contain the user_id (UUID)
+      await expect(guestFloatingName.first()).toHaveAttribute(
+        "title",
+        "00000000-0000-4000-8000-000000000102",
+      );
 
       // Wait for the toast that we started watching for before the guest joined.
       await toastPromise;
 
       // Verify the toast structure: line 1 is user_id, line 2 is action
       const firstToast = hostJoinedToast.first();
-      await expect(firstToast.locator(".toast-name")).toContainText("guest-toast@videocall.rs");
+      await expect(firstToast.locator(".toast-name")).toContainText(
+        "00000000-0000-4000-8000-000000000102",
+      );
       await expect(firstToast.locator(".toast-action")).toContainText("joined the meeting");
 
       // Verify the toast container has the correct CSS class (.peer-toasts)
@@ -218,13 +223,13 @@ test.describe("Toast notifications for participant join/leave", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host-leave@videocall.rs",
+        "00000000-0000-4000-8000-000000000201",
         "LeaveHost",
         uiURL,
       );
       const guestCtx = await createAuthenticatedContext(
         browser2,
-        "guest-leave@videocall.rs",
+        "00000000-0000-4000-8000-000000000202",
         "LeaveGuest",
         uiURL,
       );
@@ -272,7 +277,9 @@ test.describe("Toast notifications for participant join/leave", () => {
 
       // Verify the toast structure: line 1 is user_id, line 2 is action
       const firstLeftToast = hostLeftToast.first();
-      await expect(firstLeftToast.locator(".toast-name")).toContainText("guest-leave@videocall.rs");
+      await expect(firstLeftToast.locator(".toast-name")).toContainText(
+        "00000000-0000-4000-8000-000000000202",
+      );
       await expect(firstLeftToast.locator(".toast-action")).toContainText("left the meeting");
 
       // Verify the toast is inside the correct container (.peer-toasts)
@@ -298,13 +305,13 @@ test.describe("Toast notifications for participant join/leave", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host-dismiss@videocall.rs",
+        "00000000-0000-4000-8000-000000000301",
         "DismissHost",
         uiURL,
       );
       const guestCtx = await createAuthenticatedContext(
         browser2,
-        "guest-dismiss@videocall.rs",
+        "00000000-0000-4000-8000-000000000302",
         "DismissGuest",
         uiURL,
       );
@@ -387,13 +394,13 @@ test.describe("Toast notifications for participant join/leave", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host-admit@videocall.rs",
+        "00000000-0000-4000-8000-000000000401",
         "AdmitHost",
         uiURL,
       );
       const guestCtx = await createAuthenticatedContext(
         browser2,
-        "guest-admit@videocall.rs",
+        "00000000-0000-4000-8000-000000000402",
         "AdmitGuest",
         uiURL,
       );
@@ -464,7 +471,7 @@ test.describe("Toast notifications for participant join/leave", () => {
       // Verify the toast structure: line 1 is user_id, line 2 is action
       const firstAdmitToast = hostJoinedToast.first();
       await expect(firstAdmitToast.locator(".toast-name")).toContainText(
-        "guest-admit@videocall.rs",
+        "00000000-0000-4000-8000-000000000402",
       );
       await expect(firstAdmitToast.locator(".toast-action")).toContainText("joined the meeting");
 

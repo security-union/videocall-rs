@@ -17,17 +17,18 @@
 //! NATS is not configured (graceful degradation).
 
 use protobuf::Message;
+use uuid::Uuid;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::SYSTEM_USER_ID;
+use videocall_types::{to_user_id_bytes, SYSTEM_USER_ID};
 
 /// Build a `PacketWrapper` containing a serialized `MeetingPacket`.
 fn build_meeting_wrapper(meeting_packet: &MeetingPacket) -> Vec<u8> {
     let wrapper = PacketWrapper {
         packet_type: PacketType::MEETING.into(),
-        user_id: SYSTEM_USER_ID.as_bytes().to_vec(),
+        user_id: to_user_id_bytes(&SYSTEM_USER_ID),
         data: meeting_packet.write_to_bytes().unwrap_or_default(),
         ..Default::default()
     };
@@ -77,13 +78,13 @@ pub async fn publish_meeting_activated(nats: Option<&async_nats::Client>, room_i
 pub async fn publish_participant_admitted(
     nats: Option<&async_nats::Client>,
     room_id: &str,
-    target_user_id: &str,
+    target_user_id: &Uuid,
 ) {
     let Some(nats) = nats else { return };
     let packet = MeetingPacket {
         event_type: MeetingEventType::PARTICIPANT_ADMITTED.into(),
         room_id: room_id.to_string(),
-        target_user_id: target_user_id.as_bytes().to_vec(),
+        target_user_id: to_user_id_bytes(target_user_id),
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
@@ -95,13 +96,13 @@ pub async fn publish_participant_admitted(
 pub async fn publish_participant_rejected(
     nats: Option<&async_nats::Client>,
     room_id: &str,
-    target_user_id: &str,
+    target_user_id: &Uuid,
 ) {
     let Some(nats) = nats else { return };
     let packet = MeetingPacket {
         event_type: MeetingEventType::PARTICIPANT_REJECTED.into(),
         room_id: room_id.to_string(),
-        target_user_id: target_user_id.as_bytes().to_vec(),
+        target_user_id: to_user_id_bytes(target_user_id),
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
@@ -145,10 +146,12 @@ mod tests {
 
     #[test]
     fn test_build_participant_admitted_packet() {
+        let alice_uuid =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
         let packet = MeetingPacket {
             event_type: MeetingEventType::PARTICIPANT_ADMITTED.into(),
             room_id: "test-room".to_string(),
-            target_user_id: "alice@example.com".as_bytes().to_vec(),
+            target_user_id: to_user_id_bytes(&alice_uuid),
             ..Default::default()
         };
         let bytes = build_meeting_wrapper(&packet);
@@ -158,10 +161,7 @@ mod tests {
             inner.event_type,
             MeetingEventType::PARTICIPANT_ADMITTED.into()
         );
-        assert_eq!(
-            inner.target_user_id,
-            "alice@example.com".as_bytes().to_vec()
-        );
+        assert_eq!(inner.target_user_id, to_user_id_bytes(&alice_uuid));
         assert!(
             inner.room_token.is_empty(),
             "room_token must not be broadcast via NATS"
@@ -170,10 +170,11 @@ mod tests {
 
     #[test]
     fn test_build_participant_rejected_packet() {
+        let bob_uuid = Uuid::parse_str("660e8400-e29b-41d4-a716-446655440001").expect("valid uuid");
         let packet = MeetingPacket {
             event_type: MeetingEventType::PARTICIPANT_REJECTED.into(),
             room_id: "test-room".to_string(),
-            target_user_id: "bob@example.com".as_bytes().to_vec(),
+            target_user_id: to_user_id_bytes(&bob_uuid),
             ..Default::default()
         };
         let bytes = build_meeting_wrapper(&packet);
@@ -183,7 +184,7 @@ mod tests {
             inner.event_type,
             MeetingEventType::PARTICIPANT_REJECTED.into()
         );
-        assert_eq!(inner.target_user_id, "bob@example.com".as_bytes().to_vec());
+        assert_eq!(inner.target_user_id, to_user_id_bytes(&bob_uuid));
     }
 
     #[test]
@@ -223,10 +224,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_nats_none_is_noop() {
+        let user_uuid =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
         // All publish functions should be no-ops when nats is None.
         publish_meeting_activated(None, "room").await;
-        publish_participant_admitted(None, "room", "user@test.com").await;
-        publish_participant_rejected(None, "room", "user@test.com").await;
+        publish_participant_admitted(None, "room", &user_uuid).await;
+        publish_participant_rejected(None, "room", &user_uuid).await;
         publish_waiting_room_updated(None, "room").await;
     }
 }

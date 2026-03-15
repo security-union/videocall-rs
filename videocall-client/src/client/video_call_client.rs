@@ -45,7 +45,7 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
 use videocall_types::Callback;
-use videocall_types::SYSTEM_USER_ID;
+use videocall_types::{is_system_user, parse_user_id, to_user_id_bytes, user_id_bytes_to_string};
 use wasm_bindgen::JsValue;
 
 /// Configuration options for creating a [`VideoCallClient`].
@@ -597,14 +597,14 @@ impl VideoCallClient {
         false
     }
 
-    pub fn is_speaking_for_peer(&self, key: &String) -> bool {
+    pub fn is_speaking_for_peer(&self, key: &str) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             return inner.peer_decode_manager.is_peer_speaking(key);
         }
         false
     }
 
-    pub fn audio_level_for_peer(&self, key: &String) -> f32 {
+    pub fn audio_level_for_peer(&self, key: &str) -> f32 {
         if let Ok(inner) = self.inner.try_borrow() {
             return inner.peer_decode_manager.peer_audio_level(key);
         }
@@ -705,10 +705,17 @@ impl VideoCallClient {
             .get_fps(peer_id, media_type)
     }
 
+    /// Returns the user_id as 16-byte UUID representation for protobuf fields.
+    fn user_id_bytes(&self) -> Vec<u8> {
+        to_user_id_bytes(
+            &parse_user_id(&self.options.user_id).expect("user_id must be a valid UUID"),
+        )
+    }
+
     pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
         let wrapper = PacketWrapper {
             packet_type: PacketType::DIAGNOSTICS.into(),
-            user_id: self.options.user_id.as_bytes().to_vec(),
+            user_id: self.user_id_bytes(),
             data: packet.write_to_bytes().unwrap(),
             ..Default::default()
         };
@@ -851,31 +858,37 @@ impl Inner {
         // Evict stale entries (older than 5 seconds).
         self.recent_peer_events.retain(|_, ts| now - *ts < 5000.0);
 
-        if self.recent_peer_events.contains_key(&key) {
-            true // duplicate
-        } else {
-            self.recent_peer_events.insert(key, now);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.recent_peer_events.entry(key) {
+            e.insert(now);
             false // first occurrence
+        } else {
+            true // duplicate
         }
+    }
+
+    /// Returns the user_id as 16-byte UUID representation for protobuf fields.
+    fn user_id_bytes(&self) -> Vec<u8> {
+        to_user_id_bytes(
+            &parse_user_id(&self.options.user_id).expect("user_id must be a valid UUID"),
+        )
     }
 
     fn on_inbound_media(&mut self, response: PacketWrapper) {
         debug!(
             "<< Received {:?} from {} (session: {})",
             response.packet_type.enum_value(),
-            String::from_utf8_lossy(&response.user_id),
+            user_id_bytes_to_string(&response.user_id),
             response.session_id
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let peer_status =
-            if response.user_id == SYSTEM_USER_ID.as_bytes() || response.session_id == 0 {
-                PeerStatus::NoChange
-            } else {
-                let peer_user_id = String::from_utf8_lossy(&response.user_id);
-                self.peer_decode_manager
-                    .ensure_peer(response.session_id, &peer_user_id)
-            };
+        let peer_status = if is_system_user(&response.user_id) || response.session_id == 0 {
+            PeerStatus::NoChange
+        } else {
+            let peer_user_id = user_id_bytes_to_string(&response.user_id);
+            self.peer_decode_manager
+                .ensure_peer(response.session_id, &peer_user_id)
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 if !self.options.enable_e2ee {
@@ -884,7 +897,7 @@ impl Inner {
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
                     debug!(
                         "Decrypted AES_KEY from {}",
-                        String::from_utf8_lossy(&response.user_id)
+                        user_id_bytes_to_string(&response.user_id)
                     );
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
@@ -928,7 +941,7 @@ impl Inner {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::AES_KEY.into(),
-                                    user_id: self.options.user_id.as_bytes().to_vec(),
+                                    user_id: self.user_id_bytes(),
                                     data,
                                     ..Default::default()
                                 };
@@ -982,7 +995,7 @@ impl Inner {
             Ok(PacketType::HEALTH) => {
                 debug!(
                     "Received unexpected health packet from {}, ignoring",
-                    String::from_utf8_lossy(&response.user_id)
+                    user_id_bytes_to_string(&response.user_id) // already UUID bytes
                 );
             }
             Ok(PacketType::SESSION_ASSIGNED) => {
@@ -1006,9 +1019,9 @@ impl Inner {
                         "Received MEETING packet: event_type={:?}, room={}, target={}, creator={}, display_name={}, session={}",
                         meeting_packet.event_type.enum_value(),
                         meeting_packet.room_id,
-                        String::from_utf8_lossy(&meeting_packet.target_user_id),
-                        String::from_utf8_lossy(&meeting_packet.creator_id),
-                        String::from_utf8_lossy(&meeting_packet.display_name),
+                        user_id_bytes_to_string(&meeting_packet.target_user_id),
+                        user_id_bytes_to_string(&meeting_packet.creator_id),
+                        String::from_utf8_lossy(&meeting_packet.display_name), // display_name is UTF-8 text stored as bytes
                         meeting_packet.session_id,
                     );
                     match meeting_packet.event_type.enum_value() {
@@ -1017,7 +1030,7 @@ impl Inner {
                                 "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
                                 meeting_packet.room_id,
                                 meeting_packet.start_time_ms,
-                                String::from_utf8_lossy(&meeting_packet.creator_id),
+                                user_id_bytes_to_string(&meeting_packet.creator_id),
                             );
 
                             if let Some(callback) = &self.options.on_meeting_info {
@@ -1041,11 +1054,12 @@ impl Inner {
                             // Check dedup before borrowing self.options to avoid
                             // overlapping mutable/immutable borrows.
                             let target_str =
-                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                                user_id_bytes_to_string(&meeting_packet.target_user_id);
                             let display_name = if meeting_packet.display_name.is_empty() {
                                 target_str.clone()
                             } else {
-                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
+                                String::from_utf8(meeting_packet.display_name.clone())
+                                    .unwrap_or_else(|_| target_str.clone())
                             };
                             // Store the display name on the peer so the UI can
                             // show it on tiles instead of the raw user_id/email.
@@ -1054,8 +1068,7 @@ impl Inner {
                                 display_name.clone(),
                             );
                             let should_emit = !meeting_packet.target_user_id.is_empty()
-                                && meeting_packet.target_user_id[..]
-                                    != *self.options.user_id.as_bytes()
+                                && meeting_packet.target_user_id != self.user_id_bytes()
                                 && !self.is_duplicate_peer_event("joined", &target_str);
                             if should_emit {
                                 info!("Peer joined: {}", target_str);
@@ -1072,10 +1085,9 @@ impl Inner {
                                     .delete_peer(meeting_packet.session_id);
                             }
                             let target_str =
-                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                                user_id_bytes_to_string(&meeting_packet.target_user_id);
                             let should_emit = !meeting_packet.target_user_id.is_empty()
-                                && meeting_packet.target_user_id[..]
-                                    != *self.options.user_id.as_bytes()
+                                && meeting_packet.target_user_id != self.user_id_bytes()
                                 && !self.is_duplicate_peer_event("left", &target_str);
                             if should_emit {
                                 info!("Peer left: {}", target_str);
@@ -1083,8 +1095,8 @@ impl Inner {
                                     let display_name = if meeting_packet.display_name.is_empty() {
                                         target_str.clone()
                                     } else {
-                                        String::from_utf8_lossy(&meeting_packet.display_name)
-                                            .to_string()
+                                        String::from_utf8(meeting_packet.display_name.clone())
+                                            .unwrap_or_else(|_| target_str.clone())
                                     };
                                     cb.emit((display_name, target_str));
                                 }
@@ -1103,11 +1115,10 @@ impl Inner {
                             info!(
                                 "Received PARTICIPANT_ADMITTED: room={}, target={}",
                                 meeting_packet.room_id,
-                                String::from_utf8_lossy(&meeting_packet.target_user_id)
+                                user_id_bytes_to_string(&meeting_packet.target_user_id)
                             );
                             // Only fire callback if this event is targeted at us
-                            if meeting_packet.target_user_id[..] == *self.options.user_id.as_bytes()
-                            {
+                            if meeting_packet.target_user_id == self.user_id_bytes() {
                                 if let Some(callback) = &self.options.on_participant_admitted {
                                     callback.emit(());
                                 }
@@ -1117,11 +1128,10 @@ impl Inner {
                             info!(
                                 "Received PARTICIPANT_REJECTED: room={}, target={}",
                                 meeting_packet.room_id,
-                                String::from_utf8_lossy(&meeting_packet.target_user_id)
+                                user_id_bytes_to_string(&meeting_packet.target_user_id)
                             );
                             // Only fire callback if this event is targeted at us
-                            if meeting_packet.target_user_id[..] == *self.options.user_id.as_bytes()
-                            {
+                            if meeting_packet.target_user_id == self.user_id_bytes() {
                                 if let Some(callback) = &self.options.on_participant_rejected {
                                     callback.emit(());
                                 }
@@ -1154,7 +1164,7 @@ impl Inner {
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",
-                    String::from_utf8_lossy(&response.user_id)
+                    user_id_bytes_to_string(&response.user_id)
                 );
             }
             Err(e) => {
@@ -1172,11 +1182,12 @@ impl Inner {
             return;
         }
         let userid = self.options.user_id.clone();
+        let uid_bytes = self.user_id_bytes();
         let rsa = &*self.rsa;
         match rsa.pub_key.to_public_key_der() {
             Ok(public_key_der) => {
                 let packet = RsaPacket {
-                    user_id: userid.as_bytes().to_vec(),
+                    user_id: uid_bytes.clone(),
                     public_key_der: public_key_der.to_vec(),
                     ..Default::default()
                 };
@@ -1189,7 +1200,7 @@ impl Inner {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::RSA_PUB_KEY.into(),
-                                    user_id: userid.as_bytes().to_vec(),
+                                    user_id: uid_bytes.clone(),
                                     data,
                                     ..Default::default()
                                 };

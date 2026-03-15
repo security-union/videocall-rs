@@ -405,8 +405,21 @@ mod tests {
     use videocall_types::protos::media_packet::MediaPacket as VcMediaPacket;
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType as VcPacketType;
     use videocall_types::protos::packet_wrapper::PacketWrapper as VcPacketWrapper;
+    use videocall_types::{parse_user_id, to_user_id_bytes};
 
     const KEEP_ALIVE_PING: &[u8] = b"ping";
+
+    /// Test UUID strings for users used in integration tests.
+    const USER_A_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const USER_B_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    const ALICE_UUID: &str = "a1a1a1a1-b2b2-c3c3-d4d4-e5e5e5e5e5e5";
+    const BOB_UUID: &str = "b1b1b1b1-c2c2-d3d3-e4e4-f5f5f5f5f5f5";
+    const CHARLIE_UUID: &str = "c1c1c1c1-d2d2-e3e3-f4f4-a5a5a5a5a5a5";
+
+    /// Convert a UUID string to user_id bytes for use in protobuf packets.
+    fn uuid_bytes(uuid_str: &str) -> Vec<u8> {
+        to_user_id_bytes(&parse_user_id(uuid_str).expect("test UUID must be valid"))
+    }
 
     async fn start_webtransport_server() -> tokio::task::JoinHandle<()> {
         if let Err(e) = CryptoProvider::install_default(rustls::crypto::ring::default_provider()) {
@@ -665,8 +678,8 @@ mod tests {
         wait_for_server_ready().await;
 
         let meeting = "it-meeting-1";
-        let user_a = "user-a";
-        let user_b = "user-b";
+        let user_a = USER_A_UUID;
+        let user_b = USER_B_UUID;
 
         println!("Connecting client A: {user_a}");
         let session_a = connect_client(user_a, meeting)
@@ -712,12 +725,12 @@ mod tests {
         // Craft a MEDIA packet that is not RTT and not health
         let media = VcMediaPacket {
             media_type: VcMediaType::AUDIO.into(),
-            user_id: user_a.as_bytes().to_vec(),
+            user_id: uuid_bytes(user_a),
             ..Default::default()
         };
         let packet = VcPacketWrapper {
             packet_type: VcPacketType::MEDIA.into(),
-            user_id: user_a.as_bytes().to_vec(),
+            user_id: uuid_bytes(user_a),
             data: media.write_to_bytes().expect("serialize media"),
             ..Default::default()
         };
@@ -830,9 +843,9 @@ mod tests {
         // ========== CLIENT CONNECTIONS ==========
         let lobby_1 = "lobby-secure";
         let lobby_2 = "lobby-public";
-        let user_a = "alice";
-        let user_b = "bob";
-        let user_c = "charlie";
+        let user_a = ALICE_UUID;
+        let user_b = BOB_UUID;
+        let user_c = CHARLIE_UUID;
         assert_eq!(get_test_packet_counter_for_user(user_a), 0);
         assert_eq!(get_test_packet_counter_for_user(user_b), 0);
         assert_eq!(get_test_packet_counter_for_user(user_c), 0);
@@ -1103,12 +1116,12 @@ mod tests {
     fn create_test_packet(sender: &str, media_type: VcMediaType, _message: String) -> Vec<u8> {
         let media = VcMediaPacket {
             media_type: media_type.into(),
-            user_id: sender.as_bytes().to_vec(),
+            user_id: uuid_bytes(sender),
             ..Default::default()
         };
         let packet = VcPacketWrapper {
             packet_type: VcPacketType::MEDIA.into(),
-            user_id: sender.as_bytes().to_vec(),
+            user_id: uuid_bytes(sender),
             data: media.write_to_bytes().expect("serialize media"),
             ..Default::default()
         };
@@ -1167,7 +1180,7 @@ mod tests {
         // ========== STEP 1: First user connects ==========
         println!("\n--- Step 1: Alice connects (first participant) ---");
 
-        let session_alice = connect_client("alice", room_id)
+        let session_alice = connect_client(ALICE_UUID, room_id)
             .await
             .expect("connect alice");
         wait_for_session_ready(&session_alice, "Alice")
@@ -1178,7 +1191,9 @@ mod tests {
         // ========== STEP 2: Second user connects ==========
         println!("\n--- Step 2: Bob connects (second participant) ---");
 
-        let session_bob = connect_client("bob", room_id).await.expect("connect bob");
+        let session_bob = connect_client(BOB_UUID, room_id)
+            .await
+            .expect("connect bob");
         wait_for_session_ready(&session_bob, "Bob")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1187,7 +1202,7 @@ mod tests {
         // ========== STEP 3: Third user connects ==========
         println!("\n--- Step 3: Charlie connects (third participant) ---");
 
-        let session_charlie = connect_client("charlie", room_id)
+        let session_charlie = connect_client(CHARLIE_UUID, room_id)
             .await
             .expect("connect charlie");
         wait_for_session_ready(&session_charlie, "Charlie")
@@ -1252,7 +1267,7 @@ mod tests {
         let token = meeting_api::token::generate_room_token(
             JWT_SECRET,
             TOKEN_TTL_SECS,
-            "alice@test.com",
+            ALICE_UUID,
             "wt-jwt-room-1",
             true,
             "Alice",
@@ -1275,7 +1290,7 @@ mod tests {
         let token = meeting_api::token::generate_room_token(
             JWT_SECRET,
             -120,
-            "alice@test.com",
+            ALICE_UUID,
             "wt-jwt-room-2",
             false,
             "Alice",
@@ -1296,7 +1311,7 @@ mod tests {
         let token = meeting_api::token::generate_room_token(
             "completely-different-secret",
             TOKEN_TTL_SECS,
-            "alice@test.com",
+            ALICE_UUID,
             "wt-jwt-room-3",
             false,
             "Alice",
@@ -1328,7 +1343,7 @@ mod tests {
         let token = meeting_api::token::generate_room_token(
             JWT_SECRET,
             TOKEN_TTL_SECS,
-            "bob@example.com",
+            BOB_UUID,
             "wt-special-room",
             false,
             "Bob",

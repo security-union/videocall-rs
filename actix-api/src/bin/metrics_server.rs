@@ -711,6 +711,10 @@ mod tests {
         NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
         PeerStats as PbPeerStats, VideoStats as PbVideoStats,
     };
+    use videocall_types::{parse_user_id, to_user_id_bytes};
+
+    /// Test UUID string for the reporting user in health packet tests.
+    const ALICE_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     #[test]
     fn test_active_server_metrics_export() {
@@ -718,7 +722,7 @@ mod tests {
         let mut hp = PbHealthPacket::new();
         hp.session_id = "s1".to_string();
         hp.meeting_id = "m1".to_string();
-        hp.reporting_user_id = "alice@example.com".as_bytes().to_vec();
+        hp.reporting_user_id = to_user_id_bytes(&parse_user_id(ALICE_UUID).expect("valid UUID"));
         hp.timestamp_ms = 12345;
         hp.reporting_audio_enabled = true;
         hp.reporting_video_enabled = true;
@@ -740,13 +744,15 @@ mod tests {
     fn create_test_health_packet(
         session_id: &str,
         meeting_id: &str,
-        reporting_user_id: &str,
+        reporting_user_id_uuid: &str,
         peer_stats: std::collections::HashMap<String, PbPeerStats>,
     ) -> PbHealthPacket {
         let mut hp = PbHealthPacket::new();
         hp.session_id = session_id.to_string();
         hp.meeting_id = meeting_id.to_string();
-        hp.reporting_user_id = reporting_user_id.as_bytes().to_vec();
+        hp.reporting_user_id = to_user_id_bytes(
+            &parse_user_id(reporting_user_id_uuid).expect("test user ID must be valid UUID"),
+        );
         hp.timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -970,7 +976,7 @@ mod tests {
         peer_stats.insert(peer_id, peer_stat);
 
         let health_packet =
-            create_test_health_packet("session_123", "meeting_456", "alice", peer_stats);
+            create_test_health_packet("session_123", "meeting_456", ALICE_UUID, peer_stats);
 
         // Process the health packet
         let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
@@ -979,13 +985,13 @@ mod tests {
         // Verify session was tracked
         {
             let tracker_guard = tracker.lock().unwrap();
-            let session_key = "meeting_456_session_123_alice".to_string();
+            let session_key = format!("meeting_456_session_123_{ALICE_UUID}");
             assert!(tracker_guard.contains_key(&session_key));
 
             let session_info = tracker_guard.get(&session_key).unwrap();
             assert_eq!(session_info.session_id, "session_123");
             assert_eq!(session_info.meeting_id, "meeting_456");
-            assert_eq!(session_info.reporting_user_id, "alice");
+            assert_eq!(session_info.reporting_user_id, ALICE_UUID);
         }
     }
 
@@ -996,7 +1002,7 @@ mod tests {
         let (peer_id, peer_stat) = create_test_peer_stats("bob", true, true, 50.0, 1.0);
         peer_stats.insert(peer_id, peer_stat);
 
-        let mut hp = create_test_health_packet("sess_self", "meet_self", "alice", peer_stats);
+        let mut hp = create_test_health_packet("sess_self", "meet_self", ALICE_UUID, peer_stats);
         hp.reporting_audio_enabled = true;
         hp.reporting_video_enabled = true;
         let result = process_health_packet_to_metrics_pb(&hp, &tracker);
@@ -1004,11 +1010,11 @@ mod tests {
 
         assert!(series_exists(
             "videocall_self_audio_enabled",
-            &[("meeting_id", "meet_self"), ("peer_id", "alice")]
+            &[("meeting_id", "meet_self"), ("peer_id", ALICE_UUID)]
         ));
         assert!(series_exists(
             "videocall_self_video_enabled",
-            &[("meeting_id", "meet_self"), ("peer_id", "alice")]
+            &[("meeting_id", "meet_self"), ("peer_id", ALICE_UUID)]
         ));
     }
 
@@ -1022,7 +1028,7 @@ mod tests {
             create_test_peer_stats_with_video("bob", true, false, 24.0, 10.0, 100, 300);
         peer_stats.insert(peer_id.clone(), ps);
 
-        let hp = create_test_health_packet("sess_ab", "meet_ab", "alice", peer_stats);
+        let hp = create_test_health_packet("sess_ab", "meet_ab", ALICE_UUID, peer_stats);
         let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
@@ -1031,7 +1037,7 @@ mod tests {
             &[
                 ("meeting_id", "meet_ab"),
                 ("session_id", "sess_ab"),
-                ("from_peer", "alice"),
+                ("from_peer", ALICE_UUID),
                 ("to_peer", "bob")
             ]
         ));
@@ -1040,7 +1046,7 @@ mod tests {
             &[
                 ("meeting_id", "meet_ab"),
                 ("session_id", "sess_ab"),
-                ("from_peer", "alice"),
+                ("from_peer", ALICE_UUID),
                 ("to_peer", "bob")
             ]
         ));
@@ -1049,7 +1055,7 @@ mod tests {
             &[
                 ("meeting_id", "meet_ab"),
                 ("session_id", "sess_ab"),
-                ("from_peer", "alice"),
+                ("from_peer", ALICE_UUID),
                 ("to_peer", "bob")
             ]
         ));
@@ -1099,7 +1105,7 @@ mod tests {
         peer_stats.insert(peer_id.clone(), peer_stat);
         let meeting_id = "meeting_rm";
         let session_id = "session_rm";
-        let reporting_user_id = "alice";
+        let reporting_user_id = ALICE_UUID;
         let packet =
             create_test_health_packet(session_id, meeting_id, reporting_user_id, peer_stats);
         let result = process_health_packet_to_metrics_pb(&packet, &tracker);
@@ -1151,7 +1157,7 @@ mod tests {
         peer_stats.insert(peer_id2, peer_stat2);
 
         let health_packet =
-            create_test_health_packet("session_789", "meeting_999", "alice", peer_stats);
+            create_test_health_packet("session_789", "meeting_999", ALICE_UUID, peer_stats);
 
         // Process the health packet
         let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
@@ -1160,7 +1166,7 @@ mod tests {
         // Verify session tracking
         {
             let tracker_guard = tracker.lock().unwrap();
-            let session_key = "meeting_999_session_789_alice".to_string();
+            let session_key = format!("meeting_999_session_789_{ALICE_UUID}");
             assert!(tracker_guard.contains_key(&session_key));
         }
     }
@@ -1171,7 +1177,7 @@ mod tests {
 
         // Test minimal packet
         let peer_stats = std::collections::HashMap::new();
-        let hp = create_test_health_packet("session_123", "meeting_123", "alice", peer_stats);
+        let hp = create_test_health_packet("session_123", "meeting_123", ALICE_UUID, peer_stats);
         let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
     }
@@ -1298,8 +1304,12 @@ mod tests {
 
         // Create health packet with empty peer stats
         let empty_peer_stats = std::collections::HashMap::new();
-        let health_packet =
-            create_test_health_packet("session_empty", "meeting_empty", "alice", empty_peer_stats);
+        let health_packet = create_test_health_packet(
+            "session_empty",
+            "meeting_empty",
+            ALICE_UUID,
+            empty_peer_stats,
+        );
 
         // Process the health packet
         let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
@@ -1308,7 +1318,7 @@ mod tests {
         // Verify session was still tracked even with empty peer stats
         {
             let tracker_guard = tracker.lock().unwrap();
-            let session_key = "meeting_empty_session_empty_alice".to_string();
+            let session_key = format!("meeting_empty_session_empty_{ALICE_UUID}");
             assert!(tracker_guard.contains_key(&session_key));
         }
     }
@@ -1321,7 +1331,7 @@ mod tests {
         let mut hp = PbHealthPacket::new();
         hp.session_id = "sess_rtt".to_string();
         hp.meeting_id = "meet_rtt".to_string();
-        hp.reporting_user_id = "alice".as_bytes().to_vec();
+        hp.reporting_user_id = to_user_id_bytes(&parse_user_id(ALICE_UUID).expect("valid UUID"));
         hp.timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1335,7 +1345,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify server info was tracked
-        let session_key = "meet_rtt_sess_rtt_alice";
+        let session_key_str = format!("meet_rtt_sess_rtt_{ALICE_UUID}");
+        let session_key = session_key_str.as_str();
         {
             let tracker_guard = tracker.lock().unwrap();
             let session_info = tracker_guard.get(session_key).unwrap();
@@ -1351,7 +1362,7 @@ mod tests {
             &[
                 ("meeting_id", "meet_rtt"),
                 ("session_id", "sess_rtt"),
-                ("peer_id", "alice"),
+                ("peer_id", ALICE_UUID),
                 ("server_url", "wss://server.example.com"),
                 ("server_type", "websocket")
             ]
@@ -1362,7 +1373,7 @@ mod tests {
             &[
                 ("meeting_id", "meet_rtt"),
                 ("session_id", "sess_rtt"),
-                ("peer_id", "alice"),
+                ("peer_id", ALICE_UUID),
                 ("server_url", "wss://server.example.com"),
                 ("server_type", "websocket")
             ]
@@ -1381,7 +1392,7 @@ mod tests {
             &[
                 ("meeting_id", "meet_rtt"),
                 ("session_id", "sess_rtt"),
-                ("peer_id", "alice"),
+                ("peer_id", ALICE_UUID),
                 ("server_url", "wss://server.example.com"),
                 ("server_type", "websocket")
             ]
@@ -1392,7 +1403,7 @@ mod tests {
             &[
                 ("meeting_id", "meet_rtt"),
                 ("session_id", "sess_rtt"),
-                ("peer_id", "alice"),
+                ("peer_id", ALICE_UUID),
                 ("server_url", "wss://server.example.com"),
                 ("server_type", "websocket")
             ]

@@ -15,6 +15,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Row returned from the `meeting_participants` table.
 #[derive(Debug, sqlx::FromRow)]
@@ -22,7 +23,7 @@ use sqlx::PgPool;
 pub struct ParticipantRow {
     pub id: i32,
     pub meeting_id: i32,
-    pub user_id: String,
+    pub user_id: Uuid,
     pub status: String,
     pub is_host: bool,
     pub is_required: bool,
@@ -43,7 +44,7 @@ const PARTICIPANT_COLUMNS: &str = r#"
 pub async fn upsert_host(
     pool: &PgPool,
     meeting_id: i32,
-    user_id: &str,
+    user_id: &Uuid,
     display_name: Option<&str>,
 ) -> Result<ParticipantRow, sqlx::Error> {
     let query = format!(
@@ -75,7 +76,7 @@ pub async fn upsert_host(
 pub async fn join_attendee(
     pool: &PgPool,
     meeting_id: i32,
-    user_id: &str,
+    user_id: &Uuid,
     display_name: Option<&str>,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -159,7 +160,7 @@ pub async fn get_admitted(
 pub async fn get_status(
     pool: &PgPool,
     meeting_id: i32,
-    user_id: &str,
+    user_id: &Uuid,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2"
@@ -175,7 +176,7 @@ pub async fn get_status(
 pub async fn admit(
     pool: &PgPool,
     meeting_id: i32,
-    user_id: &str,
+    user_id: &Uuid,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
@@ -212,7 +213,7 @@ pub async fn admit_all(pool: &PgPool, meeting_id: i32) -> Result<Vec<Participant
 pub async fn reject(
     pool: &PgPool,
     meeting_id: i32,
-    user_id: &str,
+    user_id: &Uuid,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
@@ -233,7 +234,7 @@ pub async fn reject(
 pub async fn leave(
     pool: &PgPool,
     meeting_id: i32,
-    user_id: &str,
+    user_id: &Uuid,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
@@ -282,7 +283,7 @@ impl ParticipantRow {
         room_token: Option<String>,
     ) -> videocall_meeting_types::responses::ParticipantStatusResponse {
         videocall_meeting_types::responses::ParticipantStatusResponse {
-            user_id: self.user_id,
+            user_id: self.user_id.to_string(),
             display_name: self.display_name,
             status: self.status,
             is_host: self.is_host,

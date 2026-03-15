@@ -222,7 +222,6 @@ pub fn HostControls(
                             let display_name = participant.display_name.clone();
 
                             let uid_for_key = peer_user_id.clone();
-                            let uid_for_view = peer_user_id.clone();
                             let uid_admit = peer_user_id.clone();
                             let uid_reject = peer_user_id.clone();
 
@@ -232,11 +231,11 @@ pub fn HostControls(
                             let fetch_admit = fetch_waiting_list.clone();
                             let fetch_reject = fetch_waiting_list.clone();
 
-                            let mut waiting_admit = waiting.clone();
-                            let mut waiting_reject = waiting.clone();
+                            let mut waiting_admit = waiting;
+                            let mut waiting_reject = waiting;
 
-                            let mut error_admit = error.clone();
-                            let mut error_reject = error.clone();
+                            let error_admit = error;
+                            let error_reject = error;
 
                             rsx! {
                                 div { key: "{uid_for_key}", class: "waiting-participant",
@@ -244,12 +243,11 @@ pub fn HostControls(
                                         if let Some(name) = display_name.clone() {
                                             if !name.trim().is_empty() {
                                                 div { class: "participant-name", "{name}" }
-                                                div { class: "participant-email", "{uid_for_view}" }
                                             } else {
-                                                div { class: "participant-name", "{uid_for_view}" }
+                                                div { class: "participant-name", "Unknown participant" }
                                             }
                                         } else {
-                                            div { class: "participant-name", "{uid_for_view}" }
+                                            div { class: "participant-name", "Unknown participant" }
                                         }
                                     }
                                     div { class: "participant-actions",
@@ -261,7 +259,7 @@ pub fn HostControls(
                                                 let uid = uid_admit.clone();
                                                 let meeting_id = meeting_id_admit.clone();
                                                 let fetch = fetch_admit.clone();
-                                                let mut error = error_admit.clone();
+                                                let mut error = error_admit;
 
                                                 spawn(async move {
                                                     match admit_participant(&meeting_id, &uid).await {
@@ -288,7 +286,7 @@ pub fn HostControls(
                                                 let uid = uid_reject.clone();
                                                 let meeting_id = meeting_id_reject.clone();
                                                 let fetch = fetch_reject.clone();
-                                                let mut error = error_reject.clone();
+                                                let mut error = error_reject;
 
                                                 spawn(async move {
                                                     match reject_participant(&meeting_id, &uid).await {

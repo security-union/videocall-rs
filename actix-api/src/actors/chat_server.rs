@@ -33,8 +33,9 @@ use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
+use uuid::Uuid;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::SYSTEM_USER_ID;
+use videocall_types::{parse_user_id, SYSTEM_USER_ID};
 
 use super::session_logic::{ConnectionState, SessionId};
 
@@ -144,9 +145,16 @@ impl ChatServer {
                             user_id, room_id, remaining_count
                         );
                         // Notify remaining peers about the departed session
+                        let uid = match parse_user_id(&user_id) {
+                            Ok(u) => u,
+                            Err(_) => {
+                                error!("Cannot build PARTICIPANT_LEFT: invalid UUID {}", user_id);
+                                return;
+                            }
+                        };
                         let bytes = SessionManager::build_peer_left_packet(
                             &room_id,
-                            &user_id,
+                            &uid,
                             session_id_val,
                             &display_name,
                         );
@@ -325,9 +333,15 @@ impl Handler<JoinRoom> for ChatServer {
         // Validate user_id synchronously BEFORE spawning async task.
         // This ensures we return an error to the client if validation fails,
         // rather than returning Ok and silently failing in the spawned task.
-        if user_id == SYSTEM_USER_ID {
-            return MessageResult(Err("Cannot use reserved system user ID".into()));
-        }
+        let user_uuid = match parse_user_id(&user_id) {
+            Ok(uuid) if uuid == SYSTEM_USER_ID => {
+                return MessageResult(Err("Cannot use reserved system user ID".into()));
+            }
+            Ok(uuid) => uuid,
+            Err(_) => {
+                return MessageResult(Err("User ID is not a valid UUID".into()));
+            }
+        };
 
         if self.active_subs.contains_key(&session) {
             return MessageResult(Ok(()));
@@ -402,7 +416,7 @@ impl Handler<JoinRoom> for ChatServer {
                     if !observer {
                         let bytes = SessionManager::build_peer_joined_packet(
                             &room_clone,
-                            &user_id_clone,
+                            &user_uuid,
                             session_id,
                             &display_name_clone,
                         );
@@ -430,9 +444,19 @@ impl Handler<JoinRoom> for ChatServer {
                     // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
                     // This ensures the new joiner learns about all participants already in the room.
                     for (existing_sid, existing_uid, existing_display_name) in &existing_members {
+                        let existing_uuid = match parse_user_id(existing_uid) {
+                            Ok(u) => u,
+                            Err(_) => {
+                                warn!(
+                                    "Skipping existing member with invalid UUID: {}",
+                                    existing_uid
+                                );
+                                continue;
+                            }
+                        };
                         let existing_bytes = SessionManager::build_peer_joined_packet(
                             &room_clone,
-                            existing_uid,
+                            &existing_uuid,
                             *existing_sid,
                             existing_display_name,
                         );
@@ -522,7 +546,7 @@ async fn send_meeting_info(
     nc: &async_nats::client::Client,
     room: &str,
     start_time_ms: u64,
-    creator_id: &str,
+    creator_id: &Uuid,
 ) {
     let packet_bytes =
         SessionManager::build_meeting_started_packet(room, start_time_ms, creator_id);
@@ -563,6 +587,16 @@ mod tests {
     use super::*;
     use actix::Actor;
     use serial_test::serial;
+
+    /// Test UUID strings for users in ChatServer tests.
+    const VALID_USER_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const ALICE_UUID: &str = "a1a1a1a1-b2b2-c3c3-d4d4-e5e5e5e5e5e5";
+    const OBSERVER_UUID: &str = "01010101-0202-0303-0404-050505050505";
+    const REAL_USER_UUID: &str = "11111111-2222-3333-4444-555555555555";
+    const OBSERVER_DC_UUID: &str = "21212121-3232-4343-5454-656565656565";
+    const REAL_DC_UUID: &str = "31313131-4242-5353-6464-757575757575";
+    const TEST_USER_UUID: &str = "41414141-5252-6363-7474-858585858585";
+    const SAME_USER_UUID: &str = "51515151-6262-7373-8484-959595959595";
 
     /// Test helper: create a database pool for integration tests.
     /// Kept for future JWT flow testing (create meeting -> get JWT -> connect via WS/WT).
@@ -680,8 +714,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: "test-room-valid".to_string(),
-                user_id: "valid-user@example.com".to_string(),
-                display_name: "valid-user@example.com".to_string(),
+                user_id: VALID_USER_UUID.to_string(),
+                display_name: VALID_USER_UUID.to_string(),
                 observer: false,
             })
             .await
@@ -711,8 +745,8 @@ mod tests {
             .send(JoinRoom {
                 session: 9999u64,
                 room: "test-room".to_string(),
-                user_id: "valid-user@example.com".to_string(),
-                display_name: "valid-user@example.com".to_string(),
+                user_id: VALID_USER_UUID.to_string(),
+                display_name: VALID_USER_UUID.to_string(),
                 observer: false,
             })
             .await
@@ -771,8 +805,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: "test-room-cleanup".to_string(),
-                user_id: "valid-user@example.com".to_string(),
-                display_name: "valid-user@example.com".to_string(),
+                user_id: VALID_USER_UUID.to_string(),
+                display_name: VALID_USER_UUID.to_string(),
                 observer: false,
             })
             .await
@@ -786,8 +820,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: "test-room-cleanup".to_string(),
-                user_id: "valid-user@example.com".to_string(),
-                display_name: "valid-user@example.com".to_string(),
+                user_id: VALID_USER_UUID.to_string(),
+                display_name: VALID_USER_UUID.to_string(),
                 observer: false,
             })
             .await
@@ -823,7 +857,7 @@ mod tests {
         let session_manager = SessionManager::new();
 
         // Create two sessions with the same user_id
-        let user_id = "same-user@example.com".to_string();
+        let user_id = SAME_USER_UUID.to_string();
         let room = "test-room-unique".to_string();
 
         let session1 = SessionLogic::new(
@@ -922,7 +956,7 @@ mod tests {
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
                 },
-                user: "test@example.com".to_string(),
+                user: TEST_USER_UUID.to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -1009,7 +1043,7 @@ mod tests {
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
                 },
-                user: "test@example.com".to_string(),
+                user: TEST_USER_UUID.to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -1153,8 +1187,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: "test-room-broadcast".to_string(),
-                user_id: "alice@example.com".to_string(),
-                display_name: "alice@example.com".to_string(),
+                user_id: ALICE_UUID.to_string(),
+                display_name: ALICE_UUID.to_string(),
                 observer: false,
             })
             .await
@@ -1261,8 +1295,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: room.to_string(),
-                user_id: "observer-user@example.com".to_string(),
-                display_name: "observer-user@example.com".to_string(),
+                user_id: OBSERVER_UUID.to_string(),
+                display_name: OBSERVER_UUID.to_string(),
                 observer: true,
             })
             .await
@@ -1353,8 +1387,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: room.to_string(),
-                user_id: "real-user@example.com".to_string(),
-                display_name: "real-user@example.com".to_string(),
+                user_id: REAL_USER_UUID.to_string(),
+                display_name: REAL_USER_UUID.to_string(),
                 observer: false,
             })
             .await
@@ -1417,8 +1451,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: room.to_string(),
-                user_id: "observer-dc@example.com".to_string(),
-                display_name: "observer-dc@example.com".to_string(),
+                user_id: OBSERVER_DC_UUID.to_string(),
+                display_name: OBSERVER_DC_UUID.to_string(),
                 observer: true,
             })
             .await
@@ -1461,8 +1495,8 @@ mod tests {
             .send(Disconnect {
                 session: session_id,
                 room: room.to_string(),
-                user_id: "observer-dc@example.com".to_string(),
-                display_name: "observer-dc@example.com".to_string(),
+                user_id: OBSERVER_DC_UUID.to_string(),
+                display_name: OBSERVER_DC_UUID.to_string(),
                 observer: true,
             })
             .await
@@ -1523,8 +1557,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: room.to_string(),
-                user_id: "real-dc@example.com".to_string(),
-                display_name: "real-dc@example.com".to_string(),
+                user_id: REAL_DC_UUID.to_string(),
+                display_name: REAL_DC_UUID.to_string(),
                 observer: false,
             })
             .await
@@ -1571,8 +1605,8 @@ mod tests {
             .send(Disconnect {
                 session: session_id,
                 room: room.to_string(),
-                user_id: "real-dc@example.com".to_string(),
-                display_name: "real-dc@example.com".to_string(),
+                user_id: REAL_DC_UUID.to_string(),
+                display_name: REAL_DC_UUID.to_string(),
                 observer: false,
             })
             .await
@@ -1636,8 +1670,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: "test-room-observer-ok".to_string(),
-                user_id: "observer@example.com".to_string(),
-                display_name: "observer@example.com".to_string(),
+                user_id: OBSERVER_UUID.to_string(),
+                display_name: OBSERVER_UUID.to_string(),
                 observer: true,
             })
             .await
@@ -1653,8 +1687,8 @@ mod tests {
             .send(JoinRoom {
                 session: session_id,
                 room: "test-room-observer-ok".to_string(),
-                user_id: "observer@example.com".to_string(),
-                display_name: "observer@example.com".to_string(),
+                user_id: OBSERVER_UUID.to_string(),
+                display_name: OBSERVER_UUID.to_string(),
                 observer: true,
             })
             .await

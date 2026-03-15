@@ -36,16 +36,20 @@ async fn test_end_meeting_success() {
 
     // Create a meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
@@ -54,7 +58,7 @@ async fn test_end_meeting_success() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/end"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -80,16 +84,20 @@ async fn test_end_meeting_not_owner() {
 
     // Create a meeting as host.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Non-owner tries to end it.
@@ -97,7 +105,7 @@ async fn test_end_meeting_not_owner() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/end"),
-        "other@example.com",
+        "660e8400-e29b-41d4-a716-446655440001",
     )
     .body(Body::empty())
     .unwrap();
@@ -121,7 +129,7 @@ async fn test_end_meeting_not_found() {
     let req = request_with_cookie(
         "POST",
         "/api/v1/meetings/nonexistent-end-test/end",
-        "user@example.com",
+        "770e8400-e29b-41d4-a716-446655440002",
     )
     .body(Body::empty())
     .unwrap();
@@ -143,16 +151,20 @@ async fn test_end_meeting_idempotent() {
 
     // Create a meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // End it the first time.
@@ -160,7 +172,7 @@ async fn test_end_meeting_idempotent() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/end"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -176,7 +188,7 @@ async fn test_end_meeting_idempotent() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/end"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -201,16 +213,20 @@ async fn test_get_meeting_includes_stats_fields() {
 
     // Create a meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Get the meeting and verify stats fields are present.
@@ -218,7 +234,7 @@ async fn test_get_meeting_includes_stats_fields() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -245,16 +261,20 @@ async fn test_end_meeting_populates_ended_at() {
 
     // Create a meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Verify ended_at is null before ending.
@@ -262,7 +282,7 @@ async fn test_end_meeting_populates_ended_at() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -275,7 +295,7 @@ async fn test_end_meeting_populates_ended_at() {
     let req = request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/end"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -287,7 +307,7 @@ async fn test_end_meeting_populates_ended_at() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -309,17 +329,21 @@ async fn test_update_meeting_returns_stats_fields() {
 
     // Create a meeting with waiting room enabled.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": [],
-                "waiting_room_enabled": true
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": [],
+            "waiting_room_enabled": true
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Update waiting room setting.
@@ -327,7 +351,7 @@ async fn test_update_meeting_returns_stats_fields() {
     let req = request_with_cookie(
         "PATCH",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .header("Content-Type", "application/json")
     .body(Body::from(

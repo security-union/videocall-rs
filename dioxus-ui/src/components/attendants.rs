@@ -329,14 +329,14 @@ fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) 
     let mut best_area = 0.0f64;
 
     for cols in 1..=n {
-        let rows = (n + cols - 1) / cols;
+        let rows = n.div_ceil(cols);
         let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
         let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
         if tile_w <= 0.0 || tile_h <= 0.0 {
             continue;
         }
         let aspect = tile_w / tile_h;
-        if aspect > MAX_ASPECT || aspect < 1.0 / MAX_ASPECT {
+        if !(1.0 / MAX_ASPECT..=MAX_ASPECT).contains(&aspect) {
             continue;
         }
         let area = tile_w * tile_h;
@@ -350,7 +350,7 @@ fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) 
     if best_area == 0.0 {
         let mut best_delta = f64::MAX;
         for cols in 1..=n {
-            let rows = (n + cols - 1) / cols;
+            let rows = n.div_ceil(cols);
             let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
             let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
             if tile_w <= 0.0 || tile_h <= 0.0 {
@@ -393,7 +393,7 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
-    let mut encoder_settings = use_signal(|| None::<String>);
+    let encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
@@ -440,7 +440,7 @@ pub fn AttendantsComponent(
 
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
-    let mut peer_status_map: PeerStatusMap = use_signal(|| HashMap::new());
+    let mut peer_status_map: PeerStatusMap = use_signal(HashMap::new);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -629,7 +629,7 @@ pub fn AttendantsComponent(
                     let mut toast_version = toast_version;
                     // Remove any pending "left" toast for this user (waiting room admission).
                     let mut current = peer_toasts.peek().clone();
-                    current.retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
+                    current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
                     play_user_joined();
                     let id = *toast_counter.peek();
                     toast_counter.set(id + 1);
@@ -775,10 +775,8 @@ pub fn AttendantsComponent(
             }) as Box<dyn FnMut(_)>);
 
             if let Some(win) = web_sys::window() {
-                let _ = win.add_event_listener_with_callback(
-                    "focus",
-                    closure.as_ref().unchecked_ref(),
-                );
+                let _ =
+                    win.add_event_listener_with_callback("focus", closure.as_ref().unchecked_ref());
             }
             closure.forget();
         });
@@ -1046,7 +1044,7 @@ pub fn AttendantsComponent(
                 if !peer_toasts().is_empty() {
                     div {
                         class: "peer-toasts",
-                        for (id, display_name, uid, is_joined) in peer_toasts().iter().cloned() {
+                        for (id, display_name, _uid, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
                                 let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };

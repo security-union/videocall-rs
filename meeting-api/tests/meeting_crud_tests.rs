@@ -39,17 +39,21 @@ async fn test_create_meeting_success() {
 
     let app = build_app(pool.clone());
 
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": ["user1@example.com", "user2@example.com"],
-                "password": "secret123"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": ["user1@example.com", "user2@example.com"],
+            "password": "secret123"
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -57,7 +61,7 @@ async fn test_create_meeting_success() {
     let body: APIResponse<CreateMeetingResponse> = response_json(resp).await;
     assert!(body.success);
     assert_eq!(body.result.meeting_id, room_id);
-    assert_eq!(body.result.host, "host@example.com");
+    assert_eq!(body.result.host, "550e8400-e29b-41d4-a716-446655440000");
     assert!(body.result.has_password);
     assert_eq!(body.result.attendees.len(), 2);
 
@@ -70,10 +74,14 @@ async fn test_create_meeting_generates_id() {
     let pool = get_test_pool().await;
     let app = build_app(pool.clone());
 
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(r#"{"attendees":[]}"#))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(r#"{"attendees":[]}"#))
+    .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -101,19 +109,27 @@ async fn test_create_meeting_duplicate_id() {
 
     // Create first meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(payload.clone()))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(payload.clone()))
+    .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Try to create a duplicate.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(payload))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(payload))
+    .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
@@ -137,10 +153,14 @@ async fn test_create_meeting_too_many_attendees() {
     }))
     .unwrap();
 
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(payload))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(payload))
+    .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -160,17 +180,21 @@ async fn test_get_meeting_success() {
 
     // Create the meeting first.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": [],
-                "password": "secret"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": [],
+            "password": "secret"
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Get it back.
@@ -178,7 +202,7 @@ async fn test_get_meeting_success() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -189,7 +213,7 @@ async fn test_get_meeting_success() {
     let body: APIResponse<MeetingInfoResponse> = response_json(resp).await;
     assert!(body.success);
     assert_eq!(body.result.meeting_id, room_id);
-    assert_eq!(body.result.host, "host@example.com");
+    assert_eq!(body.result.host, "550e8400-e29b-41d4-a716-446655440000");
     assert!(body.result.has_password);
 
     cleanup_test_data(&pool, room_id).await;
@@ -204,7 +228,7 @@ async fn test_get_meeting_not_found() {
     let req = request_with_cookie(
         "GET",
         "/api/v1/meetings/nonexistent-meeting",
-        "user@example.com",
+        "770e8400-e29b-41d4-a716-446655440002",
     )
     .body(Body::empty())
     .unwrap();
@@ -227,16 +251,20 @@ async fn test_list_meetings_success() {
 
     // Create a meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // List meetings.
@@ -244,7 +272,7 @@ async fn test_list_meetings_success() {
     let req = request_with_cookie(
         "GET",
         "/api/v1/meetings?limit=10&offset=0",
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -270,16 +298,20 @@ async fn test_delete_meeting_success() {
 
     // Create a meeting.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Owner deletes meeting.
@@ -287,7 +319,7 @@ async fn test_delete_meeting_success() {
     let req = request_with_cookie(
         "DELETE",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -303,7 +335,7 @@ async fn test_delete_meeting_success() {
     let req = request_with_cookie(
         "GET",
         &format!("/api/v1/meetings/{room_id}"),
-        "host@example.com",
+        "550e8400-e29b-41d4-a716-446655440000",
     )
     .body(Body::empty())
     .unwrap();
@@ -322,16 +354,20 @@ async fn test_delete_meeting_not_owner() {
 
     // Create a meeting as host.
     let app = build_app(pool.clone());
-    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
-        .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "meeting_id": room_id,
-                "attendees": []
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let req = request_with_cookie(
+        "POST",
+        "/api/v1/meetings",
+        "550e8400-e29b-41d4-a716-446655440000",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "meeting_id": room_id,
+            "attendees": []
+        }))
+        .unwrap(),
+    ))
+    .unwrap();
     let _ = app.oneshot(req).await.unwrap();
 
     // Non-owner tries to delete.
@@ -339,7 +375,7 @@ async fn test_delete_meeting_not_owner() {
     let req = request_with_cookie(
         "DELETE",
         &format!("/api/v1/meetings/{room_id}"),
-        "other@example.com",
+        "660e8400-e29b-41d4-a716-446655440001",
     )
     .body(Body::empty())
     .unwrap();

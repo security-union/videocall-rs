@@ -1193,7 +1193,7 @@ impl Component for AttendantsComponent {
                 // (the deferred leave sound will also be suppressed because
                 // it checks whether the toast still exists).
                 self.peer_toasts
-                    .retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
+                    .retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
 
                 // Always show the join toast and play the join sound.
                 Self::play_user_joined();
@@ -1354,7 +1354,7 @@ impl Component for AttendantsComponent {
                     // "participant joined/left" toast notifications
                     if !self.peer_toasts.is_empty() {
                         <div class="peer-toasts">
-                            { for self.peer_toasts.iter().map(|(id, display_name, uid, is_joined)| {
+                            { for self.peer_toasts.iter().map(|(id, display_name, _uid, is_joined)| {
                                 let key = id.to_string();
                                 let is_joined = *is_joined;
                                 let variant_class = if is_joined {
@@ -1455,8 +1455,8 @@ impl Component for AttendantsComponent {
 
                     {
                         if can_stream {
-                            let mic_available = matches!(self.mic_error, None);
-                            let video_available = matches!(self.video_error, None);
+                            let mic_available = self.mic_error.is_none();
+                            let video_available = self.video_error.is_none();
                             html! {
                                 <nav class="host">
                                     <div class="controls">

@@ -157,7 +157,7 @@ pub fn Home() -> Element {
                             div { class: "auth-dropdown-menu",
                                 div { class: "auth-dropdown-header",
                                     p { class: "auth-dropdown-name", "{profile.name}" }
-                                    p { class: "auth-dropdown-email", "{profile.user_id}" }
+                                    p { class: "auth-dropdown-email", "{profile.name}" }
                                 }
                                 button {
                                     r#type: "button",

@@ -31,10 +31,10 @@ pub struct DiagnosticsPacket {
     ///  Basic identification
     // @@protoc_insertion_point(field:DiagnosticsPacket.stream_id)
     pub stream_id: ::std::string::String,
-    // @@protoc_insertion_point(field:DiagnosticsPacket.sender_id)
-    pub sender_id: ::std::string::String,
+    // @@protoc_insertion_point(field:DiagnosticsPacket.sender_session_id)
+    pub sender_session_id: u64,
     // @@protoc_insertion_point(field:DiagnosticsPacket.target_id)
-    pub target_id: ::std::string::String,
+    pub target_id: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:DiagnosticsPacket.timestamp_ms)
     pub timestamp_ms: u64,
     // @@protoc_insertion_point(field:DiagnosticsPacket.media_type)
@@ -70,9 +70,9 @@ impl DiagnosticsPacket {
             |m: &mut DiagnosticsPacket| { &mut m.stream_id },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "sender_id",
-            |m: &DiagnosticsPacket| { &m.sender_id },
-            |m: &mut DiagnosticsPacket| { &mut m.sender_id },
+            "sender_session_id",
+            |m: &DiagnosticsPacket| { &m.sender_session_id },
+            |m: &mut DiagnosticsPacket| { &mut m.sender_session_id },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "target_id",
@@ -120,11 +120,11 @@ impl ::protobuf::Message for DiagnosticsPacket {
                 10 => {
                     self.stream_id = is.read_string()?;
                 },
-                18 => {
-                    self.sender_id = is.read_string()?;
+                16 => {
+                    self.sender_session_id = is.read_uint64()?;
                 },
                 26 => {
-                    self.target_id = is.read_string()?;
+                    self.target_id = is.read_bytes()?;
                 },
                 32 => {
                     self.timestamp_ms = is.read_uint64()?;
@@ -153,11 +153,11 @@ impl ::protobuf::Message for DiagnosticsPacket {
         if !self.stream_id.is_empty() {
             my_size += ::protobuf::rt::string_size(1, &self.stream_id);
         }
-        if !self.sender_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(2, &self.sender_id);
+        if self.sender_session_id != 0 {
+            my_size += ::protobuf::rt::uint64_size(2, self.sender_session_id);
         }
         if !self.target_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(3, &self.target_id);
+            my_size += ::protobuf::rt::bytes_size(3, &self.target_id);
         }
         if self.timestamp_ms != 0 {
             my_size += ::protobuf::rt::uint64_size(4, self.timestamp_ms);
@@ -182,11 +182,11 @@ impl ::protobuf::Message for DiagnosticsPacket {
         if !self.stream_id.is_empty() {
             os.write_string(1, &self.stream_id)?;
         }
-        if !self.sender_id.is_empty() {
-            os.write_string(2, &self.sender_id)?;
+        if self.sender_session_id != 0 {
+            os.write_uint64(2, self.sender_session_id)?;
         }
         if !self.target_id.is_empty() {
-            os.write_string(3, &self.target_id)?;
+            os.write_bytes(3, &self.target_id)?;
         }
         if self.timestamp_ms != 0 {
             os.write_uint64(4, self.timestamp_ms)?;
@@ -218,7 +218,7 @@ impl ::protobuf::Message for DiagnosticsPacket {
 
     fn clear(&mut self) {
         self.stream_id.clear();
-        self.sender_id.clear();
+        self.sender_session_id = 0;
         self.target_id.clear();
         self.timestamp_ms = 0;
         self.media_type = ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::MEDIA_TYPE_UNKNOWN);
@@ -230,8 +230,8 @@ impl ::protobuf::Message for DiagnosticsPacket {
     fn default_instance() -> &'static DiagnosticsPacket {
         static instance: DiagnosticsPacket = DiagnosticsPacket {
             stream_id: ::std::string::String::new(),
-            sender_id: ::std::string::String::new(),
-            target_id: ::std::string::String::new(),
+            sender_session_id: 0,
+            target_id: ::std::vec::Vec::new(),
             timestamp_ms: 0,
             media_type: ::protobuf::EnumOrUnknown::from_i32(0),
             video_metrics: ::protobuf::MessageField::none(),

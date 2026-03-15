@@ -160,7 +160,10 @@ impl AudioProducer {
 
                     // Create media packet
                     let media_packet = MediaPacket {
-                        email: user_id.clone(),
+                        user_id: videocall_types::to_user_id_bytes(
+                            &videocall_types::parse_user_id(&user_id)
+                                .expect("bot user_id must be valid UUID"),
+                        ),
                         media_type: MediaType::AUDIO.into(),
                         data: encoded,
                         frame_type: "key".to_string(),
@@ -176,7 +179,10 @@ impl AudioProducer {
                     // Wrap in packet wrapper
                     let packet_wrapper = PacketWrapper {
                         data: media_packet.write_to_bytes()?,
-                        email: user_id.clone(),
+                        user_id: videocall_types::to_user_id_bytes(
+                            &videocall_types::parse_user_id(&user_id)
+                                .expect("bot user_id must be valid UUID"),
+                        ),
                         packet_type: PacketType::MEDIA.into(),
                         ..Default::default()
                     };

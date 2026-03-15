@@ -6,8 +6,8 @@ import "types/media_packet.proto";
 message DiagnosticsPacket {
   // Basic identification
   string stream_id = 1;        // Identifier for the specific stream being diagnosed
-  string sender_id = 2;        // Email/ID of who is sending this diagnostic message
-  string target_id = 3;        // Email/ID of who the diagnostic is about
+  uint64 sender_session_id = 2; // Session ID of the peer sending media (numeric, from PacketWrapper.session_id)
+  bytes target_id = 3;         // UUID bytes of the user who is reporting these diagnostics
   uint64 timestamp_ms = 4;     // When these diagnostics were collected (milliseconds since epoch)
   
   MediaPacket.MediaType media_type = 5;    // Type of media (audio/video/screen)

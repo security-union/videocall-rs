@@ -228,8 +228,8 @@ pub fn PeerList(
                                         li {
                                             key: "{peer}",
                                             PeerListItem {
-                                                name: peer_display_name,
-                                                tooltip: peer.clone(),
+                                                name: peer_display_name.clone(),
+                                                tooltip: peer_display_name,
                                                 is_host: is_peer_host,
                                                 muted: muted,
                                                 speaking: speaking,

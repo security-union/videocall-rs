@@ -171,35 +171,58 @@ mod tests {
 
     #[tokio::test]
     async fn valid_session_cookie_returns_auth_user() {
-        let jwt = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Alice",
+            3600,
+        )
+        .unwrap();
         let auth = extract_with_cookie(Some(&format!("session={jwt}")))
             .await
             .expect("should succeed");
-        assert_eq!(auth.user_id, "alice@test.com");
+        assert_eq!(auth.user_id, "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[tokio::test]
     async fn valid_bearer_token_returns_auth_user() {
-        let jwt = generate_session_token(TEST_SECRET, "bob@test.com", "Bob", 3600).unwrap();
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "660e8400-e29b-41d4-a716-446655440001",
+            "Bob",
+            3600,
+        )
+        .unwrap();
         let auth = extract_with_bearer(&jwt).await.expect("should succeed");
-        assert_eq!(auth.user_id, "bob@test.com");
+        assert_eq!(auth.user_id, "660e8400-e29b-41d4-a716-446655440001");
         assert_eq!(auth.name, "Bob");
     }
 
     #[tokio::test]
     async fn valid_cookie_extracts_name() {
-        let jwt =
-            generate_session_token(TEST_SECRET, "alice@test.com", "Alice Wonder", 3600).unwrap();
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Alice Wonder",
+            3600,
+        )
+        .unwrap();
         let auth = extract_with_cookie(Some(&format!("session={jwt}")))
             .await
             .expect("should succeed");
-        assert_eq!(auth.user_id, "alice@test.com");
+        assert_eq!(auth.user_id, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(auth.name, "Alice Wonder");
     }
 
     #[tokio::test]
     async fn expired_bearer_token_returns_unauthorized() {
-        let jwt = generate_session_token(TEST_SECRET, "a@b.com", "A", -120).unwrap();
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "770e8400-e29b-41d4-a716-446655440002",
+            "A",
+            -120,
+        )
+        .unwrap();
         let err = extract_with_bearer(&jwt).await.unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
@@ -212,7 +235,13 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_secret_bearer_token_returns_unauthorized() {
-        let jwt = generate_session_token("wrong-secret", "a@b.com", "A", 3600).unwrap();
+        let jwt = generate_session_token(
+            "wrong-secret",
+            "770e8400-e29b-41d4-a716-446655440002",
+            "A",
+            3600,
+        )
+        .unwrap();
         let err = extract_with_bearer(&jwt).await.unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
@@ -239,7 +268,13 @@ mod tests {
 
     #[tokio::test]
     async fn expired_jwt_returns_unauthorized() {
-        let jwt = generate_session_token(TEST_SECRET, "a@b.com", "A", -120).unwrap();
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "770e8400-e29b-41d4-a716-446655440002",
+            "A",
+            -120,
+        )
+        .unwrap();
         let err = extract_with_cookie(Some(&format!("session={jwt}")))
             .await
             .unwrap_err();
@@ -248,7 +283,13 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_secret_returns_unauthorized() {
-        let jwt = generate_session_token("different-secret", "a@b.com", "A", 3600).unwrap();
+        let jwt = generate_session_token(
+            "different-secret",
+            "770e8400-e29b-41d4-a716-446655440002",
+            "A",
+            3600,
+        )
+        .unwrap();
         let err = extract_with_cookie(Some(&format!("session={jwt}")))
             .await
             .unwrap_err();
@@ -257,10 +298,20 @@ mod tests {
 
     #[tokio::test]
     async fn cookie_takes_precedence_over_bearer() {
-        let cookie_jwt =
-            generate_session_token(TEST_SECRET, "cookie@test.com", "Cookie", 3600).unwrap();
-        let bearer_jwt =
-            generate_session_token(TEST_SECRET, "bearer@test.com", "Bearer", 3600).unwrap();
+        let cookie_jwt = generate_session_token(
+            TEST_SECRET,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Cookie",
+            3600,
+        )
+        .unwrap();
+        let bearer_jwt = generate_session_token(
+            TEST_SECRET,
+            "660e8400-e29b-41d4-a716-446655440001",
+            "Bearer",
+            3600,
+        )
+        .unwrap();
 
         let state = make_test_state();
         let req = Request::builder()
@@ -274,16 +325,22 @@ mod tests {
         let auth = AuthUser::from_request_parts(&mut parts, &state)
             .await
             .expect("should succeed");
-        assert_eq!(auth.user_id, "cookie@test.com");
+        assert_eq!(auth.user_id, "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[tokio::test]
     async fn session_cookie_among_other_cookies() {
-        let jwt = generate_session_token(TEST_SECRET, "multi@test.com", "Multi", 3600).unwrap();
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Multi",
+            3600,
+        )
+        .unwrap();
         let auth = extract_with_cookie(Some(&format!("lang=en; session={jwt}; theme=dark")))
             .await
             .expect("should find session in middle");
-        assert_eq!(auth.user_id, "multi@test.com");
+        assert_eq!(auth.user_id, "550e8400-e29b-41d4-a716-446655440000");
     }
 
     // -----------------------------------------------------------------------
@@ -294,22 +351,33 @@ mod tests {
     #[tokio::test]
     async fn custom_cookie_name_is_accepted() {
         let state = make_state_with_cookie_name("pr1-session");
-        let jwt = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Alice",
+            3600,
+        )
+        .unwrap();
         let auth = extract_with_cookie_and_state(Some(&format!("pr1-session={jwt}")), &state)
             .await
             .expect("pr1-session cookie should be accepted");
-        assert_eq!(auth.user_id, "alice@test.com");
+        assert_eq!(auth.user_id, "550e8400-e29b-41d4-a716-446655440000");
     }
 
     /// Core regression test: PR preview API configured with "pr1-session" must
-    /// reject a "session=" cookie — exactly what the production API sets with
+    /// reject a "session=" cookie -- exactly what the production API sets with
     /// Domain=.videocall.rs, which the browser would otherwise send to
     /// pr1-api.sandbox.videocall.rs causing a 401.
     #[tokio::test]
     async fn production_session_cookie_rejected_by_preview_api() {
         let state = make_state_with_cookie_name("pr1-session");
-        let production_jwt =
-            generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
+        let production_jwt = generate_session_token(
+            TEST_SECRET,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Alice",
+            3600,
+        )
+        .unwrap();
         // Even with a valid JWT, the wrong cookie name must be rejected.
         let err = extract_with_cookie_and_state(Some(&format!("session={production_jwt}")), &state)
             .await
@@ -321,7 +389,13 @@ mod tests {
     #[tokio::test]
     async fn different_slot_cookie_rejected() {
         let state = make_state_with_cookie_name("pr1-session");
-        let jwt = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Alice",
+            3600,
+        )
+        .unwrap();
         let err = extract_with_cookie_and_state(Some(&format!("pr2-session={jwt}")), &state)
             .await
             .unwrap_err();
@@ -333,8 +407,14 @@ mod tests {
     #[tokio::test]
     async fn custom_cookie_name_among_other_cookies() {
         let state = make_state_with_cookie_name("pr1-session");
-        let jwt = generate_session_token(TEST_SECRET, "multi@test.com", "Multi", 3600).unwrap();
-        // "session" appears as a prefix of "pr1-session" in the cookie header —
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Multi",
+            3600,
+        )
+        .unwrap();
+        // "session" appears as a prefix of "pr1-session" in the cookie header --
         // verify we match the full name and don't accidentally split on it.
         let auth = extract_with_cookie_and_state(
             Some(&format!(
@@ -344,14 +424,20 @@ mod tests {
         )
         .await
         .expect("should find pr1-session and ignore session=garbage");
-        assert_eq!(auth.user_id, "multi@test.com");
+        assert_eq!(auth.user_id, "550e8400-e29b-41d4-a716-446655440000");
     }
 
     /// Bearer token still works regardless of cookie_name configuration.
     #[tokio::test]
     async fn bearer_works_with_custom_cookie_name() {
         let state = make_state_with_cookie_name("pr1-session");
-        let jwt = generate_session_token(TEST_SECRET, "bob@test.com", "Bob", 3600).unwrap();
+        let jwt = generate_session_token(
+            TEST_SECRET,
+            "660e8400-e29b-41d4-a716-446655440001",
+            "Bob",
+            3600,
+        )
+        .unwrap();
         let req = Request::builder()
             .uri("/test")
             .method("GET")
@@ -362,6 +448,6 @@ mod tests {
         let auth = AuthUser::from_request_parts(&mut parts, &state)
             .await
             .expect("bearer should work regardless of cookie_name");
-        assert_eq!(auth.user_id, "bob@test.com");
+        assert_eq!(auth.user_id, "660e8400-e29b-41d4-a716-446655440001");
     }
 }

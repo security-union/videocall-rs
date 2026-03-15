@@ -53,12 +53,12 @@ impl MicrophoneDaemon {
         &mut self,
         wt_tx: Sender<Vec<u8>>,
         device: String,
-        email: String,
+        user_id: String,
     ) -> anyhow::Result<()> {
         self.handles.push(start_microphone(
             device.clone(),
             wt_tx.clone(),
-            email,
+            user_id,
             self.stop.clone(),
         )?);
         Ok(())
@@ -77,7 +77,7 @@ impl MicrophoneDaemon {
 fn start_microphone(
     device: String,
     wt_tx: Sender<Vec<u8>>,
-    email: String,
+    user_id: String,
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
     let host = cpal::default_host();
@@ -113,7 +113,7 @@ fn start_microphone(
                 &config.into(),
                 move |data, _: &_| {
                     for chunk in data.chunks_exact(960) {
-                        match encode_and_send_i16(chunk, &mut encoder, &wt_tx, email.clone()) {
+                        match encode_and_send_i16(chunk, &mut encoder, &wt_tx, user_id.clone()) {
                             Ok(_) => {}
                             Err(e) => {
                                 error!("Failed to encode and send audio: {}", e);
@@ -147,10 +147,10 @@ fn encode_and_send_i16(
     input: &[i16],
     encoder: &mut opus::Encoder,
     wt_tx: &Sender<Vec<u8>>,
-    email: String,
+    user_id: String,
 ) -> anyhow::Result<()> {
     let output = encoder.encode_vec(input, 960)?;
-    let output = transform_audio_chunk(output, email, 0);
+    let output = transform_audio_chunk(output, user_id, 0);
     let output_bytes = output?.write_to_bytes()?;
     tracing::info!("Queueing AUDIO packet: {} bytes", output_bytes.len());
     wt_tx.try_send(output_bytes)?;
@@ -160,17 +160,18 @@ fn encode_and_send_i16(
 
 fn transform_audio_chunk(
     data: Vec<u8>,
-    email: String,
+    user_id: String,
     sequence: u64,
 ) -> anyhow::Result<PacketWrapper> {
-    let user_id_bytes = email.as_bytes();
+    let user_id_bytes =
+        videocall_types::to_user_id_bytes(&videocall_types::parse_user_id(&user_id)?);
     Ok(PacketWrapper {
         packet_type: PacketType::MEDIA.into(),
-        user_id: user_id_bytes.to_vec(),
+        user_id: user_id_bytes.clone(),
         data: MediaPacket {
             media_type: MediaType::AUDIO.into(),
             data,
-            user_id: user_id_bytes.to_vec(),
+            user_id: user_id_bytes,
             frame_type: String::from("key"),
             timestamp: get_micros_now(),
             // TODO: Duration of the audio in microseconds.

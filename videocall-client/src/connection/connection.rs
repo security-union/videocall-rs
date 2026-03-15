@@ -33,6 +33,7 @@ use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
+use videocall_types::{parse_user_id, to_user_id_bytes};
 
 #[derive(Clone, Copy, Debug)]
 enum Status {
@@ -245,9 +246,10 @@ fn build_heartbeat_packet(
         ..Default::default()
     };
 
+    let uid_bytes = to_user_id_bytes(&parse_user_id(userid).expect("userid must be a valid UUID"));
     let packet = MediaPacket {
         media_type: MediaType::HEARTBEAT.into(),
-        user_id: userid.as_bytes().to_vec(),
+        user_id: Vec::new(), // user_id on inner MediaPacket is unused for heartbeats
         timestamp: js_sys::Date::now(),
         heartbeat_metadata: Some(heartbeat_metadata).into(),
         ..Default::default()
@@ -268,7 +270,7 @@ fn build_heartbeat_packet(
         .ok()?;
     let mut packet_wrapper = PacketWrapper {
         data,
-        user_id: userid.as_bytes().to_vec(),
+        user_id: uid_bytes,
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     };

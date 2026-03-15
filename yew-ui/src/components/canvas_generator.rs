@@ -155,7 +155,7 @@ pub fn generate_for_peer(
                     })}
                 >
                     { if is_video_enabled_for_peer { html!{ <UserVideo id={key.clone()} hidden={false}/> } } else { html!{ <div class=""><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> } } }
-                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_user_id}") } else {peer_user_id.clone() }} dir={"auto"}>
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_display_name}") } else {peer_display_name.clone() }} dir={"auto"}>
                         {peer_display_name.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>
@@ -188,7 +188,7 @@ pub fn generate_for_peer(
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
                     })}>
                         <ScreenCanvas peer_id={key.clone()} />
-                        <h4 class="floating-name" title={format!("{}-screen", &peer_user_id)} dir={"auto"}>{format!("{}-screen", &peer_display_name)}</h4>
+                        <h4 class="floating-name" title={format!("{}-screen", &peer_display_name)} dir={"auto"}>{format!("{}-screen", &peer_display_name)}</h4>
                         <button onclick={Callback::from({ let canvas_id = format!("screen-share-{}", key.clone()); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon">
                             <CropIcon/>
                         </button>
@@ -216,7 +216,7 @@ pub fn generate_for_peer(
                             <span class="placeholder-text">{"Video Disabled"}</span>
                         </div>
                     }
-                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_user_id}") } else { peer_user_id.clone() }} dir={"auto"}>
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_display_name}") } else { peer_display_name.clone() }} dir={"auto"}>
                         {peer_display_name.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>

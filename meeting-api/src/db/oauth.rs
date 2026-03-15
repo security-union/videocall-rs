@@ -14,6 +14,7 @@
 //! OAuth request and user storage queries.
 
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Stored PKCE challenge/verifier and CSRF state for an in-flight OAuth flow.
 #[derive(Debug, sqlx::FromRow)]
@@ -67,26 +68,28 @@ pub async fn fetch_oauth_request(
 }
 
 /// Upsert a user after successful OAuth login.
+///
+/// Returns the user's UUID (`id` column) so it can be embedded in the session JWT.
 pub async fn upsert_user(
     pool: &PgPool,
     email: &str,
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<Uuid, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO users (email, name, access_token, refresh_token, created_at, last_login)
         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT (email)
         DO UPDATE SET access_token = $3, refresh_token = $4, name = $2, last_login = CURRENT_TIMESTAMP
+        RETURNING id
         "#,
     )
     .bind(email)
     .bind(name)
     .bind(access_token)
     .bind(refresh_token)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .fetch_one(pool)
+    .await
 }

@@ -33,6 +33,7 @@ use wasm_bindgen::JsValue;
 use web_sys::window;
 
 use videocall_types::protos::diagnostics_packet::{AudioMetrics, DiagnosticsPacket, VideoMetrics};
+use videocall_types::{parse_user_id, to_user_id_bytes, user_id_bytes_to_string};
 
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -41,7 +42,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 #[derive(Debug, Clone)]
 pub enum DiagnosticEvent {
     FrameReceived {
-        peer_id: String,
+        peer_session_id: u64,
         media_type: MediaType,
         frame_size: u64, // Size of the frame in bytes
     },
@@ -55,7 +56,7 @@ pub enum DiagnosticEvent {
 // Stats for a peer's decoder
 #[derive(Debug, Clone)]
 pub struct DecoderStats {
-    pub peer_id: String,
+    pub peer_session_id: u64,
     pub frames_decoded: u32,
     pub frames_dropped: u32,
     pub fps: f64,
@@ -66,7 +67,7 @@ pub struct DecoderStats {
 // Stats for a peer's connection
 #[derive(Debug, Clone)]
 pub struct ConnectionStats {
-    pub peer_id: String,
+    pub peer_session_id: u64,
     pub bytes_received: u64,
     pub packets_received: u64,
     pub packets_lost: u64,
@@ -206,7 +207,7 @@ unsafe impl Send for DiagnosticManager {}
 // Internal worker that processes diagnostic events
 struct DiagnosticWorker {
     // Track FPS per peer and per media type (audio, video, screen)
-    fps_trackers: HashMap<String, HashMap<MediaType, FpsTracker>>,
+    fps_trackers: HashMap<u64, HashMap<MediaType, FpsTracker>>,
     on_stats_update: Option<Callback<String>>,
     last_report_time: f64, // timestamp in ms
     report_interval_ms: u64,
@@ -320,14 +321,14 @@ impl DiagnosticManager {
     }
 
     // Track a frame received from a peer for a specific media type
-    pub fn track_frame(&self, peer_id: &str, media_type: MediaType, frame_size: u64) -> f64 {
+    pub fn track_frame(&self, peer_session_id: u64, media_type: MediaType, frame_size: u64) -> f64 {
         self.frames_decoded.fetch_add(1, Ordering::SeqCst);
 
         if let Err(e) = self
             .sender
             .clone()
             .try_send(DiagnosticEvent::FrameReceived {
-                peer_id: peer_id.to_string(),
+                peer_session_id,
                 media_type,
                 frame_size,
             })
@@ -387,11 +388,11 @@ impl DiagnosticWorker {
     fn handle_event(&mut self, event: DiagnosticEvent) {
         match event {
             DiagnosticEvent::FrameReceived {
-                peer_id,
+                peer_session_id,
                 media_type,
                 frame_size,
             } => {
-                let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
+                let peer_trackers = self.fps_trackers.entry(peer_session_id).or_default();
 
                 let tracker = peer_trackers
                     .entry(media_type)
@@ -428,7 +429,7 @@ impl DiagnosticWorker {
         let now = Date::now();
         let timestamp_ms = now as u64;
 
-        for (peer_id, peer_trackers) in &self.fps_trackers {
+        for (peer_session_id, peer_trackers) in &self.fps_trackers {
             for (media_type, tracker) in peer_trackers {
                 // Always publish to global diagnostics broadcast system (independent of packet handler)
                 let event = DiagEvent {
@@ -440,12 +441,12 @@ impl DiagnosticWorker {
                         metric!("bitrate_kbps", tracker.current_bitrate),
                         metric!("media_type", format!("{:?}", media_type)),
                         metric!("from_peer", self.userid.clone()),
-                        metric!("to_peer", peer_id.clone()),
+                        metric!("to_peer_session", *peer_session_id),
                     ],
                 };
                 debug!(
-                    "Broadcasting decoder event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps",
-                    peer_id, media_type, tracker.fps, tracker.current_bitrate
+                    "Broadcasting decoder event for session {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps",
+                    peer_session_id, media_type, tracker.fps, tracker.current_bitrate
                 );
                 let _ = global_sender().try_broadcast(event);
 
@@ -458,7 +459,7 @@ impl DiagnosticWorker {
                         metric!("fps_received", tracker.fps),
                         metric!("bitrate_kbps", tracker.current_bitrate),
                         metric!("from_peer", self.userid.clone()),
-                        metric!("to_peer", peer_id.clone()),
+                        metric!("to_peer_session", *peer_session_id),
                     ],
                 };
                 let _ = global_sender().try_broadcast(video_event);
@@ -466,8 +467,11 @@ impl DiagnosticWorker {
                 // Only create and send protobuf packets if packet handler is set (legacy system)
                 if let Some(handler) = &self.packet_handler {
                     let mut packet = DiagnosticsPacket::new();
-                    packet.target_id = self.userid.clone();
-                    packet.sender_id = peer_id.clone();
+                    // target_id: our user UUID as 16-byte representation
+                    packet.target_id = to_user_id_bytes(
+                        &parse_user_id(&self.userid).expect("userid must be valid UUID"),
+                    );
+                    packet.sender_session_id = *peer_session_id;
                     packet.timestamp_ms = timestamp_ms;
 
                     packet.media_type = (*media_type).into();
@@ -485,8 +489,8 @@ impl DiagnosticWorker {
                     }
 
                     debug!(
-                        "Sending diagnostic packet to {}: {:?} FPS: {:.2} Bitrate: {:.1} kbit/s",
-                        peer_id, media_type, tracker.fps, tracker.current_bitrate
+                        "Sending diagnostic packet for session {}: {:?} FPS: {:.2} Bitrate: {:.1} kbit/s",
+                        peer_session_id, media_type, tracker.fps, tracker.current_bitrate
                     );
                     handler.emit(packet);
                 }
@@ -514,15 +518,15 @@ impl DiagnosticWorker {
     }
 
     // Get all FPS stats for all peers
-    fn get_all_fps_stats(&self) -> HashMap<String, HashMap<MediaType, (f64, f64)>> {
+    fn get_all_fps_stats(&self) -> HashMap<u64, HashMap<MediaType, (f64, f64)>> {
         let mut result = HashMap::new();
-        for (peer_id, peer_trackers) in &self.fps_trackers {
+        for (peer_session_id, peer_trackers) in &self.fps_trackers {
             let mut media_fps = HashMap::new();
             for (media_type, tracker) in peer_trackers {
                 let metrics = tracker.get_metrics();
                 media_fps.insert(*media_type, metrics);
             }
-            result.insert(peer_id.clone(), media_fps);
+            result.insert(*peer_session_id, media_fps);
         }
 
         result
@@ -537,8 +541,8 @@ impl DiagnosticWorker {
         let now = Date::now();
         result.push_str(&format!("Time: {now:.0}ms\n"));
 
-        for (peer_id, media_stats) in stats.iter() {
-            result.push_str(&format!("Peer {peer_id}: "));
+        for (peer_session_id, media_stats) in stats.iter() {
+            result.push_str(&format!("Session {peer_session_id}: "));
 
             // First show Video if it exists
             if let Some((fps, bitrate)) = media_stats.get(&MediaType::VIDEO) {
@@ -770,32 +774,32 @@ impl SenderDiagnosticWorker {
     fn handle_event(&mut self, event: SenderDiagnosticEvent) {
         match event {
             SenderDiagnosticEvent::DiagnosticPacketReceived(packet) => {
-                let sender_id = packet.sender_id.clone();
-                let target_id = packet.target_id.clone();
+                let sender_session_id = packet.sender_session_id;
+                let target_id_str = user_id_bytes_to_string(&packet.target_id);
                 let media_type: MediaType = packet.media_type.enum_value_or_default();
 
                 // Publish to global diagnostics broadcast system
                 let event = DiagEvent {
                     subsystem: "sender",
-                    stream_id: Some(target_id.clone()),
+                    stream_id: Some(target_id_str.clone()),
                     ts_ms: now_ms(),
                     metrics: vec![
-                        metric!("sender_id", sender_id.clone()),
-                        metric!("target_id", target_id.clone()),
+                        metric!("sender_session_id", sender_session_id),
+                        metric!("target_id", target_id_str.clone()),
                         metric!("media_type", format!("{:?}", media_type)),
                         metric!("packet_timestamp", packet.timestamp_ms),
                     ],
                 };
                 debug!(
-                    "Broadcasting sender event for target {target_id}: sender={sender_id}, media_type={media_type:?}"
+                    "Broadcasting sender event for target {target_id_str}: sender_session={sender_session_id}, media_type={media_type:?}"
                 );
                 let _ = global_sender().try_broadcast(event);
 
-                if sender_id == self.userid {
-                    let peer_stats = self.stream_stats.entry(target_id.clone()).or_default();
+                if target_id_str == self.userid {
+                    let peer_stats = self.stream_stats.entry(target_id_str.clone()).or_default();
                     let stats = peer_stats
                         .entry(media_type)
-                        .or_insert_with(|| StreamStats::new(target_id, media_type));
+                        .or_insert_with(|| StreamStats::new(target_id_str, media_type));
                     stats.update_from_packet(&packet, media_type);
                 }
 

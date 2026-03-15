@@ -14,7 +14,7 @@ const BROWSER_ARGS = [
 
 async function createAuthenticatedContext(
   browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
-  email: string,
+  userId: string,
   name: string,
   uiURL: string,
 ) {
@@ -22,7 +22,7 @@ async function createAuthenticatedContext(
     baseURL: uiURL,
     ignoreHTTPSErrors: true,
   });
-  const token = generateSessionToken(email, name);
+  const token = generateSessionToken(userId, name);
   const url = new URL(uiURL);
   await context.addCookies([
     {
@@ -70,7 +70,7 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
  *   - "Waiting to be admitted" (waiting room)
  *   - "Waiting for meeting to start" (host hasn't started yet)
  *
- * Auth dropdown (user name/email, sign-out) is only shown on the home
+ * Auth dropdown (user name, sign-out) is only shown on the home
  * page -- it no longer appears on this pre-meeting screen.
  */
 async function joinMeetingFromPage(
@@ -115,7 +115,7 @@ test.describe("Waiting for meeting (push notifications)", () => {
     try {
       const guestCtx = await createAuthenticatedContext(
         browser,
-        "early-guest@videocall.rs",
+        "00000000-0000-4000-8000-000000000501",
         "EarlyGuest",
         uiURL,
       );
@@ -151,13 +151,13 @@ test.describe("Waiting for meeting (push notifications)", () => {
     try {
       const guestCtx = await createAuthenticatedContext(
         browser1,
-        "guest-early@videocall.rs",
+        "00000000-0000-4000-8000-000000000601",
         "GuestEarly",
         uiURL,
       );
       const hostCtx = await createAuthenticatedContext(
         browser2,
-        "host-late@videocall.rs",
+        "00000000-0000-4000-8000-000000000602",
         "HostLate",
         uiURL,
       );
@@ -236,13 +236,13 @@ test.describe("Waiting for meeting (push notifications)", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host-reject@videocall.rs",
+        "00000000-0000-4000-8000-000000000701",
         "HostReject",
         uiURL,
       );
       const guestCtx = await createAuthenticatedContext(
         browser2,
-        "guest-reject@videocall.rs",
+        "00000000-0000-4000-8000-000000000702",
         "GuestReject",
         uiURL,
       );

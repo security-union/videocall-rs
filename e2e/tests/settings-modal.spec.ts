@@ -11,7 +11,9 @@ test.describe("Device settings modal", () => {
     await injectSessionCookie(context, { baseURL });
   });
 
-  test("user can open settings modal and switch between Audio and Video sections", async ({ page }) => {
+  test("user can open settings modal and switch between Audio and Video sections", async ({
+    page,
+  }) => {
     const meetingId = `e2e_settings_${Date.now()}`;
 
     await page.goto("/");
@@ -33,12 +35,16 @@ test.describe("Device settings modal", () => {
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator("#grid-container")).toBeVisible({
+      timeout: 15_000,
+    });
 
     // Open settings modal from bottom toolbar gear
-    await page.locator(".video-control-button").filter({ has: page.locator("svg") }).nth(5).click();
+    await page.locator('[data-testid="open-settings"]').click();
 
-    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator(".device-settings-modal")).toBeVisible({
+      timeout: 10_000,
+    });
 
     // Default section: Audio
     await expect(page.locator(".settings-nav-button.active")).toContainText("Audio");
@@ -52,6 +58,5 @@ test.describe("Device settings modal", () => {
     await expect(page.locator(".settings-nav-button.active")).toContainText("Video");
     await expect(page.locator("#modal-video-select")).toBeVisible();
     await expect(page.locator("#modal-audio-select")).toHaveCount(0);
-
   });
 });

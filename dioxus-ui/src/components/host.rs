@@ -70,7 +70,7 @@ pub fn Host(
     on_encoder_settings_update: EventHandler<String>,
     device_settings_open: bool,
     on_device_settings_toggle: EventHandler<()>,
-   #[props(default)] on_microphone_error: EventHandler<String>,
+    #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
     reload_devices_counter: u32,
@@ -513,7 +513,7 @@ pub fn Host(
             style: if video_enabled {
                 "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; pointer-events:auto;"
             } else {
-                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;".to_string()
+                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
             button {

@@ -328,10 +328,16 @@ async fn device_settings_modal_close_button_present() {
     yield_now().await;
 
     let btn = mount.query_selector(".close-button").unwrap().unwrap();
+
     assert_eq!(
-        btn.text_content().unwrap(),
-        "x",
-        "close button should display multiplication sign"
+        btn.get_attribute("type").unwrap_or_default(),
+        "button",
+        "close button should have type=button"
+    );
+    assert_eq!(
+        btn.get_attribute("aria-label").unwrap_or_default(),
+        "Close settings",
+        "close button should expose an accessible label"
     );
 
     cleanup(&mount);

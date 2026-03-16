@@ -97,12 +97,12 @@ impl AppError {
         Self::new(StatusCode::NOT_FOUND, APIError::not_in_meeting())
     }
 
-    pub fn bad_request(message: &str) -> Self {
+    pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
             APIError {
                 code: "BAD_REQUEST".to_string(),
-                message: message.to_string(),
+                message: message.into(),
                 engineering_error: None,
             },
         )

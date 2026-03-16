@@ -43,8 +43,8 @@ pub async fn join_meeting(
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let display_name = body.as_ref().and_then(|b| b.display_name.as_deref());
 
@@ -160,8 +160,8 @@ pub async fn get_my_status(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -202,8 +202,8 @@ pub async fn leave_meeting(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -235,8 +235,8 @@ pub async fn get_participants(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<Vec<ParticipantStatusResponse>>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?

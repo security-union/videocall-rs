@@ -34,7 +34,7 @@ pub enum SessionError {
     /// User tried to use the reserved system user ID
     ReservedUserId,
     /// User ID is not a valid UUID
-    InvalidUserId,
+    InvalidUserId(uuid::Error),
 }
 
 impl std::fmt::Display for SessionError {
@@ -43,8 +43,8 @@ impl std::fmt::Display for SessionError {
             SessionError::ReservedUserId => {
                 write!(f, "Cannot use reserved system user ID")
             }
-            SessionError::InvalidUserId => {
-                write!(f, "User ID is not a valid UUID")
+            SessionError::InvalidUserId(err) => {
+                write!(f, "User ID is not a valid UUID: {err}")
             }
         }
     }
@@ -98,7 +98,7 @@ impl SessionManager {
         user_id: &str,
         id: u64,
     ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
-        let uuid = parse_user_id(user_id).map_err(|_| SessionError::InvalidUserId)?;
+        let uuid = parse_user_id(user_id).map_err(SessionError::InvalidUserId)?;
         if uuid == SYSTEM_USER_ID {
             return Err(Box::new(SessionError::ReservedUserId));
         }

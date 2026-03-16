@@ -52,8 +52,8 @@ pub async fn get_waiting_room(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<WaitingRoomResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -80,10 +80,10 @@ pub async fn admit_participant(
     Path(meeting_id): Path<String>,
     Json(body): Json<AdmitRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
     let target_uuid = parse_user_id(&body.user_id)
-        .map_err(|_| AppError::bad_request("invalid user_id format"))?;
+        .map_err(|err| AppError::bad_request(format!("invalid target user_id format: {err}")))?;
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -108,8 +108,8 @@ pub async fn admit_all(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<AdmitAllResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -145,10 +145,10 @@ pub async fn reject_participant(
     Path(meeting_id): Path<String>,
     Json(body): Json<AdmitRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
     let target_uuid = parse_user_id(&body.user_id)
-        .map_err(|_| AppError::bad_request("invalid user_id format"))?;
+        .map_err(|err| AppError::bad_request(format!("invalid target user_id format: {err}")))?;
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?

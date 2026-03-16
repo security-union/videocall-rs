@@ -147,8 +147,10 @@ impl ChatServer {
                         // Notify remaining peers about the departed session
                         let uid = match parse_user_id(&user_id) {
                             Ok(u) => u,
-                            Err(_) => {
-                                error!("Cannot build PARTICIPANT_LEFT: invalid UUID {}", user_id);
+                            Err(err) => {
+                                error!(
+                                    "Cannot build PARTICIPANT_LEFT: invalid UUID {user_id}: {err}"
+                                );
                                 return;
                             }
                         };
@@ -338,8 +340,8 @@ impl Handler<JoinRoom> for ChatServer {
                 return MessageResult(Err("Cannot use reserved system user ID".into()));
             }
             Ok(uuid) => uuid,
-            Err(_) => {
-                return MessageResult(Err("User ID is not a valid UUID".into()));
+            Err(err) => {
+                return MessageResult(Err(format!("User ID is not a valid UUID: {err}").into()));
             }
         };
 
@@ -446,10 +448,9 @@ impl Handler<JoinRoom> for ChatServer {
                     for (existing_sid, existing_uid, existing_display_name) in &existing_members {
                         let existing_uuid = match parse_user_id(existing_uid) {
                             Ok(u) => u,
-                            Err(_) => {
+                            Err(err) => {
                                 warn!(
-                                    "Skipping existing member with invalid UUID: {}",
-                                    existing_uid
+                                    "Skipping existing member with invalid UUID {existing_uid}: {err}"
                                 );
                                 continue;
                             }

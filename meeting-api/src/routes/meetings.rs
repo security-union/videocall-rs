@@ -71,8 +71,8 @@ pub async fn create_meeting(
     AuthUser { user_id, .. }: AuthUser,
     Json(body): Json<CreateMeetingRequest>,
 ) -> Result<(StatusCode, Json<APIResponse<CreateMeetingResponse>>), AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let meeting_id = match &body.meeting_id {
         Some(id) => {
@@ -141,8 +141,8 @@ pub async fn list_meetings(
     AuthUser { user_id, .. }: AuthUser,
     Query(params): Query<ListMeetingsQuery>,
 ) -> Result<Json<APIResponse<ListMeetingsResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let limit = params.limit.clamp(1, 100);
     let offset = params.offset.max(0);
@@ -183,8 +183,8 @@ pub async fn get_meeting(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -218,8 +218,8 @@ pub async fn delete_meeting(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<DeleteMeetingResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     // Check the meeting exists first to distinguish 404 from 403.
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -243,8 +243,8 @@ pub async fn end_meeting_handler(
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -316,8 +316,8 @@ pub async fn update_meeting(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
-    let user_uuid =
-        parse_user_id(&user_id).map_err(|_| AppError::bad_request("invalid user_id format"))?;
+    let user_uuid = parse_user_id(&user_id)
+        .map_err(|err| AppError::bad_request(format!("invalid user_id format: {err}")))?;
 
     let row = if let Some(enabled) = body.waiting_room_enabled {
         // Atomically updates the setting and, when disabling, auto-admits

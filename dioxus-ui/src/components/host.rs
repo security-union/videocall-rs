@@ -27,7 +27,7 @@ use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShar
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use crate::components::{
-    device_settings_modal::DeviceSettingsModal,
+    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,

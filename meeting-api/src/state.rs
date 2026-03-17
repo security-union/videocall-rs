@@ -45,6 +45,10 @@ pub struct AppState {
     pub cookie_secure: bool,
     /// NATS client for publishing meeting events. `None` when `NATS_URL` is not configured.
     pub nats: Option<async_nats::Client>,
+    /// Internal URLs for fetching version info from peer services.
+    pub service_version_urls: Vec<String>,
+    /// Shared HTTP client for outbound requests (e.g. version fan-out).
+    pub http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -66,6 +70,11 @@ impl AppState {
             cookie_name: config.cookie_name.clone(),
             cookie_secure: config.cookie_secure,
             nats,
+            service_version_urls: config.service_version_urls.clone(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .expect("failed to build reqwest client"),
         }
     }
 }

@@ -64,6 +64,8 @@ pub fn build_app(pool: PgPool) -> Router {
         cookie_name: "session".to_string(),
         cookie_secure: false,
         nats: None,
+        service_version_urls: Vec::new(),
+        http_client: reqwest::Client::new(),
     };
     routes::router().with_state(state)
 }

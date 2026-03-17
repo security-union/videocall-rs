@@ -450,6 +450,7 @@ pub fn Diagnostics(
     let mut neteq_buffer_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut neteq_jitter_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut diag_task = use_signal(|| None::<Task>);
+    let mut backend_versions = use_signal(|| Vec::<serde_json::Value>::new());
 
     // Subscribe to diagnostics events using Dioxus `spawn`.
     // `spawn` runs within the Dioxus runtime so signal mutations properly
@@ -623,6 +624,26 @@ pub fn Diagnostics(
         diag_task.set(Some(task));
     });
 
+    // Fetch aggregated version info from meeting-api when the panel opens.
+    use_effect(move || {
+        if !is_open {
+            backend_versions.set(Vec::new());
+            return;
+        }
+        spawn(async move {
+            if let Ok(base_url) = crate::constants::meeting_api_base_url() {
+                let url = format!("{base_url}/api/v1/versions");
+                if let Ok(resp) = reqwest::get(&url).await {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Some(components) = body["components"].as_array() {
+                            backend_versions.set(components.clone());
+                        }
+                    }
+                }
+            }
+        });
+    });
+
     // Resolve numeric session IDs to display names via VideoCallClient context.
     let client = use_context::<VideoCallClient>();
     let peer_display_name = move |session_id: &str| -> String {
@@ -691,8 +712,6 @@ pub fn Diagnostics(
     let screen_str = if share_screen { "Enabled" } else { "Disabled" };
     let media_status =
         format!("Video: {video_str}\nAudio: {audio_str}\nScreen Share: {screen_str}");
-    let version = env!("CARGO_PKG_VERSION");
-    let version_str = format!("VideoCall UI: {version}");
     let current_peer_display = if current_peer == "All Peers" {
         "All Peers".to_string()
     } else {
@@ -710,8 +729,30 @@ pub fn Diagnostics(
             }
             div { class: "sidebar-content",
                 div { class: "diagnostics-section",
-                    h3 { "Application Version" }
-                    pre { "{version_str}" }
+                    h3 { "Build Info" }
+                    div { class: "build-info-table",
+                        div { class: "build-info-header",
+                            span { class: "build-info-cell", "Component" }
+                            span { class: "build-info-cell", "Commit" }
+                            span { class: "build-info-cell", "Branch" }
+                        }
+                        for comp in backend_versions() {
+                            {
+                                let svc = comp["service"].as_str().unwrap_or("?").to_string();
+                                let ver = comp["version"].as_str().unwrap_or("").to_string();
+                                let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
+                                let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
+                                let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
+                                rsx! {
+                                    div { class: "build-info-row",
+                                        span { class: "build-info-cell build-info-service", "{label}" }
+                                        span { class: "build-info-cell monospace", "{sha}" }
+                                        span { class: "build-info-cell", "{br}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 div { class: "diagnostics-section",
                     h3 { "Connection Manager" }

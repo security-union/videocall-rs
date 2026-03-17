@@ -894,9 +894,16 @@ impl Component for AttendantsComponent {
                         self.video_error = Some(MediaErrorState::PermissionDenied);
                     }
 
-                    if (self.mic_error.is_some() || self.video_error.is_some())
-                        && !self.session_loaded
-                    {
+                    if self.session_loaded {
+                        if self.mic_error.is_some() {
+                            self.mic_enabled = false;
+                            self.pending_mic_enable = false;
+                        }
+                        if self.video_error.is_some() {
+                            self.video_enabled = false;
+                            self.pending_video_enable = false;
+                        }
+                    } else if self.mic_error.is_some() || self.video_error.is_some() {
                         self.show_device_warning = true;
                     } else {
                         ctx.link().send_message(WsAction::Connect);

@@ -426,12 +426,6 @@ jobs:
 
           echo "✅ Dioxus UI deployed"
 
-      - name: Wait for all pods to be ready
-        run: |
-          echo "Waiting for all pods to be ready in ${NAMESPACE}..."
-          kubectl wait --for=condition=ready pod --all -n ${NAMESPACE} --timeout=300s
-          echo "✅ All pods ready"
-
       - name: Verify rollout status
         run: |
           echo "Verifying rollout status for all deployments..."

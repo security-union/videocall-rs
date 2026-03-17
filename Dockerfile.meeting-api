@@ -1,11 +1,22 @@
 FROM securityunion/actix-base:meeting-ownership-branch-c4b19265 as build
 
+ARG GIT_SHA=unknown
+ARG GIT_BRANCH=unknown
+ARG BUILD_TIMESTAMP=unknown
 ENV CARGO_TARGET_DIR=/app/meeting-api/target
+ENV GIT_SHA=${GIT_SHA}
+ENV GIT_BRANCH=${GIT_BRANCH}
+ENV BUILD_TIMESTAMP=${BUILD_TIMESTAMP}
 COPY . /app
 WORKDIR /app/meeting-api
 RUN cargo build --release --bin meeting-api
 
 FROM debian:trixie-slim as production
+
+ARG GIT_SHA=unknown
+ARG GIT_BRANCH=unknown
+LABEL org.opencontainers.image.revision=${GIT_SHA}
+LABEL org.opencontainers.image.ref.name=${GIT_BRANCH}
 
 RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
 

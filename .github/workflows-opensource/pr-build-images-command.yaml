@@ -161,6 +161,10 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/videocall-media-server:pr-${{ needs.check-permissions.outputs.pr_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ needs.check-permissions.outputs.pr_sha }}
+            GIT_BRANCH=${{ needs.check-permissions.outputs.pr_ref }}
+            BUILD_TIMESTAMP=${{ github.event.comment.created_at }}
 
   build-meeting-api:
     name: Build Meeting API Docker image
@@ -192,6 +196,10 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/videocall-meeting-api:pr-${{ needs.check-permissions.outputs.pr_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ needs.check-permissions.outputs.pr_sha }}
+            GIT_BRANCH=${{ needs.check-permissions.outputs.pr_ref }}
+            BUILD_TIMESTAMP=${{ github.event.comment.created_at }}
 
   build-ui:
     name: Build UI Docker image
@@ -223,6 +231,10 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/videocall-web-ui:pr-${{ needs.check-permissions.outputs.pr_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ needs.check-permissions.outputs.pr_sha }}
+            GIT_BRANCH=${{ needs.check-permissions.outputs.pr_ref }}
+            BUILD_TIMESTAMP=${{ github.event.comment.created_at }}
 
   comment-success:
     name: Comment with image tags

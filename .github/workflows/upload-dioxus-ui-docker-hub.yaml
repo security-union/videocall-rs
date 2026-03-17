@@ -1,25 +1,25 @@
-name: Publish API to Docker image
+name: Publish Dioxus UI to Docker image
 
 on:
   workflow_dispatch:
   push:
     branches:
       - main
-      - add-auth
-      - feature/meeting-backend-api
     paths:
-      - 'actix-api/**'
+      - 'dioxus-ui/**'
       - 'videocall-types/**'
       - 'protobuf/**'
-      - Dockerfile.actix
-      - Cargo.lock
-      - Cargo.toml
+      - 'videocall-client/**'
+      - 'videocall-codecs/**'
+      - 'neteq/**'
+      - Dockerfile.dioxus
+      - nginx.conf
       - flake.nix
       - flake.lock
 
 jobs:
   push_to_registry:
-    name: Push API Docker image to Docker Hub
+    name: Push Dioxus UI Docker image to Docker Hub
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repo
@@ -31,7 +31,7 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-      
+
       - name: Extract SHA
         id: extract_sha
         run: echo "sha8=$(echo ${GITHUB_SHA::8})" >> "$GITHUB_OUTPUT"
@@ -40,16 +40,12 @@ jobs:
         id: extract_branch
         run: echo "branch=$(echo ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}} | sed 's/\//-/g')" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push API Docker image
+      - name: Build and push Dioxus UI Docker image
         uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
         with:
           context: .
-          file: Dockerfile.actix
+          file: Dockerfile.dioxus
           push: true
           tags: |
-            securityunion/videocall-media-server:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
-            securityunion/videocall-media-server:latest
-          build-args: |
-            GIT_SHA=${{ steps.extract_sha.outputs.sha8 }}
-            GIT_BRANCH=${{ steps.extract_branch.outputs.branch }}
-            BUILD_TIMESTAMP=${{ github.event.head_commit.timestamp }}
+            securityunion/videocall-dioxus-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/videocall-dioxus-ui:latest

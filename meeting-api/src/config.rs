@@ -47,6 +47,9 @@ pub struct Config {
     /// NATS server URL (e.g. "nats://localhost:4222"). `None` if `NATS_URL` is unset.
     /// When not configured, NATS event publishing is silently skipped (graceful degradation).
     pub nats_url: Option<String>,
+    /// Internal URLs for fetching version info from peer services.
+    /// Used by the aggregated `/api/v1/versions` endpoint.
+    pub service_version_urls: Vec<String>,
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -123,6 +126,14 @@ impl Config {
             .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
             .unwrap_or_default();
         let nats_url = env::var("NATS_URL").ok().filter(|s| !s.is_empty());
+
+        // Internal URLs for the aggregated /api/v1/versions endpoint.
+        // Comma-separated list, e.g. "http://rustlemania-websocket:8080/version,http://rustlemania-webtransport:444/version"
+        let service_version_urls = env::var("SERVICE_VERSION_URLS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
+            .unwrap_or_default();
 
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
@@ -207,6 +218,7 @@ impl Config {
             cookie_secure,
             cors_allowed_origin,
             nats_url,
+            service_version_urls,
         })
     }
 

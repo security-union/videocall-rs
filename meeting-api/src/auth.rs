@@ -134,6 +134,8 @@ mod tests {
             cookie_name: name.to_string(),
             cookie_secure: false,
             nats: None,
+            service_version_urls: Vec::new(),
+            http_client: reqwest::Client::new(),
         }
     }
 

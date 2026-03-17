@@ -726,7 +726,16 @@ pub fn AttendantsComponent(
                 _ => {}
             }
 
-            if (mic_error.read().is_some() || video_error.read().is_some()) && !session_loaded() {
+            if session_loaded() {
+                if mic_error.read().is_some() {
+                    mic_enabled.set(false);
+                    pending_mic_enable.set(false);
+                }
+                if video_error.read().is_some() {
+                    video_enabled.set(false);
+                    pending_video_enable.set(false);
+                }
+            } else if mic_error.read().is_some() || video_error.read().is_some() {
                 show_device_warning.set(true);
                 meeting_joined.set(false);
             } else {
@@ -766,8 +775,10 @@ pub fn AttendantsComponent(
             }) as Box<dyn FnMut(_)>);
 
             if let Some(win) = web_sys::window() {
-                let _ =
-                    win.add_event_listener_with_callback("focus", closure.as_ref().unchecked_ref());
+                let _ = win.add_event_listener_with_callback(
+                    "focus",
+                    closure.as_ref().unchecked_ref(),
+                );
             }
             closure.forget();
         });

@@ -100,6 +100,7 @@ pub async fn create_meeting(
         serde_json::to_value(&body.attendees).map_err(|e| AppError::internal(&e.to_string()))?;
 
     let waiting_room_enabled = body.waiting_room_enabled.unwrap_or(true);
+    let admitted_can_admit = body.admitted_can_admit.unwrap_or(false);
 
     let row = db_meetings::create_with_options(
         &state.db,
@@ -108,6 +109,7 @@ pub async fn create_meeting(
         password_hash.as_deref(),
         &attendees_json,
         waiting_room_enabled,
+        admitted_can_admit,
     )
     .await
     .map_err(|e| match e {
@@ -125,6 +127,7 @@ pub async fn create_meeting(
         attendees: body.attendees,
         has_password: password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
+        admitted_can_admit: row.admitted_can_admit,
     };
 
     Ok((StatusCode::CREATED, Json(APIResponse::ok(response))))
@@ -158,6 +161,7 @@ pub async fn list_meetings(
             ended_at: row.ended_at.map(|t| t.timestamp()),
             waiting_count,
             waiting_room_enabled: row.waiting_room_enabled,
+            admitted_can_admit: row.admitted_can_admit,
         });
     }
 
@@ -193,6 +197,7 @@ pub async fn get_meeting(
         host_user_id: row.creator_id,
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
+        admitted_can_admit: row.admitted_can_admit,
         participant_count,
         waiting_count,
         started_at: row.started_at.timestamp_millis(),
@@ -253,6 +258,7 @@ pub async fn end_meeting_handler(
             host_user_id: meeting.creator_id,
             has_password: meeting.password_hash.is_some(),
             waiting_room_enabled: meeting.waiting_room_enabled,
+            admitted_can_admit: meeting.admitted_can_admit,
             participant_count,
             waiting_count,
             started_at: meeting.started_at.timestamp_millis(),
@@ -281,6 +287,7 @@ pub async fn end_meeting_handler(
         host_user_id: row.creator_id,
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
+        admitted_can_admit: row.admitted_can_admit,
         participant_count,
         waiting_count,
         started_at: row.started_at.timestamp_millis(),
@@ -296,7 +303,7 @@ pub async fn update_meeting(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
-    let row = if let Some(enabled) = body.waiting_room_enabled {
+    let mut row = if let Some(enabled) = body.waiting_room_enabled {
         // Atomically updates the setting and, when disabling, auto-admits
         // all waiting participants within a single transaction.
         // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
@@ -315,7 +322,7 @@ pub async fn update_meeting(
             }
         }
     } else {
-        // No changes requested — fetch and verify ownership.
+        // No waiting_room change — fetch and verify ownership.
         let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
             .await?
             .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
@@ -324,6 +331,27 @@ pub async fn update_meeting(
         }
         row
     };
+
+    if let Some(admitted_can_admit) = body.admitted_can_admit {
+        match db_meetings::update_admitted_can_admit(
+            &state.db,
+            &meeting_id,
+            &user_id,
+            admitted_can_admit,
+        )
+        .await?
+        {
+            Some(updated) => row = updated,
+            None => {
+                return Err(
+                    match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
+                        Some(_) => AppError::not_owner(),
+                        None => AppError::meeting_not_found(&meeting_id),
+                    },
+                );
+            }
+        }
+    }
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
@@ -339,6 +367,7 @@ pub async fn update_meeting(
         host_user_id: row.creator_id,
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
+        admitted_can_admit: row.admitted_can_admit,
         participant_count,
         waiting_count,
         started_at: row.started_at.timestamp_millis(),

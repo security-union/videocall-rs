@@ -169,7 +169,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         saving.set(true);
         let meeting_id = meeting_id_toggle.clone();
         spawn(async move {
-            match update_meeting(&meeting_id, new_val).await {
+            match update_meeting(&meeting_id, new_val, None).await {
                 Ok(updated) => {
                     waiting_room_toggle.set(updated.waiting_room_enabled);
                     saving.set(false);

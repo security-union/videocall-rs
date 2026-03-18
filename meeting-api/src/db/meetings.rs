@@ -34,6 +34,7 @@ pub struct MeetingRow {
     pub attendees: Option<JsonValue>,
     pub host_display_name: Option<String>,
     pub waiting_room_enabled: bool,
+    pub admitted_can_admit: bool,
 }
 
 /// Create a new meeting. Uses INSERT ... ON CONFLICT to handle the partial unique index.
@@ -44,7 +45,7 @@ pub async fn create(
     password_hash: Option<&str>,
     attendees: &JsonValue,
 ) -> Result<MeetingRow, sqlx::Error> {
-    create_with_options(pool, room_id, creator_id, password_hash, attendees, true).await
+    create_with_options(pool, room_id, creator_id, password_hash, attendees, true, false).await
 }
 
 /// Create a new meeting with explicit waiting_room_enabled setting.
@@ -55,14 +56,15 @@ pub async fn create_with_options(
     password_hash: Option<&str>,
     attendees: &JsonValue,
     waiting_room_enabled: bool,
+    admitted_can_admit: bool,
 ) -> Result<MeetingRow, sqlx::Error> {
     sqlx::query_as::<_, MeetingRow>(
         r#"
-        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled)
-        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5)
+        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, admitted_can_admit)
+        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5, $6)
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled
+                  waiting_room_enabled, admitted_can_admit
         "#,
     )
     .bind(room_id)
@@ -70,6 +72,7 @@ pub async fn create_with_options(
     .bind(password_hash)
     .bind(attendees)
     .bind(waiting_room_enabled)
+    .bind(admitted_can_admit)
     .fetch_one(pool)
     .await
 }
@@ -83,7 +86,7 @@ pub async fn get_by_room_id(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
                deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled
+               waiting_room_enabled, admitted_can_admit
         FROM meetings
         WHERE room_id = $1 AND deleted_at IS NULL
         "#,
@@ -104,7 +107,7 @@ pub async fn list_by_owner(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
                deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled
+               waiting_room_enabled, admitted_can_admit
         FROM meetings
         WHERE deleted_at IS NULL AND creator_id = $1
         ORDER BY created_at DESC
@@ -142,7 +145,7 @@ pub async fn soft_delete(
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled
+                  waiting_room_enabled, admitted_can_admit
         "#,
     )
     .bind(room_id)
@@ -201,7 +204,7 @@ pub async fn update_waiting_room_enabled(
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled
+                  waiting_room_enabled, admitted_can_admit
         "#,
     )
     .bind(room_id)
@@ -225,4 +228,28 @@ pub async fn update_waiting_room_enabled(
 
     tx.commit().await?;
     Ok(updated)
+}
+
+/// Update the `admitted_can_admit` setting for a meeting.
+pub async fn update_admitted_can_admit(
+    pool: &PgPool,
+    room_id: &str,
+    creator_id: &str,
+    admitted_can_admit: bool,
+) -> Result<Option<MeetingRow>, sqlx::Error> {
+    sqlx::query_as::<_, MeetingRow>(
+        r#"
+        UPDATE meetings
+        SET admitted_can_admit = $3
+        WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
+        RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
+                  deleted_at, creator_id, password_hash, state, attendees, host_display_name,
+                  waiting_room_enabled, admitted_can_admit
+        "#,
+    )
+    .bind(room_id)
+    .bind(creator_id)
+    .bind(admitted_can_admit)
+    .fetch_optional(pool)
+    .await
 }

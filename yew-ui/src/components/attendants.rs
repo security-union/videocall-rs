@@ -37,11 +37,7 @@ use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
-<<<<<<< HEAD
-use videocall_client::{MediaAccessKind, MediaPermission, MediaPermissionsErrorState, PermissionState, utils::is_ios};
-=======
 use std::collections::HashMap;
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
     utils::is_ios, MediaAccessKind, MediaPermission, MediaPermissionsErrorState, PermissionState,
@@ -50,12 +46,7 @@ use videocall_client::{
     MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
-<<<<<<< HEAD
 use wasm_bindgen::{JsValue, JsCast, prelude::*};
-=======
-use wasm_bindgen::{prelude::*, JsCast, JsValue};
-use web_sys::Event;
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
 use web_sys::*;
 use web_sys::Event;
 use yew::prelude::*;
@@ -97,10 +88,6 @@ pub enum WsAction {
     Log(String),
     EncoderSettingsUpdated(String),
     MeetingInfoReceived(u64),
-<<<<<<< HEAD
-    ToggleDropdown,
-=======
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
     CloseDeviceWarning,
 }
 
@@ -460,12 +447,8 @@ impl AttendantsComponent {
         let link = ctx.link().clone();
         media_device_access.on_result = {
             VcCallback::from(move |permission: MediaPermission| {
-<<<<<<< HEAD
-                link.send_message(WsAction::MediaPermissionsUpdated(permission))})
-=======
                 link.send_message(WsAction::MediaPermissionsUpdated(permission))
             })
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
         };
         media_device_access
     }
@@ -684,17 +667,10 @@ impl AttendantsComponent {
             messages.push(self.render_single_error("Camera", err));
         }
 
-<<<<<<< HEAD
-        html!{ for messages}
-    }
-
-    fn render_single_error(&self, device: &str, error:&MediaErrorState) -> Html {
-=======
         html! { for messages}
     }
 
     fn render_single_error(&self, device: &str, error: &MediaErrorState) -> Html {
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
         match error {
             MediaErrorState::NoDevice => html! {
                 <p>{ format!(" {} not found on this device.",device)}</p>
@@ -862,14 +838,9 @@ impl Component for AttendantsComponent {
                     false
                 }
                 WsAction::WindowFocused => {
-<<<<<<< HEAD
-                    if matches!(self.mic_error, Some(MediaErrorState::PermissionDenied)) ||
-                       matches!(self.video_error, Some(MediaErrorState::PermissionDenied)) {
-=======
                     if matches!(self.mic_error, Some(MediaErrorState::PermissionDenied))
                         || matches!(self.video_error, Some(MediaErrorState::PermissionDenied))
                     {
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
                         ctx.link().send_message(WsAction::ReloadDevices);
                     } else {
                         ctx.link().send_message(WsAction::RequestMediaPermissions);
@@ -888,51 +859,14 @@ impl Component for AttendantsComponent {
 
                     if let PermissionState::Granted = &permit.audio {
                         if self.pending_mic_enable {
-<<<<<<< HEAD
-                               self.mic_enabled = true;
-                               self.pending_mic_enable = false;
-=======
                             self.mic_enabled = true;
                             self.pending_mic_enable = false;
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
+
                         }
                     };
 
                     if let PermissionState::Granted = &permit.video {
                         if self.pending_video_enable {
-<<<<<<< HEAD
-                               self.video_enabled = true;
-                               self.pending_video_enable = false;
-                        }
-                    }
-
-                    if let PermissionState::Denied(MediaPermissionsErrorState::Other(_)) = &permit.audio {
-                        self.mic_error = Some(MediaErrorState::Other);
-                    }
-
-                    if let PermissionState::Denied(MediaPermissionsErrorState::Other(_)) = &permit.video {
-                        self.video_error = Some(MediaErrorState::Other);
-                    }
-
-                    if permit.audio == PermissionState::Denied(MediaPermissionsErrorState::NoDevice) {
-                        self.mic_error = Some(MediaErrorState::NoDevice);
-                    }
-
-                    if permit.video == PermissionState::Denied(MediaPermissionsErrorState::NoDevice) {
-                        self.video_error = Some(MediaErrorState::NoDevice);
-                    }
-
-                    if permit.audio == PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied) {
-                        self.mic_error = Some(MediaErrorState::PermissionDenied);
-                    }
-
-                    if permit.video == PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied) {
-                        self.video_error = Some(MediaErrorState::PermissionDenied);
-                    }
-
-                    if (self.mic_error.is_some() || self.video_error.is_some()) &&
-                        !self.session_loaded {
-=======
                             self.video_enabled = true;
                             self.pending_video_enable = false;
                         }
@@ -972,10 +906,16 @@ impl Component for AttendantsComponent {
                         self.video_error = Some(MediaErrorState::PermissionDenied);
                     }
 
-                    if (self.mic_error.is_some() || self.video_error.is_some())
-                        && !self.session_loaded
-                    {
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
+                    if self.session_loaded {
+                        if self.mic_error.is_some() {
+                            self.mic_enabled = false;
+                            self.pending_mic_enable = false;
+                        }
+                        if self.video_error.is_some() {
+                            self.video_enabled = false;
+                            self.pending_video_enable = false;
+                        }
+                    } else if self.mic_error.is_some() || self.video_error.is_some() {
                         self.show_device_warning = true;
                     } else {
                         ctx.link().send_message(WsAction::Connect);
@@ -997,13 +937,6 @@ impl Component for AttendantsComponent {
                     self.meeting_start_time_server = Some(start_time as f64);
                     true
                 }
-<<<<<<< HEAD
-                WsAction::ToggleDropdown => {
-                    self.show_dropdown = !self.show_dropdown;
-                    true
-                }
-=======
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
                 WsAction::CloseDeviceWarning => {
                     self.show_device_warning = false;
                     ctx.link().send_message(WsAction::Connect);
@@ -1048,14 +981,10 @@ impl Component for AttendantsComponent {
                     }
                     MeetingAction::ToggleMicMute => {
                         if !self.mic_enabled {
-<<<<<<< HEAD
-                            if self.media_device_access.is_granted(MediaAccessKind::AudioCheck) {
-=======
                             if self
                                 .media_device_access
                                 .is_granted(MediaAccessKind::AudioCheck)
                             {
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
                                 self.mic_enabled = true;
                             } else {
                                 self.pending_mic_enable = true;
@@ -1067,14 +996,10 @@ impl Component for AttendantsComponent {
                     }
                     MeetingAction::ToggleVideoOnOff => {
                         if !self.video_enabled {
-<<<<<<< HEAD
-                            if self.media_device_access.is_granted(MediaAccessKind::VideoCheck) {
-=======
                             if self
                                 .media_device_access
                                 .is_granted(MediaAccessKind::VideoCheck)
                             {
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
                                 self.video_enabled = true;
                             } else {
                                 self.pending_video_enable = true;
@@ -1319,13 +1244,9 @@ impl Component for AttendantsComponent {
         let is_allowed = users_allowed_to_stream().unwrap_or_default();
         let can_stream =
             is_allowed.is_empty() || is_allowed.iter().any(|host| host == &effective_user_id);
-<<<<<<< HEAD
-        let media_access_granted = self.media_device_access.is_granted(MediaAccessKind::BothCheck);
-=======
         let media_access_granted = self
             .media_device_access
             .is_granted(MediaAccessKind::BothCheck);
->>>>>>> 385d89b3274ab5c46162f2218e581d6211cef973
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
         let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);

@@ -47,3 +47,7 @@ jobs:
           tags: |
             securityunion/videocall-meeting-api:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
             securityunion/videocall-meeting-api:latest
+          build-args: |
+            GIT_SHA=${{ steps.extract_sha.outputs.sha8 }}
+            GIT_BRANCH=${{ steps.extract_branch.outputs.branch }}
+            BUILD_TIMESTAMP=${{ github.event.head_commit.timestamp }}

@@ -1,6 +1,12 @@
 FROM nixos/nix:2.33.2 AS builder
 
+ARG GIT_SHA=unknown
+ARG GIT_BRANCH=unknown
+ARG BUILD_TIMESTAMP=unknown
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
+ENV GIT_SHA=${GIT_SHA}
+ENV GIT_BRANCH=${GIT_BRANCH}
+ENV BUILD_TIMESTAMP=${BUILD_TIMESTAMP}
 
 WORKDIR /app
 
@@ -22,6 +28,11 @@ RUN nix develop .#yew-ui --command bash -c "\
 
 # ---------------------------------------------------------------------------
 FROM nginx:1.21.5-alpine
+
+ARG GIT_SHA=unknown
+ARG GIT_BRANCH=unknown
+LABEL org.opencontainers.image.revision=${GIT_SHA}
+LABEL org.opencontainers.image.ref.name=${GIT_BRANCH}
 
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY --from=builder /app/yew-ui/dist /usr/share/nginx/html

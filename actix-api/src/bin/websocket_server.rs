@@ -37,6 +37,7 @@ use sec_api::{
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
+    version,
 };
 use tracing::{debug, error, info};
 use videocall_types::truthy;
@@ -327,6 +328,7 @@ async fn main() -> std::io::Result<()> {
                 .service(logout)
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
+                .route("/version", web::get().to(version::websocket_version))
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
@@ -354,6 +356,7 @@ async fn main() -> std::io::Result<()> {
                 .service(logout)
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
+                .route("/version", web::get().to(version::websocket_version))
         } else {
             // OAuth configured but database disabled - skip OAuth routes
             error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");
@@ -370,6 +373,7 @@ async fn main() -> std::io::Result<()> {
                 .service(logout)
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
+                .route("/version", web::get().to(version::websocket_version))
         }
     })
     .bind((

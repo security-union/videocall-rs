@@ -1090,7 +1090,7 @@ pub fn AttendantsComponent(
                 if !peer_toasts().is_empty() {
                     div {
                         class: "peer-toasts",
-                        for (id, display_name, uid, is_joined) in peer_toasts().iter().cloned() {
+                        for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
                                 let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };

@@ -98,6 +98,12 @@ pub struct ScreenEncoder {
     /// When set to `true`, the next encoded frame will be forced as a keyframe.
     /// Used by the PLI (Picture Loss Indication) mechanism.
     force_keyframe: Arc<AtomicBool>,
+    /// Holds the *original* video track returned by getDisplayMedia so that `stop()` can call
+    /// `.stop()` on it directly.  The browser's native screen-share indicator bar (the
+    /// "You are sharing" bar with "Stop sharing" / "Hide") is only dismissed when the
+    /// original capture track is stopped; stopping a cloned track (e.g. from
+    /// `MediaStream::clone()`) does **not** affect the indicator.
+    active_video_track: Rc<RefCell<Option<MediaStreamTrack>>>,
 }
 
 impl ScreenEncoder {
@@ -128,6 +134,7 @@ impl ScreenEncoder {
             tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
+            active_video_track: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -314,6 +321,7 @@ impl ScreenEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
+        let active_video_track = self.active_video_track.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -677,6 +685,8 @@ impl ScreenEncoder {
                                 screen_frame_counter
                             );
                         }
+                        opts.set_key_frame(screen_frame_counter == 0);
+                        screen_frame_counter = (screen_frame_counter + 1) % 50;
 
                         if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
                             error!("Error encoding screen frame: {e:?}");

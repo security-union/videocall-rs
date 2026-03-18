@@ -109,7 +109,7 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32) -> String {
 }
 
 /// Controls what a `PeerTile` renders in the split screen-share layout.
-#[derive(PartialEq, Clone, Default)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub enum TileMode {
     /// Normal grid tile — renders screen-share canvas (if active) AND peer video side-by-side.
     #[default]
@@ -119,6 +119,43 @@ pub enum TileMode {
     ScreenOnly,
     /// Split-layout right panel — renders only the peer video tile (no screen-share canvas).
     VideoOnly,
+}
+
+/// Outcome of the split-layout eligibility check.
+#[derive(Debug, PartialEq)]
+pub(crate) enum TileDecision {
+    /// Render nothing — the peer should not appear in this panel.
+    Empty,
+    /// Render the screen-share canvas for this peer.
+    RenderScreenShare,
+    /// Render the peer video tile (no screen-share canvas).
+    RenderVideo,
+    /// Not a split-layout mode — fall through to full/grid logic.
+    FallThrough,
+}
+
+/// Pure decision function: given the tile mode, whether the peer is
+/// screen-sharing, and whether the peer is the local user, returns
+/// which rendering path to take.
+///
+/// Extracted so that the branching logic can be tested without requiring
+/// a `VideoCallClient`, DOM, or any WASM environment.
+pub(crate) fn split_layout_decision(
+    mode: &TileMode,
+    is_screen_share_enabled: bool,
+    is_self_peer: bool,
+) -> TileDecision {
+    match mode {
+        TileMode::ScreenOnly => {
+            if !is_screen_share_enabled || is_self_peer {
+                TileDecision::Empty
+            } else {
+                TileDecision::RenderScreenShare
+            }
+        }
+        TileMode::VideoOnly => TileDecision::RenderVideo,
+        TileMode::Full => TileDecision::FallThrough,
+    }
 }
 
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
@@ -172,6 +209,18 @@ pub fn generate_for_peer(
         {
             return rsx! {};
         }
+    }
+
+    // ---- Split-layout: early return for ScreenOnly / VideoOnly ----------------
+    let is_self_peer = my_peer_id.map_or(false, |id| id == peer_user_id);
+    let decision = split_layout_decision(&mode, is_screen_share_enabled_for_peer, is_self_peer);
+
+    if decision == TileDecision::Empty {
+        return rsx! {};
+    }
+
+    // ---- Split-layout: screen-share left panel --------------------------------
+    if decision == TileDecision::RenderScreenShare {
         let ss_canvas_crop = format!("screen-share-{}", key);
         let ss_name = format!("{}-screen", peer_display_name);
         let ss_name_title = ss_name.clone();
@@ -198,7 +247,7 @@ pub fn generate_for_peer(
     }
 
     // ---- Split-layout: peer video right panel ---------------------------------
-    if matches!(mode, TileMode::VideoOnly) {
+    if decision == TileDecision::RenderVideo {
         let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
         let div_id_mobile = (*peer_video_div_id).clone();
         let pv_canvas_crop = key.clone();
@@ -635,5 +684,114 @@ fn toggle_canvas_crop(canvas_id: &str) {
             let _ = class_list.remove_1("uncropped");
             let _ = class_list.add_1("cropped");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — split-layout decision logic
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- ScreenOnly: remote peer IS screen-sharing → render screen share ------
+    #[test]
+    fn screen_only_remote_sharing_renders_screen() {
+        assert_eq!(
+            split_layout_decision(&TileMode::ScreenOnly, true, false),
+            TileDecision::RenderScreenShare,
+        );
+    }
+
+    // -- ScreenOnly: remote peer is NOT screen-sharing → empty ----------------
+    #[test]
+    fn screen_only_remote_not_sharing_returns_empty() {
+        assert_eq!(
+            split_layout_decision(&TileMode::ScreenOnly, false, false),
+            TileDecision::Empty,
+        );
+    }
+
+    // -- ScreenOnly: local (self) peer IS screen-sharing → empty (never show
+    //    own screen share in the split panel) ---------------------------------
+    #[test]
+    fn screen_only_self_peer_sharing_returns_empty() {
+        assert_eq!(
+            split_layout_decision(&TileMode::ScreenOnly, true, true),
+            TileDecision::Empty,
+        );
+    }
+
+    // -- ScreenOnly: local peer, not sharing → empty --------------------------
+    #[test]
+    fn screen_only_self_peer_not_sharing_returns_empty() {
+        assert_eq!(
+            split_layout_decision(&TileMode::ScreenOnly, false, true),
+            TileDecision::Empty,
+        );
+    }
+
+    // -- VideoOnly: always renders the peer video tile ------------------------
+    #[test]
+    fn video_only_renders_video() {
+        assert_eq!(
+            split_layout_decision(&TileMode::VideoOnly, false, false),
+            TileDecision::RenderVideo,
+        );
+    }
+
+    #[test]
+    fn video_only_self_peer_renders_video() {
+        assert_eq!(
+            split_layout_decision(&TileMode::VideoOnly, false, true),
+            TileDecision::RenderVideo,
+        );
+    }
+
+    #[test]
+    fn video_only_with_screen_share_renders_video() {
+        assert_eq!(
+            split_layout_decision(&TileMode::VideoOnly, true, false),
+            TileDecision::RenderVideo,
+        );
+    }
+
+    #[test]
+    fn video_only_self_peer_with_screen_share_renders_video() {
+        assert_eq!(
+            split_layout_decision(&TileMode::VideoOnly, true, true),
+            TileDecision::RenderVideo,
+        );
+    }
+
+    // -- Full: always falls through to the grid / full-bleed paths ------------
+    #[test]
+    fn full_mode_falls_through() {
+        assert_eq!(
+            split_layout_decision(&TileMode::Full, false, false),
+            TileDecision::FallThrough,
+        );
+    }
+
+    #[test]
+    fn full_mode_with_screen_share_falls_through() {
+        assert_eq!(
+            split_layout_decision(&TileMode::Full, true, false),
+            TileDecision::FallThrough,
+        );
+    }
+
+    #[test]
+    fn full_mode_self_peer_falls_through() {
+        assert_eq!(
+            split_layout_decision(&TileMode::Full, false, true),
+            TileDecision::FallThrough,
+        );
+    }
+
+    // -- TileMode Default trait -----------------------------------------------
+    #[test]
+    fn tile_mode_default_is_full() {
+        assert_eq!(TileMode::default(), TileMode::Full);
     }
 }

@@ -42,6 +42,9 @@ use web_sys::MediaStream;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
+// Type alias to simplify the nested Rc<RefCell<Option<>>> pattern
+type SharedScreenStream = Rc<RefCell<Option<MediaStream>>>;
+
 struct EncoderSettings {
     camera: Option<String>,
     microphone: Option<String>,
@@ -151,7 +154,7 @@ pub fn Host(
             }
         });
         let screen_state_cell = screen_state_handler.clone();
-        let screen_stream_for_cb = Rc::new(RefCell::new(None::<Rc<RefCell<Option<MediaStream>>>>));
+        let screen_stream_for_cb: Rc<RefCell<Option<SharedScreenStream>>> = Rc::new(RefCell::new(None));
         let screen_stream_cell = screen_stream_for_cb.clone();
         let screen_state_cb = VcCallback::from(move |event: ScreenShareEvent| {
             match &event {
@@ -181,6 +184,9 @@ pub fn Host(
         camera.set_congestion_step_down_flag(client.congestion_step_down_flag());
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
+
+        // Store the screen stream handle so the callback can access it for preview
+        *screen_stream_for_cb.borrow_mut() = Some(screen.screen_stream());
 
         // Wire up encoder controls. The microphone encoder no longer needs
         // its own diagnostics channel — it reads audio tier settings from
@@ -724,7 +730,7 @@ struct HostState {
     prev_video_enabled: bool,
     initialized: bool,
     last_reload_counter: u32,
-    screen_stream_cell: Rc<RefCell<Option<Rc<RefCell<Option<MediaStream>>>>>>,
+    screen_stream_cell: Rc<RefCell<Option<SharedScreenStream>>>,
 }
 
 fn attach_screen_preview(stream: &MediaStream) {

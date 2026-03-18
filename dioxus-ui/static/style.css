@@ -354,9 +354,7 @@ canvas {
   bottom: clamp(1rem, 2vh, 1.5rem);
   right: clamp(1rem, 2vw, 1.5rem);
   width: clamp(10rem, 18vw, 15rem);
-  height: calc(clamp(10rem, 18vw, 15rem) *  0.5625);
   max-width: 240px;
-  max-height: 180px;
   border: 2px solid #444;
   border-radius: 8px;
   z-index: 10;
@@ -2217,6 +2215,18 @@ select {
 .settings-option-label    { font-size: 0.9375rem; font-weight: 500; color: var(--text-primary, #FFFFFF); }
 .settings-option-controls { display: flex; align-items: center; gap: 0.75rem; }
 
+/* Local screen-share preview — rendered above camera inside .host */
+.screen-share-preview {
+  width: 100%;
+  max-height: 180px;
+  border-bottom: 1px solid #444;
+  border-radius: 0;
+  background: #000;
+  object-fit: contain;
+  pointer-events: none;
+  flex-shrink: 0;
+}
+
 .settings-info-icon {
   position: relative;
   display: inline-flex;
@@ -2363,7 +2373,7 @@ select {
 }
 .peer_item_mic.speaking svg { stroke: #00ff41; }
 
-.host-video-wrapper { border-radius: 0; overflow: hidden; border: none; box-shadow: none; }
+.host-video-wrapper { border-radius: 0; overflow: hidden; border: none; box-shadow: none; aspect-ratio: 16 / 9; flex-shrink: 0; }
 
 /* Glow transitions are now fully controlled by inline styles from Rust.
    No .speaking-tile class needed — speak_style() always returns explicit values. */

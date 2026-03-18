@@ -24,8 +24,10 @@ use crate::components::icons::push_pin::PushPinIcon;
 use crate::constants::users_allowed_to_stream;
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
+use wasm_bindgen::JsCast;
 use web_sys::{window, HtmlCanvasElement};
 
 /// Compute the inline CSS for the speaking glow on the canvas container.
@@ -105,6 +107,19 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32) -> String {
     )
 }
 
+/// Controls what a `PeerTile` renders in the split screen-share layout.
+#[derive(PartialEq, Clone, Default)]
+pub enum TileMode {
+    /// Normal grid tile — renders screen-share canvas (if active) AND peer video side-by-side.
+    #[default]
+    Full,
+    /// Split-layout left panel — renders only the screen-share canvas for this peer.
+    /// Returns empty when the peer is not screen-sharing.
+    ScreenOnly,
+    /// Split-layout right panel — renders only the peer video tile (no screen-share canvas).
+    VideoOnly,
+}
+
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
 /// the video tile will occupy the full grid area. The `audio_level` parameter (0.0–1.0) drives
 /// a glow whose intensity scales with voice volume.
@@ -116,6 +131,8 @@ pub fn generate_for_peer(
     audio_level: f32,
     mic_audio_level: f32,
     host_user_id: Option<&str>,
+    mode: TileMode,
+    my_peer_id: Option<&str>,
 ) -> Element {
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
     let peer_display_name = client
@@ -145,6 +162,107 @@ pub fn generate_for_peer(
     // mic icon uses mic_audio_level (held for 1s after silence in Rust)
     let tile_style = speak_style(audio_level);
     let mic_inline_style = mic_style(mic_audio_level, audio_level);
+
+    // ---- Split-layout: screen-share left panel --------------------------------
+    if matches!(mode, TileMode::ScreenOnly) {
+        // Don't render the local user's own screen share
+        if !is_screen_share_enabled_for_peer
+            || my_peer_id.map_or(false, |id| id == peer_user_id)
+        {
+            return rsx! {};
+        }
+        let ss_canvas_crop = format!("screen-share-{}", key);
+        let ss_name = format!("{}-screen", peer_display_name);
+        let ss_name_title = ss_name.clone();
+        return rsx! {
+            div {
+                class: "split-screen-tile",
+                div {
+                    class: "canvas-container video-on",
+                    ScreenCanvas { peer_id: key.clone() }
+                    h4 {
+                        class: "floating-name",
+                        title: "{ss_name_title}",
+                        dir: "auto",
+                        "{ss_name}"
+                    }
+                    button {
+                        onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
+                        class: "crop-icon",
+                        CropIcon {}
+                    }
+                }
+            }
+        };
+    }
+
+    // ---- Split-layout: peer video right panel ---------------------------------
+    if matches!(mode, TileMode::VideoOnly) {
+        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+        let div_id_mobile = (*peer_video_div_id).clone();
+        let pv_canvas_crop = key.clone();
+        let key_clone = key.clone();
+        let peer_display_name_vo = peer_display_name.clone();
+        let title_vo = if is_host {
+            format!("Host: {peer_user_id}")
+        } else {
+            peer_user_id.clone()
+        };
+        let vo_tile_style = tile_style.clone();
+        let vo_mic_style = mic_inline_style.clone();
+        let vo_audio_class = audio_speaking_class;
+        let grid_class = if is_video_enabled_for_peer {
+            "canvas-container video-on"
+        } else {
+            "canvas-container"
+        };
+        return rsx! {
+            div {
+                class: "split-peer-tile",
+                id: "{peer_video_div_id}",
+                div {
+                    class: "{grid_class}",
+                    onclick: move |_| {
+                        if is_mobile_viewport() {
+                            toggle_pinned_div(&div_id_mobile);
+                        }
+                    },
+                    if is_video_enabled_for_peer {
+                        UserVideo { id: key_clone.clone(), hidden: false }
+                    } else {
+                        div {
+                            class: "placeholder-content",
+                            PeerIcon {}
+                            span { class: "placeholder-text", "Video Disabled" }
+                        }
+                    }
+                    h4 {
+                        class: "floating-name",
+                        title: "{title_vo}",
+                        dir: "auto",
+                        "{peer_display_name_vo}"
+                        if is_host {
+                            CrownIcon {}
+                        }
+                    }
+                    div {
+                        class: "{vo_audio_class}",
+                        style: "{vo_mic_style}",
+                        MicIcon { muted: !is_audio_enabled_for_peer }
+                    }
+                    button {
+                        onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
+                        class: "crop-icon",
+                        CropIcon {}
+                    }
+                    div {
+                        style: "{vo_tile_style}",
+                        class: "glow-overlay",
+                    }
+                }
+            }
+        };
+    }
 
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {
@@ -247,9 +365,13 @@ pub fn generate_for_peer(
         peer_user_id.clone()
     };
 
+    // Derive flat &str values so the rsx! condition is a simple != comparison.
+    let peer_id = peer_user_id.as_str();
+    let my_peer_id = my_peer_id.unwrap_or("");
+
     rsx! {
         // Canvas for Screen share.
-        if is_screen_share_enabled_for_peer {
+        if peer_id != my_peer_id && is_screen_share_enabled_for_peer {
             div {
                 class: "{screen_share_css}",
                 id: "{screen_share_div_id}",

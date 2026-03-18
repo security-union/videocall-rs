@@ -46,9 +46,9 @@ use videocall_client::{
     MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use wasm_bindgen::{JsValue, JsCast, prelude::*};
-use web_sys::*;
+use wasm_bindgen::{prelude::*, JsCast, JsValue};
 use web_sys::Event;
+use web_sys::*;
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
 
@@ -698,17 +698,6 @@ impl Component for AttendantsComponent {
         let link = ctx.link().clone();
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
-       
-        let window = web_sys::window().expect("no global window exist");
-        let closure = Closure::wrap(Box::new(move |_event: Event| {
-            link.send_message(WsAction::WindowFocused);
-        }) as Box<dyn FnMut(_)>);
-
-        window
-            .add_event_listener_with_callback("focus", closure.as_ref().unchecked_ref())
-            .expect("failed to add focus listener");
-
-        closure.forget();
 
         let window = web_sys::window().expect("no global window exist");
         let closure = Closure::wrap(Box::new(move |_event: Event| {
@@ -861,7 +850,6 @@ impl Component for AttendantsComponent {
                         if self.pending_mic_enable {
                             self.mic_enabled = true;
                             self.pending_mic_enable = false;
-
                         }
                     };
 

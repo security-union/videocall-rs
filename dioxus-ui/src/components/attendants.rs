@@ -18,6 +18,7 @@
 
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
+    canvas_generator::TileMode,
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
@@ -44,7 +45,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
-use wasm_bindgen::{closure::Closure, JsCast};
 use videocall_client::{
     MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
     PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
@@ -390,6 +390,7 @@ pub fn AttendantsComponent(
 
     // --- State signals ---
     let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
+
     let mut mic_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
@@ -895,15 +896,28 @@ pub fn AttendantsComponent(
     let ch = container_h();
     let (cols, rows) = compute_grid(num_display_peers.min(CANVAS_LIMIT), cw, ch);
 
-    let container_style = format!(
+    // Detect whether any peer is screen-sharing to switch to the split layout.
+    let has_screen_share = display_peers
+        .iter()
+        .any(|k| client.is_screen_share_enabled_for_peer(k));
+
+    let container_style = if has_screen_share {
+        // 2/3 screen-share panel on the left, 1/3 peer panel on the right
         "position: absolute; inset: 0; width: 100%; height: 100%; \
-         --num-peers: {}; \
-         grid-template-columns: repeat({}, 1fr); \
-         grid-template-rows: repeat({}, 1fr);",
-        num_peers_for_styling.max(1),
-        cols,
-        rows,
-    );
+         display: flex; flex-direction: row; gap: 10px; padding: 16px; \
+         align-items: center; box-sizing: border-box;"
+            .to_string()
+    } else {
+        format!(
+            "position: absolute; inset: 0; width: 100%; height: 100%; \
+             --num-peers: {}; \
+             grid-template-columns: repeat({}, 1fr); \
+             grid-template-rows: repeat({}, 1fr);",
+            num_peers_for_styling.max(1),
+            cols,
+            rows,
+        )
+    };
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
@@ -1101,24 +1115,57 @@ pub fn AttendantsComponent(
                     id: "grid-container",
                     style: "{container_style}",
 
-                    // Peer tiles
-                    for (i, peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
-                        {
-                            let full_bleed = display_peers.len() == 1
-                                && !client.is_screen_share_enabled_for_peer(peer_id);
-                            rsx! {
+                    if has_screen_share {
+                        // ---- Split layout: screen shares (left 2/3) + peer videos (right 1/3) ----
+                        // Left panel — screen-share canvases stacked vertically
+                        div {
+                            style: "flex: 2; min-width: 0; height: 100%; display: flex; flex-direction: column; \
+                                    align-items: center; justify-content: center; gap: 10px; overflow: hidden;",
+                            for (i, peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
                                 PeerTile {
-                                    key: "tile-{i}-{peer_id}",
+                                    key: "ss-{i}-{peer_id}",
                                     peer_id: peer_id.clone(),
-                                    full_bleed: full_bleed,
+                                    full_bleed: false,
                                     host_user_id: host_user_id.clone(),
+                                    render_mode: TileMode::ScreenOnly,
+                                    my_peer_id: user_id.clone(),
                                 }
                             }
                         }
-                    }
+                        // Right panel — all peer video tiles stacked vertically
+                        div {
+                            style: "flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;",
+                            for (i, peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
+                                PeerTile {
+                                    key: "vid-{i}-{peer_id}",
+                                    peer_id: peer_id.clone(),
+                                    full_bleed: false,
+                                    host_user_id: host_user_id.clone(),
+                                    render_mode: TileMode::VideoOnly,
+                                    my_peer_id: user_id.clone(),
+                                }
+                            }
+                        }
+                    } else {
+                        // ---- Normal grid layout ----
+                        for (i, peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
+                            {
+                                let full_bleed = display_peers.len() == 1
+                                    && !client.is_screen_share_enabled_for_peer(peer_id);
+                                rsx! {
+                                    PeerTile {
+                                        key: "tile-{i}-{peer_id}",
+                                        peer_id: peer_id.clone(),
+                                        full_bleed: full_bleed,
+                                        host_user_id: host_user_id.clone(),
+                                        my_peer_id: user_id.clone(),
+                                    }
+                                }
+                            }
+                        }
 
-                    // Invitation overlay when no peers
-                    if num_display_peers == 0 {
+                        // Invitation overlay when no peers
+                        if num_display_peers == 0 {
                         div {
                             id: "invite-overlay",
                             class: "card-apple",
@@ -1172,6 +1219,7 @@ pub fn AttendantsComponent(
                             }
                         }
                     }
+                    } // end of else (normal grid layout)
 
                     // Controls nav
                     if can_stream {
@@ -1358,8 +1406,12 @@ pub fn AttendantsComponent(
                                     on_screen_share_state: move |event: ScreenShareEvent| {
                                         log::info!("Screen share state changed: {event:?}");
                                         match event {
-                                            ScreenShareEvent::Started => screen_share_state.set(ScreenShareState::Active),
-                                            ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => screen_share_state.set(ScreenShareState::Idle),
+                                            ScreenShareEvent::Started => {
+                                                screen_share_state.set(ScreenShareState::Active);
+                                            }
+                                            ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
+                                                screen_share_state.set(ScreenShareState::Idle);
+                                            }
                                             ScreenShareEvent::Failed(ref msg) => {
                                                 log::error!("Screen share failed: {msg}");
                                                 screen_share_state.set(ScreenShareState::Idle);

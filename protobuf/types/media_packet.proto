@@ -8,6 +8,7 @@ message MediaPacket {
     SCREEN = 3;
     HEARTBEAT = 4;
     RTT = 5;  // Client to Server RTT
+    KEYFRAME_REQUEST = 6;  // Request keyframe from sender (PLI)
   }
   MediaType media_type = 1;
   bytes user_id = 2;

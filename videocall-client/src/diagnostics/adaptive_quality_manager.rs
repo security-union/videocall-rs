@@ -76,6 +76,8 @@ impl AdaptiveQualityManager {
     /// Starts at `DEFAULT_VIDEO_TIER_INDEX` (medium). Use this for camera
     /// encoders where starting at medium avoids wasting bandwidth before the
     /// first adaptation.
+    ///
+    /// Use `VIDEO_QUALITY_TIERS` for camera, `SCREEN_QUALITY_TIERS` for screen share.
     pub fn new(video_tiers: &'static [VideoQualityTier]) -> Self {
         Self {
             video_tiers,

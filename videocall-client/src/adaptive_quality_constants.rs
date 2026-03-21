@@ -272,14 +272,6 @@ pub const PID_CORRECTION_THROTTLE_MS: f64 = 1000.0;
 pub const PID_FPS_HISTORY_SIZE: usize = 10;
 
 // ---------------------------------------------------------------------------
-// Bitrate Change Threshold
-// ---------------------------------------------------------------------------
-
-/// Only apply a bitrate change if it exceeds this ratio of the current bitrate.
-/// Prevents tiny fluctuations from causing unnecessary encoder reconfigurations.
-pub const BITRATE_CHANGE_THRESHOLD: f64 = 0.20;
-
-// ---------------------------------------------------------------------------
 // Keyframe & Error Recovery
 // ---------------------------------------------------------------------------
 

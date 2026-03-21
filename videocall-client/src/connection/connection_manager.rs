@@ -861,7 +861,8 @@ impl ConnectionManager {
                         }
                     }
                     Err(_) => {
-                        warn!("Reconnection attempt {attempt}: could not borrow manager (busy)");
+                        warn!("Reconnection attempt {attempt}: could not borrow manager (busy), will retry");
+                        attempt = attempt.saturating_sub(1); // Don't count this toward the limit
                     }
                 }
             }

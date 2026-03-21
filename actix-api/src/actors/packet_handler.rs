@@ -27,7 +27,6 @@ use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-use crate::client_diagnostics::health_processor;
 use crate::constants::{KEYFRAME_REQUEST_MAX_PER_SEC, KEYFRAME_REQUEST_WINDOW_MS};
 use std::time::Instant;
 
@@ -42,9 +41,16 @@ pub enum PacketKind {
     Data,
     /// Packet that should be silently dropped (e.g., client-originated CONGESTION)
     Dropped,
+    /// KEYFRAME_REQUEST packet - subject to per-session rate limiting
+    KeyframeRequest,
 }
 
 /// Classify a packet based on its contents.
+///
+/// Parses the `PacketWrapper` exactly once and uses the `packet_type` field
+/// to classify the packet. For MEDIA packets, the inner `MediaPacket` is
+/// parsed at most once to distinguish RTT and KEYFRAME_REQUEST from regular
+/// media data.
 ///
 /// # Arguments
 /// * `data` - Raw packet bytes
@@ -52,25 +58,40 @@ pub enum PacketKind {
 /// # Returns
 /// The classification of the packet
 pub fn classify_packet(data: &[u8]) -> PacketKind {
+    let packet_wrapper = match PacketWrapper::parse_from_bytes(data) {
+        Ok(pw) => pw,
+        Err(_) => return PacketKind::Data, // unparseable, treat as opaque data
+    };
+
     // Drop client-originated CONGESTION packets.
     // CONGESTION signals must only originate from the server's CongestionTracker,
     // never from clients. A malicious client could craft a CONGESTION packet with
     // a victim's session_id to force them to degrade video quality.
-    if is_congestion_packet(data) {
+    if packet_wrapper.packet_type == PacketType::CONGESTION.into() {
         return PacketKind::Dropped;
     }
 
-    // Check RTT first (most specific check)
-    if is_rtt_packet(data) {
-        return PacketKind::Rtt;
+    // Check if it's a MEDIA packet (RTT, keyframe request, or regular media).
+    if packet_wrapper.packet_type == PacketType::MEDIA.into() {
+        // Try to parse inner MediaPacket to distinguish control sub-types.
+        // For encrypted payloads this parse will fail, correctly falling
+        // through to PacketKind::Data.
+        if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+            if media_packet.media_type == MediaType::RTT.into() {
+                return PacketKind::Rtt;
+            }
+            if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
+                return PacketKind::KeyframeRequest;
+            }
+        }
+        return PacketKind::Data;
     }
 
-    // Check health packet
-    if health_processor::is_health_packet_bytes(data) {
+    // Check health packet.
+    if packet_wrapper.packet_type == PacketType::HEALTH.into() {
         return PacketKind::Health;
     }
 
-    // Default to data packet
     PacketKind::Data
 }
 
@@ -305,6 +326,62 @@ mod tests {
         };
         let bytes = wrapper.write_to_bytes().unwrap();
         assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+    }
+
+    #[test]
+    fn test_classify_keyframe_request() {
+        let media = MediaPacket {
+            media_type: MediaType::KEYFRAME_REQUEST.into(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::KeyframeRequest);
+    }
+
+    #[test]
+    fn test_classify_rtt_packet() {
+        let media = MediaPacket {
+            media_type: MediaType::RTT.into(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Rtt);
+    }
+
+    #[test]
+    fn test_classify_health_packet() {
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::HEALTH.into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Health);
+    }
+
+    #[test]
+    fn test_classify_regular_media_as_data() {
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Data);
     }
 
     #[test]

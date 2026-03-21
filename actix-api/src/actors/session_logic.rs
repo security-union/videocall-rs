@@ -23,9 +23,7 @@
 //! adapters while all business logic lives here.
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::packet_handler::{
-    classify_packet, is_keyframe_request, KeyframeRequestLimiter, PacketKind,
-};
+use crate::actors::packet_handler::{classify_packet, KeyframeRequestLimiter, PacketKind};
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
     CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
@@ -363,23 +361,28 @@ impl SessionLogic {
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
                 InboundAction::Processed
             }
+            PacketKind::KeyframeRequest => {
+                if self.observer {
+                    return InboundAction::Processed;
+                }
+                // Rate-limit KEYFRAME_REQUEST packets to prevent abuse.
+                // A malicious client could flood these to force senders to
+                // continuously generate expensive keyframes.
+                if !self.keyframe_limiter.allow() {
+                    warn!(
+                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {})",
+                        self.id, self.user_id
+                    );
+                    return InboundAction::Processed;
+                }
+                InboundAction::Forward(Arc::new(data.to_vec()))
+            }
             PacketKind::Data => {
                 if self.observer {
                     trace!(
                         "Observer session {} dropping media packet from {}",
                         self.id,
                         self.user_id
-                    );
-                    return InboundAction::Processed;
-                }
-
-                // Rate-limit KEYFRAME_REQUEST packets to prevent abuse.
-                // A malicious client could flood these to force senders to
-                // continuously generate expensive keyframes.
-                if is_keyframe_request(data) && !self.keyframe_limiter.allow() {
-                    warn!(
-                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {})",
-                        self.id, self.user_id
                     );
                     return InboundAction::Processed;
                 }

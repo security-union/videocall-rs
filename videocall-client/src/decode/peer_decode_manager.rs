@@ -465,15 +465,6 @@ impl Peer {
                 );
                 Ok((media_type, DecodeStatus::SKIPPED, None))
             }
-            MediaType::KEYFRAME_REQUEST => {
-                // KEYFRAME_REQUEST is handled by VideoCallClient before
-                // reaching the peer decoder. If one arrives here, just skip.
-                debug!(
-                    "Received KEYFRAME_REQUEST for peer {} - ignoring in peer decoder",
-                    self.session_id
-                );
-                Ok((media_type, DecodeStatus::SKIPPED))
-            }
             MediaType::MEDIA_TYPE_UNKNOWN => {
                 log::error!(
                     "Received packet with unknown media type from peer {}",
@@ -2072,7 +2063,7 @@ mod tests {
             "Visible peer should attempt video decode"
         );
         // If it got through to the decoder (Ok), it means visibility didn't block it.
-        if let Ok((_mt, status, _kf)) = result {
+        if let Ok((_mt, _status, _kf)) = result {
             // With noop decoder, rendered might be false, but the important
             // thing is that it wasn't the visibility-SKIPPED path.
             // We verify by checking that the visibility path was NOT taken.

@@ -20,8 +20,7 @@ use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::adaptive_quality_constants::{
     RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
-    RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES,
-    REELECTION_RTT_MULTIPLIER,
+    RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
 };
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
@@ -54,7 +53,6 @@ pub enum ConnectionState {
     Reconnecting {
         server_url: String,
         attempt: u32,
-        max_attempts: u32,
     },
     Failed {
         error: String,
@@ -505,13 +503,9 @@ impl ConnectionManager {
             on_state_changed.emit(ConnectionState::Reconnecting {
                 server_url: server_url.clone(),
                 attempt: 1,
-                max_attempts: RECONNECT_MAX_ATTEMPTS,
             });
 
-            info!(
-                "Active connection lost, starting automatic reconnection (max {} attempts)",
-                RECONNECT_MAX_ATTEMPTS
-            );
+            info!("Active connection lost, starting automatic reconnection (unlimited retries with backoff)");
 
             // Launch the async reconnection loop.
             let reconnection_phase_clone = reconnection_phase.clone();
@@ -794,14 +788,8 @@ impl ConnectionManager {
             }
 
             attempt += 1;
-            if attempt > RECONNECT_MAX_ATTEMPTS {
-                break;
-            }
 
-            info!(
-                "Reconnection attempt {}/{} — waiting {}ms",
-                attempt, RECONNECT_MAX_ATTEMPTS, delay_ms
-            );
+            info!("Reconnection attempt {} — waiting {}ms", attempt, delay_ms);
 
             // Update phase and emit state so the UI can show progress.
             *reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
@@ -811,7 +799,6 @@ impl ConnectionManager {
             on_state_changed.emit(ConnectionState::Reconnecting {
                 server_url: last_server_url.clone(),
                 attempt,
-                max_attempts: RECONNECT_MAX_ATTEMPTS,
             });
 
             // Wait with exponential backoff.
@@ -862,7 +849,7 @@ impl ConnectionManager {
                     }
                     Err(_) => {
                         warn!("Reconnection attempt {attempt}: could not borrow manager (busy), will retry");
-                        attempt = attempt.saturating_sub(1); // Don't count this toward the limit
+                        attempt = attempt.saturating_sub(1); // Don't count a borrow-conflict as an attempt
                     }
                 }
             }
@@ -940,21 +927,11 @@ impl ConnectionManager {
                 RECONNECT_MAX_DELAY_MS,
             );
         }
-
-        // All attempts exhausted.
-        error!(
-            "Reconnection failed after {} attempts — giving up",
-            RECONNECT_MAX_ATTEMPTS
-        );
-
-        *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
-        on_state_changed.emit(ConnectionState::Failed {
-            error: format!(
-                "Reconnection failed after {} attempts",
-                RECONNECT_MAX_ATTEMPTS
-            ),
-            last_known_server: Some(last_server_url),
-        });
+        // The loop only exits via `return`:
+        //   (a) successful reconnection
+        //   (b) intentional disconnect
+        //   (c) consecutive zero-connection fast-fail (auth/server rejection)
+        //   (d) manager dropped
     }
 
     /// Returns the current reconnection phase.
@@ -1547,8 +1524,7 @@ mod tests {
     use super::*;
     use crate::adaptive_quality_constants::{
         RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
-        RECONNECT_MAX_ATTEMPTS, RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES,
-        REELECTION_RTT_MULTIPLIER,
+        RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
     };
 
     // -----------------------------------------------------------------------
@@ -1697,14 +1673,14 @@ mod tests {
             delays.push(delay);
         }
 
-        // With multiplier 2.0 and initial 1000:
-        // 1000, 2000, 4000, 8000, 16000, 16000 (capped)
-        assert_eq!(delays[0], 1000);
-        assert_eq!(delays[1], 2000);
-        assert_eq!(delays[2], 4000);
-        assert_eq!(delays[3], 8000);
-        assert_eq!(delays[4], 16000);
-        assert_eq!(delays[5], 16000); // capped at max
+        // With multiplier 2.0 and initial 500, max 2000:
+        // 500, 1000, 2000, 2000, 2000, 2000 (capped)
+        assert_eq!(delays[0], 500);
+        assert_eq!(delays[1], 1000);
+        assert_eq!(delays[2], 2000);
+        assert_eq!(delays[3], 2000); // capped at max
+        assert_eq!(delays[4], 2000);
+        assert_eq!(delays[5], 2000);
     }
 
     #[test]
@@ -1715,10 +1691,10 @@ mod tests {
     }
 
     #[test]
-    fn backoff_reaches_max_within_max_attempts() {
-        // Verify that RECONNECT_MAX_ATTEMPTS is sufficient to reach the cap.
+    fn backoff_reaches_max_quickly() {
+        // With initial=500, mult=2.0, max=2000, the cap is reached by attempt 2.
         let mut delay = RECONNECT_INITIAL_DELAY_MS;
-        for _ in 0..RECONNECT_MAX_ATTEMPTS {
+        for _ in 0..3 {
             delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_MAX_DELAY_MS);
         }
         assert_eq!(delay, RECONNECT_MAX_DELAY_MS);
@@ -1882,20 +1858,15 @@ mod tests {
     }
 
     #[test]
-    fn max_attempts_is_ten() {
-        assert_eq!(RECONNECT_MAX_ATTEMPTS, 10);
-    }
-
-    #[test]
-    fn fast_fail_triggers_before_max_attempts() {
-        // RECONNECT_CONSECUTIVE_ZERO_LIMIT (3) < RECONNECT_MAX_ATTEMPTS (10)
-        // so fast-fail kicks in well before the attempt limit.
-        let limit: u32 = RECONNECT_CONSECUTIVE_ZERO_LIMIT;
-        let max: u32 = RECONNECT_MAX_ATTEMPTS;
-        assert!(
-            limit < max,
-            "fast-fail limit should be less than max attempts"
-        );
+    fn reconnect_retries_indefinitely() {
+        // There is no RECONNECT_MAX_ATTEMPTS constant -- the client retries
+        // indefinitely. The only hard stop is RECONNECT_CONSECUTIVE_ZERO_LIMIT
+        // (consecutive auth/server rejections). Verify the constants reflect this.
+        assert_eq!(RECONNECT_INITIAL_DELAY_MS, 500);
+        assert_eq!(RECONNECT_MAX_DELAY_MS, 2000);
+        assert_eq!(RECONNECT_BACKOFF_MULTIPLIER, 2.0);
+        // fast-fail limit is a small number so it triggers quickly on auth failures
+        assert!(RECONNECT_CONSECUTIVE_ZERO_LIMIT <= 5);
     }
 
     // ===================================================================
@@ -2069,7 +2040,6 @@ mod tests {
         let reconnecting = ConnectionState::Reconnecting {
             server_url: "wss://test".to_string(),
             attempt: 3,
-            max_attempts: 10,
         };
         assert!(matches!(reconnecting, ConnectionState::Reconnecting { .. }));
 
@@ -2086,22 +2056,21 @@ mod tests {
 
     #[test]
     fn full_backoff_sequence_matches_expected() {
-        // Simulate the exact sequence the reconnection loop would produce.
+        // Simulate several iterations of the reconnection loop's backoff.
+        // The loop runs indefinitely, so we just verify the first N steps.
         let mut delay = RECONNECT_INITIAL_DELAY_MS;
         let mut sequence = vec![];
 
-        for _ in 0..RECONNECT_MAX_ATTEMPTS {
+        for _ in 0..8 {
             sequence.push(delay);
             delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_MAX_DELAY_MS);
         }
 
-        // With initial=1000, mult=2.0, max=16000, 10 attempts:
-        // [1000, 2000, 4000, 8000, 16000, 16000, 16000, 16000, 16000, 16000]
-        assert_eq!(sequence[0], 1000);
-        assert_eq!(sequence[1], 2000);
-        assert_eq!(sequence[2], 4000);
-        assert_eq!(sequence[3], 8000);
-        for delay in &sequence[4..] {
+        // With initial=500, mult=2.0, max=2000:
+        // [500, 1000, 2000, 2000, 2000, 2000, 2000, 2000]
+        assert_eq!(sequence[0], 500);
+        assert_eq!(sequence[1], 1000);
+        for delay in &sequence[2..] {
             assert_eq!(*delay, RECONNECT_MAX_DELAY_MS);
         }
     }

@@ -303,19 +303,21 @@ pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
 // ---------------------------------------------------------------------------
 
 /// Initial reconnection delay (milliseconds).
-pub const RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
+/// Kept low so the first retry fires quickly after a transient drop.
+pub const RECONNECT_INITIAL_DELAY_MS: u64 = 500;
 
 /// Maximum reconnection delay (milliseconds). Exponential backoff caps here.
-pub const RECONNECT_MAX_DELAY_MS: u64 = 16000;
+/// Capped at 2 seconds so the user never waits long between attempts --
+/// a video call client should keep trying indefinitely but still back off
+/// enough to avoid hammering a downed server.
+pub const RECONNECT_MAX_DELAY_MS: u64 = 2000;
 
 /// Backoff multiplier per attempt.
 pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
 
-/// Maximum number of reconnection attempts before giving up.
-pub const RECONNECT_MAX_ATTEMPTS: u32 = 10;
-
 /// Stop reconnection if this many consecutive attempts yield zero successful
-/// connections (no server responds at all). This catches auth failures and
+/// connections (no server responds at all). Because the client retries
+/// indefinitely, this is the only hard stop: it catches auth failures and
 /// server rejections early, avoiding futile retries that waste resources and
 /// may trigger server-side rate limiting.
 pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 3;

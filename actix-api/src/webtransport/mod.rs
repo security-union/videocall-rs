@@ -604,9 +604,9 @@ mod tests {
             || {
                 let session = session_clone.clone();
                 async move {
-                    // Race between uni stream and datagram since MEDIA packets
-                    // may arrive via either transport (send_auto routes small
-                    // MEDIA packets as datagrams for lower latency).
+                    // Race between uni stream and datagram since non-MEDIA
+                    // packets (e.g., MEETING, AES_KEY) may arrive via datagrams
+                    // (send_auto routes small control packets as datagrams).
                     let buf = tokio::select! {
                         Ok(mut stream) = session.accept_uni() => {
                             stream.read_to_end(usize::MAX).await.ok()
@@ -744,9 +744,9 @@ mod tests {
             || {
                 let session = session_b_recv.clone();
                 async move {
-                    // Race between uni stream and datagram since MEDIA packets
-                    // may arrive via either transport (send_auto routes small
-                    // MEDIA packets as datagrams for lower latency).
+                    // Race between uni stream and datagram since non-MEDIA
+                    // packets (e.g., MEETING, AES_KEY) may arrive via datagrams
+                    // (send_auto routes small control packets as datagrams).
                     let buf = tokio::select! {
                         Ok(mut stream) = session.accept_uni() => {
                             stream.read_to_end(usize::MAX).await.ok()

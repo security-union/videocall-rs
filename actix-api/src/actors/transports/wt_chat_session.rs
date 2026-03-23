@@ -22,7 +22,7 @@
 //! to `SessionLogic`. It handles WebTransport-specific I/O via channels.
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::packet_handler::should_use_datagram;
+use crate::actors::packet_handler::DATAGRAM_MAX_SIZE;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
 use crate::messages::server::{ActivateConnection, Packet};
@@ -34,9 +34,12 @@ use actix::{
     Handler, Message as ActixMessage, Running, WrapFuture,
 };
 use bytes::Bytes;
+use protobuf::Message as ProtobufMessage;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
@@ -165,8 +168,12 @@ impl WtChatSession {
     /// Media packets (VIDEO, AUDIO, SCREEN) that fit within the datagram MTU
     /// are sent via unreliable datagrams for lower latency. Control packets
     /// and oversized media packets use reliable unidirectional streams.
-    fn send_auto(&self, data: Vec<u8>) -> WtSendResult {
-        let outbound = if should_use_datagram(&data) {
+    ///
+    /// The `is_media` hint is pre-computed by the caller from an already-parsed
+    /// `PacketWrapper`, avoiding a redundant protobuf parse on every outbound
+    /// packet.
+    fn send_auto(&self, data: Vec<u8>, is_media: bool) -> WtSendResult {
+        let outbound = if is_media && data.len() <= DATAGRAM_MAX_SIZE {
             WtOutbound::Datagram(data.into())
         } else {
             WtOutbound::UniStream(data.into())
@@ -301,21 +308,42 @@ impl Actor for WtChatSession {
 /// Uses `send_auto` to route media packets via datagrams (low latency)
 /// and control packets via reliable streams. This mirrors the client-side
 /// routing where VIDEO/AUDIO/SCREEN go through datagrams.
+///
+/// The outbound `msg.msg` is a serialized `PacketWrapper`. We parse it once
+/// to extract both the sender's `session_id` (for congestion tracking) and
+/// the `packet_type` (for datagram vs. stream routing), avoiding a second
+/// parse inside `send_auto`.
+///
+/// Note: `msg.session` is the **receiver's** session ID (set by
+/// `chat_server::handle_msg`), NOT the sender's. The sender's session ID
+/// lives inside the serialized `PacketWrapper.session_id` field.
 impl Handler<Message> for WtChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
-        let sender_session = msg.session;
         let bytes = self.logic.handle_outbound(&msg);
-        match self.send_auto(bytes) {
+
+        // Parse the PacketWrapper once to extract the sender's session_id
+        // and packet_type. This avoids a redundant parse in send_auto and
+        // ensures congestion tracking targets the correct (sender) session.
+        let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
+        let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
+        let is_media = parsed
+            .as_ref()
+            .map(|pw| pw.packet_type == PacketType::MEDIA.into())
+            .unwrap_or(false);
+
+        match self.send_auto(bytes, is_media) {
             WtSendResult::Sent => {}
             WtSendResult::Dead => {
                 ctx.stop();
             }
             WtSendResult::Dropped => {
-                // Outbound channel full -- record the drop for this sender
+                // Outbound channel full -- record the drop for the actual sender
                 // so we can send CONGESTION feedback when the threshold is exceeded.
-                self.logic.on_outbound_drop(sender_session);
+                if sender_session_id != 0 {
+                    self.logic.on_outbound_drop(sender_session_id);
+                }
             }
         }
     }

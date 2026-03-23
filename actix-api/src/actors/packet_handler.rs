@@ -95,50 +95,6 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
     PacketKind::Data
 }
 
-/// Check if a packet is a CONGESTION packet.
-///
-/// CONGESTION packets must only originate from the server's `CongestionTracker`.
-/// Client-originated CONGESTION packets are dropped to prevent a malicious client
-/// from forcing victims to degrade their video quality.
-pub fn is_congestion_packet(data: &[u8]) -> bool {
-    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-        return packet_wrapper.packet_type == PacketType::CONGESTION.into();
-    }
-    false
-}
-
-/// Check if a packet is an RTT (Round-Trip Time) measurement packet.
-///
-/// RTT packets are used to measure network latency and should be
-/// echoed back to the sender immediately without forwarding to other peers.
-pub fn is_rtt_packet(data: &[u8]) -> bool {
-    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-        if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-            if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                return media_packet.media_type == MediaType::RTT.into();
-            }
-        }
-    }
-    false
-}
-
-/// Check if a MEDIA packet contains a KEYFRAME_REQUEST.
-///
-/// Attempts to parse the inner `MediaPacket` from the `PacketWrapper.data` field.
-/// If the inner packet is AES-encrypted (as in normal media flow), parsing will
-/// fail and this returns `false`. This check is effective for unencrypted control
-/// packets and serves as an additional defence layer.
-pub fn is_keyframe_request(data: &[u8]) -> bool {
-    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-        if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-            if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                return media_packet.media_type == MediaType::KEYFRAME_REQUEST.into();
-            }
-        }
-    }
-    false
-}
-
 /// Per-session rate limiter for KEYFRAME_REQUEST packets.
 ///
 /// Tracks the number of KEYFRAME_REQUEST packets forwarded within a sliding
@@ -192,41 +148,59 @@ impl KeyframeRequestLimiter {
 /// than this are sent via reliable unidirectional streams instead.
 pub const DATAGRAM_MAX_SIZE: usize = 1200;
 
-/// Check if a packet contains real-time media data (VIDEO, AUDIO, or SCREEN)
-/// that benefits from low-latency datagram delivery.
-///
-/// Control packets (HEARTBEAT, RTT, KEYFRAME_REQUEST, DIAGNOSTICS, HEALTH)
-/// are NOT considered media for this purpose because they require reliable
-/// delivery.
-///
-/// Note: the inner `MediaPacket` is AES-encrypted, so we cannot inspect the
-/// `media_type` field without decryption. However, the `PacketWrapper` still
-/// has the unencrypted `packet_type` field. Since only MEDIA packet types
-/// contain real-time audio/video/screen data, we use a size-based heuristic:
-/// MEDIA packets that are small enough for datagrams are sent unreliably.
-/// Large MEDIA packets (e.g., keyframes) fall back to streams.
-///
-/// This conservative approach means some control-type MEDIA packets (like
-/// HEARTBEAT) that happen to be small could be sent via datagram, but since
-/// heartbeats are also sent periodically, occasional loss is acceptable.
-pub fn should_use_datagram(data: &[u8]) -> bool {
-    if data.len() > DATAGRAM_MAX_SIZE {
-        return false;
-    }
-
-    // Only use datagrams for MEDIA packet type.
-    // Other types (RSA_PUB_KEY, AES_KEY, CONNECTION, DIAGNOSTICS, HEALTH,
-    // MEETING, SESSION_ASSIGNED, CONGESTION) must use reliable streams.
-    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-        return packet_wrapper.packet_type == PacketType::MEDIA.into();
-    }
-
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // Test-only helper functions
+    //
+    // These standalone is_* functions are used only by their own unit tests.
+    // Production code uses `classify_packet()` instead.
+    // =========================================================================
+
+    /// Check if a packet is a CONGESTION packet (test-only helper).
+    fn is_congestion_packet(data: &[u8]) -> bool {
+        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+            return packet_wrapper.packet_type == PacketType::CONGESTION.into();
+        }
+        false
+    }
+
+    /// Check if a packet is an RTT measurement packet (test-only helper).
+    fn is_rtt_packet(data: &[u8]) -> bool {
+        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+            if packet_wrapper.packet_type == PacketType::MEDIA.into() {
+                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+                    return media_packet.media_type == MediaType::RTT.into();
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if a MEDIA packet contains a KEYFRAME_REQUEST (test-only helper).
+    fn is_keyframe_request(data: &[u8]) -> bool {
+        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+            if packet_wrapper.packet_type == PacketType::MEDIA.into() {
+                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+                    return media_packet.media_type == MediaType::KEYFRAME_REQUEST.into();
+                }
+            }
+        }
+        false
+    }
+
+    /// Test-only helper that replicates the datagram routing logic from
+    /// `WtChatSession::send_auto`. Verifies that a pre-parsed `is_media`
+    /// flag plus size check produces the correct routing decision.
+    fn should_use_datagram(data: &[u8]) -> bool {
+        if let Ok(pw) = PacketWrapper::parse_from_bytes(data) {
+            let is_media = pw.packet_type == PacketType::MEDIA.into();
+            return is_media && data.len() <= DATAGRAM_MAX_SIZE;
+        }
+        false
+    }
 
     #[test]
     fn test_classify_empty_packet_as_data() {

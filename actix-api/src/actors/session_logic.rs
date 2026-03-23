@@ -96,6 +96,9 @@ struct SenderDropState {
 pub struct CongestionTracker {
     /// Drop state keyed by sender session ID.
     senders: HashMap<u64, SenderDropState>,
+    /// Total drops since the last stale-entry cleanup. Cleanup runs every
+    /// [`CLEANUP_INTERVAL`] drops to amortize the cost of `retain()`.
+    total_drops: u32,
 }
 
 impl Default for CongestionTracker {
@@ -104,10 +107,15 @@ impl Default for CongestionTracker {
     }
 }
 
+/// Number of drops between stale-entry cleanup passes. Amortizes the
+/// O(n) `retain()` cost so it does not run on every single drop.
+const CLEANUP_INTERVAL: u32 = 100;
+
 impl CongestionTracker {
     pub fn new() -> Self {
         Self {
             senders: HashMap::new(),
+            total_drops: 0,
         }
     }
 
@@ -117,17 +125,21 @@ impl CongestionTracker {
     /// exceeded and a CONGESTION notification should be sent. Returns `None`
     /// if the threshold has not been met or the notification is rate-limited.
     ///
-    /// Also performs opportunistic cleanup of stale entries: any sender whose
-    /// `window_start` is older than `CONGESTION_WINDOW * 10` (10 seconds of
-    /// inactivity) is removed. This prevents unbounded growth when transient
-    /// participants leave.
+    /// Performs amortized cleanup of stale entries every [`CLEANUP_INTERVAL`]
+    /// drops: any sender whose `window_start` is older than
+    /// `CONGESTION_WINDOW * 10` (10 seconds of inactivity) is removed. This
+    /// prevents unbounded growth when transient participants leave while
+    /// avoiding an O(n) `retain()` on every single drop.
     pub fn record_drop(&mut self, sender_session_id: u64) -> Option<u64> {
         let now = Instant::now();
 
-        // Opportunistic cleanup of stale sender entries.
-        let stale_threshold = CONGESTION_WINDOW * 10;
-        self.senders
-            .retain(|_, state| now.duration_since(state.window_start) <= stale_threshold);
+        // Amortized cleanup of stale sender entries.
+        self.total_drops = self.total_drops.wrapping_add(1);
+        if self.total_drops.is_multiple_of(CLEANUP_INTERVAL) {
+            let stale_threshold = CONGESTION_WINDOW * 10;
+            self.senders
+                .retain(|_, state| now.duration_since(state.window_start) <= stale_threshold);
+        }
 
         let state = self
             .senders
@@ -492,6 +504,9 @@ mod tests {
 
         assert_eq!(tracker.senders.len(), 2);
 
+        // Set total_drops so the next record_drop triggers cleanup.
+        tracker.total_drops = CLEANUP_INTERVAL - 1;
+
         // Recording a drop for a new sender should trigger cleanup.
         let trigger_id = 3000;
         tracker.record_drop(trigger_id);
@@ -689,6 +704,9 @@ mod tests {
 
         assert_eq!(tracker.senders.len(), 6);
 
+        // Set total_drops so the next record_drop triggers cleanup.
+        tracker.total_drops = CLEANUP_INTERVAL - 1;
+
         // Trigger cleanup by recording a drop.
         tracker.record_drop(200);
 
@@ -714,6 +732,9 @@ mod tests {
                 last_notify: None,
             },
         );
+
+        // Set total_drops so the next record_drop triggers cleanup.
+        tracker.total_drops = CLEANUP_INTERVAL - 1;
 
         tracker.record_drop(2);
 

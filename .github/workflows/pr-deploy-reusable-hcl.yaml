@@ -568,6 +568,8 @@ jobs:
             --set "env[12].value=info" \
             --set "env[13].name=COOKIE_NAME" \
             --set "env[13].value=pr${SLOT}-session" \
+            --set "env[14].name=SERVICE_VERSION_URLS" \
+            --set "env[14].value=http://websocket-pr-${PR_NUM}:8080/version\,http://dx-pr-${PR_NUM}:80/version.json\,http://ui-pr-${PR_NUM}:80/version.json" \
             --set "ingress.hosts[0].host=pr${SLOT}-api.preview.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

@@ -323,6 +323,25 @@ jobs:
 
           echo "✅ WebSocket server deployed"
 
+      - name: Deploy Metrics API
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Deploying Metrics API to ${NAMESPACE}..."
+
+          helm upgrade --install metrics-api helm/metrics-api/ \
+            --namespace ${NAMESPACE} \
+            --set metricsApi.image.repository=${REGISTRY}/videocall-media-server \
+            --set metricsApi.image.tag=${TAG} \
+            --set metricsApi.imagePullSecrets[0].name=harbor-pull-secret \
+            --set serverStats.image.repository=${REGISTRY}/videocall-media-server \
+            --set serverStats.image.tag=${TAG} \
+            --wait --timeout 5m
+
+          echo "✅ Metrics API deployed"
+
       - name: Deploy Meeting API
         run: |
           TAG=${{ steps.determine-tag.outputs.tag }}
@@ -373,6 +392,8 @@ jobs:
             --set "env[12].value=info" \
             --set "env[13].name=COOKIE_NAME" \
             --set "env[13].value=videocall-session" \
+            --set "env[14].name=SERVICE_VERSION_URLS" \
+            --set "env[14].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
             --set "ingress.hosts[0].host=api.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -432,6 +453,8 @@ jobs:
 
           kubectl rollout status deployment/videocall-webtransport -n ${NAMESPACE} --timeout=180s
           kubectl rollout status deployment/videocall-websocket -n ${NAMESPACE} --timeout=180s
+          kubectl rollout status deployment/client-metrics-api -n ${NAMESPACE} --timeout=180s
+          kubectl rollout status deployment/server-metrics-api -n ${NAMESPACE} --timeout=180s
           kubectl rollout status deployment/videocall-api -n ${NAMESPACE} --timeout=180s
           kubectl rollout status deployment/videocall-dioxus-ui -n ${NAMESPACE} --timeout=180s
 

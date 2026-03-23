@@ -33,6 +33,7 @@ use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
 
@@ -541,7 +542,15 @@ fn handle_msg(
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
         if msg.subject == format!("room.{room}.{session}").replace(' ', "_").into() {
-            return Ok(());
+            // Self-skip prevents echo of our own broadcasts. However,
+            // CONGESTION signals published on our subject by a congested
+            // receiver must still be delivered — they are not echo.
+            let is_congestion = PacketWrapper::parse_from_bytes(&msg.payload)
+                .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
+                .unwrap_or(false);
+            if !is_congestion {
+                return Ok(());
+            }
         }
         let message = Message {
             msg: msg.payload.to_vec(),

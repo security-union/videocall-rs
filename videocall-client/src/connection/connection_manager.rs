@@ -1015,9 +1015,9 @@ impl ConnectionManager {
         false
     }
 
-    /// Begin a re-election: create new connections to all servers while keeping the
-    /// current active connection alive. Once election completes, switch to the new
-    /// best server seamlessly.
+    /// Begin a re-election: tear down existing connections, reset monitoring
+    /// state, and create fresh connections to all servers. There is a brief
+    /// disconnection period while the new election runs and selects a winner.
     pub fn start_reelection(&mut self) -> Result<()> {
         if self.reelection_in_progress {
             info!("Re-election already in progress, skipping");
@@ -1027,6 +1027,7 @@ impl ConnectionManager {
         info!("Starting connection quality re-election");
         self.reelection_in_progress = true;
         self.degradation_counter = 0;
+        self.baseline_rtt = None;
 
         // Close the old active connection before creating new ones.
         // `create_all_connections` reuses the same connection IDs (ws_0, wt_0, ...),
@@ -1050,6 +1051,12 @@ impl ConnectionManager {
         // Drain stale RTT responses from the previous connections.
         if let Ok(mut responses) = self.rtt_responses.try_borrow_mut() {
             responses.clear();
+        }
+
+        // Clear pending session IDs — connection IDs are reused (ws_0, wt_0, …)
+        // so stale entries could be incorrectly applied to new connections.
+        if let Ok(mut pending) = self.pending_session_ids.try_borrow_mut() {
+            pending.clear();
         }
 
         // Create fresh connections to all servers for testing.

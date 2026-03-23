@@ -20,7 +20,7 @@ use gloo_utils::window;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::MediaStreamConstraints;
+use web_sys::{MediaStream, MediaStreamConstraints, MediaStreamTrack};
 
 #[derive(Clone, Copy)]
 pub enum MediaAccessKind {
@@ -129,6 +129,15 @@ impl MediaDeviceAccess {
         }
     }
 
+    /// Stop all tracks on a MediaStream so the browser releases the hardware
+    /// (camera light / microphone indicator turn off).
+    fn stop_tracks(stream: &MediaStream) {
+        for track in stream.get_tracks().iter() {
+            let track: MediaStreamTrack = track.unchecked_into();
+            track.stop();
+        }
+    }
+
     async fn request_audio_permissions() -> Result<(), MediaPermissionsErrorState> {
         let navigator = window().navigator();
         let media_devices = navigator
@@ -145,7 +154,10 @@ impl MediaDeviceAccess {
             .map_err(MediaPermissionsErrorState::Other)?;
 
         match JsFuture::from(promise).await {
-            Ok(_) => Ok(()),
+            Ok(stream) => {
+                Self::stop_tracks(&stream.unchecked_into());
+                Ok(())
+            }
 
             Err(err) => {
                 let name = js_sys::Reflect::get(&err, &JsValue::from_str("name"))
@@ -177,7 +189,10 @@ impl MediaDeviceAccess {
             .map_err(MediaPermissionsErrorState::Other)?;
 
         match JsFuture::from(promise).await {
-            Ok(_) => Ok(()),
+            Ok(stream) => {
+                Self::stop_tracks(&stream.unchecked_into());
+                Ok(())
+            }
 
             Err(err) => {
                 let name = js_sys::Reflect::get(&err, &JsValue::from_str("name"))

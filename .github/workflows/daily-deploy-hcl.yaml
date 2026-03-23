@@ -392,6 +392,8 @@ jobs:
             --set "env[12].value=info" \
             --set "env[13].name=COOKIE_NAME" \
             --set "env[13].value=videocall-session" \
+            --set "env[14].name=SERVICE_VERSION_URLS" \
+            --set "env[14].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
             --set "ingress.hosts[0].host=api.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

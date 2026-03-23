@@ -25,7 +25,9 @@ use crate::constants::users_allowed_to_stream;
 use crate::context::VideoCallClientCtx;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
-use web_sys::{window, HtmlCanvasElement};
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
+use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry};
 use yew::prelude::*;
 use yew::{html, Html};
 
@@ -250,19 +252,48 @@ fn user_video(props: &UserVideoProps) -> Html {
     let video_ref = use_node_ref();
     let client = use_context::<VideoCallClientCtx>().expect("VideoCallClient context missing");
 
-    // Pass canvas reference to client when mounted
+    // Pass canvas reference to client when mounted and set up IntersectionObserver
     {
         let video_ref = video_ref.clone();
         let peer_id = props.id.clone();
         let client = client.clone();
 
         use_effect_with(video_ref.clone(), move |_| {
+            let mut observer_handle: Option<IntersectionObserver> = None;
+
             if let Some(canvas) = video_ref.cast::<HtmlCanvasElement>() {
-                if let Err(e) = client.set_peer_video_canvas(&peer_id, canvas) {
+                if let Err(e) = client.set_peer_video_canvas(&peer_id, canvas.clone()) {
                     log::debug!("Canvas not yet ready for peer {peer_id}: {e:?}");
                 }
+
+                // Set up IntersectionObserver to track visibility
+                let client_for_observer = client.clone();
+                let peer_id_for_observer = peer_id.clone();
+                let callback = Closure::wrap(Box::new(
+                    move |entries: js_sys::Array, _observer: IntersectionObserver| {
+                        for entry in entries.iter() {
+                            let entry: IntersectionObserverEntry = entry.unchecked_into();
+                            let is_visible = entry.is_intersecting();
+                            client_for_observer
+                                .set_peer_visibility(&peer_id_for_observer, is_visible);
+                        }
+                    },
+                )
+                    as Box<dyn FnMut(js_sys::Array, IntersectionObserver)>);
+
+                if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
+                    observer.observe(&canvas);
+                    observer_handle = Some(observer);
+                }
+                callback.forget();
             }
-            || ()
+
+            move || {
+                // Clean up the observer on unmount
+                if let Some(observer) = observer_handle {
+                    observer.disconnect();
+                }
+            }
         });
     }
 
@@ -282,19 +313,47 @@ fn screen_canvas(props: &ScreenCanvasProps) -> Html {
     let canvas_ref = use_node_ref();
     let client = use_context::<VideoCallClientCtx>().expect("VideoCallClient context missing");
 
-    // Pass canvas reference to client when mounted
+    // Pass canvas reference to client when mounted and set up IntersectionObserver
     {
         let canvas_ref = canvas_ref.clone();
         let peer_id = props.peer_id.clone();
         let client = client.clone();
 
         use_effect_with(canvas_ref.clone(), move |_| {
+            let mut observer_handle: Option<IntersectionObserver> = None;
+
             if let Some(canvas) = canvas_ref.cast::<HtmlCanvasElement>() {
-                if let Err(e) = client.set_peer_screen_canvas(&peer_id, canvas) {
+                if let Err(e) = client.set_peer_screen_canvas(&peer_id, canvas.clone()) {
                     log::debug!("Screen canvas not yet ready for peer {peer_id}: {e:?}");
                 }
+
+                // Set up IntersectionObserver to track visibility for screen share
+                let client_for_observer = client.clone();
+                let peer_id_for_observer = peer_id.clone();
+                let callback = Closure::wrap(Box::new(
+                    move |entries: js_sys::Array, _observer: IntersectionObserver| {
+                        for entry in entries.iter() {
+                            let entry: IntersectionObserverEntry = entry.unchecked_into();
+                            let is_visible = entry.is_intersecting();
+                            client_for_observer
+                                .set_peer_visibility(&peer_id_for_observer, is_visible);
+                        }
+                    },
+                )
+                    as Box<dyn FnMut(js_sys::Array, IntersectionObserver)>);
+
+                if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
+                    observer.observe(&canvas);
+                    observer_handle = Some(observer);
+                }
+                callback.forget();
             }
-            || ()
+
+            move || {
+                if let Some(observer) = observer_handle {
+                    observer.disconnect();
+                }
+            }
         });
     }
 

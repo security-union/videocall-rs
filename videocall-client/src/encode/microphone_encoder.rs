@@ -16,9 +16,12 @@
  * conditions.
  */
 
+use crate::adaptive_quality_constants::{
+    AUDIO_QUALITY_TIERS, AUDIO_REDUNDANCY_ENABLED, AUDIO_RED_FORMAT, VAD_POLL_INTERVAL_MS,
+};
 use crate::audio_constants::{
     rms_to_intensity, AUDIO_LEVEL_DELTA_THRESHOLD, DEFAULT_VAD_THRESHOLD, VAD_FFT_SIZE,
-    VAD_POLL_INTERVAL_MS, VAD_SMOOTHING_TIME_CONSTANT,
+    VAD_SMOOTHING_TIME_CONSTANT,
 };
 use crate::audio_worklet_codec::EncoderInitOptions;
 use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
@@ -28,8 +31,6 @@ use crate::crypto::aes::Aes128State;
 use crate::encode::encoder_state::EncoderState;
 use crate::wrappers::EncodedAudioChunkTypeWrapper;
 use crate::VideoCallClient;
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
 use gloo::timers::callback::Interval;
 use gloo_utils::window;
 use js_sys::Array;
@@ -38,8 +39,7 @@ use js_sys::Uint8Array;
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::{
     media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
@@ -59,26 +59,62 @@ use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
 use web_time::SystemTime;
 
+/// Holds the previous audio frame for RED-style redundancy.
+pub(crate) struct PreviousAudioFrame {
+    data: Vec<u8>,
+    sequence: u64,
+}
+
+/// Pack primary and redundant audio frames into a single data buffer.
+///
+/// Format: `[4-byte primary_len LE][primary_data][4-byte redundant_seq LE][redundant_data]`
+///
+/// The receiver uses `primary_len` to split the buffer and `redundant_seq`
+/// to check whether the redundant frame was already received.
+fn pack_redundant_audio(primary: &[u8], redundant: &PreviousAudioFrame) -> Vec<u8> {
+    let primary_len = primary.len() as u32;
+    let redundant_seq = redundant.sequence as u32;
+    let total_len = 4 + primary.len() + 4 + redundant.data.len();
+    let mut buf = Vec::with_capacity(total_len);
+    buf.extend_from_slice(&primary_len.to_le_bytes());
+    buf.extend_from_slice(primary);
+    buf.extend_from_slice(&redundant_seq.to_le_bytes());
+    buf.extend_from_slice(&redundant.data);
+    buf
+}
+
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,
     user_id: &str,
     sequence: u64,
     aes: Rc<Aes128State>,
+    previous_frame: Option<&PreviousAudioFrame>,
 ) -> PacketWrapper {
     let now_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_millis() as f64;
-    // chunk length in bytes
+
+    let primary_data = chunk.to_vec();
+
+    // Determine whether to include redundancy.
+    let (data, audio_format) = match previous_frame {
+        Some(prev) => {
+            let packed = pack_redundant_audio(&primary_data, prev);
+            (packed, AUDIO_RED_FORMAT.to_string())
+        }
+        None => (primary_data, String::new()),
+    };
 
     let media_packet: MediaPacket = MediaPacket {
         user_id: Vec::new(),
         media_type: MediaType::AUDIO.into(),
         frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
-        data: chunk.to_vec(),
+        data,
         timestamp: now_ms,
         audio_metadata: Some(AudioMetadata {
             sequence,
+            audio_format,
             ..Default::default()
         })
         .into(),
@@ -103,16 +139,39 @@ pub struct MicrophoneEncoder {
     is_speaking: Rc<AtomicBool>,
     vad_interval: Rc<RefCell<Option<Interval>>>,
     vad_threshold: f32,
+    /// Tier-controlled audio bitrate in bps (e.g. 50000 for 50 kbps).
+    /// Shared with the camera encoder's quality manager.
+    /// Currently not read at runtime because the AudioWorklet does not
+    /// support dynamic bitrate reconfiguration. Kept for forward-
+    /// compatibility when the worklet gains that capability.
+    #[allow(dead_code)]
+    tier_audio_bitrate: Rc<AtomicU32>,
+    /// Whether the current audio tier has FEC enabled.
+    /// When true AND `AUDIO_REDUNDANCY_ENABLED`, each packet carries the
+    /// previous frame as redundant data for loss recovery.
+    tier_enable_fec: Rc<AtomicBool>,
 }
 
 impl MicrophoneEncoder {
+    /// Construct a microphone encoder.
+    ///
+    /// `shared_audio_tier_bitrate` and `shared_audio_tier_fec` are shared
+    /// atomics owned by the `CameraEncoder`. The camera encoder's quality
+    /// manager writes to these when the audio tier changes, and the
+    /// microphone encoder reads them to apply the current audio settings.
+    /// This avoids creating a duplicate `EncoderBitrateController` that
+    /// would redundantly process the same diagnostics packets.
     pub fn new(
         client: VideoCallClient,
         _bitrate_kbps: u32,
         on_encoder_settings_update: Callback<String>,
         on_error: Callback<String>,
         vad_threshold: Option<f32>,
+        shared_audio_tier_bitrate: Option<Rc<AtomicU32>>,
+        shared_audio_tier_fec: Option<Rc<AtomicBool>>,
     ) -> Self {
+        let default_audio_bitrate_bps = AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000;
+        let default_enable_fec = AUDIO_QUALITY_TIERS[0].enable_fec;
         Self {
             client,
             state: EncoderState::new(),
@@ -122,26 +181,15 @@ impl MicrophoneEncoder {
             is_speaking: Rc::new(AtomicBool::new(false)),
             vad_interval: Rc::new(RefCell::new(None)),
             vad_threshold: vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD),
+            tier_audio_bitrate: shared_audio_tier_bitrate
+                .unwrap_or_else(|| Rc::new(AtomicU32::new(default_audio_bitrate_bps))),
+            tier_enable_fec: shared_audio_tier_fec
+                .unwrap_or_else(|| Rc::new(AtomicBool::new(default_enable_fec))),
         }
     }
 
     pub fn set_error_callback(&mut self, on_error: Callback<String>) {
         self.on_error = Some(on_error);
-    }
-
-    pub fn set_encoder_control(
-        &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-    ) {
-        // Consume the diagnostics receiver in an async task to prevent "receiver is gone" errors
-        // For Microphone encoder, we'll just consume the packets without processing them for now
-        // since Microphone encoder doesn't support dynamic bitrate control yet
-        wasm_bindgen_futures::spawn_local(async move {
-            while let Some(_packet) = diagnostics_receiver.next().await {
-                // TODO: Implement bitrate control for Microphone encoder if needed
-                // For now, just consume the packets to prevent the "receiver is gone" error
-            }
-        });
     }
 
     // delegates to self.state
@@ -211,11 +259,16 @@ impl MicrophoneEncoder {
 
         // Clone atomic values for use in different closures
         let enabled_for_handler = enabled.clone();
+        let enable_fec_for_handler = self.tier_enable_fec.clone();
 
         let audio_output_handler = {
             log::info!("Starting Microphone audio encoder with AnalyserNode VAD");
-            let mut sequence_number = 0;
+            let mut sequence_number: u64 = 0;
             let client_for_send = client.clone();
+            // Buffer for RED-style redundancy: stores the previous frame's
+            // encoded data and sequence number so it can be included in the
+            // next packet for loss recovery.
+            let mut previous_frame: Option<PreviousAudioFrame> = None;
 
             Box::new(move |chunk: MessageEvent| {
                 // Check if encoder should stop
@@ -240,9 +293,34 @@ impl MicrophoneEncoder {
 
                 let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
-                    let packet: PacketWrapper =
-                        transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
-                    client_for_send.send_packet(packet);
+                    // Decide whether to include redundancy based on the
+                    // AUDIO_REDUNDANCY_ENABLED constant and the current tier's
+                    // enable_fec flag.
+                    let use_redundancy = AUDIO_REDUNDANCY_ENABLED
+                        && enable_fec_for_handler.load(Ordering::Relaxed)
+                        && previous_frame.is_some();
+
+                    let red_ref = if use_redundancy {
+                        previous_frame.as_ref()
+                    } else {
+                        None
+                    };
+
+                    let packet: PacketWrapper = transform_audio_chunk(
+                        &data,
+                        &user_id,
+                        sequence_number,
+                        aes.clone(),
+                        red_ref,
+                    );
+                    client_for_send.send_media_packet(packet);
+
+                    // Store current frame as the previous frame for the next
+                    // iteration's redundancy payload.
+                    previous_frame = Some(PreviousAudioFrame {
+                        data: data.to_vec(),
+                        sequence: sequence_number,
+                    });
                     sequence_number += 1;
                 } else {
                     log::error!("Received non-MessageEvent: {chunk:?}");
@@ -407,12 +485,20 @@ impl MicrophoneEncoder {
             codec.set_onmessage(output_handler.as_ref().unchecked_ref());
             output_handler.forget();
 
+            // Use the tier-controlled bitrate (defaults to AUDIO_QUALITY_TIERS[0]),
+            // and pass FEC/DTX settings from the initial audio tier.
+            // NOTE: FEC and DTX require AudioWorklet support; the fields are
+            // serialized here for forward-compatibility but the worklet currently
+            // ignores them.  See audio_worklet_codec.rs for details.
+            let initial_tier = &AUDIO_QUALITY_TIERS[0];
             let _ = codec.send_message(&CodecMessages::Init {
                 options: Some(EncoderInitOptions {
                     encoder_frame_size: Some(20), // 20ms frames for 50Hz rate
                     original_sample_rate: Some(input_rate),
-                    encoder_bit_rate: Some(50_000_u32),
+                    encoder_bit_rate: Some(initial_tier.bitrate_kbps * 1000),
                     encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
+                    encoder_fec: Some(initial_tier.enable_fec),
+                    encoder_dtx: Some(initial_tier.enable_dtx),
                     ..Default::default()
                 }),
             });
@@ -562,5 +648,170 @@ impl MicrophoneEncoder {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::neteq_audio_decoder::NetEqAudioPeerDecoder;
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    fn pack_normal_primary_and_redundant() {
+        let primary = b"hello_primary";
+        let redundant = PreviousAudioFrame {
+            data: b"prev_frame".to_vec(),
+            sequence: 42,
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        // Verify total length: 4 + primary.len() + 4 + redundant.len()
+        assert_eq!(packed.len(), 4 + 13 + 4 + 10);
+
+        // Verify primary_len field (first 4 bytes, little-endian)
+        let primary_len = u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+        assert_eq!(primary_len, 13);
+
+        // Verify primary data
+        assert_eq!(&packed[4..4 + 13], b"hello_primary");
+
+        // Verify redundant_seq field
+        let redundant_seq = u32::from_le_bytes([packed[17], packed[18], packed[19], packed[20]]);
+        assert_eq!(redundant_seq, 42);
+
+        // Verify redundant data
+        assert_eq!(&packed[21..], b"prev_frame");
+    }
+
+    #[wasm_bindgen_test]
+    fn pack_empty_primary() {
+        let primary = b"";
+        let redundant = PreviousAudioFrame {
+            data: b"redundant_data".to_vec(),
+            sequence: 0,
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        // 4 (primary_len) + 0 (primary) + 4 (redundant_seq) + 14 (redundant)
+        assert_eq!(packed.len(), 22);
+
+        let primary_len = u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+        assert_eq!(primary_len, 0);
+
+        // Redundant seq starts immediately after primary_len + 0 bytes of data
+        let redundant_seq = u32::from_le_bytes([packed[4], packed[5], packed[6], packed[7]]);
+        assert_eq!(redundant_seq, 0);
+
+        assert_eq!(&packed[8..], b"redundant_data");
+    }
+
+    #[wasm_bindgen_test]
+    fn pack_empty_redundant_data() {
+        let primary = b"some_audio";
+        let redundant = PreviousAudioFrame {
+            data: vec![],
+            sequence: 100,
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        // 4 (primary_len) + 10 (primary) + 4 (redundant_seq) + 0 (redundant)
+        assert_eq!(packed.len(), 18);
+
+        let primary_len = u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+        assert_eq!(primary_len, 10);
+
+        assert_eq!(&packed[4..14], b"some_audio");
+
+        let redundant_seq = u32::from_le_bytes([packed[14], packed[15], packed[16], packed[17]]);
+        assert_eq!(redundant_seq, 100);
+
+        // No redundant data after the seq
+        assert_eq!(packed.len(), 18);
+    }
+
+    #[wasm_bindgen_test]
+    fn pack_typical_opus_frame_size() {
+        // Typical Opus frame at 50kbps, 20ms = ~125 bytes
+        let primary: Vec<u8> = (0..120).collect();
+        let redundant = PreviousAudioFrame {
+            data: (0..100).collect(),
+            sequence: 9999,
+        };
+
+        let packed = pack_redundant_audio(&primary, &redundant);
+
+        assert_eq!(packed.len(), 4 + 120 + 4 + 100);
+
+        let primary_len = u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+        assert_eq!(primary_len, 120);
+
+        assert_eq!(&packed[4..124], primary.as_slice());
+
+        let redundant_seq =
+            u32::from_le_bytes([packed[124], packed[125], packed[126], packed[127]]);
+        assert_eq!(redundant_seq, 9999);
+
+        assert_eq!(&packed[128..], redundant.data.as_slice());
+    }
+
+    #[wasm_bindgen_test]
+    fn pack_large_sequence_number_truncation() {
+        // Sequence number > u32::MAX should be truncated to lower 32 bits
+        let primary = b"data";
+        let redundant = PreviousAudioFrame {
+            data: b"red".to_vec(),
+            sequence: (u32::MAX as u64) + 5, // 0x1_0000_0004
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        let redundant_seq = u32::from_le_bytes([packed[8], packed[9], packed[10], packed[11]]);
+        // u64 0x1_0000_0004 cast to u32 = 4
+        assert_eq!(redundant_seq, 4);
+    }
+
+    #[wasm_bindgen_test]
+    fn round_trip_pack_then_unpack() {
+        let primary = b"primary_audio_frame_data";
+        let redundant = PreviousAudioFrame {
+            data: b"redundant_audio_frame".to_vec(),
+            sequence: 77,
+        };
+
+        let packed = pack_redundant_audio(primary, &redundant);
+
+        // Unpack using the decoder's function
+        let result = NetEqAudioPeerDecoder::unpack_red_audio_public(&packed);
+        assert!(
+            result.is_some(),
+            "unpack should succeed for valid packed data"
+        );
+
+        let (unpacked_primary, unpacked_seq, unpacked_redundant) = result.unwrap();
+        assert_eq!(unpacked_primary, primary);
+        assert_eq!(unpacked_seq, 77);
+        assert_eq!(unpacked_redundant, redundant.data);
+    }
+
+    #[wasm_bindgen_test]
+    fn round_trip_with_typical_opus_sizes() {
+        let primary: Vec<u8> = (0..80).collect();
+        let redundant = PreviousAudioFrame {
+            data: (0..60).collect(),
+            sequence: 12345,
+        };
+
+        let packed = pack_redundant_audio(&primary, &redundant);
+        let result = NetEqAudioPeerDecoder::unpack_red_audio_public(&packed);
+        assert!(result.is_some());
+
+        let (unpacked_primary, unpacked_seq, unpacked_redundant) = result.unwrap();
+        assert_eq!(unpacked_primary, primary);
+        assert_eq!(unpacked_seq, 12345);
+        assert_eq!(unpacked_redundant, redundant.data);
     }
 }

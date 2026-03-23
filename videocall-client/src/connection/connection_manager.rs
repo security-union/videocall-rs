@@ -848,8 +848,10 @@ impl ConnectionManager {
                         }
                     }
                     Err(_) => {
-                        warn!("Reconnection attempt {attempt}: could not borrow manager (busy), will retry");
+                        warn!("Reconnection: could not borrow manager (busy), retrying in 200ms");
                         attempt = attempt.saturating_sub(1); // Don't count a borrow-conflict as an attempt
+                        gloo_timers::future::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
                     }
                 }
             }
@@ -861,12 +863,11 @@ impl ConnectionManager {
                 .await;
 
             // Check the result. Again scope the borrow tightly.
-            let connected = {
-                match manager_rc.try_borrow() {
-                    Ok(mgr) => mgr.is_connected(),
-                    Err(_) => false,
-                }
-            };
+            // Borrow failure means unknown — treat as not-yet-connected and retry.
+            let connected = manager_rc
+                .try_borrow()
+                .map(|mgr| mgr.is_connected())
+                .unwrap_or(false);
 
             if connected {
                 info!("Reconnection successful on attempt {attempt}");
@@ -889,18 +890,23 @@ impl ConnectionManager {
             // Only increment the zero-connection counter when the server truly did
             // not respond at all (likely auth rejection). If some connections were
             // made but election still failed (e.g. poor RTT), reset the counter.
-            let any_connections = {
-                match manager_rc.try_borrow() {
-                    Ok(mgr) => mgr.connections.values().any(|c| c.is_connected()),
-                    Err(_) => false,
-                }
+            let any_connections = match manager_rc.try_borrow() {
+                Ok(mgr) => Some(mgr.connections.values().any(|c| c.is_connected())),
+                Err(_) => None, // borrow conflict — unknown, don't count
             };
 
-            if any_connections {
-                // Some servers responded — reset the zero-connection counter.
-                consecutive_zero_connections = 0;
-            } else {
-                consecutive_zero_connections += 1;
+            match any_connections {
+                Some(true) => {
+                    // Some servers responded — reset the zero-connection counter.
+                    consecutive_zero_connections = 0;
+                }
+                Some(false) => {
+                    consecutive_zero_connections += 1;
+                }
+                None => {
+                    // Borrow conflict — neither increment nor reset.
+                    warn!("Reconnection: could not check connection state (manager busy)");
+                }
             }
             if consecutive_zero_connections >= RECONNECT_CONSECUTIVE_ZERO_LIMIT {
                 error!(

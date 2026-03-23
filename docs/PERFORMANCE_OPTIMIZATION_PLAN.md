@@ -42,7 +42,7 @@ The investigation covered five areas: adaptive bitrate control, network transpor
 | B3 | **No DTX (Discontinuous Transmission)** | Full Opus audio frames sent during silence | Wasted bandwidth when nobody is speaking |
 | B4 | **VAD polls every 50ms when muted** | 50ms timer runs even when microphone is muted | Unnecessary CPU/timer overhead |
 | B5 | **All peers decoded regardless of visibility** | Off-screen or minimized peer tiles still fully decode | Wasted CPU in large calls |
-| B6 | **WebTransport uses reliable streams for media** | Unidirectional streams (reliable/ordered) instead of datagrams | Head-of-line blocking: one lost packet delays all subsequent packets |
+| B6 | **WebTransport datagram/stream routing** | Media (VIDEO, AUDIO, SCREEN) uses reliable streams to avoid artifacts; control packets (heartbeats, RTT, diagnostics) use unreliable datagrams for lower overhead | Correct trade-off: media integrity preserved, expendable control traffic has minimal overhead |
 
 ### C. Resilience & Quality Gaps
 
@@ -532,20 +532,19 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 - `videocall-client/src/connection/connection_controller.rs` — RTT threshold monitoring
 - `videocall-client/src/adaptive_quality_constants.rs` — `REELECTION_RTT_MULTIPLIER`, `REELECTION_CONSECUTIVE_SAMPLES`
 
-#### 2.3 — WebTransport Datagrams for Media
+#### 2.3 — WebTransport Datagram/Stream Routing Policy (DONE)
 
-**Problem:** All media uses reliable unidirectional streams, causing head-of-line blocking — one lost packet delays all subsequent packets on that stream.
-
-**Solution:**
-- Use WebTransport datagrams (unreliable, unordered) for video and audio media packets
-- Keep unidirectional streams for control messages (keyframe requests, diagnostics, heartbeats)
-- Application layer handles packet loss gracefully (jitter buffer already designed for this)
-- Implement MTU-aware fragmentation for large video frames that exceed datagram size limits
+**Routing policy:**
+- **Media (VIDEO, AUDIO, SCREEN) -> reliable unidirectional streams.** Media packets require reliable delivery to avoid visual/audio artifacts from packet loss. The jitter buffer handles reordering and timing, but cannot recover missing data.
+- **Control (HEARTBEAT, RTT, DIAGNOSTICS, HEALTH) -> unreliable datagrams.** Control packets are periodic and expendable — a missed heartbeat or RTT probe is harmless because the next one arrives shortly. Datagrams have lower overhead (no stream setup, no retransmission).
+- **Large control packets -> reliable streams (fallback).** Any packet exceeding `DATAGRAM_MAX_SIZE` (1200 bytes) uses reliable streams regardless of type.
 
 **Files involved:**
-- `videocall-client/src/connection/webtransport.rs` — datagram send/receive paths
-- `videocall-transport/src/webtransport.rs` — datagram API integration
-- `actix-api/src/webtransport/bridge.rs` — server-side datagram forwarding
+- `actix-api/src/actors/transports/wt_chat_session.rs` — server-side `send_auto()` routing
+- `actix-api/src/actors/packet_handler.rs` — `DATAGRAM_MAX_SIZE` constant and test helpers
+- `videocall-client/src/client/video_call_client.rs` — `send_media_packet()` uses reliable stream
+- `videocall-client/src/connection/connection.rs` — heartbeats use datagrams
+- `videocall-client/src/connection/connection_manager.rs` — RTT probes use datagrams
 
 ---
 

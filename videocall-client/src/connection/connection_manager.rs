@@ -534,7 +534,10 @@ impl ConnectionManager {
         })
     }
 
-    /// Send RTT probe to a specific connection
+    /// Send RTT probe to a specific connection.
+    ///
+    /// RTT probes are periodic and expendable — a missed probe just means we
+    /// skip one measurement. They use datagrams for lower overhead.
     fn send_rtt_probe(&mut self, connection_id: &str) -> Result<()> {
         let connection = self
             .connections
@@ -553,7 +556,7 @@ impl ConnectionManager {
         let timestamp = js_sys::Date::now();
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
-        connection.send_packet(rtt_packet);
+        connection.send_packet_datagram(rtt_packet);
         debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
@@ -1334,9 +1337,10 @@ impl ConnectionManager {
 
     /// Send packet through active connection via datagram (unreliable, low-latency).
     ///
-    /// Used for media packets (VIDEO, AUDIO, SCREEN) where low latency matters
-    /// more than guaranteed delivery. Falls back to reliable stream for
-    /// WebSocket connections or oversized packets.
+    /// Used for control packets (heartbeats, RTT probes, diagnostics) that are
+    /// periodic and expendable — lower overhead matters more than guaranteed
+    /// delivery. Falls back to reliable stream for WebSocket connections or
+    /// oversized packets.
     pub fn send_packet_datagram(&self, packet: PacketWrapper) -> Result<()> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {

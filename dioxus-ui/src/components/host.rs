@@ -27,8 +27,7 @@ use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShar
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use crate::components::{
-    canvas_generator::speak_style, device_selector::DeviceSelector,
-    device_settings_modal::DeviceSettingsModal,
+    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
 };
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
@@ -70,7 +69,7 @@ pub fn Host(
     #[props(default)] audio_level: f32,
     on_encoder_settings_update: EventHandler<String>,
     device_settings_open: bool,
-    on_device_settings_toggle: EventHandler<MouseEvent>,
+    on_device_settings_toggle: EventHandler<()>,
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
@@ -519,9 +518,9 @@ pub fn Host(
         div {
             class: "host-video-wrapper",
             style: if video_enabled {
-                "position:relative; width:auto; height:auto; opacity:1; overflow:hidden; pointer-events:auto;".to_string()
+                "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; pointer-events:auto;"
             } else {
-                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;".to_string()
+                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
             button {
@@ -579,34 +578,12 @@ pub fn Host(
         // Device Settings Menu Button
         button {
             class: "device-settings-menu-button btn-apple btn-secondary",
-            onclick: move |e| on_device_settings_toggle.call(e),
+            onclick: move |_| on_device_settings_toggle.call(()),
             title: "Device Settings",
             svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                 circle { cx: "12", cy: "12", r: "3" }
-                path { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" }
-            }
-        }
-
-        // Desktop Device Selector
-        {
-            let on_mic = on_mic_change.clone();
-            let on_cam = on_cam_change.clone();
-            let on_spk = on_speaker_change.clone();
-            rsx! {
-                div { class: "desktop-device-selector",
-                    DeviceSelector {
-                        microphones: microphones.clone(),
-                        cameras: cameras.clone(),
-                        speakers: speakers.clone(),
-                        selected_microphone_id: selected_microphone_id.clone(),
-                        selected_camera_id: selected_camera_id.clone(),
-                        selected_speaker_id: selected_speaker_id.clone(),
-                        on_microphone_select: move |d: DeviceInfo| on_mic(d),
-                        on_camera_select: move |d: DeviceInfo| on_cam(d),
-                        on_speaker_select: move |d: DeviceInfo| on_spk(d),
-                    }
-                }
-            }
+                 path { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" }
+             }
         }
 
         // Mobile Device Settings Modal
@@ -626,7 +603,7 @@ pub fn Host(
                     on_camera_select: move |d: DeviceInfo| on_cam(d),
                     on_speaker_select: move |d: DeviceInfo| on_spk(d),
                     visible: device_settings_open,
-                    on_close: move |e| on_device_settings_toggle.call(e),
+                    on_close: move |_| on_device_settings_toggle.call(())
                 }
             }
         }

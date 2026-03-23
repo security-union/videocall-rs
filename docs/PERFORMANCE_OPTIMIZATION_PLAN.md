@@ -179,7 +179,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 ];
 
 /// Index into VIDEO_QUALITY_TIERS for the default starting tier.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 0; // "high"
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "medium" — avoids wasted encoding before first adaptation
 ```
 
 ### Screen Share Quality Tiers
@@ -343,17 +343,19 @@ pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
 ### Reconnection
 
 ```rust
-/// Initial reconnection delay (milliseconds).
-pub const RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
+/// Initial reconnection delay (milliseconds). Kept low so the first retry fires quickly.
+pub const RECONNECT_INITIAL_DELAY_MS: u64 = 500;
 
-/// Maximum reconnection delay (milliseconds). Exponential backoff caps here.
-pub const RECONNECT_MAX_DELAY_MS: u64 = 16000;
+/// Maximum reconnection delay (milliseconds). Capped at 2s to keep video calls responsive.
+pub const RECONNECT_MAX_DELAY_MS: u64 = 2000;
 
 /// Backoff multiplier per attempt.
 pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
 
-/// Maximum number of reconnection attempts before giving up.
-pub const RECONNECT_MAX_ATTEMPTS: u32 = 10;
+/// Consecutive zero-connection attempts before aborting (likely auth/server rejection).
+/// Replaces the old fixed RECONNECT_MAX_ATTEMPTS — the client now retries indefinitely
+/// unless this safety valve fires or the user intentionally disconnects.
+pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 3;
 
 /// RTT degradation multiplier to trigger connection re-election.
 /// If current RTT > election_rtt * this multiplier, re-elect.
@@ -511,7 +513,7 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 - `videocall-client/src/connection/connection_manager.rs` — reconnection state machine
 - `videocall-client/src/client/video_call_client.rs` — orchestrate reconnection
 - `yew-ui/` and `dioxus-ui/` — UI indicators for reconnection state
-- `videocall-client/src/adaptive_quality_constants.rs` — `RECONNECT_INITIAL_DELAY_MS`, `RECONNECT_MAX_DELAY_MS`, `RECONNECT_BACKOFF_MULTIPLIER`, `RECONNECT_MAX_ATTEMPTS`
+- `videocall-client/src/adaptive_quality_constants.rs` — `RECONNECT_INITIAL_DELAY_MS`, `RECONNECT_MAX_DELAY_MS`, `RECONNECT_BACKOFF_MULTIPLIER`, `RECONNECT_CONSECUTIVE_ZERO_LIMIT`
 
 #### 2.2 — Automatic Connection Quality Re-election
 

@@ -122,6 +122,8 @@
 //!     Callback::noop(),
 //!     Callback::noop(),
 //!     None, // vad_threshold
+//!     Some(camera.shared_audio_tier_bitrate()),
+//!     Some(camera.shared_audio_tier_fec()),
 //! );
 //! let mut screen = ScreenEncoder::new(
 //!     client,
@@ -180,6 +182,7 @@
 //!
 //! ```
 
+pub mod adaptive_quality_constants;
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;

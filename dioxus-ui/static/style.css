@@ -65,7 +65,6 @@ canvas {
   justify-content: space-between;
   align-items: center;
   padding: 15px;
-  border-bottom: 1px solid #3a3b3c;
 }
 
 .sidebar-content {
@@ -83,16 +82,6 @@ h3 {
   font-size: 16px;
   font-weight: 500;
   color: #e4e6eb;
-}
-
-.close-button {
-  background: none;
-  border: none;
-  color: white;
-  font-size: 24px;
-  cursor: pointer;
-  padding: 0;
-  line-height: 1;
 }
 
 .search-container {
@@ -365,23 +354,27 @@ canvas {
   bottom: clamp(1rem, 2vh, 1.5rem);
   right: clamp(1rem, 2vw, 1.5rem);
   width: clamp(10rem, 18vw, 15rem);
+  height: calc(clamp(10rem, 18vw, 15rem) *  0.5625);
   max-width: 240px;
+  max-height: 180px;
   border: 2px solid #444;
   border-radius: 8px;
   z-index: 10;
   background-color: #1c1c1c;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .host canvas,
 .host .self-camera {
   width: 100%;
-  object-fit: contain;
+  height: 100%;
+  object-fit: cover;
   flex-grow: 1;
   min-height: 0;
   background-color: #000;
-  border-radius: 6px 6px 0 0;
+  border-radius: 0;
 }
 
 .hidden {
@@ -541,7 +534,7 @@ select {
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
+  border-radius: 0;
 }
 
 .placeholder-content {
@@ -1127,34 +1120,20 @@ select {
 
 .device-settings-modal-overlay {
   position: fixed;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  background-color: rgba(0, 0, 0, 0.8);
+  inset: 0;
+  background-color: rgba(0,0,0,0.8);
   z-index: 2000;
+
   display: flex;
   align-items: center;
   justify-content: center;
+
+  padding: 24px;
+  box-sizing: border-box;
 }
 
 .device-settings-modal {
-  background-color: #242526;
-  border-radius: 12px;
   padding: 0;
-  max-width: 90%;
-  max-height: 80%;
-  overflow: hidden;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-}
-
-.device-settings-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 20px;
-  background-color: #18191a;
-  border-bottom: 1px solid #3a3b3c;
 }
 
 .device-settings-header h2 {
@@ -1164,9 +1143,7 @@ select {
 }
 
 .device-settings-content {
-  padding: 20px;
-  max-height: 60vh;
-  overflow-y: auto;
+  min-width: 0;
 }
 
 .device-setting-group {
@@ -2117,7 +2094,7 @@ select {
 .meeting-edit-btn:hover { background: rgba(255, 255, 255, 0.1); color: rgba(255, 255, 255, 0.9); }
 .meeting-edit-btn svg   { width: 16px; height: 16px; }
 
-.settings-header { display: flex; align-items: center; margin-bottom: 0.25rem; }
+.settings-header { display: flex; align-items: center; margin-bottom: 0; }
 
 .settings-back-btn {
   display: inline-flex;
@@ -2386,7 +2363,7 @@ select {
 }
 .peer_item_mic.speaking svg { stroke: #00ff41; }
 
-.host-video-wrapper { border-radius: 0; overflow: hidden; border: 1.5px solid transparent; box-shadow: none; }
+.host-video-wrapper { border-radius: 0; overflow: hidden; border: none; box-shadow: none; }
 
 /* Glow transitions are now fully controlled by inline styles from Rust.
    No .speaking-tile class needed — speak_style() always returns explicit values. */
@@ -2541,4 +2518,186 @@ select {
         width: 14px;
         height: 14px;
     }
+}
+
+/* ============================================================
+   Settings Modal Layout
+   ============================================================ */
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 0;
+  min-width: min(900px, 92vw);
+  min-height: 520px;
+  max-height: calc(100vh - 48px - 73px);
+}
+
+.settings-panel {
+  padding: 20px;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.settings-sidebar {
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  border-right: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-bottom-left-radius: 24px;
+}
+
+.settings-nav-button {
+  width: 100%;
+  min-height: 40px;
+  padding: 10px 12px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-secondary, #AEAEB2);
+  font-size: 0.9375rem;
+  font-weight: 500;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease,
+    transform 0.12s ease;
+}
+
+.settings-nav-button:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary, #FFFFFF);
+}
+
+.settings-nav-button:active {
+  transform: scale(0.985);
+}
+
+.settings-nav-button.active {
+  background: rgba(10, 132, 255, 0.16);
+  color: var(--accent, #0A84FF);
+  box-shadow: inset 0 0 0 1px rgba(10, 132, 255, 0.22);
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-section-title {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--text-primary, #FFFFFF);
+}
+
+.settings-section-description {
+  margin: -8px 0 4px;
+  font-size: 0.875rem;
+  line-height: 1.45;
+  color: var(--text-secondary, #AEAEB2);
+  max-width: 640px;
+}
+
+.settings-placeholder {
+  display: flex;
+  align-items: center;
+  min-height: 120px;
+  padding: 16px 18px;
+  border-radius: 14px;
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-tertiary, #8E8E93);
+  font-size: 0.9375rem;
+  line-height: 1.5;
+}
+
+.settings-section .device-setting-group {
+  margin-bottom: 0;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 12px;
+}
+
+.settings-section .device-setting-group label {
+  color: var(--text-primary, #FFFFFF);
+  font-size: 0.875rem;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.settings-section .device-selector-modal {
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.settings-modal {
+  width: min(920px, 92vw);
+  max-width: min(920px, 92vw);
+  max-height: calc(100vh - 48px);
+  background-color: #242526;
+  border-radius: 24px;
+  overflow: hidden;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+.settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px;
+  background-color: #18191a;
+  border-bottom: none;
+  border-top-left-radius: 24px;
+  border-top-right-radius: 24px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+
+/* Mobile */
+@media (max-width: 37.5em) {
+  .settings-layout {
+    display: flex;
+    flex-direction: column;
+    min-width: 100%;
+    min-height: 100%;
+  }
+
+  .settings-sidebar {
+    flex-direction: row;
+    overflow-x: auto;
+    gap: 10px;
+    padding: 12px 16px;
+    border-right: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  .settings-nav-button {
+    width: auto;
+    flex: 0 0 auto;
+    white-space: nowrap;
+    padding: 10px 14px;
+    border-radius: 999px;
+  }
+
+  .settings-panel {
+    padding: 16px;
+  }
+
+  .settings-section-title {
+    font-size: 1rem;
+  }
+
+  .settings-placeholder {
+    min-height: 88px;
+    padding: 14px;
+  }
 }

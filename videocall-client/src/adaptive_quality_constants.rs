@@ -124,14 +124,6 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 /// connections or step down on bad ones.
 pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "medium"
 
-/// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
-///
-/// Screen share starts at the highest tier (1080p/15fps/1500kbps) because
-/// screen content is resolution-sensitive -- text and fine UI details become
-/// unreadable at lower resolutions. The system can still step down if
-/// network conditions require it.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0; // "high"
-
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
 // ---------------------------------------------------------------------------
@@ -303,21 +295,19 @@ pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
 // ---------------------------------------------------------------------------
 
 /// Initial reconnection delay (milliseconds).
-/// Kept low so the first retry fires quickly after a transient drop.
-pub const RECONNECT_INITIAL_DELAY_MS: u64 = 500;
+pub const RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 
 /// Maximum reconnection delay (milliseconds). Exponential backoff caps here.
-/// Capped at 2 seconds so the user never waits long between attempts --
-/// a video call client should keep trying indefinitely but still back off
-/// enough to avoid hammering a downed server.
-pub const RECONNECT_MAX_DELAY_MS: u64 = 2000;
+pub const RECONNECT_MAX_DELAY_MS: u64 = 16000;
 
 /// Backoff multiplier per attempt.
 pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
 
+/// Maximum number of reconnection attempts before giving up.
+pub const RECONNECT_MAX_ATTEMPTS: u32 = 10;
+
 /// Stop reconnection if this many consecutive attempts yield zero successful
-/// connections (no server responds at all). Because the client retries
-/// indefinitely, this is the only hard stop: it catches auth failures and
+/// connections (no server responds at all). This catches auth failures and
 /// server rejections early, avoiding futile retries that waste resources and
 /// may trigger server-side rate limiting.
 pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 3;
@@ -519,16 +509,6 @@ mod tests {
             "DEFAULT_VIDEO_TIER_INDEX ({}) out of bounds (len={})",
             DEFAULT_VIDEO_TIER_INDEX,
             VIDEO_QUALITY_TIERS.len(),
-        );
-    }
-
-    #[test]
-    fn test_default_screen_tier_index_in_bounds() {
-        assert!(
-            DEFAULT_SCREEN_TIER_INDEX < SCREEN_QUALITY_TIERS.len(),
-            "DEFAULT_SCREEN_TIER_INDEX ({}) out of bounds (len={})",
-            DEFAULT_SCREEN_TIER_INDEX,
-            SCREEN_QUALITY_TIERS.len(),
         );
     }
 

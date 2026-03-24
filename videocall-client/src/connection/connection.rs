@@ -136,10 +136,7 @@ impl Connection {
                 &session_id,
             ) {
                 if let Status::Connected = status.get() {
-                    // Heartbeats are periodic and expendable — use datagrams
-                    // for lower overhead. A missed heartbeat is harmless; the
-                    // next one arrives within HEARTBEAT_KEEPALIVE_INTERVAL_MS.
-                    task.send_packet_datagram(packet_wrapper);
+                    task.send_packet(packet_wrapper);
                 }
             }
         }));
@@ -162,10 +159,9 @@ impl Connection {
 
     /// Send a packet via datagram (unreliable, low-latency) when supported.
     ///
-    /// Used for control packets (heartbeats, RTT probes, diagnostics) that are
-    /// periodic and expendable — lower overhead matters more than guaranteed
-    /// delivery. Falls back to reliable stream for WebSocket connections or
-    /// oversized packets.
+    /// Used for media packets (VIDEO, AUDIO, SCREEN) where low latency matters
+    /// more than guaranteed delivery. Falls back to reliable stream for
+    /// WebSocket connections or oversized packets.
     pub fn send_packet_datagram(&self, packet: PacketWrapper) {
         if let Status::Connected = self.status.get() {
             self.task.send_packet_datagram(packet);
@@ -204,10 +200,6 @@ impl Connection {
 
     /// Send a heartbeat packet immediately so peers learn about state changes
     /// without waiting for the next keepalive heartbeat tick.
-    ///
-    /// Uses datagrams for consistency with the periodic heartbeat path.
-    /// Heartbeats are expendable — a missed immediate heartbeat is followed
-    /// by the next periodic one within HEARTBEAT_KEEPALIVE_INTERVAL_MS.
     fn send_immediate_heartbeat(&self) {
         let userid = match self.userid.borrow().as_ref() {
             Some(id) => id.clone(),
@@ -227,7 +219,7 @@ impl Connection {
             &self.aes,
             &self.session_id,
         ) {
-            self.task.send_packet_datagram(packet_wrapper);
+            self.task.send_packet(packet_wrapper);
         }
     }
 

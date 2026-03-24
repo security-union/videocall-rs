@@ -241,23 +241,7 @@ pub struct EncoderBitrateController {
 impl EncoderBitrateController {
     /// Create a new bitrate controller using the default `VIDEO_QUALITY_TIERS`.
     pub fn new(ideal_bitrate_kbps: u32, target_fps: Rc<AtomicU32>) -> Self {
-        let quality_manager = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
-    }
-
-    /// Create a new bitrate controller for screen share.
-    ///
-    /// Uses `SCREEN_QUALITY_TIERS` starting at the highest tier (1080p) via
-    /// [`AdaptiveQualityManager::new_for_screen`]. The initial
-    /// `ideal_bitrate_kbps` is synced from the starting tier so the PID
-    /// controller does not make an unnecessary correction on the first update.
-    pub fn new_for_screen(
-        target_fps: Rc<AtomicU32>,
-        video_tiers: &'static [VideoQualityTier],
-    ) -> Self {
-        let quality_manager = AdaptiveQualityManager::new_for_screen(video_tiers);
-        let tier_ideal = quality_manager.current_video_tier().ideal_bitrate_kbps;
-        Self::build(tier_ideal, target_fps, quality_manager)
+        Self::new_with_tiers(ideal_bitrate_kbps, target_fps, VIDEO_QUALITY_TIERS)
     }
 
     /// Create a new bitrate controller using a custom video tier array
@@ -266,16 +250,6 @@ impl EncoderBitrateController {
         ideal_bitrate_kbps: u32,
         target_fps: Rc<AtomicU32>,
         video_tiers: &'static [VideoQualityTier],
-    ) -> Self {
-        let quality_manager = AdaptiveQualityManager::new(video_tiers);
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
-    }
-
-    /// Internal constructor shared by `new`, `new_with_tiers`, and `new_for_screen`.
-    fn build(
-        ideal_bitrate_kbps: u32,
-        target_fps: Rc<AtomicU32>,
-        quality_manager: AdaptiveQualityManager,
     ) -> Self {
         let initial_target = target_fps.load(Ordering::Relaxed) as f64;
 
@@ -306,7 +280,7 @@ impl EncoderBitrateController {
             diagnostic_packets,
             last_correction_time: 0.0,
             correction_throttle_ms: PID_CORRECTION_THROTTLE_MS,
-            quality_manager,
+            quality_manager: AdaptiveQualityManager::new(video_tiers),
             tier_changed: false,
         }
     }
@@ -1238,25 +1212,6 @@ mod tests {
         assert!(
             (min_bitrate..=max_bitrate).contains(&bitrate),
             "Bitrate should be within bounds even with tiny dt, got {bitrate}"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn test_new_for_screen_starts_at_highest_tier() {
-        use crate::adaptive_quality_constants::{DEFAULT_SCREEN_TIER_INDEX, SCREEN_QUALITY_TIERS};
-
-        let target_fps = Rc::new(AtomicU32::new(15));
-        let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
-
-        // Should start at the highest screen tier (index 0, "high")
-        assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
-        assert_eq!(controller.current_video_tier().label, "high");
-
-        // The ideal_bitrate_kbps should be synced with the starting tier
-        let expected_bitrate = SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].ideal_bitrate_kbps;
-        assert_eq!(
-            controller.ideal_bitrate_kbps, expected_bitrate,
-            "Initial ideal_bitrate_kbps should match the starting tier's ideal_bitrate_kbps"
         );
     }
 }

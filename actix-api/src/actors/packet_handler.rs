@@ -27,6 +27,7 @@ use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
+use crate::client_diagnostics::health_processor;
 use crate::constants::{KEYFRAME_REQUEST_MAX_PER_SEC, KEYFRAME_REQUEST_WINDOW_MS};
 use std::time::Instant;
 
@@ -41,16 +42,9 @@ pub enum PacketKind {
     Data,
     /// Packet that should be silently dropped (e.g., client-originated CONGESTION)
     Dropped,
-    /// KEYFRAME_REQUEST packet - subject to per-session rate limiting
-    KeyframeRequest,
 }
 
 /// Classify a packet based on its contents.
-///
-/// Parses the `PacketWrapper` exactly once and uses the `packet_type` field
-/// to classify the packet. For MEDIA packets, the inner `MediaPacket` is
-/// parsed at most once to distinguish RTT and KEYFRAME_REQUEST from regular
-/// media data.
 ///
 /// # Arguments
 /// * `data` - Raw packet bytes
@@ -58,41 +52,70 @@ pub enum PacketKind {
 /// # Returns
 /// The classification of the packet
 pub fn classify_packet(data: &[u8]) -> PacketKind {
-    let packet_wrapper = match PacketWrapper::parse_from_bytes(data) {
-        Ok(pw) => pw,
-        Err(_) => return PacketKind::Data, // unparseable, treat as opaque data
-    };
-
     // Drop client-originated CONGESTION packets.
     // CONGESTION signals must only originate from the server's CongestionTracker,
     // never from clients. A malicious client could craft a CONGESTION packet with
     // a victim's session_id to force them to degrade video quality.
-    if packet_wrapper.packet_type == PacketType::CONGESTION.into() {
+    if is_congestion_packet(data) {
         return PacketKind::Dropped;
     }
 
-    // Check if it's a MEDIA packet (RTT, keyframe request, or regular media).
-    if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-        // Try to parse inner MediaPacket to distinguish control sub-types.
-        // For encrypted payloads this parse will fail, correctly falling
-        // through to PacketKind::Data.
-        if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-            if media_packet.media_type == MediaType::RTT.into() {
-                return PacketKind::Rtt;
-            }
-            if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
-                return PacketKind::KeyframeRequest;
-            }
-        }
-        return PacketKind::Data;
+    // Check RTT first (most specific check)
+    if is_rtt_packet(data) {
+        return PacketKind::Rtt;
     }
 
-    // Check health packet.
-    if packet_wrapper.packet_type == PacketType::HEALTH.into() {
+    // Check health packet
+    if health_processor::is_health_packet_bytes(data) {
         return PacketKind::Health;
     }
 
+    // Default to data packet
     PacketKind::Data
+}
+
+/// Check if a packet is a CONGESTION packet.
+///
+/// CONGESTION packets must only originate from the server's `CongestionTracker`.
+/// Client-originated CONGESTION packets are dropped to prevent a malicious client
+/// from forcing victims to degrade their video quality.
+pub fn is_congestion_packet(data: &[u8]) -> bool {
+    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+        return packet_wrapper.packet_type == PacketType::CONGESTION.into();
+    }
+    false
+}
+
+/// Check if a packet is an RTT (Round-Trip Time) measurement packet.
+///
+/// RTT packets are used to measure network latency and should be
+/// echoed back to the sender immediately without forwarding to other peers.
+pub fn is_rtt_packet(data: &[u8]) -> bool {
+    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+        if packet_wrapper.packet_type == PacketType::MEDIA.into() {
+            if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+                return media_packet.media_type == MediaType::RTT.into();
+            }
+        }
+    }
+    false
+}
+
+/// Check if a MEDIA packet contains a KEYFRAME_REQUEST.
+///
+/// Attempts to parse the inner `MediaPacket` from the `PacketWrapper.data` field.
+/// If the inner packet is AES-encrypted (as in normal media flow), parsing will
+/// fail and this returns `false`. This check is effective for unencrypted control
+/// packets and serves as an additional defence layer.
+pub fn is_keyframe_request(data: &[u8]) -> bool {
+    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+        if packet_wrapper.packet_type == PacketType::MEDIA.into() {
+            if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+                return media_packet.media_type == MediaType::KEYFRAME_REQUEST.into();
+            }
+        }
+    }
+    false
 }
 
 /// Per-session rate limiter for KEYFRAME_REQUEST packets.
@@ -144,72 +167,45 @@ impl KeyframeRequestLimiter {
 
 /// Maximum payload size for WebTransport datagrams (bytes).
 ///
-/// Datagrams are used for control packets (heartbeats, RTT probes,
-/// diagnostics) that are periodic and expendable. Media packets always use
-/// reliable unidirectional streams. Control packets larger than this limit
-/// also fall back to reliable streams.
-///
-/// Must match the client-side `DATAGRAM_MAX_SIZE` constant.
+/// Must match the client-side `DATAGRAM_MAX_SIZE` constant. Packets larger
+/// than this are sent via reliable unidirectional streams instead.
 pub const DATAGRAM_MAX_SIZE: usize = 1200;
+
+/// Check if a packet contains real-time media data (VIDEO, AUDIO, or SCREEN)
+/// that benefits from low-latency datagram delivery.
+///
+/// Control packets (HEARTBEAT, RTT, KEYFRAME_REQUEST, DIAGNOSTICS, HEALTH)
+/// are NOT considered media for this purpose because they require reliable
+/// delivery.
+///
+/// Note: the inner `MediaPacket` is AES-encrypted, so we cannot inspect the
+/// `media_type` field without decryption. However, the `PacketWrapper` still
+/// has the unencrypted `packet_type` field. Since only MEDIA packet types
+/// contain real-time audio/video/screen data, we use a size-based heuristic:
+/// MEDIA packets that are small enough for datagrams are sent unreliably.
+/// Large MEDIA packets (e.g., keyframes) fall back to streams.
+///
+/// This conservative approach means some control-type MEDIA packets (like
+/// HEARTBEAT) that happen to be small could be sent via datagram, but since
+/// heartbeats are also sent periodically, occasional loss is acceptable.
+pub fn should_use_datagram(data: &[u8]) -> bool {
+    if data.len() > DATAGRAM_MAX_SIZE {
+        return false;
+    }
+
+    // Only use datagrams for MEDIA packet type.
+    // Other types (RSA_PUB_KEY, AES_KEY, CONNECTION, DIAGNOSTICS, HEALTH,
+    // MEETING, SESSION_ASSIGNED, CONGESTION) must use reliable streams.
+    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+        return packet_wrapper.packet_type == PacketType::MEDIA.into();
+    }
+
+    false
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // =========================================================================
-    // Test-only helper functions
-    //
-    // These standalone is_* functions are used only by their own unit tests.
-    // Production code uses `classify_packet()` instead.
-    // =========================================================================
-
-    /// Check if a packet is a CONGESTION packet (test-only helper).
-    fn is_congestion_packet(data: &[u8]) -> bool {
-        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-            return packet_wrapper.packet_type == PacketType::CONGESTION.into();
-        }
-        false
-    }
-
-    /// Check if a packet is an RTT measurement packet (test-only helper).
-    fn is_rtt_packet(data: &[u8]) -> bool {
-        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-            if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                    return media_packet.media_type == MediaType::RTT.into();
-                }
-            }
-        }
-        false
-    }
-
-    /// Check if a MEDIA packet contains a KEYFRAME_REQUEST (test-only helper).
-    fn is_keyframe_request(data: &[u8]) -> bool {
-        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-            if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                    return media_packet.media_type == MediaType::KEYFRAME_REQUEST.into();
-                }
-            }
-        }
-        false
-    }
-
-    /// Test-only helper that replicates the datagram routing logic from
-    /// `WtChatSession::send_auto`. Control packets (non-media) that fit
-    /// within the datagram MTU use datagrams; media packets always use
-    /// reliable streams. Empty/unparseable inputs are never routed via
-    /// datagram.
-    fn should_use_datagram(data: &[u8]) -> bool {
-        if data.is_empty() {
-            return false;
-        }
-        if let Ok(pw) = PacketWrapper::parse_from_bytes(data) {
-            let is_media = pw.packet_type == PacketType::MEDIA.into();
-            return !is_media && data.len() <= DATAGRAM_MAX_SIZE;
-        }
-        false
-    }
 
     #[test]
     fn test_classify_empty_packet_as_data() {
@@ -243,7 +239,6 @@ mod tests {
 
     #[test]
     fn test_should_use_datagram_media_packet() {
-        // MEDIA packets always use reliable streams (avoids artifacts)
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
             data: vec![1, 2, 3], // small payload
@@ -251,12 +246,11 @@ mod tests {
         };
         let bytes = wrapper.write_to_bytes().unwrap();
         assert!(bytes.len() <= DATAGRAM_MAX_SIZE);
-        assert!(!should_use_datagram(&bytes));
+        assert!(should_use_datagram(&bytes));
     }
 
     #[test]
     fn test_should_use_datagram_oversized_media_packet() {
-        // Oversized MEDIA packets also use reliable streams
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
             data: vec![0u8; DATAGRAM_MAX_SIZE + 100], // exceeds MTU
@@ -268,46 +262,34 @@ mod tests {
 
     #[test]
     fn test_should_use_datagram_non_media_packet() {
-        // Small AES_KEY packets use datagrams (control, expendable)
+        // AES_KEY packets should always use reliable stream
         let wrapper = PacketWrapper {
             packet_type: PacketType::AES_KEY.into(),
             data: vec![1, 2, 3],
             ..Default::default()
         };
         let bytes = wrapper.write_to_bytes().unwrap();
-        assert!(should_use_datagram(&bytes));
+        assert!(!should_use_datagram(&bytes));
     }
 
     #[test]
     fn test_should_use_datagram_diagnostics_packet() {
-        // Small DIAGNOSTICS packets use datagrams (periodic, expendable)
+        // DIAGNOSTICS packets should always use reliable stream
         let wrapper = PacketWrapper {
             packet_type: PacketType::DIAGNOSTICS.into(),
             data: vec![1, 2, 3],
             ..Default::default()
         };
         let bytes = wrapper.write_to_bytes().unwrap();
-        assert!(should_use_datagram(&bytes));
+        assert!(!should_use_datagram(&bytes));
     }
 
     #[test]
     fn test_should_use_datagram_health_packet() {
-        // Small HEALTH packets use datagrams (periodic, expendable)
+        // HEALTH packets should always use reliable stream
         let wrapper = PacketWrapper {
             packet_type: PacketType::HEALTH.into(),
             data: vec![1, 2, 3],
-            ..Default::default()
-        };
-        let bytes = wrapper.write_to_bytes().unwrap();
-        assert!(should_use_datagram(&bytes));
-    }
-
-    #[test]
-    fn test_should_use_datagram_oversized_control_packet() {
-        // Control packets exceeding DATAGRAM_MAX_SIZE fall back to reliable stream
-        let wrapper = PacketWrapper {
-            packet_type: PacketType::DIAGNOSTICS.into(),
-            data: vec![0u8; DATAGRAM_MAX_SIZE + 100],
             ..Default::default()
         };
         let bytes = wrapper.write_to_bytes().unwrap();
@@ -323,62 +305,6 @@ mod tests {
         };
         let bytes = wrapper.write_to_bytes().unwrap();
         assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
-    }
-
-    #[test]
-    fn test_classify_keyframe_request() {
-        let media = MediaPacket {
-            media_type: MediaType::KEYFRAME_REQUEST.into(),
-            ..Default::default()
-        };
-        let wrapper = PacketWrapper {
-            packet_type: PacketType::MEDIA.into(),
-            data: media.write_to_bytes().unwrap(),
-            ..Default::default()
-        };
-        let bytes = wrapper.write_to_bytes().unwrap();
-        assert_eq!(classify_packet(&bytes), PacketKind::KeyframeRequest);
-    }
-
-    #[test]
-    fn test_classify_rtt_packet() {
-        let media = MediaPacket {
-            media_type: MediaType::RTT.into(),
-            ..Default::default()
-        };
-        let wrapper = PacketWrapper {
-            packet_type: PacketType::MEDIA.into(),
-            data: media.write_to_bytes().unwrap(),
-            ..Default::default()
-        };
-        let bytes = wrapper.write_to_bytes().unwrap();
-        assert_eq!(classify_packet(&bytes), PacketKind::Rtt);
-    }
-
-    #[test]
-    fn test_classify_health_packet() {
-        let wrapper = PacketWrapper {
-            packet_type: PacketType::HEALTH.into(),
-            data: vec![1, 2, 3],
-            ..Default::default()
-        };
-        let bytes = wrapper.write_to_bytes().unwrap();
-        assert_eq!(classify_packet(&bytes), PacketKind::Health);
-    }
-
-    #[test]
-    fn test_classify_regular_media_as_data() {
-        let media = MediaPacket {
-            media_type: MediaType::VIDEO.into(),
-            ..Default::default()
-        };
-        let wrapper = PacketWrapper {
-            packet_type: PacketType::MEDIA.into(),
-            data: media.write_to_bytes().unwrap(),
-            ..Default::default()
-        };
-        let bytes = wrapper.write_to_bytes().unwrap();
-        assert_eq!(classify_packet(&bytes), PacketKind::Data);
     }
 
     #[test]

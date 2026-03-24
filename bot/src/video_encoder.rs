@@ -151,6 +151,19 @@ impl VideoEncoder {
     }
 
     pub fn encode(&mut self, pts: i64, data: &[u8]) -> anyhow::Result<Frames<'_>> {
+        self.encode_inner(pts, data, false)
+    }
+
+    pub fn encode_keyframe(&mut self, pts: i64, data: &[u8]) -> anyhow::Result<Frames<'_>> {
+        self.encode_inner(pts, data, true)
+    }
+
+    fn encode_inner(
+        &mut self,
+        pts: i64,
+        data: &[u8],
+        force_keyframe: bool,
+    ) -> anyhow::Result<Frames<'_>> {
         let image = MaybeUninit::zeroed();
         let mut image = unsafe { image.assume_init() };
 
@@ -163,7 +176,11 @@ impl VideoEncoder {
             data.as_ptr() as _,
         ));
 
-        let flags: i64 = 0;
+        let flags: i64 = if force_keyframe {
+            VPX_EFLAG_FORCE_KF as i64
+        } else {
+            0
+        };
 
         vpx!(vpx_codec_encode(
             &mut self.ctx,

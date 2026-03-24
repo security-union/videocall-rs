@@ -1,105 +1,155 @@
 # Videocall Synthetic Client Bot
 
-Enhanced bot that streams synthetic audio and video to videocall-rs for load testing and scale validation.
+Synthetic bot that streams real VP9 video and Opus audio to videocall-rs meetings over WebSocket or WebTransport. Useful for load testing, scale validation, and call quality measurement.
 
 ## Features
 
-- **WebTransport Client**: Connects using WebTransport instead of WebSocket
-- **Audio Streaming**: Loops WAV files and encodes to Opus (50fps, 20ms packets)
-- **Video Streaming**: Cycles through JPEG images and sends mock video packets (30fps)
-- **Per-Client Configuration**: Individual audio/video settings per client
-- **Linear Ramp-up**: Configurable delay between client starts
-- **Multi-Client Support**: Run multiple synthetic clients per container
+- **Dual Transport**: WebSocket (`wss://`) and WebTransport (`https://`) with per-config selection
+- **Real VP9 Video**: Encodes JPEG image sequences to VP9 at 15fps (1280x720)
+- **Opus Audio**: Encodes WAV files to Opus at 48kHz (50 packets/sec, 20ms frames)
+- **Conversation Mode**: Two bots with interleaved TTS dialogue and synchronized EKG video
+- **A/V Sync**: Shared media clock ensures audio and video stay aligned across loop boundaries
+- **RX Quality Diagnostics**: Per-bot jitter, sequence gaps, A/V sync delta, and keyframe stats every 10s
+- **JWT Authentication**: Mints per-client JWTs when `jwt_secret` is configured
+- **Multi-Client Support**: Run multiple bots per process with configurable ramp-up delay
+- **Loop Boundary Recovery**: Forces VP9 keyframes at loop restart so video recovers instantly
 
-## Configuration
+## Quick Start
 
-### Option 1: YAML Configuration File (Recommended)
+### 1. Generate conversation assets (optional)
 
-Create a `config.yaml` file:
+This creates interleaved WAV files and EKG video frames for two bots using Piper TTS.
+
+**Install Python dependencies:**
+
+```bash
+pip install piper-tts scipy pillow numpy
+```
+
+**Download Piper voice models** from Hugging Face (one-time, ~120 MB total):
+
+```bash
+mkdir -p voices
+HF_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US"
+# Amy (female) - alice's voice
+curl -L -o voices/amy-medium.onnx      "$HF_BASE/amy/medium/en_US-amy-medium.onnx"
+curl -L -o voices/amy-medium.onnx.json "$HF_BASE/amy/medium/en_US-amy-medium.onnx.json"
+# Joe (male) - bob's voice
+curl -L -o voices/joe-medium.onnx      "$HF_BASE/joe/medium/en_US-joe-medium.onnx"
+curl -L -o voices/joe-medium.onnx.json "$HF_BASE/joe/medium/en_US-joe-medium.onnx.json"
+```
+
+**Generate the conversation:**
+
+```bash
+python3 generate-conversation.py
+```
+
+Produces:
+- `conversation/conversation-alice.wav` / `conversation-bob.wav` (48kHz mono)
+- `conversation/frames-alice/frame_NNNNN.jpg` / `frames-bob/` (1280x720 @ 15fps)
+
+The conversation text is hardcoded in `generate-conversation.py` — edit the `CONVERSATION` list to customize.
+
+### 2. Configure
+
+Create a `config.yaml`:
 
 ```yaml
-ramp_up_delay_ms: 1000
-server_url: "https://webtransport-us-east.webtransport.video"
+transport: "websocket"   # or "webtransport"
+server_url: "https://websocket.example.com"
+jwt_secret: "your-base64-secret"
+ramp_up_delay_ms: 0
+
 clients:
-  - user_id: "bot001"
-    meeting_id: "test-room"
+  - user_id: "alice"
+    meeting_id: "1"
     enable_audio: true
-    enable_video: false
-  - user_id: "bot002"
-    meeting_id: "test-room"
-    enable_audio: false
     enable_video: true
+    audio_file: "conversation/conversation-alice.wav"
+    image_dir: "conversation/frames-alice"
+
+  - user_id: "bob"
+    meeting_id: "1"
+    enable_audio: true
+    enable_video: true
+    audio_file: "conversation/conversation-bob.wav"
+    image_dir: "conversation/frames-bob"
 ```
 
-Then run:
+If `audio_file` is omitted, defaults to `BundyBests2.wav`. If `image_dir` is omitted, defaults to the current directory (legacy `output_120..124.jpg` pattern).
+
+### 3. Run
+
 ```bash
-BOT_CONFIG_PATH=config.yaml cargo run
+RUST_LOG=info cargo run --release -- --config config.yaml
 ```
 
-### Option 2: Environment Variables (Backwards Compatible)
+Or with a different config path:
 
 ```bash
-N_CLIENTS=3
-SERVER_URL="https://webtransport-us-east.webtransport.video"
-ROOM="test-room"
-CLIENT_0_ENABLE_AUDIO=true
-CLIENT_0_ENABLE_VIDEO=false
-CLIENT_1_ENABLE_AUDIO=false  
-CLIENT_1_ENABLE_VIDEO=true
-CLIENT_2_ENABLE_AUDIO=true
-CLIENT_2_ENABLE_VIDEO=true
-cargo run
+RUST_LOG=info BOT_CONFIG_PATH=config-prod.yaml cargo run --release
 ```
 
-## Assets
+## RX Quality Diagnostics
 
-The bot includes pre-loaded media assets:
+Every 10 seconds each bot logs a stats line:
 
-- **Audio**: `BundyBests2.wav` - Looped and encoded to Opus
-- **Video**: `output_120.jpg` to `output_124.jpg` - Cycled as mock video frames
-
-## Usage Examples
-
-### Test Audio-Only Clients
-```bash
-BOT_CONFIG_PATH=config.yaml RUST_LOG=info cargo run
+```
+[alice] RX STATS (10s): audio=500 pkts (40 KB, jitter=3.8ms, gaps=0), video=151 pkts (1 key, 162 KB, jitter=5.2ms, gaps=0), heartbeat=30, A/V sync=34ms, errors=0
 ```
 
-### Quick 10-Client Test
-```bash
-N_CLIENTS=10 ROOM="load-test" cargo run
-```
-
-### Docker Build
-```bash
-docker build -t videocall-synthetic-client .
-```
+| Metric | Excellent | Acceptable | Poor |
+|--------|-----------|------------|------|
+| Audio jitter | <10ms | 10-30ms | >50ms |
+| Video jitter | <20ms | 20-50ms | >80ms |
+| Audio gaps/10s | 0 | <10 | >50 |
+| Video gaps/10s | 0 | <5 | >20 |
+| A/V sync | <30ms | 30-80ms | >150ms |
 
 ## Media Protocol
 
-- **Audio**: 50fps (20ms Opus packets) following neteq_player.rs pattern
-- **Video**: 30fps (~33ms packets) with mock VP9 data
-- **Transport**: WebTransport unidirectional streams
-- **Format**: videocall-types protobuf MediaPacket
+- **Audio**: 48kHz Opus, 20ms packets (50fps), monotonic sequence numbers
+- **Video**: VP9 Profile 0, 1280x720 @ 15fps, keyframes forced at loop boundaries
+- **Wire format**: Protobuf `PacketWrapper` → `MediaPacket` (same as browser client)
+- **Heartbeat**: 1Hz protobuf heartbeat via the same packet channel
 
-## TODO
+## Configuration Reference
 
-- [ ] Add proper VP9 encoding (currently sends mock data)
-- [ ] Add Helm chart for Kubernetes deployment  
-- [ ] Add metrics collection and Prometheus export
-- [ ] Add graceful shutdown handling
-- [ ] Add configurable test duration
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `transport` | no | `"webtransport"` | `"websocket"` or `"webtransport"` |
+| `server_url` | yes | — | Base URL of the videocall server |
+| `jwt_secret` | no | — | Base64-encoded HMAC secret for JWT auth |
+| `ramp_up_delay_ms` | no | `1000` | Delay between starting each client |
+| `insecure` | no | `false` | Skip TLS certificate verification |
+| `clients[].user_id` | yes | — | Bot display name and identity |
+| `clients[].meeting_id` | yes | — | Room to join |
+| `clients[].enable_audio` | no | `false` | Stream audio |
+| `clients[].enable_video` | no | `false` | Stream video |
+| `clients[].audio_file` | no | `"BundyBests2.wav"` | Path to WAV file (48kHz recommended) |
+| `clients[].image_dir` | no | `"."` | Directory containing `frame_NNNNN.jpg` files |
+
+## Architecture
+
+```
+main.rs
+  ├── Shared media clock (Instant) + loop duration (from WAV length)
+  ├── Per-client:
+  │     ├── transport.rs → websocket_client.rs / webtransport_client.rs
+  │     ├── audio_producer.rs  (tokio task, Opus encoding)
+  │     ├── video_producer.rs  (OS thread, JPEG decode → VP9 encoding)
+  │     ├── heartbeat producer (1Hz, via shared mpsc channel)
+  │     └── inbound_stats.rs   (RX quality diagnostics)
+  └── mpsc channel (500 slots) connects producers → transport sender
+```
+
+Both audio and video producers derive their position from the same `Instant` epoch and wrap at the same `loop_duration`, preventing drift. Video uses a global monotonic PTS (never wraps) for VP9 encoding while selecting source frames by loop-relative position.
 
 ## Development
 
-Compile and check:
 ```bash
-cargo check
-cargo clippy
-cargo test
-```
-
-Run with debug logging:
-```bash
-RUST_LOG=debug cargo run
+cargo check -p bot
+cargo clippy -p bot
+RUST_LOG=debug cargo run --release -- --config config.yaml
 ```

@@ -158,7 +158,7 @@ impl ConnectionManager {
 
         let rtt_responses = Rc::new(RefCell::new(Vec::new()));
 
-        let mut manager = Self {
+        let manager = Self {
             connections: HashMap::new(),
             active_connection_id: Rc::new(RefCell::new(None)),
             rtt_measurements: HashMap::new(),
@@ -181,9 +181,6 @@ impl ConnectionManager {
             reelection_in_progress: false,
         };
 
-        // Immediately start creating connections and testing
-        manager.start_election()?;
-
         Ok(manager)
     }
 
@@ -191,6 +188,13 @@ impl ConnectionManager {
     /// the real manager instance. Called by `ConnectionController` after construction.
     pub fn set_manager_ref(&mut self, weak: Weak<RefCell<ConnectionManager>>) {
         self.manager_ref = weak;
+    }
+
+    /// Kick off the initial server election. Must be called **after**
+    /// `set_manager_ref()` so that the connection-lost callbacks capture a
+    /// valid `Weak` back-reference to the owning `Rc<RefCell<ConnectionManager>>`.
+    pub fn initialize(&mut self) -> Result<()> {
+        self.start_election()
     }
 
     /// Reset all connection state and start a fresh election on the same manager
@@ -1344,7 +1348,6 @@ impl ConnectionManager {
 
     pub fn disconnect(&mut self) -> anyhow::Result<()> {
         self.connections.clear();
-        self.get_connection_state();
         Ok(())
     }
 

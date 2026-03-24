@@ -775,10 +775,8 @@ pub fn AttendantsComponent(
             }) as Box<dyn FnMut(_)>);
 
             if let Some(win) = web_sys::window() {
-                let _ = win.add_event_listener_with_callback(
-                    "focus",
-                    closure.as_ref().unchecked_ref(),
-                );
+                let _ =
+                    win.add_event_listener_with_callback("focus", closure.as_ref().unchecked_ref());
             }
             closure.forget();
         });

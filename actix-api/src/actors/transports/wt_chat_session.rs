@@ -165,15 +165,16 @@ impl WtChatSession {
 
     /// Send outbound message, automatically choosing datagram or stream.
     ///
-    /// Media packets (VIDEO, AUDIO, SCREEN) that fit within the datagram MTU
-    /// are sent via unreliable datagrams for lower latency. Control packets
-    /// and oversized media packets use reliable unidirectional streams.
+    /// Diagnostics and health packets that fit within the datagram MTU are
+    /// sent via unreliable datagrams (loss-tolerant, low latency). Media
+    /// packets and all other packet types use reliable unidirectional streams
+    /// to ensure ordered, guaranteed delivery.
     ///
-    /// The `is_media` hint is pre-computed by the caller from an already-parsed
-    /// `PacketWrapper`, avoiding a redundant protobuf parse on every outbound
-    /// packet.
-    fn send_auto(&self, data: Vec<u8>, is_media: bool) -> WtSendResult {
-        let outbound = if is_media && data.len() <= DATAGRAM_MAX_SIZE {
+    /// The `is_datagram_eligible` hint is pre-computed by the caller from an
+    /// already-parsed `PacketWrapper`, avoiding a redundant protobuf parse on
+    /// every outbound packet.
+    fn send_auto(&self, data: Vec<u8>, is_datagram_eligible: bool) -> WtSendResult {
+        let outbound = if is_datagram_eligible && data.len() <= DATAGRAM_MAX_SIZE {
             WtOutbound::Datagram(data.into())
         } else {
             WtOutbound::UniStream(data.into())
@@ -305,9 +306,9 @@ impl Actor for WtChatSession {
 
 /// Handle outbound messages from ChatServer.
 ///
-/// Uses `send_auto` to route media packets via datagrams (low latency)
-/// and control packets via reliable streams. This mirrors the client-side
-/// routing where VIDEO/AUDIO/SCREEN go through datagrams.
+/// Uses `send_auto` to route diagnostics/health packets via datagrams
+/// (loss-tolerant, low latency) and all other packets (including media)
+/// via reliable streams.
 ///
 /// The outbound `msg.msg` is a serialized `PacketWrapper`. We parse it once
 /// to extract both the sender's `session_id` (for congestion tracking) and
@@ -328,12 +329,15 @@ impl Handler<Message> for WtChatSession {
         // ensures congestion tracking targets the correct (sender) session.
         let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
         let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
-        let is_media = parsed
+        let is_datagram_eligible = parsed
             .as_ref()
-            .map(|pw| pw.packet_type == PacketType::MEDIA.into())
+            .map(|pw| {
+                pw.packet_type == PacketType::DIAGNOSTICS.into()
+                    || pw.packet_type == PacketType::HEALTH.into()
+            })
             .unwrap_or(false);
 
-        match self.send_auto(bytes, is_media) {
+        match self.send_auto(bytes, is_datagram_eligible) {
             WtSendResult::Sent => {}
             WtSendResult::Dead => {
                 ctx.stop();

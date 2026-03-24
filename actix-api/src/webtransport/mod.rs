@@ -46,49 +46,6 @@ lazy_static::lazy_static! {
         .unwrap_or(1);
 }
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::Arc;
-
-#[cfg(test)]
-use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::Mutex;
-
-#[cfg(test)]
-lazy_static::lazy_static! {
-    static ref TEST_PACKET_COUNTERS: Arc<Mutex<HashMap<String, AtomicU64>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-}
-
-#[cfg(test)]
-fn increment_test_packet_counter_for_user(username: &str) {
-    let counters = TEST_PACKET_COUNTERS.clone();
-    let mut counters_map = counters.lock().unwrap();
-    let counter = counters_map
-        .entry(username.to_string())
-        .or_insert_with(|| AtomicU64::new(0));
-    counter.fetch_add(1, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-fn get_test_packet_counter_for_user(username: &str) -> u64 {
-    let counters = TEST_PACKET_COUNTERS.clone();
-    let counters_map = counters.lock().unwrap();
-    counters_map
-        .get(username)
-        .map(|counter| counter.load(Ordering::Relaxed))
-        .unwrap_or(0)
-}
-
-#[cfg(test)]
-fn reset_test_packet_counters() {
-    let counters = TEST_PACKET_COUNTERS.clone();
-    let mut counters_map = counters.lock().unwrap();
-    counters_map.clear();
-}
-
 use web_transport_quinn::{quinn, Session};
 
 /// Videocall WebTransport API
@@ -369,7 +326,7 @@ async fn handle_webtransport_session(
     let on_packet_sent = {
         let username_for_callback = username.to_string();
         Some(
-            Box::new(move || increment_test_packet_counter_for_user(&username_for_callback))
+            Box::new(move || tests::increment_test_packet_counter_for_user(&username_for_callback))
                 as bridge::PacketSentCallback,
         )
     };
@@ -400,6 +357,9 @@ mod tests {
     use super::*;
     use protobuf::Message as ProtobufMessage;
     use rustls::crypto::CryptoProvider;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use videocall_types::protos::media_packet::media_packet::MediaType as VcMediaType;
     use videocall_types::protos::media_packet::MediaPacket as VcMediaPacket;
@@ -407,6 +367,35 @@ mod tests {
     use videocall_types::protos::packet_wrapper::PacketWrapper as VcPacketWrapper;
 
     const KEEP_ALIVE_PING: &[u8] = b"ping";
+
+    lazy_static::lazy_static! {
+        static ref TEST_PACKET_COUNTERS: Arc<Mutex<HashMap<String, AtomicU64>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+    }
+
+    pub(super) fn increment_test_packet_counter_for_user(username: &str) {
+        let counters = TEST_PACKET_COUNTERS.clone();
+        let mut counters_map = counters.lock().unwrap();
+        let counter = counters_map
+            .entry(username.to_string())
+            .or_insert_with(|| AtomicU64::new(0));
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn get_test_packet_counter_for_user(username: &str) -> u64 {
+        let counters = TEST_PACKET_COUNTERS.clone();
+        let counters_map = counters.lock().unwrap();
+        counters_map
+            .get(username)
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    fn reset_test_packet_counters() {
+        let counters = TEST_PACKET_COUNTERS.clone();
+        let mut counters_map = counters.lock().unwrap();
+        counters_map.clear();
+    }
 
     async fn start_webtransport_server() -> tokio::task::JoinHandle<()> {
         if let Err(e) = CryptoProvider::install_default(rustls::crypto::ring::default_provider()) {
@@ -604,9 +593,8 @@ mod tests {
             || {
                 let session = session_clone.clone();
                 async move {
-                    // Race between uni stream and datagram since MEDIA packets
-                    // may arrive via either transport (send_auto routes small
-                    // MEDIA packets as datagrams for lower latency).
+                    // Race between uni stream and datagram — test infra
+                    // should be transport-agnostic.
                     let buf = tokio::select! {
                         Ok(mut stream) = session.accept_uni() => {
                             stream.read_to_end(usize::MAX).await.ok()
@@ -744,9 +732,8 @@ mod tests {
             || {
                 let session = session_b_recv.clone();
                 async move {
-                    // Race between uni stream and datagram since MEDIA packets
-                    // may arrive via either transport (send_auto routes small
-                    // MEDIA packets as datagrams for lower latency).
+                    // Race between uni stream and datagram — test infra
+                    // should be transport-agnostic.
                     let buf = tokio::select! {
                         Ok(mut stream) = session.accept_uni() => {
                             stream.read_to_end(usize::MAX).await.ok()

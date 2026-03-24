@@ -192,12 +192,15 @@ mod tests {
     }
 
     /// Test-only helper that replicates the datagram routing logic from
-    /// `WtChatSession::send_auto`. Verifies that a pre-parsed `is_media`
-    /// flag plus size check produces the correct routing decision.
+    /// `WtChatSession::send_auto`. Verifies that a pre-parsed
+    /// `is_datagram_eligible` flag plus size check produces the correct
+    /// routing decision.  Only DIAGNOSTICS and HEALTH packets are eligible
+    /// for datagram transport; MEDIA and all other types use reliable streams.
     fn should_use_datagram(data: &[u8]) -> bool {
         if let Ok(pw) = PacketWrapper::parse_from_bytes(data) {
-            let is_media = pw.packet_type == PacketType::MEDIA.into();
-            return is_media && data.len() <= DATAGRAM_MAX_SIZE;
+            let is_datagram_eligible = pw.packet_type == PacketType::DIAGNOSTICS.into()
+                || pw.packet_type == PacketType::HEALTH.into();
+            return is_datagram_eligible && data.len() <= DATAGRAM_MAX_SIZE;
         }
         false
     }
@@ -234,6 +237,7 @@ mod tests {
 
     #[test]
     fn test_should_use_datagram_media_packet() {
+        // MEDIA packets must always use reliable streams, never datagrams.
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
             data: vec![1, 2, 3], // small payload
@@ -241,13 +245,15 @@ mod tests {
         };
         let bytes = wrapper.write_to_bytes().unwrap();
         assert!(bytes.len() <= DATAGRAM_MAX_SIZE);
-        assert!(should_use_datagram(&bytes));
+        assert!(!should_use_datagram(&bytes));
     }
 
     #[test]
-    fn test_should_use_datagram_oversized_media_packet() {
+    fn test_should_use_datagram_oversized_diagnostics_packet() {
+        // DIAGNOSTICS packets that exceed DATAGRAM_MAX_SIZE must fall back
+        // to reliable streams.
         let wrapper = PacketWrapper {
-            packet_type: PacketType::MEDIA.into(),
+            packet_type: PacketType::DIAGNOSTICS.into(),
             data: vec![0u8; DATAGRAM_MAX_SIZE + 100], // exceeds MTU
             ..Default::default()
         };
@@ -269,26 +275,28 @@ mod tests {
 
     #[test]
     fn test_should_use_datagram_diagnostics_packet() {
-        // DIAGNOSTICS packets should always use reliable stream
+        // DIAGNOSTICS packets CAN use datagrams (loss-tolerant, low latency).
         let wrapper = PacketWrapper {
             packet_type: PacketType::DIAGNOSTICS.into(),
             data: vec![1, 2, 3],
             ..Default::default()
         };
         let bytes = wrapper.write_to_bytes().unwrap();
-        assert!(!should_use_datagram(&bytes));
+        assert!(bytes.len() <= DATAGRAM_MAX_SIZE);
+        assert!(should_use_datagram(&bytes));
     }
 
     #[test]
     fn test_should_use_datagram_health_packet() {
-        // HEALTH packets should always use reliable stream
+        // HEALTH packets CAN use datagrams (loss-tolerant, low latency).
         let wrapper = PacketWrapper {
             packet_type: PacketType::HEALTH.into(),
             data: vec![1, 2, 3],
             ..Default::default()
         };
         let bytes = wrapper.write_to_bytes().unwrap();
-        assert!(!should_use_datagram(&bytes));
+        assert!(bytes.len() <= DATAGRAM_MAX_SIZE);
+        assert!(should_use_datagram(&bytes));
     }
 
     #[test]

@@ -141,6 +141,9 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
+    /// Cached 16-byte UUID representation of the user ID, computed once at
+    /// construction to avoid re-parsing on every packet send.
+    user_id_bytes: Vec<u8>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so we deduplicate by (event_type, target_user_id) within a
@@ -267,6 +270,9 @@ impl VideoCallClient {
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
+                user_id_bytes: to_user_id_bytes(
+                    &parse_user_id(&options.user_id).expect("user_id must be a valid UUID"),
+                ),
                 recent_peer_events: HashMap::new(),
             })),
             connection_controller,
@@ -707,9 +713,7 @@ impl VideoCallClient {
 
     /// Returns the user_id as 16-byte UUID representation for protobuf fields.
     fn user_id_bytes(&self) -> Vec<u8> {
-        to_user_id_bytes(
-            &parse_user_id(&self.options.user_id).expect("user_id must be a valid UUID"),
-        )
+        self.inner.borrow().user_id_bytes.clone()
     }
 
     pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
@@ -868,9 +872,7 @@ impl Inner {
 
     /// Returns the user_id as 16-byte UUID representation for protobuf fields.
     fn user_id_bytes(&self) -> Vec<u8> {
-        to_user_id_bytes(
-            &parse_user_id(&self.options.user_id).expect("user_id must be a valid UUID"),
-        )
+        self.user_id_bytes.clone()
     }
 
     fn on_inbound_media(&mut self, response: PacketWrapper) {

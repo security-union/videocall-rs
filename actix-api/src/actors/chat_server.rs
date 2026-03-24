@@ -341,7 +341,7 @@ impl Handler<JoinRoom> for ChatServer {
             }
             Ok(uuid) => uuid,
             Err(err) => {
-                return MessageResult(Err(format!("User ID is not a valid UUID: {err}").into()));
+                return MessageResult(Err(format!("User ID is not a valid UUID: {err}")));
             }
         };
 

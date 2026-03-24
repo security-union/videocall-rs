@@ -136,6 +136,9 @@ impl AudioProducer {
             user_id, sample_rate, channels, 20
         );
 
+        let user_id_bytes =
+            videocall_types::to_user_id_bytes(&videocall_types::parse_user_id(&user_id)?);
+
         let mut audio_position = 0;
         let mut sequence = 0u64;
 
@@ -160,10 +163,7 @@ impl AudioProducer {
 
                     // Create media packet
                     let media_packet = MediaPacket {
-                        user_id: videocall_types::to_user_id_bytes(
-                            &videocall_types::parse_user_id(&user_id)
-                                .expect("bot user_id must be valid UUID"),
-                        ),
+                        user_id: user_id_bytes.clone(),
                         media_type: MediaType::AUDIO.into(),
                         data: encoded,
                         frame_type: "key".to_string(),
@@ -179,10 +179,7 @@ impl AudioProducer {
                     // Wrap in packet wrapper
                     let packet_wrapper = PacketWrapper {
                         data: media_packet.write_to_bytes()?,
-                        user_id: videocall_types::to_user_id_bytes(
-                            &videocall_types::parse_user_id(&user_id)
-                                .expect("bot user_id must be valid UUID"),
-                        ),
+                        user_id: user_id_bytes.clone(),
                         packet_type: PacketType::MEDIA.into(),
                         ..Default::default()
                     };

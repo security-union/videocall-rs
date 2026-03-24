@@ -229,7 +229,7 @@ pub fn PeerList(
                                             key: "{peer}",
                                             PeerListItem {
                                                 name: peer_display_name.clone(),
-                                                tooltip: peer_display_name,
+                                                tooltip: peer.clone(),
                                                 is_host: is_peer_host,
                                                 muted: muted,
                                                 speaking: speaking,

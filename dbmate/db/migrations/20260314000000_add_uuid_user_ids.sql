@@ -42,4 +42,6 @@ DROP INDEX IF EXISTS idx_meetings_creator_id;
 CREATE INDEX idx_meetings_creator_id ON meetings(creator_id);
 
 -- migrate:down
--- (reverse migration omitted for brevity; this is a one-way migration)
+DO $$ BEGIN
+  RAISE EXCEPTION 'Irreversible migration: UUID primary keys cannot be safely reverted to email-based keys';
+END $$;

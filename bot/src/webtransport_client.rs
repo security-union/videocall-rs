@@ -101,6 +101,10 @@ impl WebTransportClient {
     }
 
     async fn send_connection_packet(&self) -> anyhow::Result<()> {
+        let user_id_bytes = videocall_types::to_user_id_bytes(&videocall_types::parse_user_id(
+            &self.config.user_id,
+        )?);
+
         let connection_packet = ConnectionPacket {
             meeting_id: self.config.meeting_id.clone(),
             ..Default::default()
@@ -108,10 +112,7 @@ impl WebTransportClient {
 
         let packet = PacketWrapper {
             packet_type: PacketType::CONNECTION.into(),
-            user_id: videocall_types::to_user_id_bytes(
-                &videocall_types::parse_user_id(&self.config.user_id)
-                    .expect("bot user_id must be valid UUID"),
-            ),
+            user_id: user_id_bytes,
             data: connection_packet.write_to_bytes()?,
             ..Default::default()
         };
@@ -125,6 +126,10 @@ impl WebTransportClient {
         if let Some(session) = &self.session {
             let session = session.clone();
             let user_id = self.config.user_id.clone();
+            let user_id_bytes = videocall_types::to_user_id_bytes(
+                &videocall_types::parse_user_id(&self.config.user_id)
+                    .expect("bot user_id must be valid UUID"),
+            );
             let video_enabled = self.config.enable_video; // Get actual video config
             let audio_enabled = self.config.enable_audio; // Get actual audio config
             let quit = self.quit.clone();
@@ -147,10 +152,7 @@ impl WebTransportClient {
 
                     let heartbeat = MediaPacket {
                         media_type: MediaType::HEARTBEAT.into(),
-                        user_id: videocall_types::to_user_id_bytes(
-                            &videocall_types::parse_user_id(&user_id)
-                                .expect("bot user_id must be valid UUID"),
-                        ),
+                        user_id: user_id_bytes.clone(),
                         timestamp: now_ms as f64,
                         heartbeat_metadata: Some(HeartbeatMetadata {
                             video_enabled,
@@ -162,10 +164,7 @@ impl WebTransportClient {
                     };
 
                     let packet = PacketWrapper {
-                        user_id: videocall_types::to_user_id_bytes(
-                            &videocall_types::parse_user_id(&user_id)
-                                .expect("bot user_id must be valid UUID"),
-                        ),
+                        user_id: user_id_bytes.clone(),
                         packet_type: PacketType::MEDIA.into(),
                         data: heartbeat.write_to_bytes().unwrap(),
                         ..Default::default()

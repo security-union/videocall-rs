@@ -155,7 +155,7 @@ pub fn generate_for_peer(
                     })}
                 >
                     { if is_video_enabled_for_peer { html!{ <UserVideo id={key.clone()} hidden={false}/> } } else { html!{ <div class=""><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> } } }
-                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_display_name}") } else {peer_display_name.clone() }} dir={"auto"}>
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_user_id}") } else { peer_user_id.clone() }} dir={"auto"}>
                         {peer_display_name.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>
@@ -216,7 +216,7 @@ pub fn generate_for_peer(
                             <span class="placeholder-text">{"Video Disabled"}</span>
                         </div>
                     }
-                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_display_name}") } else { peer_display_name.clone() }} dir={"auto"}>
+                    <h4 class="floating-name" title={if is_host { format!("Host: {peer_user_id}") } else { peer_user_id.clone() }} dir={"auto"}>
                         {peer_display_name.clone()}
                         if is_host { <CrownIcon /> }
                     </h4>

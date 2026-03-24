@@ -155,9 +155,9 @@ pub fn generate_for_peer(
         let key_clone = key.clone();
         let peer_display_name_fb = peer_display_name.clone();
         let title = if is_host {
-            format!("Host: {peer_display_name}")
+            format!("Host: {peer_user_id}")
         } else {
-            peer_display_name.clone()
+            peer_user_id.clone()
         };
         let full_bleed_class = if is_video_enabled_for_peer {
             "canvas-container video-on"
@@ -242,9 +242,9 @@ pub fn generate_for_peer(
     let key_clone = key.clone();
     let peer_display_name_grid = peer_display_name.clone();
     let title_grid = if is_host {
-        format!("Host: {peer_display_name}")
+        format!("Host: {peer_user_id}")
     } else {
-        peer_display_name.clone()
+        peer_user_id.clone()
     };
 
     rsx! {

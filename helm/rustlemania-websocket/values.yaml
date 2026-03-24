@@ -30,11 +30,11 @@ env:
         key: secret
 resources:
   limits:
-    cpu: "50m"
-    memory: "10Mi"
+    cpu: "500m"
+    memory: "256Mi"
   requests:
-    cpu: "20m"
-    memory: "10Mi"
+    cpu: "100m"
+    memory: "32Mi"
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}

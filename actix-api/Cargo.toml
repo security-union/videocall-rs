@@ -9,6 +9,9 @@ categories = ["network-programming", "multimedia"]
 
 [features]
 default = []
+## Expose test-only helpers (e.g. packet counters) so that integration tests
+## in `tests/` can import them.  Never enable in production builds.
+testing = []
 
 [lib]
 name = "sec_api"
@@ -61,6 +64,7 @@ uuid = { version = "0.8", features = ["serde", "v4"] }
 web-transport-quinn = { workspace = true }
 
 [dev-dependencies]
+videocall-api = { path = ".", features = ["testing"] }
 chrono = "0.4"
 url = "2"
 serial_test = "3"

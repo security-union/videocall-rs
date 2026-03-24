@@ -27,7 +27,7 @@ use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
 use log::{debug, error, info, warn};
 use protobuf::Message;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
@@ -143,7 +143,7 @@ pub struct ConnectionManager {
     reelection_in_progress: bool,
     /// Set to `true` when the user explicitly calls `disconnect()`. Checked by
     /// the reconnection loop to prevent reconnecting after an intentional leave.
-    intentionally_disconnected: Rc<RefCell<bool>>,
+    intentionally_disconnected: Rc<Cell<bool>>,
 }
 
 impl ConnectionManager {
@@ -180,7 +180,7 @@ impl ConnectionManager {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
-            intentionally_disconnected: Rc::new(RefCell::new(false)),
+            intentionally_disconnected: Rc::new(Cell::new(false)),
         };
 
         // Immediately start creating connections and testing
@@ -467,13 +467,9 @@ impl ConnectionManager {
         Callback::from(move |error| {
             warn!("Connection {connection_id} lost: {error:?}");
 
-            // If the user explicitly called disconnect(), do not attempt reconnection.
-            if *intentionally_disconnected.borrow() {
-                info!("Connection lost after intentional disconnect — not reconnecting");
-                return;
-            }
-
             // Only react if this was the active connection.
+            // After intentional disconnect(), active_connection_id is already None,
+            // so this guard catches that case too (Some(id) != None → return).
             if Some(connection_id.as_str()) != active_connection_id.borrow().as_deref() {
                 info!(
                     "Non-active connection lost: {connection_id}, current active: {:?}",
@@ -482,10 +478,8 @@ impl ConnectionManager {
                 return;
             }
 
-            // Clear the active connection so is_connected() returns false immediately.
             *active_connection_id.borrow_mut() = None;
 
-            // If a reconnection is already in progress, do not start another one.
             {
                 let phase = reconnection_phase.borrow();
                 if matches!(*phase, ReconnectionPhase::Reconnecting { .. }) {
@@ -494,7 +488,6 @@ impl ConnectionManager {
                 }
             }
 
-            // Transition to Reconnecting and notify the UI.
             *reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
                 attempt: 0,
                 next_delay_ms: RECONNECT_INITIAL_DELAY_MS,
@@ -507,7 +500,6 @@ impl ConnectionManager {
 
             info!("Active connection lost, starting automatic reconnection (unlimited retries with backoff)");
 
-            // Launch the async reconnection loop.
             let reconnection_phase_clone = reconnection_phase.clone();
             let active_connection_id_clone = active_connection_id.clone();
             let on_state_changed_clone = on_state_changed.clone();
@@ -692,45 +684,18 @@ impl ConnectionManager {
 
     /// Find the connection with the best (lowest) average RTT
     fn find_best_connection(&self) -> Result<(String, ServerRttMeasurement)> {
-        // We run two passes: first look exclusively at WebTransport connections.
-        // Only if none of them are usable do we fall back to WebSocket.
-
-        let mut best_wt: Option<(String, ServerRttMeasurement)> = None;
-        let mut best_wt_rtt = f64::INFINITY;
-
-        let mut best_ws: Option<(String, ServerRttMeasurement)> = None;
-        let mut best_ws_rtt = f64::INFINITY;
-
-        for (connection_id, measurement) in &self.rtt_measurements {
-            // Skip connections that are not yet fully established
-            if let Some(conn) = self.connections.get(connection_id) {
-                if !conn.is_connected() {
-                    continue;
-                }
-            }
-
-            if let Some(avg_rtt) = measurement.average_rtt {
-                if measurement.measurements.is_empty() {
-                    continue;
-                }
-
-                if measurement.is_webtransport {
-                    if avg_rtt < best_wt_rtt {
-                        best_wt_rtt = avg_rtt;
-                        best_wt = Some((connection_id.clone(), measurement.clone()));
-                    }
-                } else if avg_rtt < best_ws_rtt {
-                    best_ws_rtt = avg_rtt;
-                    best_ws = Some((connection_id.clone(), measurement.clone()));
-                }
-            }
-        }
-
-        if let Some(best) = best_wt {
-            return Ok(best);
-        }
-
-        best_ws.ok_or_else(|| anyhow!("No valid connections with RTT measurements found"))
+        let candidates: Vec<_> = self
+            .rtt_measurements
+            .iter()
+            .filter(|(id, _)| {
+                self.connections
+                    .get(*id)
+                    .map(|c| c.is_connected())
+                    .unwrap_or(false)
+            })
+            .map(|(id, m)| (id.as_str(), m))
+            .collect();
+        select_best_connection(&candidates)
     }
 
     /// Close all unused connections after election
@@ -770,7 +735,7 @@ impl ConnectionManager {
         last_server_url: String,
         manager_ref: Weak<RefCell<ConnectionManager>>,
         election_period_ms: u64,
-        intentionally_disconnected: Rc<RefCell<bool>>,
+        intentionally_disconnected: Rc<Cell<bool>>,
     ) {
         let mut attempt: u32 = 0;
         let mut delay_ms: u64 = RECONNECT_INITIAL_DELAY_MS;
@@ -781,7 +746,7 @@ impl ConnectionManager {
 
         loop {
             // Check if user intentionally disconnected (e.g. left the meeting).
-            if *intentionally_disconnected.borrow() {
+            if intentionally_disconnected.get() {
                 info!("Reconnection loop cancelled — user disconnected intentionally");
                 *reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
                 return;
@@ -801,12 +766,10 @@ impl ConnectionManager {
                 attempt,
             });
 
-            // Wait with exponential backoff.
             gloo_timers::future::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
-            // Re-check intentional disconnect after the sleep — user may have
-            // left the meeting while we were waiting.
-            if *intentionally_disconnected.borrow() {
+            // Re-check after sleep — user may have left during backoff.
+            if intentionally_disconnected.get() {
                 info!(
                     "Reconnection loop cancelled during backoff — user disconnected intentionally"
                 );
@@ -849,7 +812,7 @@ impl ConnectionManager {
                     }
                     Err(_) => {
                         warn!("Reconnection: could not borrow manager (busy), retrying in 200ms");
-                        attempt = attempt.saturating_sub(1); // Don't count a borrow-conflict as an attempt
+                        attempt -= 1; // undo the increment — borrow conflict is not a real attempt
                         gloo_timers::future::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     }
@@ -1408,17 +1371,11 @@ impl ConnectionManager {
     }
 
     pub fn disconnect(&mut self) -> anyhow::Result<()> {
-        // Signal that this is an intentional disconnect so that any in-flight
-        // or future reconnection attempts are cancelled.
-        *self.intentionally_disconnected.borrow_mut() = true;
-
-        // Cancel any pending reconnection.
+        self.intentionally_disconnected.set(true);
         *self.reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
-
-        // Clear the active connection id so is_connected() returns false.
+        // Must clear active_connection_id BEFORE connections.clear() so that
+        // on_disconnect callbacks see None and don't start reconnection.
         *self.active_connection_id.borrow_mut() = None;
-
-        // Drop all connections (stops heartbeats, closes transports).
         self.connections.clear();
         self.get_connection_state();
         Ok(())
@@ -1503,6 +1460,44 @@ impl ConnectionManager {
 // Pure helper functions extracted for testability
 // -----------------------------------------------------------------------
 
+/// Pure election algorithm: prefer WebTransport over WebSocket, lowest RTT wins.
+///
+/// Two-pass selection: first considers only WebTransport candidates, falling back
+/// to WebSocket only if no valid WebTransport connections exist.
+fn select_best_connection(
+    candidates: &[(&str, &ServerRttMeasurement)],
+) -> Result<(String, ServerRttMeasurement)> {
+    let mut best_wt: Option<(String, ServerRttMeasurement)> = None;
+    let mut best_wt_rtt = f64::INFINITY;
+
+    let mut best_ws: Option<(String, ServerRttMeasurement)> = None;
+    let mut best_ws_rtt = f64::INFINITY;
+
+    for &(connection_id, measurement) in candidates {
+        if let Some(avg_rtt) = measurement.average_rtt {
+            if measurement.measurements.is_empty() {
+                continue;
+            }
+
+            if measurement.is_webtransport {
+                if avg_rtt < best_wt_rtt {
+                    best_wt_rtt = avg_rtt;
+                    best_wt = Some((connection_id.to_string(), measurement.clone()));
+                }
+            } else if avg_rtt < best_ws_rtt {
+                best_ws_rtt = avg_rtt;
+                best_ws = Some((connection_id.to_string(), measurement.clone()));
+            }
+        }
+    }
+
+    if let Some(best) = best_wt {
+        return Ok(best);
+    }
+
+    best_ws.ok_or_else(|| anyhow!("No valid connections with RTT measurements found"))
+}
+
 /// Calculate the next backoff delay given the current delay and multiplier,
 /// capped at `max_delay_ms`.
 fn next_backoff_delay(current_delay_ms: u64, multiplier: f64, max_delay_ms: u64) -> u64 {
@@ -1536,8 +1531,8 @@ impl Drop for ConnectionManager {
 mod tests {
     use super::*;
     use crate::adaptive_quality_constants::{
-        RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
-        RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
+        RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_MS,
+        REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
     };
 
     // -----------------------------------------------------------------------
@@ -1581,7 +1576,7 @@ mod tests {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
-            intentionally_disconnected: Rc::new(RefCell::new(false)),
+            intentionally_disconnected: Rc::new(Cell::new(false)),
         }
     }
 
@@ -1858,28 +1853,96 @@ mod tests {
     }
 
     // ===================================================================
-    // 4. Fast-fail logic — constants verification
+    // 4. disconnect() state transitions
     // ===================================================================
-    // The actual fast-fail logic runs inside `run_reconnection_loop` (async),
-    // which requires a wasm runtime. We verify the constants and the backoff
-    // sequence that the loop would follow, then note what needs integration
-    // testing.
 
     #[test]
-    fn fast_fail_limit_is_three() {
-        assert_eq!(RECONNECT_CONSECUTIVE_ZERO_LIMIT, 3);
+    fn disconnect_sets_active_connection_id_to_none() {
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "ws_0".to_string(),
+            elected_at: 0.0,
+        };
+        assert!(mgr.is_connected());
+
+        mgr.disconnect().unwrap();
+
+        assert!(mgr.active_connection_id.borrow().is_none());
     }
 
     #[test]
-    fn reconnect_retries_indefinitely() {
-        // There is no RECONNECT_MAX_ATTEMPTS constant -- the client retries
-        // indefinitely. The only hard stop is RECONNECT_CONSECUTIVE_ZERO_LIMIT
-        // (consecutive auth/server rejections). Verify the constants reflect this.
-        assert_eq!(RECONNECT_INITIAL_DELAY_MS, 500);
-        assert_eq!(RECONNECT_MAX_DELAY_MS, 2000);
-        assert_eq!(RECONNECT_BACKOFF_MULTIPLIER, 2.0);
-        // fast-fail limit is a small number so it triggers quickly on auth failures
-        assert!(RECONNECT_CONSECUTIVE_ZERO_LIMIT <= 5);
+    fn disconnect_sets_intentionally_disconnected_flag() {
+        let mut mgr = make_test_manager();
+        assert!(!mgr.intentionally_disconnected.get());
+
+        mgr.disconnect().unwrap();
+
+        assert!(mgr.intentionally_disconnected.get());
+    }
+
+    #[test]
+    fn disconnect_sets_reconnection_phase_to_idle() {
+        let mut mgr = make_test_manager();
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 3,
+            next_delay_ms: 2000,
+        };
+
+        mgr.disconnect().unwrap();
+
+        assert_eq!(mgr.reconnection_phase(), ReconnectionPhase::Idle);
+    }
+
+    #[test]
+    fn disconnect_clears_all_connections() {
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "ws_0".to_string(),
+            elected_at: 0.0,
+        };
+
+        mgr.disconnect().unwrap();
+
+        assert!(mgr.connections.is_empty());
+        assert!(mgr.active_connection_id.borrow().is_none());
+        assert!(mgr.intentionally_disconnected.get());
+        assert_eq!(mgr.reconnection_phase(), ReconnectionPhase::Idle);
+    }
+
+    #[test]
+    fn active_connection_id_guard_catches_intentional_disconnect() {
+        // Proves that after disconnect(), the callback's active_connection_id
+        // guard (Some(id) != None) is always true, making the explicit
+        // intentionally_disconnected check in the callback redundant.
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+
+        mgr.disconnect().unwrap();
+
+        // For ANY connection_id, Some(id) != active_connection_id (None) is true.
+        let active = mgr.active_connection_id.borrow();
+        assert!(Some("ws_0") != active.as_deref());
+        assert!(Some("wt_0") != active.as_deref());
+        assert!(Some("anything") != active.as_deref());
+    }
+
+    #[test]
+    fn intentionally_disconnected_needed_for_reconnection_loop() {
+        // The reconnection loop checks active_connection_id.is_some() to detect
+        // EXTERNAL reconnection. After disconnect(), active_connection_id is None,
+        // which the loop would misinterpret as "not yet reconnected, keep trying."
+        // The intentionally_disconnected flag disambiguates.
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+
+        mgr.disconnect().unwrap();
+
+        // active_connection_id is None -- loop would see "no connection yet"
+        assert!(mgr.active_connection_id.borrow().is_none());
+        // But intentionally_disconnected is true -- loop should exit
+        assert!(mgr.intentionally_disconnected.get());
     }
 
     // ===================================================================
@@ -1962,24 +2025,147 @@ mod tests {
     }
 
     // ===================================================================
-    // 6. find_best_connection — election logic
+    // 6. select_best_connection — pure election algorithm
     // ===================================================================
-    // Note: find_best_connection checks `conn.is_connected()` on each connection.
-    // Since we have no live Connection objects in test, we cannot fully exercise
-    // the "skip non-connected" path. We test the RTT comparison logic by
-    // verifying the preference for WebTransport over WebSocket.
+    // Tests call select_best_connection() directly with plain data.
+    // No ConnectionManager, no fake state, no side doors.
 
-    #[test]
-    fn find_best_connection_fails_with_no_measurements() {
-        let mgr = make_test_manager();
-        assert!(mgr.find_best_connection().is_err());
+    fn m(id: &str, is_wt: bool, avg: Option<f64>, samples: Vec<f64>) -> ServerRttMeasurement {
+        ServerRttMeasurement {
+            url: format!("https://test/{id}"),
+            is_webtransport: is_wt,
+            measurements: samples,
+            average_rtt: avg,
+            connection_id: id.to_string(),
+            active: false,
+            connected: false,
+        }
     }
 
     #[test]
-    fn find_best_connection_fails_with_no_average_rtt() {
-        let mut mgr = make_test_manager();
-        insert_measurement(&mut mgr, "ws_0", false, None, vec![]);
-        assert!(mgr.find_best_connection().is_err());
+    fn election_no_candidates() {
+        assert!(select_best_connection(&[]).is_err());
+    }
+
+    #[test]
+    fn election_no_average_rtt() {
+        let ws = m("ws_0", false, None, vec![]);
+        assert!(select_best_connection(&[("ws_0", &ws)]).is_err());
+    }
+
+    #[test]
+    fn election_empty_measurements_vec() {
+        let ws = m("ws_0", false, Some(50.0), vec![]);
+        assert!(select_best_connection(&[("ws_0", &ws)]).is_err());
+    }
+
+    #[test]
+    fn election_single_websocket() {
+        let ws = m("ws_0", false, Some(50.0), vec![50.0]);
+        let (id, result) = select_best_connection(&[("ws_0", &ws)]).unwrap();
+        assert_eq!(id, "ws_0");
+        assert!((result.average_rtt.unwrap() - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn election_single_webtransport() {
+        let wt = m("wt_0", true, Some(30.0), vec![30.0]);
+        let (id, _) = select_best_connection(&[("wt_0", &wt)]).unwrap();
+        assert_eq!(id, "wt_0");
+    }
+
+    #[test]
+    fn election_prefers_webtransport_over_websocket() {
+        let ws = m("ws_0", false, Some(10.0), vec![10.0]); // better RTT
+        let wt = m("wt_0", true, Some(80.0), vec![80.0]); // worse RTT, but WT
+        let (id, _) = select_best_connection(&[("ws_0", &ws), ("wt_0", &wt)]).unwrap();
+        assert_eq!(id, "wt_0");
+    }
+
+    #[test]
+    fn election_falls_back_to_websocket_when_no_wt() {
+        let ws0 = m("ws_0", false, Some(40.0), vec![40.0]);
+        let ws1 = m("ws_1", false, Some(60.0), vec![60.0]);
+        let (id, _) = select_best_connection(&[("ws_0", &ws0), ("ws_1", &ws1)]).unwrap();
+        assert_eq!(id, "ws_0");
+    }
+
+    #[test]
+    fn election_lowest_rtt_among_webtransport() {
+        let wt0 = m("wt_0", true, Some(100.0), vec![100.0]);
+        let wt1 = m("wt_1", true, Some(25.0), vec![25.0]);
+        let (id, _) = select_best_connection(&[("wt_0", &wt0), ("wt_1", &wt1)]).unwrap();
+        assert_eq!(id, "wt_1");
+    }
+
+    #[test]
+    fn election_lowest_rtt_among_websocket() {
+        let ws0 = m("ws_0", false, Some(90.0), vec![90.0]);
+        let ws1 = m("ws_1", false, Some(45.0), vec![45.0]);
+        let (id, _) = select_best_connection(&[("ws_0", &ws0), ("ws_1", &ws1)]).unwrap();
+        assert_eq!(id, "ws_1");
+    }
+
+    #[test]
+    fn election_four_backends_elects_best_wt() {
+        let ws0 = m("ws_0", false, Some(20.0), vec![20.0]); // best RTT overall
+        let ws1 = m("ws_1", false, Some(35.0), vec![35.0]);
+        let wt0 = m("wt_0", true, Some(50.0), vec![50.0]);
+        let wt1 = m("wt_1", true, Some(40.0), vec![40.0]); // best WT
+
+        let (id, result) = select_best_connection(&[
+            ("ws_0", &ws0),
+            ("ws_1", &ws1),
+            ("wt_0", &wt0),
+            ("wt_1", &wt1),
+        ])
+        .unwrap();
+        assert_eq!(id, "wt_1");
+        assert!(result.is_webtransport);
+        assert!((result.average_rtt.unwrap() - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn election_four_backends_falls_back_to_ws_when_wt_has_no_rtt() {
+        let ws0 = m("ws_0", false, Some(30.0), vec![30.0]);
+        let ws1 = m("ws_1", false, Some(55.0), vec![55.0]);
+        let wt0 = m("wt_0", true, None, vec![]);
+        let wt1 = m("wt_1", true, None, vec![]);
+
+        let (id, result) = select_best_connection(&[
+            ("ws_0", &ws0),
+            ("ws_1", &ws1),
+            ("wt_0", &wt0),
+            ("wt_1", &wt1),
+        ])
+        .unwrap();
+        assert_eq!(id, "ws_0");
+        assert!(!result.is_webtransport);
+    }
+
+    #[test]
+    fn election_skips_candidates_without_measurements() {
+        let wt0 = m("wt_0", true, Some(10.0), vec![]); // avg set but no samples → skipped
+        let wt1 = m("wt_1", true, Some(80.0), vec![80.0]);
+        let (id, _) = select_best_connection(&[("wt_0", &wt0), ("wt_1", &wt1)]).unwrap();
+        assert_eq!(id, "wt_1");
+    }
+
+    #[test]
+    fn election_mixed_validity_four_backends() {
+        let ws0 = m("ws_0", false, Some(25.0), vec![25.0]);
+        let ws1 = m("ws_1", false, None, vec![]);
+        let wt0 = m("wt_0", true, None, vec![]);
+        let wt1 = m("wt_1", true, Some(60.0), vec![60.0]);
+
+        let (id, _) = select_best_connection(&[
+            ("ws_0", &ws0),
+            ("ws_1", &ws1),
+            ("wt_0", &wt0),
+            ("wt_1", &wt1),
+        ])
+        .unwrap();
+        assert_eq!(id, "wt_1");
     }
 
     // ===================================================================

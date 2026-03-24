@@ -39,7 +39,7 @@ use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -356,7 +356,7 @@ impl SessionLogic {
         // Classify and handle
         match classify_packet(data) {
             PacketKind::Dropped => {
-                warn!(
+                debug!(
                     "Dropping disallowed packet from session {} (user {})",
                     self.id, self.user_id
                 );

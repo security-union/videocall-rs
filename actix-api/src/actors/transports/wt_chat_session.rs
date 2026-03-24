@@ -165,16 +165,18 @@ impl WtChatSession {
 
     /// Send outbound message, automatically choosing datagram or stream.
     ///
-    /// Diagnostics and health packets that fit within the datagram MTU are
-    /// sent via unreliable datagrams (loss-tolerant, low latency). Media
-    /// packets and all other packet types use reliable unidirectional streams
-    /// to ensure ordered, guaranteed delivery.
+    /// Control packets (heartbeats, RTT probes, diagnostics) that fit within
+    /// the datagram MTU are sent via unreliable datagrams -- they are periodic
+    /// and expendable, so lower overhead matters more than guaranteed delivery.
     ///
-    /// The `is_datagram_eligible` hint is pre-computed by the caller from an
-    /// already-parsed `PacketWrapper`, avoiding a redundant protobuf parse on
-    /// every outbound packet.
-    fn send_auto(&self, data: Vec<u8>, is_datagram_eligible: bool) -> WtSendResult {
-        let outbound = if is_datagram_eligible && data.len() <= DATAGRAM_MAX_SIZE {
+    /// Media packets (VIDEO, AUDIO, SCREEN) use reliable unidirectional streams
+    /// to avoid visual/audio artifacts from packet loss.
+    ///
+    /// The `is_media` hint is pre-computed by the caller from an already-parsed
+    /// `PacketWrapper`, avoiding a redundant protobuf parse on every outbound
+    /// packet.
+    fn send_auto(&self, data: Vec<u8>, is_media: bool) -> WtSendResult {
+        let outbound = if !is_media && data.len() <= DATAGRAM_MAX_SIZE {
             WtOutbound::Datagram(data.into())
         } else {
             WtOutbound::UniStream(data.into())
@@ -306,9 +308,9 @@ impl Actor for WtChatSession {
 
 /// Handle outbound messages from ChatServer.
 ///
-/// Uses `send_auto` to route diagnostics/health packets via datagrams
-/// (loss-tolerant, low latency) and all other packets (including media)
-/// via reliable streams.
+/// Uses `send_auto` to route control packets (heartbeats, RTT, diagnostics)
+/// via datagrams (periodic and expendable) and media packets (VIDEO, AUDIO,
+/// SCREEN) via reliable streams (avoids visual/audio artifacts).
 ///
 /// The outbound `msg.msg` is a serialized `PacketWrapper`. We parse it once
 /// to extract both the sender's `session_id` (for congestion tracking) and
@@ -329,15 +331,12 @@ impl Handler<Message> for WtChatSession {
         // ensures congestion tracking targets the correct (sender) session.
         let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
         let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
-        let is_datagram_eligible = parsed
+        let is_media = parsed
             .as_ref()
-            .map(|pw| {
-                pw.packet_type == PacketType::DIAGNOSTICS.into()
-                    || pw.packet_type == PacketType::HEALTH.into()
-            })
+            .map(|pw| pw.packet_type == PacketType::MEDIA.into())
             .unwrap_or(false);
 
-        match self.send_auto(bytes, is_datagram_eligible) {
+        match self.send_auto(bytes, is_media) {
             WtSendResult::Sent => {}
             WtSendResult::Dead => {
                 ctx.stop();

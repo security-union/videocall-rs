@@ -143,7 +143,11 @@ pub struct ConnectionManager {
     reelection_in_progress: bool,
     /// Set to `true` when the user explicitly calls `disconnect()`. Checked by
     /// the reconnection loop to prevent reconnecting after an intentional leave.
+<<<<<<< HEAD
     intentionally_disconnected: Rc<Cell<bool>>,
+=======
+    intentionally_disconnected: Rc<RefCell<bool>>,
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
 }
 
 impl ConnectionManager {
@@ -180,7 +184,11 @@ impl ConnectionManager {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
+<<<<<<< HEAD
             intentionally_disconnected: Rc::new(Cell::new(false)),
+=======
+            intentionally_disconnected: Rc::new(RefCell::new(false)),
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
         };
 
         Ok(manager)
@@ -471,6 +479,12 @@ impl ConnectionManager {
         Callback::from(move |error| {
             warn!("Connection {connection_id} lost: {error:?}");
 
+            // If the user explicitly called disconnect(), do not attempt reconnection.
+            if *intentionally_disconnected.borrow() {
+                info!("Connection lost after intentional disconnect — not reconnecting");
+                return;
+            }
+
             // Only react if this was the active connection.
             // After intentional disconnect(), active_connection_id is already None,
             // so this guard catches that case too (Some(id) != None → return).
@@ -526,7 +540,10 @@ impl ConnectionManager {
         })
     }
 
-    /// Send RTT probe to a specific connection
+    /// Send RTT probe to a specific connection.
+    ///
+    /// RTT probes are periodic and expendable — a missed probe just means we
+    /// skip one measurement. They use datagrams for lower overhead.
     fn send_rtt_probe(&mut self, connection_id: &str) -> Result<()> {
         let connection = self
             .connections
@@ -545,7 +562,7 @@ impl ConnectionManager {
         let timestamp = js_sys::Date::now();
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
-        connection.send_packet(rtt_packet);
+        connection.send_packet_datagram(rtt_packet);
         debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
@@ -739,7 +756,11 @@ impl ConnectionManager {
         last_server_url: String,
         manager_ref: Weak<RefCell<ConnectionManager>>,
         election_period_ms: u64,
+<<<<<<< HEAD
         intentionally_disconnected: Rc<Cell<bool>>,
+=======
+        intentionally_disconnected: Rc<RefCell<bool>>,
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
     ) {
         let mut attempt: u32 = 0;
         let mut delay_ms: u64 = RECONNECT_INITIAL_DELAY_MS;
@@ -750,7 +771,11 @@ impl ConnectionManager {
 
         loop {
             // Check if user intentionally disconnected (e.g. left the meeting).
+<<<<<<< HEAD
             if intentionally_disconnected.get() {
+=======
+            if *intentionally_disconnected.borrow() {
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
                 info!("Reconnection loop cancelled — user disconnected intentionally");
                 *reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
                 return;
@@ -772,8 +797,14 @@ impl ConnectionManager {
 
             gloo_timers::future::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
+<<<<<<< HEAD
             // Re-check after sleep — user may have left during backoff.
             if intentionally_disconnected.get() {
+=======
+            // Re-check intentional disconnect after the sleep — user may have
+            // left the meeting while we were waiting.
+            if *intentionally_disconnected.borrow() {
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
                 info!(
                     "Reconnection loop cancelled during backoff — user disconnected intentionally"
                 );
@@ -816,7 +847,11 @@ impl ConnectionManager {
                     }
                     Err(_) => {
                         warn!("Reconnection: could not borrow manager (busy), retrying in 200ms");
+<<<<<<< HEAD
                         attempt -= 1; // undo the increment — borrow conflict is not a real attempt
+=======
+                        attempt = attempt.saturating_sub(1); // Don't count a borrow-conflict as an attempt
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
                         gloo_timers::future::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     }
@@ -1297,9 +1332,10 @@ impl ConnectionManager {
 
     /// Send packet through active connection via datagram (unreliable, low-latency).
     ///
-    /// Used for media packets (VIDEO, AUDIO, SCREEN) where low latency matters
-    /// more than guaranteed delivery. Falls back to reliable stream for
-    /// WebSocket connections or oversized packets.
+    /// Used for control packets (heartbeats, RTT probes, diagnostics) that are
+    /// periodic and expendable — lower overhead matters more than guaranteed
+    /// delivery. Falls back to reliable stream for WebSocket connections or
+    /// oversized packets.
     pub fn send_packet_datagram(&self, packet: PacketWrapper) -> Result<()> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {
@@ -1375,11 +1411,25 @@ impl ConnectionManager {
     }
 
     pub fn disconnect(&mut self) -> anyhow::Result<()> {
+<<<<<<< HEAD
         self.intentionally_disconnected.set(true);
         *self.reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
         // Must clear active_connection_id BEFORE connections.clear() so that
         // on_disconnect callbacks see None and don't start reconnection.
         *self.active_connection_id.borrow_mut() = None;
+=======
+        // Signal that this is an intentional disconnect so that any in-flight
+        // or future reconnection attempts are cancelled.
+        *self.intentionally_disconnected.borrow_mut() = true;
+
+        // Cancel any pending reconnection.
+        *self.reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
+
+        // Clear the active connection id so is_connected() returns false.
+        *self.active_connection_id.borrow_mut() = None;
+
+        // Drop all connections (stops heartbeats, closes transports).
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
         self.connections.clear();
         Ok(())
     }
@@ -1534,8 +1584,13 @@ impl Drop for ConnectionManager {
 mod tests {
     use super::*;
     use crate::adaptive_quality_constants::{
+<<<<<<< HEAD
         RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_MS,
         REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
+=======
+        RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
+        RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
     };
 
     // -----------------------------------------------------------------------
@@ -1579,7 +1634,11 @@ mod tests {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
+<<<<<<< HEAD
             intentionally_disconnected: Rc::new(Cell::new(false)),
+=======
+            intentionally_disconnected: Rc::new(RefCell::new(false)),
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
         }
     }
 
@@ -1875,6 +1934,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn disconnect_sets_intentionally_disconnected_flag() {
         let mut mgr = make_test_manager();
         assert!(!mgr.intentionally_disconnected.get());
@@ -1946,6 +2006,17 @@ mod tests {
         assert!(mgr.active_connection_id.borrow().is_none());
         // But intentionally_disconnected is true -- loop should exit
         assert!(mgr.intentionally_disconnected.get());
+=======
+    fn reconnect_retries_indefinitely() {
+        // There is no RECONNECT_MAX_ATTEMPTS constant -- the client retries
+        // indefinitely. The only hard stop is RECONNECT_CONSECUTIVE_ZERO_LIMIT
+        // (consecutive auth/server rejections). Verify the constants reflect this.
+        assert_eq!(RECONNECT_INITIAL_DELAY_MS, 500);
+        assert_eq!(RECONNECT_MAX_DELAY_MS, 2000);
+        assert_eq!(RECONNECT_BACKOFF_MULTIPLIER, 2.0);
+        // fast-fail limit is a small number so it triggers quickly on auth failures
+        assert!(RECONNECT_CONSECUTIVE_ZERO_LIMIT <= 5);
+>>>>>>> 82eb0f3029833fb1bdcee1b49af2aeb45ee6018b
     }
 
     // ===================================================================

@@ -351,19 +351,13 @@ fn UserVideo(id: String, hidden: bool) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let id_for_effect = id.clone();
 
-    // Store the IntersectionObserver together with its backing Closure so that
-    // both are kept alive for exactly as long as needed.  When the effect
-    // re-runs the old tuple is dropped, which disconnects the observer and
-    // frees the closure (instead of leaking via `Closure::forget`).
-    type ObserverState = (
-        IntersectionObserver,
-        Closure<dyn FnMut(js_sys::Array, IntersectionObserver)>,
-    );
-    let mut observer_signal: Signal<Option<ObserverState>> = use_signal(|| None);
+    // Store the IntersectionObserver so we can disconnect it when the effect
+    // re-runs (preventing accumulation) and on component unmount.
+    let mut observer_signal: Signal<Option<IntersectionObserver>> = use_signal(|| None);
 
     use_effect(move || {
         // Disconnect any previous observer before creating a new one.
-        if let Some((old_observer, _old_closure)) = observer_signal.write().take() {
+        if let Some(old_observer) = observer_signal.write().take() {
             old_observer.disconnect();
         }
 
@@ -392,19 +386,18 @@ fn UserVideo(id: String, hidden: bool) -> Element {
 
                 if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
                     observer.observe(&canvas);
-                    // Store both the observer and its closure in the signal so
-                    // the closure stays alive without `forget()`.  When the
-                    // signal is overwritten or the component unmounts, both are
-                    // dropped together.
-                    observer_signal.set(Some((observer, callback)));
+                    observer_signal.set(Some(observer));
                 }
+                // The Closure must outlive the observer; forget it so it is
+                // not dropped when this scope exits.
+                callback.forget();
             }
         }
     });
 
     // Disconnect the observer when the component unmounts.
     use_drop(move || {
-        if let Some((obs, _closure)) = observer_signal.write().take() {
+        if let Some(obs) = observer_signal.write().take() {
             obs.disconnect();
         }
     });
@@ -425,19 +418,13 @@ fn ScreenCanvas(peer_id: String) -> Element {
     let canvas_id_for_effect = canvas_id.clone();
     let peer_id_for_effect = peer_id.clone();
 
-    // Store the IntersectionObserver together with its backing Closure so that
-    // both are kept alive for exactly as long as needed.  When the effect
-    // re-runs the old tuple is dropped, which disconnects the observer and
-    // frees the closure (instead of leaking via `Closure::forget`).
-    type ScreenObserverState = (
-        IntersectionObserver,
-        Closure<dyn FnMut(js_sys::Array, IntersectionObserver)>,
-    );
-    let mut observer_signal: Signal<Option<ScreenObserverState>> = use_signal(|| None);
+    // Store the IntersectionObserver so we can disconnect it when the effect
+    // re-runs (preventing accumulation) and on component unmount.
+    let mut observer_signal: Signal<Option<IntersectionObserver>> = use_signal(|| None);
 
     use_effect(move || {
         // Disconnect any previous observer before creating a new one.
-        if let Some((old_observer, _old_closure)) = observer_signal.write().take() {
+        if let Some(old_observer) = observer_signal.write().take() {
             old_observer.disconnect();
         }
 
@@ -466,19 +453,18 @@ fn ScreenCanvas(peer_id: String) -> Element {
 
                 if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
                     observer.observe(&canvas);
-                    // Store both the observer and its closure in the signal so
-                    // the closure stays alive without `forget()`.  When the
-                    // signal is overwritten or the component unmounts, both are
-                    // dropped together.
-                    observer_signal.set(Some((observer, callback)));
+                    observer_signal.set(Some(observer));
                 }
+                // The Closure must outlive the observer; forget it so it is
+                // not dropped when this scope exits.
+                callback.forget();
             }
         }
     });
 
     // Disconnect the observer when the component unmounts.
     use_drop(move || {
-        if let Some((obs, _closure)) = observer_signal.write().take() {
+        if let Some(obs) = observer_signal.write().take() {
             obs.disconnect();
         }
     });

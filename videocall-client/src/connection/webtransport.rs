@@ -97,6 +97,26 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
     fn send_bytes(&self, bytes: Vec<u8>) {
         WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
     }
+
+    fn send_bytes_datagram(&self, bytes: Vec<u8>) {
+        use crate::adaptive_quality_constants::DATAGRAM_MAX_SIZE;
+
+        if bytes.len() <= DATAGRAM_MAX_SIZE {
+            // Packet fits within the datagram MTU -- send as unreliable datagram
+            // for lower latency and no head-of-line blocking.
+            WebTransportTask::send_datagram(self.transport.clone(), bytes);
+        } else {
+            // Packet exceeds datagram size limit (e.g., a keyframe).
+            // Fall back to a reliable unidirectional stream to avoid
+            // implementing application-layer fragmentation.
+            debug!(
+                "Packet size {} exceeds datagram MTU {}, falling back to stream",
+                bytes.len(),
+                DATAGRAM_MAX_SIZE
+            );
+            WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+        }
+    }
 }
 
 fn handle_unidirectional_stream(

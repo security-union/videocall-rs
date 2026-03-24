@@ -189,6 +189,11 @@ impl WebTransportBridge {
                         if let Err(e) = session.send_datagram(data) {
                             error!("Error sending datagram: {}", e);
                             // Don't break on datagram errors - they're unreliable
+                        } else {
+                            // Call packet sent callback if provided (for test instrumentation)
+                            if let Some(ref callback) = on_packet_sent {
+                                callback();
+                            }
                         }
                     }
                 }

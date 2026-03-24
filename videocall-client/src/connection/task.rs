@@ -54,4 +54,16 @@ impl Task {
             Task::WebTransport(wt) => wt.send_packet(packet),
         }
     }
+
+    /// Send a packet via datagram (unreliable, low-latency) when supported.
+    ///
+    /// For WebTransport, this uses datagrams for small packets and falls back
+    /// to streams for oversized packets. For WebSocket, this is equivalent to
+    /// `send_packet()` since WebSocket has no datagram concept.
+    pub fn send_packet_datagram(&self, packet: PacketWrapper) {
+        match self {
+            Task::WebSocket(ws) => ws.send_packet(packet),
+            Task::WebTransport(wt) => wt.send_packet_datagram(packet),
+        }
+    }
 }

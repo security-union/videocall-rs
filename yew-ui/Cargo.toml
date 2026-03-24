@@ -67,6 +67,9 @@ features = [
     "Navigator",
     "OscillatorNode",
     "OscillatorType",
+    "IntersectionObserver",
+    "IntersectionObserverEntry",
+    "IntersectionObserverInit",
     "Storage",
     "console",
 ]

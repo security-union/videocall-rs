@@ -27,8 +27,9 @@ use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{window, HtmlCanvasElement};
+use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry};
 
 /// Compute the inline CSS for the speaking glow on the canvas container.
 /// Always returns explicit values so the glow is fully self-contained in the
@@ -471,16 +472,54 @@ fn UserVideo(id: String, hidden: bool) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let id_for_effect = id.clone();
 
+    // Store the IntersectionObserver so we can disconnect it when the effect
+    // re-runs (preventing accumulation) and on component unmount.
+    let mut observer_signal: Signal<Option<IntersectionObserver>> = use_signal(|| None);
+
     use_effect(move || {
-        use wasm_bindgen::JsCast;
+        // Disconnect any previous observer before creating a new one.
+        if let Some(old_observer) = observer_signal.write().take() {
+            old_observer.disconnect();
+        }
+
         if let Some(elem) = gloo_utils::document().get_element_by_id(&id_for_effect) {
             if let Ok(canvas) = elem.dyn_into::<HtmlCanvasElement>() {
-                let client = client.clone();
-                let id = id_for_effect.clone();
-                if let Err(e) = client.set_peer_video_canvas(&id, canvas) {
-                    log::debug!("Canvas not yet ready for peer {id}: {e:?}");
+                let client_ref = client.clone();
+                let id_ref = id_for_effect.clone();
+                if let Err(e) = client_ref.set_peer_video_canvas(&id_ref, canvas.clone()) {
+                    log::debug!("Canvas not yet ready for peer {id_ref}: {e:?}");
                 }
+
+                // Set up IntersectionObserver to track visibility
+                let client_for_observer = client.clone();
+                let peer_id_for_observer = id_for_effect.clone();
+                let callback = Closure::wrap(Box::new(
+                    move |entries: js_sys::Array, _observer: IntersectionObserver| {
+                        for entry in entries.iter() {
+                            let entry: IntersectionObserverEntry = entry.unchecked_into();
+                            let is_visible = entry.is_intersecting();
+                            client_for_observer
+                                .set_peer_visibility(&peer_id_for_observer, is_visible);
+                        }
+                    },
+                )
+                    as Box<dyn FnMut(js_sys::Array, IntersectionObserver)>);
+
+                if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
+                    observer.observe(&canvas);
+                    observer_signal.set(Some(observer));
+                }
+                // The Closure must outlive the observer; forget it so it is
+                // not dropped when this scope exits.
+                callback.forget();
             }
+        }
+    });
+
+    // Disconnect the observer when the component unmounts.
+    use_drop(move || {
+        if let Some(obs) = observer_signal.write().take() {
+            obs.disconnect();
         }
     });
 
@@ -500,16 +539,54 @@ fn ScreenCanvas(peer_id: String) -> Element {
     let canvas_id_for_effect = canvas_id.clone();
     let peer_id_for_effect = peer_id.clone();
 
+    // Store the IntersectionObserver so we can disconnect it when the effect
+    // re-runs (preventing accumulation) and on component unmount.
+    let mut observer_signal: Signal<Option<IntersectionObserver>> = use_signal(|| None);
+
     use_effect(move || {
-        use wasm_bindgen::JsCast;
+        // Disconnect any previous observer before creating a new one.
+        if let Some(old_observer) = observer_signal.write().take() {
+            old_observer.disconnect();
+        }
+
         if let Some(elem) = gloo_utils::document().get_element_by_id(&canvas_id_for_effect) {
             if let Ok(canvas) = elem.dyn_into::<HtmlCanvasElement>() {
-                let client = client.clone();
-                let peer_id = peer_id_for_effect.clone();
-                if let Err(e) = client.set_peer_screen_canvas(&peer_id, canvas) {
-                    log::debug!("Screen canvas not yet ready for peer {peer_id}: {e:?}");
+                let client_ref = client.clone();
+                let peer_id_ref = peer_id_for_effect.clone();
+                if let Err(e) = client_ref.set_peer_screen_canvas(&peer_id_ref, canvas.clone()) {
+                    log::debug!("Screen canvas not yet ready for peer {peer_id_ref}: {e:?}");
                 }
+
+                // Set up IntersectionObserver to track visibility for screen share
+                let client_for_observer = client.clone();
+                let peer_id_for_observer = peer_id_for_effect.clone();
+                let callback = Closure::wrap(Box::new(
+                    move |entries: js_sys::Array, _observer: IntersectionObserver| {
+                        for entry in entries.iter() {
+                            let entry: IntersectionObserverEntry = entry.unchecked_into();
+                            let is_visible = entry.is_intersecting();
+                            client_for_observer
+                                .set_peer_visibility(&peer_id_for_observer, is_visible);
+                        }
+                    },
+                )
+                    as Box<dyn FnMut(js_sys::Array, IntersectionObserver)>);
+
+                if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
+                    observer.observe(&canvas);
+                    observer_signal.set(Some(observer));
+                }
+                // The Closure must outlive the observer; forget it so it is
+                // not dropped when this scope exits.
+                callback.forget();
             }
+        }
+    });
+
+    // Disconnect the observer when the component unmounts.
+    use_drop(move || {
+        if let Some(obs) = observer_signal.write().take() {
+            obs.disconnect();
         }
     });
 

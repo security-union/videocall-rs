@@ -604,26 +604,16 @@ mod tests {
             || {
                 let session = session_clone.clone();
                 async move {
-                    // Race between uni stream and datagram since non-MEDIA
-                    // packets (e.g., MEETING, AES_KEY) may arrive via datagrams
-                    // (send_auto routes small control packets as datagrams).
-                    let buf = tokio::select! {
-                        Ok(mut stream) = session.accept_uni() => {
-                            stream.read_to_end(usize::MAX).await.ok()
-                        }
-                        Ok(datagram) = session.read_datagram() => {
-                            Some(datagram.to_vec())
-                        }
-                        else => None,
-                    };
-                    if let Some(buf) = buf {
-                        if !buf.is_empty() {
-                            if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&buf) {
-                                if wrapper.packet_type
-                                    == videocall_types::protos::packet_wrapper::packet_wrapper::PacketType::MEETING.into()
-                                {
-                                    println!("✓ {name} received MEETING_STARTED - session ready");
-                                    return Some(());
+                    if let Ok(mut stream) = session.accept_uni().await {
+                        if let Ok(buf) = stream.read_to_end(usize::MAX).await {
+                            if !buf.is_empty() {
+                                if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&buf) {
+                                    if wrapper.packet_type
+                                        == videocall_types::protos::packet_wrapper::packet_wrapper::PacketType::MEETING.into()
+                                    {
+                                        println!("✓ {name} received MEETING_STARTED - session ready");
+                                        return Some(());
+                                    }
                                 }
                             }
                         }
@@ -744,9 +734,9 @@ mod tests {
             || {
                 let session = session_b_recv.clone();
                 async move {
-                    // Race between uni stream and datagram since non-MEDIA
-                    // packets (e.g., MEETING, AES_KEY) may arrive via datagrams
-                    // (send_auto routes small control packets as datagrams).
+                    // Race between uni stream and datagram since MEDIA packets
+                    // may arrive via either transport (send_auto routes small
+                    // MEDIA packets as datagrams for lower latency).
                     let buf = tokio::select! {
                         Ok(mut stream) = session.accept_uni() => {
                             stream.read_to_end(usize::MAX).await.ok()

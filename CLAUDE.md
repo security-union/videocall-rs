@@ -84,8 +84,6 @@ The `connection/` module was already properly separated before this refactoring.
 
 Always delegate work to the specialized roster agents instead of making changes directly. Use the appropriate agent for each task:
 
-**This includes technical decisions, not just code edits.** Before making any recommendation or assessment about transport protocols (WebTransport, WebSocket, QUIC, datagrams, reliability), security design, or performance trade-offs, delegate to the relevant specialist agent first. Do not reason about domain-specific behavior independently — use the agent's expertise, then relay its findings. Getting the answer wrong because you skipped the expert is worse than taking an extra minute to ask.
-
 - **frontend-rust-webtransport-and-websocket** — All Dioxus/Yew UI changes (components, pages, styling, state management)
 - **backend-rust-streaming** — All backend/API changes (Axum routes, DB queries, server logic)
 - **code-reviewer** — Review all code changes before committing

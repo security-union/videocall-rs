@@ -24,6 +24,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::PeerList,
     peer_tile::PeerTile,
+    update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
         CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
         PeerListButton, ScreenShareButton,
@@ -194,7 +195,7 @@ fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
 fn schedule_reconnect(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
     meeting_id: String,
-    display_name: String,
+    current_display_name: Signal<String>,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
     attempt: u32,
@@ -221,7 +222,8 @@ fn schedule_reconnect(
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
-                    let (ws, wt) = build_lobby_urls(&new_token, &display_name, &meeting_id);
+                    let latest_display_name = current_display_name();
+                    let (ws, wt) = build_lobby_urls(&new_token, &latest_display_name, &meeting_id);
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
                         if let Err(e) = client.connect() {
@@ -238,7 +240,7 @@ fn schedule_reconnect(
                     schedule_reconnect(
                         client_cell,
                         meeting_id,
-                        display_name,
+                        current_display_name,
                         connection_error,
                         meeting_ended_message,
                         attempt + 1,
@@ -291,6 +293,7 @@ fn schedule_reconnect_no_jwt(
                 true
             }
         };
+
         if reconnect_needed {
             schedule_reconnect_no_jwt(client_cell, connection_error, attempt + 1);
         }
@@ -329,14 +332,14 @@ fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) 
     let mut best_area = 0.0f64;
 
     for cols in 1..=n {
-        let rows = (n + cols - 1) / cols;
+        let rows = n.div_ceil(cols);
         let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
         let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
         if tile_w <= 0.0 || tile_h <= 0.0 {
             continue;
         }
         let aspect = tile_w / tile_h;
-        if aspect > MAX_ASPECT || aspect < 1.0 / MAX_ASPECT {
+        if !(1.0 / MAX_ASPECT..=MAX_ASPECT).contains(&aspect) {
             continue;
         }
         let area = tile_w * tile_h;
@@ -350,7 +353,7 @@ fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) 
     if best_area == 0.0 {
         let mut best_delta = f64::MAX;
         for cols in 1..=n {
-            let rows = (n + cols - 1) / cols;
+            let rows = n.div_ceil(cols);
             let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
             let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
             if tile_w <= 0.0 || tile_h <= 0.0 {
@@ -393,10 +396,12 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
-    let mut encoder_settings = use_signal(|| None::<String>);
+    let encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
+    let mut display_name_modal_open = use_signal(|| false);
+    let current_display_name = use_signal(|| display_name.clone());
     let mut meeting_joined = use_signal(|| false);
     let mut show_copy_toast = use_signal(|| false);
     let mut meeting_start_time_server = use_signal(|| None::<f64>);
@@ -422,6 +427,7 @@ pub fn AttendantsComponent(
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
+    let peer_display_name_version = use_signal(|| 0u32);
 
     // Container dimensions — updated on every window resize so compute_grid
     // reacts to viewport changes without any JS ResizeObserver boilerplate.
@@ -440,7 +446,7 @@ pub fn AttendantsComponent(
 
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
-    let mut peer_status_map: PeerStatusMap = use_signal(|| HashMap::new());
+    let mut peer_status_map: PeerStatusMap = use_signal(HashMap::new);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -459,19 +465,25 @@ pub fn AttendantsComponent(
         #[cfg(not(feature = "media-server-jwt-auth"))]
         let token = String::new();
 
-        let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &display_name, &id);
+        let initial_display_name = current_display_name();
+        let (websocket_urls, webtransport_urls) =
+            build_lobby_urls(&token, &initial_display_name, &id);
 
         log::info!(
             "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
-            display_name,
+            initial_display_name,
             id
         );
 
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
 
+        let user_id_for_display_name_changed = user_id.clone();
+
         let opts = VideoCallClientOptions {
-            user_id: user_id.clone().unwrap_or_else(|| display_name.clone()),
+            user_id: user_id
+                .clone()
+                .unwrap_or_else(|| initial_display_name.clone()),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -488,10 +500,10 @@ pub fn AttendantsComponent(
             }),
             on_connection_lost: {
                 let id = id.clone();
-                let display_name = display_name.clone();
                 let client_cell = client_for_reconnect.clone();
-                VcCallback::from(move |_| {
-                    log::warn!("DIOXUS-UI: Connection lost");
+                VcCallback::from(move |reason: wasm_bindgen::JsValue| {
+                    let reason_str = reason.as_string().unwrap_or_else(|| format!("{reason:?}"));
+                    log::warn!("DIOXUS-UI: Connection lost — reason: {reason_str}");
                     let mut connection_error = connection_error;
                     let meeting_ended_message = meeting_ended_message;
                     connection_error.set(Some("Connection lost, reconnecting...".to_string()));
@@ -500,11 +512,11 @@ pub fn AttendantsComponent(
                     {
                         let client_cell = client_cell.clone();
                         let meeting_id = id.clone();
-                        let display_name = display_name.clone();
+                        let current_display_name = current_display_name;
                         schedule_reconnect(
                             client_cell,
                             meeting_id,
-                            display_name,
+                            current_display_name,
                             connection_error,
                             meeting_ended_message,
                             0,
@@ -629,7 +641,7 @@ pub fn AttendantsComponent(
                     let mut toast_version = toast_version;
                     // Remove any pending "left" toast for this user (waiting room admission).
                     let mut current = peer_toasts.peek().clone();
-                    current.retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
+                    current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
                     play_user_joined();
                     let id = *toast_counter.peek();
                     toast_counter.set(id + 1);
@@ -659,6 +671,30 @@ pub fn AttendantsComponent(
                         }
                     })
                     .forget();
+                },
+            )),
+            on_display_name_changed: Some(VcCallback::from(
+                move |(changed_user_id, new_display_name): (String, String)| {
+                    log::info!(
+                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\"",
+                        changed_user_id,
+                        new_display_name,
+                    );
+
+                    if user_id_for_display_name_changed.as_deref() == Some(changed_user_id.as_str())
+                    {
+                        log::info!(
+                            "DIOXUS-UI: Local user display name confirmed by server: {}",
+                            new_display_name
+                        );
+                        let mut current_display_name = current_display_name;
+                        current_display_name.set(new_display_name.clone());
+                        log::debug!("DIOXUS-UI: current_display_name signal updated");
+                    }
+
+                    let mut v = peer_display_name_version;
+                    v.set(v() + 1);
+                    log::debug!("DIOXUS-UI: peer_display_name_version bumped");
                 },
             )),
         };
@@ -775,10 +811,8 @@ pub fn AttendantsComponent(
             }) as Box<dyn FnMut(_)>);
 
             if let Some(win) = web_sys::window() {
-                let _ = win.add_event_listener_with_callback(
-                    "focus",
-                    closure.as_ref().unchecked_ref(),
-                );
+                let _ =
+                    win.add_event_listener_with_callback("focus", closure.as_ref().unchecked_ref());
             }
             closure.forget();
         });
@@ -877,6 +911,7 @@ pub fn AttendantsComponent(
     // --- Derived values ---
     let _ = peer_list_version(); // subscribe to trigger re-renders when peers change
     let _ = toast_version(); // subscribe to trigger re-renders when toasts change
+    let _ = peer_display_name_version();
     let display_peers = client.sorted_peer_keys();
     let peers_for_display: Vec<String> = display_peers
         .iter()
@@ -910,7 +945,8 @@ pub fn AttendantsComponent(
     };
 
     let is_allowed = users_allowed_to_stream().unwrap_or_default();
-    let effective_user_id = user_id.as_deref().unwrap_or(&display_name);
+    let latest_display_name = current_display_name();
+    let effective_user_id = user_id.as_deref().unwrap_or(&latest_display_name);
     let can_stream =
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
 
@@ -1405,6 +1441,10 @@ pub fn AttendantsComponent(
                             },
                             host_display_name: host_display_name.clone(),
                             host_user_id: host_user_id.clone(),
+                            local_user_display_name: current_display_name(),
+                            on_edit_self_name: {move |_| {
+                                display_name_modal_open.set(true);
+                            }},
                         }
                     }
                 }
@@ -1416,6 +1456,25 @@ pub fn AttendantsComponent(
                         is_admitted: true,
                         waiting_room_version: waiting_room_version,
                     }
+                }
+
+                UpdateDisplayNameModal {
+                    visible: display_name_modal_open(),
+                    current_display_name: current_display_name(),
+                    meeting_id: id.clone(),
+                    on_close: move |_| {
+                        display_name_modal_open.set(false);
+                    },
+                    on_success: move |new_name: String| {
+                        // Update local UI immediately — do NOT wait for server broadcast.
+                        // The server will broadcast PARTICIPANT_DISPLAY_NAME_CHANGED moments later,
+                        // which will be handled by on_display_name_changed callback and will
+                        // confirm the same value. This ensures no perceived lag for the user.
+                        log::info!("RENAME: on_success called with new_name: {}", new_name);
+                        let mut current_name = current_display_name;
+                        current_name.set(new_name.clone());
+                        display_name_modal_open.set(false);
+                    },
                 }
 
                 // Meeting ended overlay

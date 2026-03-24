@@ -697,7 +697,7 @@ impl PeerDecodeManager {
             .and_then(|peer| peer.display_name.clone())
     }
 
-    pub fn is_peer_speaking(&self, key: &String) -> bool {
+    pub fn is_peer_speaking(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,

@@ -72,3 +72,13 @@ pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
         Err(e) => Err(e),
     }
 }
+
+pub async fn update_display_name(
+    meeting_id: &str,
+    display_name: &str,
+) -> Result<JoinMeetingResponse, JoinError> {
+    log::info!("Updating display name via API: {meeting_id} (display_name: {display_name})");
+    client()?
+        .update_display_name(meeting_id, display_name)
+        .await
+}

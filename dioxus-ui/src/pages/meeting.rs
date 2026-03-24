@@ -278,6 +278,7 @@ pub fn MeetingPage(id: String) -> Element {
                 vad_threshold: None,
                 on_peer_left: None,
                 on_peer_joined: None,
+                on_display_name_changed: None,
             };
 
             let mut client = VideoCallClient::new(opts);

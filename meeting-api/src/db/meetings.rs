@@ -45,7 +45,16 @@ pub async fn create(
     password_hash: Option<&str>,
     attendees: &JsonValue,
 ) -> Result<MeetingRow, sqlx::Error> {
-    create_with_options(pool, room_id, creator_id, password_hash, attendees, true, false).await
+    create_with_options(
+        pool,
+        room_id,
+        creator_id,
+        password_hash,
+        attendees,
+        true,
+        false,
+    )
+    .await
 }
 
 /// Create a new meeting with explicit waiting_room_enabled setting.
@@ -252,4 +261,84 @@ pub async fn update_admitted_can_admit(
     .bind(admitted_can_admit)
     .fetch_optional(pool)
     .await
+}
+
+/// Atomically update `waiting_room_enabled` and/or `admitted_can_admit` for a
+/// meeting within a single transaction.  When disabling the waiting room,
+/// auto-admits all currently waiting participants (same semantics as
+/// [`update_waiting_room_enabled`]).
+///
+/// Returns `None` when the meeting does not exist or the caller is not the
+/// owner — the transaction is rolled back in that case.
+pub async fn update_meeting_settings(
+    pool: &PgPool,
+    room_id: &str,
+    creator_id: &str,
+    waiting_room_enabled: Option<bool>,
+    admitted_can_admit: Option<bool>,
+) -> Result<Option<MeetingRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let mut result: Option<MeetingRow> = None;
+
+    if let Some(enabled) = waiting_room_enabled {
+        let updated = sqlx::query_as::<_, MeetingRow>(
+            r#"
+            UPDATE meetings
+            SET waiting_room_enabled = $3
+            WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
+                      deleted_at, creator_id, password_hash, state, attendees, host_display_name,
+                      waiting_room_enabled, admitted_can_admit
+            "#,
+        )
+        .bind(room_id)
+        .bind(creator_id)
+        .bind(enabled)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(ref row) = updated {
+            if !enabled {
+                sqlx::query(
+                    "UPDATE meeting_participants SET status = 'admitted', admitted_at = NOW() \
+                     WHERE meeting_id = $1 AND status = 'waiting'",
+                )
+                .bind(row.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        } else {
+            // Row not found or not owner — rollback (drop tx).
+            return Ok(None);
+        }
+
+        result = updated;
+    }
+
+    if let Some(aca) = admitted_can_admit {
+        let updated = sqlx::query_as::<_, MeetingRow>(
+            r#"
+            UPDATE meetings
+            SET admitted_can_admit = $3
+            WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
+                      deleted_at, creator_id, password_hash, state, attendees, host_display_name,
+                      waiting_room_enabled, admitted_can_admit
+            "#,
+        )
+        .bind(room_id)
+        .bind(creator_id)
+        .bind(aca)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if updated.is_none() {
+            return Ok(None);
+        }
+
+        result = updated;
+    }
+
+    tx.commit().await?;
+    Ok(result)
 }

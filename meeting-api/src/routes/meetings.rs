@@ -303,13 +303,18 @@ pub async fn update_meeting(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
-    let mut row = if let Some(enabled) = body.waiting_room_enabled {
-        // Atomically updates the setting and, when disabling, auto-admits
-        // all waiting participants within a single transaction.
+    let row = if body.waiting_room_enabled.is_some() || body.admitted_can_admit.is_some() {
+        // Atomically update both settings within a single transaction.
         // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
         // so we only fetch separately on failure to distinguish 404 vs 403.
-        match db_meetings::update_waiting_room_enabled(&state.db, &meeting_id, &user_id, enabled)
-            .await?
+        match db_meetings::update_meeting_settings(
+            &state.db,
+            &meeting_id,
+            &user_id,
+            body.waiting_room_enabled,
+            body.admitted_can_admit,
+        )
+        .await?
         {
             Some(row) => row,
             None => {
@@ -322,7 +327,7 @@ pub async fn update_meeting(
             }
         }
     } else {
-        // No waiting_room change — fetch and verify ownership.
+        // No updates requested — fetch and verify ownership.
         let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
             .await?
             .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
@@ -331,27 +336,6 @@ pub async fn update_meeting(
         }
         row
     };
-
-    if let Some(admitted_can_admit) = body.admitted_can_admit {
-        match db_meetings::update_admitted_can_admit(
-            &state.db,
-            &meeting_id,
-            &user_id,
-            admitted_can_admit,
-        )
-        .await?
-        {
-            Some(updated) => row = updated,
-            None => {
-                return Err(
-                    match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
-                        Some(_) => AppError::not_owner(),
-                        None => AppError::meeting_not_found(&meeting_id),
-                    },
-                );
-            }
-        }
-    }
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));

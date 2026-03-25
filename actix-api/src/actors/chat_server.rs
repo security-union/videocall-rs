@@ -119,6 +119,16 @@ impl ChatServer {
                 return;
             }
 
+            if let Some(state) = self.connection_states.get(session_id) {
+                if *state != ConnectionState::Active {
+                    info!(
+                        "Skipping PARTICIPANT_LEFT for non-active session {}",
+                        session_id
+                    );
+                    return;
+                }
+            }
+
             tokio::spawn(async move {
                 match session_manager.end_session(&room_id, &user_id).await {
                     Ok(SessionEndResult::HostEndedMeeting) => {

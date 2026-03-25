@@ -1550,6 +1550,14 @@ mod tests {
             .expect("Message delivery should succeed");
         assert!(result.is_ok(), "Non-observer JoinRoom should succeed");
 
+        // Activate the connection so the state is Active before disconnect
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
         // Wait for session setup
         sleep(Duration::from_millis(300)).await;
 

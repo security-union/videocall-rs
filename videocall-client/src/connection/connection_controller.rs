@@ -48,6 +48,10 @@ impl ConnectionController {
             .borrow_mut()
             .set_manager_ref(Rc::downgrade(&manager));
 
+        // Start the initial election AFTER set_manager_ref so that
+        // connection-lost callbacks capture a valid Weak back-reference.
+        manager.borrow_mut().initialize()?;
+
         let timers = Self::start_timers(Rc::downgrade(&manager));
 
         info!("ConnectionController created with all timers started");
@@ -131,9 +135,10 @@ impl ConnectionController {
 
     /// Send packet through active connection via datagram (unreliable, low-latency).
     ///
-    /// Used for media packets (VIDEO, AUDIO, SCREEN) where low latency matters
-    /// more than guaranteed delivery. Falls back to reliable stream for
-    /// WebSocket connections or oversized packets.
+    /// Used for control packets (heartbeats, RTT probes, diagnostics) that are
+    /// periodic and expendable — lower overhead matters more than guaranteed
+    /// delivery. Falls back to reliable stream for WebSocket connections or
+    /// oversized packets.
     pub fn send_packet_datagram(&self, packet: PacketWrapper) -> Result<()> {
         let mgr = self
             .manager

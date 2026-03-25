@@ -1404,7 +1404,7 @@ pub fn AttendantsComponent(
                                     on_screen_share_state: move |event: ScreenShareEvent| {
                                         log::info!("Screen share state changed: {event:?}");
                                         match event {
-                                            ScreenShareEvent::Started => {
+                                            ScreenShareEvent::Started(_stream) => {
                                                 screen_share_state.set(ScreenShareState::Active);
                                             }
                                             ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {

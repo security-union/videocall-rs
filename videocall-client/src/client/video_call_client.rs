@@ -491,19 +491,19 @@ impl VideoCallClient {
         }
     }
 
-    /// Send a media packet via datagram (unreliable, low-latency) when supported.
+    /// Send a media packet via reliable stream.
     ///
-    /// Used for VIDEO, AUDIO, and SCREEN packets where low latency is more
-    /// important than guaranteed delivery. The existing jitter buffer handles
-    /// out-of-order and missing packets gracefully. Falls back to reliable
-    /// stream for WebSocket connections or oversized packets (e.g., keyframes).
+    /// Used for VIDEO, AUDIO, and SCREEN packets where reliable delivery is
+    /// required to avoid visual/audio artifacts from packet loss. Control
+    /// packets (heartbeats, RTT probes, diagnostics) use datagrams instead
+    /// since they are periodic and expendable.
     pub(crate) fn send_media_packet(&self, media: PacketWrapper) {
         let packet_type = media.packet_type.enum_value();
         match self.connection_controller.try_borrow() {
             Ok(cc) => {
                 if let Some(controller) = cc.as_ref() {
-                    if let Err(e) = controller.send_packet_datagram(media) {
-                        debug!("Failed to send {packet_type:?} media packet via datagram: {e}");
+                    if let Err(e) = controller.send_packet(media) {
+                        debug!("Failed to send {packet_type:?} media packet: {e}");
                     }
                 } else {
                     error!("No connection manager available for {packet_type:?} media packet");

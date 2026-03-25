@@ -154,16 +154,10 @@ pub fn Host(
             }
         });
         let screen_state_cell = screen_state_handler.clone();
-        let screen_stream_for_cb: Rc<RefCell<Option<SharedScreenStream>>> = Rc::new(RefCell::new(None));
-        let screen_stream_cell = screen_stream_for_cb.clone();
         let screen_state_cb = VcCallback::from(move |event: ScreenShareEvent| {
             match &event {
-                ScreenShareEvent::Started => {
-                    if let Some(stream_handle) = screen_stream_cell.borrow().as_ref() {
-                        if let Some(stream) = stream_handle.borrow().as_ref() {
-                            attach_screen_preview(stream);
-                        }
-                    }
+                ScreenShareEvent::Started(stream) => {
+                    attach_screen_preview(stream);
                 }
                 _ => {
                     detach_screen_preview();
@@ -184,9 +178,6 @@ pub fn Host(
         camera.set_congestion_step_down_flag(client.congestion_step_down_flag());
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
-
-        // Store the screen stream handle so the callback can access it for preview
-        *screen_stream_for_cb.borrow_mut() = Some(screen.screen_stream());
 
         // Wire up encoder controls. The microphone encoder no longer needs
         // its own diagnostics channel — it reads audio tier settings from
@@ -217,7 +208,6 @@ pub fn Host(
             prev_video_enabled: false,
             initialized: false,
             last_reload_counter: 0,
-            screen_stream_cell: screen_stream_for_cb,
         }))
     });
 
@@ -730,7 +720,6 @@ struct HostState {
     prev_video_enabled: bool,
     initialized: bool,
     last_reload_counter: u32,
-    screen_stream_cell: Rc<RefCell<Option<SharedScreenStream>>>,
 }
 
 fn attach_screen_preview(stream: &MediaStream) {

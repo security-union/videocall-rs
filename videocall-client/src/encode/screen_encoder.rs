@@ -60,10 +60,10 @@ use crate::diagnostics::EncoderBitrateController;
 ///
 /// This allows the UI to react to screen share lifecycle events without managing
 /// the MediaStream directly.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum ScreenShareEvent {
-    /// Screen share successfully started and encoding is active
-    Started,
+    /// Screen share successfully started and encoding is active, carrying the MediaStream
+    Started(MediaStream),
     /// User cancelled the browser picker dialog (no error dialog shown)
     Cancelled,
     /// Screen share ended normally (user clicked browser's "Stop sharing" or stream ended)
@@ -524,7 +524,7 @@ impl ScreenEncoder {
             // All setup complete - NOW emit Started event and notify peers
             client_for_state.set_screen_enabled(true);
             if let Some(ref callback) = on_state_change {
-                callback.emit(ScreenShareEvent::Started);
+                callback.emit(ScreenShareEvent::Started(screen_to_share.clone()));
             }
 
             let screen_reader = screen_processor

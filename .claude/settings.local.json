@@ -44,7 +44,14 @@
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:crates.io)",
       "Bash(cargo fmt:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(git merge:*)",
+      "Bash(git add:*)",
+      "Bash(git stash:*)",
+      "Bash(rustfmt /Users/antonioestrada/DEV/git/hcllabs/p7/videocall-rs/actix-api/src/actors/session_logic.rs)",
+      "Bash(rustfmt --edition 2021 /Users/antonioestrada/DEV/git/hcllabs/p7/videocall-rs/actix-api/src/actors/session_logic.rs)",
+      "Bash(git commit -m \"fix: retry reconnection indefinitely with faster backoff:*)",
+      "Bash(git commit -m \"Merge upstream/main into perf-opt-3-connection:*)"
     ]
   }
 }

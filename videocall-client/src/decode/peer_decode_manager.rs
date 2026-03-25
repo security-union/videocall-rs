@@ -2063,7 +2063,7 @@ mod tests {
             "Visible peer should attempt video decode"
         );
         // If it got through to the decoder (Ok), it means visibility didn't block it.
-        if let Ok((_mt, status, _kf)) = result {
+        if let Ok((_mt, _status, _kf)) = result {
             // With noop decoder, rendered might be false, but the important
             // thing is that it wasn't the visibility-SKIPPED path.
             // We verify by checking that the visibility path was NOT taken.

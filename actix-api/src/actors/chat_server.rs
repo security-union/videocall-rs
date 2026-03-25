@@ -119,6 +119,16 @@ impl ChatServer {
                 return;
             }
 
+            if let Some(state) = self.connection_states.get(session_id) {
+                if *state != ConnectionState::Active {
+                    info!(
+                        "Skipping PARTICIPANT_LEFT for non-active session {}",
+                        session_id
+                    );
+                    return;
+                }
+            }
+
             tokio::spawn(async move {
                 match session_manager.end_session(&room_id, &user_id).await {
                     Ok(SessionEndResult::HostEndedMeeting) => {
@@ -234,10 +244,12 @@ impl Handler<ActivateConnection> for ChatServer {
 
     fn handle(&mut self, msg: ActivateConnection, _ctx: &mut Self::Context) -> Self::Result {
         let ActivateConnection { session } = msg;
+        let mut send_join_events = false;
         if let Some(state) = self.connection_states.get_mut(&session) {
             if *state == ConnectionState::Testing {
                 *state = ConnectionState::Active;
                 info!("Session {} activated (Testing -> Active)", session);
+                send_join_events = true;
             }
         } else {
             self.connection_states
@@ -246,6 +258,130 @@ impl Handler<ActivateConnection> for ChatServer {
                 "Session {} activated (state was missing, created as Active)",
                 session
             );
+            send_join_events = true;
+        }
+
+        if send_join_events {
+            if let Some((room, uid, display_name)) =
+                self.room_members.iter().find_map(|(room, members)| {
+                    members.iter().find(|(sid, _, _)| *sid == session).map(
+                        |(_, uid, display_name)| (room.clone(), uid.clone(), display_name.clone()),
+                    )
+                })
+            {
+                let observer = false;
+                let existing_members: Vec<(SessionId, String, String)> = self
+                    .room_members
+                    .get(&room)
+                    .map(|v| {
+                        v.iter()
+                            .filter(|(sid, _, _)| *sid != session)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let session_manager = self.session_manager.clone();
+                let nc = self.nats_connection.clone();
+                let new_joiner_recipient = self.sessions.get(&session).cloned();
+                let chat_server_addr = _ctx.address();
+                let session_for_cleanup = session;
+                if let Some(new_joiner_recipient) = new_joiner_recipient {
+                    tokio::spawn(async move {
+                        match session_manager.start_session(&room, &uid, session).await {
+                            Ok(result) => {
+                                info!(
+                                    "Session started for room {} (first: {}) at {} by creator {} (session {})",
+                                    room,
+                                    result.is_first_participant,
+                                    result.start_time_ms,
+                                    result.creator_id,
+                                    session,
+                                );
+
+                                // SESSION_ASSIGNED is sent by ws_chat_session / wt_chat_session
+                                // in their started() method before this JoinRoom handler runs.
+                                send_meeting_info(
+                                    &nc,
+                                    &room,
+                                    result.start_time_ms,
+                                    &result.creator_id,
+                                )
+                                .await;
+
+                                // Notify existing participants about the new joiner.
+                                // Observer sessions (waiting room) should NOT trigger this.
+                                if !observer {
+                                    let bytes = SessionManager::build_peer_joined_packet(
+                                        &room,
+                                        &uid,
+                                        session,
+                                        &display_name,
+                                    );
+                                    let subject = format!("room.{}.system", room.replace(' ', "_"));
+                                    info!(
+                                        "Publishing PARTICIPANT_JOINED for {} (display={}) to {}",
+                                        uid, display_name, subject
+                                    );
+                                    let subject_for_log = subject.clone();
+                                    if let Err(e) = nc.publish(subject, bytes.into()).await {
+                                        error!("Error publishing PARTICIPANT_JOINED: {}", e);
+                                    } else {
+                                        info!(
+                                            "Successfully published PARTICIPANT_JOINED for {} to {}",
+                                            uid, subject_for_log
+                                        );
+                                    }
+                                } else {
+                                    info!(
+                                        "Skipping PARTICIPANT_JOINED for observer {} in room {}",
+                                        uid, room
+                                    );
+                                }
+
+                                // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
+                                // This ensures the new joiner learns about all participants already in the room.
+                                for (existing_sid, existing_uid, existing_display_name) in
+                                    &existing_members
+                                {
+                                    let existing_bytes = SessionManager::build_peer_joined_packet(
+                                        &room,
+                                        existing_uid,
+                                        *existing_sid,
+                                        existing_display_name,
+                                    );
+                                    info!(
+                                        "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
+                                        existing_uid, existing_display_name, uid
+                                    );
+                                    if let Err(e) = new_joiner_recipient.try_send(Message {
+                                        msg: existing_bytes,
+                                        session: *existing_sid,
+                                    }) {
+                                        warn!(
+                                            "Failed to send existing PARTICIPANT_JOINED for {} to new joiner {}: {}",
+                                            existing_uid, uid, e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Error starting session for room {}: {} - rejecting join",
+                                    room, e
+                                );
+                                // Session rejected - notify ChatServer to clean up active_subs
+                                // This fixes the race condition where a failed start_session would
+                                // leave a stale entry in active_subs, blocking future join attempts.
+                                let _ = chat_server_addr.try_send(CleanupFailedJoin {
+                                    session: session_for_cleanup,
+                                    room: room.clone(),
+                                });
+                                return;
+                            }
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -334,13 +470,6 @@ impl Handler<JoinRoom> for ChatServer {
             return MessageResult(Ok(()));
         }
 
-        let session_manager = self.session_manager.clone();
-        let room_clone = room.clone();
-        let user_id_clone = user_id.clone();
-        let display_name_clone = display_name.clone();
-        let session_id = session;
-        let nc = self.nats_connection.clone();
-
         let session_str = session.to_string();
         let (subject, queue) = build_subject_and_queue(&room, &session_str);
         let session_recipient = match self.sessions.get(&session) {
@@ -349,14 +478,6 @@ impl Handler<JoinRoom> for ChatServer {
                 return MessageResult(Err("Session not found".into()));
             }
         };
-
-        // Collect existing non-observer room members for notifying the new joiner
-        let existing_members: Vec<(SessionId, String, String)> = if !observer {
-            self.room_members.get(&room).cloned().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
         // Track this session in room_members (only for non-observers)
         if !observer {
             self.room_members.entry(room.clone()).or_default().push((
@@ -365,109 +486,10 @@ impl Handler<JoinRoom> for ChatServer {
                 display_name.clone(),
             ));
         }
-
-        // Clone the recipient so we can send existing member info directly to the new joiner
-        let new_joiner_recipient = session_recipient.clone();
-
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
-
-        // Get ChatServer address for cleanup on failure
-        let chat_server_addr = ctx.address();
-        let session_for_cleanup = session;
-
+        let room_clone = room.clone();
         let handle = tokio::spawn(async move {
-            // Start session using SessionManager - await result before subscribing
-            match session_manager
-                .start_session(&room_clone, &user_id_clone, session_id)
-                .await
-            {
-                Ok(result) => {
-                    info!(
-                        "Session started for room {} (first: {}) at {} by creator {} (session {})",
-                        room_clone,
-                        result.is_first_participant,
-                        result.start_time_ms,
-                        result.creator_id,
-                        session_id,
-                    );
-
-                    // SESSION_ASSIGNED is sent by ws_chat_session / wt_chat_session
-                    // in their started() method before this JoinRoom handler runs.
-
-                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
-                        .await;
-
-                    // Notify existing participants about the new joiner.
-                    // Observer sessions (waiting room) should NOT trigger this.
-                    if !observer {
-                        let bytes = SessionManager::build_peer_joined_packet(
-                            &room_clone,
-                            &user_id_clone,
-                            session_id,
-                            &display_name_clone,
-                        );
-                        let subject = format!("room.{}.system", room_clone.replace(' ', "_"));
-                        info!(
-                            "Publishing PARTICIPANT_JOINED for {} (display={}) to {}",
-                            user_id_clone, display_name_clone, subject
-                        );
-                        let subject_for_log = subject.clone();
-                        if let Err(e) = nc.publish(subject, bytes.into()).await {
-                            error!("Error publishing PARTICIPANT_JOINED: {}", e);
-                        } else {
-                            info!(
-                                "Successfully published PARTICIPANT_JOINED for {} to {}",
-                                user_id_clone, subject_for_log
-                            );
-                        }
-                    } else {
-                        info!(
-                            "Skipping PARTICIPANT_JOINED for observer {} in room {}",
-                            user_id_clone, room_clone
-                        );
-                    }
-
-                    // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
-                    // This ensures the new joiner learns about all participants already in the room.
-                    for (existing_sid, existing_uid, existing_display_name) in &existing_members {
-                        let existing_bytes = SessionManager::build_peer_joined_packet(
-                            &room_clone,
-                            existing_uid,
-                            *existing_sid,
-                            existing_display_name,
-                        );
-                        info!(
-                            "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
-                            existing_uid, existing_display_name, user_id_clone
-                        );
-                        if let Err(e) = new_joiner_recipient.try_send(Message {
-                            msg: existing_bytes,
-                            session: *existing_sid,
-                        }) {
-                            warn!(
-                                "Failed to send existing PARTICIPANT_JOINED for {} to new joiner {}: {}",
-                                existing_uid, user_id_clone, e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Error starting session for room {}: {} - rejecting join",
-                        room_clone, e
-                    );
-                    // Session rejected - notify ChatServer to clean up active_subs
-                    // This fixes the race condition where a failed start_session would
-                    // leave a stale entry in active_subs, blocking future join attempts.
-                    let _ = chat_server_addr.try_send(CleanupFailedJoin {
-                        session: session_for_cleanup,
-                        room: room_clone.clone(),
-                    });
-                    return;
-                }
-            }
-
             match nc2.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
                     while let Some(msg) = sub.next().await {

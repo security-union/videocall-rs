@@ -6,7 +6,7 @@ fullnameOverride: ""
 
 replicaCount: 1
 image:
-  repository: securityunion/videocall-web-ui
+  repository: securityunion/videocall-dioxus-ui
   pullPolicy: Always
   tag: latest
 resources:
@@ -33,7 +33,7 @@ tolerations: []
 affinity: {}
 
 runtimeConfig:
-  # Using values aligned with docker/Dockerfile.yew
+  # Using values aligned with docker/Dockerfile.dioxus
   apiBaseUrl: "https://app.videocall.rs"
   wsUrl: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
   webTransportHost: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"

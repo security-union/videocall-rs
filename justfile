@@ -28,18 +28,18 @@ connect_to_db:
 
 # Clippy-fix Rule: Run cargo clippy to check and fix code issues
 clippy-fix:
-	# This runs clippy with the --fix flag for both yew-ui and websocket-api
-	{{DOCKER_COMPOSE}} run yew-ui bash -c "cd /app/yew-ui && cargo clippy --fix"
+	# This runs clippy with the --fix flag for both dioxus-ui and websocket-api
+	{{DOCKER_COMPOSE}} run dioxus-ui bash -c "cd /app/dioxus-ui && cargo clippy --fix"
 	{{DOCKER_COMPOSE}} run websocket-api bash -c "cd /app/actix-api && cargo clippy --fix"
 
-# Fmt Rule: Format the code for both yew-ui and websocket-api using cargo fmt
+# Fmt Rule: Format the code for both dioxus-ui and websocket-api using cargo fmt
 fmt:
 	# This runs cargo fmt to automatically format the code for both services
-	{{DOCKER_COMPOSE}} run yew-ui bash -c "cd /app/yew-ui && cargo fmt"
+	{{DOCKER_COMPOSE}} run dioxus-ui bash -c "cd /app/dioxus-ui && cargo fmt"
 	{{DOCKER_COMPOSE}} run websocket-api bash -c "cd /app/actix-api && cargo fmt"
 
 # Check Rule: Run cargo clippy and cargo fmt --check to check code for linting issues and formatting issues
 check:
 	# This checks both the formatting and lints the code for warnings and errors without making changes
 	{{DOCKER_COMPOSE}} run websocket-api bash -c "cd /app/actix-api && cargo clippy --all -- --deny warnings && cargo fmt --check"
-	{{DOCKER_COMPOSE}} run yew-ui bash -c "cd /app/yew-ui && cargo clippy --all -- --deny warnings && cargo fmt --check"
+	{{DOCKER_COMPOSE}} run dioxus-ui bash -c "cd /app/dioxus-ui && cargo clippy --all -- --deny warnings && cargo fmt --check"

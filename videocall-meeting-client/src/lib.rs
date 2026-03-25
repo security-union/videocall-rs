@@ -51,7 +51,7 @@ use reqwest::Client;
 #[derive(Debug, Clone)]
 pub enum AuthMode {
     /// Browser mode: send credentials (cookies) automatically via `fetch`.
-    /// This is the mode used by `yew-ui` and other WASM frontends.
+    /// This is the mode used by `dioxus-ui` and other WASM frontends.
     Cookie,
     /// Bearer token mode: attach `Authorization: Bearer <token>` to every
     /// request. Used by CLI tools, mobile apps, and integration tests.

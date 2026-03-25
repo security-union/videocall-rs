@@ -376,7 +376,6 @@ impl Handler<ActivateConnection> for ChatServer {
                                     session: session_for_cleanup,
                                     room: room.clone(),
                                 });
-                                return;
                             }
                         }
                     });
@@ -457,7 +456,7 @@ impl Handler<JoinRoom> for ChatServer {
             display_name,
             observer,
         }: JoinRoom,
-        ctx: &mut Self::Context,
+        _ctx: &mut Self::Context,
     ) -> Self::Result {
         // Validate user_id synchronously BEFORE spawning async task.
         // This ensures we return an error to the client if validation fails,

@@ -65,7 +65,9 @@ fn home_wrapper_direct() -> Element {
         Ok(_) => rsx! {
             Router::<dioxus_ui::routing::Route> {}
         },
-        Err(e) => rsx! { ConfigError { message: e } },
+        Err(e) => rsx! {
+            ConfigError { message: e }
+        },
     }
 }
 
@@ -90,7 +92,7 @@ async fn home_page_renders_with_oauth_disabled() {
 
     // The page text should contain landmarks that identify the home screen.
     let text = mount.text_content().unwrap_or_default();
-    assert!(text.contains("videocall.rs"), "title missing");
+    assert!(text.contains("Concept Car"), "title missing");
     assert!(
         text.contains("Start or Join a Meeting"),
         "form heading missing"

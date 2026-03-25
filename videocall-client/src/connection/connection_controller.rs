@@ -48,6 +48,10 @@ impl ConnectionController {
             .borrow_mut()
             .set_manager_ref(Rc::downgrade(&manager));
 
+        // Start the initial election AFTER set_manager_ref so that
+        // connection-lost callbacks capture a valid Weak back-reference.
+        manager.borrow_mut().initialize()?;
+
         let timers = Self::start_timers(Rc::downgrade(&manager));
 
         info!("ConnectionController created with all timers started");

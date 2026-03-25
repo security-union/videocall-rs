@@ -33,9 +33,10 @@
 
 use crate::adaptive_quality_constants::{
     AudioQualityTier, VideoQualityTier, AUDIO_QUALITY_TIERS, AUDIO_TIER_DEGRADE_FPS_RATIO,
-    AUDIO_TIER_RECOVER_FPS_RATIO, DEFAULT_VIDEO_TIER_INDEX, MIN_TIER_TRANSITION_INTERVAL_MS,
-    STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_TIER_DEGRADE_BITRATE_RATIO,
-    VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO,
+    AUDIO_TIER_RECOVER_FPS_RATIO, DEFAULT_SCREEN_TIER_INDEX, DEFAULT_VIDEO_TIER_INDEX,
+    MIN_TIER_TRANSITION_INTERVAL_MS, STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS,
+    VIDEO_TIER_DEGRADE_BITRATE_RATIO, VIDEO_TIER_DEGRADE_FPS_RATIO,
+    VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO,
 };
 
 /// Adaptive quality manager that automatically selects video and audio tiers
@@ -72,11 +73,34 @@ pub struct AdaptiveQualityManager {
 impl AdaptiveQualityManager {
     /// Create a new manager for the given video tier array.
     ///
+    /// Starts at `DEFAULT_VIDEO_TIER_INDEX` (medium). Use this for camera
+    /// encoders where starting at medium avoids wasting bandwidth before the
+    /// first adaptation.
+    ///
     /// Use `VIDEO_QUALITY_TIERS` for camera, `SCREEN_QUALITY_TIERS` for screen share.
     pub fn new(video_tiers: &'static [VideoQualityTier]) -> Self {
         Self {
             video_tiers,
             video_tier_index: DEFAULT_VIDEO_TIER_INDEX,
+            audio_tier_index: 0,
+            last_transition_time_ms: 0.0,
+            degrade_start_ms: None,
+            recover_start_ms: None,
+            audio_degrade_start_ms: None,
+            audio_recover_start_ms: None,
+        }
+    }
+
+    /// Create a new manager for screen share.
+    ///
+    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` (high/1080p) because screen
+    /// content is resolution-sensitive -- text and fine UI details become
+    /// unreadable at lower resolutions. The system can still step down if
+    /// network conditions require it.
+    pub fn new_for_screen(video_tiers: &'static [VideoQualityTier]) -> Self {
+        Self {
+            video_tiers,
+            video_tier_index: DEFAULT_SCREEN_TIER_INDEX,
             audio_tier_index: 0,
             last_transition_time_ms: 0.0,
             degrade_start_ms: None,
@@ -316,7 +340,7 @@ impl AdaptiveQualityManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adaptive_quality_constants::VIDEO_QUALITY_TIERS;
+    use crate::adaptive_quality_constants::{SCREEN_QUALITY_TIERS, VIDEO_QUALITY_TIERS};
     use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]
@@ -329,6 +353,19 @@ mod tests {
             VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX].label
         );
         assert_eq!(mgr.current_audio_tier().label, "high");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_screen_starts_at_highest_tier() {
+        let mgr = AdaptiveQualityManager::new_for_screen(SCREEN_QUALITY_TIERS);
+        assert_eq!(mgr.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
+        assert_eq!(mgr.audio_tier_index(), 0);
+        assert_eq!(
+            mgr.current_video_tier().label,
+            SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].label
+        );
+        // Screen share should start at "high" (1080p)
+        assert_eq!(mgr.current_video_tier().label, "high");
     }
 
     #[wasm_bindgen_test]

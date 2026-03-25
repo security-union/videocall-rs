@@ -374,9 +374,18 @@ pub const DATAGRAM_MAX_SIZE: usize = 1200;
 // ---------------------------------------------------------------------------
 
 /// Enable redundant audio when FEC flag is set in AudioQualityTier.
-/// Each audio packet carries the previous frame as redundancy.
-/// Increases audio bandwidth by ~2x but provides loss recovery.
-pub const AUDIO_REDUNDANCY_ENABLED: bool = true;
+///
+/// **Disabled.** Reliable QUIC streams guarantee delivery, so there is no
+/// packet loss to recover from — RED provides zero benefit on this transport.
+/// RED doubles audio bandwidth (2x per stream) with no corresponding gain.
+/// At 100 participants this adds ~341 Mbps of unnecessary server outbound
+/// bandwidth. Worse, RED activates during congestion (medium/low/emergency
+/// tiers) which is exactly the wrong time to double bandwidth. NetEQ already
+/// handles gap concealment on the receiver side.
+///
+/// The implementation is retained behind this constant so RED can be
+/// re-enabled if the transport layer ever switches to unreliable delivery.
+pub const AUDIO_REDUNDANCY_ENABLED: bool = false;
 
 /// Default Opus frame duration in milliseconds.
 ///

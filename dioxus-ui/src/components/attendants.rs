@@ -34,7 +34,9 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap};
+use crate::context::{
+    save_display_name_to_storage, DisplayNameCtx, MeetingTime, PeerMediaState, PeerStatusMap,
+};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
@@ -402,6 +404,8 @@ pub fn AttendantsComponent(
     let mut user_error = use_signal(|| None::<String>);
     let mut display_name_modal_open = use_signal(|| false);
     let current_display_name = use_signal(|| display_name.clone());
+    let display_name_ctx = use_context::<DisplayNameCtx>();
+    let display_name_ctx_signal = display_name_ctx.0;
     let mut meeting_joined = use_signal(|| false);
     let mut show_copy_toast = use_signal(|| false);
     let mut meeting_start_time_server = use_signal(|| None::<f64>);
@@ -687,8 +691,11 @@ pub fn AttendantsComponent(
                             "DIOXUS-UI: Local user display name confirmed by server: {}",
                             new_display_name
                         );
+                        save_display_name_to_storage(&new_display_name);
                         let mut current_display_name = current_display_name;
                         current_display_name.set(new_display_name.clone());
+                        let mut dn_ctx = display_name_ctx_signal;
+                        dn_ctx.set(Some(new_display_name.clone()));
                         log::debug!("DIOXUS-UI: current_display_name signal updated");
                     }
 
@@ -1473,6 +1480,8 @@ pub fn AttendantsComponent(
                         log::info!("RENAME: on_success called with new_name: {}", new_name);
                         let mut current_name = current_display_name;
                         current_name.set(new_name.clone());
+                        let mut dn_ctx = display_name_ctx_signal;
+                        dn_ctx.set(Some(new_name.clone()));
                         display_name_modal_open.set(false);
                     },
                 }

@@ -355,4 +355,83 @@ test.describe("Display name live update", () => {
       await browser2.close();
     }
   });
+
+  /**
+   * Verify that after a display name change is confirmed by the server,
+   * navigating back to the home page shows the updated name pre-filled in
+   * the username input. This tests the localStorage persistence path:
+   *   on_display_name_changed → save_display_name_to_storage → reload → load_display_name_from_storage
+   */
+  test("updated display name persists after navigating to home", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_persist_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-persist@videocall.rs",
+        "PersistHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-persist@videocall.rs",
+        "OldName",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host joins
+      await navigateToMeeting(hostPage, meetingId, "PersistHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins
+      await navigateToMeeting(guestPage, meetingId, "OldName");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer discovery
+      await expect(guestPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // Guest changes display name via API
+      await updateDisplayNameViaApi(
+        "guest-persist@videocall.rs",
+        "OldName",
+        meetingId,
+        "NewPersisted",
+      );
+
+      // Wait for the server confirmation to propagate — guest sees own new name
+      const guestSelfName = guestPage.locator(".floating-name", {
+        hasText: "NewPersisted",
+      });
+      await expect(guestSelfName.first()).toBeVisible({ timeout: 15_000 });
+
+      // Navigate guest back to home page
+      await guestPage.goto("/");
+      await guestPage.waitForTimeout(2000);
+
+      // The username input should be pre-filled with the persisted new name
+      const usernameInput = guestPage.locator("#username");
+      await expect(usernameInput).toBeVisible({ timeout: 10_000 });
+      await expect(usernameInput).toHaveValue("NewPersisted", { timeout: 5_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
 });

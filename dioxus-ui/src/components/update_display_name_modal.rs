@@ -11,7 +11,7 @@
  * at your option.
  */
 
-use crate::context::validate_display_name;
+use crate::context::{save_display_name_to_storage, validate_display_name};
 use dioxus::prelude::*;
 
 #[component]
@@ -97,6 +97,7 @@ pub fn UpdateDisplayNameModal(
                                                 Ok(_) => {
                                                     log::info!("RENAME: API CALL SUCCESS");
 
+                                                    save_display_name_to_storage(&valid_name_clone);
                                                     is_updating.set(false);
                                                     success_message.set(Some("Display name updated!".to_string()));
                                                     on_success.call(valid_name_clone);

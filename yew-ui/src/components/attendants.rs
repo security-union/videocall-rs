@@ -437,6 +437,7 @@ impl AttendantsComponent {
                     link.send_message(Msg::OnPeerJoined(pair));
                 })
             }),
+            on_display_name_changed: None,
         };
 
         VideoCallClient::new(opts)
@@ -1354,7 +1355,7 @@ impl Component for AttendantsComponent {
                     // "participant joined/left" toast notifications
                     if !self.peer_toasts.is_empty() {
                         <div class="peer-toasts">
-                            { for self.peer_toasts.iter().map(|(id, display_name, uid, is_joined)| {
+                            { for self.peer_toasts.iter().map(|(id, display_name, _uid, is_joined)| {
                                 let key = id.to_string();
                                 let is_joined = *is_joined;
                                 let variant_class = if is_joined {

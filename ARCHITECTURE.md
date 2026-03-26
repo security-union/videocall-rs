@@ -33,9 +33,8 @@ graph TD
 
 ### 1. Client Applications
 
-- **Web Client**: Built with Yew (Rust-to-WebAssembly framework)
-  - **`yew-ui`** Web frontend built with the Yew framework and compiled to WebAssembly
-  - **`tailwind-yew`** css
+- **Web Client**: Built with Dioxus (Rust-to-WebAssembly framework)
+  - **`dioxus-ui`** Web frontend built with the Dioxus framework and compiled to WebAssembly
   - **`videocall-client`** Client library for native integration
 - **CLI Client**: Native Rust client for headless devices
   - **`videocall-cli`** Command-line interface for headless video streaming
@@ -371,7 +370,7 @@ graph TD
     B --> H[external-dns]
     
     C --> I[videocall-website]
-    C --> J[rustlemania-ui]
+    C --> J[videocall-ui]
     C --> K[rustlemania-websocket]
     C --> L[rustlemania-webtransport]
     C --> M[matomo]
@@ -389,7 +388,7 @@ graph TD
 2. **Application Components**
    - **rustlemania-websocket**: Deploys the Actix API server for WebSocket connections
    - **rustlemania-webtransport**: Deploys the WebTransport server
-   - **rustlemania-ui**: Deploys the Yew-based frontend application
+   - **videocall-ui**: Deploys the Dioxus-based frontend application
    - **videocall-website**: Deploys the marketing website
    - **matomo**: Deploys analytics tools for usage tracking
 
@@ -440,7 +439,7 @@ ingress:
 
 2. **Application Deployment**:
    ```
-   helm upgrade --install rustlemania-ui ./helm/rustlemania-ui
+   helm upgrade --install videocall-ui ./helm/videocall-ui
    helm upgrade --install rustlemania-websocket ./helm/rustlemania-websocket
    helm upgrade --install rustlemania-webtransport ./helm/rustlemania-webtransport
    ```

@@ -17,6 +17,7 @@
  */
 
 use crate::{
+    constants::RECONNECT_GRACE_PERIOD,
     messages::{
         server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
         session::Message,
@@ -27,6 +28,7 @@ use crate::{
 
 use actix::{
     Actor, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
+    SpawnHandle,
 };
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
@@ -49,6 +51,27 @@ struct CleanupFailedJoin {
     room: String,
 }
 
+/// Internal message sent via `notify_later` after the reconnection grace period
+/// expires. If the user has not reconnected by the time this message is handled,
+/// the actual `leave_rooms()` + PARTICIPANT_LEFT flow executes.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct ExecutePendingDeparture {
+    session: SessionId,
+    room: String,
+    user_id: String,
+    display_name: String,
+}
+
+/// State stored while a departure is pending (waiting for possible reconnection).
+struct PendingDepartureState {
+    /// Handle returned by `ctx.notify_later()`, used to cancel the delayed
+    /// `ExecutePendingDeparture` message if the user reconnects in time.
+    spawn_handle: SpawnHandle,
+    /// The old session ID that disconnected — used for cleanup.
+    old_session: SessionId,
+}
+
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
@@ -58,6 +81,11 @@ pub struct ChatServer {
     /// Track which sessions are in which room, with their user_id and display_name.
     /// Used to send PARTICIPANT_JOINED for existing peers to new joiners.
     room_members: HashMap<String, Vec<(SessionId, String, String)>>,
+    /// Pending departures keyed by `(room_id, user_id)`. When a session disconnects
+    /// we defer the PARTICIPANT_LEFT broadcast by [`RECONNECT_GRACE_PERIOD`]. If the
+    /// same user reconnects before the timer fires, the departure is cancelled
+    /// silently — no PARTICIPANT_LEFT or PARTICIPANT_JOINED is sent.
+    pending_departures: HashMap<(String, String), PendingDepartureState>,
 }
 
 impl ChatServer {
@@ -69,6 +97,7 @@ impl ChatServer {
             session_manager: SessionManager::new(),
             connection_states: HashMap::new(),
             room_members: HashMap::new(),
+            pending_departures: HashMap::new(),
         }
     }
 
@@ -206,17 +235,68 @@ impl Handler<Disconnect> for ChatServer {
             display_name,
             observer,
         }: Disconnect,
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
     ) -> Self::Result {
-        self.leave_rooms(
-            &session,
-            Some(&room),
-            Some(&user_id),
-            Some(&display_name),
-            observer,
-        );
+        // Clean up session-level state immediately — the transport is gone.
         let _ = self.sessions.remove(&session);
         let _ = self.connection_states.remove(&session);
+
+        // Observers and non-active sessions bypass the grace period — they
+        // never triggered PARTICIPANT_JOINED, so there is nothing to defer.
+        if observer {
+            self.leave_rooms(
+                &session,
+                Some(&room),
+                Some(&user_id),
+                Some(&display_name),
+                true,
+            );
+            return;
+        }
+
+        // Remove the NATS subscription task immediately so the old session
+        // stops receiving media. Keep room_members intact for now — they
+        // will be cleaned up either on reconnection or when the grace
+        // period expires.
+        if let Some(task) = self.active_subs.remove(&session) {
+            task.abort();
+        }
+
+        // If there is already a pending departure for this (room, user_id),
+        // cancel the old timer and replace it. This handles the edge case of
+        // rapid disconnect-reconnect-disconnect cycles.
+        let key = (room.clone(), user_id.clone());
+        if let Some(old) = self.pending_departures.remove(&key) {
+            ctx.cancel_future(old.spawn_handle);
+            info!(
+                "Replaced existing pending departure for user {} in room {} (old session {})",
+                user_id, room, old.old_session
+            );
+        }
+
+        info!(
+            "Deferring PARTICIPANT_LEFT for user {} (session {}) in room {} — \
+             grace period {:?}",
+            user_id, session, room, RECONNECT_GRACE_PERIOD
+        );
+
+        let handle = ctx.notify_later(
+            ExecutePendingDeparture {
+                session,
+                room: room.clone(),
+                user_id: user_id.clone(),
+                display_name,
+            },
+            RECONNECT_GRACE_PERIOD,
+        );
+
+        self.pending_departures.insert(
+            key,
+            PendingDepartureState {
+                spawn_handle: handle,
+                old_session: session,
+            },
+        );
     }
 }
 
@@ -232,6 +312,19 @@ impl Handler<Leave> for ChatServer {
         }: Leave,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
+        // Cancel any pending departure for this (room, user_id) to avoid a
+        // duplicate PARTICIPANT_LEFT when the grace-period timer fires later.
+        // We don't need ctx.cancel_future() because ExecutePendingDeparture::handle
+        // already checks whether the entry exists in pending_departures — once
+        // removed, the timer becomes a no-op.
+        let key = (room.clone(), user_id.clone());
+        if self.pending_departures.remove(&key).is_some() {
+            info!(
+                "Cancelled pending departure for user {} in room {} — explicit Leave received",
+                user_id, room
+            );
+        }
+
         // Leave is always a real participant, never an observer.
         // No display_name available from Leave message; leave_rooms will
         // fall back to user_id.
@@ -255,6 +348,61 @@ impl Handler<ActivateConnection> for ChatServer {
             info!(
                 "Session {} activated (state was missing, created as Active)",
                 session
+            );
+        }
+    }
+}
+
+/// Handler for deferred departure execution.
+/// Runs after [`RECONNECT_GRACE_PERIOD`] unless cancelled by a reconnection.
+impl Handler<ExecutePendingDeparture> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        ExecutePendingDeparture {
+            session,
+            room,
+            user_id,
+            display_name,
+        }: ExecutePendingDeparture,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        let key = (room.clone(), user_id.clone());
+
+        // Only execute if this departure is still pending. It may have been
+        // cancelled by a reconnection or replaced by a newer disconnect.
+        if let Some(pending) = self.pending_departures.remove(&key) {
+            if pending.old_session != session {
+                // A newer disconnect replaced this one — do nothing, the newer
+                // timer will handle it.
+                info!(
+                    "Stale pending departure for user {} in room {} (session {} != {}), skipping",
+                    user_id, room, session, pending.old_session
+                );
+                // Re-insert the newer pending state.
+                self.pending_departures.insert(key, pending);
+                return;
+            }
+
+            info!(
+                "Grace period expired for user {} (session {}) in room {} — \
+                 executing PARTICIPANT_LEFT",
+                user_id, session, room
+            );
+            // Observer sessions bypass the grace period entirely (handled
+            // directly in Disconnect), so this path is always non-observer.
+            self.leave_rooms(
+                &session,
+                Some(&room),
+                Some(&user_id),
+                Some(&display_name),
+                false,
+            );
+        } else {
+            info!(
+                "Pending departure for user {} in room {} already cancelled (reconnected)",
+                user_id, room
             );
         }
     }
@@ -344,6 +492,30 @@ impl Handler<JoinRoom> for ChatServer {
             return MessageResult(Ok(()));
         }
 
+        // --- Reconnection grace period: cancel pending departure ---
+        // If the same user_id is reconnecting to the same room within
+        // the grace window, suppress both PARTICIPANT_LEFT (already deferred)
+        // and the PARTICIPANT_JOINED that would normally follow.
+        let departure_key = (room.clone(), user_id.clone());
+        let is_reconnection = if let Some(pending) = self.pending_departures.remove(&departure_key)
+        {
+            ctx.cancel_future(pending.spawn_handle);
+
+            // Clean up stale room_members entry from the old session
+            if let Some(members) = self.room_members.get_mut(&room) {
+                members.retain(|(sid, _, _)| *sid != pending.old_session);
+            }
+
+            info!(
+                "Reconnection detected for user {} in room {} — cancelled pending \
+                 PARTICIPANT_LEFT (old session {}, new session {})",
+                user_id, room, pending.old_session, session
+            );
+            true
+        } else {
+            false
+        };
+
         let session_manager = self.session_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
@@ -360,7 +532,9 @@ impl Handler<JoinRoom> for ChatServer {
             }
         };
 
-        // Collect existing non-observer room members for notifying the new joiner
+        // Collect existing non-observer room members for notifying the new joiner.
+        // On reconnection, we still send the existing member list so the
+        // reconnecting client knows who is in the room.
         let existing_members: Vec<(SessionId, String, String)> = if !observer {
             self.room_members.get(&room).cloned().unwrap_or_default()
         } else {
@@ -409,8 +583,10 @@ impl Handler<JoinRoom> for ChatServer {
                         .await;
 
                     // Notify existing participants about the new joiner.
-                    // Observer sessions (waiting room) should NOT trigger this.
-                    if !observer {
+                    // Suppress the broadcast when:
+                    //  - This is a reconnection (PARTICIPANT_LEFT was never sent)
+                    //  - This is an observer (waiting room, never a real participant)
+                    if !observer && !is_reconnection {
                         let bytes = SessionManager::build_peer_joined_packet(
                             &room_clone,
                             &user_id_clone,
@@ -431,6 +607,11 @@ impl Handler<JoinRoom> for ChatServer {
                                 user_id_clone, subject_for_log
                             );
                         }
+                    } else if is_reconnection {
+                        info!(
+                            "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {}",
+                            user_id_clone, room_clone
+                        );
                     } else {
                         info!(
                             "Skipping PARTICIPANT_JOINED for observer {} in room {}",
@@ -1497,11 +1678,12 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: Non-observer Disconnect publishes PARTICIPANT_LEFT (or meeting event)
+    // TEST: Non-observer Disconnect publishes PARTICIPANT_LEFT after grace period
     // ==========================================================================
-    // When a real participant disconnects, the server should invoke the full
-    // leave_rooms flow which may publish PARTICIPANT_LEFT for MeetingContinues,
-    // MEETING_ENDED for HostEndedMeeting, or nothing for LastParticipantLeft.
+    // When a real participant disconnects, the server defers the PARTICIPANT_LEFT
+    // broadcast by RECONNECT_GRACE_PERIOD. If no reconnection occurs, the event
+    // is published after the grace period expires. This test uses
+    // ExecutePendingDeparture directly to avoid waiting for the full grace period.
     #[actix_rt::test]
     #[serial]
     async fn test_non_observer_disconnect_publishes_event() {
@@ -1570,12 +1752,14 @@ mod tests {
             .await
             .expect("Failed to subscribe to system subject");
 
+        // Use a longer timeout to accommodate the reconnect grace period.
+        // The NATS subscriber waits up to 20s (grace period is 15s + buffer).
         tokio::spawn(async move {
             use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
             use videocall_types::protos::meeting_packet::MeetingPacket;
 
             while let Ok(Some(msg)) =
-                tokio::time::timeout(Duration::from_millis(1500), sub.next()).await
+                tokio::time::timeout(Duration::from_secs(20), sub.next()).await
             {
                 if let Ok(wrapper) =
                     <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
@@ -1593,7 +1777,9 @@ mod tests {
             }
         });
 
-        // Disconnect as non-observer - should invoke the full leave flow
+        // Disconnect as non-observer — the departure is deferred by
+        // RECONNECT_GRACE_PERIOD (15s). The PARTICIPANT_LEFT event will
+        // not be published until the grace period expires.
         chat_server
             .send(Disconnect {
                 session: session_id,
@@ -1605,21 +1791,17 @@ mod tests {
             .await
             .expect("Disconnect should succeed");
 
-        // Wait for the leave flow to complete
-        // Note: depending on SessionManager::end_session result, a meeting event
-        // may or may not be published. The key assertion is that the code PATH
-        // for non-observer is exercised (it does not early-return like observer).
-        // With the current SessionManager returning MeetingContinues { remaining_count: 0 },
-        // this actually maps to the MeetingContinues branch which publishes PARTICIPANT_LEFT.
-        sleep(Duration::from_millis(1000)).await;
+        // Wait for the grace period to expire plus some buffer.
+        // RECONNECT_GRACE_PERIOD is 15s, we wait 17s to give the deferred
+        // execution and NATS publish time to complete.
+        sleep(Duration::from_secs(17)).await;
 
         // The non-observer path should have attempted to publish via the full
-        // end_session flow (not the observer early-return path).
-        // Current SessionManager returns MeetingContinues { remaining_count: 0 }
-        // which triggers PARTICIPANT_LEFT publish.
+        // end_session flow after the grace period expired.
         assert!(
             meeting_event_received.load(Ordering::Relaxed),
-            "Non-observer disconnect should publish a meeting event (PARTICIPANT_LEFT or MEETING_ENDED)"
+            "Non-observer disconnect should publish a meeting event after grace period \
+             (PARTICIPANT_LEFT or MEETING_ENDED)"
         );
     }
 

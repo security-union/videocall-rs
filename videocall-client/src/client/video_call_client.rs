@@ -712,6 +712,36 @@ impl VideoCallClient {
         None
     }
 
+    /// Returns `true` if the client is currently in a reconnecting state.
+    ///
+    /// During reconnection, the server replays the full participant list as
+    /// PARTICIPANT_JOINED events.  The UI can use this to suppress toast
+    /// notifications for these replayed events.
+    pub fn is_reconnecting(&self) -> bool {
+        matches!(
+            self.get_connection_state(),
+            Some(ConnectionState::Reconnecting { .. })
+        )
+    }
+
+    /// Returns `true` if any peer with the given `user_id` is currently
+    /// tracked in the peer decode manager.
+    ///
+    /// This is useful for the UI to decide whether a PARTICIPANT_JOINED
+    /// event represents a genuinely new participant or a reconnection of
+    /// an already-known participant.
+    pub fn has_peer_with_user_id(&self, user_id: &str) -> bool {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.sorted_keys().iter().any(|sid| {
+                inner
+                    .peer_decode_manager
+                    .get(sid)
+                    .map_or(false, |peer| peer.user_id == user_id)
+            }),
+            Err(_) => false,
+        }
+    }
+
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
         if let Ok(cc) = self.connection_controller.try_borrow() {
             if let Some(controller) = cc.as_ref() {
@@ -938,18 +968,23 @@ impl VideoCallClient {
 }
 
 impl Inner {
-    /// Returns `true` if this peer event was already seen recently (within 5 s).
+    /// Returns `true` if this peer event was already seen recently (within 30 s).
     ///
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so the same PARTICIPANT_JOINED / PARTICIPANT_LEFT event can
     /// arrive twice.  This helper deduplicates them so the UI only fires one
     /// toast notification per actual event.
+    ///
+    /// The 30-second window is chosen to outlast the reconnection backoff
+    /// schedule (which can exceed 5 seconds).  A shorter window would allow
+    /// stale "existing member" PARTICIPANT_JOINED events to slip through
+    /// after a reconnect because the dedup entry had already expired.
     fn is_duplicate_peer_event(&mut self, event_type: &str, target_user_id: &str) -> bool {
         let now = js_sys::Date::now();
         let key = (event_type.to_string(), target_user_id.to_string());
 
-        // Evict stale entries (older than 5 seconds).
-        self.recent_peer_events.retain(|_, ts| now - *ts < 5000.0);
+        // Evict stale entries (older than 30 seconds).
+        self.recent_peer_events.retain(|_, ts| now - *ts < 30_000.0);
 
         if self.recent_peer_events.contains_key(&key) {
             true // duplicate

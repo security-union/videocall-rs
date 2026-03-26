@@ -581,86 +581,155 @@ pub fn AttendantsComponent(
                 let mut v = waiting_room_version;
                 v.set(v() + 1);
             })),
-            on_peer_left: Some(VcCallback::from(
-                move |(display_name, user_id): (String, String)| {
-                    log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
-                    let mut toast_counter = toast_counter;
-                    let mut peer_toasts = peer_toasts;
-                    let mut toast_version = toast_version;
-                    let id = *toast_counter.peek();
-                    toast_counter.set(id + 1);
-                    let mut current = peer_toasts.peek().clone();
-                    current.push((id, display_name, user_id, false));
-                    peer_toasts.set(current);
-                    {
-                        let v = *toast_version.peek();
-                        toast_version.set(v + 1);
-                    }
-                    // Defer the leave sound: only play if the toast still exists
-                    // after 500ms (i.e. no join event cancelled it).
-                    Timeout::new(500, move || {
-                        if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
-                            play_user_left();
+            on_peer_left: {
+                let client_cell = client_for_reconnect.clone();
+                Some(VcCallback::from(
+                    move |(display_name, user_id): (String, String)| {
+                        log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+
+                        // Suppress toast if the client is reconnecting — the server
+                        // replays the full member list on each connect, so leave
+                        // events during reconnection are not genuine departures.
+                        let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
+                            if client.is_reconnecting() {
+                                log::debug!(
+                                    "Suppressing leave toast for {} (reconnecting)",
+                                    user_id
+                                );
+                                true
+                            } else if !client.has_peer_with_user_id(&user_id) {
+                                // Peer is not in the tracked list (already removed
+                                // by a previous event) — no toast needed.
+                                log::debug!(
+                                    "Suppressing leave toast for {} (not in peer list)",
+                                    user_id
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if suppress_toast {
+                            return;
                         }
-                    })
-                    .forget();
-                    // Schedule toast removal after 8 seconds.
-                    Timeout::new(8_000, move || {
-                        let updated: Vec<_> = peer_toasts
-                            .peek()
-                            .iter()
-                            .filter(|(tid, _, _, _)| *tid != id)
-                            .cloned()
-                            .collect();
-                        peer_toasts.set(updated);
+
+                        let mut toast_counter = toast_counter;
+                        let mut peer_toasts = peer_toasts;
+                        let mut toast_version = toast_version;
+                        let id = *toast_counter.peek();
+                        toast_counter.set(id + 1);
+                        let mut current = peer_toasts.peek().clone();
+                        current.push((id, display_name, user_id, false));
+                        peer_toasts.set(current);
                         {
                             let v = *toast_version.peek();
                             toast_version.set(v + 1);
                         }
-                    })
-                    .forget();
-                },
-            )),
-            on_peer_joined: Some(VcCallback::from(
-                move |(display_name, user_id): (String, String)| {
-                    log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
-                    let mut toast_counter = toast_counter;
-                    let mut peer_toasts = peer_toasts;
-                    let mut toast_version = toast_version;
-                    // Remove any pending "left" toast for this user (waiting room admission).
-                    let mut current = peer_toasts.peek().clone();
-                    current.retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
-                    play_user_joined();
-                    let id = *toast_counter.peek();
-                    toast_counter.set(id + 1);
-                    current.push((id, display_name, user_id, true));
-                    peer_toasts.set(current);
-                    {
-                        let v = *toast_version.peek();
-                        toast_version.set(v + 1);
-                    }
-                    // Force tile re-render so display names appear.
-                    {
-                        let mut v = peer_list_version;
-                        v.set(v() + 1);
-                    }
-                    // Schedule toast removal after 8 seconds.
-                    Timeout::new(8_000, move || {
-                        let updated: Vec<_> = peer_toasts
-                            .peek()
-                            .iter()
-                            .filter(|(tid, _, _, _)| *tid != id)
-                            .cloned()
-                            .collect();
-                        peer_toasts.set(updated);
-                        {
-                            let v = *toast_version.peek();
-                            toast_version.set(v + 1);
+                        // Defer the leave sound: only play if the toast still exists
+                        // after 500ms (i.e. no join event cancelled it).
+                        Timeout::new(500, move || {
+                            if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
+                                play_user_left();
+                            }
+                        })
+                        .forget();
+                        // Schedule toast removal after 8 seconds.
+                        Timeout::new(8_000, move || {
+                            let updated: Vec<_> = peer_toasts
+                                .peek()
+                                .iter()
+                                .filter(|(tid, _, _, _)| *tid != id)
+                                .cloned()
+                                .collect();
+                            peer_toasts.set(updated);
+                            {
+                                let v = *toast_version.peek();
+                                toast_version.set(v + 1);
+                            }
+                        })
+                        .forget();
+                    },
+                ))
+            },
+            on_peer_joined: {
+                let client_cell = client_for_reconnect.clone();
+                Some(VcCallback::from(
+                    move |(display_name, user_id): (String, String)| {
+                        log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+
+                        // Suppress toast if the client is reconnecting — the server
+                        // replays the full member list as PARTICIPANT_JOINED events
+                        // on each connect, so these are not genuine new arrivals.
+                        // Also suppress if this participant is already tracked in the
+                        // peer list (they reconnected, not newly joined).
+                        let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
+                            if client.is_reconnecting() {
+                                log::debug!(
+                                    "Suppressing join toast for {} (reconnecting)",
+                                    user_id
+                                );
+                                true
+                            } else if client.has_peer_with_user_id(&user_id) {
+                                log::debug!(
+                                    "Suppressing join toast for {} (already in peer list)",
+                                    user_id
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        let mut toast_counter = toast_counter;
+                        let mut peer_toasts = peer_toasts;
+                        let mut toast_version = toast_version;
+                        // Remove any pending "left" toast for this user (waiting room admission).
+                        let mut current = peer_toasts.peek().clone();
+                        current.retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
+
+                        if !suppress_toast {
+                            play_user_joined();
+                            let id = *toast_counter.peek();
+                            toast_counter.set(id + 1);
+                            current.push((id, display_name, user_id, true));
+                            peer_toasts.set(current);
+                            {
+                                let v = *toast_version.peek();
+                                toast_version.set(v + 1);
+                            }
+                            // Schedule toast removal after 8 seconds.
+                            Timeout::new(8_000, move || {
+                                let updated: Vec<_> = peer_toasts
+                                    .peek()
+                                    .iter()
+                                    .filter(|(tid, _, _, _)| *tid != id)
+                                    .cloned()
+                                    .collect();
+                                peer_toasts.set(updated);
+                                {
+                                    let v = *toast_version.peek();
+                                    toast_version.set(v + 1);
+                                }
+                            })
+                            .forget();
+                        } else {
+                            peer_toasts.set(current);
                         }
-                    })
-                    .forget();
-                },
-            )),
+
+                        // Always force tile re-render so display names appear,
+                        // even when the toast is suppressed.
+                        {
+                            let mut v = peer_list_version;
+                            v.set(v() + 1);
+                        }
+                    },
+                ))
+            },
         };
 
         let client = VideoCallClient::new(opts);

@@ -48,7 +48,7 @@ jobs:
             const packages = [
               'videocall-media-server',
               'videocall-meeting-api',
-              'videocall-web-ui',
+              'videocall-dioxus-ui',
             ];
 
             const cutoff = new Date();

@@ -199,7 +199,6 @@ jobs:
           PACKAGES=(
             "videocall-media-server"
             "videocall-meeting-api"
-            "videocall-web-ui"
             "videocall-dioxus-ui"
           )
 
@@ -492,7 +491,7 @@ jobs:
             --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[1].valueFrom.secretKeyRef.key=secret" \
             --set "env[2].name=CORS_ALLOWED_ORIGIN" \
-            --set "env[2].value=https://pr${SLOT}.sandbox.videocall.rs\,https://pr${SLOT}-dx.sandbox.videocall.rs" \
+            --set "env[2].value=https://pr${SLOT}-dx.sandbox.videocall.rs" \
             --set "env[3].name=COOKIE_DOMAIN" \
             --set "env[3].value=.sandbox.videocall.rs" \
             --set "env[4].name=OAUTH_ISSUER" \
@@ -504,7 +503,7 @@ jobs:
             --set "env[7].name=OAUTH_REDIRECT_URL" \
             --set "env[7].value=https://pr${SLOT}-api.sandbox.videocall.rs/login/callback" \
             --set "env[8].name=AFTER_LOGIN_URL" \
-            --set "env[8].value=https://pr${SLOT}.sandbox.videocall.rs" \
+            --set "env[8].value=https://pr${SLOT}-dx.sandbox.videocall.rs" \
             --set "env[9].name=OAUTH_SCOPES" \
             --set "env[9].value=openid email profile" \
             --set "env[10].name=LISTEN_ADDR" \
@@ -514,9 +513,9 @@ jobs:
             --set "env[12].name=COOKIE_NAME" \
             --set "env[12].value=pr${SLOT}-session" \
             --set "env[13].name=ALLOWED_REDIRECT_URLS" \
-            --set "env[13].value=https://pr${SLOT}.sandbox.videocall.rs\,https://pr${SLOT}-dx.sandbox.videocall.rs" \
+            --set "env[13].value=https://pr${SLOT}-dx.sandbox.videocall.rs" \
             --set "env[14].name=SERVICE_VERSION_URLS" \
-            --set "env[14].value=http://websocket-pr-${PR_NUM}:8080/version\,http://dx-pr-${PR_NUM}:80/version.json\,http://ui-pr-${PR_NUM}:80/version.json" \
+            --set "env[14].value=http://websocket-pr-${PR_NUM}:8080/version\,http://dx-pr-${PR_NUM}:80/version.json" \
             --set "ingress.hosts[0].host=pr${SLOT}-api.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -529,46 +528,6 @@ jobs:
             --wait --timeout 5m
 
           echo "✅ Meeting API deployed to slot ${SLOT} with OAuth"
-
-      - name: Deploy UI
-        run: |
-          PR_NUM=${{ inputs.pr_number }}
-          SLOT=${{ steps.assign-slot.outputs.SLOT }}
-          NAMESPACE="preview-slot-${SLOT}"
-
-          echo "Deploying UI to slot ${SLOT} with OAuth enabled..."
-
-          helm upgrade --install preview-${PR_NUM}-ui helm/rustlemania-ui/ \
-            --namespace ${NAMESPACE} \
-            --set image.repository=ghcr.io/${{ github.repository_owner }}/videocall-web-ui \
-            --set image.tag=pr-${PR_NUM} \
-            --set fullnameOverride=ui-pr-${PR_NUM} \
-            --set ingress.redirect=false \
-            --set "runtimeConfig.apiBaseUrl=https://pr${SLOT}-api.sandbox.videocall.rs" \
-            --set "runtimeConfig.meetingApiBaseUrl=https://pr${SLOT}-api.sandbox.videocall.rs" \
-            --set "runtimeConfig.wsUrl=wss://pr${SLOT}-ws.sandbox.videocall.rs" \
-            --set "runtimeConfig.webTransportHost=" \
-            --set-string "runtimeConfig.webTransportEnabled=false" \
-            --set-string "runtimeConfig.oauthEnabled=true" \
-            --set-string "runtimeConfig.e2eeEnabled=false" \
-            --set-string "runtimeConfig.firefoxEnabled=false" \
-            --set "runtimeConfig.usersAllowedToStream=" \
-            --set "runtimeConfig.serverElectionPeriodMs=2000" \
-            --set "runtimeConfig.audioBitrateKbps=65" \
-            --set "runtimeConfig.videoBitrateKbps=1000" \
-            --set "runtimeConfig.screenBitrateKbps=1000" \
-            --set "ingress.hosts[0].host=pr${SLOT}.sandbox.videocall.rs" \
-            --set "ingress.hosts[0].paths[0].path=/" \
-            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
-            --set "ingress.hosts[0].paths[0].service.name=ui-pr-${PR_NUM}" \
-            --set "ingress.hosts[0].paths[0].service.port.number=80" \
-            --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr${SLOT}.sandbox.videocall.rs" \
-            --set "ingress.annotations.cert-manager\.io/issuer=null" \
-            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
-            --wait --timeout 5m
-
-          echo "✅ UI deployed to slot ${SLOT} with OAuth"
 
       - name: Deploy Dioxus UI
         run: |
@@ -653,7 +612,6 @@ jobs:
               body: `✅ **Preview ${deploymentType} to slot ${slot}** ${slotStatus}
 
             🌐 **Preview URLs:**
-            - **Yew UI:** https://pr${slot}.sandbox.videocall.rs
             - **Dioxus UI:** https://pr${slot}-dx.sandbox.videocall.rs
             - **API:** https://pr${slot}-api.sandbox.videocall.rs
             - **WebSocket:** wss://pr${slot}-ws.sandbox.videocall.rs

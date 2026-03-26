@@ -31,7 +31,7 @@ dioxus-ui
   |- matomo-logger           (analytics)
 ```
 
-`videocall-client` is the core library shared with the yew-ui frontend. The dioxus-ui uses it **without** the `yew-compat` feature, meaning callbacks use `Rc<dyn Fn(T)>` closures instead of Yew's `Callback<T>`.
+`videocall-client` is the core client library. The dioxus-ui uses it **without** the `yew-compat` feature, meaning callbacks use `Rc<dyn Fn(T)>` closures.
 
 ### Project Structure
 
@@ -85,7 +85,7 @@ dioxus-ui/
     login_provider_logo.rs       # OAuth provider branding
   index.html           # Trunk entry point with WebCodecs polyfills
   webdriver.json       # Chrome flags for test device simulation
-  static/              # CSS files (symlinked from yew-ui)
+  static/              # CSS files
   scripts/             # Runtime config.js, Opus encoder/decoder workers
   assets/              # Audio files, images
 ```
@@ -148,7 +148,7 @@ window.__APP_CONFIG = Object.freeze({
 Or use the Nix devShell (includes all tools):
 
 ```bash
-nix develop .#yew-ui
+nix develop .#frontend
 ```
 
 ### Running Locally
@@ -271,7 +271,7 @@ CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --
 If you use the Nix devShell, all tooling is pre-installed:
 
 ```bash
-nix develop .#yew-ui
+nix develop .#frontend
 cd dioxus-ui
 CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown
 ```

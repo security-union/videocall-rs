@@ -34,6 +34,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let mut loading = use_signal(|| true);
     let mut error = use_signal(|| None::<String>);
     let mut waiting_room_toggle = use_signal(|| false);
+    let mut admitted_can_admit_toggle = use_signal(|| false);
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let mut ending = use_signal(|| false);
@@ -69,6 +70,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                 match get_meeting_info(&meeting_id).await {
                     Ok(info) => {
                         waiting_room_toggle.set(info.waiting_room_enabled);
+                        admitted_can_admit_toggle.set(info.admitted_can_admit);
                         meeting.set(Some(info));
                         loading.set(false);
                     }
@@ -160,23 +162,63 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let meeting_id_end = id.clone();
     let meeting_id_delete = id.clone();
 
+    let meeting_id_toggle2 = id.clone();
+
     let on_toggle_waiting_room = move |new_val: bool| {
         if saving() {
             return;
         }
         toggle_error.set(None);
+        let prev_aca = admitted_can_admit_toggle();
         waiting_room_toggle.set(new_val);
+        // When disabling waiting room, also disable admitted_can_admit
+        if !new_val {
+            admitted_can_admit_toggle.set(false);
+        }
         saving.set(true);
         let meeting_id = meeting_id_toggle.clone();
+        let aca = if new_val {
+            Some(admitted_can_admit_toggle())
+        } else {
+            Some(false)
+        };
         spawn(async move {
-            match update_meeting(&meeting_id, new_val, None).await {
+            match update_meeting(&meeting_id, new_val, aca).await {
                 Ok(updated) => {
                     waiting_room_toggle.set(updated.waiting_room_enabled);
+                    admitted_can_admit_toggle.set(updated.admitted_can_admit);
                     saving.set(false);
                 }
                 Err(e) => {
                     log::error!("Failed to update waiting room: {e}");
                     waiting_room_toggle.set(!new_val);
+                    admitted_can_admit_toggle.set(prev_aca);
+                    saving.set(false);
+                    toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                }
+            }
+        });
+    };
+
+    let on_toggle_admitted_can_admit = move |new_val: bool| {
+        if saving() || !waiting_room_toggle() {
+            return;
+        }
+        toggle_error.set(None);
+        admitted_can_admit_toggle.set(new_val);
+        saving.set(true);
+        let meeting_id = meeting_id_toggle2.clone();
+        let wr = waiting_room_toggle();
+        spawn(async move {
+            match update_meeting(&meeting_id, wr, Some(new_val)).await {
+                Ok(updated) => {
+                    waiting_room_toggle.set(updated.waiting_room_enabled);
+                    admitted_can_admit_toggle.set(updated.admitted_can_admit);
+                    saving.set(false);
+                }
+                Err(e) => {
+                    log::error!("Failed to update admitted_can_admit: {e}");
+                    admitted_can_admit_toggle.set(!new_val);
                     saving.set(false);
                     toggle_error.set(Some(format!("Failed to update setting: {e}")));
                 }
@@ -384,6 +426,31 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                         enabled: waiting_room_toggle(),
                         on_toggle: on_toggle_waiting_room,
                         disabled: saving(),
+                    }
+                }
+            }
+
+            div {
+                class: "settings-option-row",
+                style: if waiting_room_toggle() { "opacity: 1.0;" } else { "opacity: 0.4;" },
+                span { class: "settings-option-label", "Participants can admit others" }
+                div { class: "settings-option-controls",
+                    span {
+                        class: "settings-info-icon",
+                        title: "Allow admitted participants to also admit others from the waiting room",
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg", width: "15", height: "15",
+                            view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                            stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                            circle { cx: "12", cy: "12", r: "10" }
+                            line { x1: "12", y1: "16", x2: "12", y2: "12" }
+                            line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
+                        }
+                    }
+                    ToggleSwitch {
+                        enabled: admitted_can_admit_toggle(),
+                        on_toggle: on_toggle_admitted_can_admit,
+                        disabled: saving() || !waiting_room_toggle(),
                     }
                 }
             }

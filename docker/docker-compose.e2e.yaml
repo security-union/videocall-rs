@@ -1,7 +1,7 @@
 ##
 ## E2E test stack — reuses the same dev Dockerfiles as CI.
 ## Starts the minimum services needed for Playwright E2E tests.
-## dioxus-ui (port 3001) is the sole frontend.
+## dioxus-ui (port 3001).
 ##
 ## Usage:
 ##   docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d

@@ -289,15 +289,24 @@ async fn device_settings_modal_renders_audio_section_dropdowns_when_visible() {
     yield_now().await;
 
     assert!(
-        mount.query_selector("#modal-audio-select").unwrap().is_some(),
+        mount
+            .query_selector("#modal-audio-select")
+            .unwrap()
+            .is_some(),
         "audio select should be visible in default Audio section"
     );
     assert!(
-        mount.query_selector("#modal-speaker-select").unwrap().is_some(),
+        mount
+            .query_selector("#modal-speaker-select")
+            .unwrap()
+            .is_some(),
         "speaker select should be visible in default Audio section"
     );
     assert!(
-        mount.query_selector("#modal-video-select").unwrap().is_none(),
+        mount
+            .query_selector("#modal-video-select")
+            .unwrap()
+            .is_none(),
         "video select should not be visible until Video section is opened"
     );
 
@@ -383,17 +392,26 @@ async fn device_settings_modal_defaults_to_audio_section() {
     );
 
     assert!(
-        mount.query_selector("#modal-audio-select").unwrap().is_some(),
+        mount
+            .query_selector("#modal-audio-select")
+            .unwrap()
+            .is_some(),
         "microphone select should be visible in Audio section"
     );
 
     assert!(
-        mount.query_selector("#modal-speaker-select").unwrap().is_some(),
+        mount
+            .query_selector("#modal-speaker-select")
+            .unwrap()
+            .is_some(),
         "speaker select should be visible in Audio section"
     );
 
     assert!(
-        mount.query_selector("#modal-video-select").unwrap().is_none(),
+        mount
+            .query_selector("#modal-video-select")
+            .unwrap()
+            .is_none(),
         "camera select should not be visible in Audio section"
     );
 
@@ -440,17 +458,26 @@ async fn device_settings_modal_switches_to_video_section_on_click() {
     yield_now().await;
 
     assert!(
-        mount.query_selector("#modal-video-select").unwrap().is_some(),
+        mount
+            .query_selector("#modal-video-select")
+            .unwrap()
+            .is_some(),
         "camera select should be visible after switching to Video section"
     );
 
     assert!(
-        mount.query_selector("#modal-audio-select").unwrap().is_none(),
+        mount
+            .query_selector("#modal-audio-select")
+            .unwrap()
+            .is_none(),
         "microphone select should not be visible in Video section"
     );
 
     assert!(
-        mount.query_selector("#modal-speaker-select").unwrap().is_none(),
+        mount
+            .query_selector("#modal-speaker-select")
+            .unwrap()
+            .is_none(),
         "speaker select should not be visible in Video section"
     );
 
@@ -560,7 +587,11 @@ async fn device_settings_modal_renders_only_audio_and_video_navigation() {
     yield_now().await;
 
     let nav_buttons = mount.query_selector_all(".settings-nav-button").unwrap();
-    assert_eq!(nav_buttons.length(), 2, "should render exactly two nav buttons");
+    assert_eq!(
+        nav_buttons.length(),
+        2,
+        "should render exactly two nav buttons"
+    );
 
     let text = mount.text_content().unwrap_or_default();
     assert!(text.contains("Audio"), "should render Audio nav");

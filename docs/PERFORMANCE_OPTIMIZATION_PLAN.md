@@ -512,7 +512,7 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 **Files involved:**
 - `videocall-client/src/connection/connection_manager.rs` — reconnection state machine
 - `videocall-client/src/client/video_call_client.rs` — orchestrate reconnection
-- `yew-ui/` and `dioxus-ui/` — UI indicators for reconnection state
+- `dioxus-ui/` — UI indicators for reconnection state
 - `videocall-client/src/adaptive_quality_constants.rs` — `RECONNECT_INITIAL_DELAY_MS`, `RECONNECT_MAX_DELAY_MS`, `RECONNECT_BACKOFF_MULTIPLIER`, `RECONNECT_CONSECUTIVE_ZERO_LIMIT`
 
 #### 2.2 — Automatic Connection Quality Re-election
@@ -609,7 +609,6 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 
 **Files involved:**
 - `videocall-client/src/decode/peer_decode_manager.rs` — visibility-gated decode
-- `yew-ui/src/components/canvas_generator.rs` — IntersectionObserver setup
 - `dioxus-ui/src/components/canvas_generator.rs` — IntersectionObserver setup
 
 ---
@@ -657,7 +656,7 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 | Packet Handler (server) | `actix-api/src/actors/packet_handler.rs` | 34–78 (classification) |
 | WebTransport (server) | `actix-api/src/actors/transports/wt_chat_session.rs` | 129–149 (channel send/drop) |
 | Health Reporter | `videocall-client/src/health_reporter.rs` | 533–625 (metrics collection) |
-| Constants (frontend) | `dioxus-ui/src/constants.rs` / `yew-ui/src/constants.rs` | 67–72 / 89–94 (bitrate config) |
+| Constants (frontend) | `dioxus-ui/src/constants.rs` | 67–72 (bitrate config) |
 
 ---
 

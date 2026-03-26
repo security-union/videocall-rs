@@ -6,7 +6,6 @@ on:
       - 'actix-api/**'
       - 'videocall-types/**'
       - 'protobuf/**'
-      - 'yew-ui/**'
       - 'dioxus-ui/**'
       - 'docker/**'
       - 'neteq/**'

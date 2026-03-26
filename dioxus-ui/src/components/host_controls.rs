@@ -235,8 +235,8 @@ pub fn HostControls(
                             let mut waiting_admit = waiting.clone();
                             let mut waiting_reject = waiting.clone();
 
-                            let mut error_admit = error.clone();
-                            let mut error_reject = error.clone();
+                            let error_admit = error.clone();
+                            let error_reject = error.clone();
 
                             rsx! {
                                 div { key: "{uid_for_key}", class: "waiting-participant",

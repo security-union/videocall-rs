@@ -1753,13 +1753,12 @@ mod tests {
             .expect("Failed to subscribe to system subject");
 
         // Use a longer timeout to accommodate the reconnect grace period.
-        // The NATS subscriber waits up to 20s (grace period is 15s + buffer).
+        // The NATS subscriber waits up to 6s (grace period is 2s + buffer).
         tokio::spawn(async move {
             use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
             use videocall_types::protos::meeting_packet::MeetingPacket;
 
-            while let Ok(Some(msg)) =
-                tokio::time::timeout(Duration::from_secs(20), sub.next()).await
+            while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(6), sub.next()).await
             {
                 if let Ok(wrapper) =
                     <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
@@ -1778,7 +1777,7 @@ mod tests {
         });
 
         // Disconnect as non-observer — the departure is deferred by
-        // RECONNECT_GRACE_PERIOD (15s). The PARTICIPANT_LEFT event will
+        // RECONNECT_GRACE_PERIOD (2s). The PARTICIPANT_LEFT event will
         // not be published until the grace period expires.
         chat_server
             .send(Disconnect {
@@ -1792,9 +1791,9 @@ mod tests {
             .expect("Disconnect should succeed");
 
         // Wait for the grace period to expire plus some buffer.
-        // RECONNECT_GRACE_PERIOD is 15s, we wait 17s to give the deferred
+        // RECONNECT_GRACE_PERIOD is 2s, we wait 4s to give the deferred
         // execution and NATS publish time to complete.
-        sleep(Duration::from_secs(17)).await;
+        sleep(Duration::from_secs(4)).await;
 
         // The non-observer path should have attempted to publish via the full
         // end_session flow after the grace period expired.

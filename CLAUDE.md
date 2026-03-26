@@ -5,7 +5,7 @@
 `videocall-rs` is a Rust-based video calling platform. The main crates are:
 
 - **videocall-client** - Client library targeting `wasm32-unknown-unknown`.
-- **dioxus-ui** - Dioxus-based frontend (the sole UI, uses `videocall-client`)
+- **dioxus-ui** - Dioxus-based frontend (uses `videocall-client`)
 - **videocall-types** - Shared protobuf types
 - **videocall-codecs** - Audio/video codec wrappers
 

@@ -59,11 +59,11 @@ ingress:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     kubernetes.io/tls-acme: "true"
   hosts:
-    - host: app-dx.videocall.rs
+    - host: app.videocall.rs
       paths:
         - path: /
           pathType: Prefix
   tls:
     - secretName: videocall-ui-tls
       hosts:
-        - app-dx.videocall.rs
+        - app.videocall.rs

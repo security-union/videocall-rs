@@ -34,9 +34,12 @@ use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -147,6 +150,15 @@ struct Inner {
     /// short time window to avoid firing duplicate toast notifications.
     /// Key: (event_type_str, target_user_id), Value: timestamp_ms
     recent_peer_events: HashMap<(String, String), f64>,
+    /// Flag set by incoming KEYFRAME_REQUEST for camera video. The
+    /// `CameraEncoder` checks this flag each frame and forces a keyframe.
+    force_camera_keyframe: Arc<AtomicBool>,
+    /// Flag set by incoming KEYFRAME_REQUEST for screen share.
+    force_screen_keyframe: Arc<AtomicBool>,
+    /// Flag set when a CONGESTION signal is received from the server.
+    /// The camera encoder's diagnostics loop checks this flag and calls
+    /// `force_video_step_down()` on the `EncoderBitrateController`.
+    congestion_step_down_requested: Arc<AtomicBool>,
 }
 
 /// The main client handle for a video call session.
@@ -236,6 +248,10 @@ impl VideoCallClient {
         let connection_controller: Rc<RefCell<Option<ConnectionController>>> =
             Rc::new(RefCell::new(None));
 
+        let force_camera_keyframe = Arc::new(AtomicBool::new(false));
+        let force_screen_keyframe = Arc::new(AtomicBool::new(false));
+        let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -268,11 +284,28 @@ impl VideoCallClient {
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
                 recent_peer_events: HashMap::new(),
+                force_camera_keyframe: force_camera_keyframe.clone(),
+                force_screen_keyframe: force_screen_keyframe.clone(),
+                congestion_step_down_requested: congestion_step_down_requested.clone(),
             })),
             connection_controller,
             aes,
             _diagnostics: diagnostics.clone(),
         };
+
+        // Wire up the send-packet callback on PeerDecodeManager so it can
+        // send KEYFRAME_REQUEST packets back through the connection.
+        {
+            let client_for_pli = client.clone();
+            if let Ok(mut inner) = client.inner.try_borrow_mut() {
+                inner.peer_decode_manager.set_send_packet_callback(
+                    Callback::from(move |packet: PacketWrapper| {
+                        client_for_pli.send_packet(packet);
+                    }),
+                    options.user_id.clone(),
+                );
+            }
+        }
 
         if let Some(diagnostics) = &diagnostics {
             let client_clone = client.clone();
@@ -458,6 +491,32 @@ impl VideoCallClient {
         }
     }
 
+    /// Send a media packet via reliable stream.
+    ///
+    /// Used for VIDEO, AUDIO, and SCREEN packets where reliable delivery is
+    /// required to avoid visual/audio artifacts from packet loss. Control
+    /// packets (heartbeats, RTT probes, diagnostics) use datagrams instead
+    /// since they are periodic and expendable.
+    pub(crate) fn send_media_packet(&self, media: PacketWrapper) {
+        let packet_type = media.packet_type.enum_value();
+        match self.connection_controller.try_borrow() {
+            Ok(cc) => {
+                if let Some(controller) = cc.as_ref() {
+                    if let Err(e) = controller.send_packet(media) {
+                        debug!("Failed to send {packet_type:?} media packet: {e}");
+                    }
+                } else {
+                    error!("No connection manager available for {packet_type:?} media packet");
+                }
+            }
+            Err(_) => {
+                error!(
+                    "Unable to borrow connection_controller -- dropping {packet_type:?} media packet"
+                )
+            }
+        }
+    }
+
     /// Returns `true` if the client has an active, elected connection.
     pub fn is_connected(&self) -> bool {
         if let Ok(cc) = self.connection_controller.try_borrow() {
@@ -611,6 +670,31 @@ impl VideoCallClient {
         0.0
     }
 
+    /// Returns a shared reference to the camera force-keyframe flag.
+    ///
+    /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets
+    /// can force the encoder to produce an immediate keyframe.
+    pub fn force_camera_keyframe_flag(&self) -> Arc<AtomicBool> {
+        self.inner.borrow().force_camera_keyframe.clone()
+    }
+
+    /// Returns a shared reference to the screen force-keyframe flag.
+    ///
+    /// Pass this to `ScreenEncoder` so that incoming KEYFRAME_REQUEST packets
+    /// can force the encoder to produce an immediate keyframe.
+    pub fn force_screen_keyframe_flag(&self) -> Arc<AtomicBool> {
+        self.inner.borrow().force_screen_keyframe.clone()
+    }
+
+    /// Returns a shared reference to the congestion step-down flag.
+    ///
+    /// Pass this to `CameraEncoder` so that incoming CONGESTION signals from
+    /// the server trigger an immediate quality tier step-down via the
+    /// `EncoderBitrateController`.
+    pub fn congestion_step_down_flag(&self) -> Arc<AtomicBool> {
+        self.inner.borrow().congestion_step_down_requested.clone()
+    }
+
     pub(crate) fn aes(&self) -> Rc<Aes128State> {
         self.aes.clone()
     }
@@ -695,6 +779,22 @@ impl VideoCallClient {
                 .set_peer_screen_canvas(sid, canvas)
         } else {
             Err(JsValue::from_str("Failed to borrow inner state"))
+        }
+    }
+
+    /// Update the visibility state for a peer. When `visible` is `false`,
+    /// video and screen decoding is paused to save CPU. Audio is always
+    /// decoded regardless of visibility.
+    ///
+    /// Called by the UI layer when an `IntersectionObserver` detects that a
+    /// peer's canvas element has scrolled in or out of the viewport.
+    pub fn set_peer_visibility(&self, peer_id: &str, visible: bool) {
+        let sid: u64 = match peer_id.parse() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.peer_decode_manager.set_peer_visibility(sid, visible);
         }
     }
 
@@ -859,6 +959,45 @@ impl Inner {
         }
     }
 
+    /// Try to handle the packet as a KEYFRAME_REQUEST. Returns `true` if it
+    /// was a keyframe request and was handled, `false` otherwise.
+    ///
+    /// A KEYFRAME_REQUEST is a MEDIA packet whose inner `MediaPacket` has
+    /// `media_type == KEYFRAME_REQUEST`. The `data` field contains the stream
+    /// type (`"VIDEO"` or `"SCREEN"`) that needs the keyframe.
+    fn try_handle_keyframe_request(&self, response: &PacketWrapper) -> bool {
+        // Parse the inner MediaPacket to check its media_type.
+        let media_packet = match MediaPacket::parse_from_bytes(&response.data) {
+            Ok(mp) => mp,
+            Err(_) => return false,
+        };
+
+        if media_packet.media_type.enum_value() != Ok(MediaType::KEYFRAME_REQUEST) {
+            return false;
+        }
+
+        let requested_stream = String::from_utf8_lossy(&media_packet.data);
+        info!(
+            "Received KEYFRAME_REQUEST from {} for {}",
+            String::from_utf8_lossy(&response.user_id),
+            requested_stream,
+        );
+
+        match requested_stream.as_ref() {
+            "VIDEO" => {
+                self.force_camera_keyframe.store(true, Ordering::Release);
+            }
+            "SCREEN" => {
+                self.force_screen_keyframe.store(true, Ordering::Release);
+            }
+            other => {
+                warn!("Unknown KEYFRAME_REQUEST stream type: {other}");
+            }
+        }
+
+        true
+    }
+
     fn on_inbound_media(&mut self, response: PacketWrapper) {
         debug!(
             "<< Received {:?} from {} (session: {})",
@@ -947,6 +1086,14 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEDIA) => {
+                // Check if this is a KEYFRAME_REQUEST targeted at us (the sender).
+                // These arrive as MEDIA packets; we intercept them here before
+                // they reach the peer decode manager which would just skip them.
+                if self.try_handle_keyframe_request(&response) {
+                    // Handled -- do not forward to peer_decode_manager.
+                    return;
+                }
+
                 let peer_session_id = response.session_id;
 
                 if let Err(e) = self
@@ -1151,6 +1298,24 @@ impl Inner {
                     error!("Failed to parse MeetingPacket: {e}");
                 }
             },
+            Ok(PacketType::CONGESTION) => {
+                // Server-side congestion feedback: the server is dropping
+                // packets destined for a receiver because the outbound channel
+                // is full. Only act on it if the target session matches ours.
+                if self.own_session_id == Some(response.session_id) {
+                    warn!(
+                        "Received CONGESTION signal from server (receiver: {}), requesting quality step-down",
+                        String::from_utf8_lossy(&response.user_id),
+                    );
+                    self.congestion_step_down_requested
+                        .store(true, Ordering::Release);
+                } else {
+                    debug!(
+                        "Ignoring CONGESTION signal targeted at session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
+                    );
+                }
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

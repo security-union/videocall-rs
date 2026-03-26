@@ -30,7 +30,7 @@ on:
         options:
           - 'all'
           - 'core-services'     # websocket, webtransport
-          - 'ui-services'       # rustlemania-ui, videocall-website
+          - 'ui-services'       # videocall-ui, videocall-website
           - 'infrastructure'    # cert-manager, ingress
           - 'monitoring'        # prometheus, grafana
       dry_run:

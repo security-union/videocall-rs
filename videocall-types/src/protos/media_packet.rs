@@ -310,6 +310,8 @@ pub mod media_packet {
         HEARTBEAT = 4,
         // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.RTT)
         RTT = 5,
+        // @@protoc_insertion_point(enum_value:MediaPacket.MediaType.KEYFRAME_REQUEST)
+        KEYFRAME_REQUEST = 6,
     }
 
     impl ::protobuf::Enum for MediaType {
@@ -327,6 +329,7 @@ pub mod media_packet {
                 3 => ::std::option::Option::Some(MediaType::SCREEN),
                 4 => ::std::option::Option::Some(MediaType::HEARTBEAT),
                 5 => ::std::option::Option::Some(MediaType::RTT),
+                6 => ::std::option::Option::Some(MediaType::KEYFRAME_REQUEST),
                 _ => ::std::option::Option::None
             }
         }
@@ -339,6 +342,7 @@ pub mod media_packet {
                 "SCREEN" => ::std::option::Option::Some(MediaType::SCREEN),
                 "HEARTBEAT" => ::std::option::Option::Some(MediaType::HEARTBEAT),
                 "RTT" => ::std::option::Option::Some(MediaType::RTT),
+                "KEYFRAME_REQUEST" => ::std::option::Option::Some(MediaType::KEYFRAME_REQUEST),
                 _ => ::std::option::Option::None
             }
         }
@@ -350,6 +354,7 @@ pub mod media_packet {
             MediaType::SCREEN,
             MediaType::HEARTBEAT,
             MediaType::RTT,
+            MediaType::KEYFRAME_REQUEST,
         ];
     }
 

@@ -16,12 +16,12 @@ RUN git init && git add flake.nix flake.lock
 
 # Downloads all tools from the Nix binary cache (~seconds).
 # This layer is cached by Docker as long as flake.nix/flake.lock are unchanged.
-RUN nix develop .#yew-ui --command true
+RUN nix develop .#frontend --command true
 
 COPY . .
 RUN git add -A
 
-RUN nix develop .#yew-ui --command bash -c "\
+RUN nix develop .#frontend --command bash -c "\
     cd dioxus-ui && \
     tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify && \
     trunk build --release"

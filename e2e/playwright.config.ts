@@ -28,13 +28,5 @@ export default defineConfig({
         launchOptions: { args: CHROME_ARGS },
       },
     },
-    {
-      name: "yew",
-      use: {
-        baseURL: "http://localhost:80",
-        ...devices["Desktop Chrome"],
-        launchOptions: { args: CHROME_ARGS },
-      },
-    },
   ],
 });

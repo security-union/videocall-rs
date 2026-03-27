@@ -118,19 +118,23 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at "medium" (480p/25fps/600kbps) avoids wasting ~1.5 seconds of
-/// high-quality encoding on constrained devices before the first step-down.
-/// Medium is a safe starting point that can quickly step up on good
-/// connections or step down on bad ones.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "medium"
+/// Starting at the lowest tier ("minimal", 240p/10fps/150kbps) ensures the
+/// system only ever upgrades from the initial state. This eliminates the
+/// visible dimension-change oscillation that occurred when starting at
+/// "medium": the PID controller allocates ~300 kbps during warmup, but
+/// medium expects ~600 kbps, so bitrate_ratio drops below the degrade
+/// threshold and triggers a step-down. Starting at minimal means the first
+/// tier transition the user sees is a quality *improvement*, not a jarring
+/// resolution drop.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 3; // "minimal"
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at the highest tier (1080p/15fps/1500kbps) because
-/// screen content is resolution-sensitive -- text and fine UI details become
-/// unreadable at lower resolutions. The system can still step down if
-/// network conditions require it.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0; // "high"
+/// Screen share starts at the lowest tier ("low", 480p/5fps/250kbps) to
+/// match the camera strategy: only upgrade, never visibly downgrade. The
+/// PID controller will quickly ramp up resolution once it measures
+/// sufficient bandwidth, so text readability recovers within seconds.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 2; // "low"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
@@ -245,6 +249,15 @@ pub const STEP_DOWN_REACTION_TIME_MS: u64 = 1500;
 /// Minimum time between any two tier transitions (milliseconds).
 /// Prevents rapid toggling even if thresholds are crossed quickly.
 pub const MIN_TIER_TRANSITION_INTERVAL_MS: u64 = 3000;
+
+/// Warmup grace period after the quality manager is created (milliseconds).
+///
+/// During encoder startup, no frames have been produced yet so `fps_ratio`
+/// reads as 0.0, which triggers aggressive step-downs (high -> low -> minimal).
+/// Once frames start flowing the manager steps back up, causing visible
+/// aspect-ratio glitches. This warmup period suppresses all tier transitions
+/// until the encoder has had time to produce stable output.
+pub const QUALITY_WARMUP_MS: f64 = 5000.0;
 
 // ---------------------------------------------------------------------------
 // PID Controller Tuning
@@ -701,7 +714,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
+        assert_eq!(tier.label, "minimal", "default tier should be 'minimal'");
     }
 
     #[test]

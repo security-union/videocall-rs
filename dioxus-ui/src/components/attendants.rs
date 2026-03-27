@@ -411,6 +411,7 @@ pub fn AttendantsComponent(
     let reload_devices_counter = use_signal(|| 0u32);
     let mut device_was_denied = use_signal(|| false);
     let session_loaded = use_signal(|| false);
+    let connecting = use_signal(|| false);
     let local_speaking = use_signal(|| false);
     let local_audio_level = use_signal(|| 0.0f32);
     let mut pending_mic_enable = use_signal(|| false);
@@ -795,7 +796,7 @@ pub fn AttendantsComponent(
                 _ => {}
             }
 
-            if session_loaded() {
+            if session_loaded() || connecting() {
                 if mic_error.read().is_some() {
                     mic_enabled.set(false);
                     pending_mic_enable.set(false);
@@ -808,6 +809,8 @@ pub fn AttendantsComponent(
                 show_device_warning.set(true);
                 meeting_joined.set(false);
             } else {
+                let mut connecting = connecting;
+                connecting.set(true);
                 if let Err(e) = client_cell.borrow_mut().connect() {
                     log::error!("Connection failed: {e:?}");
                 }
@@ -828,6 +831,10 @@ pub fn AttendantsComponent(
         use_effect(move || {
             let value = mda.clone();
             let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+                if session_loaded() || connecting() {
+                    return;
+                }
+
                 let mic_denied = matches!(
                     mic_error.read().as_ref(),
                     Some(MediaErrorState::PermissionDenied)

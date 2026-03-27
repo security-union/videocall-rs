@@ -332,6 +332,34 @@ impl VideoCallClient {
     }
 
     pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
+        // Idempotency guard: if a ConnectionController already exists we need
+        // to decide whether to skip (actively connecting/connected) or tear
+        // down a stale controller (failed state) before reconnecting.
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                let state = controller.get_connection_state();
+                match state {
+                    // Election running, connection active, or manager is
+                    // already handling its own reconnection — skip.
+                    ConnectionState::Testing { .. }
+                    | ConnectionState::Connected { .. }
+                    | ConnectionState::Reconnecting { .. } => {
+                        info!(
+                            "connect() called but ConnectionController is in {state:?} state — skipping duplicate connection"
+                        );
+                        return Ok(());
+                    }
+                    // Connection permanently failed — tear down the stale
+                    // controller and create a fresh one below.
+                    ConnectionState::Failed { .. } => {
+                        drop(cc);
+                        info!("connect() called with failed ConnectionController — disconnecting before reconnect");
+                        let _ = self.disconnect();
+                    }
+                }
+            }
+        }
+
         let websocket_count = self.options.websocket_urls.len();
         let webtransport_count = if self.options.enable_webtransport {
             self.options.webtransport_urls.len()

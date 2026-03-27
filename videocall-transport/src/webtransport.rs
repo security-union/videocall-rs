@@ -376,9 +376,14 @@ impl WebTransportTask {
         });
     }
 
+    /// Sends data to a WebTransport connection via a unidirectional stream.
+    ///
+    /// Stream errors (creation failure, write backpressure, QUIC congestion) are
+    /// transient -- they affect only this single frame send. The transport is NOT
+    /// closed on failure; if the transport is genuinely dead, the reader loops and
+    /// the `closed` promise will detect it independently.
     pub fn send_unidirectional_stream(transport: Rc<WebTransport>, data: Vec<u8>) {
         wasm_bindgen_futures::spawn_local(async move {
-            let transport = transport.clone();
             let result: Result<(), anyhow::Error> = {
                 let transport = transport.clone();
                 async move {
@@ -408,20 +413,31 @@ impl WebTransportTask {
             }
             .await;
             if let Err(e) = result {
-                let e = e.to_string();
-                log!("error: ", e);
-                transport.close();
+                // Transient stream error -- log and drop the packet. Do NOT
+                // close the transport; a single failed frame should not kill
+                // the entire connection for all participants.
+                log!(
+                    "unidirectional stream send failed (frame dropped):",
+                    e.to_string()
+                );
             }
         });
     }
 
+    /// Sends data to a WebTransport connection via a bidirectional stream and
+    /// reads the response.
+    ///
+    /// Stream errors are transient -- they affect only this single stream
+    /// exchange. The transport is NOT closed on failure; if the transport is
+    /// genuinely dead, the reader loops and the `closed` promise will detect it
+    /// independently. The inner reader task will terminate naturally when the
+    /// stream's readable side ends or errors out.
     pub fn send_bidirectional_stream(
         transport: Rc<WebTransport>,
         data: Vec<u8>,
         callback: Callback<Vec<u8>>,
     ) {
         wasm_bindgen_futures::spawn_local(async move {
-            let transport = transport.clone();
             let result: Result<(), anyhow::Error> = {
                 let transport = transport.clone();
                 async move {
@@ -436,11 +452,13 @@ impl WebTransportTask {
                             let read_result = JsFuture::from(readable.read()).await;
                             match read_result {
                                 Err(e) => {
-                                    let reason = WebTransportCloseInfo::default();
-                                    reason.set_reason(
-                                        format!("Failed to read incoming stream {e:?}").as_str(),
+                                    // Stream read error -- log and stop reading.
+                                    // Do NOT close the transport; this is a
+                                    // single-stream failure.
+                                    log!(
+                                        "bidirectional stream read error (stopping reader):",
+                                        format!("{e:?}")
                                     );
-                                    transport.close_with_close_info(&reason);
                                     break;
                                 }
                                 Ok(result) => {
@@ -481,9 +499,14 @@ impl WebTransportTask {
             }
             .await;
             if let Err(e) = result {
-                let e = e.to_string();
-                log!("error: {}", e);
-                transport.close();
+                // Transient stream error -- log and drop the packet. Do NOT
+                // close the transport; a single failed frame should not kill
+                // the entire connection for all participants. The inner reader
+                // task (if spawned) will terminate when the stream ends.
+                log!(
+                    "bidirectional stream send failed (frame dropped):",
+                    e.to_string()
+                );
             }
         });
     }

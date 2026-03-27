@@ -104,15 +104,23 @@ pub fn Home() -> Element {
         }
     });
 
-    // Logout handler — clear profile state and display name, then stay on home page
+    // Logout handler: clear local state first, then navigate the browser to
+    // the meeting-api /logout endpoint.  The server clears the session cookie
+    // and, when an OIDC end_session_endpoint is configured, redirects to the
+    // provider's logout page (RP-initiated logout).  Doing a browser
+    // navigation — rather than a fetch() — ensures the provider redirect is
+    // followed as a real page load.
     let on_logout = move |_| {
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = logout().await;
-            user_profile.set(None);
-            clear_display_name_from_storage();
-            display_name_ctx.0.set(None);
-            username_value.set(String::new());
-        });
+        // Clear persisted display name before the page unloads so the user
+        // starts fresh after the OIDC provider redirects back.
+        clear_display_name_from_storage();
+        // Reset in-memory signals (best-effort; page unloads shortly after).
+        user_profile.set(None);
+        display_name_ctx.0.set(None);
+        username_value.set(String::new());
+        if let Err(e) = logout() {
+            log::error!("Logout navigation failed: {e}");
+        }
     };
 
     let get_meeting_id = move || -> String {
@@ -363,7 +371,7 @@ pub fn Home() -> Element {
                 }
 
                 div { class: "content-separator" }
-            
+
             // div { class: "grid grid-cols-1 md:grid-cols-2 gap-8", style: "margin-top:1em",
             //     div {
             //         button {

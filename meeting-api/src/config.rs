@@ -77,6 +77,19 @@ pub struct OAuthConfig {
     /// "http://localhost:80,http://localhost:3001"). The origin of
     /// `after_login_url` is implicitly allowed.
     pub allowed_redirect_urls: Vec<String>,
+    /// End-session endpoint for RP-initiated logout (OIDC RP-Initiated Logout
+    /// 1.0). Discovered from the provider's OpenID Configuration when
+    /// `OAUTH_ISSUER` is set, or overridden via `OAUTH_END_SESSION_URL`.
+    ///
+    /// When set, `GET /logout` redirects the browser to this URL (with
+    /// `client_id` and optionally `post_logout_redirect_uri`) after clearing
+    /// the local session cookie, so the provider also terminates the session.
+    pub end_session_endpoint: Option<String>,
+    /// URL to redirect to after the provider has completed logout
+    /// (`post_logout_redirect_uri` sent to `end_session_endpoint`).
+    /// Configured via `AFTER_LOGOUT_URL`. When not set, the parameter is
+    /// omitted from the end-session redirect.
+    pub after_logout_url: Option<String>,
 }
 
 impl Config {
@@ -96,6 +109,9 @@ impl Config {
     ///   `OAUTH_ISSUER`, `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_JWKS_URL`,
     ///   `OAUTH_USERINFO_URL`, `OAUTH_SCOPES` (default: `"openid email profile"`),
     ///   `AFTER_LOGIN_URL`
+    /// - OIDC logout: `OAUTH_END_SESSION_URL` (manual override; auto-discovered
+    ///   from `OAUTH_ISSUER` when not set), `AFTER_LOGOUT_URL` (sent as
+    ///   `post_logout_redirect_uri` to the provider's end-session endpoint)
     /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"` or comma-separated for multiple origins)
     pub fn from_env() -> Result<Self, String> {
         let database_url = env::var("DATABASE_URL")
@@ -147,10 +163,16 @@ impl Config {
                 let userinfo_url = env::var("OAUTH_USERINFO_URL")
                     .ok()
                     .filter(|s| !s.is_empty());
+                let end_session_url = env::var("OAUTH_END_SESSION_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty());
                 let scopes = env::var("OAUTH_SCOPES")
                     .ok()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "openid email profile".to_string());
+
+                // post_logout_redirect_uri sent to the provider's end-session endpoint.
+                let after_logout_url = env::var("AFTER_LOGOUT_URL").ok().filter(|s| !s.is_empty());
 
                 // When no issuer is set, auth_url and token_url must be provided manually.
                 let auth_url = match auth_url {
@@ -202,6 +224,8 @@ impl Config {
                         }
                         urls
                     },
+                    end_session_endpoint: end_session_url,
+                    after_logout_url,
                 })
             })
             .transpose()?;
@@ -256,13 +280,18 @@ impl Config {
         if oauth.userinfo_url.is_none() {
             oauth.userinfo_url = endpoints.userinfo_endpoint;
         }
+        if oauth.end_session_endpoint.is_none() {
+            oauth.end_session_endpoint = endpoints.end_session_endpoint;
+        }
 
         tracing::info!(
-            "OIDC discovery complete: auth_url={}, token_url={}, jwks_url={:?}, userinfo_url={:?}",
+            "OIDC discovery complete: auth_url={}, token_url={}, jwks_url={:?}, \
+             userinfo_url={:?}, end_session_endpoint={:?}",
             oauth.auth_url,
             oauth.token_url,
             oauth.jwks_url,
-            oauth.userinfo_url
+            oauth.userinfo_url,
+            oauth.end_session_endpoint,
         );
 
         Ok(())

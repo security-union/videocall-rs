@@ -97,6 +97,11 @@ pub fn router() -> Router<AppState> {
         .route("/session", get(oauth::check_session))
         .route("/profile", get(oauth::get_profile))
         .route("/logout", get(oauth::logout))
+        // OIDC front-channel logout — provider calls this URL in a hidden iframe
+        // when the user logs out at the provider or via another relying party.
+        // Register {base_url}/logout/frontchannel as `frontchannel_logout_uri`
+        // in your OIDC client configuration.
+        .route("/logout/frontchannel", get(oauth::frontchannel_logout))
         // Meeting CRUD
         .route("/api/v1/meetings", get(meetings::list_meetings))
         .route("/api/v1/meetings", post(meetings::create_meeting))

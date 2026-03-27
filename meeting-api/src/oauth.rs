@@ -85,6 +85,10 @@ pub struct OidcEndpoints {
     pub jwks_uri: Option<String>,
     #[serde(default)]
     pub userinfo_endpoint: Option<String>,
+    /// End-session endpoint used for both RP-initiated logout and front-channel
+    /// logout flows (OIDC RP-Initiated Logout 1.0 / Front-Channel Logout 1.0).
+    #[serde(default)]
+    pub end_session_endpoint: Option<String>,
 }
 
 /// Fetch OIDC discovery document from `{issuer}/.well-known/openid-configuration`.

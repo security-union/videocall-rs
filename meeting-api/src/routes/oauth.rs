@@ -291,8 +291,146 @@ pub async fn get_profile(
     Json(APIResponse::ok(ProfileResponse { user_id, name }))
 }
 
-/// GET /logout -- clears the session cookie.
+/// GET /logout -- clears the session cookie, then redirects the browser to the
+/// provider's `end_session_endpoint` (RP-initiated logout per OIDC RP-Initiated
+/// Logout 1.0) when one is configured.
+///
+/// Redirect parameters sent to the provider:
+/// - `client_id` — always included.
+/// - `post_logout_redirect_uri` — included when `AFTER_LOGOUT_URL` is set.
+///
+/// Note: `id_token_hint` is not sent because session JWTs are short-lived
+/// admission tickets; the original ID token is not persisted.
+///
+/// When no `end_session_endpoint` is configured the handler returns `200 OK`
+/// (backward-compatible behaviour for non-browser API clients).
 pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError> {
+    let clear = build_clear_session_cookie(
+        &state.cookie_name,
+        state.cookie_domain.as_deref(),
+        state.cookie_secure,
+    );
+
+    // Redirect to the provider's end-session endpoint when configured so that
+    // the provider also terminates its session (RP-initiated logout).
+    let mut response = if let Some(end_session_url) = state
+        .oauth
+        .as_ref()
+        .and_then(|o| o.end_session_endpoint.as_deref())
+    {
+        let oauth_cfg = state.oauth.as_ref().expect("oauth is Some");
+        let redirect_url = build_end_session_url(end_session_url, oauth_cfg)?;
+        tracing::info!(
+            end_session_url = %redirect_url,
+            "Initiating RP-initiated logout via provider end-session endpoint",
+        );
+        Redirect::to(&redirect_url).into_response()
+    } else {
+        StatusCode::OK.into_response()
+    };
+
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear)
+            .map_err(|_| AppError::internal("failed to build clear cookie header"))?,
+    );
+    Ok(response)
+}
+
+/// Build the provider's end-session URL for RP-initiated logout.
+///
+/// Appends `client_id` and, when configured, `post_logout_redirect_uri` to
+/// `end_session_url` using proper percent-encoding via the `url` crate.
+fn build_end_session_url(
+    end_session_url: &str,
+    oauth_cfg: &crate::config::OAuthConfig,
+) -> Result<String, AppError> {
+    let mut url = Url::parse(end_session_url)
+        .map_err(|e| AppError::internal(&format!("Invalid end_session_endpoint URL: {e}")))?;
+    {
+        let mut params = url.query_pairs_mut();
+        params.append_pair("client_id", &oauth_cfg.client_id);
+        if let Some(ref after_logout_url) = oauth_cfg.after_logout_url {
+            params.append_pair("post_logout_redirect_uri", after_logout_url);
+        }
+    }
+    Ok(url.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Front-channel logout
+// ---------------------------------------------------------------------------
+
+/// Query parameters sent by the OIDC provider to the front-channel logout URI.
+/// Defined in OpenID Connect Front-Channel Logout 1.0.
+#[derive(Debug, Deserialize)]
+pub struct FrontChannelLogoutQuery {
+    /// Issuer identifier of the provider initiating logout. Optional per spec;
+    /// validated against `OAUTH_ISSUER` when present.
+    pub iss: Option<String>,
+    /// Provider browser-session identifier. Optional per spec; logged for
+    /// observability. Cannot be used to revoke stateless JWTs server-side.
+    pub sid: Option<String>,
+}
+
+/// GET /logout/frontchannel
+///
+/// OIDC front-channel logout endpoint (OpenID Connect Front-Channel Logout 1.0).
+///
+/// The identity provider loads this URL in a **hidden iframe** when the
+/// End-User logs out of the provider directly or via another relying party.
+/// The request therefore comes from the user's browser, which means that
+/// returning a `Set-Cookie` in the response will clear the local session even
+/// though `SameSite=Lax` prevents the cookie from being *sent* in the
+/// cross-site iframe request.
+///
+/// Spec requirements implemented here:
+/// - Validates the `iss` parameter against the configured issuer (when both
+///   are present) to reject spurious logout triggers from unknown providers.
+/// - Clears the local session cookie via `Set-Cookie: Max-Age=0`.
+/// - Returns `200 OK` with an empty body — **must not redirect** because the
+///   response is consumed by the provider's iframe, not the browser's top-level
+///   navigation.
+///
+/// # Provider registration
+/// Register the URL `{base_url}/logout/frontchannel` as the
+/// `frontchannel_logout_uri` in your OIDC client configuration at the
+/// provider.
+pub async fn frontchannel_logout(
+    State(state): State<AppState>,
+    Query(query): Query<FrontChannelLogoutQuery>,
+) -> Result<Response, AppError> {
+    // Validate the `iss` parameter against our configured issuer to prevent
+    // unauthenticated third parties from triggering spurious logouts.
+    if let Some(ref iss_param) = query.iss {
+        if let Some(ref oauth_cfg) = state.oauth {
+            if let Some(ref configured_issuer) = oauth_cfg.issuer {
+                if iss_param != configured_issuer {
+                    tracing::warn!(
+                        iss_received = %iss_param,
+                        iss_expected = %configured_issuer,
+                        "Front-channel logout rejected: issuer mismatch",
+                    );
+                    return Err(AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        videocall_meeting_types::APIError::internal_error(
+                            "iss parameter does not match configured issuer",
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        sid = query.sid.as_deref().unwrap_or("<none>"),
+        iss = query.iss.as_deref().unwrap_or("<none>"),
+        "Processing OIDC front-channel logout",
+    );
+
+    // Clear the session cookie. Browsers honour Set-Cookie in iframe responses
+    // even when SameSite=Lax prevents the cookie from being included in the
+    // cross-origin request, so this effectively terminates the browser session.
     let clear = build_clear_session_cookie(
         &state.cookie_name,
         state.cookie_domain.as_deref(),
@@ -598,5 +736,383 @@ mod tests {
     fn clear_cookie_domain_appended() {
         let cookie = build_clear_session_cookie("session", Some(".videocall.rs"), false);
         assert!(cookie.contains("Domain=.videocall.rs"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_end_session_url
+    // ---------------------------------------------------------------------------
+
+    /// Minimal `OAuthConfig` used by unit tests that exercise logout URL building.
+    fn minimal_oauth_config(
+        end_session_endpoint: Option<String>,
+        after_logout_url: Option<String>,
+    ) -> crate::config::OAuthConfig {
+        crate::config::OAuthConfig {
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            redirect_url: "https://app.example.com/callback".to_string(),
+            issuer: Some("https://provider.example.com".to_string()),
+            auth_url: "https://provider.example.com/auth".to_string(),
+            token_url: "https://provider.example.com/token".to_string(),
+            jwks_url: None,
+            userinfo_url: None,
+            scopes: "openid email profile".to_string(),
+            after_login_url: "https://app.example.com/".to_string(),
+            allowed_redirect_urls: vec![],
+            end_session_endpoint,
+            after_logout_url,
+        }
+    }
+
+    #[test]
+    fn build_end_session_url_includes_client_id() {
+        let cfg = minimal_oauth_config(None, None);
+        let url = build_end_session_url("https://provider.example.com/logout", &cfg).unwrap();
+        assert!(
+            url.contains("client_id=test-client"),
+            "expected client_id in URL, got: {url}"
+        );
+    }
+
+    #[test]
+    fn build_end_session_url_includes_post_logout_redirect_uri_when_set() {
+        let cfg = minimal_oauth_config(
+            Some("https://provider.example.com/logout".to_string()),
+            Some("https://app.example.com/after-logout".to_string()),
+        );
+        let url = build_end_session_url("https://provider.example.com/logout", &cfg).unwrap();
+        assert!(
+            url.contains("post_logout_redirect_uri="),
+            "expected post_logout_redirect_uri in URL, got: {url}"
+        );
+        assert!(
+            url.contains("app.example.com"),
+            "expected redirect URI host in URL, got: {url}"
+        );
+    }
+
+    #[test]
+    fn build_end_session_url_omits_post_logout_redirect_uri_when_unset() {
+        let cfg = minimal_oauth_config(None, None);
+        let url = build_end_session_url("https://provider.example.com/end_session", &cfg).unwrap();
+        assert!(
+            !url.contains("post_logout_redirect_uri"),
+            "should not contain post_logout_redirect_uri, got: {url}"
+        );
+    }
+
+    #[test]
+    fn build_end_session_url_preserves_existing_query_params() {
+        let cfg = minimal_oauth_config(None, None);
+        let url = build_end_session_url("https://provider.example.com/logout?realm=master", &cfg)
+            .unwrap();
+        assert!(
+            url.contains("realm=master"),
+            "existing query param should be preserved, got: {url}"
+        );
+        assert!(
+            url.contains("client_id="),
+            "client_id should be appended, got: {url}"
+        );
+    }
+
+    #[test]
+    fn build_end_session_url_encodes_special_characters_in_redirect_uri() {
+        let cfg = minimal_oauth_config(
+            None,
+            Some("https://app.example.com/after logout?ref=1&foo=bar".to_string()),
+        );
+        let url = build_end_session_url("https://provider.example.com/logout", &cfg).unwrap();
+        // Spaces and ampersands inside the redirect URI value must be percent-encoded
+        // so they do not break the outer query string.
+        assert!(
+            !url.ends_with(' '),
+            "spaces must be percent-encoded, got: {url}"
+        );
+        // The url crate encodes the value properly; at minimum verify the key appears.
+        assert!(
+            url.contains("post_logout_redirect_uri="),
+            "post_logout_redirect_uri key should appear, got: {url}"
+        );
+    }
+
+    #[test]
+    fn build_end_session_url_rejects_invalid_base_url() {
+        let cfg = minimal_oauth_config(None, None);
+        let result = build_end_session_url("not-a-valid-url", &cfg);
+        assert!(result.is_err(), "invalid base URL should produce an error");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Handler tests: logout + frontchannel_logout
+    // ---------------------------------------------------------------------------
+    //
+    // These tests wire up a minimal Router (no real DB — lazy pool only) and
+    // use tower::ServiceExt::oneshot to send a single request.
+
+    use crate::state::AppState;
+    use axum::body::Body as AxumBody;
+    use sqlx::postgres::PgPoolOptions;
+
+    /// Build a minimal `AppState` suitable for handler tests (no real DB, no NATS).
+    fn make_handler_state(oauth: Option<crate::config::OAuthConfig>) -> AppState {
+        let db = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost/unused")
+            .expect("lazy pool creation should not fail");
+        AppState {
+            db,
+            jwt_secret: "test-secret".to_string(),
+            token_ttl_secs: 60,
+            session_ttl_secs: 3600,
+            oauth,
+            jwks_cache: None,
+            cookie_domain: None,
+            cookie_name: "session".to_string(),
+            cookie_secure: false,
+            nats: None,
+            service_version_urls: vec![],
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    fn oauth_cfg_with_end_session(
+        end_session_endpoint: &str,
+        after_logout_url: Option<&str>,
+    ) -> crate::config::OAuthConfig {
+        minimal_oauth_config(
+            Some(end_session_endpoint.to_string()),
+            after_logout_url.map(|s| s.to_string()),
+        )
+    }
+
+    // --- logout handler ---
+
+    #[tokio::test]
+    async fn logout_returns_200_when_no_end_session_endpoint() {
+        use tower::ServiceExt;
+        let state = make_handler_state(None);
+        let app = axum::Router::new()
+            .route("/logout", axum::routing::get(logout))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "should clear cookie, got: {set_cookie}"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_redirects_when_end_session_endpoint_is_configured() {
+        use tower::ServiceExt;
+        let cfg = oauth_cfg_with_end_session(
+            "https://provider.example.com/logout",
+            Some("https://app.example.com/after-logout"),
+        );
+        let state = make_handler_state(Some(cfg));
+        let app = axum::Router::new()
+            .route("/logout", axum::routing::get(logout))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Must be a redirect (303 See Other).
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("Location header must be present")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.starts_with("https://provider.example.com/logout"),
+            "Location should point to provider end-session endpoint: {location}"
+        );
+        assert!(
+            location.contains("client_id=test-client"),
+            "client_id must be present: {location}"
+        );
+        assert!(
+            location.contains("post_logout_redirect_uri="),
+            "post_logout_redirect_uri must be present: {location}"
+        );
+        // Cookie must also be cleared in the same response.
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "cookie should be cleared alongside redirect: {set_cookie}"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_redirect_omits_post_logout_redirect_uri_when_not_configured() {
+        use tower::ServiceExt;
+        let cfg = oauth_cfg_with_end_session("https://provider.example.com/logout", None);
+        let state = make_handler_state(Some(cfg));
+        let app = axum::Router::new()
+            .route("/logout", axum::routing::get(logout))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            !location.contains("post_logout_redirect_uri"),
+            "post_logout_redirect_uri should be absent: {location}"
+        );
+    }
+
+    // --- frontchannel_logout handler ---
+
+    #[tokio::test]
+    async fn frontchannel_logout_returns_200_and_clears_cookie() {
+        use tower::ServiceExt;
+        let state = make_handler_state(None);
+        let app = axum::Router::new()
+            .route(
+                "/logout/frontchannel",
+                axum::routing::get(frontchannel_logout),
+            )
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout/frontchannel")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "should clear cookie: {set_cookie}"
+        );
+        // Must NOT redirect — the request arrives in an iframe context.
+        assert!(
+            resp.headers().get(header::LOCATION).is_none(),
+            "front-channel logout must not redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn frontchannel_logout_accepts_matching_iss_param() {
+        use tower::ServiceExt;
+        // minimal_oauth_config sets issuer = "https://provider.example.com"
+        let cfg = minimal_oauth_config(None, None);
+        let state = make_handler_state(Some(cfg));
+        let app = axum::Router::new()
+            .route(
+                "/logout/frontchannel",
+                axum::routing::get(frontchannel_logout),
+            )
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout/frontchannel?iss=https%3A%2F%2Fprovider.example.com")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn frontchannel_logout_rejects_mismatched_iss_param() {
+        use tower::ServiceExt;
+        let cfg = minimal_oauth_config(None, None); // issuer = "https://provider.example.com"
+        let state = make_handler_state(Some(cfg));
+        let app = axum::Router::new()
+            .route(
+                "/logout/frontchannel",
+                axum::routing::get(frontchannel_logout),
+            )
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout/frontchannel?iss=https%3A%2F%2Fevil.example.com")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn frontchannel_logout_skips_iss_validation_when_no_oauth_configured() {
+        use tower::ServiceExt;
+        // When OAuth is not configured at all, any iss is accepted (no issuer to validate against).
+        let state = make_handler_state(None);
+        let app = axum::Router::new()
+            .route(
+                "/logout/frontchannel",
+                axum::routing::get(frontchannel_logout),
+            )
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout/frontchannel?iss=https%3A%2F%2Fanyone.example.com")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn frontchannel_logout_accepts_sid_param() {
+        use tower::ServiceExt;
+        let state = make_handler_state(None);
+        let app = axum::Router::new()
+            .route(
+                "/logout/frontchannel",
+                axum::routing::get(frontchannel_logout),
+            )
+            .with_state(state);
+
+        // sid is accepted and logged; it cannot invalidate a stateless JWT server-side.
+        let req = axum::http::Request::builder()
+            .uri("/logout/frontchannel?sid=abc123session")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

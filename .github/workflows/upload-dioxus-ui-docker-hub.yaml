@@ -49,3 +49,7 @@ jobs:
           tags: |
             securityunion/videocall-dioxus-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
             securityunion/videocall-dioxus-ui:latest
+          build-args: |
+            GIT_SHA=${{ steps.extract_sha.outputs.sha8 }}
+            GIT_BRANCH=${{ steps.extract_branch.outputs.branch }}
+            BUILD_TIMESTAMP=${{ github.event.head_commit.timestamp }}

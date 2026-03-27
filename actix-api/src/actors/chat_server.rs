@@ -70,6 +70,11 @@ struct PendingDepartureState {
     spawn_handle: SpawnHandle,
     /// The old session ID that disconnected — used for cleanup.
     old_session: SessionId,
+    /// Whether the disconnecting session had been activated (Testing -> Active).
+    /// Only Active sessions should trigger PARTICIPANT_LEFT, because only Active
+    /// sessions had their PARTICIPANT_JOINED broadcast. Testing sessions (e.g.,
+    /// the losing connection during RTT election) never announced themselves.
+    was_active: bool,
 }
 
 pub struct ChatServer {
@@ -86,6 +91,10 @@ pub struct ChatServer {
     /// same user reconnects before the timer fires, the departure is cancelled
     /// silently — no PARTICIPANT_LEFT or PARTICIPANT_JOINED is sent.
     pending_departures: HashMap<(String, String), PendingDepartureState>,
+    /// Sessions that should NOT have PARTICIPANT_JOINED broadcast at activation.
+    /// This is used for reconnection sessions: the user never "left" from peers'
+    /// perspective, so announcing a "join" would be misleading.
+    suppress_join_broadcast: std::collections::HashSet<SessionId>,
 }
 
 impl ChatServer {
@@ -98,6 +107,7 @@ impl ChatServer {
             connection_states: HashMap::new(),
             room_members: HashMap::new(),
             pending_departures: HashMap::new(),
+            suppress_join_broadcast: std::collections::HashSet::new(),
         }
     }
 
@@ -238,6 +248,13 @@ impl Handler<Disconnect> for ChatServer {
         ctx: &mut Self::Context,
     ) -> Self::Result {
         // Clean up session-level state immediately — the transport is gone.
+        // Capture whether the session was Active before removing the state,
+        // so we can store it in PendingDepartureState for the grace period.
+        let was_active = self
+            .connection_states
+            .get(&session)
+            .map(|s| *s == ConnectionState::Active)
+            .unwrap_or(false);
         let _ = self.sessions.remove(&session);
         let _ = self.connection_states.remove(&session);
 
@@ -295,6 +312,7 @@ impl Handler<Disconnect> for ChatServer {
             PendingDepartureState {
                 spawn_handle: handle,
                 old_session: session,
+                was_active,
             },
         );
     }
@@ -335,12 +353,15 @@ impl Handler<Leave> for ChatServer {
 impl Handler<ActivateConnection> for ChatServer {
     type Result = ();
 
-    fn handle(&mut self, msg: ActivateConnection, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: ActivateConnection, ctx: &mut Self::Context) -> Self::Result {
         let ActivateConnection { session } = msg;
-        if let Some(state) = self.connection_states.get_mut(&session) {
+        let was_testing = if let Some(state) = self.connection_states.get_mut(&session) {
             if *state == ConnectionState::Testing {
                 *state = ConnectionState::Active;
                 info!("Session {} activated (Testing -> Active)", session);
+                true
+            } else {
+                false
             }
         } else {
             self.connection_states
@@ -349,6 +370,59 @@ impl Handler<ActivateConnection> for ChatServer {
                 "Session {} activated (state was missing, created as Active)",
                 session
             );
+            // Treat missing state as a Testing -> Active transition so we
+            // still broadcast PARTICIPANT_JOINED.
+            true
+        };
+
+        // Broadcast PARTICIPANT_JOINED now that this connection is confirmed
+        // as the elected/active one. During JoinRoom, the broadcast was deferred
+        // to avoid ghost join events from Testing connections (e.g., the losing
+        // connection during RTT election).
+        if was_testing {
+            // Look up the session's room, user_id, and display_name from room_members.
+            let mut found: Option<(String, String, String)> = None;
+            for (room_id, members) in &self.room_members {
+                for (sid, uid, dname) in members {
+                    if *sid == session {
+                        found = Some((room_id.clone(), uid.clone(), dname.clone()));
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+
+            if let Some((room_id, user_id, display_name)) = found {
+                let bytes = SessionManager::build_peer_joined_packet(
+                    &room_id,
+                    &user_id,
+                    session,
+                    &display_name,
+                );
+                let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                info!(
+                    "Publishing deferred PARTICIPANT_JOINED for {} (display={}, session={}) to {}",
+                    user_id, display_name, session, subject
+                );
+                let nc = self.nats_connection.clone();
+                let fut = async move {
+                    if let Err(e) = nc.publish(subject, bytes.into()).await {
+                        error!("Error publishing deferred PARTICIPANT_JOINED: {}", e);
+                    }
+                };
+                let fut = actix::fut::wrap_future::<_, Self>(fut);
+                ctx.spawn(fut);
+            } else {
+                // This can happen for observer sessions (not tracked in room_members)
+                // or if the session was cleaned up before activation. Not an error.
+                info!(
+                    "Session {} activated but not found in room_members — \
+                     skipping PARTICIPANT_JOINED (likely observer or already cleaned up)",
+                    session
+                );
+            }
         }
     }
 }
@@ -382,6 +456,26 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                 );
                 // Re-insert the newer pending state.
                 self.pending_departures.insert(key, pending);
+                return;
+            }
+
+            // Only broadcast PARTICIPANT_LEFT if the session was Active when it
+            // disconnected. Testing sessions (e.g., the losing connection during
+            // RTT election) never had PARTICIPANT_JOINED broadcast, so emitting
+            // PARTICIPANT_LEFT would cause ghost leave events for other participants.
+            if !pending.was_active {
+                info!(
+                    "Grace period expired for user {} (session {}) in room {} — \
+                     skipping PARTICIPANT_LEFT (session was never activated)",
+                    user_id, session, room
+                );
+                // Still clean up room_members for the old session.
+                if let Some(members) = self.room_members.get_mut(&room) {
+                    members.retain(|(sid, _, _)| *sid != session);
+                    if members.is_empty() {
+                        self.room_members.remove(&room);
+                    }
+                }
                 return;
             }
 
@@ -516,6 +610,13 @@ impl Handler<JoinRoom> for ChatServer {
             false
         };
 
+        // Mark reconnection and observer sessions so ActivateConnection does not
+        // broadcast PARTICIPANT_JOINED for them. Reconnection sessions never
+        // "left" from peers' perspective; observers are never announced.
+        if is_reconnection || observer {
+            self.suppress_join_broadcast.insert(session);
+        }
+
         let session_manager = self.session_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
@@ -582,40 +683,30 @@ impl Handler<JoinRoom> for ChatServer {
                     send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
                         .await;
 
-                    // Notify existing participants about the new joiner.
-                    // Suppress the broadcast when:
-                    //  - This is a reconnection (PARTICIPANT_LEFT was never sent)
-                    //  - This is an observer (waiting room, never a real participant)
-                    if !observer && !is_reconnection {
-                        let bytes = SessionManager::build_peer_joined_packet(
-                            &room_clone,
-                            &user_id_clone,
-                            session_id,
-                            &display_name_clone,
-                        );
-                        let subject = format!("room.{}.system", room_clone.replace(' ', "_"));
+                    // PARTICIPANT_JOINED broadcast is deferred until
+                    // ActivateConnection is received. This prevents ghost join
+                    // events from Testing connections during RTT election — only
+                    // the elected (activated) connection announces itself.
+                    //
+                    // Reconnection joins also skip the broadcast (the user never
+                    // "left" from peers' perspective), and observer joins are
+                    // never broadcast either.
+                    if is_reconnection {
                         info!(
-                            "Publishing PARTICIPANT_JOINED for {} (display={}) to {}",
-                            user_id_clone, display_name_clone, subject
+                            "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {} \
+                             (deferred broadcast also skipped)",
+                            user_id_clone, room_clone
                         );
-                        let subject_for_log = subject.clone();
-                        if let Err(e) = nc.publish(subject, bytes.into()).await {
-                            error!("Error publishing PARTICIPANT_JOINED: {}", e);
-                        } else {
-                            info!(
-                                "Successfully published PARTICIPANT_JOINED for {} to {}",
-                                user_id_clone, subject_for_log
-                            );
-                        }
-                    } else if is_reconnection {
+                    } else if observer {
                         info!(
-                            "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {}",
+                            "Skipping PARTICIPANT_JOINED for observer {} in room {}",
                             user_id_clone, room_clone
                         );
                     } else {
                         info!(
-                            "Skipping PARTICIPANT_JOINED for observer {} in room {}",
-                            user_id_clone, room_clone
+                            "Deferring PARTICIPANT_JOINED for {} (display={}) in room {} \
+                             until ActivateConnection (session {})",
+                            user_id_clone, display_name_clone, room_clone, session_id
                         );
                     }
 

@@ -20,7 +20,8 @@ use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::adaptive_quality_constants::{
     RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
-    RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
+    RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MIN_THRESHOLD_MS,
+    REELECTION_RTT_MULTIPLIER,
 };
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
@@ -141,6 +142,10 @@ pub struct ConnectionManager {
     degradation_counter: u32,
     /// Whether a re-election is currently in progress (prevents overlapping re-elections).
     reelection_in_progress: bool,
+    /// During re-election, the old active connection is kept alive here so it
+    /// can continue carrying media traffic while new candidate connections are
+    /// being tested. `complete_election` drops it after a winner is selected.
+    old_active_connection: Option<(String, Connection)>,
     /// Set to `true` when the user explicitly calls `disconnect()`. Checked by
     /// the reconnection loop to prevent reconnecting after an intentional leave.
     intentionally_disconnected: Rc<RefCell<bool>>,
@@ -180,6 +185,7 @@ impl ConnectionManager {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
+            old_active_connection: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
         };
 
@@ -208,6 +214,9 @@ impl ConnectionManager {
     /// `ConnectionManager`.
     pub fn reset_and_start_election(&mut self) -> Result<()> {
         info!("Resetting connections and starting fresh election for reconnection");
+
+        // Drop old active connection if a re-election was in progress.
+        self.old_active_connection = None;
 
         // Drop all existing connections (stops heartbeats, closes transports).
         self.connections.clear();
@@ -680,8 +689,15 @@ impl ConnectionManager {
                     info!("Baseline RTT for re-election monitoring: {rtt:.1}ms");
                 }
 
-                // Close unused connections
+                // Close unused connections (candidate losers from the election).
                 self.close_unused_connections();
+
+                // If a re-election was in progress, drop the old active
+                // connection now that the new winner is carrying traffic.
+                if let Some((old_id, old_conn)) = self.old_active_connection.take() {
+                    info!("Re-election complete: closing old active connection {old_id}");
+                    drop(old_conn);
+                }
 
                 // Report state
                 self.report_state();
@@ -988,7 +1004,13 @@ impl ConnectionManager {
             None => return false,
         };
 
-        let threshold = baseline * REELECTION_RTT_MULTIPLIER;
+        // Apply a minimum floor so that sub-ms baselines (typical on localhost)
+        // don't trigger on normal jitter. The effective threshold is the greater
+        // of the multiplier-based threshold and the absolute minimum.
+        let threshold = f64::max(
+            baseline * REELECTION_RTT_MULTIPLIER,
+            REELECTION_RTT_MIN_THRESHOLD_MS,
+        );
 
         if current_rtt > threshold {
             self.degradation_counter += 1;
@@ -1038,51 +1060,57 @@ impl ConnectionManager {
         false
     }
 
-    /// Begin a re-election: tear down existing connections, reset monitoring
-    /// state, and create fresh connections to all servers. There is a brief
-    /// disconnection period while the new election runs and selects a winner.
+    /// Begin a re-election: create fresh candidate connections while keeping
+    /// the old active connection alive. The old connection continues to carry
+    /// media traffic during the election period so there is no gap where the
+    /// user appears to leave and rejoin. Once a new winner is elected,
+    /// `complete_election` closes the old connection.
     pub fn start_reelection(&mut self) -> Result<()> {
         if self.reelection_in_progress {
             info!("Re-election already in progress, skipping");
             return Ok(());
         }
 
-        info!("Starting connection quality re-election");
+        info!("Starting connection quality re-election (keeping old connection alive)");
         self.reelection_in_progress = true;
         self.degradation_counter = 0;
         self.baseline_rtt = None;
 
-        // Close the old active connection before creating new ones.
-        // `create_all_connections` reuses the same connection IDs (ws_0, wt_0, ...),
-        // so inserting into the HashMap would silently drop the old Connection.
-        // We close explicitly here to ensure proper WebTransport session teardown
-        // and to avoid leaking resources.
+        // Move the old active connection out of the main HashMap into the
+        // dedicated `old_active_connection` field. It continues carrying media
+        // traffic (via `send_packet` / `send_packet_datagram` which check this
+        // field) while new candidate connections are tested. This avoids
+        // connection-ID collisions when `create_all_connections` reuses
+        // IDs like `ws_0`, `wt_0`.
         let old_active_id = self.active_connection_id.borrow().clone();
         if let Some(ref id) = old_active_id {
             if let Some(old_conn) = self.connections.remove(id) {
-                info!("Re-election: closing old active connection {id}");
-                drop(old_conn);
+                info!("Re-election: preserving old active connection {id} for media continuity");
+                self.old_active_connection = Some((id.clone(), old_conn));
             }
         }
-        // Clear any remaining non-active connections too (from a previous election).
+        // Clear any remaining non-active stale connections.
         self.connections.clear();
-        *self.active_connection_id.borrow_mut() = None;
 
-        // Clear stale RTT measurements so the new election starts clean.
+        // Clear RTT measurements so the new election starts clean.
         self.rtt_measurements.clear();
 
-        // Drain stale RTT responses from the previous connections.
+        // Drain stale RTT responses from previous connections.
         if let Ok(mut responses) = self.rtt_responses.try_borrow_mut() {
             responses.clear();
         }
 
-        // Clear pending session IDs — connection IDs are reused (ws_0, wt_0, …)
-        // so stale entries could be incorrectly applied to new connections.
+        // Clear pending session IDs — new connections will get fresh ones.
         if let Ok(mut pending) = self.pending_session_ids.try_borrow_mut() {
             pending.clear();
         }
 
-        // Create fresh connections to all servers for testing.
+        // NOTE: We do NOT clear active_connection_id here. The old connection
+        // stays active (via old_active_connection) so that:
+        //  (a) `send_packet` / `send_packet_datagram` continue to work
+        //  (b) The server does not see a disconnect/reconnect
+
+        // Create fresh candidate connections to all servers for testing.
         self.create_all_connections()?;
 
         // Reset election state to Testing so the normal election flow runs.
@@ -1345,11 +1373,23 @@ impl ConnectionManager {
     }
 
     /// Send packet through active connection via reliable stream.
+    ///
+    /// During re-election, the old active connection (preserved in
+    /// `old_active_connection`) is used if the elected connection is no
+    /// longer in the main connections HashMap.
     pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            // Try the main connections HashMap first.
             if let Some(connection) = self.connections.get(active_id) {
                 connection.send_packet(packet);
                 return Ok(());
+            }
+            // During re-election, the old connection lives in old_active_connection.
+            if let Some((ref old_id, ref old_conn)) = self.old_active_connection {
+                if old_id == active_id {
+                    old_conn.send_packet(packet);
+                    return Ok(());
+                }
             }
         }
 
@@ -1362,70 +1402,89 @@ impl ConnectionManager {
     /// periodic and expendable — lower overhead matters more than guaranteed
     /// delivery. Falls back to reliable stream for WebSocket connections or
     /// oversized packets.
+    ///
+    /// During re-election, the old active connection is used if the elected
+    /// connection is no longer in the main connections HashMap.
     pub fn send_packet_datagram(&self, packet: PacketWrapper) -> Result<()> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            // Try the main connections HashMap first.
             if let Some(connection) = self.connections.get(active_id) {
                 connection.send_packet_datagram(packet);
                 return Ok(());
             }
+            // During re-election, the old connection lives in old_active_connection.
+            if let Some((ref old_id, ref old_conn)) = self.old_active_connection {
+                if old_id == active_id {
+                    old_conn.send_packet_datagram(packet);
+                    return Ok(());
+                }
+            }
         }
 
         Err(anyhow!("No active connection available"))
     }
 
-    /// Set video enabled on active connection
+    /// Set video enabled on active connection.
+    /// During re-election, falls back to the old active connection.
     pub fn set_video_enabled(&self, enabled: bool) -> Result<()> {
-        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
-            if let Some(connection) = self.connections.get(active_id) {
-                connection.set_video_enabled(enabled);
-                return Ok(());
-            }
+        if let Some(conn) = self.get_active_connection() {
+            conn.set_video_enabled(enabled);
+            return Ok(());
         }
-
         Err(anyhow!("No active connection available"))
     }
 
-    /// Set audio enabled on active connection
+    /// Set audio enabled on active connection.
+    /// During re-election, falls back to the old active connection.
     pub fn set_audio_enabled(&self, enabled: bool) -> Result<()> {
-        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
-            if let Some(connection) = self.connections.get(active_id) {
-                connection.set_audio_enabled(enabled);
-                return Ok(());
-            }
+        if let Some(conn) = self.get_active_connection() {
+            conn.set_audio_enabled(enabled);
+            return Ok(());
         }
-
         Err(anyhow!("No active connection available"))
     }
 
-    /// Set screen enabled on active connection
+    /// Set screen enabled on active connection.
+    /// During re-election, falls back to the old active connection.
     pub fn set_screen_enabled(&self, enabled: bool) -> Result<()> {
-        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
-            if let Some(connection) = self.connections.get(active_id) {
-                connection.set_screen_enabled(enabled);
-                return Ok(());
-            }
+        if let Some(conn) = self.get_active_connection() {
+            conn.set_screen_enabled(enabled);
+            return Ok(());
         }
-
         Err(anyhow!("No active connection available"))
     }
 
-    /// Set speaking on active connection
+    /// Set speaking on active connection.
+    /// During re-election, falls back to the old active connection.
     pub fn set_speaking(&self, speaking: bool) {
-        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
-            if let Some(connection) = self.connections.get(active_id) {
-                connection.set_speaking(speaking);
+        if let Some(conn) = self.get_active_connection() {
+            conn.set_speaking(speaking);
+        }
+    }
+
+    /// Resolve the active connection, checking the main HashMap first and
+    /// falling back to `old_active_connection` during re-election.
+    fn get_active_connection(&self) -> Option<&Connection> {
+        let active_id = self.active_connection_id.borrow();
+        if let Some(id) = active_id.as_deref() {
+            if let Some(conn) = self.connections.get(id) {
+                return Some(conn);
+            }
+            if let Some((ref old_id, ref old_conn)) = self.old_active_connection {
+                if old_id == id {
+                    return Some(old_conn);
+                }
             }
         }
+        None
     }
 
     /// Set own session_id for filtering self-packets and stamp outgoing heartbeats
     pub fn set_own_session_id(&self, session_id: u64) {
         *self.own_session_id.borrow_mut() = Some(session_id);
 
-        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
-            if let Some(connection) = self.connections.get(active_id) {
-                connection.set_session_id(session_id);
-            }
+        if let Some(conn) = self.get_active_connection() {
+            conn.set_session_id(session_id);
         }
         debug!("Set own_session_id to {session_id}");
     }
@@ -1446,6 +1505,9 @@ impl ConnectionManager {
 
         // Clear the active connection id so is_connected() returns false.
         *self.active_connection_id.borrow_mut() = None;
+
+        // Drop the old active connection if a re-election was in progress.
+        self.old_active_connection = None;
 
         // Drop all connections (stops heartbeats, closes transports).
         self.connections.clear();
@@ -1565,7 +1627,8 @@ mod tests {
     use super::*;
     use crate::adaptive_quality_constants::{
         RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
-        RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MULTIPLIER,
+        RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MIN_THRESHOLD_MS,
+        REELECTION_RTT_MULTIPLIER,
     };
 
     // -----------------------------------------------------------------------
@@ -1609,6 +1672,7 @@ mod tests {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
+            old_active_connection: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
         }
     }
@@ -1790,8 +1854,8 @@ mod tests {
         mgr.baseline_rtt = Some(baseline);
         *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
 
-        // Set current RTT above threshold (baseline * REELECTION_RTT_MULTIPLIER = 100.0)
-        insert_measurement(&mut mgr, "wt_0", true, Some(150.0), vec![150.0]);
+        // threshold = max(50 * 3.0, 50.0) = 150.0; set current RTT above that
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0]);
 
         // First call: counter goes to 1, not yet at threshold
         assert!(!mgr.check_rtt_degradation());
@@ -1805,8 +1869,8 @@ mod tests {
         mgr.baseline_rtt = Some(baseline);
         *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
 
-        // Simulate a few degraded samples
-        insert_measurement(&mut mgr, "wt_0", true, Some(150.0), vec![150.0]);
+        // Simulate a few degraded samples (threshold = max(50*3, 50) = 150)
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0]);
         mgr.check_rtt_degradation();
         mgr.check_rtt_degradation();
         assert_eq!(mgr.degradation_counter, 2);
@@ -1847,9 +1911,12 @@ mod tests {
         mgr.baseline_rtt = Some(baseline);
         *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
 
-        // RTT exactly at threshold (baseline * multiplier = 100.0)
+        // RTT exactly at threshold = max(baseline * multiplier, min_floor)
         // The check is `current_rtt > threshold`, so equal should NOT trigger.
-        let threshold = baseline * REELECTION_RTT_MULTIPLIER;
+        let threshold = f64::max(
+            baseline * REELECTION_RTT_MULTIPLIER,
+            REELECTION_RTT_MIN_THRESHOLD_MS,
+        );
         insert_measurement(&mut mgr, "wt_0", true, Some(threshold), vec![threshold]);
 
         for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 2) {
@@ -1868,6 +1935,7 @@ mod tests {
         mgr.baseline_rtt = Some(baseline);
         *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
 
+        // threshold = max(50*3, 50) = 150; 200 is above
         insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0]);
 
         // 3 bad samples
@@ -1876,7 +1944,7 @@ mod tests {
         }
         assert_eq!(mgr.degradation_counter, 3);
 
-        // One good sample resets
+        // One good sample resets (60 < 150 threshold)
         mgr.rtt_measurements.get_mut("wt_0").unwrap().average_rtt = Some(60.0);
         mgr.check_rtt_degradation();
         assert_eq!(mgr.degradation_counter, 0);
@@ -1961,25 +2029,63 @@ mod tests {
     fn single_server_rebase_adapts_to_new_normal() {
         let mut mgr = make_test_manager();
         mgr.options.webtransport_urls = vec!["https://only-server".into()];
-        mgr.baseline_rtt = Some(3.0); // Typical localhost baseline
+        // Use a baseline high enough that the multiplier-based threshold exceeds
+        // the minimum floor: baseline=20, threshold = max(20*3, 50) = 60
+        mgr.baseline_rtt = Some(20.0);
         *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
 
-        // First degradation cycle: RTT rises to 8ms (> 2x 3ms baseline = 6ms threshold)
-        insert_measurement(&mut mgr, "wt_0", true, Some(8.0), vec![8.0]);
+        // First degradation cycle: RTT rises to 80ms (> 60ms threshold)
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
 
         for _ in 0..REELECTION_CONSECUTIVE_SAMPLES {
             assert!(!mgr.check_rtt_degradation());
         }
 
-        // Baseline rebased to 8ms, counter reset.
+        // Baseline rebased to 80ms, counter reset.
         assert_eq!(mgr.degradation_counter, 0);
-        assert!((mgr.baseline_rtt.unwrap() - 8.0).abs() < 0.01);
+        assert!((mgr.baseline_rtt.unwrap() - 80.0).abs() < 0.01);
 
-        // After rebase, 8ms is the new normal. 10ms (< 2x 8ms = 16ms) should not
+        // After rebase, 80ms is the new normal.
+        // New threshold = max(80*3, 50) = 240ms. 100ms < 240ms should not
         // even increment the counter.
-        mgr.rtt_measurements.get_mut("wt_0").unwrap().average_rtt = Some(10.0);
+        mgr.rtt_measurements.get_mut("wt_0").unwrap().average_rtt = Some(100.0);
         assert!(!mgr.check_rtt_degradation());
         assert_eq!(mgr.degradation_counter, 0);
+    }
+
+    // ===================================================================
+    // 3c. RTT minimum threshold floor
+    // ===================================================================
+
+    #[test]
+    fn rtt_degradation_minimum_floor_prevents_localhost_false_positives() {
+        // Simulates the exact scenario from the bug report: localhost baseline
+        // of ~1ms should not trigger degradation on normal 2-5ms jitter.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(0.9); // Typical localhost baseline
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+
+        // threshold = max(0.9 * 3.0, 50.0) = max(2.7, 50.0) = 50.0
+        // RTT values from the bug report (2.4ms, 3.3ms, 4.6ms) are all
+        // well below the 50ms floor.
+        for rtt in [2.4, 3.3, 4.6, 5.0, 10.0, 20.0, 30.0] {
+            insert_measurement(&mut mgr, "wt_0", true, Some(rtt), vec![rtt]);
+            assert!(!mgr.check_rtt_degradation());
+            assert_eq!(
+                mgr.degradation_counter, 0,
+                "RTT {rtt}ms should not trigger degradation on localhost"
+            );
+        }
+    }
+
+    #[test]
+    fn rtt_degradation_minimum_floor_value() {
+        // Verify the minimum floor constant is reasonable.
+        assert!(
+            REELECTION_RTT_MIN_THRESHOLD_MS >= 10.0,
+            "Minimum threshold should be at least 10ms to avoid localhost false positives"
+        );
     }
 
     // ===================================================================
@@ -2218,12 +2324,14 @@ mod tests {
     // ===================================================================
 
     #[test]
+    #[cfg(target_arch = "wasm32")]
     fn start_reelection_sets_flag() {
         let mut mgr = make_test_manager();
         assert!(!mgr.is_reelection_in_progress());
 
         // start_reelection calls create_all_connections which is a no-op
         // when websocket_urls and webtransport_urls are both empty.
+        // NOTE: requires wasm32 because it calls js_sys::Date::now().
         mgr.start_reelection().unwrap();
         assert!(mgr.is_reelection_in_progress());
         assert_eq!(mgr.degradation_counter, 0);

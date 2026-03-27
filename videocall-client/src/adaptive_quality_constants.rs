@@ -336,8 +336,18 @@ pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
 pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 3;
 
 /// RTT degradation multiplier to trigger connection re-election.
-/// If current RTT > election_rtt * this multiplier, re-elect.
-pub const REELECTION_RTT_MULTIPLIER: f64 = 2.0;
+/// If current RTT > max(election_rtt * this multiplier, REELECTION_RTT_MIN_THRESHOLD_MS),
+/// re-elect.
+pub const REELECTION_RTT_MULTIPLIER: f64 = 3.0;
+
+/// Minimum absolute RTT degradation threshold (milliseconds).
+///
+/// On localhost or very fast networks the baseline RTT can be sub-millisecond
+/// (e.g. 0.5ms), making a pure multiplier-based threshold trigger on normal
+/// jitter (2-3ms). This floor guarantees that the threshold is never lower
+/// than this value, regardless of the baseline. The effective threshold is:
+///   `max(baseline * REELECTION_RTT_MULTIPLIER, REELECTION_RTT_MIN_THRESHOLD_MS)`
+pub const REELECTION_RTT_MIN_THRESHOLD_MS: f64 = 50.0;
 
 /// Number of consecutive degraded RTT samples before triggering re-election.
 pub const REELECTION_CONSECUTIVE_SAMPLES: u32 = 5;

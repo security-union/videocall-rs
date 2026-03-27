@@ -279,7 +279,13 @@ pub fn process_binary(bytes: &Uint8Array, callback: &Callback<Vec<u8>>) {
 }
 
 impl WebTransportTask {
-    /// Sends data to a WebTransport connection.
+    /// Sends data to a WebTransport connection via datagram.
+    ///
+    /// Datagrams are unreliable and expendable by design (heartbeats, RTT probes,
+    /// diagnostics). If the writable side is already locked by a concurrent write,
+    /// the packet is silently dropped instead of killing the entire transport
+    /// connection. Only fatal errors (transport closed, write failure after
+    /// acquiring the lock) close the transport.
     pub fn send_datagram(transport: Rc<WebTransport>, data: Vec<u8>) {
         wasm_bindgen_futures::spawn_local(async move {
             let transport = transport.clone();
@@ -289,7 +295,10 @@ impl WebTransportTask {
                     let stream = transport.datagrams();
                     let stream: WritableStream = stream.writable();
                     if stream.locked() {
-                        return Err(anyhow::anyhow!("Stream is locked"));
+                        // Another datagram write is in progress. Datagrams are
+                        // expendable -- just drop this one silently. Do NOT close
+                        // the transport; the in-flight write will release the lock.
+                        return Err(anyhow::anyhow!("Datagram stream locked, dropping packet"));
                     }
                     let writer = stream.get_writer().map_err(|e| anyhow!("{:?}", e))?;
                     let data = Uint8Array::from(data.as_slice());
@@ -305,9 +314,16 @@ impl WebTransportTask {
             }
             .await;
             if let Err(e) = result {
-                let e = e.to_string();
-                log!("error: ", e);
-                transport.close();
+                let e_str = e.to_string();
+                if e_str.contains("locked") {
+                    // Stream was locked by a concurrent write -- not fatal.
+                    // The packet is expendable; just log at debug level.
+                    log!("datagram dropped (stream busy)");
+                } else {
+                    // Fatal transport error -- close the connection.
+                    log!("error: ", e_str);
+                    transport.close();
+                }
             }
         });
     }

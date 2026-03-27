@@ -1002,6 +1002,22 @@ impl ConnectionManager {
             );
 
             if self.degradation_counter >= REELECTION_CONSECUTIVE_SAMPLES {
+                // If there is only one server configured, re-electing would connect
+                // to the same server, causing a needless session reset (new peer,
+                // lost keyframe state, video freeze). Instead, adapt the baseline
+                // to the current RTT so the detector adjusts to the new normal.
+                if self.total_server_count() <= 1 {
+                    info!(
+                        "RTT degradation threshold reached but only {} server configured \
+                         — skipping re-election and rebasing RTT to {:.1}ms",
+                        self.total_server_count(),
+                        current_rtt,
+                    );
+                    self.degradation_counter = 0;
+                    self.baseline_rtt = Some(current_rtt);
+                    return false;
+                }
+
                 info!(
                     "RTT degradation threshold reached ({} consecutive samples) — triggering re-election",
                     REELECTION_CONSECUTIVE_SAMPLES
@@ -1085,6 +1101,11 @@ impl ConnectionManager {
     #[allow(dead_code)]
     pub fn is_reelection_in_progress(&self) -> bool {
         self.reelection_in_progress
+    }
+
+    /// Returns the total number of configured servers (WebSocket + WebTransport).
+    fn total_server_count(&self) -> usize {
+        self.options.websocket_urls.len() + self.options.webtransport_urls.len()
     }
 
     /// Start 1Hz diagnostics reporting
@@ -1799,6 +1820,8 @@ mod tests {
     #[test]
     fn rtt_degradation_triggers_reelection_after_consecutive_threshold() {
         let mut mgr = make_test_manager();
+        // Need 2+ servers so the single-server guard does not suppress re-election.
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
         let baseline = 50.0;
         mgr.baseline_rtt = Some(baseline);
         *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
@@ -1839,6 +1862,8 @@ mod tests {
     #[test]
     fn rtt_degradation_intermittent_resets_counter() {
         let mut mgr = make_test_manager();
+        // Need 2+ servers so the single-server guard does not suppress re-election.
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
         let baseline = 50.0;
         mgr.baseline_rtt = Some(baseline);
         *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
@@ -1862,6 +1887,99 @@ mod tests {
             assert!(!mgr.check_rtt_degradation());
         }
         assert!(mgr.check_rtt_degradation());
+    }
+
+    // ===================================================================
+    // 3b. Single-server re-election suppression
+    // ===================================================================
+
+    #[test]
+    fn rtt_degradation_skips_reelection_with_single_server() {
+        let mut mgr = make_test_manager();
+        // Exactly one server configured — re-election would reconnect to the same host.
+        mgr.options.webtransport_urls = vec!["https://only-server".into()];
+        let baseline = 50.0;
+        mgr.baseline_rtt = Some(baseline);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+
+        let degraded_rtt = 200.0;
+        insert_measurement(
+            &mut mgr,
+            "wt_0",
+            true,
+            Some(degraded_rtt),
+            vec![degraded_rtt],
+        );
+
+        // Reach the threshold — should NOT trigger re-election with 1 server.
+        for _ in 0..REELECTION_CONSECUTIVE_SAMPLES {
+            assert!(!mgr.check_rtt_degradation());
+        }
+
+        // Counter was reset and baseline was rebased to the degraded RTT.
+        assert_eq!(mgr.degradation_counter, 0);
+        assert!((mgr.baseline_rtt.unwrap() - degraded_rtt).abs() < 0.01);
+    }
+
+    #[test]
+    fn rtt_degradation_skips_reelection_with_zero_servers() {
+        // make_test_manager creates 0 servers — also counts as single-server case.
+        let mut mgr = make_test_manager();
+        let baseline = 50.0;
+        mgr.baseline_rtt = Some(baseline);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0]);
+
+        for _ in 0..REELECTION_CONSECUTIVE_SAMPLES {
+            assert!(!mgr.check_rtt_degradation());
+        }
+        assert_eq!(mgr.degradation_counter, 0);
+        assert!((mgr.baseline_rtt.unwrap() - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn rtt_degradation_still_triggers_with_multiple_servers() {
+        let mut mgr = make_test_manager();
+        // Two servers — re-election should still happen normally.
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec!["https://b".into()];
+        let baseline = 50.0;
+        mgr.baseline_rtt = Some(baseline);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0]);
+
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
+            assert!(!mgr.check_rtt_degradation());
+        }
+        // With 2 servers, re-election IS triggered.
+        assert!(mgr.check_rtt_degradation());
+    }
+
+    #[test]
+    fn single_server_rebase_adapts_to_new_normal() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://only-server".into()];
+        mgr.baseline_rtt = Some(3.0); // Typical localhost baseline
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+
+        // First degradation cycle: RTT rises to 8ms (> 2x 3ms baseline = 6ms threshold)
+        insert_measurement(&mut mgr, "wt_0", true, Some(8.0), vec![8.0]);
+
+        for _ in 0..REELECTION_CONSECUTIVE_SAMPLES {
+            assert!(!mgr.check_rtt_degradation());
+        }
+
+        // Baseline rebased to 8ms, counter reset.
+        assert_eq!(mgr.degradation_counter, 0);
+        assert!((mgr.baseline_rtt.unwrap() - 8.0).abs() < 0.01);
+
+        // After rebase, 8ms is the new normal. 10ms (< 2x 8ms = 16ms) should not
+        // even increment the counter.
+        mgr.rtt_measurements.get_mut("wt_0").unwrap().average_rtt = Some(10.0);
+        assert!(!mgr.check_rtt_degradation());
+        assert_eq!(mgr.degradation_counter, 0);
     }
 
     // ===================================================================

@@ -35,12 +35,12 @@
           extensions = [ "rust-src" "rust-analyzer" ];
         };
 
-        # yew-ui: pinned stable (needs >= 1.85 for edition 2024 deps)
-        yewRustMinimal = pkgs.rust-bin.stable."1.93.1".minimal.override {
+        # frontend: pinned stable (needs >= 1.85 for edition 2024 deps)
+        frontendRustMinimal = pkgs.rust-bin.stable."1.93.1".minimal.override {
           targets = [ "wasm32-unknown-unknown" ];
         };
 
-        yewRustDev = pkgs.rust-bin.stable."1.93.1".default.override {
+        frontendRustDev = pkgs.rust-bin.stable."1.93.1".default.override {
           targets = [ "wasm32-unknown-unknown" ];
           extensions = [ "rust-src" "rust-analyzer" ];
         };
@@ -58,7 +58,7 @@
           pkgs.nodejs_20
         ] ++ coreInputs;
 
-        yewBuildInputs = [
+        frontendBuildInputs = [
           pkgs.trunk
           pkgs.wasm-bindgen-cli_0_2_108
           pkgs.tailwindcss
@@ -71,7 +71,7 @@
 
         # trunk 0.21.x reads NO_COLOR but chokes on the value "1" that
         # mkShell injects; fully unsetting it avoids the clash.
-        yewHook = ''
+        frontendHook = ''
           unset NO_COLOR
         '';
 
@@ -108,14 +108,14 @@
           nativeBuildInputs = [ leptosRustDev ] ++ leptosBuildInputs;
         });
 
-        devShells.yew-ui = pkgs.mkShell {
-          nativeBuildInputs = [ yewRustMinimal ] ++ yewBuildInputs;
-          shellHook = yewHook;
+        devShells.frontend = pkgs.mkShell {
+          nativeBuildInputs = [ frontendRustMinimal ] ++ frontendBuildInputs;
+          shellHook = frontendHook;
         };
 
-        devShells.yew-ui-dev = pkgs.mkShell {
-          nativeBuildInputs = [ yewRustDev ] ++ yewBuildInputs;
-          shellHook = yewHook;
+        devShells.frontend-dev = pkgs.mkShell {
+          nativeBuildInputs = [ frontendRustDev ] ++ frontendBuildInputs;
+          shellHook = frontendHook;
         };
 
         devShells.backend = pkgs.mkShell (backendEnv // {
@@ -126,7 +126,7 @@
           nativeBuildInputs = [ backendRustDev pkgs.cargo-watch pkgs.cargo-machete ] ++ backendBuildInputs;
         });
 
-        devShells.default = self.devShells.${system}.yew-ui-dev;
+        devShells.default = self.devShells.${system}.frontend-dev;
       }
     );
 }

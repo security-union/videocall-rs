@@ -11,12 +11,10 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       # UI image dependencies
-      - 'yew-ui/**'
       - 'dioxus-ui/**'
       - 'videocall-client/**'
       - 'videocall-codecs/**'
       - 'neteq/**'
-      - 'Dockerfile.yew'
       - 'Dockerfile.dioxus'
       - 'nginx.conf'
       - 'flake.nix'
@@ -27,8 +25,7 @@ on:
       - 'Dockerfile.meeting-api'
       # Docker directory changes
       - 'docker/Dockerfile.actix.dev'
-      - 'docker/Dockerfile.yew.dev'
-      - 'docker/start-yew.sh'
+      - 'docker/Dockerfile.dioxus.dev'
       # Website image dependencies
       - 'leptos-website/**'
       - 'docker/Dockerfile.website'
@@ -80,29 +77,6 @@ jobs:
             GIT_BRANCH=${{ github.head_ref }}
             BUILD_TIMESTAMP=${{ github.event.pull_request.updated_at }}
 
-  build-ui:
-    name: Build UI Docker image
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out the repo
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build UI Docker image (no push)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.yew
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            GIT_SHA=${{ github.event.pull_request.head.sha }}
-            GIT_BRANCH=${{ github.head_ref }}
-            BUILD_TIMESTAMP=${{ github.event.pull_request.updated_at }}
-
   build-dioxus-ui:
     name: Build Dioxus UI Docker image
     runs-on: ubuntu-latest
@@ -140,4 +114,3 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
-

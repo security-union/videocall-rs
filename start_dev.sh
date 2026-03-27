@@ -47,9 +47,9 @@ cargo watch -x "run --bin $server_command" &
 ACTIX_PROC=$!
 popd > /dev/null || exit
 
-pushd yew-ui > /dev/null || exit
+pushd dioxus-ui > /dev/null || exit
 trunk serve &
 popd > /dev/null || exit
 
 wait $ACTIX_PROC
-echo "Done running actix and yew, bye"
+echo "Done running actix and dioxus, bye"

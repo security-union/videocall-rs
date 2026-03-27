@@ -11,6 +11,6 @@ COPY flake.nix flake.lock ./
 RUN git init && git add flake.nix flake.lock
 
 # Pre-download all tools from the Nix binary cache.
-RUN nix develop .#yew-ui --command true
+RUN nix develop .#frontend --command true
 
 WORKDIR /app/dioxus-ui

@@ -38,8 +38,8 @@ An open-source, ultra-low-latency video conferencing platform and API built with
   - [Nix Build System (WIP)](#nix-build-system-wip)
   - [Manual Setup](#manual-setup)
 - [Runtime Configuration](#runtime-configuration-frontend-configjs)
-  - [Local (no Docker)](#local-no-docker-create-yew-uiscriptsconfigjs)
-  - [Local/Docker](#localdocker-start-yewsh)
+  - [Local (no Docker)](#local-no-docker-create-dioxus-uiscriptsconfigjs)
+  - [Local/Docker](#localdocker-start-dioxussh)
   - [Kubernetes/Helm](#kuberneteshelm-configmap-configjsyaml)
 - [Usage](#usage)
 - [Meeting Management](#meeting-management)
@@ -47,7 +47,7 @@ An open-source, ultra-low-latency video conferencing platform and API built with
 - [Security](#security)
 - [Feature Flags](#feature-flags)
 - [Testing](#testing)
-  - [UI Testing (yew-ui)](#ui-testing-yew-ui)
+  - [UI Testing (dioxus-ui)](#ui-testing-dioxus-ui)
   - [Backend Testing (actix-api)](#backend-testing-actix-api)
   - [E2E Testing (Playwright)](#e2e-testing-playwright)
 - [Roadmap](#roadmap)
@@ -126,7 +126,7 @@ graph TD
 ```
 
 1. **actix-api:** Rust-based backend server using Actix Web framework
-2. **yew-ui:** Web frontend built with the Yew framework and compiled to WebAssembly
+2. **dioxus-ui:** Web frontend built with the Dioxus framework and compiled to WebAssembly
 3. **videocall-types:** Shared data types and protocol definitions
 4. **videocall-client:** Client library for native integration
 5. **videocall-cli:** Command-line interface for headless video streaming
@@ -176,7 +176,7 @@ The quickest way to get started is with our Docker-based setup:
    ```
    make up
    ```
-   The first run compiles Rust/WASM inside the containers — this takes several minutes. Watch the `yew-ui` logs; it's ready when Trunk prints `server listening on http://0.0.0.0:<port>`.
+   The first run compiles Rust/WASM inside the containers — this takes several minutes. Watch the `dioxus-ui` logs; it's ready when Trunk prints `server listening on http://0.0.0.0:<port>`.
 
 4. Access the application at:
    ```
@@ -186,11 +186,11 @@ The quickest way to get started is with our Docker-based setup:
 
 **Platform notes:**
 
-- **Rancher Desktop (Windows/WSL2) with Traefik Ingress on port 80:** Rancher Desktop runs Traefik on port 80 by default, which conflicts with the yew-ui frontend. Override the port in your local `.env` (not `.env-sample`):
+- **Rancher Desktop (Windows/WSL2) with Traefik Ingress on port 3001:** Rancher Desktop runs Traefik which may conflict with the dioxus-ui frontend. Override the port in your local `.env` (not `.env-sample`):
   ```
-  TRUNK_SERVE_PORT=8088
+  DIOXUS_SERVE_PORT=8088
   AFTER_LOGIN_URL=http://localhost:8088
-  ALLOWED_REDIRECT_URLS=http://localhost:8088,http://localhost:3001
+  ALLOWED_REDIRECT_URLS=http://localhost:8088
   ```
   Then access the app at `http://localhost:8088`.
 - **Shell environment variables:** If you have `API_BASE_URL`, `OAUTH_REDIRECT_URL`, or similar variables exported in your shell profile (`~/.bashrc`, `~/.zshrc`), they will override `.env` values. Remove them from your profile before running `make up`.
@@ -213,7 +213,7 @@ We are migrating the build infrastructure to [Nix](https://nixos.org/) for repro
 
 The integration is transparent to the user, and the development experience is the same as with Docker.
 
-**What's next:** Nixifying additional components (actix-api, yew-ui) and evaluating [crane](https://github.com/ipetkov/crane) for full Nix-managed Rust dependency caching.
+**What's next:** Nixifying additional components (actix-api, dioxus-ui) and evaluating [crane](https://github.com/ipetkov/crane) for full Nix-managed Rust dependency caching.
 
 ### Manual Setup (Experimental)
 
@@ -250,16 +250,16 @@ For detailed configuration options, see our [setup documentation](https://docs.v
 
 ## Runtime Configuration (Frontend config.js)
 
-The Yew UI is configured at runtime via a `window.__APP_CONFIG` object provided by a `config.js` file. The file is copied by Trunk and loaded at `/config.js` by `yew-ui/index.html`.
+The frontend is configured at runtime via a `window.__APP_CONFIG` object provided by a `config.js` file. The file is copied by Trunk and loaded at `/config.js` by `dioxus-ui/index.html`.
 
-### Local (no Docker): create yew-ui/scripts/config.js
+### Local (no Docker): create dioxus-ui/scripts/config.js
 
 - Start services with `./start_dev.sh`.
-- Create `yew-ui/scripts/config.js` that assigns `window.__APP_CONFIG = Object.freeze({...})`.
+- Create `dioxus-ui/scripts/config.js` that assigns `window.__APP_CONFIG = Object.freeze({...})`.
 - Keep the keys in sync with the authoritative sources below. Trunk will copy the file and the app will pick it up on refresh.
-- Tip: `mkdir -p yew-ui/scripts` to ensure the directory exists.
+- Tip: `mkdir -p dioxus-ui/scripts` to ensure the directory exists.
 
-Authoritative keys and defaults: see `docker/start-yew.sh` and the Helm template referenced below.
+Authoritative keys and defaults: see `docker/start-dioxus.sh` and the Helm template referenced below.
 
 ### Voice Activity Detection (VAD) Threshold
 
@@ -279,15 +279,15 @@ window.__APP_CONFIG = Object.freeze({
 | `0.05` | Low — only triggers on louder speech | Noisy environments, reduces false positives |
 | `0.10` | Very low — requires loud/close speech | Very noisy environments |
 
-The threshold can also be set via the `VAD_THRESHOLD` environment variable when running in Docker (see `docker/start-yew.sh` and `docker/start-dioxus.sh`), or via `runtimeConfig.vadThreshold` in Helm values.
+The threshold can also be set via the `VAD_THRESHOLD` environment variable when running in Docker (see `docker/start-dioxus.sh`), or via `runtimeConfig.vadThreshold` in Helm values.
 
-### Local/Docker: start-yew.sh
+### Local/Docker: start-dioxus.sh
 
-`docker/start-yew.sh` generates `/app/yew-ui/scripts/config.js` from environment variables at container startup. For the current list of supported variables and defaults, refer directly to `docker/start-yew.sh`. Restart the container to apply changes.
+`docker/start-dioxus.sh` generates `/app/dioxus-ui/scripts/config.js` from environment variables at container startup. For the current list of supported variables and defaults, refer directly to `docker/start-dioxus.sh`. Restart the container to apply changes.
 
 ### Kubernetes/Helm: configmap-configjs.yaml
 
-`helm/rustlemania-ui/templates/configmap-configjs.yaml` renders `config.js` from `.Values.runtimeConfig`. Define `runtimeConfig` in your values file and deploy/upgrade. For the exact structure and latest behavior, refer to the template itself.
+`helm/videocall-ui/templates/configmap-configjs.yaml` renders `config.js` from `.Values.runtimeConfig`. Define `runtimeConfig` in your values file and deploy/upgrade. For the exact structure and latest behavior, refer to the template itself.
 
  
 
@@ -434,32 +434,27 @@ Any other value (or unset variable) is treated as `false`.
 
 ## Testing
 
-### UI Testing (yew-ui)
+### UI Testing (dioxus-ui)
 
-The Yew frontend uses a three-layer testing pyramid, all running in a real
+The Dioxus frontend uses a three-layer testing pyramid, all running in a real
 browser via `wasm-bindgen-test`:
 
 | Layer | What it covers | Example |
 |-------|---------------|---------|
 | **Unit** | `MediaDeviceList` logic — hot-plug, fallback, device switching | `videocall-client/src/media_devices/media_device_list.rs` |
-| **Component** | Isolated Yew components with mock `MediaDeviceInfo` objects | `yew-ui/tests/device_selector.rs`, `yew-ui/tests/video_control_buttons.rs` |
-| **Integration** | Real Chrome fake devices → component rendering end-to-end | `yew-ui/tests/device_integration.rs` |
+| **Component** | Isolated Dioxus components with mock `MediaDeviceInfo` objects | `dioxus-ui/tests/device_selector.rs`, `dioxus-ui/tests/video_control_buttons.rs` |
+| **Integration** | Real Chrome fake devices → component rendering end-to-end | `dioxus-ui/tests/device_integration.rs` |
 
 ```bash
 # Run UI component tests natively (requires Chrome + chromedriver)
-make yew-tests
-
-# Run in headed mode to watch the browser
-make yew-tests HEADED=1
-
-# Run UI component tests in Docker (no local deps needed)
-make yew-tests-docker
+cd dioxus-ui
+CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown
 ```
 
 CI runs these tests automatically via `.github/workflows/wasm-test.yaml`.
 For the full testing guide — including how to write new tests, the test harness
 API, and the mock device vs real fake device strategy — see
-**[yew-ui/TESTING.md](yew-ui/TESTING.md)**.
+**[dioxus-ui/README.md](dioxus-ui/README.md#testing)**.
 
 ### Backend Testing (actix-api)
 
@@ -501,9 +496,8 @@ and how to write new tests — see **[actix-api/TESTING.md](actix-api/TESTING.md
 ### E2E Testing (Playwright)
 
 Full browser-based end-to-end tests using [Playwright](https://playwright.dev/).
-Tests run against both the **Dioxus UI** and **Yew UI** simultaneously, verifying
-meeting flows with real browsers. Authentication is bypassed via JWT cookie
-injection — no OAuth setup needed.
+Tests run against the **Dioxus UI**, verifying meeting flows with real browsers.
+Authentication is bypassed via JWT cookie injection — no OAuth setup needed.
 
 The E2E stack is defined in `docker/docker-compose.e2e.yaml` and uses the same
 Nix-based dev Dockerfiles as CI. Tests run automatically on pushes to `main` and
@@ -540,7 +534,7 @@ See our [Contributing Guidelines](CONTRIBUTING.md) for more detailed information
 ### Technology Stack
 
 - **Backend**: Rust + Actix Web + PostgreSQL + NATS
-- **Frontend**: Rust + Yew + WebAssembly + Tailwind CSS
+- **Frontend**: Rust + Dioxus + WebAssembly + Tailwind CSS
 - **Transport**: WebTransport (QUIC/HTTP3) + WebSockets (fallback)
 - **Build System**: Cargo + Trunk + Nix (WIP) + Docker + Helm
 - **Testing**: `cargo test` + `wasm-bindgen-test` (browser-based UI tests) + Docker Compose (backend integration)

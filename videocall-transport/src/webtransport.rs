@@ -55,6 +55,10 @@ pub enum WebTransportError {
 }
 
 /// A handle to control the WebTransport connection.
+///
+/// When dropped, the underlying `WebTransport` is closed, which causes all
+/// reader loops (datagrams, unidirectional, bidirectional) to terminate because
+/// their `reader.read()` futures resolve with errors on a closed transport.
 #[must_use = "the connection will be closed when the task is dropped"]
 pub struct WebTransportTask {
     pub transport: Rc<WebTransport>,
@@ -62,6 +66,14 @@ pub struct WebTransportTask {
     notification: Callback<WebTransportStatus>,
     #[allow(dead_code)]
     listeners: [Promise; 2],
+    /// Stored so the closures live as long as the task and are properly dropped
+    /// instead of being leaked via `forget()`. The closed closure is wrapped in
+    /// `Rc` because it is shared across multiple promise chains (`ready.catch`,
+    /// `closed.then`, `closed.catch`).
+    #[allow(dead_code)]
+    opened_closure: Closure<dyn FnMut(JsValue)>,
+    #[allow(dead_code)]
+    closed_closure: Rc<Closure<dyn FnMut(JsValue)>>,
 }
 
 impl WebTransportTask {
@@ -69,12 +81,27 @@ impl WebTransportTask {
         transport: Rc<WebTransport>,
         notification: Callback<WebTransportStatus>,
         listeners: [Promise; 2],
+        opened_closure: Closure<dyn FnMut(JsValue)>,
+        closed_closure: Rc<Closure<dyn FnMut(JsValue)>>,
     ) -> WebTransportTask {
         WebTransportTask {
             transport,
             notification,
             listeners,
+            opened_closure,
+            closed_closure,
         }
+    }
+}
+
+impl Drop for WebTransportTask {
+    fn drop(&mut self) {
+        // Close the underlying WebTransport session. This causes the reader
+        // loops (datagrams, unidirectional streams, bidirectional streams) to
+        // break out of their `reader.read()` await — the futures resolve with
+        // errors on a closed transport, allowing the spawn_local tasks and
+        // their captured Rc<WebTransport> clones to be cleaned up.
+        self.transport.close();
     }
 }
 
@@ -98,7 +125,8 @@ impl WebTransportService {
         on_bidirectional_stream: Callback<WebTransportBidirectionalStream>,
         notification: Callback<WebTransportStatus>,
     ) -> Result<WebTransportTask, WebTransportError> {
-        let ConnectCommon(transport, listeners) = Self::connect_common(url, &notification)?;
+        let ConnectCommon(transport, listeners, opened_closure, closed_closure) =
+            Self::connect_common(url, &notification)?;
         let transport = Rc::new(transport);
 
         Self::start_listening_incoming_datagrams(
@@ -118,7 +146,13 @@ impl WebTransportService {
             on_bidirectional_stream,
         );
 
-        Ok(WebTransportTask::new(transport, notification, listeners))
+        Ok(WebTransportTask::new(
+            transport,
+            notification,
+            listeners,
+            opened_closure,
+            closed_closure,
+        ))
     }
 
     fn start_listening_incoming_unidirectional_streams(
@@ -247,13 +281,19 @@ impl WebTransportService {
 
         let notify = notification.clone();
 
-        let opened_closure = Closure::wrap(Box::new(move |_| {
+        // Both closures are stored in the WebTransportTask struct so they are
+        // dropped when the task is dropped, instead of being leaked via
+        // `forget()`. Previously, every reconnection/re-election cycle would
+        // permanently leak two closures into WASM linear memory.
+        let opened_closure = Closure::wrap(Box::new(move |_: JsValue| {
             notify.emit(WebTransportStatus::Opened);
         }) as Box<dyn FnMut(JsValue)>);
         let notify = notification.clone();
-        let closed_closure = Closure::wrap(Box::new(move |e: JsValue| {
+        // `closed_closure` is shared via `Rc` because it is referenced by
+        // multiple promise chains (`ready.catch`, `closed.then`, `closed.catch`).
+        let closed_closure = Rc::new(Closure::wrap(Box::new(move |e: JsValue| {
             notify.emit(WebTransportStatus::Closed(e));
-        }) as Box<dyn FnMut(JsValue)>);
+        }) as Box<dyn FnMut(JsValue)>));
         let ready = transport
             .ready()
             .then(&opened_closure)
@@ -262,16 +302,24 @@ impl WebTransportService {
             .closed()
             .then(&closed_closure)
             .catch(&closed_closure);
-        opened_closure.forget();
-        closed_closure.forget();
 
         {
             let listeners = [ready, closed];
-            Ok(ConnectCommon(transport, listeners))
+            Ok(ConnectCommon(
+                transport,
+                listeners,
+                opened_closure,
+                closed_closure,
+            ))
         }
     }
 }
-struct ConnectCommon(WebTransport, [Promise; 2]);
+struct ConnectCommon(
+    WebTransport,
+    [Promise; 2],
+    Closure<dyn FnMut(JsValue)>,
+    Rc<Closure<dyn FnMut(JsValue)>>,
+);
 
 pub fn process_binary(bytes: &Uint8Array, callback: &Callback<Vec<u8>>) {
     let data = bytes.to_vec();

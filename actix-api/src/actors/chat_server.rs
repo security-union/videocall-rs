@@ -257,6 +257,7 @@ impl Handler<Disconnect> for ChatServer {
             .unwrap_or(false);
         let _ = self.sessions.remove(&session);
         let _ = self.connection_states.remove(&session);
+        let _ = self.suppress_join_broadcast.remove(&session);
 
         // Observers and non-active sessions bypass the grace period — they
         // never triggered PARTICIPANT_JOINED, so there is nothing to defer.
@@ -379,7 +380,11 @@ impl Handler<ActivateConnection> for ChatServer {
         // as the elected/active one. During JoinRoom, the broadcast was deferred
         // to avoid ghost join events from Testing connections (e.g., the losing
         // connection during RTT election).
-        if was_testing {
+        //
+        // Skip the broadcast for sessions marked in suppress_join_broadcast
+        // (reconnection sessions and observer sessions).
+        let suppressed = self.suppress_join_broadcast.remove(&session);
+        if was_testing && !suppressed {
             // Look up the session's room, user_id, and display_name from room_members.
             let mut found: Option<(String, String, String)> = None;
             for (room_id, members) in &self.room_members {
@@ -1571,10 +1576,12 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: Non-observer JoinRoom DOES publish PARTICIPANT_JOINED
+    // TEST: Non-observer JoinRoom + ActivateConnection publishes PARTICIPANT_JOINED
     // ==========================================================================
-    // When a real participant joins a room, the server should publish a
-    // PARTICIPANT_JOINED event to NATS so other peers are notified.
+    // When a real participant joins a room and their connection is activated,
+    // the server should publish a PARTICIPANT_JOINED event to NATS so other
+    // peers are notified. The broadcast is deferred from JoinRoom to
+    // ActivateConnection to avoid ghost join events during RTT election.
     #[actix_rt::test]
     #[serial]
     async fn test_non_observer_join_publishes_participant_joined() {
@@ -1639,7 +1646,7 @@ mod tests {
             .await
             .expect("Connect should succeed");
 
-        // Join as non-observer - SHOULD publish PARTICIPANT_JOINED
+        // Join as non-observer
         let result = chat_server
             .send(JoinRoom {
                 session: session_id,
@@ -1653,12 +1660,218 @@ mod tests {
 
         assert!(result.is_ok(), "Non-observer JoinRoom should succeed");
 
-        // Wait for the spawned async task to publish PARTICIPANT_JOINED
+        // Activate the connection — this triggers the deferred PARTICIPANT_JOINED
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Wait for the async task to publish PARTICIPANT_JOINED
         sleep(Duration::from_millis(1000)).await;
 
         assert!(
             participant_joined_received.load(Ordering::Relaxed),
-            "Non-observer join SHOULD publish PARTICIPANT_JOINED to NATS"
+            "Non-observer join + activate SHOULD publish PARTICIPANT_JOINED to NATS"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: JoinRoom without ActivateConnection does NOT publish PARTICIPANT_JOINED
+    // ==========================================================================
+    // When a connection joins but is never activated (e.g., the losing connection
+    // during RTT election), PARTICIPANT_JOINED should NOT be broadcast.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_without_activate_does_not_publish_participant_joined() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 3001u64;
+        let room = "test-room-no-activate";
+
+        // Subscribe to the system subject for this room BEFORE join
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let participant_joined_received = Arc::new(AtomicBool::new(false));
+        let flag = participant_joined_received.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        tokio::spawn(async move {
+            use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+            use videocall_types::protos::meeting_packet::MeetingPacket;
+
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(1500), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Register session
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Join as non-observer but do NOT activate
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "testing-user@example.com".to_string(),
+                display_name: "testing-user@example.com".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(result.is_ok(), "JoinRoom should succeed");
+
+        // Wait — no ActivateConnection sent
+        sleep(Duration::from_millis(1500)).await;
+
+        assert!(
+            !participant_joined_received.load(Ordering::Relaxed),
+            "JoinRoom without ActivateConnection should NOT publish PARTICIPANT_JOINED"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: Testing session disconnect does NOT publish PARTICIPANT_LEFT
+    // ==========================================================================
+    // When a Testing session disconnects (e.g., the losing connection during
+    // RTT election), PARTICIPANT_LEFT should NOT be broadcast because
+    // PARTICIPANT_JOINED was never broadcast for it.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_testing_session_disconnect_does_not_publish_participant_left() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 3002u64;
+        let room = "test-room-testing-dc";
+
+        // Register and join (Testing state, never activated)
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "testing-dc@example.com".to_string(),
+                display_name: "testing-dc@example.com".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+        assert!(result.is_ok(), "JoinRoom should succeed");
+
+        // Wait for session setup
+        sleep(Duration::from_millis(300)).await;
+
+        // Subscribe to system subject to watch for PARTICIPANT_LEFT
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let participant_left_received = Arc::new(AtomicBool::new(false));
+        let flag = participant_left_received.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        tokio::spawn(async move {
+            use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+            use videocall_types::protos::meeting_packet::MeetingPacket;
+
+            while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(6), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Disconnect while still in Testing state (never activated)
+        chat_server
+            .send(Disconnect {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "testing-dc@example.com".to_string(),
+                display_name: "testing-dc@example.com".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Wait for grace period to expire plus buffer
+        sleep(Duration::from_secs(4)).await;
+
+        assert!(
+            !participant_left_received.load(Ordering::Relaxed),
+            "Testing session disconnect should NOT publish PARTICIPANT_LEFT \
+             (was_active=false prevents ghost leave event)"
         );
     }
 

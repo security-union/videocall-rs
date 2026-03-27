@@ -37,8 +37,7 @@ declare -a CHARTS=(
     # Additional services deployed to US East cluster for consolidation
     "global/us-east/engineering-vlog"
     "global/us-east/matomo"
-    "global/us-east/rustlemania-ui"
-    "global/us-east/rustlemania-ui-staging" 
+    "global/us-east/videocall-ui"
     "global/us-east/videocall-website"
     # Monitoring infrastructure
     "global/us-east/prometheus"
@@ -61,7 +60,7 @@ declare -a CERTIFICATE_FILES=(
     # Additional certificates for consolidated services
     "global/us-east/engineering-vlog/certificate.yaml"
     "global/us-east/matomo/certificate.yaml"
-    "global/us-east/rustlemania-ui/certificate.yaml"
+    "global/us-east/videocall-ui/certificate.yaml"
     "global/us-east/videocall-website/certificate.yaml"
     "global/us-east/grafana/certificate.yaml"
 )
@@ -190,7 +189,7 @@ get_context_for_chart() {
             echo "${SINGAPORE_CONTEXT}"
             ;;
         # Additional services deployed to US East for consolidation
-        "global/us-east/engineering-vlog"|"global/us-east/matomo"|"global/us-east/rustlemania-ui"|"global/us-east/rustlemania-ui-staging"|"global/us-east/videocall-website"|"global/us-east/prometheus"|"global/us-east/grafana"|"global/us-east/metrics-api")
+        "global/us-east/engineering-vlog"|"global/us-east/matomo"|"global/us-east/videocall-ui"|"global/us-east/videocall-website"|"global/us-east/prometheus"|"global/us-east/grafana"|"global/us-east/metrics-api")
             echo "${US_EAST_CONTEXT}"
             ;;
         *)
@@ -226,11 +225,8 @@ get_release_name_for_chart() {
         "global/us-east/matomo")
             echo "matomo-us-east"
             ;;
-        "global/us-east/rustlemania-ui")
+        "global/us-east/videocall-ui")
             echo "videocall-ui-us-east"
-            ;;
-        "global/us-east/rustlemania-ui-staging")
-            echo "videocall-staging-ui-us-east"
             ;;
         "global/us-east/videocall-website")
             echo "videocall-website-us-east"
@@ -369,7 +365,7 @@ Options:
     --singapore-only         Deploy only to Singapore region (shortcut for --region singapore)
     --services SERVICES      Deploy only specific services (comma-separated)
                             Available: websocket, webtransport, ingress-nginx, engineering-vlog,
-                            matomo, rustlemania-ui, rustlemania-ui-staging, videocall-website,
+                            matomo, videocall-ui, videocall-website,
                             prometheus, grafana, metrics-api
     -h, --help              Show this help message
 
@@ -379,7 +375,7 @@ This script will:
 3. Update helm dependencies for selected charts
 4. Deploy SSL certificates for selected endpoints
 5. Deploy WebSocket and WebTransport services to selected regions
-6. Deploy consolidated services to US East (website, engineering blog, matomo, videocall-ui, videocall-staging-ui, videocall-website)
+6. Deploy consolidated services to US East (website, engineering blog, matomo, videocall-ui, videocall-website)
 7. Verify deployments and check certificate status
 
 Contexts used:
@@ -819,7 +815,6 @@ verify_deployments() {
             local blog_deployment=$(kubectl get deployment engineering-vlog-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local matomo_deployment=$(kubectl get deployment matomo-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local ui_deployment=$(kubectl get deployment videocall-ui-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-            local staging_deployment=$(kubectl get deployment videocall-staging-ui-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local videocall_website_deployment=$(kubectl get deployment videocall-website-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local prometheus_deployment=$(kubectl get deployment prometheus-us-east-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local grafana_deployment=$(kubectl get deployment grafana-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
@@ -828,7 +823,6 @@ verify_deployments() {
             log_info "    Engineering Blog: ${blog_deployment} replicas ready"
             log_info "    Matomo: ${matomo_deployment} replicas ready"
             log_info "    Videocall UI: ${ui_deployment} replicas ready"
-            log_info "    Videocall Staging UI: ${staging_deployment} replicas ready"
             log_info "    Videocall Website: ${videocall_website_deployment} replicas ready"
             log_info "    Prometheus: ${prometheus_deployment} replicas ready"
             log_info "    Grafana: ${grafana_deployment} replicas ready"
@@ -838,7 +832,6 @@ verify_deployments() {
             local blog_ingress=$(kubectl get ingress engineering-vlog-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local matomo_ingress=$(kubectl get ingress matomo-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local ui_ingress=$(kubectl get ingress videocall-ui-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
-            local staging_ingress=$(kubectl get ingress videocall-staging-ui-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local videocall_website_ingress=$(kubectl get ingress videocall-website-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local grafana_ingress=$(kubectl get ingress grafana-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             
@@ -848,7 +841,6 @@ verify_deployments() {
             log_info "    Engineering Blog: ${blog_ingress}"
             log_info "    Matomo: ${matomo_ingress}"
             log_info "    Videocall UI: ${ui_ingress}"
-            log_info "    Videocall Staging UI: ${staging_ingress}"
             log_info "    Videocall Website: ${videocall_website_ingress}"
             log_info "    Grafana: ${grafana_ingress}"
         fi

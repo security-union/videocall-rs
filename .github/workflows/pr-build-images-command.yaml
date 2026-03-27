@@ -88,7 +88,7 @@ jobs:
             Building 3 Docker images:
             - Media Server (WebSocket/WebTransport)
             - Meeting API (REST backend)
-            - Web UI (WASM frontend)
+            - Dioxus UI (WASM frontend)
 
             ⏱️ This typically takes 5-10 minutes. I will post another comment once the build is complete.
 
@@ -226,9 +226,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile.yew
+          file: Dockerfile.dioxus
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/videocall-web-ui:pr-${{ needs.check-permissions.outputs.pr_number }}
+          tags: ghcr.io/${{ github.repository_owner }}/videocall-dioxus-ui:pr-${{ needs.check-permissions.outputs.pr_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -269,13 +269,13 @@ jobs:
             Images pushed to GitHub Container Registry:
             - \`ghcr.io/${{ github.repository_owner }}/videocall-media-server:pr-${prNumber}\`
             - \`ghcr.io/${{ github.repository_owner }}/videocall-meeting-api:pr-${prNumber}\`
-            - \`ghcr.io/${{ github.repository_owner }}/videocall-web-ui:pr-${prNumber}\`
+            - \`ghcr.io/${{ github.repository_owner }}/videocall-dioxus-ui:pr-${prNumber}\`
 
             To pull locally:
             \`\`\`bash
             docker pull ghcr.io/${{ github.repository_owner }}/videocall-media-server:pr-${prNumber}
             docker pull ghcr.io/${{ github.repository_owner }}/videocall-meeting-api:pr-${prNumber}
-            docker pull ghcr.io/${{ github.repository_owner }}/videocall-web-ui:pr-${prNumber}
+            docker pull ghcr.io/${{ github.repository_owner }}/videocall-dioxus-ui:pr-${prNumber}
             \`\`\`
 
             Comment \`/deploy\` to create a preview environment (coming soon).`

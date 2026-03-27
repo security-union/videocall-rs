@@ -36,10 +36,10 @@ docker volume create docker_rustlemania-actix-web-cargo-registry-cache
 docker volume create docker_rustlemania-actix-web-cargo-git-cache
 docker volume create docker_rustlemania-actix-web-cargo-target-cache
 docker volume create docker_rustlemania-actix-web-target-cache
-docker volume create docker_rustlemania-yew-ui-cargo-registry-cache
-docker volume create docker_rustlemania-yew-ui-cargo-git-cache
-docker volume create docker_rustlemania-yew-ui-cargo-target-cache
-docker volume create docker_rustlemania-yew-ui-cache
+docker volume create docker_rustlemania-dioxus-ui-cargo-registry-cache
+docker volume create docker_rustlemania-dioxus-ui-cargo-git-cache
+docker volume create docker_rustlemania-dioxus-ui-cargo-target-cache
+docker volume create docker_rustlemania-dioxus-ui-cache
 docker volume create docker_rustlemania-actix-webtransport-cargo-registry-cache
 docker volume create docker_rustlemania-actix-webtransport-cargo-git-cache
 docker volume create docker_rustlemania-actix-webtransport-cargo-target-cache
@@ -69,10 +69,10 @@ make up
 In a separate terminal:
 
 ```bash
-docker compose -f docker/docker-compose.yaml logs -f yew-ui
+docker compose -f docker/docker-compose.yaml logs -f dioxus-ui
 ```
 
-Wait for: `Serving on http://0.0.0.0:80`
+Wait for: `Serving on http://0.0.0.0:3001`
 
 ### 6. Access the Application (not necessary, only for WebTransport mode)
 

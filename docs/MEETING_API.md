@@ -60,7 +60,7 @@ Pass the session JWT in the `Authorization` header:
 
 The session JWT is obtained after a successful OAuth login via `GET /login`. The OAuth callback issues the token, and all subsequent API calls must include it in the `Authorization: Bearer` header.
 
-> **Browser note**: The web UI (`yew-ui`) uses an `HttpOnly` session cookie that the browser sends automatically. This is an implementation detail of the browser client -- for API testing, CLI tools, mobile apps, and all documentation examples, always use the `Authorization: Bearer` header.
+> **Browser note**: The web UI (`dioxus-ui`) uses an `HttpOnly` session cookie that the browser sends automatically. This is an implementation detail of the browser client -- for API testing, CLI tools, mobile apps, and all documentation examples, always use the `Authorization: Bearer` header.
 
 ### Session JWT Claims
 
@@ -98,7 +98,7 @@ The following diagram shows the complete lifecycle of a room access token, inclu
 
 ```mermaid
 sequenceDiagram
-    participant UI as yew-ui
+    participant UI as dioxus-ui
     participant API as meeting-api :8081
     participant MS as media-server :8080
 

@@ -9,7 +9,6 @@ members = [
     "videocall-meeting-client",
     "videocall-client",
     "videocall-cli",
-    "yew-ui",
     "dioxus-ui",
     "videocall-sdk",
     "videocall-codecs",

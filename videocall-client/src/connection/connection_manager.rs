@@ -22,8 +22,10 @@ use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::adaptive_quality_constants::{
     ELECTION_MAX_EXTENSIONS, ELECTION_MIN_RTT_SAMPLES, RECONNECT_BACKOFF_MULTIPLIER,
-    RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_MS,
-    REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
+    RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_PHASE1_MS,
+    RECONNECT_MAX_DELAY_PHASE2_MS, RECONNECT_MAX_DELAY_PHASE3_MS, RECONNECT_PHASE1_MAX_ATTEMPTS,
+    RECONNECT_PHASE2_MAX_ATTEMPTS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MIN_THRESHOLD_MS,
+    REELECTION_RTT_MULTIPLIER,
 };
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
@@ -1035,12 +1037,8 @@ impl ConnectionManager {
                 return;
             }
 
-            // Exponential backoff for next attempt.
-            delay_ms = next_backoff_delay(
-                delay_ms,
-                RECONNECT_BACKOFF_MULTIPLIER,
-                RECONNECT_MAX_DELAY_MS,
-            );
+            // Exponential backoff for next attempt with progressive caps.
+            delay_ms = next_backoff_delay(delay_ms, RECONNECT_BACKOFF_MULTIPLIER, attempt);
         }
         // The loop only exits via `return`:
         //   (a) successful reconnection
@@ -1724,15 +1722,29 @@ impl ConnectionManager {
 // Pure helper functions extracted for testability
 // -----------------------------------------------------------------------
 
-/// Calculate the next backoff delay given the current delay and multiplier,
-/// capped at `max_delay_ms`, with decorrelated jitter to prevent thundering
-/// herd when many clients reconnect simultaneously.
+/// Calculate the next backoff delay given the current delay, multiplier, and
+/// attempt count, with progressive caps and decorrelated jitter to prevent
+/// thundering herd when many clients reconnect simultaneously.
+///
+/// Progressive caps increase with the attempt count to balance fast recovery
+/// for transient drops against server protection during extended outages:
+/// - Attempts 1-5:  cap at `RECONNECT_MAX_DELAY_PHASE1_MS` (2s)
+/// - Attempts 6-15: cap at `RECONNECT_MAX_DELAY_PHASE2_MS` (10s)
+/// - Attempts 16+:  cap at `RECONNECT_MAX_DELAY_PHASE3_MS` (30s)
 ///
 /// The jitter adds a random value in `[0, base_delay * 0.5)` on top of the
 /// exponential base, so the returned delay is in `[base, base * 1.5)` (before
 /// capping). This spreads retry storms across a wider time window while
 /// keeping the expected delay close to the deterministic exponential value.
-fn next_backoff_delay(current_delay_ms: u64, multiplier: f64, max_delay_ms: u64) -> u64 {
+fn next_backoff_delay(current_delay_ms: u64, multiplier: f64, attempt: u32) -> u64 {
+    let max_delay_ms = if attempt <= RECONNECT_PHASE1_MAX_ATTEMPTS {
+        RECONNECT_MAX_DELAY_PHASE1_MS
+    } else if attempt <= RECONNECT_PHASE2_MAX_ATTEMPTS {
+        RECONNECT_MAX_DELAY_PHASE2_MS
+    } else {
+        RECONNECT_MAX_DELAY_PHASE3_MS
+    };
+
     let base = (current_delay_ms as f64 * multiplier) as u64;
     // Decorrelated jitter: add random(0, base * 0.5).
     // js_sys::Math::random() returns a value in [0, 1).
@@ -1768,8 +1780,10 @@ mod tests {
     use super::*;
     use crate::adaptive_quality_constants::{
         RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
-        RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MIN_THRESHOLD_MS,
-        REELECTION_RTT_MULTIPLIER,
+        RECONNECT_MAX_DELAY_PHASE1_MS, RECONNECT_MAX_DELAY_PHASE2_MS,
+        RECONNECT_MAX_DELAY_PHASE3_MS, RECONNECT_PHASE1_MAX_ATTEMPTS,
+        RECONNECT_PHASE2_MAX_ATTEMPTS, REELECTION_CONSECUTIVE_SAMPLES,
+        REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
     };
 
     // -----------------------------------------------------------------------
@@ -1918,53 +1932,61 @@ mod tests {
     fn backoff_increases_exponentially() {
         let mut delay = RECONNECT_INITIAL_DELAY_MS;
 
-        // First call: base = 500*2 = 1000, jitter in [0, 500) -> delay in [1000, 1500)
-        delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_MAX_DELAY_MS);
+        // First call (attempt 1): base = 500*2 = 1000, jitter in [0, 500) -> delay in [1000, 1500)
+        delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, 1);
         assert!(
             delay >= 1000 && delay < 1500,
             "expected [1000, 1500), got {delay}"
         );
 
-        // Subsequent calls should be capped at RECONNECT_MAX_DELAY_MS
-        for _ in 0..4 {
-            delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_MAX_DELAY_MS);
+        // Subsequent calls within phase 1 should be capped at RECONNECT_MAX_DELAY_PHASE1_MS
+        for attempt in 2..=5 {
+            delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, attempt);
             assert!(
-                delay <= RECONNECT_MAX_DELAY_MS,
-                "delay {delay} exceeds max {}",
-                RECONNECT_MAX_DELAY_MS
+                delay <= RECONNECT_MAX_DELAY_PHASE1_MS,
+                "delay {delay} exceeds phase1 max {}",
+                RECONNECT_MAX_DELAY_PHASE1_MS
             );
         }
     }
 
     #[test]
     #[cfg(target_arch = "wasm32")]
-    fn backoff_is_capped_at_max_delay() {
-        // Starting from a large value: base + jitter would exceed max, so cap applies.
-        let delay = next_backoff_delay(20000, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_MAX_DELAY_MS);
-        assert_eq!(delay, RECONNECT_MAX_DELAY_MS);
+    fn backoff_is_capped_at_max_delay_per_phase() {
+        // Phase 1 (attempt 1): starting from a large value, cap at phase 1 max.
+        let delay = next_backoff_delay(20000, RECONNECT_BACKOFF_MULTIPLIER, 1);
+        assert_eq!(delay, RECONNECT_MAX_DELAY_PHASE1_MS);
+
+        // Phase 2 (attempt 10): cap at phase 2 max.
+        let delay = next_backoff_delay(20000, RECONNECT_BACKOFF_MULTIPLIER, 10);
+        assert_eq!(delay, RECONNECT_MAX_DELAY_PHASE2_MS);
+
+        // Phase 3 (attempt 20): cap at phase 3 max.
+        let delay = next_backoff_delay(20000, RECONNECT_BACKOFF_MULTIPLIER, 20);
+        assert_eq!(delay, RECONNECT_MAX_DELAY_PHASE3_MS);
     }
 
     #[test]
     #[cfg(target_arch = "wasm32")]
-    fn backoff_reaches_max_quickly() {
-        // With initial=500, mult=2.0, max=2000, the cap is reached by attempt 2.
+    fn backoff_reaches_phase1_max_quickly() {
+        // With initial=500, mult=2.0, phase1 cap=2000, the cap is reached by attempt 2.
         let mut delay = RECONNECT_INITIAL_DELAY_MS;
-        for _ in 0..3 {
-            delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_MAX_DELAY_MS);
+        for attempt in 1..=3 {
+            delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, attempt);
         }
-        assert_eq!(delay, RECONNECT_MAX_DELAY_MS);
+        assert_eq!(delay, RECONNECT_MAX_DELAY_PHASE1_MS);
     }
 
     #[test]
     #[cfg(target_arch = "wasm32")]
     fn backoff_with_multiplier_one_adds_jitter() {
-        // With multiplier 1.0 and current=1000: base=1000, jitter in [0, 500)
-        // -> delay in [1000, 1500)
-        let delay = next_backoff_delay(1000, 1.0, RECONNECT_MAX_DELAY_MS);
+        // With multiplier 1.0, attempt 1, and current=1000: base=1000, jitter in [0, 500)
+        // -> delay in [1000, 1500), capped at phase1 max (2000)
+        let delay = next_backoff_delay(1000, 1.0, 1);
         assert!(
-            delay >= 1000 && delay <= RECONNECT_MAX_DELAY_MS,
+            delay >= 1000 && delay <= RECONNECT_MAX_DELAY_PHASE1_MS,
             "expected [1000, {}], got {delay}",
-            RECONNECT_MAX_DELAY_MS
+            RECONNECT_MAX_DELAY_PHASE1_MS
         );
     }
 
@@ -2265,7 +2287,11 @@ mod tests {
         // indefinitely. The only hard stop is RECONNECT_CONSECUTIVE_ZERO_LIMIT
         // (consecutive auth/server rejections). Verify the constants reflect this.
         assert_eq!(RECONNECT_INITIAL_DELAY_MS, 500);
-        assert_eq!(RECONNECT_MAX_DELAY_MS, 2000);
+        assert_eq!(RECONNECT_MAX_DELAY_PHASE1_MS, 2000);
+        assert_eq!(RECONNECT_MAX_DELAY_PHASE2_MS, 10000);
+        assert_eq!(RECONNECT_MAX_DELAY_PHASE3_MS, 30000);
+        assert_eq!(RECONNECT_PHASE1_MAX_ATTEMPTS, 5);
+        assert_eq!(RECONNECT_PHASE2_MAX_ATTEMPTS, 15);
         assert_eq!(RECONNECT_BACKOFF_MULTIPLIER, 2.0);
         // fast-fail limit tolerates network transitions but still catches auth failures
         assert!(RECONNECT_CONSECUTIVE_ZERO_LIMIT <= 15);
@@ -2546,14 +2572,15 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     fn full_backoff_sequence_matches_expected() {
         // Simulate several iterations of the reconnection loop's backoff.
-        // The loop runs indefinitely, so we just verify the first N steps.
-        // With jitter, exact values are non-deterministic; verify ranges.
+        // The loop runs indefinitely, so we just verify the first N steps
+        // and progressive cap transitions. With jitter, exact values are
+        // non-deterministic; verify ranges.
         let mut delay = RECONNECT_INITIAL_DELAY_MS;
         let mut sequence = vec![];
 
-        for _ in 0..8 {
+        for attempt in 0..20 {
             sequence.push(delay);
-            delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_MAX_DELAY_MS);
+            delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, attempt + 1);
         }
 
         // First entry is the initial delay (no backoff applied yet).
@@ -2564,14 +2591,34 @@ mod tests {
             "expected [1000, 1500), got {}",
             sequence[1]
         );
-        // All subsequent entries are capped at RECONNECT_MAX_DELAY_MS.
-        for (i, d) in sequence[2..].iter().enumerate() {
+        // Phase 1 entries (attempts 1-5) are capped at RECONNECT_MAX_DELAY_PHASE1_MS.
+        for (i, d) in sequence[2..5].iter().enumerate() {
             assert!(
-                *d <= RECONNECT_MAX_DELAY_MS,
-                "sequence[{}] = {} exceeds max {}",
+                *d <= RECONNECT_MAX_DELAY_PHASE1_MS,
+                "sequence[{}] = {} exceeds phase1 max {}",
                 i + 2,
                 d,
-                RECONNECT_MAX_DELAY_MS
+                RECONNECT_MAX_DELAY_PHASE1_MS
+            );
+        }
+        // Phase 2 entries (attempts 6-15) are capped at RECONNECT_MAX_DELAY_PHASE2_MS.
+        for (i, d) in sequence[5..15].iter().enumerate() {
+            assert!(
+                *d <= RECONNECT_MAX_DELAY_PHASE2_MS,
+                "sequence[{}] = {} exceeds phase2 max {}",
+                i + 5,
+                d,
+                RECONNECT_MAX_DELAY_PHASE2_MS
+            );
+        }
+        // Phase 3 entries (attempts 16+) are capped at RECONNECT_MAX_DELAY_PHASE3_MS.
+        for (i, d) in sequence[15..].iter().enumerate() {
+            assert!(
+                *d <= RECONNECT_MAX_DELAY_PHASE3_MS,
+                "sequence[{}] = {} exceeds phase3 max {}",
+                i + 15,
+                d,
+                RECONNECT_MAX_DELAY_PHASE3_MS
             );
         }
     }

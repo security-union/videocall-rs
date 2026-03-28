@@ -319,11 +319,26 @@ pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
 /// Kept low so the first retry fires quickly after a transient drop.
 pub const RECONNECT_INITIAL_DELAY_MS: u64 = 500;
 
-/// Maximum reconnection delay (milliseconds). Exponential backoff caps here.
-/// Capped at 2 seconds so the user never waits long between attempts --
-/// a video call client should keep trying indefinitely but still back off
-/// enough to avoid hammering a downed server.
-pub const RECONNECT_MAX_DELAY_MS: u64 = 2000;
+/// Progressive reconnection delay caps (milliseconds).
+///
+/// Instead of a single flat cap, the backoff limit increases with the attempt
+/// count. This balances fast recovery for transient drops against server
+/// protection during extended outages:
+///
+/// - Attempts 1-5:  cap at 2s  (quick recovery for WiFi blips)
+/// - Attempts 6-15: cap at 10s (moderate backoff for longer disruptions)
+/// - Attempts 16+:  cap at 30s (gentle polling during extended outages)
+///
+/// Over a 5-minute outage, a single client now produces ~15 attempts instead
+/// of ~150, reducing server load by ~10x during widespread failures.
+pub const RECONNECT_MAX_DELAY_PHASE1_MS: u64 = 2000;
+pub const RECONNECT_MAX_DELAY_PHASE2_MS: u64 = 10000;
+pub const RECONNECT_MAX_DELAY_PHASE3_MS: u64 = 30000;
+
+/// Attempt thresholds for progressive backoff phases.
+/// Attempts <= PHASE1 use PHASE1 cap, <= PHASE2 use PHASE2 cap, else PHASE3.
+pub const RECONNECT_PHASE1_MAX_ATTEMPTS: u32 = 5;
+pub const RECONNECT_PHASE2_MAX_ATTEMPTS: u32 = 15;
 
 /// Backoff multiplier per attempt.
 pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
@@ -335,8 +350,9 @@ pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
 /// may trigger server-side rate limiting.
 ///
 /// Set to 10 (not 3) to tolerate WiFi handoffs and network transitions that
-/// can take 5-30 seconds. With the 2-second backoff cap, 10 attempts spans
-/// ~15 seconds of retries, which covers most real-world network disruptions.
+/// can take 5-30 seconds. With the progressive backoff caps (2s -> 10s -> 30s),
+/// 10 attempts spans ~30-60 seconds of retries, which covers most real-world
+/// network disruptions.
 pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 10;
 
 /// RTT degradation multiplier to trigger connection re-election.

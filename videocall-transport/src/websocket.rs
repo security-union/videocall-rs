@@ -270,6 +270,9 @@ impl WebSocketTask {
 
     /// Sends data to a WebSocket connection.
     pub fn send(&mut self, data: String) {
+        if !self.is_active() {
+            return;
+        }
         if self.ws.send_with_str(&data).is_err() {
             // Only emit Error if the socket is no longer open. A transient
             // send failure while OPEN (e.g. GC pause, tab backgrounding) should
@@ -290,6 +293,9 @@ impl WebSocketTask {
     /// slow networks. This mirrors the congestion-drop behavior used on the
     /// WebTransport datagram path.
     pub fn send_binary(&self, data: Vec<u8>) {
+        if !self.is_active() {
+            return;
+        }
         let buffered = self.ws.buffered_amount();
         if buffered > MAX_BUFFERED_AMOUNT {
             warn!(

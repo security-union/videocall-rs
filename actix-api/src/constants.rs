@@ -35,6 +35,14 @@ pub const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(2);
 /// Allows alphanumeric characters, underscores, and hyphens
 pub const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]*$";
 
+/// Maximum incoming frame/stream size in bytes for both WebSocket and WebTransport.
+///
+/// 4 MB accommodates worst-case 1080p VP9 keyframes (1-2 MB raw) plus protobuf
+/// wrapping overhead. The previous 1 MB limit caused session termination when a
+/// participant shared a high-quality 1080p screen, because VP9 keyframes exceeded
+/// the cap and triggered a protocol error that closed the entire connection.
+pub const MAX_FRAME_SIZE: usize = 4_000_000;
+
 // ---------------------------------------------------------------------------
 // Server Congestion Feedback
 // ---------------------------------------------------------------------------

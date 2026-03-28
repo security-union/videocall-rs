@@ -35,7 +35,7 @@ use tracing::{debug, error};
 use videocall_types::FeatureFlags;
 
 use crate::actors::transports::ws_chat_session::WsChatSession;
-use crate::constants::VALID_ID_PATTERN;
+use crate::constants::{MAX_FRAME_SIZE, VALID_ID_PATTERN};
 use crate::models::AppState;
 use crate::token_validator;
 
@@ -120,7 +120,7 @@ pub async fn ws_connect_authenticated(
         session_manager,
         observer,
     );
-    let codec = Codec::new().max_size(1_000_000);
+    let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
 }
 
@@ -174,6 +174,6 @@ pub async fn ws_connect(
         session_manager,
         false, // deprecated path-based endpoint: never observer
     );
-    let codec = Codec::new().max_size(1_000_000);
+    let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
 }

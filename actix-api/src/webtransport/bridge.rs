@@ -50,16 +50,13 @@
 //! ```
 
 use crate::actors::transports::wt_chat_session::{WtInbound, WtInboundSource, WtOutbound};
+use crate::constants::MAX_FRAME_SIZE;
 use actix::Addr;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{error, info};
 use web_transport_quinn::Session;
-
-/// Maximum bytes allowed on a single incoming UniStream.
-/// Matches the WebSocket codec `max_size` in `lobby.rs` for transport parity.
-const MAX_UNISTREAM_SIZE: usize = 1_000_000;
 
 /// Callback for tracking packets sent to clients (used in tests)
 pub type PacketSentCallback = Box<dyn Fn() + Send + Sync>;
@@ -130,7 +127,7 @@ impl WebTransportBridge {
             while let Ok(mut uni_stream) = session.accept_uni().await {
                 let actor_addr = actor_addr.clone();
                 tokio::spawn(async move {
-                    match uni_stream.read_to_end(MAX_UNISTREAM_SIZE).await {
+                    match uni_stream.read_to_end(MAX_FRAME_SIZE).await {
                         Ok(buf) => {
                             let _ = actor_addr.try_send(WtInbound {
                                 data: Bytes::from(buf),
@@ -140,7 +137,7 @@ impl WebTransportBridge {
                         Err(e) => {
                             error!(
                                 "UniStream read failed (limit {} bytes): {}",
-                                MAX_UNISTREAM_SIZE, e
+                                MAX_FRAME_SIZE, e
                             );
                         }
                     }

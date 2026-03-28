@@ -49,7 +49,7 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
             options.on_inbound_media,
             notification,
         )?;
-        debug!("WebSocket connection success");
+        debug!("WebSocket task created (connection pending)");
         Ok(task)
     }
 

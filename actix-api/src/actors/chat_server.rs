@@ -844,10 +844,13 @@ fn handle_msg(
             session,
         };
 
-        session_recipient.try_send(message).map_err(|e| {
-            error!("error sending message to session {}: {}", session, e);
-            std::io::Error::other(e)
-        })
+        if let Err(e) = session_recipient.try_send(message) {
+            warn!(
+                "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
+                session, e
+            );
+        }
+        Ok(())
     }
 }
 

@@ -244,10 +244,16 @@ impl WebSocketTask {
 
     /// Sends data to a WebSocket connection.
     pub fn send(&mut self, data: String) {
-        let result = self.ws.send_with_str(&data);
-
-        if result.is_err() {
-            self.notification.emit(WebSocketStatus::Error);
+        if self.ws.send_with_str(&data).is_err() {
+            // Only emit Error if the socket is no longer open. A transient
+            // send failure while OPEN (e.g. GC pause, tab backgrounding) should
+            // not cascade into a full disconnect — the browser's own `error`
+            // and `close` event listeners will fire if the connection truly dies.
+            if self.ws.ready_state() != WebSocket::OPEN {
+                self.notification.emit(WebSocketStatus::Error);
+            } else {
+                warn!("WebSocket send_with_str failed but socket still OPEN; dropping packet");
+            }
         }
     }
 
@@ -269,10 +275,20 @@ impl WebSocketTask {
             return;
         }
 
-        let result = self.ws.send_with_u8_array(&data);
-
-        if result.is_err() {
-            self.notification.emit(WebSocketStatus::Error);
+        if self.ws.send_with_u8_array(&data).is_err() {
+            // Only emit Error if the socket is no longer open. A transient
+            // send failure while OPEN (e.g. GC pause, tab backgrounding on iOS)
+            // should not cascade into a full disconnect — the browser's own
+            // `error` and `close` event listeners will fire if the connection
+            // truly dies.
+            if self.ws.ready_state() != WebSocket::OPEN {
+                self.notification.emit(WebSocketStatus::Error);
+            } else {
+                warn!(
+                    "WebSocket send_with_u8_array failed but socket still OPEN; dropping {} byte packet",
+                    data.len()
+                );
+            }
         }
     }
 }

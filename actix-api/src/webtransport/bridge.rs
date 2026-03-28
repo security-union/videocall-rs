@@ -179,6 +179,9 @@ impl WebTransportBridge {
                                 error!("Error writing to UniStream: {}", e);
                                 break;
                             }
+                            if let Err(e) = stream.finish() {
+                                error!("Error finishing UniStream: {}", e);
+                            }
                             // Call packet sent callback if provided (for test instrumentation)
                             if let Some(ref callback) = on_packet_sent {
                                 callback();

@@ -909,6 +909,18 @@ impl ConnectionManager {
                 }
             }
 
+            // TOCTOU guard: disconnect() may have been called DURING
+            // reset_and_start_election(). The new election would have created
+            // connections and callbacks capturing a stale manager_ref, so bail
+            // out immediately to avoid spawning a duplicate reconnection loop.
+            if *intentionally_disconnected.borrow() {
+                info!(
+                    "Reconnection loop cancelled after election reset — user disconnected intentionally"
+                );
+                *reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
+                return;
+            }
+
             // Give the election period time to complete. The ConnectionController's
             // existing 200ms RTT probe timer and 100ms election-check timer will
             // drive the election automatically on the same manager instance.

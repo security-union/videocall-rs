@@ -237,6 +237,12 @@ impl Drop for ConnectionController {
     fn drop(&mut self) {
         info!("Dropping ConnectionController and cleaning up timers");
 
+        // Signal intentional disconnect so any in-flight reconnection loops
+        // stop instead of continuing to run against a dropped controller.
+        if let Ok(mut mgr) = self.manager.try_borrow_mut() {
+            mgr.disconnect().ok();
+        }
+
         // Timers are automatically cleaned up when the Vec<Interval> is dropped
         // Each Interval's Drop implementation will cancel the timer
     }

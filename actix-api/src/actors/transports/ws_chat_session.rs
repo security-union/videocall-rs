@@ -143,9 +143,6 @@ impl Actor for WsChatSession {
             }),
         );
 
-        // Start heartbeat
-        self.start_heartbeat(ctx);
-
         // Register with ChatServer
         let addr = ctx.address();
         self.logic
@@ -163,6 +160,10 @@ impl Actor for WsChatSession {
 
         // Join room
         self.join_room(ctx);
+
+        // Start heartbeat AFTER all initialization is complete to avoid
+        // premature timeout if Connect/JoinRoom are slow under load.
+        self.start_heartbeat(ctx);
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {

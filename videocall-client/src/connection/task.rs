@@ -21,7 +21,7 @@
 //
 // Handles rollover of connection from WebTransport to WebSocket
 //
-use log::{debug, error};
+use log::debug;
 use videocall_transport::websocket::WebSocketTask;
 use videocall_transport::webtransport::WebTransportTask;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -39,13 +39,11 @@ impl Task {
     pub fn connect(webtransport: bool, options: ConnectOptions) -> anyhow::Result<Self> {
         if webtransport {
             debug!("Task::connect trying WebTransport");
-            match WebTransportTask::connect(options.clone()) {
-                Ok(task) => return Ok(Task::WebTransport(task)),
-                Err(_e) => error!("WebTransport connect failed, falling back to WebSocket"),
-            }
+            WebTransportTask::connect(options).map(Task::WebTransport)
+        } else {
+            debug!("Task::connect trying WebSocket");
+            WebSocketTask::connect(options).map(Task::WebSocket)
         }
-        debug!("Task::connect trying WebSocket");
-        WebSocketTask::connect(options).map(Task::WebSocket)
     }
 
     pub fn send_packet(&self, packet: PacketWrapper) {

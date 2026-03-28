@@ -16,6 +16,8 @@
  * conditions.
  */
 
+use std::collections::VecDeque;
+
 use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::adaptive_quality_constants::{
@@ -83,7 +85,7 @@ pub enum ConnectionState {
 pub struct ServerRttMeasurement {
     pub url: String,
     pub is_webtransport: bool,
-    pub measurements: Vec<f64>,
+    pub measurements: VecDeque<f64>,
     pub average_rtt: Option<f64>,
     pub connection_id: String,
     pub active: bool,
@@ -325,7 +327,7 @@ impl ConnectionManager {
                         ServerRttMeasurement {
                             url: url.clone(),
                             is_webtransport: false,
-                            measurements: Vec::new(),
+                            measurements: VecDeque::new(),
                             average_rtt: None,
                             connection_id: conn_id.clone(),
                             active: false,
@@ -361,7 +363,7 @@ impl ConnectionManager {
                         ServerRttMeasurement {
                             url: url.clone(),
                             is_webtransport: true,
-                            measurements: Vec::new(),
+                            measurements: VecDeque::new(),
                             average_rtt: None,
                             connection_id: conn_id.clone(),
                             active: false,
@@ -634,11 +636,11 @@ impl ConnectionManager {
         }
 
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
-            measurement.measurements.push(rtt);
+            measurement.measurements.push_back(rtt);
 
             // Keep only recent measurements (last 10)
             if measurement.measurements.len() > 10 {
-                measurement.measurements.remove(0);
+                measurement.measurements.pop_front();
             }
 
             // Update average
@@ -1829,7 +1831,7 @@ mod tests {
             ServerRttMeasurement {
                 url: format!("https://test/{conn_id}"),
                 is_webtransport,
-                measurements,
+                measurements: measurements.into(),
                 average_rtt: avg_rtt,
                 connection_id: conn_id.to_string(),
                 active: false,

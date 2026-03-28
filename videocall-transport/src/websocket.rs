@@ -19,7 +19,7 @@ const MAX_BUFFERED_AMOUNT: u32 = 1_048_576;
 use gloo::events::EventListener;
 use js_sys::Uint8Array;
 use wasm_bindgen::JsCast;
-use web_sys::{BinaryType, Event, MessageEvent, WebSocket};
+use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 
 /// Represents formatting errors.
 #[derive(Debug, ThisError)]
@@ -44,7 +44,15 @@ pub enum WebSocketStatus {
     /// Fired when a WebSocket connection has opened.
     Opened,
     /// Fired when a WebSocket connection has closed.
-    Closed,
+    ///
+    /// Contains an optional `(code, reason)` tuple extracted from the
+    /// browser's `CloseEvent`. Well-known codes include:
+    /// - 1000: normal closure
+    /// - 1006: abnormal closure (network failure, no close frame received)
+    /// - 1008: policy violation (e.g. expired JWT)
+    /// - 1013: try again later (server overload)
+    /// - 4000+: application-specific codes
+    Closed(Option<(u16, String)>),
     /// Fired when a WebSocket connection has failed.
     Error,
 }
@@ -167,8 +175,26 @@ impl WebSocketService {
             notify.emit(WebSocketStatus::Opened);
         };
         let notify = notification.clone();
-        let listener_close = move |_: &Event| {
-            notify.emit(WebSocketStatus::Closed);
+        let listener_close = move |event: &Event| {
+            // Downcast to CloseEvent to extract the close code and reason.
+            // The browser always fires a CloseEvent for the "close" event on
+            // a WebSocket, but we guard with `dyn_ref` in case of unexpected
+            // environments.
+            let close_info = event.dyn_ref::<CloseEvent>().map(|ce| {
+                let code = ce.code();
+                let reason = ce.reason();
+                warn!(
+                    "WebSocket closed: code={}, reason={:?}, was_clean={}",
+                    code,
+                    reason,
+                    ce.was_clean()
+                );
+                (code, reason)
+            });
+            if close_info.is_none() {
+                warn!("WebSocket closed: could not extract CloseEvent details");
+            }
+            notify.emit(WebSocketStatus::Closed(close_info));
         };
         let notify = notification.clone();
         let listener_error = move |_: &Event| {

@@ -29,9 +29,16 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
     fn connect(options: ConnectOptions) -> anyhow::Result<WebSocketTask> {
         let notification = Callback::from(move |status| match status {
             WebSocketStatus::Opened => options.on_connected.emit(()),
-            WebSocketStatus::Closed => options
-                .on_connection_lost
-                .emit(JsValue::from_str("WebSocket closed")),
+            WebSocketStatus::Closed(close_info) => {
+                let msg = match close_info {
+                    Some((code, ref reason)) if !reason.is_empty() => {
+                        format!("WebSocket closed: code={code}, reason={reason}")
+                    }
+                    Some((code, _)) => format!("WebSocket closed: code={code}"),
+                    None => "WebSocket closed".to_string(),
+                };
+                options.on_connection_lost.emit(JsValue::from_str(&msg));
+            }
             WebSocketStatus::Error => options
                 .on_connection_lost
                 .emit(JsValue::from_str("WebSocket error")),

@@ -893,6 +893,32 @@ mod tests {
         // a short delay instead of waiting for a cross-session broadcast.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
+        // ========== ACTIVATE ALL CONNECTIONS ==========
+        // ActivateConnection (and its PARTICIPANT_JOINED broadcast) is deferred
+        // until the first non-RTT data packet. Send an activation packet from
+        // each client so these broadcasts happen BEFORE the counting phase.
+        println!("\n--- Activating connections ---");
+        let activation_a =
+            create_test_packet(user_a, VcMediaType::AUDIO, "activation-a".to_string());
+        let activation_b =
+            create_test_packet(user_b, VcMediaType::AUDIO, "activation-b".to_string());
+        let activation_c =
+            create_test_packet(user_c, VcMediaType::AUDIO, "activation-c".to_string());
+        send_packet(&session_a, activation_a).await;
+        send_packet(&session_b, activation_b).await;
+        send_packet(&session_c, activation_c).await;
+        println!("✓ Sent activation packets from all clients");
+
+        // Wait for PARTICIPANT_JOINED broadcasts to settle.
+        // Alice and Charlie are in the same room, so each receives the other's
+        // PARTICIPANT_JOINED. Allow time for the async broadcast pipeline
+        // (ActivateConnection -> NATS publish -> subscription delivery).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Reset counters so the counting phase starts from zero.
+        reset_test_packet_counters();
+        println!("✓ Reset packet counters after activation");
+
         // ========== PHASE 1: CROSS-LOBBY ISOLATION TEST ==========
         println!("\n--- Phase 1: Testing Cross-Lobby Isolation ---");
 

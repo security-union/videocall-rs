@@ -887,15 +887,11 @@ mod tests {
         // Keep connections alive
         start_keep_alive_tasks(&session_a, &session_b, &session_c).await;
 
-        // Wait for Alice to receive Charlie's MEETING_STARTED broadcast
-        // (Alice and Charlie are in the same room, so Alice gets notified when Charlie joins)
-        wait_for_condition_bool(
-            || async move { get_test_packet_counter_for_user(user_a) >= 2 },
-            Duration::from_secs(5),
-            Duration::from_millis(10),
-        )
-        .await
-        .expect("Alice should receive Charlie's MEETING_STARTED");
+        // Give NATS subscriptions time to fully propagate after all sessions
+        // are ready. MEETING_STARTED is only published for the first participant
+        // now (the transport actors send it directly to every joiner), so we use
+        // a short delay instead of waiting for a cross-session broadcast.
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // ========== PHASE 1: CROSS-LOBBY ISOLATION TEST ==========
         println!("\n--- Phase 1: Testing Cross-Lobby Isolation ---");

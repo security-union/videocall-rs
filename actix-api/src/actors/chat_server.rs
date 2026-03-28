@@ -647,6 +647,11 @@ impl Handler<JoinRoom> for ChatServer {
             Vec::new()
         };
 
+        // True when the room had no non-observer participants before this join.
+        // Used to gate the NATS MEETING_STARTED broadcast (the transport actors
+        // already send MEETING_STARTED directly to every connecting client).
+        let is_first_in_room = existing_members.is_empty() && !observer;
+
         // Track this session in room_members (only for non-observers)
         if !observer {
             self.room_members.entry(room.clone()).or_default().push((
@@ -685,8 +690,19 @@ impl Handler<JoinRoom> for ChatServer {
                     // SESSION_ASSIGNED is sent by ws_chat_session / wt_chat_session
                     // in their started() method before this JoinRoom handler runs.
 
-                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
+                    // Only broadcast MEETING_STARTED via NATS for the first
+                    // participant. The transport actors already send it directly
+                    // to every connecting client, so subsequent joins would just
+                    // produce redundant events for existing participants.
+                    if is_first_in_room {
+                        send_meeting_info(
+                            &nc,
+                            &room_clone,
+                            result.start_time_ms,
+                            &result.creator_id,
+                        )
                         .await;
+                    }
 
                     // PARTICIPANT_JOINED broadcast is deferred until
                     // ActivateConnection is received. This prevents ghost join

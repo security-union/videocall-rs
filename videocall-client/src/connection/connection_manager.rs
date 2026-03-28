@@ -19,9 +19,9 @@
 use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::adaptive_quality_constants::{
-    RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
-    RECONNECT_MAX_DELAY_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MIN_THRESHOLD_MS,
-    REELECTION_RTT_MULTIPLIER,
+    ELECTION_MAX_EXTENSIONS, ELECTION_MIN_RTT_SAMPLES, RECONNECT_BACKOFF_MULTIPLIER,
+    RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_MS,
+    REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
 };
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
@@ -96,6 +96,10 @@ pub enum ElectionState {
         start_time: f64,
         duration_ms: u64,
         probe_timer: Option<Interval>,
+        /// Number of 1-second deadline extensions applied because no connection
+        /// had enough RTT samples when the timer expired. Capped at
+        /// `ELECTION_MAX_EXTENSIONS`.
+        extensions_used: u32,
     },
     Elected {
         connection_id: String,
@@ -286,6 +290,7 @@ impl ConnectionManager {
             start_time,
             duration_ms: election_duration,
             probe_timer: None, // Will be set externally
+            extensions_used: 0,
         };
 
         // Start RTT reporting to diagnostics
@@ -747,12 +752,24 @@ impl ConnectionManager {
     fn find_best_connection(&self) -> Result<(String, ServerRttMeasurement)> {
         // We run two passes: first look exclusively at WebTransport connections.
         // Only if none of them are usable do we fall back to WebSocket.
+        //
+        // Connections must have at least `ELECTION_MIN_RTT_SAMPLES` measurements
+        // to be considered. If no connection meets the minimum, we fall back to
+        // accepting any connection with at least 1 measurement so the election
+        // does not fail entirely on marginal networks.
 
         let mut best_wt: Option<(String, ServerRttMeasurement)> = None;
         let mut best_wt_rtt = f64::INFINITY;
 
         let mut best_ws: Option<(String, ServerRttMeasurement)> = None;
         let mut best_ws_rtt = f64::INFINITY;
+
+        // Fallbacks for connections with <MIN_RTT_SAMPLES but >0 measurements
+        let mut fallback_wt: Option<(String, ServerRttMeasurement)> = None;
+        let mut fallback_wt_rtt = f64::INFINITY;
+
+        let mut fallback_ws: Option<(String, ServerRttMeasurement)> = None;
+        let mut fallback_ws_rtt = f64::INFINITY;
 
         for (connection_id, measurement) in &self.rtt_measurements {
             // Skip connections that are not yet fully established
@@ -767,23 +784,48 @@ impl ConnectionManager {
                     continue;
                 }
 
+                let has_enough = measurement.measurements.len() >= ELECTION_MIN_RTT_SAMPLES;
+
                 if measurement.is_webtransport {
-                    if avg_rtt < best_wt_rtt {
+                    if has_enough && avg_rtt < best_wt_rtt {
                         best_wt_rtt = avg_rtt;
                         best_wt = Some((connection_id.clone(), measurement.clone()));
+                    } else if !has_enough && avg_rtt < fallback_wt_rtt {
+                        fallback_wt_rtt = avg_rtt;
+                        fallback_wt = Some((connection_id.clone(), measurement.clone()));
                     }
-                } else if avg_rtt < best_ws_rtt {
+                } else if has_enough && avg_rtt < best_ws_rtt {
                     best_ws_rtt = avg_rtt;
                     best_ws = Some((connection_id.clone(), measurement.clone()));
+                } else if !has_enough && avg_rtt < fallback_ws_rtt {
+                    fallback_ws_rtt = avg_rtt;
+                    fallback_ws = Some((connection_id.clone(), measurement.clone()));
                 }
             }
         }
 
+        // Prefer connections meeting the minimum sample count.
+        // Within each tier, WebTransport is preferred over WebSocket.
         if let Some(best) = best_wt {
             return Ok(best);
         }
+        if let Some(best) = best_ws {
+            return Ok(best);
+        }
 
-        best_ws.ok_or_else(|| anyhow!("No valid connections with RTT measurements found"))
+        // Fall back to connections with fewer samples rather than failing.
+        // Preserves the WT > WS preference order within fallbacks.
+        if fallback_wt.is_some() || fallback_ws.is_some() {
+            warn!(
+                "No connection has {} RTT samples; falling back to best available measurement",
+                ELECTION_MIN_RTT_SAMPLES,
+            );
+        }
+        if let Some(fb) = fallback_wt {
+            return Ok(fb);
+        }
+
+        fallback_ws.ok_or_else(|| anyhow!("No valid connections with RTT measurements found"))
     }
 
     /// Close all unused connections after election
@@ -1161,6 +1203,7 @@ impl ConnectionManager {
             start_time,
             duration_ms: self.options.election_period_ms,
             probe_timer: None,
+            extensions_used: 0,
         };
 
         Ok(())
@@ -1571,17 +1614,61 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Check if election should be completed and do so if needed
+    /// Check if election should be completed and do so if needed.
+    ///
+    /// When the timer expires, we verify that at least one connection has
+    /// accumulated `ELECTION_MIN_RTT_SAMPLES` measurements. If not, we
+    /// extend the deadline by 1 second, up to `ELECTION_MAX_EXTENSIONS`
+    /// times. This prevents high-latency connections (200ms+ RTT) from
+    /// being misjudged or missed entirely because the handshake consumed
+    /// most of the original election window.
     pub fn check_and_complete_election(&mut self) {
         if let ElectionState::Testing {
             start_time,
             duration_ms,
+            extensions_used,
             ..
         } = &self.election_state
         {
-            let elapsed = monotonic_now_ms() - start_time;
-            if elapsed >= *duration_ms as f64 {
+            let elapsed = monotonic_now_ms() - *start_time;
+            if elapsed < *duration_ms as f64 {
+                return;
+            }
+
+            // Timer expired. Check if any connection has enough RTT samples.
+            let has_enough_samples = self.rtt_measurements.values().any(|m| {
+                m.measurements.len() >= ELECTION_MIN_RTT_SAMPLES && m.average_rtt.is_some()
+            });
+
+            if has_enough_samples || *extensions_used >= ELECTION_MAX_EXTENSIONS {
+                if !has_enough_samples {
+                    warn!(
+                        "Election deadline reached after {} extensions with no connection \
+                         having {} RTT samples — completing with best available data",
+                        extensions_used, ELECTION_MIN_RTT_SAMPLES,
+                    );
+                }
                 self.complete_election();
+            } else {
+                // Extend the deadline by 1 second.
+                let ext = *extensions_used;
+                if let ElectionState::Testing {
+                    duration_ms,
+                    extensions_used,
+                    ..
+                } = &mut self.election_state
+                {
+                    *duration_ms += 1000;
+                    *extensions_used = ext + 1;
+                    info!(
+                        "Election extended by 1s (extension {}/{}) — \
+                         no connection has {} RTT samples yet, new deadline {}ms",
+                        ext + 1,
+                        ELECTION_MAX_EXTENSIONS,
+                        ELECTION_MIN_RTT_SAMPLES,
+                        *duration_ms,
+                    );
+                }
             }
         }
     }

@@ -377,6 +377,21 @@ pub const DIAGNOSTICS_REPORT_INTERVAL_MS: u64 = 1000;
 /// RTT probe interval during server election (milliseconds).
 pub const RTT_PROBE_ELECTION_INTERVAL_MS: u64 = 200;
 
+/// Minimum number of RTT samples a connection must have before it can be
+/// considered for election. On high-latency connections (200ms+ RTT, common
+/// in India, Africa, Southeast Asia, Australia), the QUIC/TLS or TCP+WS
+/// handshake alone can take 400-900ms, leaving too few probes for a reliable
+/// measurement within the default election period. Requiring multiple samples
+/// ensures the elected transport is chosen on stable data, not a single
+/// potentially anomalous measurement.
+pub const ELECTION_MIN_RTT_SAMPLES: usize = 2;
+
+/// Maximum number of 1-second deadline extensions allowed when the election
+/// timer expires but no connection has accumulated `ELECTION_MIN_RTT_SAMPLES`.
+/// This caps the total additional wait to avoid indefinitely delaying the
+/// election on networks where connections never complete their handshake.
+pub const ELECTION_MAX_EXTENSIONS: u32 = 2;
+
 /// RTT probe interval after server election (milliseconds).
 pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 

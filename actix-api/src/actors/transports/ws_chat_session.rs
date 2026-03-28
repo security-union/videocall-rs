@@ -251,6 +251,9 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             ws::Message::Pong(_) => {
                 self.heartbeat = Instant::now();
             }
+            ws::Message::Text(_) => {
+                self.heartbeat = Instant::now();
+            }
             ws::Message::Close(reason) => {
                 info!(
                     "Close received for session {} in room {}",

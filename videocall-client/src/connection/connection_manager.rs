@@ -39,6 +39,24 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
 
+/// Maximum plausible RTT in milliseconds. Measurements exceeding this are
+/// discarded as they likely result from clock anomalies or extreme outliers.
+const RTT_SANITY_MAX_MS: f64 = 10_000.0;
+
+/// Returns a monotonic, high-resolution timestamp in milliseconds using
+/// `performance.now()`. This is immune to NTP adjustments, DST changes, and
+/// user clock manipulation — unlike `js_sys::Date::now()` — making it safe
+/// for RTT and elapsed-time calculations.
+///
+/// Falls back to `js_sys::Date::now()` when the Performance API is
+/// unavailable (e.g. some headless WASM runtimes).
+fn monotonic_now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or_else(js_sys::Date::now)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
     Testing {
@@ -170,7 +188,7 @@ impl ConnectionManager {
             rtt_measurements: HashMap::new(),
             election_state: ElectionState::Failed {
                 reason: "Not started".to_string(),
-                failed_at: js_sys::Date::now(),
+                failed_at: monotonic_now_ms(),
             },
             rtt_reporter: None,
             rtt_probe_timer: None,
@@ -256,7 +274,7 @@ impl ConnectionManager {
     /// Start the election process by creating all connections upfront
     fn start_election(&mut self) -> Result<()> {
         let election_duration = self.options.election_period_ms;
-        let start_time = js_sys::Date::now();
+        let start_time = monotonic_now_ms();
 
         info!("Starting connection election for {election_duration}ms");
 
@@ -403,7 +421,7 @@ impl ConnectionManager {
 
             // Handle RTT responses internally
             if packet.user_id[..] == *userid.as_bytes() {
-                let reception_time = js_sys::Date::now();
+                let reception_time = monotonic_now_ms();
                 if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
                         if media_packet.media_type == MediaType::RTT.into() {
@@ -562,7 +580,7 @@ impl ConnectionManager {
             measurement.connected = true;
         }
 
-        let timestamp = js_sys::Date::now();
+        let timestamp = monotonic_now_ms();
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
         connection.send_packet_datagram(rtt_packet);
@@ -588,7 +606,10 @@ impl ConnectionManager {
         })
     }
 
-    /// Handle RTT response and calculate round-trip time
+    /// Handle RTT response and calculate round-trip time.
+    ///
+    /// Measurements that are negative (clock anomaly) or exceed
+    /// `RTT_SANITY_MAX_MS` (extreme outlier) are silently discarded.
     fn handle_rtt_response(
         &mut self,
         connection_id: &str,
@@ -597,6 +618,15 @@ impl ConnectionManager {
     ) {
         let sent_timestamp = media_packet.timestamp;
         let rtt = reception_time - sent_timestamp;
+
+        // Discard implausible RTT measurements.
+        if !(0.0..=RTT_SANITY_MAX_MS).contains(&rtt) {
+            warn!(
+                "Discarding implausible RTT measurement on {}: {:.1}ms (sent={}, recv={})",
+                connection_id, rtt, sent_timestamp, reception_time
+            );
+            return;
+        }
 
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
             measurement.measurements.push(rtt);
@@ -645,7 +675,7 @@ impl ConnectionManager {
 
                 self.election_state = ElectionState::Elected {
                     connection_id: connection_id.clone(),
-                    elected_at: js_sys::Date::now(),
+                    elected_at: monotonic_now_ms(),
                 };
 
                 // Apply pending session_id for the elected connection
@@ -706,7 +736,7 @@ impl ConnectionManager {
                 error!("Election failed: {e}");
                 self.election_state = ElectionState::Failed {
                     reason: e.to_string(),
-                    failed_at: js_sys::Date::now(),
+                    failed_at: monotonic_now_ms(),
                 };
                 self.report_state();
             }
@@ -1114,7 +1144,7 @@ impl ConnectionManager {
         self.create_all_connections()?;
 
         // Reset election state to Testing so the normal election flow runs.
-        let start_time = js_sys::Date::now();
+        let start_time = monotonic_now_ms();
         self.election_state = ElectionState::Testing {
             start_time,
             duration_ms: self.options.election_period_ms,
@@ -1190,7 +1220,7 @@ impl ConnectionManager {
                 duration_ms,
                 ..
             } => {
-                let elapsed = js_sys::Date::now() - start_time;
+                let elapsed = monotonic_now_ms() - start_time;
                 let progress = (elapsed / *duration_ms as f64).min(1.0) as f32;
                 metrics.push(metric!("election_state", "testing"));
                 metrics.push(metric!("election_progress", progress as f64));
@@ -1334,7 +1364,7 @@ impl ConnectionManager {
                 duration_ms,
                 ..
             } => {
-                let elapsed = js_sys::Date::now() - start_time;
+                let elapsed = monotonic_now_ms() - start_time;
                 let progress = (elapsed / *duration_ms as f64).min(1.0) as f32;
 
                 ConnectionState::Testing {
@@ -1537,7 +1567,7 @@ impl ConnectionManager {
             ..
         } = &self.election_state
         {
-            let elapsed = js_sys::Date::now() - start_time;
+            let elapsed = monotonic_now_ms() - start_time;
             if elapsed >= *duration_ms as f64 {
                 self.complete_election();
             }
@@ -1552,7 +1582,7 @@ impl ConnectionManager {
                 duration_ms,
                 ..
             } => {
-                let elapsed = js_sys::Date::now() - start_time;
+                let elapsed = monotonic_now_ms() - start_time;
                 let progress = (elapsed / *duration_ms as f64).min(1.0) as f32;
 
                 ConnectionState::Testing {
@@ -2192,6 +2222,92 @@ mod tests {
         assert!(!mgr.rtt_measurements.contains_key("unknown"));
     }
 
+    #[test]
+    fn handle_rtt_response_discards_negative_rtt() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        // reception_time < sent_timestamp => negative RTT => discarded
+        let pkt = MediaPacket {
+            timestamp: 2000.0,
+            ..Default::default()
+        };
+        mgr.handle_rtt_response("wt_0", &pkt, 1000.0);
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert!(
+            m.measurements.is_empty(),
+            "negative RTT should be discarded"
+        );
+        assert_eq!(m.average_rtt, None);
+    }
+
+    #[test]
+    fn handle_rtt_response_discards_excessive_rtt() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        // RTT = 15000ms > RTT_SANITY_MAX_MS => discarded
+        let pkt = MediaPacket {
+            timestamp: 1000.0,
+            ..Default::default()
+        };
+        mgr.handle_rtt_response("wt_0", &pkt, 16000.0);
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert!(
+            m.measurements.is_empty(),
+            "RTT exceeding sanity max should be discarded"
+        );
+        assert_eq!(m.average_rtt, None);
+    }
+
+    #[test]
+    fn handle_rtt_response_accepts_rtt_at_sanity_boundary() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        // RTT exactly at the boundary (10000ms) should be accepted.
+        let pkt = MediaPacket {
+            timestamp: 1000.0,
+            ..Default::default()
+        };
+        mgr.handle_rtt_response("wt_0", &pkt, 1000.0 + RTT_SANITY_MAX_MS);
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(m.measurements.len(), 1);
+        assert!((m.average_rtt.unwrap() - RTT_SANITY_MAX_MS).abs() < 0.01);
+    }
+
+    #[test]
+    fn handle_rtt_response_discards_zero_rtt_not() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        // RTT = 0.0 is not negative, so it should be accepted.
+        let pkt = MediaPacket {
+            timestamp: 1000.0,
+            ..Default::default()
+        };
+        mgr.handle_rtt_response("wt_0", &pkt, 1000.0);
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(m.measurements.len(), 1);
+        assert!((m.average_rtt.unwrap() - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn rtt_sanity_max_constant_is_reasonable() {
+        assert!(
+            RTT_SANITY_MAX_MS >= 5000.0,
+            "Sanity max should be at least 5s to allow legitimate slow connections"
+        );
+        assert!(
+            RTT_SANITY_MAX_MS <= 30_000.0,
+            "Sanity max should not exceed 30s"
+        );
+    }
+
     // ===================================================================
     // 6. find_best_connection — election logic
     // ===================================================================
@@ -2331,7 +2447,7 @@ mod tests {
 
         // start_reelection calls create_all_connections which is a no-op
         // when websocket_urls and webtransport_urls are both empty.
-        // NOTE: requires wasm32 because it calls js_sys::Date::now().
+        // NOTE: requires wasm32 because monotonic_now_ms() calls web_sys::window().
         mgr.start_reelection().unwrap();
         assert!(mgr.is_reelection_in_progress());
         assert_eq!(mgr.degradation_counter, 0);

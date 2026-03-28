@@ -177,9 +177,16 @@ impl WebTransportService {
                         break;
                     }
                     Ok(result) => {
-                        let done = Reflect::get(&result, &JsString::from("done"))
-                            .unwrap()
-                            .unchecked_into::<Boolean>();
+                        let done = match Reflect::get(&result, &JsString::from("done")) {
+                            Ok(val) => val.unchecked_into::<Boolean>(),
+                            Err(e) => {
+                                log!(
+                                    "Failed to read 'done' from unidirectional stream result",
+                                    &e
+                                );
+                                break;
+                            }
+                        };
                         if let Ok(value) = Reflect::get(&result, &JsString::from("value")) {
                             if value.is_undefined() {
                                 break;
@@ -216,15 +223,24 @@ impl WebTransportService {
                         break;
                     }
                     Ok(result) => {
-                        let done = Reflect::get(&result, &JsString::from("done"))
-                            .unwrap()
-                            .unchecked_into::<Boolean>();
+                        let done = match Reflect::get(&result, &JsString::from("done")) {
+                            Ok(val) => val.unchecked_into::<Boolean>(),
+                            Err(e) => {
+                                log!("Failed to read 'done' from datagram result", &e);
+                                break;
+                            }
+                        };
                         if done.is_truthy() {
                             break;
                         }
-                        let value: Uint8Array = Reflect::get(&result, &JsString::from("value"))
-                            .unwrap()
-                            .unchecked_into();
+                        let value: Uint8Array =
+                            match Reflect::get(&result, &JsString::from("value")) {
+                                Ok(val) => val.unchecked_into(),
+                                Err(e) => {
+                                    log!("Failed to read 'value' from datagram result", &e);
+                                    break;
+                                }
+                            };
                         process_binary(&value, &callback);
                     }
                 }
@@ -251,9 +267,13 @@ impl WebTransportService {
                         break;
                     }
                     Ok(result) => {
-                        let done = Reflect::get(&result, &JsString::from("done"))
-                            .unwrap()
-                            .unchecked_into::<Boolean>();
+                        let done = match Reflect::get(&result, &JsString::from("done")) {
+                            Ok(val) => val.unchecked_into::<Boolean>(),
+                            Err(e) => {
+                                log!("Failed to read 'done' from bidirectional stream result", &e);
+                                break;
+                            }
+                        };
                         if let Ok(value) = Reflect::get(&result, &JsString::from("value")) {
                             if value.is_undefined() {
                                 break;
@@ -462,16 +482,31 @@ impl WebTransportTask {
                                     break;
                                 }
                                 Ok(result) => {
-                                    let done = Reflect::get(&result, &JsString::from("done"))
-                                        .unwrap()
-                                        .unchecked_into::<Boolean>();
+                                    let done =
+                                        match Reflect::get(&result, &JsString::from("done")) {
+                                            Ok(val) => val.unchecked_into::<Boolean>(),
+                                            Err(e) => {
+                                                log!(
+                                                    "Failed to read 'done' from bidi send reader result",
+                                                    &e
+                                                );
+                                                break;
+                                            }
+                                        };
                                     if done.is_truthy() {
                                         break;
                                     }
                                     let value: Uint8Array =
-                                        Reflect::get(&result, &JsString::from("value"))
-                                            .unwrap()
-                                            .unchecked_into();
+                                        match Reflect::get(&result, &JsString::from("value")) {
+                                            Ok(val) => val.unchecked_into(),
+                                            Err(e) => {
+                                                log!(
+                                                    "Failed to read 'value' from bidi send reader result",
+                                                    &e
+                                                );
+                                                break;
+                                            }
+                                        };
                                     process_binary(&value, &callback);
                                 }
                             }

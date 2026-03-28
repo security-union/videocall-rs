@@ -29,6 +29,7 @@ use js_sys::Uint8Array;
 use log::debug;
 use log::error;
 use log::info;
+use log::warn;
 use protobuf::Message;
 use videocall_transport::webtransport::{
     WebTransportService, WebTransportStatus, WebTransportTask,
@@ -41,6 +42,11 @@ use web_sys::ReadableStreamDefaultReader;
 use web_sys::WebTransportBidirectionalStream;
 use web_sys::WebTransportCloseInfo;
 use web_sys::WebTransportReceiveStream;
+
+/// Maximum size for an inbound stream buffer (4 MB), matching the server's MAX_FRAME_SIZE.
+/// Prevents a malicious or misbehaving peer from consuming all WASM memory by sending
+/// an arbitrarily large stream payload.
+const MAX_INBOUND_STREAM_SIZE: usize = 4_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MessageType {
@@ -146,14 +152,32 @@ fn handle_unidirectional_stream(
                     break;
                 }
                 Ok(result) => {
-                    let done = Reflect::get(&result, &JsString::from("done"))
-                        .unwrap()
-                        .unchecked_into::<Boolean>();
+                    let done = match Reflect::get(&result, &JsString::from("done")) {
+                        Ok(val) => val.unchecked_into::<Boolean>(),
+                        Err(e) => {
+                            warn!("Failed to read 'done' from unistream result: {:?}", e);
+                            break;
+                        }
+                    };
 
-                    let value = Reflect::get(&result, &JsString::from("value")).unwrap();
+                    let value = match Reflect::get(&result, &JsString::from("value")) {
+                        Ok(val) => val,
+                        Err(e) => {
+                            warn!("Failed to read 'value' from unistream result: {:?}", e);
+                            break;
+                        }
+                    };
                     if !value.is_undefined() {
                         let value: Uint8Array = value.unchecked_into();
                         append_uint8_array_to_vec(&mut buffer, &value);
+                        if buffer.len() > MAX_INBOUND_STREAM_SIZE {
+                            error!(
+                                "Inbound unistream exceeded {} bytes (got {}), dropping",
+                                MAX_INBOUND_STREAM_SIZE,
+                                buffer.len()
+                            );
+                            break;
+                        }
                     }
 
                     if done.is_truthy() {
@@ -196,13 +220,31 @@ fn handle_bidirectional_stream(
                     break;
                 }
                 Ok(result) => {
-                    let done = Reflect::get(&result, &JsString::from("done"))
-                        .unwrap()
-                        .unchecked_into::<Boolean>();
-                    let value = Reflect::get(&result, &JsString::from("value")).unwrap();
+                    let done = match Reflect::get(&result, &JsString::from("done")) {
+                        Ok(val) => val.unchecked_into::<Boolean>(),
+                        Err(e) => {
+                            warn!("Failed to read 'done' from bidistream result: {:?}", e);
+                            break;
+                        }
+                    };
+                    let value = match Reflect::get(&result, &JsString::from("value")) {
+                        Ok(val) => val,
+                        Err(e) => {
+                            warn!("Failed to read 'value' from bidistream result: {:?}", e);
+                            break;
+                        }
+                    };
                     if !value.is_undefined() {
                         let value: Uint8Array = value.unchecked_into();
                         append_uint8_array_to_vec(&mut buffer, &value);
+                        if buffer.len() > MAX_INBOUND_STREAM_SIZE {
+                            error!(
+                                "Inbound bidistream exceeded {} bytes (got {}), dropping",
+                                MAX_INBOUND_STREAM_SIZE,
+                                buffer.len()
+                            );
+                            break;
+                        }
                     }
                     if done.is_truthy() {
                         callback.emit(buffer);

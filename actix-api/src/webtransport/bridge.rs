@@ -55,7 +55,7 @@ use actix::Addr;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use web_transport_quinn::Session;
 
 /// Callback for tracking packets sent to clients (used in tests)
@@ -129,10 +129,13 @@ impl WebTransportBridge {
                 tokio::spawn(async move {
                     match uni_stream.read_to_end(MAX_FRAME_SIZE).await {
                         Ok(buf) => {
-                            let _ = actor_addr.try_send(WtInbound {
+                            let buf_len = buf.len();
+                            if let Err(e) = actor_addr.try_send(WtInbound {
                                 data: Bytes::from(buf),
                                 source: WtInboundSource::UniStream,
-                            });
+                            }) {
+                                warn!("Dropped UniStream frame ({} bytes): {}", buf_len, e);
+                            }
                         }
                         Err(e) => {
                             error!(

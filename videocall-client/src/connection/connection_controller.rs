@@ -20,7 +20,7 @@ use super::connection_manager::{ConnectionManager, ConnectionManagerOptions, Con
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -90,6 +90,8 @@ impl ConnectionController {
                             }
                         }
                     }
+                } else {
+                    warn!("1Hz diagnostics timer: skipped — ConnectionManager already borrowed");
                 }
             }
         }));
@@ -104,6 +106,8 @@ impl ConnectionController {
                             debug!("Failed to send RTT probes during election: {e}");
                         }
                     }
+                } else {
+                    warn!("200ms RTT probe timer: skipped — ConnectionManager already borrowed");
                 }
             }
         }));
@@ -114,6 +118,10 @@ impl ConnectionController {
             if let Some(mgr) = mgr_ref.upgrade() {
                 if let Ok(mut mgr) = mgr.try_borrow_mut() {
                     mgr.check_and_complete_election();
+                } else {
+                    warn!(
+                        "100ms election check timer: skipped — ConnectionManager already borrowed"
+                    );
                 }
             }
         }));

@@ -33,6 +33,7 @@ use actix::{
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -40,16 +41,6 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
 
 use super::session_logic::{ConnectionState, SessionId};
-
-/// Internal message to clean up active_subs when a spawned join task fails.
-/// This fixes a race condition where start_session could fail inside the spawned task,
-/// leaving a stale entry in active_subs that blocks future join attempts.
-#[derive(ActixMessage)]
-#[rtype(result = "()")]
-struct CleanupFailedJoin {
-    session: SessionId,
-    room: String,
-}
 
 /// Internal message sent via `notify_later` after the reconnection grace period
 /// expires. If the user has not reconnected by the time this message is handled,
@@ -622,7 +613,6 @@ impl Handler<JoinRoom> for ChatServer {
             self.suppress_join_broadcast.insert(session);
         }
 
-        let session_manager = self.session_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
         let display_name_clone = display_name.clone();
@@ -667,107 +657,85 @@ impl Handler<JoinRoom> for ChatServer {
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
 
-        // Get ChatServer address for cleanup on failure
-        let chat_server_addr = ctx.address();
-        let session_for_cleanup = session;
-
         let handle = tokio::spawn(async move {
-            // Start session using SessionManager - await result before subscribing
-            match session_manager
-                .start_session(&room_clone, &user_id_clone, session_id)
-                .await
-            {
-                Ok(result) => {
-                    info!(
-                        "Session started for room {} (first: {}) at {} by creator {} (session {})",
-                        room_clone,
-                        result.is_first_participant,
-                        result.start_time_ms,
-                        result.creator_id,
-                        session_id,
+            // start_session is called by the transport actors (ws_chat_session /
+            // wt_chat_session) in their started() method, which blocks with
+            // ctx.wait() before this JoinRoom handler runs. We do NOT call it
+            // again here to avoid double-counting if SessionManager ever
+            // acquires stateful tracking (room capacity, DB records, etc.).
+            //
+            // The reserved-user-ID check is performed synchronously at the top
+            // of this handler, so we can proceed directly to NATS setup.
+
+            let start_time_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            info!(
+                "JoinRoom task running for user {} in room {} (session {})",
+                user_id_clone, room_clone, session_id,
+            );
+
+            // SESSION_ASSIGNED is sent by ws_chat_session / wt_chat_session
+            // in their started() method before this JoinRoom handler runs.
+
+            // Only broadcast MEETING_STARTED via NATS for the first
+            // participant. The transport actors already send it directly
+            // to every connecting client, so subsequent joins would just
+            // produce redundant events for existing participants.
+            if is_first_in_room {
+                send_meeting_info(&nc, &room_clone, start_time_ms, &user_id_clone).await;
+            }
+
+            // PARTICIPANT_JOINED broadcast is deferred until
+            // ActivateConnection is received. This prevents ghost join
+            // events from Testing connections during RTT election — only
+            // the elected (activated) connection announces itself.
+            //
+            // Reconnection joins also skip the broadcast (the user never
+            // "left" from peers' perspective), and observer joins are
+            // never broadcast either.
+            if is_reconnection {
+                info!(
+                    "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {} \
+                     (deferred broadcast also skipped)",
+                    user_id_clone, room_clone
+                );
+            } else if observer {
+                info!(
+                    "Skipping PARTICIPANT_JOINED for observer {} in room {}",
+                    user_id_clone, room_clone
+                );
+            } else {
+                info!(
+                    "Deferring PARTICIPANT_JOINED for {} (display={}) in room {} \
+                     until ActivateConnection (session {})",
+                    user_id_clone, display_name_clone, room_clone, session_id
+                );
+            }
+
+            // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
+            // This ensures the new joiner learns about all participants already in the room.
+            for (existing_sid, existing_uid, existing_display_name) in &existing_members {
+                let existing_bytes = SessionManager::build_peer_joined_packet(
+                    &room_clone,
+                    existing_uid,
+                    *existing_sid,
+                    existing_display_name,
+                );
+                info!(
+                    "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
+                    existing_uid, existing_display_name, user_id_clone
+                );
+                if let Err(e) = new_joiner_recipient.try_send(Message {
+                    msg: existing_bytes,
+                    session: *existing_sid,
+                }) {
+                    warn!(
+                        "Failed to send existing PARTICIPANT_JOINED for {} to new joiner {}: {}",
+                        existing_uid, user_id_clone, e
                     );
-
-                    // SESSION_ASSIGNED is sent by ws_chat_session / wt_chat_session
-                    // in their started() method before this JoinRoom handler runs.
-
-                    // Only broadcast MEETING_STARTED via NATS for the first
-                    // participant. The transport actors already send it directly
-                    // to every connecting client, so subsequent joins would just
-                    // produce redundant events for existing participants.
-                    if is_first_in_room {
-                        send_meeting_info(
-                            &nc,
-                            &room_clone,
-                            result.start_time_ms,
-                            &result.creator_id,
-                        )
-                        .await;
-                    }
-
-                    // PARTICIPANT_JOINED broadcast is deferred until
-                    // ActivateConnection is received. This prevents ghost join
-                    // events from Testing connections during RTT election — only
-                    // the elected (activated) connection announces itself.
-                    //
-                    // Reconnection joins also skip the broadcast (the user never
-                    // "left" from peers' perspective), and observer joins are
-                    // never broadcast either.
-                    if is_reconnection {
-                        info!(
-                            "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {} \
-                             (deferred broadcast also skipped)",
-                            user_id_clone, room_clone
-                        );
-                    } else if observer {
-                        info!(
-                            "Skipping PARTICIPANT_JOINED for observer {} in room {}",
-                            user_id_clone, room_clone
-                        );
-                    } else {
-                        info!(
-                            "Deferring PARTICIPANT_JOINED for {} (display={}) in room {} \
-                             until ActivateConnection (session {})",
-                            user_id_clone, display_name_clone, room_clone, session_id
-                        );
-                    }
-
-                    // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
-                    // This ensures the new joiner learns about all participants already in the room.
-                    for (existing_sid, existing_uid, existing_display_name) in &existing_members {
-                        let existing_bytes = SessionManager::build_peer_joined_packet(
-                            &room_clone,
-                            existing_uid,
-                            *existing_sid,
-                            existing_display_name,
-                        );
-                        info!(
-                            "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
-                            existing_uid, existing_display_name, user_id_clone
-                        );
-                        if let Err(e) = new_joiner_recipient.try_send(Message {
-                            msg: existing_bytes,
-                            session: *existing_sid,
-                        }) {
-                            warn!(
-                                "Failed to send existing PARTICIPANT_JOINED for {} to new joiner {}: {}",
-                                existing_uid, user_id_clone, e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Error starting session for room {}: {} - rejecting join",
-                        room_clone, e
-                    );
-                    // Session rejected - notify ChatServer to clean up active_subs
-                    // This fixes the race condition where a failed start_session would
-                    // leave a stale entry in active_subs, blocking future join attempts.
-                    let _ = chat_server_addr.try_send(CleanupFailedJoin {
-                        session: session_for_cleanup,
-                        room: room_clone.clone(),
-                    });
-                    return;
                 }
             }
 
@@ -794,31 +762,6 @@ impl Handler<JoinRoom> for ChatServer {
         self.active_subs.insert(session, handle);
 
         MessageResult(Ok(()))
-    }
-}
-
-/// Handler for cleaning up failed join attempts.
-/// When start_session fails inside the spawned task, it sends this message
-/// to remove the stale entry from active_subs.
-impl Handler<CleanupFailedJoin> for ChatServer {
-    type Result = ();
-
-    fn handle(&mut self, msg: CleanupFailedJoin, _ctx: &mut Self::Context) -> Self::Result {
-        if let Some(task) = self.active_subs.remove(&msg.session) {
-            // Abort the task (though it should already be finished/returned)
-            task.abort();
-            warn!(
-                "Cleaned up failed join for session {} from active_subs",
-                msg.session
-            );
-        }
-        // Also remove from room_members since the join failed
-        if let Some(members) = self.room_members.get_mut(&msg.room) {
-            members.retain(|(sid, _, _)| *sid != msg.session);
-            if members.is_empty() {
-                self.room_members.remove(&msg.room);
-            }
-        }
     }
 }
 
@@ -1044,14 +987,13 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: CleanupFailedJoin allows retry after spawn failure
+    // TEST: Duplicate join with same session returns Ok
     // ==========================================================================
-    // This test verifies the race condition fix: when start_session fails inside
-    // the spawned task, the CleanupFailedJoin message removes the stale entry
-    // from active_subs, allowing subsequent join attempts to proceed.
+    // Verifies that a second JoinRoom for the same session_id returns Ok
+    // immediately because the session is already tracked in active_subs.
     #[actix_rt::test]
     #[serial]
-    async fn test_cleanup_failed_join_allows_retry() {
+    async fn test_duplicate_join_same_session_returns_ok() {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await

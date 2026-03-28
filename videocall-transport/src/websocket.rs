@@ -5,9 +5,16 @@
 //! adapted to use `videocall_types::Callback` instead of `yew::Callback`.
 
 use anyhow::Error;
+use log::warn;
 use std::fmt;
 use thiserror::Error as ThisError;
 use videocall_types::Callback;
+
+/// Maximum allowed buffered bytes before dropping outbound packets.
+/// When the browser's WebSocket send buffer exceeds this threshold, new sends
+/// are silently dropped to prevent unbounded memory growth on slow networks.
+/// 1 MB matches the congestion-drop behavior used on the WebTransport path.
+const MAX_BUFFERED_AMOUNT: u32 = 1_048_576;
 
 use gloo::events::EventListener;
 use js_sys::Uint8Array;
@@ -230,6 +237,11 @@ where
 }
 
 impl WebSocketTask {
+    /// Returns the number of bytes queued in the browser's WebSocket send buffer.
+    pub fn buffered_amount(&self) -> u32 {
+        self.ws.buffered_amount()
+    }
+
     /// Sends data to a WebSocket connection.
     pub fn send(&mut self, data: String) {
         let result = self.ws.send_with_str(&data);
@@ -240,7 +252,23 @@ impl WebSocketTask {
     }
 
     /// Sends binary data to a WebSocket connection.
+    ///
+    /// If the browser's send buffer already exceeds [`MAX_BUFFERED_AMOUNT`],
+    /// the packet is silently dropped to prevent unbounded memory growth on
+    /// slow networks. This mirrors the congestion-drop behavior used on the
+    /// WebTransport datagram path.
     pub fn send_binary(&self, data: Vec<u8>) {
+        let buffered = self.ws.buffered_amount();
+        if buffered > MAX_BUFFERED_AMOUNT {
+            warn!(
+                "WebSocket backpressure: dropping {} byte packet (buffered: {} bytes, threshold: {} bytes)",
+                data.len(),
+                buffered,
+                MAX_BUFFERED_AMOUNT,
+            );
+            return;
+        }
+
         let result = self.ws.send_with_u8_array(&data);
 
         if result.is_err() {

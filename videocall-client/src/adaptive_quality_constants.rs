@@ -333,7 +333,11 @@ pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
 /// indefinitely, this is the only hard stop: it catches auth failures and
 /// server rejections early, avoiding futile retries that waste resources and
 /// may trigger server-side rate limiting.
-pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 3;
+///
+/// Set to 10 (not 3) to tolerate WiFi handoffs and network transitions that
+/// can take 5-30 seconds. With the 2-second backoff cap, 10 attempts spans
+/// ~15 seconds of retries, which covers most real-world network disruptions.
+pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 10;
 
 /// RTT degradation multiplier to trigger connection re-election.
 /// If current RTT > max(election_rtt * this multiplier, REELECTION_RTT_MIN_THRESHOLD_MS),

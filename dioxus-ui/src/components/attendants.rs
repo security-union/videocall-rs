@@ -691,7 +691,7 @@ pub fn AttendantsComponent(
                         let mut toast_version = toast_version;
                         // Remove any pending "left" toast for this user (waiting room admission).
                         let mut current = peer_toasts.peek().clone();
-                        current.retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
+                        current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
 
                         if !suppress_toast {
                             play_user_joined();

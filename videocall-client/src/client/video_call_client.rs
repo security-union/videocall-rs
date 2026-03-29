@@ -764,7 +764,7 @@ impl VideoCallClient {
                 inner
                     .peer_decode_manager
                     .get(sid)
-                    .map_or(false, |peer| peer.user_id == user_id)
+                    .is_some_and(|peer| peer.user_id == user_id)
             }),
             Err(_) => false,
         }

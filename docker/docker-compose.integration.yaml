@@ -53,22 +53,6 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
-    command: >
-      nix develop /app#backend-dev --command bash -c '
-        set -euo pipefail
-        echo "=== RUNNING DATABASE MIGRATIONS ==="
-        cd /app/dbmate && dbmate wait && dbmate up
-        cd /app
-        echo "=== CLIPPY (all workspace crates) ==="
-        cargo clippy --all -- -D warnings
-        echo "=== FMT CHECK ==="
-        cargo fmt --all --check
-        echo "=== TESTING videocall-api ==="
-        cargo test -p videocall-api -- --nocapture --test-threads=1
-        echo "=== TESTING meeting-api ==="
-        cargo test -p meeting-api -- --nocapture --test-threads=1
-        echo "=== ALL TESTS FINISHED ==="
-      '
 
 volumes:
   nix-store-it-tests:

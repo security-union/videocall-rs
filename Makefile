@@ -4,7 +4,15 @@ COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 .PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
 
 tests_run:
-	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests
+	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
+		nix develop /app#backend-dev --command bash -c "\
+		set -euo pipefail && \
+		cd /app/dbmate && dbmate wait && dbmate up && \
+		cd /app && \
+		cargo clippy --all -- -D warnings && \
+		cargo fmt --all --check && \
+		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
+		cargo test -p meeting-api -- --nocapture --test-threads=1"
 
 tests_build:
 	docker compose -f $(COMPOSE_IT) build
@@ -33,13 +41,13 @@ connect_to_nats:
 	$(COMPOSE) exec nats-box sh
 
 clippy-fix:
-		docker compose -f $(COMPOSE_IT) run --rm --no-deps -e CARGO_TARGET_DIR=/app/target rust-tests nix develop /app#backend-dev --command bash -c "cd /app && cargo clippy --all --fix --allow-dirty --allow-staged"
+		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo clippy --all --fix --allow-dirty --allow-staged"
 
 fmt:
-		docker compose -f $(COMPOSE_IT) run --rm --no-deps -e CARGO_TARGET_DIR=/app/target rust-tests nix develop /app#backend-dev --command bash -c "cd /app && cargo fmt --all"
+		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo fmt --all"
 
 check:
-		docker compose -f $(COMPOSE_IT) run --rm --no-deps -e CARGO_TARGET_DIR=/app/target rust-tests nix develop /app#backend-dev --command bash -c "cd /app && cargo clippy --all -- --deny warnings && cargo fmt --all --check"
+		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo clippy --all -- --deny warnings && cargo fmt --all --check"
 
 clean:
 		$(COMPOSE) down --remove-orphans \

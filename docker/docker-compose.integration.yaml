@@ -19,7 +19,7 @@ services:
     build:
       dockerfile: docker/Dockerfile.actix.dev
       context: ../
-    working_dir: /app
+    working_dir: /app/actix-api
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -36,7 +36,7 @@ services:
       - HEALTH_LISTEN_URL=0.0.0.0:5321
       - CERT_PATH=certs/localhost.pem
       - KEY_PATH=certs/localhost.key
-      - CARGO_TARGET_DIR=/app/target
+      - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
       - JWT_SECRET=test-secret-for-integration-tests
@@ -47,12 +47,24 @@ services:
       - nix-store-it-tests:/nix
       - rustlemania-it-tests-registry:/root/.cargo/registry
       - rustlemania-it-tests-git:/root/.cargo/git
-      - rustlemania-it-tests-cache:/app/target
+      - rustlemania-it-tests-cache:/app/actix-api/target
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_started
+    command: >
+      nix develop /app#backend-dev --command bash -c '
+        set -euo pipefail
+        echo "=== RUNNING DATABASE MIGRATIONS ==="
+        cd /app/dbmate && dbmate wait && dbmate up
+        cd /app/actix-api
+        echo "=== TESTING videocall-api ==="
+        cargo test -p videocall-api -- --nocapture --test-threads=1
+        echo "=== TESTING meeting-api ==="
+        cargo test -p meeting-api -- --nocapture --test-threads=1
+        echo "=== ALL TESTS FINISHED ==="
+      '
 
 volumes:
   nix-store-it-tests:

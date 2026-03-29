@@ -684,14 +684,14 @@ impl VideoCallClient {
         false
     }
 
-    pub fn is_speaking_for_peer(&self, key: &String) -> bool {
+    pub fn is_speaking_for_peer(&self, key: &str) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             return inner.peer_decode_manager.is_peer_speaking(key);
         }
         false
     }
 
-    pub fn audio_level_for_peer(&self, key: &String) -> f32 {
+    pub fn audio_level_for_peer(&self, key: &str) -> f32 {
         if let Ok(inner) = self.inner.try_borrow() {
             return inner.peer_decode_manager.peer_audio_level(key);
         }
@@ -1014,11 +1014,11 @@ impl Inner {
         // Evict stale entries (older than 30 seconds).
         self.recent_peer_events.retain(|_, ts| now - *ts < 30_000.0);
 
-        if self.recent_peer_events.contains_key(&key) {
-            true // duplicate
-        } else {
-            self.recent_peer_events.insert(key, now);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.recent_peer_events.entry(key) {
+            e.insert(now);
             false // first occurrence
+        } else {
+            true // duplicate
         }
     }
 

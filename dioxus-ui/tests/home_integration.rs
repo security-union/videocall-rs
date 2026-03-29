@@ -29,16 +29,16 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 /// Create a bubbling "input" event so Dioxus event delegation picks it up.
 fn bubbling_input_event() -> Event {
-    let mut init = EventInit::new();
-    init.bubbles(true);
+    let init = EventInit::new();
+    init.set_bubbles(true);
     Event::new_with_event_init_dict("input", &init).unwrap()
 }
 
 /// Create a bubbling, cancelable "submit" event.
 fn bubbling_submit_event() -> Event {
-    let mut init = EventInit::new();
-    init.bubbles(true);
-    init.cancelable(true);
+    let init = EventInit::new();
+    init.set_bubbles(true);
+    init.set_cancelable(true);
     Event::new_with_event_init_dict("submit", &init).unwrap()
 }
 

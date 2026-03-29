@@ -136,7 +136,7 @@ impl VideoProducer {
                 let media_packet = MediaPacket {
                     media_type: MediaType::VIDEO.into(),
                     data: frame.data.to_vec(), // Real VP9 encoded data!
-                    email: user_id.clone(),
+                    user_id: user_id.clone().into_bytes(),
                     frame_type: if frame.key { "key" } else { "delta" }.to_string(),
                     timestamp: get_timestamp_ms(),
                     duration: (1000.0 / framerate as f64),
@@ -152,7 +152,7 @@ impl VideoProducer {
                 // Wrap in packet wrapper
                 let packet_wrapper = PacketWrapper {
                     packet_type: PacketType::MEDIA.into(),
-                    email: user_id.clone(),
+                    user_id: user_id.clone().into_bytes(),
                     data: media_packet.write_to_bytes()?,
                     ..Default::default()
                 };

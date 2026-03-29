@@ -6,11 +6,11 @@ COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
 		nix develop /app#backend-dev --command bash -c "\
+		set -euo pipefail && \
 		cd /app/dbmate && dbmate wait && dbmate up && \
-		cd /app/actix-api && \
-		cargo clippy -- -D warnings && \
-		cargo fmt --check && \
-		cargo machete && \
+		cd /app && \
+		cargo clippy --all -- -D warnings && \
+		cargo fmt --all --check && \
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
 		cargo test -p meeting-api -- --nocapture --test-threads=1"
 
@@ -41,13 +41,13 @@ connect_to_nats:
 	$(COMPOSE) exec nats-box sh
 
 clippy-fix:
-		$(COMPOSE) run dioxus-ui bash -c "cd /app && cargo clippy --fix"
+		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo clippy --all --fix --allow-dirty --allow-staged"
 
 fmt:
-		$(COMPOSE) run dioxus-ui bash -c "cd /app && cargo fmt"
+		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo fmt --all"
 
 check:
-		$(COMPOSE) run dioxus-ui bash -c "cd /app && cargo clippy --all  -- --deny warnings && cargo fmt --check"
+		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo clippy --all -- --deny warnings && cargo fmt --all --check"
 
 clean:
 		$(COMPOSE) down --remove-orphans \

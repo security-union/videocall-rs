@@ -939,7 +939,7 @@ impl PeerDecodeManager {
             .and_then(|peer| peer.display_name.clone())
     }
 
-    pub fn is_peer_speaking(&self, key: &String) -> bool {
+    pub fn is_peer_speaking(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,
@@ -950,7 +950,7 @@ impl PeerDecodeManager {
         false
     }
 
-    pub fn peer_audio_level(&self, key: &String) -> f32 {
+    pub fn peer_audio_level(&self, key: &str) -> f32 {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return 0.0,

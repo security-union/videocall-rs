@@ -1405,6 +1405,7 @@ impl ConnectionManager {
     ///
     /// During re-election, the old active connection is used if the elected
     /// connection is no longer in the main connections HashMap.
+    #[allow(dead_code)]
     pub fn send_packet_datagram(&self, packet: PacketWrapper) -> Result<()> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             // Try the main connections HashMap first.

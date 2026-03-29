@@ -95,6 +95,7 @@ pub fn DeviceSelector(
     }
 }
 
+#[allow(dead_code)]
 fn find_device_by_id(devices: &[MediaDeviceInfo], device_id: &str) -> Option<DeviceInfo> {
     devices
         .iter()

@@ -115,6 +115,7 @@ fn resolve_audio_level(audio_lvl: Option<f32>, speaking: Option<bool>) -> Option
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_diagnostics_event(
     evt: &DiagEvent,
     peer_id: &str,

@@ -14,6 +14,26 @@ Synthetic bot that streams real VP9 video and Opus audio to videocall-rs meeting
 - **Multi-Client Support**: Run multiple bots per process with configurable ramp-up delay
 - **Loop Boundary Recovery**: Forces VP9 keyframes at loop restart so video recovers instantly
 
+## Prerequisites
+
+### System packages (Ubuntu/Debian)
+
+```bash
+sudo apt-get install -y libopus-dev libvpx-dev nasm pkg-config build-essential
+```
+
+- `libopus-dev` — Opus audio encoding
+- `libvpx-dev` + `nasm` — VP9 video encoding (used by `env-libvpx-sys`)
+- `pkg-config`, `build-essential` — standard Rust build tooling
+
+### Rust
+
+```bash
+rustup update stable
+```
+
+The bot builds with `cargo build --release -p bot`.
+
 ## Quick Start
 
 ### 1. Generate conversation assets (optional)
@@ -24,6 +44,12 @@ This creates interleaved WAV files and EKG video frames for two bots using Piper
 
 ```bash
 pip install piper-tts scipy pillow numpy
+```
+
+The `piper-tts` package pulls in `onnxruntime` automatically. On some systems you may also need:
+
+```bash
+sudo apt-get install -y libonnxruntime-dev
 ```
 
 **Download Piper voice models** from Hugging Face (one-time, ~120 MB total):
@@ -57,7 +83,7 @@ Create a `config.yaml`:
 
 ```yaml
 transport: "websocket"   # or "webtransport"
-server_url: "https://websocket.example.com"
+server_url: "wss://websocket.example.com"   # wss:// for websocket, https:// for webtransport
 jwt_secret: "your-base64-secret"
 ramp_up_delay_ms: 0
 
@@ -79,17 +105,25 @@ clients:
 
 If `audio_file` is omitted, defaults to `BundyBests2.wav`. If `image_dir` is omitted, defaults to the current directory (legacy `output_120..124.jpg` pattern).
 
-### 3. Run
+### 3. Build & Run
 
 ```bash
-RUST_LOG=info cargo run --release -- --config config.yaml
+cargo build --release -p bot
 ```
 
-Or with a different config path:
+Run with a config file (recommended):
 
 ```bash
-RUST_LOG=info BOT_CONFIG_PATH=config-prod.yaml cargo run --release
+RUST_LOG=info ./target/release/bot --config config.yaml
 ```
+
+The config path can also be set via env var:
+
+```bash
+RUST_LOG=info BOT_CONFIG_PATH=config.yaml ./target/release/bot
+```
+
+Without a config file, the bot falls back to environment variables (see Configuration Reference).
 
 ## RX Quality Diagnostics
 
@@ -119,7 +153,7 @@ Every 10 seconds each bot logs a stats line:
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `transport` | no | `"webtransport"` | `"websocket"` or `"webtransport"` |
-| `server_url` | yes | — | Base URL of the videocall server |
+| `server_url` | yes | — | Server URL (`wss://` for websocket, `https://` for webtransport) |
 | `jwt_secret` | no | — | Base64-encoded HMAC secret for JWT auth |
 | `ramp_up_delay_ms` | no | `1000` | Delay between starting each client |
 | `insecure` | no | `false` | Skip TLS certificate verification |
@@ -151,5 +185,5 @@ Both audio and video producers derive their position from the same `Instant` epo
 ```bash
 cargo check -p bot
 cargo clippy -p bot
-RUST_LOG=debug cargo run --release -- --config config.yaml
+RUST_LOG=debug ./target/release/bot --config config.yaml
 ```

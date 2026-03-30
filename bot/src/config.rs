@@ -64,6 +64,18 @@ impl BotConfig {
         Ok(config)
     }
 
+    /// Load config from CLI args (`--config`/`-c`), then `BOT_CONFIG_PATH` env
+    /// var, then fall back to environment variable defaults.
+    pub fn from_args() -> anyhow::Result<Self> {
+        let args: Vec<String> = std::env::args().collect();
+        for i in 0..args.len() {
+            if (args[i] == "--config" || args[i] == "-c") && i + 1 < args.len() {
+                return Self::from_file(&args[i + 1]);
+            }
+        }
+        Self::from_env_or_default()
+    }
+
     pub fn from_env_or_default() -> anyhow::Result<Self> {
         // Try to load from config file first
         if let Ok(config_path) = std::env::var("BOT_CONFIG_PATH") {

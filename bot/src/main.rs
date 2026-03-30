@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting videocall synthetic client bot");
 
-    let config = BotConfig::from_env_or_default()?;
+    let config = BotConfig::from_args()?;
     info!("Loaded configuration for {} clients", config.clients.len());
     info!(
         "Transport: {:?}, JWT auth: {}",

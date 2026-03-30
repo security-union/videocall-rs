@@ -18,10 +18,12 @@
 pub mod adapter;
 pub mod context;
 pub mod generic_adapter;
+pub mod jmap_adapter;
 pub mod types;
 
 // Re-export the most commonly used items for convenience.
 pub use adapter::ChatServiceAdapter;
 pub use context::{use_chat_state, ChatState};
 pub use generic_adapter::GenericChatAdapter;
+pub use jmap_adapter::JmapChatAdapter;
 pub use types::{ChatConfig, ChatError, ChatMessage};

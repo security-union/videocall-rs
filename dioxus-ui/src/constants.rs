@@ -81,6 +81,9 @@ pub struct RuntimeConfig {
     #[serde(rename = "chatPollIntervalMs")]
     #[serde(default)]
     pub chat_poll_interval_ms: Option<u32>,
+    #[serde(rename = "chatProtocol")]
+    #[serde(default)]
+    pub chat_protocol: Option<String>,
 }
 
 fn default_vad_threshold() -> f32 {

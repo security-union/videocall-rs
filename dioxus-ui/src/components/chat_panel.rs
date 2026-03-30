@@ -11,14 +11,75 @@ use dioxus_core::Task;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::chat::{ChatConfig, ChatMessage, ChatServiceAdapter, ChatState, GenericChatAdapter};
+use crate::chat::{
+    ChatConfig, ChatMessage, ChatServiceAdapter, ChatState, GenericChatAdapter, JmapChatAdapter,
+};
 use crate::constants::app_config;
+
+/// Enum dispatch wrapper so we can select the adapter at runtime based on
+/// the `chatProtocol` config value without needing trait objects.
+enum ChatAdapterKind {
+    Rest(GenericChatAdapter),
+    Jmap(JmapChatAdapter),
+}
+
+impl ChatServiceAdapter for ChatAdapterKind {
+    async fn authenticate(
+        &mut self,
+        user_id: &str,
+        display_name: &str,
+    ) -> Result<(), crate::chat::ChatError> {
+        match self {
+            Self::Rest(a) => a.authenticate(user_id, display_name).await,
+            Self::Jmap(a) => a.authenticate(user_id, display_name).await,
+        }
+    }
+
+    async fn join_room(
+        &mut self,
+        meeting_id: &str,
+    ) -> Result<crate::chat::types::ChatRoom, crate::chat::ChatError> {
+        match self {
+            Self::Rest(a) => a.join_room(meeting_id).await,
+            Self::Jmap(a) => a.join_room(meeting_id).await,
+        }
+    }
+
+    async fn send_message(
+        &self,
+        room_id: &str,
+        content: &str,
+    ) -> Result<ChatMessage, crate::chat::ChatError> {
+        match self {
+            Self::Rest(a) => a.send_message(room_id, content).await,
+            Self::Jmap(a) => a.send_message(room_id, content).await,
+        }
+    }
+
+    async fn get_messages(
+        &self,
+        room_id: &str,
+        since: Option<f64>,
+    ) -> Result<Vec<ChatMessage>, crate::chat::ChatError> {
+        match self {
+            Self::Rest(a) => a.get_messages(room_id, since).await,
+            Self::Jmap(a) => a.get_messages(room_id, since).await,
+        }
+    }
+
+    async fn disconnect(&mut self) -> Result<(), crate::chat::ChatError> {
+        match self {
+            Self::Rest(a) => a.disconnect().await,
+            Self::Jmap(a) => a.disconnect().await,
+        }
+    }
+}
 
 /// Helper: take the adapter out of the cell, call `get_messages`, put it back,
 /// and return the result. This avoids holding the `RefCell` borrow across an
 /// `.await` point (which would panic in debug builds).
 async fn poll_messages(
-    cell: &Rc<RefCell<Option<GenericChatAdapter>>>,
+    cell: &Rc<RefCell<Option<ChatAdapterKind>>>,
     room_id: &str,
     since: Option<f64>,
 ) -> Option<Result<Vec<ChatMessage>, crate::chat::ChatError>> {
@@ -30,7 +91,7 @@ async fn poll_messages(
 
 /// Helper: take the adapter out, call `send_message`, put it back.
 async fn send_msg(
-    cell: &Rc<RefCell<Option<GenericChatAdapter>>>,
+    cell: &Rc<RefCell<Option<ChatAdapterKind>>>,
     room_id: &str,
     content: &str,
 ) -> Option<Result<ChatMessage, crate::chat::ChatError>> {
@@ -56,7 +117,7 @@ pub fn ChatPanel(
 
     // Shared adapter cell — created once when the panel mounts with a valid
     // meeting_id, then reused for send/poll operations.
-    let adapter: Signal<Rc<RefCell<Option<GenericChatAdapter>>>> =
+    let adapter: Signal<Rc<RefCell<Option<ChatAdapterKind>>>> =
         use_signal(|| Rc::new(RefCell::new(None)));
 
     // Track the last message timestamp for incremental polling.
@@ -117,7 +178,11 @@ pub fn ChatPanel(
                 };
 
                 let poll_interval_ms = cfg.poll_interval_ms;
-                let mut new_adapter = GenericChatAdapter::new(cfg);
+                let mut new_adapter = if cfg.protocol == "jmap" {
+                    ChatAdapterKind::Jmap(JmapChatAdapter::new(cfg))
+                } else {
+                    ChatAdapterKind::Rest(GenericChatAdapter::new(cfg))
+                };
 
                 // Authenticate
                 if let Err(e) = new_adapter.authenticate(&user_id, &display_name).await {

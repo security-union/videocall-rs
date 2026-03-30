@@ -2,9 +2,9 @@ window.__APP_CONFIG = Object.freeze({
   apiBaseUrl: "http://localhost:8081",
   wsUrl: "ws://localhost:8080",
   webTransportHost: "https://127.0.0.1:4433",
-  oauthEnabled: "true",
+  oauthEnabled: "false",
   e2eeEnabled: "false",
-  webTransportEnabled: "false",
+  webTransportEnabled: "true",
   firefoxEnabled: "false",
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,
@@ -25,5 +25,6 @@ window.__APP_CONFIG = Object.freeze({
   chatRoomPrefix: "",
   chatExtraHeaders: "",
   chatExtraParams: "",
-  chatPollIntervalMs: 3000
+  chatPollIntervalMs: 3000,
+  chatProtocol: ""
 });

@@ -116,6 +116,8 @@ pub struct ChatConfig {
     pub extra_params: HashMap<String, String>,
     /// Polling interval in milliseconds when WebSocket is not configured.
     pub poll_interval_ms: u32,
+    /// Protocol to use: "rest" (default) or "jmap".
+    pub protocol: String,
 }
 
 impl ChatConfig {
@@ -173,6 +175,12 @@ impl ChatConfig {
             extra_headers,
             extra_params,
             poll_interval_ms: cfg.chat_poll_interval_ms.unwrap_or(3000),
+            protocol: cfg
+                .chat_protocol
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("rest")
+                .to_string(),
         })
     }
 }

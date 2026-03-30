@@ -32,7 +32,8 @@ class UltraFastPCMBuffer {
         console.log(`Ultra-fast PCM buffer: ${maxSamples} samples (~${(maxSamples/48000*1000).toFixed(1)}ms), ${channels} channels`);
     }
     
-    // Drop the oldest samples to make room (advance read pointer)
+    // Drop the oldest samples to make room (advance read pointer).
+    // Only used as a last resort when the buffer is completely full.
     dropOldestSamples(samplesToDrop) {
         if (samplesToDrop <= 0) return 0;
         const drop = Math.min(samplesToDrop, this.availableSamples);
@@ -41,23 +42,44 @@ class UltraFastPCMBuffer {
         return drop;
     }
 
-    // Ensure capacity for a frame by applying a burst-drop policy (drop oldest)
-    // Returns number of samples dropped
-    ensureCapacityFor(frameLength, highWatermark, lowWatermark) {
-        // If we're above the high watermark, proactively reduce to low watermark
-        let dropped = 0;
-        if (this.availableSamples >= highWatermark) {
-            const target = Math.max(0, Math.min(lowWatermark, this.maxSamples));
-            const toDrop = this.availableSamples - target;
-            dropped += this.dropOldestSamples(toDrop);
-        }
-
-        // If still not enough room for the incoming frame, drop just enough
+    // Ensure there is physical room for an incoming frame.
+    // Only drops samples when the buffer is literally full — the gradual
+    // speedup in process() keeps the level from reaching this point under
+    // normal conditions.
+    ensureCapacityFor(frameLength) {
         const overflow = (this.availableSamples + frameLength) - this.maxSamples;
         if (overflow > 0) {
-            dropped += this.dropOldestSamples(overflow);
+            return this.dropOldestSamples(overflow);
         }
-        return dropped;
+        return 0;
+    }
+
+    // Read `count` samples from the circular buffer using linear
+    // interpolation at the given playback rate.  Returns the number of
+    // source samples actually consumed (may differ from `count` when
+    // rate != 1.0).
+    pullResampledMono(out, count, rate) {
+        // How many source samples we need (fractional)
+        const srcNeeded = Math.ceil(count * rate) + 1;
+        if (this.availableSamples < srcNeeded) {
+            out.fill(0);
+            return 0;
+        }
+
+        let srcPos = 0.0; // fractional position into source
+        for (let i = 0; i < count; i++) {
+            const idx = Math.floor(srcPos);
+            const frac = srcPos - idx;
+            const a = this.buffer[(this.readPos + idx) % this.maxSamples];
+            const b = this.buffer[(this.readPos + idx + 1) % this.maxSamples];
+            out[i] = a + (b - a) * frac;
+            srcPos += rate;
+        }
+
+        const consumed = Math.floor(srcPos);
+        this.readPos = (this.readPos + consumed) % this.maxSamples;
+        this.availableSamples -= consumed;
+        return consumed;
     }
 
     // Optimized push with minimal branching
@@ -145,20 +167,25 @@ class UltraFastPCMBuffer {
 class PCMPlayerProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
-        
+
         // Initialize with optimized settings for low-end devices
-        this.buffer = new UltraFastPCMBuffer(4096 * 3, 1); // 85ms at 48kHz
+        this.buffer = new UltraFastPCMBuffer(4096 * 3, 1); // ~256ms at 48kHz
         this.sampleRate = 48000;
         this.channels = 1;
-        // Burst-drop policy configuration
-        this.highWatermarkRatio = 0.80; // start dropping when >= 80% full
-        this.lowWatermarkRatio = 0.50;  // drop down to 20%
+
+        // Gradual-speedup configuration (replaces burst-drop policy).
+        // When the buffer fill level exceeds targetLevel, playback rate
+        // increases linearly up to maxRate.  This drains the excess
+        // smoothly without audible gaps.
+        this.targetLevel = 0.40;  // 40% full = ~102ms — ideal operating point
+        this.speedupStart = 0.55; // start speeding up above 55%
+        this.maxRate = 1.08;      // never exceed 8% speedup (inaudible)
         this.lastDropWarnTime = 0;
-        this.dropWarnCooldownMs = 1000; // rate-limit warnings
-        
-        console.log('Ultra-Fast PCM Player Worklet initialized - JavaScript optimized for maximum performance');
-        
-        // Setup message handler  
+        this.dropWarnCooldownMs = 1000;
+
+        console.log('PCM Player Worklet initialized (gradual-speedup mode)');
+
+        // Setup message handler
         this.port.onmessage = (event) => this.handleMessage(event.data);
     }
     
@@ -175,30 +202,20 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
                 
             case 'play':
                 if (pcm && pcm instanceof Float32Array) {
-                    // Apply burst-drop policy before enqueuing
                     const frameLength = pcm.length / this.channels;
-                    const highWM = Math.floor(this.buffer.maxSamples * this.highWatermarkRatio);
-                    const lowWM = Math.floor(this.buffer.maxSamples * this.lowWatermarkRatio);
-                    const dropped = this.buffer.ensureCapacityFor(frameLength, highWM, lowWM);
+                    // Only drop when physically full — the gradual speedup in
+                    // process() normally prevents us from reaching this point.
+                    const dropped = this.buffer.ensureCapacityFor(frameLength);
 
                     if (dropped > 0) {
                         const now = Date.now();
                         if (now - this.lastDropWarnTime >= this.dropWarnCooldownMs) {
-                            console.warn(`PCM buffer high-watermark: dropped ${dropped} samples to cap latency (avail=${this.buffer.availableSamples}/${this.buffer.maxSamples})`);
+                            console.warn(`PCM buffer overflow: dropped ${dropped} samples (avail=${this.buffer.availableSamples}/${this.buffer.maxSamples})`);
                             this.lastDropWarnTime = now;
                         }
                     }
 
-                    // Enqueue after ensuring capacity. If this still fails, frame is too large.
-                    const success = this.buffer.pushInterleaved(pcm);
-                    if (!success) {
-                        // Extremely rare: frame larger than buffer capacity
-                        const now = Date.now();
-                        if (now - this.lastDropWarnTime >= this.dropWarnCooldownMs) {
-                            console.warn('Failed to enqueue PCM data: frame larger than buffer capacity');
-                            this.lastDropWarnTime = now;
-                        }
-                    }
+                    this.buffer.pushInterleaved(pcm);
                 }
                 break;
                 
@@ -209,20 +226,39 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     }
     
     /**
-     * Process audio - called by Web Audio API at ~375Hz  
-     * This is the critical hot path - must be ultra-fast
+     * Compute the playback rate based on current buffer fullness.
+     * Returns 1.0 when the buffer is at or below the target level, and
+     * ramps linearly up to this.maxRate as it approaches 100%.
+     */
+    playbackRate() {
+        const fill = this.buffer.availableSamples / this.buffer.maxSamples;
+        if (fill <= this.speedupStart) return 1.0;
+        // Linear ramp: speedupStart → 1.0 fill  maps to  1.0 → maxRate
+        const t = (fill - this.speedupStart) / (1.0 - this.speedupStart);
+        return 1.0 + t * (this.maxRate - 1.0);
+    }
+
+    /**
+     * Process audio — called by Web Audio API at ~375Hz (128 samples/call).
+     * When the buffer is growing, we consume slightly more source samples
+     * per call (up to 8% faster) via linear interpolation, draining the
+     * excess smoothly instead of dropping chunks.
      */
     process(inputs, outputs, parameters) {
         const output = outputs[0];
-        
-        if (output.length >= 2) {
-            // Stereo output - use direct channel access for maximum speed
-            this.buffer.pullToChannels(output[0], output[1]);
+        const left = output[0];
+        const count = left.length; // typically 128
+
+        if (this.channels === 1 || output.length < 2) {
+            const rate = this.playbackRate();
+            this.buffer.pullResampledMono(left, count, rate);
+            if (output.length >= 2) output[1].set(left);
         } else {
-            // Mono output - pass the same channel twice
-            this.buffer.pullToChannels(output[0], output[0]);
+            // Stereo: fall back to original 1:1 pull (speedup not yet
+            // implemented for stereo — rare path for this project).
+            this.buffer.pullToChannels(left, output[1]);
         }
-        
+
         return true;
     }
     

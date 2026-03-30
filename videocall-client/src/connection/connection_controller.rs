@@ -139,6 +139,7 @@ impl ConnectionController {
     /// periodic and expendable — lower overhead matters more than guaranteed
     /// delivery. Falls back to reliable stream for WebSocket connections or
     /// oversized packets.
+    #[allow(dead_code)]
     pub fn send_packet_datagram(&self, packet: PacketWrapper) -> Result<()> {
         let mgr = self
             .manager

@@ -49,6 +49,7 @@ All chat configuration properties are added to the existing `__APP_CONFIG` objec
 | `chatExtraHeaders` | `string` | `""` | JSON-encoded key-value pairs for service-specific HTTP headers |
 | `chatExtraParams` | `string` | `""` | JSON-encoded key-value pairs for service-specific query parameters |
 | `chatPollIntervalMs` | `number` | `3000` | Fallback polling interval (ms) when WebSocket is not configured |
+| `chatProtocol` | `string` | `""` | Protocol adapter: `"rest"` (default) or `"jmap"`. JMAP is required for Smatter-compatible chat servers. |
 
 ### Backend Configuration (meeting-api environment variables)
 
@@ -133,7 +134,8 @@ All participants in the same meeting derive the same room ID, ensuring chat isol
 | `chat/mod.rs` | Module root, public exports. |
 | `chat/types.rs` | `ChatMessage`, `ChatRoom`, `ChatError` structs. |
 | `chat/adapter.rs` | `ChatServiceAdapter` trait definition. |
-| `chat/generic_adapter.rs` | Config-driven HTTP/WebSocket adapter implementing the trait. |
+| `chat/generic_adapter.rs` | Config-driven REST adapter implementing the trait. |
+| `chat/jmap_adapter.rs` | JMAP protocol adapter for Smatter-compatible servers. |
 | `chat/context.rs` | Dioxus context types for chat state management. |
 
 **Trait definition**:
@@ -157,6 +159,40 @@ The `GenericChatAdapter` implements this trait using:
 - URL template substitution at runtime (e.g., `{roomId}` replaced with actual room ID)
 
 **Token refresh**: The adapter catches 401 responses and re-calls `authenticate()` before retrying the request.
+
+#### JMAP Protocol Adapter
+
+The `JmapChatAdapter` implements the same `ChatServiceAdapter` trait for JMAP-based chat servers such as HCL Smatter. It is selected at runtime when `chatProtocol` is set to `"jmap"`. The adapter uses `ChatAdapterKind` enum dispatch in `chat_panel.rs` to choose between REST and JMAP without trait objects.
+
+**Key differences from the REST adapter:**
+
+| Operation | REST Adapter | JMAP Adapter |
+|---|---|---|
+| Create/join room | `POST chatCreateRoomEndpoint` | `Conversation/query` to find existing room by topic, then `Conversation/create` if not found |
+| Add participant | Implicit (room join) | `Conversation/setMembers` to add the joining user |
+| Send message | `POST chatMessagesEndpoint` | `ChatMessage/set` with `create` map |
+| Get messages | `GET chatMessagesEndpoint` | `ChatMessage/query` + `ChatMessage/get` batched (uses JMAP result references) |
+| Auth | Configurable (bearer/cookie/header/query) | Bearer token via `/auth/login` or token exchange endpoint |
+| Endpoint | Multiple REST endpoints | Single `POST /jmap` with batched method calls |
+
+All JMAP operations go through `POST {chatApiBaseUrl}/jmap` using the JMAP envelope format:
+```json
+{
+  "using": ["urn:ietf:params:jmap:core"],
+  "methodCalls": [["MethodName", { ...arguments }, "callId"]]
+}
+```
+
+When `chatProtocol` is `"jmap"`, the `chatCreateRoomEndpoint` and `chatMessagesEndpoint` config fields are not required (they are REST-specific).
+
+**Smatter configuration example (Docker `.env`):**
+```bash
+CHAT_ENABLED=true
+CHAT_PROTOCOL=jmap
+CHAT_API_BASE_URL=https://smatterchat.fnxlabs.com:8443
+CHAT_AUTH_MODE=bearer
+CHAT_ROOM_PREFIX=videocall-
+```
 
 ---
 
@@ -294,6 +330,8 @@ Phases 1, 2, and 6 can proceed in parallel. Phase 4 depends on Phases 1 and 2. P
 | **Chat token expiry** | Requests fail with 401 mid-meeting | Adapter catches 401, re-calls `authenticate()`, retries the request. Follows the same pattern as `schedule_reconnect` in `attendants.rs`. |
 | **WASM bundle size increase** | Larger download for users | Chat module uses existing dependencies (`reqwest`, `web_sys`, `serde`). No new heavy crates needed. |
 | **Chat service downtime** | Chat unavailable during a meeting | Chat errors are non-fatal. The meeting continues normally; the chat panel shows an error state with retry option. |
+| **JMAP protocol differences** | JMAP uses a single endpoint with batched method calls, unlike REST | `JmapChatAdapter` handles JMAP envelope format and result references. Selected via `chatProtocol: "jmap"`. |
+| **JMAP self-signed certs** | Smatter dev instances may use self-signed TLS certificates | Browser `fetch` (used by `reqwest` in WASM) will reject self-signed certs. Requires proper CA or browser trust override. |
 
 ---
 

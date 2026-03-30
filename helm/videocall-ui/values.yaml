@@ -63,6 +63,7 @@ runtimeConfig:
   chatExtraHeaders: ""
   chatExtraParams: ""
   chatPollIntervalMs: 3000
+  chatProtocol: ""
 
 ingress:
   enabled: true

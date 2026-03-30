@@ -46,6 +46,7 @@ videocall-ui:
     chatExtraHeaders: ""
     chatExtraParams: ""
     chatPollIntervalMs: 3000
+    chatProtocol: ""
 
   service:
     type: ClusterIP

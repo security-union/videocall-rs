@@ -159,6 +159,8 @@ canvas {
   justify-content: center;
   width: 36px;
   height: 36px;
+  padding: 0;
+  margin: 0;
   border-radius: 50%;
   border: none;
   background-color: #0084ff;
@@ -166,6 +168,8 @@ canvas {
   cursor: pointer;
   transition: background-color 0.2s ease;
   flex-shrink: 0;
+  line-height: 1;
+  box-sizing: border-box;
 }
 
 .chat-send-button:hover:not(:disabled) {

@@ -151,18 +151,30 @@ impl JmapChatAdapter {
         format!("{}/jmap", self.config.api_base_url)
     }
 
-    /// Build the auth login URL.
-    fn login_url(&self) -> String {
-        format!("{}/auth/login", self.config.api_base_url)
-    }
-
-    /// Apply the bearer token to a request builder.
-    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    /// Apply authentication, extra headers, and extra query params to a
+    /// request builder.
+    fn apply_auth(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(ref token) = self.auth_token {
-            builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-        } else {
-            builder
+            builder = builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
         }
+
+        // Extra headers from config.
+        for (key, value) in &self.config.extra_headers {
+            builder = builder.header(key, value);
+        }
+
+        // Extra query params from config.
+        if !self.config.extra_params.is_empty() {
+            let pairs: Vec<(&str, &str)> = self
+                .config
+                .extra_params
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            builder = builder.query(&pairs);
+        }
+
+        builder
     }
 
     /// Send a JMAP request and return the parsed response.
@@ -283,41 +295,7 @@ impl ChatServiceAdapter for JmapChatAdapter {
                     self.user_id = auth_resp.user.id;
                     log::info!("Chat JMAP: bearer token obtained via token exchange");
                 } else {
-                    // Try direct login with username/password if chatApiBaseUrl
-                    // has a /auth/login endpoint. The user_id is used as username
-                    // and display_name as a fallback. This is a best-effort path.
-                    log::info!(
-                        "Chat JMAP: no token endpoint configured, attempting direct login for {user_id}"
-                    );
-
-                    let body = serde_json::json!({
-                        "username": user_id,
-                        "password": display_name,
-                    });
-
-                    let response = self
-                        .http
-                        .post(self.login_url())
-                        .json(&body)
-                        .send()
-                        .await
-                        .map_err(|e| ChatError::NetworkError(e.to_string()))?;
-
-                    if response.status().is_success() {
-                        let auth_resp: AuthLoginResponse = response
-                            .json()
-                            .await
-                            .map_err(|e| ChatError::NetworkError(e.to_string()))?;
-
-                        self.auth_token = Some(auth_resp.token);
-                        self.user_id = auth_resp.user.id;
-                        log::info!("Chat JMAP: authenticated via direct login");
-                    } else {
-                        log::warn!(
-                            "Chat JMAP: direct login failed with status {}, continuing without auth",
-                            response.status()
-                        );
-                    }
+                    log::warn!("Chat: no auth token endpoint configured for JMAP; requests will be unauthenticated");
                 }
             }
             ChatAuthMode::Cookie => {
@@ -391,6 +369,29 @@ impl ChatServiceAdapter for JmapChatAdapter {
                     room.id,
                     room.name
                 );
+
+                // Best-effort: ensure the current user is a participant.
+                let mut update = serde_json::Map::new();
+                update.insert(
+                    self.user_id.clone(),
+                    serde_json::json!({
+                        "userId": self.user_id,
+                        "displayName": self.display_name,
+                        "role": "member"
+                    }),
+                );
+                let _ = self
+                    .jmap_call(vec![(
+                        "Conversation/setMembers".to_string(),
+                        serde_json::json!({
+                            "accountId": self.user_id,
+                            "conversationId": conv.id,
+                            "update": update,
+                        }),
+                        "sm1".to_string(),
+                    )])
+                    .await;
+
                 return Ok(room);
             }
         }
@@ -400,7 +401,6 @@ impl ChatServiceAdapter for JmapChatAdapter {
             "creatorId": self.user_id,
             "topic": topic,
             "isDirectMessage": false,
-            "initialParticipants": [],
         });
 
         let resp = self
@@ -509,7 +509,10 @@ impl ChatServiceAdapter for JmapChatAdapter {
                     "ChatMessage/get".to_string(),
                     serde_json::json!({
                         "accountId": self.user_id,
-                        "ids": ["#q1"],
+                        "#ids": {
+                            "resultOf": "q1",
+                            "path": "/ids"
+                        },
                     }),
                     "g1".to_string(),
                 ),

@@ -142,19 +142,44 @@ impl ChatConfig {
             ChatError::InvalidConfig(format!("Unknown chatAuthMode: {auth_mode_str}"))
         })?;
 
-        let create_room_endpoint = cfg
-            .chat_create_room_endpoint
+        let protocol = cfg
+            .chat_protocol
             .as_deref()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ChatError::InvalidConfig("chatCreateRoomEndpoint is required".into()))?
+            .unwrap_or("rest")
             .to_string();
 
-        let messages_endpoint = cfg
-            .chat_messages_endpoint
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| ChatError::InvalidConfig("chatMessagesEndpoint is required".into()))?
-            .to_string();
+        let is_jmap = protocol == "jmap";
+
+        let create_room_endpoint = if is_jmap {
+            cfg.chat_create_room_endpoint
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            cfg.chat_create_room_endpoint
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ChatError::InvalidConfig("chatCreateRoomEndpoint is required".into())
+                })?
+                .to_string()
+        };
+
+        let messages_endpoint = if is_jmap {
+            cfg.chat_messages_endpoint
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            cfg.chat_messages_endpoint
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ChatError::InvalidConfig("chatMessagesEndpoint is required".into()))?
+                .to_string()
+        };
 
         let extra_headers = parse_json_map(cfg.chat_extra_headers.as_deref());
         let extra_params = parse_json_map(cfg.chat_extra_params.as_deref());
@@ -175,12 +200,7 @@ impl ChatConfig {
             extra_headers,
             extra_params,
             poll_interval_ms: cfg.chat_poll_interval_ms.unwrap_or(3000),
-            protocol: cfg
-                .chat_protocol
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("rest")
-                .to_string(),
+            protocol,
         })
     }
 }

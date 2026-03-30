@@ -458,7 +458,7 @@ h3 {
   #diagnostics-sidebar .close-button,
   #chat-panel-container .close-button {
     font-size: 28px !important;
-    padding: 5px 10px !important;
+    padding: 0 !important;
     background-color: rgba(255, 255, 255, 0.1) !important;
     border-radius: 50% !important;
     width: 40px !important;
@@ -466,6 +466,7 @@ h3 {
     display: flex !important;
     align-items: center !important;
     justify-content: center !important;
+    line-height: 1 !important;
   }
   #peer-list-container .sidebar-content,
   #diagnostics-sidebar .sidebar-content {
@@ -908,7 +909,8 @@ select {
   color: #fff;
   font-size: 24px;
   cursor: pointer;
-  padding: 0 5px;
+  padding: 0;
+  line-height: 1;
 }
 
 #diagnostics-sidebar .close-button:hover {
@@ -954,6 +956,7 @@ select {
   border-radius: 8px;
   width: 32px;
   height: 32px;
+  padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -961,6 +964,7 @@ select {
   transition: all 0.2s ease;
   color: #ffffff;
   font-size: 1.5rem;
+  line-height: 1;
 }
 
 .close-button:hover {

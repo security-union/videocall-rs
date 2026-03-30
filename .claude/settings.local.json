@@ -50,7 +50,8 @@
       "WebFetch(domain:dioxuslabs.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:docs.rs)",
-      "WebFetch(domain:crates.io)"
+      "WebFetch(domain:crates.io)",
+      "Bash(cargo clippy:*)"
     ]
   }
 }

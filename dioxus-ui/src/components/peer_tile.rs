@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::components::canvas_generator::{generate_for_peer, TileMode};
+use crate::components::canvas_generator::{generate_for_peer, AudioLevels, TileMode};
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
 use futures::future::AbortHandle;
@@ -108,8 +108,10 @@ pub fn PeerTile(
         &client,
         &peer_id,
         full_bleed,
-        level,
-        mic_level,
+        AudioLevels {
+            raw: level,
+            mic: mic_level,
+        },
         host_uid,
         render_mode,
         my_peer_id.as_deref(),
@@ -126,6 +128,7 @@ fn resolve_audio_level(audio_lvl: Option<f32>, speaking: Option<bool>) -> Option
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_diagnostics_event(
     evt: &DiagEvent,
     peer_id: &str,

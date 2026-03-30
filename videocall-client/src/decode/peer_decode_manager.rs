@@ -94,7 +94,8 @@ pub struct Peer {
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
-    heartbeat_count: u8,
+    activity_count: u8,
+    missed_heartbeat_checks: u32,
     pub video_enabled: bool,
     pub audio_enabled: bool,
     pub screen_enabled: bool,
@@ -161,7 +162,8 @@ impl Peer {
             video_canvas_id,
             screen_canvas_id,
             aes,
-            heartbeat_count: 1,
+            activity_count: 1,
+            missed_heartbeat_checks: 0,
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
@@ -370,32 +372,56 @@ impl Peer {
                 let kf_request = self.track_sequence(media_type, &packet);
 
                 if !self.screen_enabled {
-                    if !self.has_received_heartbeat {
-                        // No heartbeat yet — infer screen_enabled from the actual frame.
-                        self.screen_enabled = true;
-                        self.broadcast_peer_status();
-                    } else {
-                        // Peer has screen off per heartbeat; drop straggler frame.
-                        return Ok((media_type, DecodeStatus::SKIPPED, None));
-                    }
+                    // A SCREEN frame arrived while screen_enabled is false.
+                    // This happens when the sender starts sharing before
+                    // the next heartbeat reaches us.  Trust the actual
+                    // media frame over the (stale) heartbeat state —
+                    // dropping the first keyframe here would leave the
+                    // decoder waiting until a PLI round-trip completes.
+                    self.screen_enabled = true;
+                    self.broadcast_peer_status();
                 }
 
                 // Skip screen decoding when the peer tile is not visible.
+                // Still propagate any keyframe request from gap detection so
+                // that the sender starts producing keyframes before the tile
+                // becomes visible again.
                 if !self.visible {
-                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    return Ok((media_type, DecodeStatus::SKIPPED, kf_request));
                 }
 
                 let screen_status = self
                     .screen
                     .decode(&packet)
                     .map_err(|_| PeerDecodeError::ScreenDecodeError)?;
+
+                // If gap detection already requested a keyframe, use that.
+                // Otherwise, proactively request one when the screen decoder
+                // is still waiting for a keyframe (e.g., late joiner starting
+                // mid-stream, or returning from off-screen). Rate-limited to
+                // avoid spamming the sender.
+                let effective_kf_request = if kf_request.is_some() {
+                    kf_request
+                } else if self.screen.is_waiting_for_keyframe() {
+                    let now = now_ms();
+                    let elapsed = now.saturating_sub(self.last_screen_keyframe_request_ms);
+                    if elapsed >= KEYFRAME_REQUEST_MIN_INTERVAL_MS {
+                        self.last_screen_keyframe_request_ms = now;
+                        Some(MediaType::SCREEN)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 Ok((
                     media_type,
                     DecodeStatus {
                         rendered: screen_status._rendered,
                         first_frame: screen_status.first_frame,
                     },
-                    kf_request,
+                    effective_kf_request,
                 ))
             }
             MediaType::HEARTBEAT => {
@@ -404,6 +430,8 @@ impl Peer {
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
                     // Check if video is being turned off (on -> off transition)
                     let video_turned_off = self.video_enabled && !metadata.video_enabled;
+                    // Check if screen is being turned off (on -> off transition)
+                    let screen_turned_off = self.screen_enabled && !metadata.screen_enabled;
                     // Check if audio is being turned off (on -> off transition)
                     let audio_turned_off = self.audio_enabled && !metadata.audio_enabled;
                     // Check if audio state changed at all
@@ -441,6 +469,15 @@ impl Peer {
                         self.audio.flush();
                         debug!(
                             "Flushed audio decoder for peer {} (audio turned off)",
+                            self.session_id
+                        );
+                    }
+
+                    // Flush screen decoder when screen sharing is turned off
+                    if screen_turned_off {
+                        self.screen.flush();
+                        debug!(
+                            "Flushed screen decoder for peer {} (screen turned off)",
                             self.session_id
                         );
                     }
@@ -553,17 +590,39 @@ impl Peer {
         None
     }
 
-    fn on_heartbeat(&mut self) {
-        self.heartbeat_count += 1;
+    /// Record inbound activity from this peer. Called for ALL successfully
+    /// dispatched media types (audio, video, screen, heartbeat) so that any
+    /// traffic counts toward liveness, not just HEARTBEAT packets.
+    fn on_activity(&mut self) {
+        self.activity_count = self.activity_count.saturating_add(1);
     }
 
+    /// Check whether this peer is still alive. Returns `true` if the peer
+    /// should be kept, `false` if it should be removed.
+    ///
+    /// A peer is only considered dead after 3 consecutive checks (~15 seconds
+    /// at the 5-second monitor interval) with zero inbound packets of any
+    /// kind. This tolerates timer phase drift between the local monitor and
+    /// the remote heartbeat sender, as well as transient packet loss.
     pub fn check_heartbeat(&mut self) -> bool {
-        if self.heartbeat_count != 0 {
-            self.heartbeat_count = 0;
+        if self.activity_count > 0 {
+            self.activity_count = 0;
+            self.missed_heartbeat_checks = 0;
             return true;
         }
-        debug!("---@@@--- detected heartbeat stop for {}", self.session_id);
-        false
+        self.missed_heartbeat_checks += 1;
+        if self.missed_heartbeat_checks >= 3 {
+            debug!(
+                "---@@@--- detected heartbeat stop for {} (missed {} consecutive checks)",
+                self.session_id, self.missed_heartbeat_checks
+            );
+            return false;
+        }
+        debug!(
+            "---@@@--- no activity for peer {} (missed {}/3 checks, still alive)",
+            self.session_id, self.missed_heartbeat_checks
+        );
+        true
     }
 }
 
@@ -683,14 +742,23 @@ impl PeerDecodeManager {
         }
     }
 
-    /// Set the canvas element for a peer's screen share decoder
+    /// Set the canvas element for a peer's screen share decoder.
+    ///
+    /// When the canvas is attached and the peer is screen-sharing, a
+    /// keyframe request is sent immediately.  This handles late joiners
+    /// and re-mounts: the first keyframe was decoded before the canvas
+    /// existed, so the decoder needs a fresh one to render.
     pub fn set_peer_screen_canvas(
         &self,
         peer_id: u64,
         canvas: web_sys::HtmlCanvasElement,
     ) -> Result<(), JsValue> {
         if let Some(peer) = self.connected_peers.get(&peer_id) {
-            peer.screen.set_canvas(canvas)
+            peer.screen.set_canvas(canvas)?;
+            if peer.screen_enabled {
+                self.send_keyframe_request(&peer.user_id, MediaType::SCREEN);
+            }
+            Ok(())
         } else {
             Err(JsValue::from_str(&format!("Peer {peer_id} not found")))
         }
@@ -719,10 +787,13 @@ impl PeerDecodeManager {
             }
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _, _)) => {
-                    peer.on_heartbeat();
+                    peer.on_activity();
                     Ok(())
                 }
                 Ok((media_type, decode_status, keyframe_request)) => {
+                    // Any successfully decoded packet (audio, video, screen)
+                    // counts toward liveness, not just heartbeats.
+                    peer.on_activity();
                     if let Some(diagnostics) = &self.diagnostics {
                         diagnostics.track_frame(
                             &peer.sid_str,
@@ -939,7 +1010,7 @@ impl PeerDecodeManager {
             .and_then(|peer| peer.display_name.clone())
     }
 
-    pub fn is_peer_speaking(&self, key: &String) -> bool {
+    pub fn is_peer_speaking(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,
@@ -950,7 +1021,7 @@ impl PeerDecodeManager {
         false
     }
 
-    pub fn peer_audio_level(&self, key: &String) -> f32 {
+    pub fn peer_audio_level(&self, key: &str) -> f32 {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return 0.0,
@@ -1090,7 +1161,8 @@ mod tests {
             video_canvas_id: format!("video-{session_id}"),
             screen_canvas_id: format!("screen-{session_id}"),
             aes: None,
-            heartbeat_count: 1,
+            activity_count: 1,
+            missed_heartbeat_checks: 0,
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
@@ -2238,6 +2310,185 @@ mod tests {
         assert!(
             !should_not_fire,
             "callback should NOT fire for non-matching userid"
+        );
+    }
+
+    // -- Proactive screen keyframe request tests ----------------------------
+
+    /// A late joiner receiving screen frames mid-stream (no prior keyframe)
+    /// should proactively request a keyframe even without a sequence gap.
+    #[wasm_bindgen_test]
+    fn screen_waiting_for_keyframe_triggers_proactive_pli() {
+        let (mut peer, _muted) = make_test_peer(230);
+
+        // Enable screen via heartbeat so the straggler guard doesn't block.
+        let hb = heartbeat_packet(230, false, false, true);
+        let _ = peer.decode(&hb);
+        assert!(peer.screen_enabled);
+
+        // The noop screen decoder always returns is_waiting_for_keyframe() = true,
+        // simulating a late joiner that hasn't decoded a keyframe yet.
+        assert!(peer.screen.is_waiting_for_keyframe());
+
+        // Ensure rate-limit is clear.
+        peer.last_screen_keyframe_request_ms = 0;
+
+        // Send a screen frame — should trigger a proactive keyframe request.
+        let pkt = screen_frame_packet(230);
+        let result = peer.decode(&pkt);
+        assert!(result.is_ok());
+        let (_mt, _status, kf_req) = result.unwrap();
+        assert_eq!(
+            kf_req,
+            Some(MediaType::SCREEN),
+            "Should proactively request screen keyframe when decoder is waiting"
+        );
+    }
+
+    /// Proactive screen keyframe requests should be rate-limited.
+    #[wasm_bindgen_test]
+    fn proactive_screen_pli_is_rate_limited() {
+        let (mut peer, _muted) = make_test_peer(231);
+
+        // Enable screen via heartbeat.
+        let hb = heartbeat_packet(231, false, false, true);
+        let _ = peer.decode(&hb);
+        peer.last_screen_keyframe_request_ms = 0;
+
+        // First frame — triggers proactive PLI.
+        let pkt1 = screen_frame_packet(231);
+        let result1 = peer.decode(&pkt1);
+        assert!(result1.is_ok());
+        let (_, _, kf1) = result1.unwrap();
+        assert_eq!(kf1, Some(MediaType::SCREEN), "First should trigger PLI");
+
+        // Immediately send another — should be rate-limited.
+        let pkt2 = screen_frame_packet(231);
+        let result2 = peer.decode(&pkt2);
+        assert!(result2.is_ok());
+        let (_, _, kf2) = result2.unwrap();
+        assert!(kf2.is_none(), "Second should be rate-limited");
+    }
+
+    /// When a screen tile goes off-screen and returns, a proactive keyframe
+    /// request should be sent since the decoder needs a keyframe to recover.
+    #[wasm_bindgen_test]
+    fn screen_visibility_return_triggers_proactive_pli() {
+        let (mut peer, _muted) = make_test_peer(232);
+
+        // Enable screen via heartbeat.
+        let hb = heartbeat_packet(232, false, false, true);
+        let _ = peer.decode(&hb);
+        assert!(peer.screen_enabled);
+
+        // Go invisible — frames are skipped.
+        peer.visible = false;
+        let pkt1 = screen_frame_packet(232);
+        let result1 = peer.decode(&pkt1);
+        assert!(result1.is_ok());
+        let (_, status1, _) = result1.unwrap();
+        assert!(!status1.rendered, "Invisible frame should be skipped");
+
+        // Restore visibility.
+        peer.visible = true;
+        peer.last_screen_keyframe_request_ms = 0;
+
+        // Next frame — decoder is waiting for keyframe, proactive PLI fires.
+        let pkt2 = screen_frame_packet(232);
+        let result2 = peer.decode(&pkt2);
+        assert!(result2.is_ok());
+        let (_, _, kf_req) = result2.unwrap();
+        assert_eq!(
+            kf_req,
+            Some(MediaType::SCREEN),
+            "Should request keyframe after returning from off-screen"
+        );
+    }
+
+    /// When invisible, gap detection keyframe requests should still be
+    /// propagated so the sender starts producing keyframes before the
+    /// tile becomes visible again.
+    #[wasm_bindgen_test]
+    fn invisible_screen_propagates_gap_keyframe_request() {
+        let (mut peer, _muted) = make_test_peer(233);
+
+        // Enable screen via heartbeat.
+        let hb = heartbeat_packet(233, false, false, true);
+        let _ = peer.decode(&hb);
+
+        // Go invisible.
+        peer.visible = false;
+
+        // Send sequential screen frames with video_metadata to establish baseline.
+        use videocall_types::protos::media_packet::VideoMetadata;
+        let pkt1 = {
+            let media = MediaPacket {
+                media_type: MediaType::SCREEN.into(),
+                user_id: "test@test.com".into(),
+                data: vec![0u8; 10],
+                video_metadata: Some(VideoMetadata {
+                    sequence: 1,
+                    ..Default::default()
+                })
+                .into(),
+                frame_type: "delta".to_string(),
+                ..Default::default()
+            };
+            wrap(&media, 233)
+        };
+        let _ = peer.decode(&pkt1);
+
+        // Introduce a gap.
+        let pkt10 = {
+            let media = MediaPacket {
+                media_type: MediaType::SCREEN.into(),
+                user_id: "test@test.com".into(),
+                data: vec![0u8; 10],
+                video_metadata: Some(VideoMetadata {
+                    sequence: 10,
+                    ..Default::default()
+                })
+                .into(),
+                frame_type: "delta".to_string(),
+                ..Default::default()
+            };
+            wrap(&media, 233)
+        };
+        let _ = peer.decode(&pkt10);
+        assert!(
+            peer.screen_gap_detected_at_ms.is_some(),
+            "Gap should be detected"
+        );
+
+        // Backdate gap and clear rate limit.
+        peer.screen_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_screen_keyframe_request_ms = 0;
+
+        // Next frame while invisible — keyframe request should still propagate.
+        let pkt11 = {
+            let media = MediaPacket {
+                media_type: MediaType::SCREEN.into(),
+                user_id: "test@test.com".into(),
+                data: vec![0u8; 10],
+                video_metadata: Some(VideoMetadata {
+                    sequence: 11,
+                    ..Default::default()
+                })
+                .into(),
+                frame_type: "delta".to_string(),
+                ..Default::default()
+            };
+            wrap(&media, 233)
+        };
+        let result = peer.decode(&pkt11);
+        assert!(result.is_ok());
+        let (_, status, kf_req) = result.unwrap();
+        assert!(!status.rendered, "Should still be invisible/skipped");
+        assert_eq!(
+            kf_req,
+            Some(MediaType::SCREEN),
+            "Gap-based keyframe request should propagate even when invisible"
         );
     }
 }

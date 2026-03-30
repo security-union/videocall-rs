@@ -685,8 +685,6 @@ impl ScreenEncoder {
                                 screen_frame_counter
                             );
                         }
-                        opts.set_key_frame(screen_frame_counter == 0);
-                        screen_frame_counter = (screen_frame_counter + 1) % 50;
 
                         if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
                             error!("Error encoding screen frame: {e:?}");

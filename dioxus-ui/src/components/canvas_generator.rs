@@ -24,7 +24,6 @@ use crate::components::icons::push_pin::PushPinIcon;
 use crate::constants::users_allowed_to_stream;
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
-use dioxus::web::WebEventExt;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
 use wasm_bindgen::prelude::*;
@@ -158,20 +157,30 @@ pub(crate) fn split_layout_decision(
     }
 }
 
+/// Audio level pair passed to [`generate_for_peer`] so the two related
+/// values travel as one argument (keeps the arg count at 7).
+pub struct AudioLevels {
+    /// Raw audio level (0.0–1.0) driving the border/glow intensity.
+    pub raw: f32,
+    /// Mic-held audio level (held 1 s after silence) driving the icon color.
+    pub mic: f32,
+}
+
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
-/// the video tile will occupy the full grid area. The `audio_level` parameter (0.0–1.0) drives
+/// the video tile will occupy the full grid area. The `audio_levels.raw` parameter (0.0–1.0) drives
 /// a glow whose intensity scales with voice volume.
 /// If `host_user_id` matches the peer's authenticated user_id, a crown icon is displayed next to the name.
 pub fn generate_for_peer(
     client: &VideoCallClient,
     key: &String,
     full_bleed: bool,
-    audio_level: f32,
-    mic_audio_level: f32,
+    audio_levels: AudioLevels,
     host_user_id: Option<&str>,
     mode: TileMode,
     my_peer_id: Option<&str>,
 ) -> Element {
+    let audio_level = audio_levels.raw;
+    let mic_audio_level = audio_levels.mic;
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
     let peer_display_name = client
         .get_peer_display_name(key)
@@ -204,13 +213,13 @@ pub fn generate_for_peer(
     // ---- Split-layout: screen-share left panel --------------------------------
     if matches!(mode, TileMode::ScreenOnly) {
         // Don't render the local user's own screen share
-        if !is_screen_share_enabled_for_peer || my_peer_id.map_or(false, |id| id == peer_user_id) {
+        if !is_screen_share_enabled_for_peer || my_peer_id == Some(peer_user_id.as_str()) {
             return rsx! {};
         }
     }
 
     // ---- Split-layout: early return for ScreenOnly / VideoOnly ----------------
-    let is_self_peer = my_peer_id.map_or(false, |id| id == peer_user_id);
+    let is_self_peer = my_peer_id == Some(peer_user_id.as_str());
     let decision = split_layout_decision(&mode, is_screen_share_enabled_for_peer, is_self_peer);
 
     if decision == TileDecision::Empty {

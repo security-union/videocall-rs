@@ -560,3 +560,67 @@ impl ChatServiceAdapter for JmapChatAdapter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jmap_request_serialization() {
+        let req = JmapRequest {
+            using: vec!["urn:ietf:params:jmap:core".to_string()],
+            method_calls: vec![(
+                "ChatMessage/query".to_string(),
+                serde_json::json!({"accountId": "user-1", "limit": 50}),
+                "q1".to_string(),
+            )],
+        };
+
+        let json = serde_json::to_value(&req).expect("should serialize");
+
+        // Verify camelCase field names.
+        assert!(json.get("using").is_some(), "expected 'using' key");
+        assert!(
+            json.get("methodCalls").is_some(),
+            "expected 'methodCalls' key (camelCase)"
+        );
+        assert!(
+            json.get("method_calls").is_none(),
+            "should not have snake_case 'method_calls'"
+        );
+
+        // Verify the `using` array content.
+        let using = json["using"].as_array().expect("using should be an array");
+        assert_eq!(using.len(), 1);
+        assert_eq!(using[0], "urn:ietf:params:jmap:core");
+
+        // Verify the method call tuple structure.
+        let calls = json["methodCalls"]
+            .as_array()
+            .expect("methodCalls should be an array");
+        assert_eq!(calls.len(), 1);
+        let call = calls[0].as_array().expect("each call should be an array");
+        assert_eq!(call.len(), 3);
+        assert_eq!(call[0], "ChatMessage/query");
+        assert_eq!(call[1]["accountId"], "user-1");
+        assert_eq!(call[1]["limit"], 50);
+        assert_eq!(call[2], "q1");
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn parse_timestamp_valid_iso() {
+        let ts = JmapChatAdapter::parse_timestamp("2025-01-15T10:30:00Z");
+        // Should be a positive value representing ms since epoch.
+        assert!(ts > 0.0, "expected positive timestamp, got {ts}");
+        // Rough check: 2025-01-15 is after 2024-01-01 (1704067200000 ms).
+        assert!(ts > 1_704_067_200_000.0);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn parse_timestamp_invalid_string() {
+        let ts = JmapChatAdapter::parse_timestamp("not-a-date");
+        assert_eq!(ts, 0.0, "invalid date should return 0.0");
+    }
+}

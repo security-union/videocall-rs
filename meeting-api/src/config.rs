@@ -149,9 +149,7 @@ impl Config {
         let chat_service_api_key = env::var("CHAT_SERVICE_API_KEY")
             .ok()
             .filter(|s| !s.is_empty());
-        let chat_room_prefix = env::var("CHAT_ROOM_PREFIX")
-            .ok()
-            .unwrap_or_default();
+        let chat_room_prefix = env::var("CHAT_ROOM_PREFIX").ok().unwrap_or_default();
 
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()

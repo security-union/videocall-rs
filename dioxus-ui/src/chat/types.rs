@@ -253,4 +253,150 @@ mod tests {
         assert!(parse_json_map(Some("")).is_empty());
         assert!(parse_json_map(Some("not json")).is_empty());
     }
+
+    /// Helper to build a RuntimeConfig with sensible defaults for testing.
+    fn make_runtime_config() -> RuntimeConfig {
+        RuntimeConfig {
+            api_base_url: "https://api.example.com".to_string(),
+            meeting_api_base_url: None,
+            ws_url: "wss://ws.example.com".to_string(),
+            web_transport_host: "https://wt.example.com".to_string(),
+            oauth_enabled: "false".to_string(),
+            e2ee_enabled: "false".to_string(),
+            web_transport_enabled: "false".to_string(),
+            firefox_enabled: "false".to_string(),
+            users_allowed_to_stream: "".to_string(),
+            oauth_provider: None,
+            server_election_period_ms: 3000,
+            audio_bitrate_kbps: 64,
+            video_bitrate_kbps: 1500,
+            screen_bitrate_kbps: 2500,
+            vad_threshold: 0.02,
+            chat_enabled: "true".to_string(),
+            chat_api_base_url: Some("https://chat.example.com".to_string()),
+            chat_auth_mode: Some("bearer".to_string()),
+            chat_auth_token_endpoint: Some("https://api.example.com/chat/token".to_string()),
+            chat_auth_header_name: None,
+            chat_auth_query_param: None,
+            chat_create_room_endpoint: Some("/rooms".to_string()),
+            chat_messages_endpoint: Some("/rooms/{roomId}/messages".to_string()),
+            chat_web_socket_url: Some("wss://chat.example.com/ws".to_string()),
+            chat_room_prefix: Some("mtg-".to_string()),
+            chat_extra_headers: Some(r#"{"X-Custom":"value"}"#.to_string()),
+            chat_extra_params: Some(r#"{"version":"2"}"#.to_string()),
+            chat_poll_interval_ms: Some(5000),
+            chat_protocol: Some("rest".to_string()),
+        }
+    }
+
+    #[test]
+    fn chat_config_from_runtime_config_all_fields() {
+        let cfg = make_runtime_config();
+        let result = ChatConfig::from_runtime_config(&cfg).expect("should succeed");
+
+        assert_eq!(result.api_base_url, "https://chat.example.com");
+        assert_eq!(result.auth_mode, ChatAuthMode::Bearer);
+        assert_eq!(
+            result.auth_token_endpoint.as_deref(),
+            Some("https://api.example.com/chat/token")
+        );
+        assert_eq!(result.create_room_endpoint, "/rooms");
+        assert_eq!(result.messages_endpoint, "/rooms/{roomId}/messages");
+        assert_eq!(
+            result.web_socket_url.as_deref(),
+            Some("wss://chat.example.com/ws")
+        );
+        assert_eq!(result.room_prefix, "mtg-");
+        assert_eq!(result.extra_headers.get("X-Custom").unwrap(), "value");
+        assert_eq!(result.extra_params.get("version").unwrap(), "2");
+        assert_eq!(result.poll_interval_ms, 5000);
+        assert_eq!(result.protocol, "rest");
+    }
+
+    #[test]
+    fn chat_config_jmap_skips_endpoint_validation() {
+        let mut cfg = make_runtime_config();
+        cfg.chat_protocol = Some("jmap".to_string());
+        cfg.chat_create_room_endpoint = None;
+        cfg.chat_messages_endpoint = None;
+
+        let result =
+            ChatConfig::from_runtime_config(&cfg).expect("JMAP should not require endpoints");
+        assert_eq!(result.protocol, "jmap");
+        assert_eq!(result.create_room_endpoint, "");
+        assert_eq!(result.messages_endpoint, "");
+    }
+
+    #[test]
+    fn chat_config_rest_requires_endpoints() {
+        let mut cfg = make_runtime_config();
+        cfg.chat_protocol = None; // defaults to "rest"
+        cfg.chat_create_room_endpoint = None;
+        cfg.chat_messages_endpoint = Some("/msgs".to_string());
+
+        let result = ChatConfig::from_runtime_config(&cfg);
+        assert!(result.is_err());
+        if let Err(ChatError::InvalidConfig(msg)) = result {
+            assert!(
+                msg.contains("chatCreateRoomEndpoint"),
+                "expected error about chatCreateRoomEndpoint, got: {msg}"
+            );
+        } else {
+            panic!("expected InvalidConfig error");
+        }
+
+        // Also test missing messages endpoint.
+        let mut cfg2 = make_runtime_config();
+        cfg2.chat_protocol = None;
+        cfg2.chat_create_room_endpoint = Some("/rooms".to_string());
+        cfg2.chat_messages_endpoint = None;
+
+        let result2 = ChatConfig::from_runtime_config(&cfg2);
+        assert!(result2.is_err());
+        if let Err(ChatError::InvalidConfig(msg)) = result2 {
+            assert!(
+                msg.contains("chatMessagesEndpoint"),
+                "expected error about chatMessagesEndpoint, got: {msg}"
+            );
+        } else {
+            panic!("expected InvalidConfig error");
+        }
+    }
+
+    #[test]
+    fn chat_config_missing_api_base_url() {
+        let mut cfg = make_runtime_config();
+        cfg.chat_api_base_url = None;
+
+        let result = ChatConfig::from_runtime_config(&cfg);
+        assert!(result.is_err());
+        if let Err(ChatError::InvalidConfig(msg)) = result {
+            assert!(
+                msg.contains("chatApiBaseUrl"),
+                "expected error about chatApiBaseUrl, got: {msg}"
+            );
+        } else {
+            panic!("expected InvalidConfig error");
+        }
+    }
+
+    #[test]
+    fn chat_config_extra_headers_parses_json() {
+        let mut cfg = make_runtime_config();
+        cfg.chat_extra_headers = Some(r#"{"X-Custom":"value","X-Other":"123"}"#.to_string());
+
+        let result = ChatConfig::from_runtime_config(&cfg).expect("should succeed");
+        assert_eq!(result.extra_headers.len(), 2);
+        assert_eq!(result.extra_headers.get("X-Custom").unwrap(), "value");
+        assert_eq!(result.extra_headers.get("X-Other").unwrap(), "123");
+    }
+
+    #[test]
+    fn chat_config_extra_headers_invalid_json_defaults_empty() {
+        let mut cfg = make_runtime_config();
+        cfg.chat_extra_headers = Some("not json".to_string());
+
+        let result = ChatConfig::from_runtime_config(&cfg).expect("should succeed");
+        assert!(result.extra_headers.is_empty());
+    }
 }

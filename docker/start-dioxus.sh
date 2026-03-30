@@ -31,7 +31,8 @@ window.__APP_CONFIG = Object.freeze({
   chatRoomPrefix: "${CHAT_ROOM_PREFIX:-}",
   chatExtraHeaders: "${CHAT_EXTRA_HEADERS:-}",
   chatExtraParams: "${CHAT_EXTRA_PARAMS:-}",
-  chatPollIntervalMs: ${CHAT_POLL_INTERVAL_MS:-3000}
+  chatPollIntervalMs: ${CHAT_POLL_INTERVAL_MS:-3000},
+  chatProtocol: "${CHAT_PROTOCOL:-}",
 });
 EOF
 

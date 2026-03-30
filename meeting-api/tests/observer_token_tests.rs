@@ -36,7 +36,7 @@ use videocall_meeting_types::{
 };
 
 /// Helper: create a meeting (idle state, host has NOT joined).
-async fn setup_idle_meeting(pool: &sqlx::PgPool, room_id: &str) {
+async fn setup_idle_meeting(pool: &meeting_api::db::DbPool, room_id: &str) {
     cleanup_test_data(pool, room_id).await;
 
     let app = build_app(pool.clone());
@@ -54,7 +54,7 @@ async fn setup_idle_meeting(pool: &sqlx::PgPool, room_id: &str) {
 }
 
 /// Helper: create a meeting and have the host join (activates it).
-async fn setup_active_meeting(pool: &sqlx::PgPool, room_id: &str) {
+async fn setup_active_meeting(pool: &meeting_api::db::DbPool, room_id: &str) {
     setup_idle_meeting(pool, room_id).await;
 
     let app = build_app(pool.clone());
@@ -69,7 +69,7 @@ async fn setup_active_meeting(pool: &sqlx::PgPool, room_id: &str) {
 }
 
 /// Helper: create a meeting with waiting room disabled and have the host join.
-async fn setup_active_meeting_no_waiting_room(pool: &sqlx::PgPool, room_id: &str) {
+async fn setup_active_meeting_no_waiting_room(pool: &meeting_api::db::DbPool, room_id: &str) {
     cleanup_test_data(pool, room_id).await;
 
     let app = build_app(pool.clone());

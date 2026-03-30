@@ -50,6 +50,15 @@ pub struct Config {
     /// Internal URLs for fetching version info from peer services.
     /// Used by the aggregated `/api/v1/versions` endpoint.
     pub service_version_urls: Vec<String>,
+    /// External chat service API URL for server-to-server token exchange.
+    /// `None` when chat integration is not configured.
+    pub chat_service_url: Option<String>,
+    /// Server-side API key for authenticating with the external chat service.
+    /// `None` when chat integration is not configured.
+    pub chat_service_api_key: Option<String>,
+    /// Prefix prepended to the meeting ID to form the chat room ID
+    /// (default: `""`). Configure via `CHAT_ROOM_PREFIX` env var.
+    pub chat_room_prefix: String,
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -133,6 +142,15 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
+            .unwrap_or_default();
+
+        // Chat service integration (optional).
+        let chat_service_url = env::var("CHAT_SERVICE_URL").ok().filter(|s| !s.is_empty());
+        let chat_service_api_key = env::var("CHAT_SERVICE_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let chat_room_prefix = env::var("CHAT_ROOM_PREFIX")
+            .ok()
             .unwrap_or_default();
 
         let oauth = env::var("OAUTH_CLIENT_ID")
@@ -219,6 +237,9 @@ impl Config {
             cors_allowed_origin,
             nats_url,
             service_version_urls,
+            chat_service_url,
+            chat_service_api_key,
+            chat_room_prefix,
         })
     }
 

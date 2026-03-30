@@ -33,6 +33,19 @@ videocall-ui:
     audioBitrateKbps: 16
     videoBitrateKbps: 160
     screenBitrateKbps: 160
+    chatEnabled: "false"
+    chatApiBaseUrl: ""
+    chatAuthMode: ""
+    chatAuthTokenEndpoint: ""
+    chatAuthHeaderName: ""
+    chatAuthQueryParam: ""
+    chatCreateRoomEndpoint: ""
+    chatMessagesEndpoint: ""
+    chatWebSocketUrl: ""
+    chatRoomPrefix: ""
+    chatExtraHeaders: ""
+    chatExtraParams: ""
+    chatPollIntervalMs: 3000
 
   service:
     type: ClusterIP

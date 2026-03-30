@@ -47,8 +47,14 @@ pub struct AppState {
     pub nats: Option<async_nats::Client>,
     /// Internal URLs for fetching version info from peer services.
     pub service_version_urls: Vec<String>,
-    /// Shared HTTP client for outbound requests (e.g. version fan-out).
+    /// Shared HTTP client for outbound requests (e.g. version fan-out, chat token exchange).
     pub http_client: reqwest::Client,
+    /// External chat service API URL. `None` when chat is not configured.
+    pub chat_service_url: Option<String>,
+    /// API key for authenticating with the external chat service.
+    pub chat_service_api_key: Option<String>,
+    /// Prefix prepended to meeting IDs to form chat room IDs.
+    pub chat_room_prefix: String,
 }
 
 impl AppState {
@@ -75,6 +81,9 @@ impl AppState {
                 .timeout(std::time::Duration::from_secs(3))
                 .build()
                 .expect("failed to build reqwest client"),
+            chat_service_url: config.chat_service_url.clone(),
+            chat_service_api_key: config.chat_service_api_key.clone(),
+            chat_room_prefix: config.chat_room_prefix.clone(),
         }
     }
 }

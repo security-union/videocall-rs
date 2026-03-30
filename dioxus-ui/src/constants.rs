@@ -42,6 +42,45 @@ pub struct RuntimeConfig {
     pub screen_bitrate_kbps: u32,
     #[serde(rename = "vadThreshold", default = "default_vad_threshold")]
     pub vad_threshold: f32,
+    #[serde(rename = "chatEnabled")]
+    #[serde(default)]
+    pub chat_enabled: String,
+    #[serde(rename = "chatApiBaseUrl")]
+    #[serde(default)]
+    pub chat_api_base_url: Option<String>,
+    #[serde(rename = "chatAuthMode")]
+    #[serde(default)]
+    pub chat_auth_mode: Option<String>,
+    #[serde(rename = "chatAuthTokenEndpoint")]
+    #[serde(default)]
+    pub chat_auth_token_endpoint: Option<String>,
+    #[serde(rename = "chatAuthHeaderName")]
+    #[serde(default)]
+    pub chat_auth_header_name: Option<String>,
+    #[serde(rename = "chatAuthQueryParam")]
+    #[serde(default)]
+    pub chat_auth_query_param: Option<String>,
+    #[serde(rename = "chatCreateRoomEndpoint")]
+    #[serde(default)]
+    pub chat_create_room_endpoint: Option<String>,
+    #[serde(rename = "chatMessagesEndpoint")]
+    #[serde(default)]
+    pub chat_messages_endpoint: Option<String>,
+    #[serde(rename = "chatWebSocketUrl")]
+    #[serde(default)]
+    pub chat_web_socket_url: Option<String>,
+    #[serde(rename = "chatRoomPrefix")]
+    #[serde(default)]
+    pub chat_room_prefix: Option<String>,
+    #[serde(rename = "chatExtraHeaders")]
+    #[serde(default)]
+    pub chat_extra_headers: Option<String>,
+    #[serde(rename = "chatExtraParams")]
+    #[serde(default)]
+    pub chat_extra_params: Option<String>,
+    #[serde(rename = "chatPollIntervalMs")]
+    #[serde(default)]
+    pub chat_poll_interval_ms: Option<u32>,
 }
 
 fn default_vad_threshold() -> f32 {
@@ -112,6 +151,9 @@ pub fn e2ee_enabled() -> Result<bool, String> {
 }
 pub fn firefox_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.firefox_enabled.as_str())))
+}
+pub fn chat_enabled() -> Result<bool, String> {
+    app_config().map(|c| truthy(Some(c.chat_enabled.as_str())))
 }
 
 pub fn users_allowed_to_stream() -> Result<Vec<String>, String> {

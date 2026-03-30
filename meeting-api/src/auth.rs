@@ -136,6 +136,9 @@ mod tests {
             nats: None,
             service_version_urls: Vec::new(),
             http_client: reqwest::Client::new(),
+            chat_service_url: None,
+            chat_service_api_key: None,
+            chat_room_prefix: String::new(),
         }
     }
 

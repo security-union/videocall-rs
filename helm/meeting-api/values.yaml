@@ -82,6 +82,13 @@ env:
   # Adjust service names per region/deployment.
   - name: SERVICE_VERSION_URLS
     value: ""
+  # --- Chat Integration (optional — bearer token exchange) ---
+  - name: CHAT_SERVICE_URL
+    value: ""
+  - name: CHAT_SERVICE_API_KEY
+    value: ""
+  - name: CHAT_ROOM_PREFIX
+    value: ""
 resources:
   limits:
     cpu: "200m"

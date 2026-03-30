@@ -318,6 +318,43 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
 }
 
 // =============================================================================
+// Chat Button
+// =============================================================================
+
+#[component]
+pub fn ChatButton(open: bool, unread_count: u32, onclick: EventHandler<MouseEvent>) -> Element {
+    let class = if open {
+        "video-control-button active"
+    } else {
+        "video-control-button"
+    };
+
+    let tooltip = if open { "Close Chat" } else { "Open Chat" };
+
+    rsx! {
+        button {
+            class,
+            "data-testid": "chat-button",
+            onclick: move |evt| onclick.call(evt),
+            svg {
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" }
+            }
+            span { class: "tooltip", "{tooltip}" }
+            if unread_count > 0 && !open {
+                span { class: "chat-badge", "{unread_count}" }
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Hang Up Button
 // =============================================================================
 

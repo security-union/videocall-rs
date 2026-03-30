@@ -6,6 +6,7 @@
 //! import components. The binary entry-point lives in `main.rs`.
 
 pub mod auth;
+pub mod chat;
 #[allow(non_camel_case_types)]
 pub mod components;
 pub mod constants;

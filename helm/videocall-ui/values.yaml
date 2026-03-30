@@ -50,6 +50,19 @@ runtimeConfig:
   videoBitrateKbps: 1000
   screenBitrateKbps: 1000
   vadThreshold: 0.02
+  chatEnabled: "false"
+  chatApiBaseUrl: ""
+  chatAuthMode: ""
+  chatAuthTokenEndpoint: ""
+  chatAuthHeaderName: ""
+  chatAuthQueryParam: ""
+  chatCreateRoomEndpoint: ""
+  chatMessagesEndpoint: ""
+  chatWebSocketUrl: ""
+  chatRoomPrefix: ""
+  chatExtraHeaders: ""
+  chatExtraParams: ""
+  chatPollIntervalMs: 3000
 
 ingress:
   enabled: true

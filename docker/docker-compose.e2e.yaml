@@ -56,6 +56,9 @@ services:
       - ALLOWED_REDIRECT_URLS=http://localhost:3001
       - NATS_URL=nats:4222
       - RUST_LOG=info
+      - CHAT_SERVICE_URL=
+      - CHAT_SERVICE_API_KEY=
+      - CHAT_ROOM_PREFIX=
       - CARGO_TARGET_DIR=/app/meeting-api/target
       - CARGO_INCREMENTAL=1
     ports:
@@ -138,6 +141,7 @@ services:
       - CARGO_NET_OFFLINE=false
       - OAUTH_PROVIDER=google
       - UI_URL=http://localhost:3001
+      - CHAT_ENABLED=false
     ports:
       - "3001:3001"
     volumes:

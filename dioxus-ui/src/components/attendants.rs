@@ -16,8 +16,10 @@
  * conditions.
  */
 
+use crate::chat::use_chat_state;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
+    chat_panel::ChatPanel,
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
@@ -25,13 +27,14 @@ use crate::components::{
     peer_list::PeerList,
     peer_tile::PeerTile,
     video_control_buttons::{
-        CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
+        CameraButton, ChatButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
         PeerListButton, ScreenShareButton,
     },
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
-    server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
+    chat_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
+    CANVAS_LIMIT,
 };
 use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap};
 use dioxus::prelude::Element as DioxusElement;
@@ -393,6 +396,8 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    let mut chat_open = use_signal(|| false);
+    let chat_state = use_chat_state();
     let encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
@@ -1248,12 +1253,25 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+                                    if chat_enabled().unwrap_or(false) {
+                                        ChatButton {
+                                            open: chat_open(),
+                                            unread_count: 0,
+                                            onclick: move |_| {
+                                                chat_open.set(!chat_open());
+                                                if chat_open() {
+                                                    diagnostics_open.set(false);
+                                                }
+                                            },
+                                        }
+                                    }
                                     PeerListButton {
                                         open: peer_list_open(),
                                         onclick: move |_| {
                                             peer_list_open.set(!peer_list_open());
                                             if peer_list_open() {
                                                 diagnostics_open.set(false);
+                                                chat_open.set(false);
                                             }
                                         },
                                     }
@@ -1263,6 +1281,7 @@ pub fn AttendantsComponent(
                                             diagnostics_open.set(!diagnostics_open());
                                             if diagnostics_open() {
                                                 peer_list_open.set(false);
+                                                chat_open.set(false);
                                             }
                                         },
                                     }
@@ -1273,6 +1292,7 @@ pub fn AttendantsComponent(
                                             if device_settings_open() {
                                                 peer_list_open.set(false);
                                                 diagnostics_open.set(false);
+                                                chat_open.set(false);
                                             }
                                         },
                                     }
@@ -1419,6 +1439,18 @@ pub fn AttendantsComponent(
                 // Meeting ended overlay
                 if let Some(message) = meeting_ended_message() {
                     MeetingEndedOverlay { message: message }
+                }
+
+                // Chat sidebar
+                if chat_enabled().unwrap_or(false) {
+                    ChatPanel {
+                        visible: chat_open(),
+                        on_close: move |_| chat_open.set(false),
+                        meeting_id: id.clone(),
+                        user_id: user_id.clone().unwrap_or_default(),
+                        display_name: display_name.clone(),
+                        chat_state: chat_state,
+                    }
                 }
 
                 // Diagnostics sidebar

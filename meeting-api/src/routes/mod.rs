@@ -13,6 +13,7 @@
 
 //! Axum router configuration for the Meeting Backend API.
 
+pub mod chat;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
@@ -130,6 +131,8 @@ pub fn router() -> Router<AppState> {
             "/api/v1/meetings/{meeting_id}/participants",
             get(participants::get_participants),
         )
+        // Chat token exchange
+        .route("/api/v1/chat/token", post(chat::get_chat_token))
         // Waiting room
         .route(
             "/api/v1/meetings/{meeting_id}/waiting",

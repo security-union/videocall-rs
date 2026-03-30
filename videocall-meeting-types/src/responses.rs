@@ -198,3 +198,19 @@ pub struct ProfileResponse {
     pub user_id: String,
     pub name: String,
 }
+
+/// Response payload for `POST /api/v1/chat/token`.
+///
+/// Contains a chat-service-specific bearer token scoped to a particular
+/// meeting's chat room.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatTokenResponse {
+    /// Bearer token for authenticating with the external chat service.
+    pub token: String,
+    /// Chat room identifier (derived as `chat_room_prefix + meeting_id`).
+    pub room_id: String,
+    /// Unix timestamp (seconds) when the token expires, or `None` if the
+    /// chat service does not provide expiry information.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}

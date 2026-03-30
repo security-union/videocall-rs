@@ -88,3 +88,13 @@ impl Default for ListMeetingsQuery {
         }
     }
 }
+
+/// Request body for `POST /api/v1/chat/token`.
+///
+/// Exchanges the user's videocall session for a chat-service-specific token
+/// scoped to a particular meeting's chat room.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatTokenRequest {
+    /// The meeting whose chat room to obtain a token for.
+    pub meeting_id: String,
+}

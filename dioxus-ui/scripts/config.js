@@ -12,5 +12,18 @@ window.__APP_CONFIG = Object.freeze({
   videoBitrateKbps: 100,
   screenBitrateKbps: 100,
   oauthProvider: "google",
-  vadThreshold: 0.02
+  vadThreshold: 0.02,
+  chatEnabled: "false",
+  chatApiBaseUrl: "",
+  chatAuthMode: "",
+  chatAuthTokenEndpoint: "",
+  chatAuthHeaderName: "",
+  chatAuthQueryParam: "",
+  chatCreateRoomEndpoint: "",
+  chatMessagesEndpoint: "",
+  chatWebSocketUrl: "",
+  chatRoomPrefix: "",
+  chatExtraHeaders: "",
+  chatExtraParams: "",
+  chatPollIntervalMs: 3000
 });

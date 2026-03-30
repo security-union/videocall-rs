@@ -18,7 +18,20 @@ window.__APP_CONFIG = Object.freeze({
   videoBitrateKbps: ${VIDEO_BITRATE_KBPS:-100},
   screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-100},
   oauthProvider: "${OAUTH_PROVIDER:-}",
-  vadThreshold: ${VAD_THRESHOLD:-0.02}
+  vadThreshold: ${VAD_THRESHOLD:-0.02},
+  chatEnabled: "${CHAT_ENABLED:-false}",
+  chatApiBaseUrl: "${CHAT_API_BASE_URL:-}",
+  chatAuthMode: "${CHAT_AUTH_MODE:-}",
+  chatAuthTokenEndpoint: "${CHAT_AUTH_TOKEN_ENDPOINT:-}",
+  chatAuthHeaderName: "${CHAT_AUTH_HEADER_NAME:-}",
+  chatAuthQueryParam: "${CHAT_AUTH_QUERY_PARAM:-}",
+  chatCreateRoomEndpoint: "${CHAT_CREATE_ROOM_ENDPOINT:-}",
+  chatMessagesEndpoint: "${CHAT_MESSAGES_ENDPOINT:-}",
+  chatWebSocketUrl: "${CHAT_WEBSOCKET_URL:-}",
+  chatRoomPrefix: "${CHAT_ROOM_PREFIX:-}",
+  chatExtraHeaders: "${CHAT_EXTRA_HEADERS:-}",
+  chatExtraParams: "${CHAT_EXTRA_PARAMS:-}",
+  chatPollIntervalMs: ${CHAT_POLL_INTERVAL_MS:-3000}
 });
 EOF
 

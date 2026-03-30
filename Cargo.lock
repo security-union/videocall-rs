@@ -8559,10 +8559,12 @@ name = "videocall-ui-dioxus"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "console_error_panic_hook",
  "console_log",
  "dioxus",
  "futures",
+ "getrandom 0.2.16",
  "gloo-timers 0.2.6",
  "gloo-utils 0.1.7",
  "js-sys",
@@ -8573,6 +8575,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen 0.6.5",
  "serde_json",
+ "sha2",
  "urlencoding",
  "videocall-client",
  "videocall-diagnostics",

@@ -94,6 +94,18 @@ pub fn router() -> Router<AppState> {
         // OAuth / session
         .route("/login", get(oauth::login))
         .route("/login/callback", get(oauth::callback))
+        // Client-side OAuth exchange: UI sends {code, code_verifier, nonce} received from the
+        // provider; server performs the token exchange and returns the id_token.
+        .route("/api/v1/oauth/exchange", post(oauth::exchange))
+        // Public: provider config for the browser's PKCE flow (no auth required).
+        // Returns auth_url, token_url, client_id, scopes, and issuer — all
+        // resolved after OIDC discovery so they are correct even when only
+        // OAUTH_ISSUER was set.
+        .route("/api/v1/oauth/provider-config", get(oauth::provider_config))
+        // Authenticated: upsert the user record after a browser-side token
+        // exchange.  The id_token is validated via JWKS by the AuthUser
+        // extractor; no provider access/refresh tokens are stored.
+        .route("/api/v1/user/register", post(oauth::register_user))
         .route("/session", get(oauth::check_session))
         .route("/profile", get(oauth::get_profile))
         .route("/logout", get(oauth::logout))

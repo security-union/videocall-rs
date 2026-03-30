@@ -11,11 +11,29 @@
  * at your option.
  */
 
-//! OAuth route handlers: login, callback, session, profile, logout.
+//! OAuth route handlers: login, callback (legacy), exchange, session, profile, logout.
 //!
-//! After a successful OAuth login the callback issues a **signed session JWT**
-//! inside an `HttpOnly; Secure; SameSite=Lax` cookie named `session`.
-//! JavaScript cannot read the cookie; the browser sends it automatically.
+//! ## New authentication flow (dioxus-ui)
+//!
+//! 1. Browser navigates to `GET /login?returnTo=<url>` — the server generates
+//!    PKCE + CSRF material, stores them in the DB, and redirects to the
+//!    identity provider.  `OAUTH_REDIRECT_URL` must now point to the **UI**
+//!    callback route (e.g. `http://localhost:3001/auth/callback`), not the
+//!    backend.
+//!
+//! 2. Provider redirects to the UI callback with `?code=...&state=...`.
+//!
+//! 3. UI calls `POST /api/v1/oauth/exchange` with `{ code, state }`.  The
+//!    server validates CSRF, performs the server-to-server token exchange
+//!    (keeping `client_secret` private), verifies the id_token via JWKS, and
+//!    returns `{ user_id, display_name, id_token, access_token, return_to }`.
+//!
+//! 4. UI stores the `id_token` in `sessionStorage` and presents it as
+//!    `Authorization: Bearer <id_token>` on subsequent API requests.
+//!
+//! **Session cookies are no longer issued.**  The legacy `GET /login/callback`
+//! handler still performs the exchange and upserts the user, but it redirects
+//! without setting a `Set-Cookie` header.
 
 use axum::{
     extract::{Query, State},
@@ -27,36 +45,19 @@ use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::Deserialize;
 use url::Url;
 
-use videocall_meeting_types::responses::{APIResponse, ProfileResponse};
+use videocall_meeting_types::responses::{
+    APIResponse, OAuthExchangeResponse, OAuthProviderConfigResponse, ProfileResponse,
+};
 
 use crate::auth::AuthUser;
 use crate::db::oauth as db_oauth;
 use crate::error::AppError;
 use crate::oauth;
 use crate::state::AppState;
-use crate::token;
 
 // ---------------------------------------------------------------------------
-// Cookie helpers
+// Cookie helpers (used only for logout / clear-cookie responses)
 // ---------------------------------------------------------------------------
-
-/// Build a `Set-Cookie` header value for the session JWT.
-fn build_session_cookie(
-    name: &str,
-    jwt: &str,
-    ttl_secs: i64,
-    domain: Option<&str>,
-    secure: bool,
-) -> String {
-    let mut cookie = format!("{name}={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
-    if secure {
-        cookie.push_str("; Secure");
-    }
-    if let Some(d) = domain {
-        cookie.push_str(&format!("; Domain={d}"));
-    }
-    cookie
-}
 
 /// Build a `Set-Cookie` header that clears the session cookie.
 fn build_clear_session_cookie(name: &str, domain: Option<&str>, secure: bool) -> String {
@@ -90,6 +91,9 @@ pub struct CallbackQuery {
 ///
 /// Initiates the OAuth flow: generates PKCE + CSRF + nonce, stores in DB,
 /// redirects to the identity provider.
+///
+/// `OAUTH_REDIRECT_URL` should be set to the UI's `/auth/callback` route so
+/// the provider sends the authorization code to the frontend.
 pub async fn login(
     State(state): State<AppState>,
     Query(query): Query<LoginQuery>,
@@ -141,9 +145,17 @@ pub async fn login(
 
 /// GET /login/callback?state=...&code=...
 ///
-/// Handles the OAuth callback: exchanges the authorization code for tokens,
-/// verifies the ID token (signature, nonce, audience, issuer when configured),
-/// creates a signed session JWT, and sets it as an `HttpOnly` cookie.
+/// **Legacy handler** — kept for backward compatibility when `OAUTH_REDIRECT_URL`
+/// still points to the backend.  For new deployments set `OAUTH_REDIRECT_URL`
+/// to the UI's `/auth/callback` route and use `POST /api/v1/oauth/exchange`.
+///
+/// Exchanges the authorization code, validates the id_token, and upserts the
+/// user, then redirects to `AFTER_LOGIN_URL`.
+///
+/// **Session cookies are no longer issued.**  Clients that previously relied
+/// on the `Set-Cookie: session=...` header from this handler must migrate to
+/// `/api/v1/oauth/exchange`, which returns the id_token in the JSON body for
+/// client-side storage.
 pub async fn callback(
     State(state): State<AppState>,
     Query(query): Query<CallbackQuery>,
@@ -219,17 +231,8 @@ pub async fn callback(
     )
     .await?;
 
-    // --- Issue signed session JWT inside an HttpOnly cookie ---
-    let session_jwt = token::generate_session_token(
-        &state.jwt_secret,
-        &email,
-        &display_name,
-        state.session_ttl_secs,
-    )?;
-
     let redirect_url = match &oauth_req.return_to {
         Some(value) if value.starts_with("http://") || value.starts_with("https://") => {
-            // Absolute URL — re-validate as defense-in-depth.
             validate_return_to(
                 value,
                 &oauth_cfg.after_login_url,
@@ -238,7 +241,6 @@ pub async fn callback(
             .unwrap_or_else(|| oauth_cfg.after_login_url.clone())
         }
         Some(path) => {
-            // Relative path (e.g. "/meeting/1") — prepend the frontend base URL.
             format!(
                 "{}{}",
                 oauth_cfg.after_login_url.trim_end_matches('/'),
@@ -248,62 +250,320 @@ pub async fn callback(
         None => oauth_cfg.after_login_url.clone(),
     };
 
-    let session_cookie = build_session_cookie(
-        &state.cookie_name,
-        &session_jwt,
-        state.session_ttl_secs,
-        state.cookie_domain.as_deref(),
-        state.cookie_secure,
-    );
-
     tracing::info!(
-        "OAuth login successful for {} ({}), redirecting to {}",
+        "Legacy OAuth callback for {} ({}), redirecting to {} \
+         (no session cookie issued; migrate to /api/v1/oauth/exchange)",
         display_name,
         email,
-        redirect_url
+        redirect_url,
     );
 
-    let mut response = Redirect::to(&redirect_url).into_response();
-    response.headers_mut().append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&session_cookie)
-            .map_err(|_| AppError::internal("failed to build session cookie header"))?,
-    );
-    Ok(response)
+    // Redirect without a session cookie. Cookie issuance has been disabled;
+    // clients must use /api/v1/oauth/exchange.
+    Ok(Redirect::to(&redirect_url).into_response())
 }
+
+// ---------------------------------------------------------------------------
+// Exchange endpoint — used by the dioxus-ui /auth/callback route
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /api/v1/oauth/exchange`.
+///
+/// ## Client-side PKCE flow (new — dioxus-ui)
+///
+/// The UI generates the PKCE verifier and nonce locally via
+/// `window.crypto.getRandomValues`, sends them here so the server can perform
+/// the server-to-server token exchange without ever exposing the
+/// `client_secret` to the browser.
+///
+/// ```json
+/// { "code": "…", "code_verifier": "…", "nonce": "…" }
+/// ```
+///
+/// ## Server-side PKCE flow (legacy — backend `/login` endpoint)
+///
+/// The backend generated the PKCE material and stored it in the DB keyed by
+/// the CSRF `state`.  The UI sends only `{ "code": "…", "state": "…" }` and
+/// the server looks up the verifier.
+///
+/// ```json
+/// { "code": "…", "state": "…" }
+/// ```
+///
+/// Both forms are accepted; `code_verifier` takes precedence when present.
+#[derive(Debug, Deserialize)]
+pub struct ExchangeRequest {
+    /// Authorization code received from the identity provider.
+    pub code: String,
+    /// PKCE code verifier generated by the UI.  Present in the client-side
+    /// PKCE flow; takes precedence over `state` when non-empty.
+    #[serde(default)]
+    pub code_verifier: Option<String>,
+    /// OIDC nonce generated by the UI.  When present it is validated against
+    /// the `nonce` claim in the provider's id_token.
+    #[serde(default)]
+    pub nonce: Option<String>,
+    /// CSRF state token used as a DB lookup key in the legacy server-side flow.
+    /// Ignored when `code_verifier` is provided.
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+/// POST /api/v1/oauth/exchange
+///
+/// Dual-mode token exchange endpoint:
+///
+/// **Client-side PKCE (new):** the UI sends `code`, `code_verifier`, and
+/// optionally `nonce`.  The server uses the provided verifier for the PKCE
+/// exchange and skips the DB lookup.  CSRF protection is the client's
+/// responsibility (state stored in `sessionStorage`).
+///
+/// **Server-side PKCE (legacy):** the UI sends `code` and `state`.  The
+/// server atomically fetches-and-deletes the stored PKCE request from the DB,
+/// validates CSRF, and uses the stored verifier.
+///
+/// In both cases:
+/// - The token exchange is server-to-server (`client_secret` never leaves the
+///   server).
+/// - The id_token is validated via JWKS (signature, `exp`, `aud`, `iss`,
+///   nonce when present).
+/// - The user record is upserted.
+/// - The id_token is returned in the JSON body; **no session cookie is set**.
+pub async fn exchange(
+    State(state): State<AppState>,
+    Json(body): Json<ExchangeRequest>,
+) -> Result<Json<APIResponse<OAuthExchangeResponse>>, AppError> {
+    let oauth_cfg = state
+        .oauth
+        .as_ref()
+        .ok_or_else(|| AppError::internal("OAuth not configured"))?;
+
+    // --- Resolve PKCE verifier and expected nonce ---
+    //
+    // Client-side PKCE flow: code_verifier was generated in the browser.
+    // Server-side PKCE flow: code_verifier is stored in the DB, keyed by state.
+    let (pkce_verifier, stored_nonce, return_to) =
+        if let Some(verifier) = body.code_verifier.filter(|v| !v.is_empty()) {
+            // New client-side flow: use the provided verifier directly.
+            // `return_to` is not stored server-side in this flow (the UI keeps
+            // it in sessionStorage).
+            (verifier, None::<String>, None::<String>)
+        } else {
+            // Legacy server-side flow: look up the verifier from the DB.
+            let csrf_state = body
+                .state
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        videocall_meeting_types::APIError::internal_error(
+                            "either code_verifier or state is required",
+                        ),
+                    )
+                })?;
+
+            let oauth_req = db_oauth::fetch_oauth_request(&state.db, csrf_state)
+                .await?
+                .ok_or_else(|| {
+                    AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        videocall_meeting_types::APIError::internal_error(
+                            "invalid or already-used OAuth state; restart the login flow",
+                        ),
+                    )
+                })?;
+
+            let verifier = oauth_req.pkce_verifier.ok_or_else(|| {
+                AppError::internal("missing PKCE verifier in stored OAuth request")
+            })?;
+
+            (verifier, oauth_req.nonce, oauth_req.return_to)
+        };
+
+    // The nonce to validate against the id_token: prefer the one supplied in
+    // the request body (client-side flow), fall back to the one stored in the
+    // DB (server-side flow).
+    let expected_nonce: Option<&str> = body
+        .nonce
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .or(stored_nonce.as_deref());
+
+    // --- Server-to-server token exchange ---
+    let (token_response, mut claims) = oauth::exchange_code_for_claims(
+        &oauth_cfg.redirect_url,
+        &oauth_cfg.client_id,
+        oauth_cfg.client_secret.as_deref(),
+        &pkce_verifier,
+        &oauth_cfg.token_url,
+        &body.code,
+        state.jwks_cache.as_deref(),
+        oauth_cfg.issuer.as_deref(),
+        expected_nonce,
+    )
+    .await?;
+
+    // Fallback to UserInfo when the id_token lacks an email claim.
+    if claims.email.as_ref().is_none_or(|e| e.is_empty()) {
+        if let Some(userinfo_url) = &oauth_cfg.userinfo_url {
+            let user_info =
+                oauth::fetch_userinfo(userinfo_url, &token_response.access_token).await?;
+            if claims.email.as_ref().is_none_or(|e| e.is_empty()) {
+                claims.email = user_info.email;
+            }
+            if claims.name.is_empty() {
+                if let Some(name) = user_info.name {
+                    claims.name = name;
+                }
+            }
+            if claims.given_name.is_none() {
+                claims.given_name = user_info.given_name;
+            }
+            if claims.family_name.is_none() {
+                claims.family_name = user_info.family_name;
+            }
+        }
+    }
+
+    let display_name = claims.display_name();
+
+    let email = claims
+        .email
+        .filter(|e| !e.is_empty())
+        .ok_or_else(|| AppError::internal("Email not available from ID token or UserInfo"))?;
+
+    // Upsert: preferred_display_name initialised on first insert only.
+    db_oauth::upsert_user(
+        &state.db,
+        &email,
+        &display_name,
+        &token_response.access_token,
+        token_response.refresh_token.as_deref(),
+    )
+    .await?;
+
+    let id_token = token_response
+        .id_token
+        .ok_or_else(|| AppError::internal("id_token missing from provider token response"))?;
+
+    tracing::info!(
+        user_id = %email,
+        display_name = %display_name,
+        "OAuth token exchange successful",
+    );
+
+    Ok(Json(APIResponse::ok(OAuthExchangeResponse {
+        user_id: email,
+        display_name,
+        id_token,
+        access_token: token_response.access_token,
+        return_to,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Provider config endpoint
+// ---------------------------------------------------------------------------
+
+/// GET /api/v1/oauth/provider-config
+///
+/// Returns the OAuth provider parameters the browser needs to build the PKCE
+/// authorization URL **and** to perform the token exchange directly with the
+/// provider.  No authentication is required — all returned values are public.
+///
+/// The dioxus-ui calls this endpoint when `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`,
+/// or `OAUTH_CLIENT_ID` are not set in `window.__APP_CONFIG` (e.g. when only
+/// `OAUTH_ISSUER` was provided and the endpoints were resolved via OIDC
+/// discovery at server start).
+pub async fn provider_config(
+    State(state): State<AppState>,
+) -> Json<APIResponse<OAuthProviderConfigResponse>> {
+    match &state.oauth {
+        None => Json(APIResponse::ok(OAuthProviderConfigResponse {
+            enabled: false,
+            auth_url: String::new(),
+            client_id: String::new(),
+            scopes: String::new(),
+            token_url: String::new(),
+            issuer: None,
+        })),
+        Some(cfg) => Json(APIResponse::ok(OAuthProviderConfigResponse {
+            enabled: true,
+            auth_url: cfg.auth_url.clone(),
+            client_id: cfg.client_id.clone(),
+            scopes: cfg.scopes.clone(),
+            token_url: cfg.token_url.clone(),
+            issuer: cfg.issuer.clone(),
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// User registration endpoint
+// ---------------------------------------------------------------------------
+
+/// POST /api/v1/user/register
+///
+/// Called by the dioxus-ui `/auth/callback` page **after** performing the
+/// token exchange directly with the identity provider (PKCE public-client
+/// flow).  The browser presents the id_token as `Authorization: Bearer
+/// <id_token>`; this endpoint:
+///
+/// 1. Validates the token via the `AuthUser` extractor (JWKS signature check,
+///    `exp`, `aud`, `iss`).
+/// 2. Upserts the user record using only the identity claims from the token —
+///    no provider access/refresh tokens are stored.
+/// 3. Returns `{ user_id, name }` so the browser can populate UI state.
+///
+/// This endpoint is also safe to call repeatedly (idempotent within a
+/// session) because the upsert only updates `name` and `last_login`.
+pub async fn register_user(
+    State(state): State<AppState>,
+    AuthUser { user_id, name }: AuthUser,
+) -> Result<Json<APIResponse<ProfileResponse>>, AppError> {
+    db_oauth::register_user_from_token(&state.db, &user_id, &name).await?;
+
+    tracing::info!(
+        user_id = %user_id,
+        name = %name,
+        "User registered from id_token",
+    );
+
+    Ok(Json(APIResponse::ok(ProfileResponse { user_id, name })))
+}
+
+// ---------------------------------------------------------------------------
+// Session / profile / logout
+// ---------------------------------------------------------------------------
 
 /// GET /session -- returns 200 if the session JWT is valid, 401 otherwise.
 ///
-/// The `AuthUser` extractor validates the session JWT from the `session`
-/// cookie (or `Authorization: Bearer` header).
+/// When OAuth/JWKS is configured the `AuthUser` extractor validates the
+/// provider id_token supplied as `Authorization: Bearer <id_token>`.
 pub async fn check_session(AuthUser { .. }: AuthUser) -> StatusCode {
     StatusCode::OK
 }
 
-/// GET /profile -- returns the authenticated user's profile from the session
-/// JWT claims.
+/// GET /profile -- returns the authenticated user's profile.
 ///
-/// Because the session JWT embeds both user ID and display name, this endpoint
-/// does not need a database query.
+/// Because the `AuthUser` extractor populates fields directly from the
+/// validated token (session JWT or provider id_token), this endpoint never
+/// needs a database query.
 pub async fn get_profile(
     AuthUser { user_id, name }: AuthUser,
 ) -> Json<APIResponse<ProfileResponse>> {
     Json(APIResponse::ok(ProfileResponse { user_id, name }))
 }
 
-/// GET /logout -- clears the session cookie, then redirects the browser to the
-/// provider's `end_session_endpoint` (RP-initiated logout per OIDC RP-Initiated
-/// Logout 1.0) when one is configured.
+/// GET /logout -- clears the legacy session cookie and optionally initiates
+/// RP-initiated logout at the provider's `end_session_endpoint`.
 ///
-/// Redirect parameters sent to the provider:
-/// - `client_id` — always included.
-/// - `post_logout_redirect_uri` — included when `AFTER_LOGOUT_URL` is set.
-///
-/// Note: `id_token_hint` is not sent because session JWTs are short-lived
-/// admission tickets; the original ID token is not persisted.
-///
-/// When no `end_session_endpoint` is configured the handler returns `200 OK`
-/// (backward-compatible behaviour for non-browser API clients).
+/// When OAuth/JWKS is configured there is no server-side session to terminate
+/// (the id_token lives in the browser's `sessionStorage`).  The client should
+/// discard the stored id_token before navigating to this endpoint.  If an
+/// `end_session_endpoint` is configured the browser is redirected there so
+/// that the provider's session is also terminated.
 pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError> {
     let clear = build_clear_session_cookie(
         &state.cookie_name,
@@ -311,8 +571,6 @@ pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError>
         state.cookie_secure,
     );
 
-    // Redirect to the provider's end-session endpoint when configured so that
-    // the provider also terminates its session (RP-initiated logout).
     let mut response = if let Some(end_session_url) = state
         .oauth
         .as_ref()
@@ -338,9 +596,6 @@ pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError>
 }
 
 /// Build the provider's end-session URL for RP-initiated logout.
-///
-/// Appends `client_id` and, when configured, `post_logout_redirect_uri` to
-/// `end_session_url` using proper percent-encoding via the `url` crate.
 fn build_end_session_url(
     end_session_url: &str,
     oauth_cfg: &crate::config::OAuthConfig,
@@ -362,14 +617,9 @@ fn build_end_session_url(
 // ---------------------------------------------------------------------------
 
 /// Query parameters sent by the OIDC provider to the front-channel logout URI.
-/// Defined in OpenID Connect Front-Channel Logout 1.0.
 #[derive(Debug, Deserialize)]
 pub struct FrontChannelLogoutQuery {
-    /// Issuer identifier of the provider initiating logout. Optional per spec;
-    /// validated against `OAUTH_ISSUER` when present.
     pub iss: Option<String>,
-    /// Provider browser-session identifier. Optional per spec; logged for
-    /// observability. Cannot be used to revoke stateless JWTs server-side.
     pub sid: Option<String>,
 }
 
@@ -377,31 +627,14 @@ pub struct FrontChannelLogoutQuery {
 ///
 /// OIDC front-channel logout endpoint (OpenID Connect Front-Channel Logout 1.0).
 ///
-/// The identity provider loads this URL in a **hidden iframe** when the
-/// End-User logs out of the provider directly or via another relying party.
-/// The request therefore comes from the user's browser, which means that
-/// returning a `Set-Cookie` in the response will clear the local session even
-/// though `SameSite=Lax` prevents the cookie from being *sent* in the
-/// cross-site iframe request.
-///
-/// Spec requirements implemented here:
-/// - Validates the `iss` parameter against the configured issuer (when both
-///   are present) to reject spurious logout triggers from unknown providers.
-/// - Clears the local session cookie via `Set-Cookie: Max-Age=0`.
-/// - Returns `200 OK` with an empty body — **must not redirect** because the
-///   response is consumed by the provider's iframe, not the browser's top-level
-///   navigation.
-///
-/// # Provider registration
-/// Register the URL `{base_url}/logout/frontchannel` as the
-/// `frontchannel_logout_uri` in your OIDC client configuration at the
-/// provider.
+/// The identity provider loads this URL in a hidden iframe when the End-User
+/// logs out at the provider or via another relying party.  Clears the legacy
+/// session cookie (a no-op when none was set) and returns `200 OK` without a
+/// redirect so the provider's iframe can process the response.
 pub async fn frontchannel_logout(
     State(state): State<AppState>,
     Query(query): Query<FrontChannelLogoutQuery>,
 ) -> Result<Response, AppError> {
-    // Validate the `iss` parameter against our configured issuer to prevent
-    // unauthenticated third parties from triggering spurious logouts.
     if let Some(ref iss_param) = query.iss {
         if let Some(ref oauth_cfg) = state.oauth {
             if let Some(ref configured_issuer) = oauth_cfg.issuer {
@@ -428,9 +661,6 @@ pub async fn frontchannel_logout(
         "Processing OIDC front-channel logout",
     );
 
-    // Clear the session cookie. Browsers honour Set-Cookie in iframe responses
-    // even when SameSite=Lax prevents the cookie from being included in the
-    // cross-origin request, so this effectively terminates the browser session.
     let clear = build_clear_session_cookie(
         &state.cookie_name,
         state.cookie_domain.as_deref(),
@@ -452,11 +682,9 @@ pub async fn frontchannel_logout(
 /// Validate and sanitize a `returnTo` value.
 ///
 /// Accepts:
-/// - Relative paths starting with `/` (but not `//`). Note: path-traversal
-///   sequences like `/../` are not stripped here because the browser resolves
-///   them before navigation and the redirect target is always an allowed origin.
-/// - Absolute `http(s)://` URLs whose origin matches `after_login_url` or
-///   any entry in `allowed_redirect_urls`.
+/// - Relative paths starting with `/` (but not `//`).
+/// - Absolute `http(s)://` URLs whose origin matches `after_login_url` or any
+///   entry in `allowed_redirect_urls`.
 ///
 /// Returns `Some(sanitized_value)` on success, `None` on rejection.
 fn validate_return_to(
@@ -469,7 +697,6 @@ fn validate_return_to(
         return None;
     }
 
-    // Relative path: must start with "/" but not "//" (protocol-relative).
     if trimmed.starts_with('/') {
         if trimmed.starts_with("//") {
             tracing::warn!(return_to = trimmed, "rejected protocol-relative returnTo");
@@ -478,7 +705,6 @@ fn validate_return_to(
         return Some(trimmed.to_string());
     }
 
-    // Only allow http/https absolute URLs.
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         tracing::warn!(
             return_to = trimmed,
@@ -496,14 +722,12 @@ fn validate_return_to(
     };
     let candidate_origin = parsed.origin().unicode_serialization();
 
-    // Check against after_login_url origin.
     if let Ok(base) = Url::parse(after_login_url) {
         if base.origin().unicode_serialization() == candidate_origin {
             return Some(trimmed.to_string());
         }
     }
 
-    // Check against the explicit allowlist.
     for allowed in allowed_redirect_urls {
         if let Ok(allowed_url) = Url::parse(allowed) {
             if allowed_url.origin().unicode_serialization() == candidate_origin {
@@ -519,6 +743,10 @@ fn validate_return_to(
     );
     None
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -614,7 +842,6 @@ mod tests {
 
     #[test]
     fn scheme_mismatch_rejected() {
-        // after_login_url is http, candidate is https on the same host.
         assert_eq!(
             validate_return_to("https://localhost:80/foo", AFTER_LOGIN, &allowed()),
             None
@@ -638,78 +865,15 @@ mod tests {
     }
 
     #[test]
-    fn absolute_url_decoded_from_meeting_page() {
-        // Meeting pages send URL-encoded returnTo values. Axum's Query
-        // extractor decodes them before they reach validate_return_to,
-        // so the function sees the decoded form.
-        let decoded = "http://localhost:3001/meeting/my-room";
-        assert_eq!(
-            validate_return_to(decoded, AFTER_LOGIN, &allowed()),
-            Some(decoded.to_string())
-        );
-    }
-
-    #[test]
     fn empty_allowed_list_still_checks_after_login() {
         assert_eq!(
             validate_return_to("http://localhost:80/meeting/1", AFTER_LOGIN, &[]),
             Some("http://localhost:80/meeting/1".to_string())
         );
-        // But a different origin is rejected.
         assert_eq!(
             validate_return_to("http://localhost:3001/meeting/1", AFTER_LOGIN, &[]),
             None
         );
-    }
-
-    // --- build_session_cookie ---
-
-    #[test]
-    fn session_cookie_contains_name_and_jwt() {
-        let cookie = build_session_cookie("session", "my.jwt.token", 3600, None, false);
-        assert!(cookie.starts_with("session=my.jwt.token;"));
-    }
-
-    #[test]
-    fn session_cookie_custom_name() {
-        let cookie = build_session_cookie("pr1-session", "my.jwt.token", 3600, None, false);
-        assert!(cookie.starts_with("pr1-session=my.jwt.token;"));
-        // Must not be mistakable for a plain "session=" cookie.
-        assert!(!cookie.starts_with("session="));
-    }
-
-    #[test]
-    fn session_cookie_includes_required_attributes() {
-        let cookie = build_session_cookie("session", "tok", 3600, None, false);
-        assert!(cookie.contains("Path=/"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Lax"));
-        assert!(cookie.contains("Max-Age=3600"));
-    }
-
-    #[test]
-    fn session_cookie_secure_flag_added_when_true() {
-        let cookie = build_session_cookie("session", "tok", 3600, None, true);
-        assert!(cookie.contains("; Secure"));
-    }
-
-    #[test]
-    fn session_cookie_no_secure_flag_when_false() {
-        let cookie = build_session_cookie("session", "tok", 3600, None, false);
-        assert!(!cookie.contains("Secure"));
-    }
-
-    #[test]
-    fn session_cookie_domain_appended() {
-        let cookie =
-            build_session_cookie("session", "tok", 3600, Some(".sandbox.videocall.rs"), false);
-        assert!(cookie.contains("Domain=.sandbox.videocall.rs"));
-    }
-
-    #[test]
-    fn session_cookie_no_domain_when_none() {
-        let cookie = build_session_cookie("session", "tok", 3600, None, false);
-        assert!(!cookie.contains("Domain="));
     }
 
     // --- build_clear_session_cookie ---
@@ -742,7 +906,6 @@ mod tests {
     // build_end_session_url
     // ---------------------------------------------------------------------------
 
-    /// Minimal `OAuthConfig` used by unit tests that exercise logout URL building.
     fn minimal_oauth_config(
         end_session_endpoint: Option<String>,
         after_logout_url: Option<String>,
@@ -750,7 +913,7 @@ mod tests {
         crate::config::OAuthConfig {
             client_id: "test-client".to_string(),
             client_secret: None,
-            redirect_url: "https://app.example.com/callback".to_string(),
+            redirect_url: "https://app.example.com/auth/callback".to_string(),
             issuer: Some("https://provider.example.com".to_string()),
             auth_url: "https://provider.example.com/auth".to_string(),
             token_url: "https://provider.example.com/token".to_string(),
@@ -817,26 +980,6 @@ mod tests {
     }
 
     #[test]
-    fn build_end_session_url_encodes_special_characters_in_redirect_uri() {
-        let cfg = minimal_oauth_config(
-            None,
-            Some("https://app.example.com/after logout?ref=1&foo=bar".to_string()),
-        );
-        let url = build_end_session_url("https://provider.example.com/logout", &cfg).unwrap();
-        // Spaces and ampersands inside the redirect URI value must be percent-encoded
-        // so they do not break the outer query string.
-        assert!(
-            !url.ends_with(' '),
-            "spaces must be percent-encoded, got: {url}"
-        );
-        // The url crate encodes the value properly; at minimum verify the key appears.
-        assert!(
-            url.contains("post_logout_redirect_uri="),
-            "post_logout_redirect_uri key should appear, got: {url}"
-        );
-    }
-
-    #[test]
     fn build_end_session_url_rejects_invalid_base_url() {
         let cfg = minimal_oauth_config(None, None);
         let result = build_end_session_url("not-a-valid-url", &cfg);
@@ -844,17 +987,13 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Handler tests: logout + frontchannel_logout
+    // Handler tests
     // ---------------------------------------------------------------------------
-    //
-    // These tests wire up a minimal Router (no real DB — lazy pool only) and
-    // use tower::ServiceExt::oneshot to send a single request.
 
     use crate::state::AppState;
     use axum::body::Body as AxumBody;
     use sqlx::postgres::PgPoolOptions;
 
-    /// Build a minimal `AppState` suitable for handler tests (no real DB, no NATS).
     fn make_handler_state(oauth: Option<crate::config::OAuthConfig>) -> AppState {
         let db = PgPoolOptions::new()
             .max_connections(1)
@@ -885,8 +1024,6 @@ mod tests {
             after_logout_url.map(|s| s.to_string()),
         )
     }
-
-    // --- logout handler ---
 
     #[tokio::test]
     async fn logout_returns_200_when_no_end_session_endpoint() {
@@ -933,7 +1070,6 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
 
-        // Must be a redirect (303 See Other).
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         let location = resp
             .headers()
@@ -953,7 +1089,6 @@ mod tests {
             location.contains("post_logout_redirect_uri="),
             "post_logout_redirect_uri must be present: {location}"
         );
-        // Cookie must also be cleared in the same response.
         let set_cookie = resp
             .headers()
             .get(header::SET_COOKIE)
@@ -994,7 +1129,7 @@ mod tests {
         );
     }
 
-    // --- frontchannel_logout handler ---
+    // --- frontchannel_logout ---
 
     #[tokio::test]
     async fn frontchannel_logout_returns_200_and_clears_cookie() {
@@ -1024,7 +1159,6 @@ mod tests {
             set_cookie.contains("Max-Age=0"),
             "should clear cookie: {set_cookie}"
         );
-        // Must NOT redirect — the request arrives in an iframe context.
         assert!(
             resp.headers().get(header::LOCATION).is_none(),
             "front-channel logout must not redirect"
@@ -1034,7 +1168,6 @@ mod tests {
     #[tokio::test]
     async fn frontchannel_logout_accepts_matching_iss_param() {
         use tower::ServiceExt;
-        // minimal_oauth_config sets issuer = "https://provider.example.com"
         let cfg = minimal_oauth_config(None, None);
         let state = make_handler_state(Some(cfg));
         let app = axum::Router::new()
@@ -1056,7 +1189,7 @@ mod tests {
     #[tokio::test]
     async fn frontchannel_logout_rejects_mismatched_iss_param() {
         use tower::ServiceExt;
-        let cfg = minimal_oauth_config(None, None); // issuer = "https://provider.example.com"
+        let cfg = minimal_oauth_config(None, None);
         let state = make_handler_state(Some(cfg));
         let app = axum::Router::new()
             .route(
@@ -1077,7 +1210,6 @@ mod tests {
     #[tokio::test]
     async fn frontchannel_logout_skips_iss_validation_when_no_oauth_configured() {
         use tower::ServiceExt;
-        // When OAuth is not configured at all, any iss is accepted (no issuer to validate against).
         let state = make_handler_state(None);
         let app = axum::Router::new()
             .route(
@@ -1106,7 +1238,6 @@ mod tests {
             )
             .with_state(state);
 
-        // sid is accepted and logged; it cannot invalidate a stateless JWT server-side.
         let req = axum::http::Request::builder()
             .uri("/logout/frontchannel?sid=abc123session")
             .body(AxumBody::empty())

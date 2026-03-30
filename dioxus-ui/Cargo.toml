@@ -44,6 +44,9 @@ serde-wasm-bindgen = "0.6"
 anyhow = "1.0"
 reqwest = { version = "0.12", features = ["json"] }
 urlencoding = "2.1"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = { version = "0.2", features = ["js"] }
 
 [dependencies.web-sys]
 version = "0.3.72"

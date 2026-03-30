@@ -18,7 +18,13 @@ window.__APP_CONFIG = Object.freeze({
   videoBitrateKbps: ${VIDEO_BITRATE_KBPS:-100},
   screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-100},
   oauthProvider: "${OAUTH_PROVIDER:-}",
-  vadThreshold: ${VAD_THRESHOLD:-0.02}
+  vadThreshold: ${VAD_THRESHOLD:-0.02},
+  oauthAuthUrl: "${OAUTH_AUTH_URL:-}",
+  oauthClientId: "${OAUTH_CLIENT_ID:-}",
+  oauthRedirectUrl: "${OAUTH_REDIRECT_URL:-}",
+  oauthScopes: "${OAUTH_SCOPES:-openid email profile}",
+  oauthTokenUrl: "${OAUTH_TOKEN_URL:-}",
+  oauthIssuer: "${OAUTH_ISSUER:-}"
 });
 EOF
 

@@ -72,6 +72,22 @@ services:
       - CARGO_NET_OFFLINE=false
       - OAUTH_PROVIDER=${OAUTH_PROVIDER:-google}
       - UI_URL=${UI_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
+      # OAuth provider parameters for the browser-side PKCE flow.
+      # The UI uses these to build the authorization URL directly without
+      # routing through the backend /login endpoint.
+      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-}
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
+      # The redirect URI registered with the identity provider.  Must point to
+      # the dioxus-ui /auth/callback route.
+      - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}/auth/callback}
+      - OAUTH_SCOPES=${OAUTH_SCOPES:-openid email profile}
+      # Token endpoint and issuer for the browser-side PKCE token exchange.
+      # At least one of these must be set so the callback page can discover
+      # where to POST the authorization code.
+      # If OAUTH_TOKEN_URL is empty the callback falls back to OIDC discovery
+      # via OAUTH_ISSUER, then to /api/v1/oauth/provider-config.
+      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-}
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
     ports:
       - "${DIOXUS_SERVE_PORT:-3001}:${DIOXUS_SERVE_PORT:-3001}"
 

@@ -12,5 +12,6 @@ pub mod constants;
 pub mod context;
 pub mod meeting_api;
 pub mod pages;
+pub mod pkce;
 pub mod routing;
 pub mod types;

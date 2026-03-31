@@ -16,12 +16,13 @@ attempting any of the steps below.
 ### 1. SSH Access
 
 Each developer has a personal account on the remote machine and your SSH public key was persisted in your `~/.ssh/authorized_keys` on the server.
+SSH keys should be created on Ubuntu.
 
 | Developer | Login |
 |-----------|-------|
 | Alena | `alena` |
 | Anhelina | `anhelina` |
-| Ilya | `ilya` |
+| Palina | `palina` |
 
 ```bash
 ssh ilya@vc2.vc2.fnxlabs.com
@@ -31,7 +32,7 @@ ssh ilya@vc2.vc2.fnxlabs.com
 
 You need a Docker Hub account to push images.
 
-1. Go to [https://hub.docker.com/signup](https://hub.docker.com/signup) and create a free account.
+1. Go to [https://hub.docker.com/signup](https://hub.docker.com/signup) and create a free account. Use your personal email for this and select option for personal usage.
 2. Choose a username (e.g. `ilya-hcl`). This becomes your registry prefix.
 3. Once registered, log in from your local machine:
 
@@ -128,7 +129,7 @@ There is a `vc2-values.yaml` override file for each service:
 | Service | Values file |
 |---------|-------------|
 | Meeting API | `./meeting-api/vc2-values.yaml` |
-| Web UI | `./rustlemania-ui/vc2-values.yaml` |
+| Dioxus UI | `./videocall-ui/vc2-values.yaml` |
 | WebSocket backend | `./rustlemania-websocket/vc2-values.yaml` |
 | WebTransport backend | `./rustlemania-webtransport/vc2-values.yaml` |
 
@@ -164,9 +165,9 @@ TEST SUITE: None
 The four upgrade commands (run whichever services you updated):
 
 ```bash
-helm upgrade meeting-api    meeting-api             -f meeting-api/vc2-values.yaml
-helm upgrade ui             rustlemania-ui          -f rustlemania-ui/vc2-values.yaml
-helm upgrade websocket      rustlemania-websocket   -f rustlemania-websocket/vc2-values.yaml
+helm upgrade meeting-api    meeting-api              -f meeting-api/vc2-values.yaml
+helm upgrade dioxus         videocall-ui             -f videocall-ui/vc2-values.yaml
+helm upgrade websocket      rustlemania-websocket    -f rustlemania-websocket/vc2-values.yaml
 helm upgrade webtransport   rustlemania-webtransport -f rustlemania-webtransport/vc2-values.yaml
 ```
 
@@ -194,6 +195,13 @@ Check that the new pod is running and has picked up your image:
 kubectl get pods
 kubectl describe pod <pod-name> | grep Image
 ```
+
+if 'kubectl get pods' doesn't workk use commands
+```
+export KUBECONFIG=~/.kube/config
+kubectl config set-context --current --namespace=videocall
+```
+and after that repeat 'kubectl get pods'.
 
 The app is accessible at https://app.vc2.fnxlabs.com.  Remember you need Cato to access this.
 

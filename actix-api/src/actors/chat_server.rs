@@ -568,6 +568,7 @@ impl Handler<JoinRoom> for ChatServer {
             user_id,
             display_name,
             observer,
+            previous_session_id,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -580,6 +581,62 @@ impl Handler<JoinRoom> for ChatServer {
 
         if self.active_subs.contains_key(&session) {
             return MessageResult(Ok(()));
+        }
+
+        // --- Live session eviction by previous_session_id ---
+        // If the client provides the session_id from its previous connection,
+        // look it up directly in room_members. If found (and it belongs to the
+        // same user), evict the stale session silently so peers don't see a
+        // spurious leave/join. This handles the common case where the client
+        // reconnects before the server's heartbeat timeout detects the old
+        // session is dead.
+        let mut evicted_old_session = false;
+        if let Some(prev_sid) = previous_session_id {
+            // Verify the previous session belongs to the same user_id
+            let user_matches = self
+                .room_members
+                .get(&room)
+                .map(|members| {
+                    members
+                        .iter()
+                        .any(|(sid, uid, _)| *sid == prev_sid && uid == &user_id)
+                })
+                .unwrap_or(false);
+
+            if user_matches && prev_sid != session {
+                info!(
+                    "Live session eviction: user {} in room {} — evicting previous \
+                     session {} in favour of new session {}",
+                    user_id, room, prev_sid, session
+                );
+
+                // Remove old session from room_members
+                if let Some(members) = self.room_members.get_mut(&room) {
+                    members.retain(|(sid, _, _)| *sid != prev_sid);
+                }
+
+                // Abort old NATS subscription
+                if let Some(task) = self.active_subs.remove(&prev_sid) {
+                    task.abort();
+                }
+
+                // Remove old session from sessions map.
+                // The actor will stop on its own when the transport closes
+                // or the heartbeat times out.
+                let _ = self.sessions.remove(&prev_sid);
+
+                // Clean up state maps
+                let _ = self.connection_states.remove(&prev_sid);
+                let _ = self.suppress_join_broadcast.remove(&prev_sid);
+
+                // Cancel any pending departure for this (room, user_id)
+                let departure_key = (room.clone(), user_id.clone());
+                if let Some(pending) = self.pending_departures.remove(&departure_key) {
+                    ctx.cancel_future(pending.spawn_handle);
+                }
+
+                evicted_old_session = true;
+            }
         }
 
         // --- Reconnection grace period: cancel pending departure ---
@@ -609,7 +666,8 @@ impl Handler<JoinRoom> for ChatServer {
         // Mark reconnection and observer sessions so ActivateConnection does not
         // broadcast PARTICIPANT_JOINED for them. Reconnection sessions never
         // "left" from peers' perspective; observers are never announced.
-        if is_reconnection || observer {
+        // Also suppress for instance_id-based evictions (same client instance).
+        if is_reconnection || evicted_old_session || observer {
             self.suppress_join_broadcast.insert(session);
         }
 
@@ -696,7 +754,7 @@ impl Handler<JoinRoom> for ChatServer {
             // Reconnection joins also skip the broadcast (the user never
             // "left" from peers' perspective), and observer joins are
             // never broadcast either.
-            if is_reconnection {
+            if is_reconnection || evicted_old_session {
                 info!(
                     "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {} \
                      (deferred broadcast also skipped)",

@@ -252,11 +252,16 @@ async fn run_webtransport_connection_from_request(
         return Err(anyhow!("Invalid path: must start with /lobby"));
     }
 
-    // Extract ?token= from query string
+    // Extract ?token= and ?previous_session_id= from query string
     let token = uri
         .query_pairs()
         .find(|(key, _)| key == "token")
         .map(|(_, val)| val.into_owned());
+
+    let previous_session_id: Option<u64> = uri
+        .query_pairs()
+        .find(|(key, _)| key == "previous_session_id")
+        .and_then(|(_, val)| val.parse().ok());
 
     // Determine username, room, and observer flag from either the JWT or URL path params.
     let (username, lobby_id, observer, display_name) = if let Some(ref tok) = token {
@@ -322,6 +327,7 @@ async fn run_webtransport_connection_from_request(
         tracker_sender,
         session_manager,
         observer,
+        previous_session_id,
     )
     .await
     {
@@ -346,6 +352,7 @@ async fn handle_webtransport_session(
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
     observer: bool,
+    previous_session_id: Option<u64>,
 ) -> anyhow::Result<()> {
     // Create channel for actor → WebTransport I/O
     let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
@@ -361,6 +368,7 @@ async fn handle_webtransport_session(
         tracker_sender,
         session_manager,
         observer,
+        previous_session_id,
     );
     let actor_addr = actor.start();
 

@@ -64,6 +64,7 @@ impl WsChatSession {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
+        previous_session_id: Option<u64>,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -74,6 +75,7 @@ impl WsChatSession {
             tracker_sender,
             session_manager,
             observer,
+            previous_session_id,
         );
 
         WsChatSession {

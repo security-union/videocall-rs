@@ -306,11 +306,23 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Append `&previous_session_id=<id>` (or `?previous_session_id=<id>`)
+    /// to a URL when reconnecting so the server can evict the stale session.
+    fn append_previous_session_id(&self, url: &str) -> String {
+        if let Some(sid) = *self.own_session_id.borrow() {
+            let separator = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{separator}previous_session_id={sid}")
+        } else {
+            url.to_string()
+        }
+    }
+
     /// Create connections to all configured servers
     fn create_all_connections(&mut self) -> Result<()> {
         // Create WebSocket connections
-        for (i, url) in self.options.websocket_urls.iter().enumerate() {
+        for (i, base_url) in self.options.websocket_urls.iter().enumerate() {
             let conn_id = format!("ws_{i}");
+            let url = self.append_previous_session_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: url.clone(),
                 webtransport_url: String::new(), // Not used for WebSocket
@@ -345,8 +357,9 @@ impl ConnectionManager {
         }
 
         // Create WebTransport connections
-        for (i, url) in self.options.webtransport_urls.iter().enumerate() {
+        for (i, base_url) in self.options.webtransport_urls.iter().enumerate() {
             let conn_id = format!("wt_{i}");
+            let url = self.append_previous_session_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: String::new(), // Not used for WebTransport
                 webtransport_url: url.clone(),

@@ -35,9 +35,14 @@ use tracing::{debug, error};
 use videocall_types::FeatureFlags;
 
 use crate::actors::transports::ws_chat_session::WsChatSession;
-use crate::constants::VALID_ID_PATTERN;
+use crate::constants::{MAX_FRAME_SIZE, VALID_ID_PATTERN};
 use crate::models::AppState;
 use crate::token_validator;
+
+lazy_static::lazy_static! {
+    /// Compiled regex for validating user_id and room in the deprecated path-based endpoint.
+    static ref VALID_ID_RE: regex::Regex = regex::Regex::new(VALID_ID_PATTERN).expect("VALID_ID_PATTERN is a valid regex");
+}
 
 /// Query parameters for the token-based lobby endpoint.
 #[derive(Debug, serde::Deserialize)]
@@ -120,7 +125,7 @@ pub async fn ws_connect_authenticated(
         session_manager,
         observer,
     );
-    let codec = Codec::new().max_size(1_000_000);
+    let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
 }
 
@@ -147,8 +152,7 @@ pub async fn ws_connect(
 
     let user_id_clean = user_id.replace(' ', "_");
     let room_clean = room.replace(' ', "_");
-    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-    if !re.is_match(&user_id_clean) || !re.is_match(&room_clean) {
+    if !VALID_ID_RE.is_match(&user_id_clean) || !VALID_ID_RE.is_match(&room_clean) {
         error!(
             "Invalid user_id or room format: user_id={}, room={}",
             user_id, room
@@ -174,6 +178,6 @@ pub async fn ws_connect(
         session_manager,
         false, // deprecated path-based endpoint: never observer
     );
-    let codec = Codec::new().max_size(1_000_000);
+    let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
 }

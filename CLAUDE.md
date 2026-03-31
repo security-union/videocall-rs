@@ -49,6 +49,16 @@ Run agents in parallel when tasks are independent. Always run `code-reviewer` af
 
 **Never generate your own general-purpose agents.** Only use the agents listed on this roster. If no roster agent fits the task, stop everything and ask the user for direction.
 
+## Change Impact Policy
+
+**This is a real-time video conferencing application used by participants connecting from different parts of the world over varying network conditions.** Every code change must be evaluated with this context:
+
+- **Consider the full lifecycle.** Before changing connection, session, or transport code, trace the complete flow: initial connection, election, reconnection, re-election, graceful disconnect, and crash recovery. Changes that fix one path must not break another.
+- **Consider all transport modes.** Changes to shared connection logic must be validated against both WebTransport and WebSocket paths. A fix for one transport must not introduce regressions in the other.
+- **Consider real-world networks.** Thresholds, timeouts, and retry logic must account for high-latency links (200ms+), packet loss, jitter, and mobile networks — not just localhost. Hardcoded values that only work on fast local connections are bugs.
+- **Consider scale.** Meetings may have many participants. Events that fire per-connection (not per-user) can cause O(n) storms during reconnection waves. Session management, NATS publishing, and UI re-renders must all be evaluated for fan-out cost.
+- **Consider the server as part of the system.** Client-side fixes that rely on server behavior (e.g., session lifecycle, event broadcasting) must verify the server actually upholds those assumptions, and vice versa. Cross-cutting changes require both frontend and backend agents.
+
 ## Source Code Rules
 
 - **No symlinks or hardlinks for source files.** Each crate/UI must own its files independently. Do not use symlinks between source directories.

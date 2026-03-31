@@ -51,7 +51,9 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:crates.io)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(openssl x509:*)",
+      "Bash(docker exec:*)"
     ]
   }
 }

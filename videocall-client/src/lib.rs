@@ -198,6 +198,7 @@ mod media_devices;
 pub mod utils;
 mod wrappers;
 pub use client::{VideoCallClient, VideoCallClientOptions};
+pub use connection::ConnectionState;
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };

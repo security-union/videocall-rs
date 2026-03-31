@@ -119,6 +119,16 @@ impl ChatServer {
                 return;
             }
 
+            if let Some(state) = self.connection_states.get(session_id) {
+                if *state != ConnectionState::Active {
+                    info!(
+                        "Skipping PARTICIPANT_LEFT for non-active session {}",
+                        session_id
+                    );
+                    return;
+                }
+            }
+
             tokio::spawn(async move {
                 match session_manager.end_session(&room_id, &user_id).await {
                     Ok(SessionEndResult::HostEndedMeeting) => {
@@ -1539,6 +1549,14 @@ mod tests {
             .await
             .expect("Message delivery should succeed");
         assert!(result.is_ok(), "Non-observer JoinRoom should succeed");
+
+        // Activate the connection so the state is Active before disconnect
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
 
         // Wait for session setup
         sleep(Duration::from_millis(300)).await;

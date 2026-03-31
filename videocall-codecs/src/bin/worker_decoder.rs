@@ -43,7 +43,7 @@ use videocall_codecs::messages::{VideoStatsMessage, WorkerMessage};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    console, DedicatedWorkerGlobalScope, EncodedVideoChunk, EncodedVideoChunkInit,
+    console, CodecState, DedicatedWorkerGlobalScope, EncodedVideoChunk, EncodedVideoChunkInit,
     EncodedVideoChunkType, VideoDecoder, VideoDecoderConfig, VideoDecoderInit,
     VideoFrame as WebVideoFrame,
 };
@@ -78,20 +78,27 @@ impl WebDecoder {
         let mut decoder_ref = self.decoder.borrow_mut();
         let mut codec_ref = self.current_codec.borrow_mut();
 
-        // Check if we already have a decoder with the same codec
-        if decoder_ref.is_some() && *codec_ref == Some(codec) {
-            return Ok(());
+        // Check if we already have a decoder with the same codec AND it is still usable.
+        // A decoder whose state is Closed (e.g. after an async WebCodecs error) must be
+        // torn down and recreated — returning early here would leave the pipeline permanently
+        // stuck.
+        if let Some(existing) = decoder_ref.as_ref() {
+            if *codec_ref == Some(codec) && existing.state() == CodecState::Configured {
+                return Ok(());
+            }
         }
 
-        // If codec changed, destroy the old decoder
-        if decoder_ref.is_some() && *codec_ref != Some(codec) {
+        // Tear down the old decoder if it exists — either the codec changed or the decoder
+        // entered a non-Configured state (Closed after an error, Unconfigured, etc.).
+        if let Some(decoder) = decoder_ref.take() {
+            let old_state = decoder.state();
             console::log_1(
                 &format!(
-                    "[WORKER] Codec changed from {codec_ref:?} to {codec:?}, reconfiguring decoder"
+                    "[WORKER] Replacing decoder (state={old_state:?}, old_codec={codec_ref:?}, new_codec={codec:?})"
                 )
                 .into(),
             );
-            if let Some(decoder) = decoder_ref.take() {
+            if old_state != CodecState::Closed {
                 let _ = decoder.close();
             }
         }
@@ -150,14 +157,14 @@ impl WebDecoder {
         let mut decoder_ref = self.decoder.borrow_mut();
 
         if let Some(decoder) = decoder_ref.take() {
-            // Attempt to close the decoder. If it is already closed the call may return an
-            // `InvalidStateError`; we simply log and continue.
-            if let Err(e) = decoder.close() {
-                console::error_1(
-                    &format!("[WORKER] Failed to close decoder cleanly: {e:?}").into(),
-                );
-            } else {
-                console::log_1(&"[WORKER] Video decoder closed".into());
+            if decoder.state() != CodecState::Closed {
+                if let Err(e) = decoder.close() {
+                    console::error_1(
+                        &format!("[WORKER] Failed to close decoder cleanly: {e:?}").into(),
+                    );
+                } else {
+                    console::log_1(&"[WORKER] Video decoder closed".into());
+                }
             }
 
             console::log_1(&"[WORKER] Video decoder destroyed".into());
@@ -205,6 +212,20 @@ impl Decodable for WebDecoder {
 
         let decoder_ref = self.decoder.borrow();
         if let Some(decoder) = decoder_ref.as_ref() {
+            // Only decode when the VideoDecoder is in the Configured state.
+            // After a successful initialize_decoder() call this should always be true,
+            // but guard defensively against unexpected browser-side state transitions.
+            if decoder.state() != CodecState::Configured {
+                console::warn_1(
+                    &format!(
+                        "[WORKER] Decoder in unexpected state {:?} after initialization, skipping frame",
+                        decoder.state()
+                    )
+                    .into(),
+                );
+                return;
+            }
+
             let chunk_type = match frame.frame.frame_type {
                 videocall_codecs::frame::FrameType::KeyFrame => EncodedVideoChunkType::Key,
                 videocall_codecs::frame::FrameType::DeltaFrame => EncodedVideoChunkType::Delta,

@@ -20,12 +20,28 @@ use std::time::Duration;
 
 /// How often heartbeat pings are sent
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-/// How long before lack of client response causes a timeout
-pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long before lack of client response causes a timeout.
+/// Set to 30s to tolerate up to 5 missed heartbeat intervals (5s each),
+/// reducing false disconnects on flaky networks.
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Grace period before broadcasting PARTICIPANT_LEFT after a disconnect.
+/// If the same user_id reconnects within this window, the departure is
+/// cancelled silently — no PARTICIPANT_LEFT or PARTICIPANT_JOINED is
+/// broadcast, avoiding false join/leave notification spam.
+pub const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 /// Regex pattern for validating usernames and room IDs
 /// Allows alphanumeric characters, underscores, and hyphens
 pub const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]*$";
+
+/// Maximum incoming frame/stream size in bytes for both WebSocket and WebTransport.
+///
+/// 4 MB accommodates worst-case 1080p VP9 keyframes (1-2 MB raw) plus protobuf
+/// wrapping overhead. The previous 1 MB limit caused session termination when a
+/// participant shared a high-quality 1080p screen, because VP9 keyframes exceeded
+/// the cap and triggered a protocol error that closed the entire connection.
+pub const MAX_FRAME_SIZE: usize = 4_000_000;
 
 // ---------------------------------------------------------------------------
 // Server Congestion Feedback

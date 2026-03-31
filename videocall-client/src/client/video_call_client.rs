@@ -332,6 +332,34 @@ impl VideoCallClient {
     }
 
     pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
+        // Idempotency guard: if a ConnectionController already exists we need
+        // to decide whether to skip (actively connecting/connected) or tear
+        // down a stale controller (failed state) before reconnecting.
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                let state = controller.get_connection_state();
+                match state {
+                    // Election running, connection active, or manager is
+                    // already handling its own reconnection — skip.
+                    ConnectionState::Testing { .. }
+                    | ConnectionState::Connected { .. }
+                    | ConnectionState::Reconnecting { .. } => {
+                        info!(
+                            "connect() called but ConnectionController is in {state:?} state — skipping duplicate connection"
+                        );
+                        return Ok(());
+                    }
+                    // Connection permanently failed — tear down the stale
+                    // controller and create a fresh one below.
+                    ConnectionState::Failed { .. } => {
+                        drop(cc);
+                        info!("connect() called with failed ConnectionController — disconnecting before reconnect");
+                        let _ = self.disconnect();
+                    }
+                }
+            }
+        }
+
         let websocket_count = self.options.websocket_urls.len();
         let webtransport_count = if self.options.enable_webtransport {
             self.options.webtransport_urls.len()
@@ -712,6 +740,36 @@ impl VideoCallClient {
         None
     }
 
+    /// Returns `true` if the client is currently in a reconnecting state.
+    ///
+    /// During reconnection, the server replays the full participant list as
+    /// PARTICIPANT_JOINED events.  The UI can use this to suppress toast
+    /// notifications for these replayed events.
+    pub fn is_reconnecting(&self) -> bool {
+        matches!(
+            self.get_connection_state(),
+            Some(ConnectionState::Reconnecting { .. })
+        )
+    }
+
+    /// Returns `true` if any peer with the given `user_id` is currently
+    /// tracked in the peer decode manager.
+    ///
+    /// This is useful for the UI to decide whether a PARTICIPANT_JOINED
+    /// event represents a genuinely new participant or a reconnection of
+    /// an already-known participant.
+    pub fn has_peer_with_user_id(&self, user_id: &str) -> bool {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.sorted_keys().iter().any(|sid| {
+                inner
+                    .peer_decode_manager
+                    .get(sid)
+                    .is_some_and(|peer| peer.user_id == user_id)
+            }),
+            Err(_) => false,
+        }
+    }
+
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
         if let Ok(cc) = self.connection_controller.try_borrow() {
             if let Some(controller) = cc.as_ref() {
@@ -938,18 +996,23 @@ impl VideoCallClient {
 }
 
 impl Inner {
-    /// Returns `true` if this peer event was already seen recently (within 5 s).
+    /// Returns `true` if this peer event was already seen recently (within 30 s).
     ///
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so the same PARTICIPANT_JOINED / PARTICIPANT_LEFT event can
     /// arrive twice.  This helper deduplicates them so the UI only fires one
     /// toast notification per actual event.
+    ///
+    /// The 30-second window is chosen to outlast the reconnection backoff
+    /// schedule (which can exceed 5 seconds).  A shorter window would allow
+    /// stale "existing member" PARTICIPANT_JOINED events to slip through
+    /// after a reconnect because the dedup entry had already expired.
     fn is_duplicate_peer_event(&mut self, event_type: &str, target_user_id: &str) -> bool {
         let now = js_sys::Date::now();
         let key = (event_type.to_string(), target_user_id.to_string());
 
-        // Evict stale entries (older than 5 seconds).
-        self.recent_peer_events.retain(|_, ts| now - *ts < 5000.0);
+        // Evict stale entries (older than 30 seconds).
+        self.recent_peer_events.retain(|_, ts| now - *ts < 30_000.0);
 
         if let std::collections::hash_map::Entry::Vacant(e) = self.recent_peer_events.entry(key) {
             e.insert(now);

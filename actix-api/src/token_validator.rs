@@ -19,8 +19,17 @@
 //! room and identity match the connection request.
 
 use jsonwebtoken::{DecodingKey, Validation};
+use regex::Regex;
 use std::fmt;
 use videocall_meeting_types::token::RoomAccessTokenClaims;
+
+use crate::constants::VALID_ID_PATTERN;
+
+lazy_static::lazy_static! {
+    /// Compiled regex for validating room identifiers against NATS-safe characters.
+    /// Only allows alphanumeric characters, underscores, and hyphens.
+    static ref VALID_ID_RE: Regex = Regex::new(VALID_ID_PATTERN).expect("VALID_ID_PATTERN is a valid regex");
+}
 
 /// Errors that can occur during room token validation.
 #[derive(Debug)]
@@ -43,6 +52,10 @@ pub enum TokenError {
         token_identity: String,
         requested_identity: String,
     },
+    /// A claim value contains characters that are unsafe for use in NATS subjects
+    /// (dots, wildcards `*` / `>`, spaces, etc.). This indicates either a tampered
+    /// JWT or a bug in the token-issuing service.
+    UnsafeIdentifier { field: String, value: String },
 }
 
 impl fmt::Display for TokenError {
@@ -66,6 +79,10 @@ impl fmt::Display for TokenError {
                 f,
                 "token identity '{token_identity}' does not match '{requested_identity}'"
             ),
+            TokenError::UnsafeIdentifier { field, value } => write!(
+                f,
+                "token {field} '{value}' contains characters unsafe for NATS subjects"
+            ),
         }
     }
 }
@@ -76,7 +93,10 @@ impl TokenError {
     /// Whether this error represents a potentially tampered or forged token
     /// (as opposed to a benign expiration or missing token).
     pub fn is_suspicious(&self) -> bool {
-        matches!(self, TokenError::Invalid(_))
+        matches!(
+            self,
+            TokenError::Invalid(_) | TokenError::UnsafeIdentifier { .. }
+        )
     }
 
     /// Whether the client should receive a 401 (retry with a fresh token) or
@@ -144,6 +164,19 @@ pub fn decode_room_token(secret: &str, token: &str) -> Result<RoomAccessTokenCla
         )?;
 
     let claims = token_data.claims;
+
+    // Reject room names containing NATS-unsafe characters (dots, wildcards,
+    // spaces, etc.). A room like "foo.>" would let an attacker subscribe to
+    // arbitrary NATS subjects. Only alphanumeric, underscore, and hyphen are
+    // allowed. We do NOT validate `sub` (email) here because email addresses
+    // naturally contain `.` and `@`; the `sub` field is not interpolated raw
+    // into NATS subjects the same way `room` is.
+    if !VALID_ID_RE.is_match(&claims.room) {
+        return Err(TokenError::UnsafeIdentifier {
+            field: "room".to_string(),
+            value: claims.room,
+        });
+    }
 
     // Allow connection if the token grants room join permission OR is an
     // observer token. Observers have `room_join: false` but `observer: true`
@@ -398,5 +431,59 @@ mod tests {
         let err = decode_room_token(TEST_SECRET, "not.a.jwt").unwrap_err();
         assert!(err.is_suspicious());
         assert!(!err.is_retryable());
+    }
+
+    // -- NATS subject injection tests --
+
+    #[test]
+    fn room_with_dots_is_rejected() {
+        let token = make_token("alice@test.com", "room.sub.topic", true, 600);
+        let err = decode_room_token(TEST_SECRET, &token).unwrap_err();
+        assert!(matches!(err, TokenError::UnsafeIdentifier { .. }));
+        assert!(err.is_suspicious());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn room_with_wildcard_star_is_rejected() {
+        let token = make_token("alice@test.com", "room-*", true, 600);
+        let err = decode_room_token(TEST_SECRET, &token).unwrap_err();
+        assert!(matches!(err, TokenError::UnsafeIdentifier { .. }));
+    }
+
+    #[test]
+    fn room_with_wildcard_gt_is_rejected() {
+        let token = make_token("alice@test.com", "room->", true, 600);
+        let err = decode_room_token(TEST_SECRET, &token).unwrap_err();
+        assert!(matches!(err, TokenError::UnsafeIdentifier { .. }));
+    }
+
+    #[test]
+    fn room_with_spaces_is_rejected() {
+        let token = make_token("alice@test.com", "room name", true, 600);
+        let err = decode_room_token(TEST_SECRET, &token).unwrap_err();
+        assert!(matches!(err, TokenError::UnsafeIdentifier { .. }));
+    }
+
+    #[test]
+    fn room_with_valid_chars_is_accepted() {
+        let token = make_token("alice@test.com", "My_Room-123", true, 600);
+        let result = decode_room_token(TEST_SECRET, &token);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().room, "My_Room-123");
+    }
+
+    #[test]
+    fn unsafe_identifier_error_is_suspicious_and_not_retryable() {
+        let err = TokenError::UnsafeIdentifier {
+            field: "room".to_string(),
+            value: "evil.>".to_string(),
+        };
+        assert!(err.is_suspicious());
+        assert!(!err.is_retryable());
+        assert_eq!(
+            err.client_message(),
+            "We detected unusual activity from your browser. This incident has been logged."
+        );
     }
 }

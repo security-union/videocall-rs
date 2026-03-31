@@ -369,6 +369,7 @@ mod tests {
                                     tracker_sender,
                                     session_manager,
                                     false, // tests use non-observer sessions
+                                    None,  // no previous_session_id
                                 );
                                 ws::start(actor, &req, stream)
                                     .map_err(actix_web::error::ErrorInternalServerError)

@@ -940,6 +940,7 @@ mod tests {
                 user_id: SYSTEM_USER_ID.to_string(),
                 display_name: SYSTEM_USER_ID.to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -999,6 +1000,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1030,6 +1032,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1089,6 +1092,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1104,6 +1108,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1150,6 +1155,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
+            None, // no previous_session_id
         );
 
         let session2 = SessionLogic::new(
@@ -1161,6 +1167,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
+            None, // no previous_session_id
         );
 
         // Verify they have different session IDs
@@ -1471,6 +1478,7 @@ mod tests {
                 user_id: "alice@example.com".to_string(),
                 display_name: "alice@example.com".to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1579,6 +1587,7 @@ mod tests {
                 user_id: "observer-user@example.com".to_string(),
                 display_name: "observer-user@example.com".to_string(),
                 observer: true,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1673,6 +1682,7 @@ mod tests {
                 user_id: "real-user@example.com".to_string(),
                 display_name: "real-user@example.com".to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1773,6 +1783,7 @@ mod tests {
                 user_id: "testing-user@example.com".to_string(),
                 display_name: "testing-user@example.com".to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1837,6 +1848,7 @@ mod tests {
                 user_id: "testing-dc@example.com".to_string(),
                 display_name: "testing-dc@example.com".to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1943,6 +1955,7 @@ mod tests {
                 user_id: "observer-dc@example.com".to_string(),
                 display_name: "observer-dc@example.com".to_string(),
                 observer: true,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2050,6 +2063,7 @@ mod tests {
                 user_id: "real-dc@example.com".to_string(),
                 display_name: "real-dc@example.com".to_string(),
                 observer: false,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2170,6 +2184,7 @@ mod tests {
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
                 observer: true,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2187,6 +2202,7 @@ mod tests {
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
                 observer: true,
+                previous_session_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2197,7 +2213,10 @@ mod tests {
         );
     }
 
-    // Helper message to get connection state for testing
+    // ======================================================================
+    // Test helper messages for inspecting ChatServer internal state
+    // ======================================================================
+
     #[derive(ActixMessage)]
     #[rtype(result = "Result<ConnectionState, ()>")]
     struct GetConnectionState {
@@ -2214,5 +2233,585 @@ mod tests {
                 .copied()
                 .unwrap_or(ConnectionState::Testing))
         }
+    }
+
+    /// Returns all (session_id, user_id, display_name) tuples for a given room.
+    #[derive(ActixMessage)]
+    #[rtype(result = "Vec<(SessionId, String, String)>")]
+    struct GetRoomMembers {
+        room: String,
+    }
+
+    impl Handler<GetRoomMembers> for ChatServer {
+        type Result = MessageResult<GetRoomMembers>;
+
+        fn handle(&mut self, msg: GetRoomMembers, _ctx: &mut Self::Context) -> Self::Result {
+            MessageResult(
+                self.room_members
+                    .get(&msg.room)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        }
+    }
+
+    /// Check whether a session is in the suppress_join_broadcast set.
+    #[derive(ActixMessage)]
+    #[rtype(result = "bool")]
+    struct IsSuppressedJoinBroadcast {
+        session: SessionId,
+    }
+
+    impl Handler<IsSuppressedJoinBroadcast> for ChatServer {
+        type Result = bool;
+
+        fn handle(
+            &mut self,
+            msg: IsSuppressedJoinBroadcast,
+            _ctx: &mut Self::Context,
+        ) -> Self::Result {
+            self.suppress_join_broadcast.contains(&msg.session)
+        }
+    }
+
+    /// Check whether a session is registered in the sessions map.
+    #[derive(ActixMessage)]
+    #[rtype(result = "bool")]
+    struct HasSession {
+        session: SessionId,
+    }
+
+    impl Handler<HasSession> for ChatServer {
+        type Result = bool;
+
+        fn handle(&mut self, msg: HasSession, _ctx: &mut Self::Context) -> Self::Result {
+            self.sessions.contains_key(&msg.session)
+        }
+    }
+
+    /// Check whether a session has an active NATS subscription.
+    #[derive(ActixMessage)]
+    #[rtype(result = "bool")]
+    struct HasActiveSub {
+        session: SessionId,
+    }
+
+    impl Handler<HasActiveSub> for ChatServer {
+        type Result = bool;
+
+        fn handle(&mut self, msg: HasActiveSub, _ctx: &mut Self::Context) -> Self::Result {
+            self.active_subs.contains_key(&msg.session)
+        }
+    }
+
+    // ======================================================================
+    // Helper: connect + join a session, returning Ok or panicking
+    // ======================================================================
+    async fn connect_and_join(
+        chat_server: &actix::Addr<ChatServer>,
+        session_id: SessionId,
+        room: &str,
+        user_id: &str,
+        addr: actix::Recipient<Message>,
+        previous_session_id: Option<u64>,
+    ) {
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr,
+            })
+            .await
+            .expect("Connect should succeed");
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                previous_session_id,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result.is_ok(),
+            "JoinRoom should succeed for session {session_id}, got: {result:?}"
+        );
+    }
+
+    // ======================================================================
+    // Session eviction via previous_session_id — integration tests
+    // ======================================================================
+
+    // ------------------------------------------------------------------
+    // TEST 1: Basic eviction — Session B evicts Session A (same user_id)
+    // ------------------------------------------------------------------
+    // Session A joins a room. Session B joins the same room with the same
+    // user_id and previous_session_id = A's session. Verify:
+    //   - Session A is removed from room_members
+    //   - Session B is present in room_members
+    //   - PARTICIPANT_JOINED is suppressed for Session B
+    #[actix_rt::test]
+    #[serial]
+    async fn test_eviction_basic_same_user() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let room = "eviction-basic";
+        let user_id = "alice@example.com";
+        let session_a: SessionId = 5001;
+        let session_b: SessionId = 5002;
+
+        // Session A joins normally (no previous_session_id)
+        let dummy_a = DummySession.start();
+        connect_and_join(
+            &chat_server,
+            session_a,
+            room,
+            user_id,
+            dummy_a.recipient(),
+            None,
+        )
+        .await;
+
+        // Allow the async JoinRoom task to start the NATS subscription
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Verify Session A is in room_members
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(members.len(), 1, "Room should have exactly 1 member");
+        assert_eq!(members[0].0, session_a, "Session A should be in the room");
+
+        // Session B joins with previous_session_id = session_a (same user)
+        let dummy_b = DummySession.start();
+        connect_and_join(
+            &chat_server,
+            session_b,
+            room,
+            user_id,
+            dummy_b.recipient(),
+            Some(session_a),
+        )
+        .await;
+
+        // Allow the async JoinRoom task to complete
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Verify Session A is evicted and Session B is in room_members
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(
+            members.len(),
+            1,
+            "Room should have exactly 1 member after eviction"
+        );
+        assert_eq!(
+            members[0].0, session_b,
+            "Session B should be the sole member"
+        );
+
+        // Verify Session A's internal state was cleaned up
+        let has_session_a = chat_server
+            .send(HasSession { session: session_a })
+            .await
+            .expect("HasSession should succeed");
+        assert!(
+            !has_session_a,
+            "Session A should be removed from sessions map"
+        );
+
+        let has_sub_a = chat_server
+            .send(HasActiveSub { session: session_a })
+            .await
+            .expect("HasActiveSub should succeed");
+        assert!(
+            !has_sub_a,
+            "Session A should have no active NATS subscription"
+        );
+
+        // Verify PARTICIPANT_JOINED is suppressed for Session B
+        let suppressed = chat_server
+            .send(IsSuppressedJoinBroadcast { session: session_b })
+            .await
+            .expect("IsSuppressedJoinBroadcast should succeed");
+        assert!(
+            suppressed,
+            "Session B should have PARTICIPANT_JOINED suppressed (eviction reconnect)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TEST 2: Different user_id — no eviction
+    // ------------------------------------------------------------------
+    // Session A joins (user "alice"). Session B joins (user "bob") with
+    // previous_session_id = A's session. Session A must NOT be evicted
+    // because the user_id does not match.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_eviction_different_user_no_eviction() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let room = "eviction-diff-user";
+        let session_a: SessionId = 6001;
+        let session_b: SessionId = 6002;
+
+        // Session A joins as "alice"
+        let dummy_a = DummySession.start();
+        connect_and_join(
+            &chat_server,
+            session_a,
+            room,
+            "alice@example.com",
+            dummy_a.recipient(),
+            None,
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Session B joins as "bob" with previous_session_id pointing to alice's session
+        let dummy_b = DummySession.start();
+        connect_and_join(
+            &chat_server,
+            session_b,
+            room,
+            "bob@example.com",
+            dummy_b.recipient(),
+            Some(session_a),
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Both sessions should be in room_members — alice was NOT evicted
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(
+            members.len(),
+            2,
+            "Room should have 2 members (no eviction across different user_ids)"
+        );
+
+        let session_ids: Vec<SessionId> = members.iter().map(|(sid, _, _)| *sid).collect();
+        assert!(
+            session_ids.contains(&session_a),
+            "Session A (alice) should still be in room_members"
+        );
+        assert!(
+            session_ids.contains(&session_b),
+            "Session B (bob) should be in room_members"
+        );
+
+        // Session A should still be registered (not evicted)
+        let has_session_a = chat_server
+            .send(HasSession { session: session_a })
+            .await
+            .expect("HasSession should succeed");
+        assert!(
+            has_session_a,
+            "Session A should NOT be removed when user_id does not match"
+        );
+
+        // Session B should NOT have suppress_join_broadcast (normal join, not eviction)
+        let suppressed = chat_server
+            .send(IsSuppressedJoinBroadcast { session: session_b })
+            .await
+            .expect("IsSuppressedJoinBroadcast should succeed");
+        assert!(
+            !suppressed,
+            "Session B (different user) should NOT suppress PARTICIPANT_JOINED"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TEST 3: No previous_session_id — normal join flow
+    // ------------------------------------------------------------------
+    // Session joins with previous_session_id = None. Verify it follows
+    // the normal PARTICIPANT_JOINED flow (not suppressed).
+    #[actix_rt::test]
+    #[serial]
+    async fn test_no_previous_session_id_normal_join() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let room = "eviction-no-prev";
+        let session_id: SessionId = 7001;
+
+        let dummy = DummySession.start();
+        connect_and_join(
+            &chat_server,
+            session_id,
+            room,
+            "carol@example.com",
+            dummy.recipient(),
+            None,
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Session should be in room_members
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(members.len(), 1, "Room should have exactly 1 member");
+        assert_eq!(
+            members[0].0, session_id,
+            "The session should be in room_members"
+        );
+
+        // PARTICIPANT_JOINED should NOT be suppressed (normal first join)
+        let suppressed = chat_server
+            .send(IsSuppressedJoinBroadcast {
+                session: session_id,
+            })
+            .await
+            .expect("IsSuppressedJoinBroadcast should succeed");
+        assert!(
+            !suppressed,
+            "Normal join (no previous_session_id) should NOT suppress PARTICIPANT_JOINED"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TEST 4: Non-existent previous_session_id — no crash, normal join
+    // ------------------------------------------------------------------
+    // Session joins with previous_session_id = 99999 which does not exist
+    // in room_members. Verify no panic and the join proceeds normally.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_nonexistent_previous_session_id_no_crash() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let room = "eviction-nonexistent";
+        let session_id: SessionId = 8001;
+
+        let dummy = DummySession.start();
+        connect_and_join(
+            &chat_server,
+            session_id,
+            room,
+            "dave@example.com",
+            dummy.recipient(),
+            Some(99999), // non-existent previous session
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Session should be in room_members despite bogus previous_session_id
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(
+            members.len(),
+            1,
+            "Room should have exactly 1 member after join with non-existent previous_session_id"
+        );
+        assert_eq!(
+            members[0].0, session_id,
+            "The new session should be in room_members"
+        );
+
+        // No eviction occurred, so PARTICIPANT_JOINED should NOT be suppressed
+        let suppressed = chat_server
+            .send(IsSuppressedJoinBroadcast {
+                session: session_id,
+            })
+            .await
+            .expect("IsSuppressedJoinBroadcast should succeed");
+        assert!(
+            !suppressed,
+            "Join with non-existent previous_session_id should NOT suppress PARTICIPANT_JOINED"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TEST 5: Multi-device safe — same user, no previous_session_id
+    // ------------------------------------------------------------------
+    // Session A joins (user "alice", session 100). Session B joins
+    // (user "alice", session 200, previous_session_id = None). Both
+    // should coexist in room_members because multi-device usage is
+    // intentional when no previous_session_id is provided.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_multi_device_safe_coexistence() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let room = "eviction-multidevice";
+        let user_id = "alice@example.com";
+        let session_a: SessionId = 9001;
+        let session_b: SessionId = 9002;
+
+        // Session A joins normally
+        let dummy_a = DummySession.start();
+        connect_and_join(
+            &chat_server,
+            session_a,
+            room,
+            user_id,
+            dummy_a.recipient(),
+            None,
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Session B joins with the same user_id but NO previous_session_id
+        // (multi-device scenario — second tab, second laptop, etc.)
+        let dummy_b = DummySession.start();
+        connect_and_join(
+            &chat_server,
+            session_b,
+            room,
+            user_id,
+            dummy_b.recipient(),
+            None,
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Both sessions should coexist in room_members
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(
+            members.len(),
+            2,
+            "Room should have 2 members (multi-device, same user, no eviction)"
+        );
+
+        let session_ids: Vec<SessionId> = members.iter().map(|(sid, _, _)| *sid).collect();
+        assert!(
+            session_ids.contains(&session_a),
+            "Session A should still be in room_members"
+        );
+        assert!(
+            session_ids.contains(&session_b),
+            "Session B should be in room_members"
+        );
+
+        // Session A should still be registered
+        let has_session_a = chat_server
+            .send(HasSession { session: session_a })
+            .await
+            .expect("HasSession should succeed");
+        assert!(
+            has_session_a,
+            "Session A should still be registered (multi-device, not evicted)"
+        );
+
+        // Neither session should have suppressed PARTICIPANT_JOINED
+        // (both are fresh joins from different devices)
+        let suppressed_a = chat_server
+            .send(IsSuppressedJoinBroadcast { session: session_a })
+            .await
+            .expect("IsSuppressedJoinBroadcast should succeed");
+        assert!(
+            !suppressed_a,
+            "Session A should NOT suppress PARTICIPANT_JOINED"
+        );
+
+        let suppressed_b = chat_server
+            .send(IsSuppressedJoinBroadcast { session: session_b })
+            .await
+            .expect("IsSuppressedJoinBroadcast should succeed");
+        assert!(
+            !suppressed_b,
+            "Session B (multi-device, no previous_session_id) should NOT suppress PARTICIPANT_JOINED"
+        );
     }
 }

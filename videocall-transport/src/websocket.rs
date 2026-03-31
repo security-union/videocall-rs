@@ -5,14 +5,21 @@
 //! adapted to use `videocall_types::Callback` instead of `yew::Callback`.
 
 use anyhow::Error;
+use log::warn;
 use std::fmt;
 use thiserror::Error as ThisError;
 use videocall_types::Callback;
 
+/// Maximum allowed buffered bytes before dropping outbound packets.
+/// When the browser's WebSocket send buffer exceeds this threshold, new sends
+/// are silently dropped to prevent unbounded memory growth on slow networks.
+/// 1 MB matches the congestion-drop behavior used on the WebTransport path.
+const MAX_BUFFERED_AMOUNT: u32 = 1_048_576;
+
 use gloo::events::EventListener;
 use js_sys::Uint8Array;
 use wasm_bindgen::JsCast;
-use web_sys::{BinaryType, Event, MessageEvent, WebSocket};
+use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 
 /// Represents formatting errors.
 #[derive(Debug, ThisError)]
@@ -37,7 +44,15 @@ pub enum WebSocketStatus {
     /// Fired when a WebSocket connection has opened.
     Opened,
     /// Fired when a WebSocket connection has closed.
-    Closed,
+    ///
+    /// Contains an optional `(code, reason)` tuple extracted from the
+    /// browser's `CloseEvent`. Well-known codes include:
+    /// - 1000: normal closure
+    /// - 1006: abnormal closure (network failure, no close frame received)
+    /// - 1008: policy violation (e.g. expired JWT)
+    /// - 1013: try again later (server overload)
+    /// - 4000+: application-specific codes
+    Closed(Option<(u16, String)>),
     /// Fired when a WebSocket connection has failed.
     Error,
 }
@@ -160,8 +175,26 @@ impl WebSocketService {
             notify.emit(WebSocketStatus::Opened);
         };
         let notify = notification.clone();
-        let listener_close = move |_: &Event| {
-            notify.emit(WebSocketStatus::Closed);
+        let listener_close = move |event: &Event| {
+            // Downcast to CloseEvent to extract the close code and reason.
+            // The browser always fires a CloseEvent for the "close" event on
+            // a WebSocket, but we guard with `dyn_ref` in case of unexpected
+            // environments.
+            let close_info = event.dyn_ref::<CloseEvent>().map(|ce| {
+                let code = ce.code();
+                let reason = ce.reason();
+                warn!(
+                    "WebSocket closed: code={}, reason={:?}, was_clean={}",
+                    code,
+                    reason,
+                    ce.was_clean()
+                );
+                (code, reason)
+            });
+            if close_info.is_none() {
+                warn!("WebSocket closed: could not extract CloseEvent details");
+            }
+            notify.emit(WebSocketStatus::Closed(close_info));
         };
         let notify = notification.clone();
         let listener_error = move |_: &Event| {
@@ -230,21 +263,64 @@ where
 }
 
 impl WebSocketTask {
+    /// Returns the number of bytes queued in the browser's WebSocket send buffer.
+    pub fn buffered_amount(&self) -> u32 {
+        self.ws.buffered_amount()
+    }
+
     /// Sends data to a WebSocket connection.
     pub fn send(&mut self, data: String) {
-        let result = self.ws.send_with_str(&data);
-
-        if result.is_err() {
-            self.notification.emit(WebSocketStatus::Error);
+        if !self.is_active() {
+            return;
+        }
+        if self.ws.send_with_str(&data).is_err() {
+            // Only emit Error if the socket is no longer open. A transient
+            // send failure while OPEN (e.g. GC pause, tab backgrounding) should
+            // not cascade into a full disconnect — the browser's own `error`
+            // and `close` event listeners will fire if the connection truly dies.
+            if self.ws.ready_state() != WebSocket::OPEN {
+                self.notification.emit(WebSocketStatus::Error);
+            } else {
+                warn!("WebSocket send_with_str failed but socket still OPEN; dropping packet");
+            }
         }
     }
 
     /// Sends binary data to a WebSocket connection.
+    ///
+    /// If the browser's send buffer already exceeds [`MAX_BUFFERED_AMOUNT`],
+    /// the packet is silently dropped to prevent unbounded memory growth on
+    /// slow networks. This mirrors the congestion-drop behavior used on the
+    /// WebTransport datagram path.
     pub fn send_binary(&self, data: Vec<u8>) {
-        let result = self.ws.send_with_u8_array(&data);
+        if !self.is_active() {
+            return;
+        }
+        let buffered = self.ws.buffered_amount();
+        if buffered > MAX_BUFFERED_AMOUNT {
+            warn!(
+                "WebSocket backpressure: dropping {} byte packet (buffered: {} bytes, threshold: {} bytes)",
+                data.len(),
+                buffered,
+                MAX_BUFFERED_AMOUNT,
+            );
+            return;
+        }
 
-        if result.is_err() {
-            self.notification.emit(WebSocketStatus::Error);
+        if self.ws.send_with_u8_array(&data).is_err() {
+            // Only emit Error if the socket is no longer open. A transient
+            // send failure while OPEN (e.g. GC pause, tab backgrounding on iOS)
+            // should not cascade into a full disconnect — the browser's own
+            // `error` and `close` event listeners will fire if the connection
+            // truly dies.
+            if self.ws.ready_state() != WebSocket::OPEN {
+                self.notification.emit(WebSocketStatus::Error);
+            } else {
+                warn!(
+                    "WebSocket send_with_u8_array failed but socket still OPEN; dropping {} byte packet",
+                    data.len()
+                );
+            }
         }
     }
 }

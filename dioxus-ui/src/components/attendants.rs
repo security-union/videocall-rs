@@ -329,14 +329,14 @@ fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) 
     let mut best_area = 0.0f64;
 
     for cols in 1..=n {
-        let rows = (n + cols - 1) / cols;
+        let rows = n.div_ceil(cols);
         let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
         let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
         if tile_w <= 0.0 || tile_h <= 0.0 {
             continue;
         }
         let aspect = tile_w / tile_h;
-        if aspect > MAX_ASPECT || aspect < 1.0 / MAX_ASPECT {
+        if !(1.0 / MAX_ASPECT..=MAX_ASPECT).contains(&aspect) {
             continue;
         }
         let area = tile_w * tile_h;
@@ -350,7 +350,7 @@ fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) 
     if best_area == 0.0 {
         let mut best_delta = f64::MAX;
         for cols in 1..=n {
-            let rows = (n + cols - 1) / cols;
+            let rows = n.div_ceil(cols);
             let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
             let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
             if tile_w <= 0.0 || tile_h <= 0.0 {
@@ -393,7 +393,7 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
-    let mut encoder_settings = use_signal(|| None::<String>);
+    let encoder_settings = use_signal(|| None::<String>);
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
@@ -411,6 +411,7 @@ pub fn AttendantsComponent(
     let reload_devices_counter = use_signal(|| 0u32);
     let mut device_was_denied = use_signal(|| false);
     let session_loaded = use_signal(|| false);
+    let connecting = use_signal(|| false);
     let local_speaking = use_signal(|| false);
     let local_audio_level = use_signal(|| 0.0f32);
     let mut pending_mic_enable = use_signal(|| false);
@@ -440,7 +441,7 @@ pub fn AttendantsComponent(
 
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
-    let mut peer_status_map: PeerStatusMap = use_signal(|| HashMap::new());
+    let mut peer_status_map: PeerStatusMap = use_signal(HashMap::new);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -581,86 +582,155 @@ pub fn AttendantsComponent(
                 let mut v = waiting_room_version;
                 v.set(v() + 1);
             })),
-            on_peer_left: Some(VcCallback::from(
-                move |(display_name, user_id): (String, String)| {
-                    log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
-                    let mut toast_counter = toast_counter;
-                    let mut peer_toasts = peer_toasts;
-                    let mut toast_version = toast_version;
-                    let id = *toast_counter.peek();
-                    toast_counter.set(id + 1);
-                    let mut current = peer_toasts.peek().clone();
-                    current.push((id, display_name, user_id, false));
-                    peer_toasts.set(current);
-                    {
-                        let v = *toast_version.peek();
-                        toast_version.set(v + 1);
-                    }
-                    // Defer the leave sound: only play if the toast still exists
-                    // after 500ms (i.e. no join event cancelled it).
-                    Timeout::new(500, move || {
-                        if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
-                            play_user_left();
+            on_peer_left: {
+                let client_cell = client_for_reconnect.clone();
+                Some(VcCallback::from(
+                    move |(display_name, user_id): (String, String)| {
+                        log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+
+                        // Suppress toast if the client is reconnecting — the server
+                        // replays the full member list on each connect, so leave
+                        // events during reconnection are not genuine departures.
+                        let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
+                            if client.is_reconnecting() {
+                                log::debug!(
+                                    "Suppressing leave toast for {} (reconnecting)",
+                                    user_id
+                                );
+                                true
+                            } else if !client.has_peer_with_user_id(&user_id) {
+                                // Peer is not in the tracked list (already removed
+                                // by a previous event) — no toast needed.
+                                log::debug!(
+                                    "Suppressing leave toast for {} (not in peer list)",
+                                    user_id
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if suppress_toast {
+                            return;
                         }
-                    })
-                    .forget();
-                    // Schedule toast removal after 8 seconds.
-                    Timeout::new(8_000, move || {
-                        let updated: Vec<_> = peer_toasts
-                            .peek()
-                            .iter()
-                            .filter(|(tid, _, _, _)| *tid != id)
-                            .cloned()
-                            .collect();
-                        peer_toasts.set(updated);
+
+                        let mut toast_counter = toast_counter;
+                        let mut peer_toasts = peer_toasts;
+                        let mut toast_version = toast_version;
+                        let id = *toast_counter.peek();
+                        toast_counter.set(id + 1);
+                        let mut current = peer_toasts.peek().clone();
+                        current.push((id, display_name, user_id, false));
+                        peer_toasts.set(current);
                         {
                             let v = *toast_version.peek();
                             toast_version.set(v + 1);
                         }
-                    })
-                    .forget();
-                },
-            )),
-            on_peer_joined: Some(VcCallback::from(
-                move |(display_name, user_id): (String, String)| {
-                    log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
-                    let mut toast_counter = toast_counter;
-                    let mut peer_toasts = peer_toasts;
-                    let mut toast_version = toast_version;
-                    // Remove any pending "left" toast for this user (waiting room admission).
-                    let mut current = peer_toasts.peek().clone();
-                    current.retain(|(_, _, uid, is_joined)| !(!is_joined && uid == &user_id));
-                    play_user_joined();
-                    let id = *toast_counter.peek();
-                    toast_counter.set(id + 1);
-                    current.push((id, display_name, user_id, true));
-                    peer_toasts.set(current);
-                    {
-                        let v = *toast_version.peek();
-                        toast_version.set(v + 1);
-                    }
-                    // Force tile re-render so display names appear.
-                    {
-                        let mut v = peer_list_version;
-                        v.set(v() + 1);
-                    }
-                    // Schedule toast removal after 8 seconds.
-                    Timeout::new(8_000, move || {
-                        let updated: Vec<_> = peer_toasts
-                            .peek()
-                            .iter()
-                            .filter(|(tid, _, _, _)| *tid != id)
-                            .cloned()
-                            .collect();
-                        peer_toasts.set(updated);
-                        {
-                            let v = *toast_version.peek();
-                            toast_version.set(v + 1);
+                        // Defer the leave sound: only play if the toast still exists
+                        // after 500ms (i.e. no join event cancelled it).
+                        Timeout::new(500, move || {
+                            if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
+                                play_user_left();
+                            }
+                        })
+                        .forget();
+                        // Schedule toast removal after 8 seconds.
+                        Timeout::new(8_000, move || {
+                            let updated: Vec<_> = peer_toasts
+                                .peek()
+                                .iter()
+                                .filter(|(tid, _, _, _)| *tid != id)
+                                .cloned()
+                                .collect();
+                            peer_toasts.set(updated);
+                            {
+                                let v = *toast_version.peek();
+                                toast_version.set(v + 1);
+                            }
+                        })
+                        .forget();
+                    },
+                ))
+            },
+            on_peer_joined: {
+                let client_cell = client_for_reconnect.clone();
+                Some(VcCallback::from(
+                    move |(display_name, user_id): (String, String)| {
+                        log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+
+                        // Suppress toast if the client is reconnecting — the server
+                        // replays the full member list as PARTICIPANT_JOINED events
+                        // on each connect, so these are not genuine new arrivals.
+                        // Also suppress if this participant is already tracked in the
+                        // peer list (they reconnected, not newly joined).
+                        let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
+                            if client.is_reconnecting() {
+                                log::debug!(
+                                    "Suppressing join toast for {} (reconnecting)",
+                                    user_id
+                                );
+                                true
+                            } else if client.has_peer_with_user_id(&user_id) {
+                                log::debug!(
+                                    "Suppressing join toast for {} (already in peer list)",
+                                    user_id
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        let mut toast_counter = toast_counter;
+                        let mut peer_toasts = peer_toasts;
+                        let mut toast_version = toast_version;
+                        // Remove any pending "left" toast for this user (waiting room admission).
+                        let mut current = peer_toasts.peek().clone();
+                        current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
+
+                        if !suppress_toast {
+                            play_user_joined();
+                            let id = *toast_counter.peek();
+                            toast_counter.set(id + 1);
+                            current.push((id, display_name, user_id, true));
+                            peer_toasts.set(current);
+                            {
+                                let v = *toast_version.peek();
+                                toast_version.set(v + 1);
+                            }
+                            // Schedule toast removal after 8 seconds.
+                            Timeout::new(8_000, move || {
+                                let updated: Vec<_> = peer_toasts
+                                    .peek()
+                                    .iter()
+                                    .filter(|(tid, _, _, _)| *tid != id)
+                                    .cloned()
+                                    .collect();
+                                peer_toasts.set(updated);
+                                {
+                                    let v = *toast_version.peek();
+                                    toast_version.set(v + 1);
+                                }
+                            })
+                            .forget();
+                        } else {
+                            peer_toasts.set(current);
                         }
-                    })
-                    .forget();
-                },
-            )),
+
+                        // Always force tile re-render so display names appear,
+                        // even when the toast is suppressed.
+                        {
+                            let mut v = peer_list_version;
+                            v.set(v() + 1);
+                        }
+                    },
+                ))
+            },
         };
 
         let client = VideoCallClient::new(opts);
@@ -726,7 +796,7 @@ pub fn AttendantsComponent(
                 _ => {}
             }
 
-            if session_loaded() {
+            if session_loaded() || connecting() {
                 if mic_error.read().is_some() {
                     mic_enabled.set(false);
                     pending_mic_enable.set(false);
@@ -739,6 +809,8 @@ pub fn AttendantsComponent(
                 show_device_warning.set(true);
                 meeting_joined.set(false);
             } else {
+                let mut connecting = connecting;
+                connecting.set(true);
                 if let Err(e) = client_cell.borrow_mut().connect() {
                     log::error!("Connection failed: {e:?}");
                 }
@@ -759,6 +831,10 @@ pub fn AttendantsComponent(
         use_effect(move || {
             let value = mda.clone();
             let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+                if session_loaded() || connecting() {
+                    return;
+                }
+
                 let mic_denied = matches!(
                     mic_error.read().as_ref(),
                     Some(MediaErrorState::PermissionDenied)

@@ -91,12 +91,14 @@
           pkgs.nasm
         ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
           pkgs.libvpx
+          pkgs.libopus
           pkgs.alsa-lib
           pkgs.libclang
         ];
 
         backendEnv = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
         };
       in
       {

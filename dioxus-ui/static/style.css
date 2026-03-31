@@ -213,8 +213,28 @@ canvas {
   color: #8a8d91;
 }
 
-.chat-empty-hint,
+.chat-error-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: #ef4444;
+  margin-bottom: 4px;
+}
+
 .chat-error-detail {
+  font-size: 0.85rem;
+  margin-top: 8px;
+  color: #b0b3b8;
+}
+
+.chat-error-hint {
+  font-size: 0.75rem;
+  margin-top: 12px;
+  opacity: 0.6;
+  max-width: 240px;
+  line-height: 1.4;
+}
+
+.chat-empty-hint {
   font-size: 0.8rem;
   margin-top: 8px;
   opacity: 0.7;

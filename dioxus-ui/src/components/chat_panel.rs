@@ -322,14 +322,23 @@ pub fn ChatPanel(
                 div { class: "chat-messages",
                     div { class: "chat-loading",
                         div { class: "loading-spinner", style: "width: 24px; height: 24px;" }
-                        p { "Connecting to chat..." }
+                        p { "Connecting to chat service..." }
                     }
                 }
             } else if let Some(error) = (chat_state.error)() {
                 div { class: "chat-messages",
                     div { class: "chat-error",
-                        p { "Chat unavailable" }
+                        p { class: "chat-error-title", "Chat unavailable" }
                         p { class: "chat-error-detail", "{error}" }
+                        p { class: "chat-error-hint", "Check that the chat service is reachable and properly configured." }
+                    }
+                }
+            } else if !(chat_state.is_connected)() {
+                div { class: "chat-messages",
+                    div { class: "chat-error",
+                        p { class: "chat-error-title", "Unable to connect" }
+                        p { class: "chat-error-detail", "Could not reach the chat service." }
+                        p { class: "chat-error-hint", "The service may be unavailable, or there may be a network or certificate issue." }
                     }
                 }
             } else {

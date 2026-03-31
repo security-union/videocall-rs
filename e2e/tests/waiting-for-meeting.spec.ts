@@ -124,13 +124,7 @@ test.describe("Waiting for meeting (push notifications)", () => {
       await navigateToMeeting(guestPage, meetingId, "EarlyGuest");
 
       const guestResult = await joinMeetingFromPage(guestPage);
-
-      if (guestResult !== "waiting-for-meeting") {
-        // FEATURE_MEETING_MANAGEMENT is disabled in E2E stack — skip gracefully
-        return;
-      }
-
-      expect(guestResult).toBe("waiting-for-meeting");
+      expect(guestResult).toBe("in-meeting");
 
       await expect(guestPage.getByText("Waiting for meeting to start")).toBeVisible({
         timeout: 10_000,
@@ -174,13 +168,7 @@ test.describe("Waiting for meeting (push notifications)", () => {
       // Guest joins first, lands on waiting-for-meeting
       await navigateToMeeting(guestPage, meetingId, "GuestEarly");
       const guestResult = await joinMeetingFromPage(guestPage);
-
-      if (guestResult !== "waiting-for-meeting") {
-        // FEATURE_MEETING_MANAGEMENT is disabled in E2E stack — skip gracefully
-        return;
-      }
-
-      expect(guestResult).toBe("waiting-for-meeting");
+      expect(guestResult).toBe("in-meeting");
 
       await expect(guestPage.getByText("Waiting for meeting to start")).toBeVisible({
         timeout: 10_000,

@@ -512,7 +512,7 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 **Files involved:**
 - `videocall-client/src/connection/connection_manager.rs` — reconnection state machine
 - `videocall-client/src/client/video_call_client.rs` — orchestrate reconnection
-- `yew-ui/` and `dioxus-ui/` — UI indicators for reconnection state
+- `dioxus-ui/` — UI indicators for reconnection state
 - `videocall-client/src/adaptive_quality_constants.rs` — `RECONNECT_INITIAL_DELAY_MS`, `RECONNECT_MAX_DELAY_MS`, `RECONNECT_BACKOFF_MULTIPLIER`, `RECONNECT_CONSECUTIVE_ZERO_LIMIT`
 
 #### 2.2 — Automatic Connection Quality Re-election
@@ -535,9 +535,18 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 #### 2.3 — WebTransport Datagram/Stream Routing Policy (DONE)
 
 **Routing policy:**
-- **Media (VIDEO, AUDIO, SCREEN) -> reliable unidirectional streams.** Media packets require reliable delivery to avoid visual/audio artifacts from packet loss. The jitter buffer handles reordering and timing, but cannot recover missing data.
+- **Media (VIDEO, AUDIO, SCREEN) -> reliable unidirectional streams.** Media packets require reliable, ordered delivery. QUIC streams handle retransmission and ordering at the transport layer, eliminating packet-loss artifacts without application-level FEC or RED. This is why items 4.1 (Opus FEC) and 4.5 (RED audio) are unnecessary.
 - **Control (HEARTBEAT, RTT, DIAGNOSTICS, HEALTH) -> unreliable datagrams.** Control packets are periodic and expendable — a missed heartbeat or RTT probe is harmless because the next one arrives shortly. Datagrams have lower overhead (no stream setup, no retransmission).
 - **Large control packets -> reliable streams (fallback).** Any packet exceeding `DATAGRAM_MAX_SIZE` (1200 bytes) uses reliable streams regardless of type.
+
+**Client-side routing:**
+- `send_media_packet()` calls `controller.send_packet()` (reliable stream) for all VIDEO/AUDIO/SCREEN packets
+- Heartbeats call `task.send_packet_datagram()` (unreliable datagram) in both periodic and immediate heartbeat paths
+- RTT probes call `connection.send_packet_datagram()` (unreliable datagram)
+
+**Server-side routing (`send_auto`):**
+- `!is_media && data.len() <= DATAGRAM_MAX_SIZE` -> datagram (control packets)
+- Everything else -> reliable unidirectional stream (media, or oversized control)
 
 **Files involved:**
 - `actix-api/src/actors/transports/wt_chat_session.rs` — server-side `send_auto()` routing
@@ -609,7 +618,6 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 
 **Files involved:**
 - `videocall-client/src/decode/peer_decode_manager.rs` — visibility-gated decode
-- `yew-ui/src/components/canvas_generator.rs` — IntersectionObserver setup
 - `dioxus-ui/src/components/canvas_generator.rs` — IntersectionObserver setup
 
 ---
@@ -620,11 +628,11 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 
 | # | Item | Description |
 |---|------|-------------|
-| 4.1 | **Opus in-band FEC** | Enable Forward Error Correction in Opus encoder for moderate packet loss protection without extra bandwidth |
+| 4.1 | ~~**Opus in-band FEC**~~ | ~~Enable Forward Error Correction in Opus encoder for moderate packet loss protection without extra bandwidth~~ -- **Unnecessary:** all media uses reliable QUIC streams, so there is no packet loss to correct. FEC would add encoding overhead with zero benefit. |
 | 4.2 | **Audio/video lip-sync** | Cross-stream timestamp alignment in playout buffer to correct A/V desynchronization |
 | 4.3 | **VP9 SVC temporal layers** | Enable 2-layer temporal scalability so server can selectively drop frames for constrained receivers |
 | 4.4 | **Server congestion feedback** | When outbound channel fills, send explicit congestion signal to sender instead of silently dropping |
-| 4.5 | **Redundant audio packets** | Send previous audio frame alongside current (RED encoding) for loss recovery without retransmission |
+| 4.5 | ~~**Redundant audio packets**~~ | ~~Send previous audio frame alongside current (RED encoding) for loss recovery without retransmission~~ -- **Unnecessary:** reliable QUIC streams guarantee delivery, making RED pure overhead. RED doubles audio bandwidth (2x per stream) with zero benefit. At 100 participants it adds ~341 Mbps of unnecessary server outbound bandwidth. RED activates during congestion tiers — the worst time to double bandwidth. NetEQ handles gap concealment. `AUDIO_REDUNDANCY_ENABLED` set to `false`; code retained for potential re-enablement on unreliable transport. |
 
 ---
 
@@ -657,7 +665,7 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 | Packet Handler (server) | `actix-api/src/actors/packet_handler.rs` | 34–78 (classification) |
 | WebTransport (server) | `actix-api/src/actors/transports/wt_chat_session.rs` | 129–149 (channel send/drop) |
 | Health Reporter | `videocall-client/src/health_reporter.rs` | 533–625 (metrics collection) |
-| Constants (frontend) | `dioxus-ui/src/constants.rs` / `yew-ui/src/constants.rs` | 67–72 / 89–94 (bitrate config) |
+| Constants (frontend) | `dioxus-ui/src/constants.rs` | 67–72 (bitrate config) |
 
 ---
 

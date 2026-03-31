@@ -20,8 +20,8 @@ Cargoes:
   - Name: ui
     Container:
       Tty: true
-      Image: docker-yew-ui:latest
-      WorkingDir: /app/yew-ui
+      Image: docker-dioxus-ui:latest
+      WorkingDir: /app/dioxus-ui
       Cmd:
         - bash
         - -c

@@ -5,8 +5,8 @@
 # Options:
 #   --restart              Restart core deployments to pull latest images
 #   --services SERVICES    Deploy only specific services (comma-separated)
-#                         Available services: websocket, webtransport, ingress-nginx, 
-#                         engineering-vlog, matomo, rustlemania-ui, rustlemania-ui-staging,
+#                         Available services: websocket, webtransport, ingress-nginx,
+#                         engineering-vlog, matomo, videocall-ui,
 #                         videocall-website, prometheus, grafana, metrics-api, meeting-api
 #   (other)               Pass through to deploy-global-infrastructure.sh
 #
@@ -80,14 +80,9 @@ map_service_to_deployments() {
                 echo "engineering-vlog-us-east"
             fi
             ;;
-        rustlemania-ui)
+        videocall-ui)
             if [[ "$region" == "us-east" ]]; then
                 echo "videocall-ui-us-east"
-            fi
-            ;;
-        rustlemania-ui-staging)
-            if [[ "$region" == "us-east" ]]; then
-                echo "videocall-staging-ui-us-east"
             fi
             ;;
         videocall-website)

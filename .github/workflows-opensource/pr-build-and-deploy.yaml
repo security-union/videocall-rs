@@ -87,7 +87,7 @@ jobs:
             **Phase 1: Building Docker images** (~10-15 min)
             - Media Server (WebSocket/WebTransport)
             - Meeting API (REST backend)
-            - Web UI (WASM frontend)
+            - Dioxus UI (WASM frontend)
 
             **Phase 2: Deploying preview** (~3-5 min)
             - Creating namespace \`preview-${{ steps.get-pr.outputs.pr_number }}\`
@@ -136,9 +136,6 @@ jobs:
           - name: meeting-api
             dockerfile: Dockerfile.meeting-api
             image: videocall-meeting-api
-          - name: web-ui
-            dockerfile: Dockerfile.yew
-            image: videocall-web-ui
           - name: dioxus-ui
             dockerfile: Dockerfile.dioxus
             image: videocall-dioxus-ui
@@ -191,7 +188,6 @@ jobs:
             📦 **Images pushed to GHCR:**
             - \`ghcr.io/${{ github.repository_owner }}/videocall-media-server:pr-${prNumber}\`
             - \`ghcr.io/${{ github.repository_owner }}/videocall-meeting-api:pr-${prNumber}\`
-            - \`ghcr.io/${{ github.repository_owner }}/videocall-web-ui:pr-${prNumber}\`
             - \`ghcr.io/${{ github.repository_owner }}/videocall-dioxus-ui:pr-${prNumber}\`
 
             🚀 **Starting deployment...**

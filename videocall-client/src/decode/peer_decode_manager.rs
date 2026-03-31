@@ -94,7 +94,8 @@ pub struct Peer {
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
-    heartbeat_count: u8,
+    activity_count: u8,
+    missed_heartbeat_checks: u32,
     pub video_enabled: bool,
     pub audio_enabled: bool,
     pub screen_enabled: bool,
@@ -161,7 +162,8 @@ impl Peer {
             video_canvas_id,
             screen_canvas_id,
             aes,
-            heartbeat_count: 1,
+            activity_count: 1,
+            missed_heartbeat_checks: 0,
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
@@ -553,17 +555,39 @@ impl Peer {
         None
     }
 
-    fn on_heartbeat(&mut self) {
-        self.heartbeat_count += 1;
+    /// Record inbound activity from this peer. Called for ALL successfully
+    /// dispatched media types (audio, video, screen, heartbeat) so that any
+    /// traffic counts toward liveness, not just HEARTBEAT packets.
+    fn on_activity(&mut self) {
+        self.activity_count = self.activity_count.saturating_add(1);
     }
 
+    /// Check whether this peer is still alive. Returns `true` if the peer
+    /// should be kept, `false` if it should be removed.
+    ///
+    /// A peer is only considered dead after 3 consecutive checks (~15 seconds
+    /// at the 5-second monitor interval) with zero inbound packets of any
+    /// kind. This tolerates timer phase drift between the local monitor and
+    /// the remote heartbeat sender, as well as transient packet loss.
     pub fn check_heartbeat(&mut self) -> bool {
-        if self.heartbeat_count != 0 {
-            self.heartbeat_count = 0;
+        if self.activity_count > 0 {
+            self.activity_count = 0;
+            self.missed_heartbeat_checks = 0;
             return true;
         }
-        debug!("---@@@--- detected heartbeat stop for {}", self.session_id);
-        false
+        self.missed_heartbeat_checks += 1;
+        if self.missed_heartbeat_checks >= 3 {
+            debug!(
+                "---@@@--- detected heartbeat stop for {} (missed {} consecutive checks)",
+                self.session_id, self.missed_heartbeat_checks
+            );
+            return false;
+        }
+        debug!(
+            "---@@@--- no activity for peer {} (missed {}/3 checks, still alive)",
+            self.session_id, self.missed_heartbeat_checks
+        );
+        true
     }
 }
 
@@ -719,10 +743,13 @@ impl PeerDecodeManager {
             }
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _, _)) => {
-                    peer.on_heartbeat();
+                    peer.on_activity();
                     Ok(())
                 }
                 Ok((media_type, decode_status, keyframe_request)) => {
+                    // Any successfully decoded packet (audio, video, screen)
+                    // counts toward liveness, not just heartbeats.
+                    peer.on_activity();
                     if let Some(diagnostics) = &self.diagnostics {
                         diagnostics.track_frame(
                             &peer.sid_str,
@@ -939,7 +966,7 @@ impl PeerDecodeManager {
             .and_then(|peer| peer.display_name.clone())
     }
 
-    pub fn is_peer_speaking(&self, key: &String) -> bool {
+    pub fn is_peer_speaking(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return false,
@@ -950,7 +977,7 @@ impl PeerDecodeManager {
         false
     }
 
-    pub fn peer_audio_level(&self, key: &String) -> f32 {
+    pub fn peer_audio_level(&self, key: &str) -> f32 {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
             Err(_) => return 0.0,
@@ -1090,7 +1117,8 @@ mod tests {
             video_canvas_id: format!("video-{session_id}"),
             screen_canvas_id: format!("screen-{session_id}"),
             aes: None,
-            heartbeat_count: 1,
+            activity_count: 1,
+            missed_heartbeat_checks: 0,
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,

@@ -34,9 +34,9 @@
 use crate::adaptive_quality_constants::{
     AudioQualityTier, VideoQualityTier, AUDIO_QUALITY_TIERS, AUDIO_TIER_DEGRADE_FPS_RATIO,
     AUDIO_TIER_RECOVER_FPS_RATIO, DEFAULT_SCREEN_TIER_INDEX, DEFAULT_VIDEO_TIER_INDEX,
-    MIN_TIER_TRANSITION_INTERVAL_MS, STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS,
-    VIDEO_TIER_DEGRADE_BITRATE_RATIO, VIDEO_TIER_DEGRADE_FPS_RATIO,
-    VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO,
+    MIN_TIER_TRANSITION_INTERVAL_MS, QUALITY_WARMUP_MS, STEP_DOWN_REACTION_TIME_MS,
+    STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_TIER_DEGRADE_BITRATE_RATIO,
+    VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO,
 };
 
 /// Adaptive quality manager that automatically selects video and audio tiers
@@ -68,45 +68,55 @@ pub struct AdaptiveQualityManager {
 
     /// Timestamp (ms) when audio recovery conditions were first detected.
     audio_recover_start_ms: Option<f64>,
+
+    /// Timestamp (ms) when this manager was created. Used to enforce a warmup
+    /// grace period during which no tier transitions occur, preventing
+    /// false step-downs from zero-FPS readings at encoder startup.
+    created_at_ms: f64,
 }
 
 impl AdaptiveQualityManager {
     /// Create a new manager for the given video tier array.
     ///
-    /// Starts at `DEFAULT_VIDEO_TIER_INDEX` (medium). Use this for camera
-    /// encoders where starting at medium avoids wasting bandwidth before the
-    /// first adaptation.
+    /// Starts at `DEFAULT_VIDEO_TIER_INDEX` (minimal/lowest). Starting at the
+    /// lowest tier ensures the system only ever upgrades, eliminating the
+    /// visible dimension-change oscillation that occurs when the PID controller
+    /// has not yet allocated enough bitrate for a higher tier.
     ///
     /// Use `VIDEO_QUALITY_TIERS` for camera, `SCREEN_QUALITY_TIERS` for screen share.
     pub fn new(video_tiers: &'static [VideoQualityTier]) -> Self {
+        let now = js_sys::Date::now();
         Self {
             video_tiers,
             video_tier_index: DEFAULT_VIDEO_TIER_INDEX,
             audio_tier_index: 0,
-            last_transition_time_ms: 0.0,
+            last_transition_time_ms: now,
             degrade_start_ms: None,
             recover_start_ms: None,
             audio_degrade_start_ms: None,
             audio_recover_start_ms: None,
+            created_at_ms: now,
         }
     }
 
     /// Create a new manager for screen share.
     ///
-    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` (high/1080p) because screen
-    /// content is resolution-sensitive -- text and fine UI details become
-    /// unreadable at lower resolutions. The system can still step down if
-    /// network conditions require it.
+    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` (low/480p) to match the
+    /// camera strategy of only upgrading, never visibly downgrading. The
+    /// PID controller will quickly ramp up resolution once it measures
+    /// sufficient bandwidth.
     pub fn new_for_screen(video_tiers: &'static [VideoQualityTier]) -> Self {
+        let now = js_sys::Date::now();
         Self {
             video_tiers,
             video_tier_index: DEFAULT_SCREEN_TIER_INDEX,
             audio_tier_index: 0,
-            last_transition_time_ms: 0.0,
+            last_transition_time_ms: now,
             degrade_start_ms: None,
             recover_start_ms: None,
             audio_degrade_start_ms: None,
             audio_recover_start_ms: None,
+            created_at_ms: now,
         }
     }
 
@@ -129,6 +139,13 @@ impl AdaptiveQualityManager {
         ideal_bitrate_kbps: f64,
         now_ms: f64,
     ) -> bool {
+        // Warmup guard: during encoder startup, no frames have been produced yet
+        // so fps_ratio reads as 0.0, triggering false step-downs. Suppress all
+        // tier transitions until the encoder has had time to stabilize.
+        if now_ms - self.created_at_ms < QUALITY_WARMUP_MS {
+            return false;
+        }
+
         // Guard: if target values are zero or negative, skip to avoid division by zero.
         if target_fps <= 0.0 || ideal_bitrate_kbps <= 0.0 {
             return false;
@@ -309,6 +326,12 @@ impl AdaptiveQualityManager {
     ///
     /// Returns `true` if the tier actually changed (not already at the lowest).
     pub fn force_video_step_down(&mut self, now_ms: f64) -> bool {
+        // Warmup guard: same as update() — suppress forced step-downs during
+        // encoder startup when zero-FPS readings would be misleading.
+        if now_ms - self.created_at_ms < QUALITY_WARMUP_MS {
+            return false;
+        }
+
         let max_video_index = self.video_tiers.len().saturating_sub(1);
         if self.video_tier_index >= max_video_index {
             return false;
@@ -343,6 +366,16 @@ mod tests {
     use crate::adaptive_quality_constants::{SCREEN_QUALITY_TIERS, VIDEO_QUALITY_TIERS};
     use wasm_bindgen_test::*;
 
+    /// Create a manager with `created_at_ms` and `last_transition_time_ms` set
+    /// to 0.0 so that tests using small `now_ms` values (e.g. 10000) are well
+    /// past the warmup period and the min-transition guard.
+    fn new_test_manager(video_tiers: &'static [VideoQualityTier]) -> AdaptiveQualityManager {
+        let mut mgr = AdaptiveQualityManager::new(video_tiers);
+        mgr.created_at_ms = 0.0;
+        mgr.last_transition_time_ms = 0.0;
+        mgr
+    }
+
     #[wasm_bindgen_test]
     fn test_starts_at_default_tier() {
         let mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
@@ -356,7 +389,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_screen_starts_at_highest_tier() {
+    fn test_screen_starts_at_lowest_tier() {
         let mgr = AdaptiveQualityManager::new_for_screen(SCREEN_QUALITY_TIERS);
         assert_eq!(mgr.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
         assert_eq!(mgr.audio_tier_index(), 0);
@@ -364,13 +397,71 @@ mod tests {
             mgr.current_video_tier().label,
             SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].label
         );
-        // Screen share should start at "high" (1080p)
-        assert_eq!(mgr.current_video_tier().label, "high");
+        // Screen share starts at "low" (480p) to avoid downgrade oscillation
+        assert_eq!(mgr.current_video_tier().label, "low");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_warmup_blocks_transitions() {
+        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        // Override created_at_ms to a known value so we can test relative to it.
+        mgr.created_at_ms = 1000.0;
+        mgr.last_transition_time_ms = 0.0;
+        mgr.video_tier_index = 0;
+
+        // During warmup (now < created_at + QUALITY_WARMUP_MS), even terrible
+        // conditions should not cause a transition.
+        let changed = mgr.update(0.0, 30.0, 0.0, 1500.0, 2000.0);
+        assert!(!changed, "Should not transition during warmup");
+        assert_eq!(mgr.video_tier_index(), 0);
+
+        // Still during warmup (4999ms after creation)
+        let changed = mgr.update(0.0, 30.0, 0.0, 1500.0, 5999.0);
+        assert!(!changed, "Should not transition during warmup");
+        assert_eq!(mgr.video_tier_index(), 0);
+
+        // After warmup (5000ms after creation), transitions should work.
+        // First call starts the degrade timer.
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, 6000.0);
+        assert!(!changed, "Degrade timer just started");
+
+        // After reaction time, should step down.
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, 7600.0);
+        assert!(changed, "Should transition after warmup + reaction time");
+        assert_eq!(mgr.video_tier_index(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_warmup_blocks_step_up() {
+        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        mgr.created_at_ms = 1000.0;
+        mgr.last_transition_time_ms = 0.0;
+        mgr.video_tier_index = 2; // start at "low" to test step-up
+
+        // During warmup, good conditions should not cause a step-up.
+        let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, 3000.0);
+        assert!(!changed, "Should not step up during warmup");
+        assert_eq!(mgr.video_tier_index(), 2);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_initial_last_transition_time_prevents_instant_transition() {
+        // Verify that constructors initialize last_transition_time_ms to now,
+        // not 0.0, so the first transition respects MIN_TIER_TRANSITION_INTERVAL_MS.
+        let mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        assert!(
+            mgr.last_transition_time_ms > 0.0,
+            "last_transition_time_ms should be initialized to current time, not 0.0"
+        );
+        assert_eq!(
+            mgr.last_transition_time_ms, mgr.created_at_ms,
+            "last_transition_time_ms and created_at_ms should both be set to the same now() value"
+        );
     }
 
     #[wasm_bindgen_test]
     fn test_no_change_under_good_conditions() {
-        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         // Start from a known state for this test
         mgr.video_tier_index = 0;
         // fps_ratio=1.0, bitrate_ratio=1.0 -- perfect conditions
@@ -381,7 +472,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_video_step_down_after_reaction_time() {
-        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         // Start at highest tier to test step-down
         mgr.video_tier_index = 0;
         let base = 10000.0;
@@ -403,7 +494,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_video_step_down_on_bitrate_ratio() {
-        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         // Start at highest tier to test step-down
         mgr.video_tier_index = 0;
         let base = 10000.0;
@@ -419,7 +510,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_video_step_up_after_stabilization() {
-        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         // Force to tier 1
         mgr.video_tier_index = 1;
         let base = 10000.0;
@@ -441,7 +532,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_min_transition_interval_enforced() {
-        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         // Start at highest tier to test step-down behavior
         mgr.video_tier_index = 0;
         let base = 10000.0;
@@ -472,7 +563,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_audio_only_degrades_at_lowest_video() {
-        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         let base = 10000.0;
 
         // Not at lowest video tier -- audio should NOT degrade even with terrible FPS
@@ -495,7 +586,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_audio_recovers_before_video() {
-        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         // Set both to degraded state
         let max_video = VIDEO_QUALITY_TIERS.len() - 1;
         mgr.video_tier_index = max_video;
@@ -515,7 +606,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_degrade_timer_resets_on_good_conditions() {
-        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         let base = 10000.0;
 
         // Start degrading
@@ -533,7 +624,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_zero_target_fps_returns_false() {
-        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         let changed = mgr.update(0.0, 0.0, 0.0, 0.0, 10000.0);
         assert!(!changed);
     }

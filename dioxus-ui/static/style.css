@@ -325,12 +325,14 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1.5px solid transparent;
-  box-shadow: none;
+  /* Match .grid-item's radius so .glow-overlay { border-radius: inherit } works. */
+  border-radius: 10px;
 }
 
 /* Transparent overlay that sits on top of the video canvas so the speaking
-   glow (border + inset box-shadow) is not hidden behind the video element. */
+   glow (box-shadow ring + inset glow) is not hidden behind the video element.
+   border-radius: inherit picks up the 10px from .canvas-container, producing
+   a ring that matches the tile's rounded corners exactly. */
 .glow-overlay {
   position: absolute;
   inset: 0;
@@ -2363,7 +2365,7 @@ select {
 }
 .peer_item_mic.speaking svg { stroke: #00ff41; }
 
-.host-video-wrapper { border-radius: 0; overflow: hidden; border: none; box-shadow: none; }
+.host-video-wrapper { border-radius: inherit; overflow: hidden; border: none; box-shadow: none; }
 
 /* Glow transitions are now fully controlled by inline styles from Rust.
    No .speaking-tile class needed — speak_style() always returns explicit values. */

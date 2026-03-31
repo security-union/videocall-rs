@@ -19,8 +19,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::components::canvas_generator::generate_for_peer;
-use crate::context::VideoCallClientCtx;
+use crate::components::canvas_generator::{clear_pinned, generate_for_peer};
+use crate::context::{PinnedPanel, PinnedPanelCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
@@ -94,6 +94,23 @@ pub fn PeerTile(
     });
 
     let host_uid = host_user_id.as_deref();
+    let pinned_panel = use_context::<PinnedPanelCtx>();
+
+    // Clear pinned state if this peer's screen-share panel was pinned but
+    // screen share has ended.
+    let peer_id_for_screen = peer_id.clone();
+    use_effect(move || {
+        let s = screen_enabled();
+        if !s {
+            let should_clear = matches!(
+                *pinned_panel.peek(),
+                Some(PinnedPanel::ScreenShare(ref k)) if *k == peer_id_for_screen
+            );
+            if should_clear {
+                clear_pinned(pinned_panel);
+            }
+        }
+    });
 
     // Re-read signals to trigger reactive re-renders
     let _ = audio_enabled();
@@ -102,7 +119,15 @@ pub fn PeerTile(
     let level = audio_level();
     let mic_level = mic_audio_level();
 
-    generate_for_peer(&client, &peer_id, full_bleed, level, mic_level, host_uid)
+    generate_for_peer(
+        &client,
+        &peer_id,
+        full_bleed,
+        level,
+        mic_level,
+        host_uid,
+        pinned_panel,
+    )
 }
 
 /// Extract the audio level from a diagnostics event, falling back to

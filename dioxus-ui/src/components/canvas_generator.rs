@@ -22,7 +22,7 @@ use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
 use crate::constants::users_allowed_to_stream;
-use crate::context::VideoCallClientCtx;
+use crate::context::{PinnedPanel, PinnedPanelCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
@@ -36,24 +36,26 @@ use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObser
 pub(crate) fn speak_style(audio_level: f32) -> String {
     if audio_level <= 0.0 {
         // Explicitly force off — no reliance on CSS class removal
-        return "border: 1.5px solid transparent; box-shadow: none; transition: border 1.5s ease-out, box-shadow 1.5s ease-out;".to_string();
+        return "box-shadow: none; transition: box-shadow 1.5s ease-out;".to_string();
     }
     let i = audio_level.clamp(0.0, 1.0);
-    // More dramatic glow that scales aggressively with intensity.
-    // Uses full `border` shorthand because the glow overlay div does not
-    // inherit the container's border — it needs its own.
+    // The first shadow (`0 0 0 1.5px`) is a zero-blur, 1.5px-spread outer
+    // box-shadow that acts as a solid ring rendered just outside the overlay's
+    // border-box.  Using box-shadow instead of `border` ensures the ring sits
+    // at the tile's edge rather than 1.5px inside it (CSS `border` renders
+    // inward, eating into the element's own box).
     format!(
-        "border: 1.5px solid rgba(0, 255, 65, {:.2}); \
-         box-shadow: inset 0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}), \
+        "box-shadow: 0 0 0 1.5px rgba(0, 255, 65, {:.2}), \
+                     inset 0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}), \
                      0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}); \
-         transition: border 0.15s ease-in, box-shadow 0.15s ease-in;",
-        0.4 + i * 0.6,   // border alpha: 0.4–1.0 (more visible)
-        15.0 + i * 25.0, // inset blur: 15–40 (bigger glow)
-        5.0 + i * 10.0,  // inset spread: 5–15 (wider)
-        0.3 + i * 0.5,   // inset alpha: 0.3–0.8 (brighter)
-        15.0 + i * 35.0, // outer blur: 15–50 (much bigger halo)
-        3.0 + i * 10.0,  // outer spread: 3–13 (wider)
-        0.2 + i * 0.4    // outer alpha: 0.2–0.6 (brighter)
+         transition: box-shadow 0.15s ease-in;",
+        0.4 + i * 0.6,   // ring alpha: 0.4–1.0
+        15.0 + i * 25.0, // inset blur: 15–40
+        5.0 + i * 10.0,  // inset spread: 5–15
+        0.3 + i * 0.5,   // inset alpha: 0.3–0.8
+        15.0 + i * 35.0, // outer blur: 15–50
+        3.0 + i * 10.0,  // outer spread: 3–13
+        0.2 + i * 0.4    // outer alpha: 0.2–0.6
     )
 }
 
@@ -107,10 +109,19 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32) -> String {
     )
 }
 
+/// Returns `true` when speaking indicators should be suppressed for `current`.
+///
+/// Suppression fires only when a panel is pinned AND `current` is not that
+/// pinned panel (variant-aware: `PeerVideo("x") != ScreenShare("x")`).
+fn is_speaking_suppressed(pinned: Option<&PinnedPanel>, current: &PinnedPanel) -> bool {
+    pinned.is_some_and(|p| p != current)
+}
+
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
 /// the video tile will occupy the full grid area. The `audio_level` parameter (0.0–1.0) drives
 /// a glow whose intensity scales with voice volume.
 /// If `host_user_id` matches the peer's authenticated user_id, a crown icon is displayed next to the name.
+/// When a panel is pinned fullscreen, speaking indicators are suppressed on all non-pinned tiles.
 pub fn generate_for_peer(
     client: &VideoCallClient,
     key: &String,
@@ -118,6 +129,7 @@ pub fn generate_for_peer(
     audio_level: f32,
     mic_audio_level: f32,
     host_user_id: Option<&str>,
+    pinned_panel: PinnedPanelCtx,
 ) -> Element {
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
     let peer_display_name = client
@@ -135,6 +147,18 @@ pub fn generate_for_peer(
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
 
+    // When a panel is pinned fullscreen, suppress speaking indicators on all
+    // non-pinned tiles so the glow doesn't bleed through behind the pinned panel.
+    // Suppression is computed per panel type: pinned exists AND current ≠ pinned.
+    let pinned = pinned_panel();
+    let suppress_peer =
+        is_speaking_suppressed(pinned.as_ref(), &PinnedPanel::PeerVideo(key.clone()));
+    // Screen share tiles have no speaking UI today; computed for correctness.
+    let _suppress_screen =
+        is_speaking_suppressed(pinned.as_ref(), &PinnedPanel::ScreenShare(key.clone()));
+    let audio_level = if suppress_peer { 0.0 } else { audio_level };
+    let mic_audio_level = if suppress_peer { 0.0 } else { mic_audio_level };
+
     let is_speaking = mic_audio_level > 0.0;
 
     let audio_speaking_class = if is_speaking {
@@ -148,11 +172,16 @@ pub fn generate_for_peer(
     let tile_style = speak_style(audio_level);
     let mic_inline_style = mic_style(mic_audio_level, audio_level);
 
+    // Pre-compute pinned state for this peer's panels so the CSS class is
+    // derived from the signal, surviving re-renders.
+    let is_pv_pinned = pinned.as_ref() == Some(&PinnedPanel::PeerVideo(key.clone()));
+    let is_ss_pinned = pinned.as_ref() == Some(&PinnedPanel::ScreenShare(key.clone()));
+
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {
         let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
-        let div_id_mobile = (*peer_video_div_id).clone();
-        let div_id_pin = (*peer_video_div_id).clone();
+        let pin_fb_mobile = PinnedPanel::PeerVideo(key.clone());
+        let pin_fb_btn = PinnedPanel::PeerVideo(key.clone());
         let canvas_id_crop = key.clone();
         let key_clone = key.clone();
         let peer_display_name_fb = peer_display_name.clone();
@@ -166,15 +195,20 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
+        let fb_grid_class = if is_pv_pinned {
+            "grid-item full-bleed grid-item-pinned"
+        } else {
+            "grid-item full-bleed"
+        };
         return rsx! {
             div {
-                class: "grid-item full-bleed",
+                class: "{fb_grid_class}",
                 id: "{peer_video_div_id}",
                 div {
                     class: "{full_bleed_class}",
                     onclick: move |_| {
                         if is_mobile_viewport() {
-                            toggle_pinned_div(&div_id_mobile);
+                            toggle_pinned(pinned_panel, &pin_fb_mobile);
                         }
                     },
                     if is_video_enabled_for_peer {
@@ -209,7 +243,7 @@ pub fn generate_for_peer(
                         CropIcon {}
                     }
                     button {
-                        onclick: move |_| toggle_pinned_div(&div_id_pin),
+                        onclick: move |_| toggle_pinned(pinned_panel, &pin_fb_btn),
                         class: "pin-icon",
                         PushPinIcon {}
                     }
@@ -225,21 +259,21 @@ pub fn generate_for_peer(
     }
 
     // Regular grid tile, optionally with screen share tile
-    let screen_share_css = if client.is_awaiting_peer_screen_frame(key) {
-        "grid-item hidden"
-    } else {
-        "grid-item"
+    let screen_share_css = match (client.is_awaiting_peer_screen_frame(key), is_ss_pinned) {
+        (true, _) => "grid-item hidden",
+        (false, true) => "grid-item grid-item-pinned",
+        (false, false) => "grid-item",
     };
     let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
     let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
 
-    let ss_div_mobile = (*screen_share_div_id).clone();
-    let ss_div_pin = (*screen_share_div_id).clone();
+    let pin_ss_mobile = PinnedPanel::ScreenShare(key.clone());
+    let pin_ss_btn = PinnedPanel::ScreenShare(key.clone());
     let ss_canvas_crop = format!("screen-share-{}", key);
     let ss_name = format!("{}-screen", peer_display_name);
 
-    let pv_div_mobile = (*peer_video_div_id).clone();
-    let pv_div_pin = (*peer_video_div_id).clone();
+    let pin_pv_mobile = PinnedPanel::PeerVideo(key.clone());
+    let pin_pv_btn = PinnedPanel::PeerVideo(key.clone());
     let pv_canvas_crop = key.clone();
     let key_clone = key.clone();
     let peer_display_name_grid = peer_display_name.clone();
@@ -259,7 +293,7 @@ pub fn generate_for_peer(
                     class: "canvas-container video-on",
                     onclick: move |_| {
                         if is_mobile_viewport() {
-                            toggle_pinned_div(&ss_div_mobile);
+                            toggle_pinned(pinned_panel, &pin_ss_mobile);
                         }
                     },
                     ScreenCanvas { peer_id: key.clone() }
@@ -275,7 +309,7 @@ pub fn generate_for_peer(
                         CropIcon {}
                     }
                     button {
-                        onclick: move |_| toggle_pinned_div(&ss_div_pin),
+                        onclick: move |_| toggle_pinned(pinned_panel, &pin_ss_btn),
                         class: "pin-icon",
                         PushPinIcon {}
                     }
@@ -290,16 +324,21 @@ pub fn generate_for_peer(
             };
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
+            let pv_grid_class = if is_pv_pinned {
+                "grid-item grid-item-pinned"
+            } else {
+                "grid-item"
+            };
             rsx! {
                 div {
-                    class: "grid-item",
+                    class: "{pv_grid_class}",
                     id: "{peer_video_div_id}",
                     // One canvas for the User Video
                     div {
                         class: "{grid_class}",
                         onclick: move |_| {
                             if is_mobile_viewport() {
-                                toggle_pinned_div(&pv_div_mobile);
+                                toggle_pinned(pinned_panel, &pin_pv_mobile);
                             }
                         },
                         if is_video_enabled_for_peer {
@@ -330,7 +369,7 @@ pub fn generate_for_peer(
                             CropIcon {}
                         }
                         button {
-                            onclick: move |_| toggle_pinned_div(&pv_div_pin),
+                            onclick: move |_| toggle_pinned(pinned_panel, &pin_pv_btn),
                             class: "pin-icon",
                             PushPinIcon {}
                         }
@@ -491,17 +530,26 @@ fn ScreenCanvas(peer_id: String) -> Element {
     }
 }
 
-fn toggle_pinned_div(div_id: &str) {
-    if let Some(div) = window()
-        .and_then(|w| w.document())
-        .and_then(|doc| doc.get_element_by_id(div_id))
-    {
-        if !div.class_list().contains("grid-item-pinned") {
-            div.class_list().add_1("grid-item-pinned").unwrap();
-        } else {
-            div.class_list().remove_1("grid-item-pinned").unwrap();
-        }
+/// Toggle the fullscreen pin for a panel.  Only one panel can be pinned at a
+/// time; pinning a new panel automatically unpins the previous one.
+///
+/// The `grid-item-pinned` CSS class is derived from the signal during render,
+/// so we only need to update the signal here — no imperative DOM manipulation.
+fn toggle_pinned(mut pinned_panel: PinnedPanelCtx, panel: &PinnedPanel) {
+    let current = pinned_panel.peek().clone();
+    if current.as_ref() == Some(panel) {
+        pinned_panel.set(None);
+    } else {
+        pinned_panel.set(Some(panel.clone()));
     }
+}
+
+/// Reset the pinned-panel signal to `None`.
+///
+/// The `grid-item-pinned` CSS class is derived from the signal during render,
+/// so we only need to clear the signal here.
+pub(crate) fn clear_pinned(mut pinned_panel: PinnedPanelCtx) {
+    pinned_panel.set(None);
 }
 
 fn is_mobile_viewport() -> bool {

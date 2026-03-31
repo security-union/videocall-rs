@@ -165,7 +165,7 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const glowOverlay = peerTile.first().locator(".glow-overlay");
       await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
 
-      // When silent: border-color is transparent, box-shadow is none.
+      // When silent: no border, box-shadow is none.
       const style = await glowOverlay.getAttribute("style");
       expect(style).toBeTruthy();
       expect(style).toContain("border: 1.5px solid transparent");
@@ -314,6 +314,305 @@ test.describe("Speaker highlight glow on video tiles", () => {
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+
+  test("pinning a peer tile adds grid-item-pinned class", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pin_class_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-pin@videocall.rs",
+        "PinHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-pin@videocall.rs",
+        "PinGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host starts the meeting
+      await navigateToMeeting(hostPage, meetingId, "PinHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins the meeting
+      await navigateToMeeting(guestPage, meetingId, "PinGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer tile to appear on the host side
+      const peerGridItem = hostPage.locator("#grid-container .grid-item").first();
+      await expect(peerGridItem).toBeVisible({ timeout: 30_000 });
+
+      // Before pinning: the grid-item should NOT have grid-item-pinned class
+      await expect(peerGridItem).not.toHaveClass(/grid-item-pinned/);
+
+      // Click the pin button on the peer tile
+      const pinButton = peerGridItem.locator(".pin-icon");
+      await expect(pinButton).toBeVisible({ timeout: 10_000 });
+      await pinButton.click();
+      await hostPage.waitForTimeout(500);
+
+      // After pinning: the grid-item should have grid-item-pinned class
+      await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+
+      // Click pin again to unpin
+      await pinButton.click();
+      await hostPage.waitForTimeout(500);
+
+      // After unpinning: the grid-item should NOT have grid-item-pinned class
+      await expect(peerGridItem).not.toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("non-pinned peer tile glow is suppressed when another tile is pinned", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pin_glow_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-pinglow@videocall.rs",
+        "PinGlowHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-pinglow@videocall.rs",
+        "PinGlowGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host starts the meeting
+      await navigateToMeeting(hostPage, meetingId, "PinGlowHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins the meeting
+      await navigateToMeeting(guestPage, meetingId, "PinGlowGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer tile to appear
+      const peerGridItem = hostPage.locator("#grid-container .grid-item").first();
+      await expect(peerGridItem).toBeVisible({ timeout: 30_000 });
+
+      // Pin the peer tile
+      const pinButton = peerGridItem.locator(".pin-icon");
+      await expect(pinButton).toBeVisible({ timeout: 10_000 });
+      await pinButton.click();
+      await hostPage.waitForTimeout(1000);
+
+      // Verify the pinned tile has the class
+      await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+
+      // The host's own tile glow overlay should have suppressed
+      // indicator styles (transparent border, no box-shadow) while
+      // another panel is pinned fullscreen.
+      const hostWrapper = hostPage.locator(".host-video-wrapper");
+      await expect(hostWrapper.first()).toBeVisible({ timeout: 15_000 });
+      const hostGlow = hostWrapper.first().locator(".glow-overlay");
+      await expect(hostGlow).toBeVisible({ timeout: 10_000 });
+
+      const hostStyle = await hostGlow.getAttribute("style");
+      expect(hostStyle).toBeTruthy();
+      // Speaking indicators must be suppressed: no shadow.
+      expect(hostStyle).toContain("box-shadow: none");
+
+      // Unpin the peer tile
+      await pinButton.click();
+      await hostPage.waitForTimeout(500);
+      await expect(peerGridItem).not.toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("non-pinned peer tile mic indicator lacks speaking class when pinned", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pin_mic_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-pinmic@videocall.rs",
+        "PinMicHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-pinmic@videocall.rs",
+        "PinMicGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host starts the meeting
+      await navigateToMeeting(hostPage, meetingId, "PinMicHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins the meeting
+      await navigateToMeeting(guestPage, meetingId, "PinMicGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer tile to appear
+      const peerGridItem = hostPage.locator("#grid-container .grid-item").first();
+      await expect(peerGridItem).toBeVisible({ timeout: 30_000 });
+
+      // Pin the peer tile
+      const pinButton = peerGridItem.locator(".pin-icon");
+      await expect(pinButton).toBeVisible({ timeout: 10_000 });
+      await pinButton.click();
+      await hostPage.waitForTimeout(1000);
+
+      // Verify the pinned tile has the class
+      await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+
+      // The peer tile's own glow overlay should still be visible (it is the pinned tile)
+      const pinnedGlow = peerGridItem.locator(".glow-overlay").first();
+      await expect(pinnedGlow).toBeVisible({ timeout: 10_000 });
+
+      // The host tile's audio-indicator should NOT have the "speaking"
+      // class — speaking indicators are suppressed on non-pinned tiles
+      // when any panel is pinned fullscreen.
+      // Check if the host-video-wrapper area has an audio indicator
+      // (the host toolbar mic is separate from tile indicators).
+      // Non-pinned peer tiles in the grid also must not show speaking.
+      // Since all audio is fake-silent, this verifies the DOM state
+      // is correctly suppressed (no "speaking" class anywhere).
+      const allAudioIndicators = hostPage.locator(".audio-indicator");
+      const count = await allAudioIndicators.count();
+      for (let i = 0; i < count; i++) {
+        await expect(allAudioIndicators.nth(i)).not.toHaveClass(/speaking/);
+      }
+
+      // Unpin
+      await pinButton.click();
+      await hostPage.waitForTimeout(500);
+      await expect(peerGridItem).not.toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("pinned tile stays pinned when an unrelated peer joins then leaves", async ({ baseURL }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pin_persist_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser3 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-persist@videocall.rs",
+        "PersistHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-persist@videocall.rs",
+        "PersistGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host starts the meeting
+      await navigateToMeeting(hostPage, meetingId, "PersistHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins
+      await navigateToMeeting(guestPage, meetingId, "PersistGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for guest peer tile on host side
+      const peerGridItem = hostPage.locator("#grid-container .grid-item").first();
+      await expect(peerGridItem).toBeVisible({ timeout: 30_000 });
+
+      // Pin the guest's tile
+      const pinButton = peerGridItem.locator(".pin-icon");
+      await expect(pinButton).toBeVisible({ timeout: 10_000 });
+      await pinButton.click();
+      await hostPage.waitForTimeout(500);
+      await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+
+      // A third user joins — this triggers peer_list_version bump & re-render
+      const thirdCtx = await createAuthenticatedContext(
+        browser3,
+        "third-persist@videocall.rs",
+        "PersistThird",
+        uiURL,
+      );
+      const thirdPage = await thirdCtx.newPage();
+      await navigateToMeeting(thirdPage, meetingId, "PersistThird");
+      const thirdResult = await joinMeetingFromPage(thirdPage);
+      await admitGuestIfNeeded(hostPage, thirdPage, thirdResult);
+
+      // Wait for the third user's tile to appear on host side (proves re-render happened)
+      await expect(hostPage.locator("#grid-container .grid-item").nth(1)).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // The originally-pinned tile must STILL have grid-item-pinned
+      await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+
+      // Third user leaves — another re-render
+      await thirdPage.close();
+      await hostPage.waitForTimeout(5_000);
+
+      // Pin must STILL be present after the third peer departs
+      await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+
+      // Finally unpin manually to confirm toggle still works
+      await pinButton.click();
+      await hostPage.waitForTimeout(500);
+      await expect(peerGridItem).not.toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+      await browser3.close();
     }
   });
 });

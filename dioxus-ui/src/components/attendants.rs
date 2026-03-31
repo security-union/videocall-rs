@@ -33,7 +33,7 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap};
+use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap, PinnedPanelCtx};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
@@ -443,6 +443,10 @@ pub fn AttendantsComponent(
     // on_peer_removed callback inside use_hook below.
     let mut peer_status_map: PeerStatusMap = use_signal(HashMap::new);
 
+    // Track which panel (if any) is pinned fullscreen so speaking indicators
+    // can be suppressed on non-pinned tiles.
+    let pinned_panel: PinnedPanelCtx = use_signal(|| None);
+
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
     // callback can access the client for reconnection. The cell is populated
@@ -537,6 +541,17 @@ pub fn AttendantsComponent(
                 //
                 // Note: we rebind to a local `mut` copy so the closure stays
                 // `Fn` (Signal is Copy; only the local is mutated each call).
+
+                // If the disconnected peer had a pinned panel, clear pin so
+                // speaking indicators resume for remaining participants.
+                // The CSS class is derived from the signal during render, so
+                // we only need to clear the signal.
+                let mut pp = pinned_panel;
+                let should_clear = pp.peek().as_ref().is_some_and(|p| p.is_for_peer(&peer_id));
+                if should_clear {
+                    pp.set(None);
+                }
+
                 let mut map = peer_status_map;
                 map.write().remove(&peer_id);
                 let mut v = peer_list_version;
@@ -866,6 +881,9 @@ pub fn AttendantsComponent(
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
     use_context_provider(|| peer_status_map);
+
+    // Provide pinned-panel signal so tiles can suppress speaking indicators.
+    use_context_provider(|| pinned_panel);
 
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
@@ -1412,7 +1430,7 @@ pub fn AttendantsComponent(
                                     share_screen: screen_share_state().is_sharing(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
-                                    audio_level: local_audio_level(),
+                                    audio_level: if pinned_panel().is_some() { 0.0 } else { local_audio_level() },
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {

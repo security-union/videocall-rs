@@ -40,6 +40,25 @@ pub struct PeerMediaState {
 /// peer B's tile to re-render.
 pub type PeerStatusMap = Signal<std::collections::HashMap<String, Signal<PeerMediaState>>>;
 
+/// Identifies a pinned panel by its type and peer session key.
+#[derive(Clone, PartialEq, Debug)]
+pub enum PinnedPanel {
+    PeerVideo(String),
+    ScreenShare(String),
+}
+
+impl PinnedPanel {
+    /// Whether this panel belongs to the given peer key.
+    pub fn is_for_peer(&self, peer_key: &str) -> bool {
+        match self {
+            PinnedPanel::PeerVideo(k) | PinnedPanel::ScreenShare(k) => k == peer_key,
+        }
+    }
+}
+
+/// Currently fullscreen-pinned panel.  `None` means no panel is pinned.
+pub type PinnedPanelCtx = Signal<Option<PinnedPanel>>;
+
 /// Holds meeting host information shared via context.
 #[derive(Clone, PartialEq, Default)]
 #[allow(dead_code)]

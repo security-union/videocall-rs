@@ -51,7 +51,7 @@
 //! `client_secret` even for PKCE (confidential clients) cannot use this
 //! flow; use the backend `/api/v1/oauth/exchange` endpoint instead.
 
-use crate::auth::{clear_pkce_state, load_pkce_state, store_id_token};
+use crate::auth::{clear_pkce_state, load_pkce_state, store_access_token, store_id_token};
 use crate::constants::{
     meeting_api_base_url, oauth_client_id, oauth_issuer, oauth_redirect_url, oauth_token_url,
 };
@@ -259,7 +259,6 @@ fn cache_token_endpoint(url: &str) {
 #[derive(Debug, Deserialize)]
 struct ProviderTokenResponse {
     #[serde(default)]
-    #[allow(dead_code)] // present in the response; not used by the UI
     access_token: Option<String>,
     #[serde(default)]
     id_token: Option<String>,
@@ -471,9 +470,12 @@ fn decode_and_validate_id_token(
 
 /// POST /api/v1/user/register — upserts the user record on the meeting-api.
 ///
-/// Failure is logged but does not abort the login flow — the user can still
-/// join meetings; the DB row will be created on a future call.
-async fn register_user_with_backend(id_token: &str) {
+/// The **access token** is forwarded as the Bearer credential.  The meeting-api
+/// validates it via JWKS (same key set as for id_tokens) and upserts the user
+/// row using whatever identity claims are present (`email` or `sub`).
+///
+/// Failure is logged but does not abort the login flow.
+async fn register_user_with_backend(access_token: &str) {
     let base_url = match meeting_api_base_url() {
         Ok(u) => u,
         Err(e) => {
@@ -485,7 +487,10 @@ async fn register_user_with_backend(id_token: &str) {
 
     match reqwest::Client::new()
         .post(&url)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {id_token}"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {access_token}"),
+        )
         .header(reqwest::header::CONTENT_LENGTH, "0")
         .send()
         .await
@@ -692,17 +697,44 @@ async fn run_callback(query_params: String) -> Result<(), String> {
                 .to_string()
         })?;
 
+    // The access token may be absent for some providers (though standard OIDC
+    // always returns one).  Log a warning but continue — the id_token alone
+    // can still be used as a fallback Bearer credential.
+    let access_token = token_resp.access_token.filter(|s| !s.is_empty());
+    if access_token.is_none() {
+        log::warn!(
+            "Provider did not return an access_token; \
+             the id_token will be used as Bearer fallback"
+        );
+    }
+
     // ── 8. Decode and validate the id_token payload ───────────────────────
+    // The id_token is decoded solely to extract user identity claims
+    // (display name, user_id).  It is NOT sent to the meeting-api — the
+    // access_token is used for all API authentication.
     let claims = decode_and_validate_id_token(&id_token, &pkce_state.nonce, &client_id)?;
 
-    // ── 9. Store the id_token ─────────────────────────────────────────────
+    // ── 9. Store both tokens ──────────────────────────────────────────────
+    // id_token  → user identity (email, display name) decoded client-side.
+    // access_token → Bearer credential forwarded to the meeting-api as-is.
     store_id_token(&id_token);
+    if let Some(ref at) = access_token {
+        store_access_token(at);
+    }
 
     // ── 10. Upsert the user record on the backend (graceful) ─────────────
-    register_user_with_backend(&id_token).await;
+    // Use the access_token as Bearer; fall back to id_token when absent.
+    let bearer_for_registration = access_token.as_deref().unwrap_or(&id_token);
+    register_user_with_backend(bearer_for_registration).await;
 
-    // ── 11. Update the local display name ────────────────────────────────
+    // ── 11. Update the local display name and cache the user profile ─────
     let raw_display_name = claims.display_name();
+    let user_id = claims.user_id().unwrap_or_default();
+
+    // Cache the profile claims extracted from the validated id_token so that
+    // get_user_profile() can return them immediately without a network call.
+    crate::auth::store_user_profile(&user_id, &raw_display_name);
+
     if !raw_display_name.is_empty() {
         let display_name = if raw_display_name.contains('@') {
             email_to_display_name(&raw_display_name)
@@ -714,7 +746,6 @@ async fn run_callback(query_params: String) -> Result<(), String> {
         }
     }
 
-    let user_id = claims.user_id().unwrap_or_default();
     log::info!(
         "OAuth callback complete for user '{}' (display: '{}')",
         user_id,

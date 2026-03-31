@@ -66,6 +66,22 @@ pub type UserProfile = ProfileResponse;
 /// closes the window.
 const ID_TOKEN_KEY: &str = "vc_id_token";
 
+/// `sessionStorage` key for the provider access token.
+///
+/// The access token is stored alongside the id_token.  It is sent as the
+/// `Authorization: Bearer` credential on all meeting-api requests.  The id_token
+/// is kept separately and used exclusively for reading user identity claims
+/// (display name, user ID) — the access token is treated as opaque.
+const ACCESS_TOKEN_KEY: &str = "vc_access_token";
+
+/// `sessionStorage` key for the user's canonical identifier extracted from the
+/// validated id_token payload (email if present, otherwise `sub`).
+const PROFILE_USER_ID_KEY: &str = "vc_profile_user_id";
+
+/// `sessionStorage` key for the user's display name extracted from the
+/// validated id_token payload.
+const PROFILE_DISPLAY_NAME_KEY: &str = "vc_profile_display_name";
+
 /// `sessionStorage` key for the cached provider auth URL (set when the value
 /// was obtained from `GET /api/v1/oauth/provider-config` rather than from
 /// `window.__APP_CONFIG`).
@@ -101,23 +117,140 @@ pub fn clear_id_token() {
 }
 
 // ---------------------------------------------------------------------------
+// Access-token storage
+// ---------------------------------------------------------------------------
+
+/// Read the stored provider access token from `sessionStorage`.
+///
+/// Returns `None` when no OAuth exchange has been completed in the current
+/// tab or when `sessionStorage` is unavailable.
+///
+/// The access token is **opaque** from the UI's perspective — it is passed
+/// through as-is to the meeting-api and never decoded or inspected by the
+/// browser.
+pub fn get_stored_access_token() -> Option<String> {
+    window()
+        .session_storage()
+        .ok()
+        .flatten()
+        .and_then(|s| s.get_item(ACCESS_TOKEN_KEY).ok().flatten())
+        .filter(|t| !t.is_empty())
+}
+
+/// Store the provider access token in `sessionStorage`.
+///
+/// Called by the OAuth callback page after a successful token exchange.
+pub fn store_access_token(token: &str) {
+    if let Some(storage) = window().session_storage().ok().flatten() {
+        let _ = storage.set_item(ACCESS_TOKEN_KEY, token);
+    }
+}
+
+/// Remove the stored access token from `sessionStorage`.
+///
+/// Called on logout so subsequent requests are unauthenticated immediately,
+/// even before the browser navigation to the logout endpoint completes.
+pub fn clear_access_token() {
+    if let Some(storage) = window().session_storage().ok().flatten() {
+        let _ = storage.remove_item(ACCESS_TOKEN_KEY);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// User profile cache
+// ---------------------------------------------------------------------------
+
+/// Persist the user profile claims extracted from a validated id_token to
+/// `sessionStorage`.
+///
+/// Called by the OAuth callback page immediately after
+/// `decode_and_validate_id_token` succeeds.  Storing the claims here lets
+/// [`get_user_profile`] return a result synchronously (from cache) without a
+/// network round-trip to `GET /profile`.
+///
+/// `user_id` is the canonical user identifier — email when present in the
+/// token, otherwise the opaque `sub` claim.
+/// `display_name` is the raw display name resolved from the token's `name`,
+/// `given_name`/`family_name`, `email`, or `sub` claims in that order.
+pub fn store_user_profile(user_id: &str, display_name: &str) {
+    if let Some(storage) = window().session_storage().ok().flatten() {
+        let _ = storage.set_item(PROFILE_USER_ID_KEY, user_id);
+        let _ = storage.set_item(PROFILE_DISPLAY_NAME_KEY, display_name);
+    }
+}
+
+/// Read the cached user profile from `sessionStorage`.
+///
+/// Returns `Some(UserProfile)` when both `user_id` and `display_name` are
+/// present (set by the OAuth callback page after a successful token exchange).
+/// Returns `None` when no profile has been cached yet.
+pub fn get_stored_user_profile() -> Option<UserProfile> {
+    let storage = window().session_storage().ok().flatten()?;
+    let user_id = storage
+        .get_item(PROFILE_USER_ID_KEY)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())?;
+    let name = storage
+        .get_item(PROFILE_DISPLAY_NAME_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Some(UserProfile { user_id, name })
+}
+
+/// Remove the cached user profile from `sessionStorage`.
+///
+/// Called on logout so stale profile data cannot be observed after the
+/// user signs out.
+pub fn clear_user_profile() {
+    if let Some(storage) = window().session_storage().ok().flatten() {
+        let _ = storage.remove_item(PROFILE_USER_ID_KEY);
+        let _ = storage.remove_item(PROFILE_DISPLAY_NAME_KEY);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session / profile
 // ---------------------------------------------------------------------------
 
 /// Check whether the current session is still valid.
 ///
-/// **Fast-path:** when `oauthEnabled` is true and no id_token is stored,
-/// returns `Err` immediately without a network round-trip.
+/// **Fast-path:** when `oauthEnabled` is true and neither the access token
+/// nor the id_token is stored, the server will always return 401 — skip the
+/// network round-trip and fail immediately.
 pub async fn check_session() -> anyhow::Result<()> {
-    if oauth_enabled().unwrap_or(false) && get_stored_id_token().is_none() {
-        return Err(anyhow!("no id_token stored; OAuth authentication required"));
+    if oauth_enabled().unwrap_or(false)
+        && get_stored_access_token().is_none()
+        && get_stored_id_token().is_none()
+    {
+        return Err(anyhow!("no OAuth token stored; authentication required"));
     }
     let client = meeting_api_client().map_err(|e| anyhow!("Config error: {e}"))?;
     client.check_session().await.map_err(|e| anyhow!("{e}"))
 }
 
-/// Fetch the authenticated user's display name and user ID.
+/// Return the authenticated user's profile.
+///
+/// **Fast-path (OAuth):** returns the profile cached in `sessionStorage` by
+/// the OAuth callback page.  The callback stores the `user_id` and
+/// `display_name` extracted from the validated id_token immediately after a
+/// successful token exchange, so this function can return without any network
+/// request.
+///
+/// **Fallback (no OAuth / no cached profile):** calls `GET /profile` on the
+/// meeting-api.  This path is taken for deployments that do not use an
+/// external OAuth provider (legacy HMAC session JWT mode) or in the unlikely
+/// event that the cache is absent despite a valid session.
 pub async fn get_user_profile() -> anyhow::Result<UserProfile> {
+    // Return the profile cached by the OAuth callback whenever it is present.
+    // This avoids a network round-trip and works even before the first API
+    // call completes.
+    if let Some(profile) = get_stored_user_profile() {
+        return Ok(profile);
+    }
+
+    // Fallback: ask the meeting-api.
     let client = meeting_api_client().map_err(|e| anyhow!("Config error: {e}"))?;
     client.get_profile().await.map_err(|e| anyhow!("{e}"))
 }
@@ -412,7 +545,11 @@ pub fn redirect_to_login() {
 /// Any `303` redirect to the OIDC provider's `end_session_endpoint` is
 /// followed as a real page load (terminating the provider session too).
 pub fn logout() -> Result<(), String> {
+    // Clear all session-scoped state before navigating away so subsequent
+    // requests are immediately unauthenticated, even if the navigation is slow.
+    clear_access_token();
     clear_id_token();
+    clear_user_profile();
     let url = logout_url()?;
     window()
         .location()

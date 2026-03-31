@@ -83,10 +83,17 @@ impl FromRequestParts<AppState> for AuthUser {
             let token = extract_bearer_token(parts)
                 .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
 
+            // Validate the Bearer token via JWKS (signature, exp, iss).
+            //
+            // Audience (`aud`) validation is intentionally skipped here:
+            // id_tokens carry `aud == client_id`, but access tokens carry a
+            // resource-server audience that differs per provider.  Signature +
+            // issuer + expiry is sufficient for per-request authentication at
+            // a resource server.
             let claims = crate::oauth::verify_and_decode_id_token(
                 jwks,
                 &token,
-                &oauth_cfg.client_id,
+                None, // skip aud — accepts both id_tokens and access tokens
                 oauth_cfg.issuer.as_deref(),
                 // Nonce is validated only during the initial token exchange;
                 // re-validating on every request would require the server to
@@ -95,16 +102,21 @@ impl FromRequestParts<AppState> for AuthUser {
             )
             .await
             .map_err(|e| {
-                tracing::warn!("Provider id_token validation failed: {e:?}");
-                AppError::unauthorized_msg("invalid or expired provider token")
+                tracing::warn!("Bearer token validation failed: {e:?}");
+                AppError::unauthorized_msg("invalid or expired bearer token")
             })?;
 
             let name = claims.display_name();
 
+            // Access tokens often omit the `email` claim; fall back to `sub`
+            // (subject), which is always present in both token types.
             let user_id = claims
                 .email
                 .filter(|e| !e.is_empty())
-                .ok_or_else(|| AppError::unauthorized_msg("id_token is missing the email claim"))?;
+                .or_else(|| claims.sub.filter(|s| !s.is_empty()))
+                .ok_or_else(|| {
+                    AppError::unauthorized_msg("bearer token is missing both email and sub claims")
+                })?;
 
             return Ok(AuthUser { user_id, name });
         }
@@ -648,5 +660,44 @@ mod tests {
 
         // Without a Bearer header the JWKS path returns 401 immediately.
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Access tokens often carry only `sub` (no `email`).  The extractor must
+    /// use `sub` as `user_id` in that case.
+    #[tokio::test]
+    async fn jwks_path_access_token_sub_only_authenticates_user() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        // Access token: has sub but no email; aud is the resource server URL,
+        // not the client_id.
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = serde_json::json!({
+            "sub": "opaque-user-sub-12345",
+            "iss": "https://provider.example.com",
+            "aud": "https://api.example.com",   // resource-server audience
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.clone());
+        let access_token = encode(&header, &claims, &enc).unwrap();
+
+        let state = make_jwks_state(jwks);
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let auth = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("sub-only access token should authenticate");
+
+        // user_id falls back to sub when email is absent
+        assert_eq!(auth.user_id, "opaque-user-sub-12345");
     }
 }

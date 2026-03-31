@@ -140,8 +140,13 @@ pub fn login_url() -> Result<String, String> {
 pub fn logout_url() -> Result<String, String> {
     meeting_api_base_url().map(|url| format!("{}/logout", url))
 }
-/// URL of the `POST /api/v1/oauth/exchange` endpoint used by the
-/// `/auth/callback` route to exchange the authorization code for tokens.
+/// URL of the `POST /api/v1/oauth/exchange` endpoint.
+///
+/// This is the **legacy** server-side PKCE exchange path.  The dioxus-ui
+/// callback now exchanges the code directly with the provider, so this
+/// function is no longer called by the UI itself but is kept for external
+/// clients that may still use the server-side flow.
+#[allow(dead_code)]
 pub fn oauth_exchange_url() -> Result<String, String> {
     meeting_api_base_url().map(|url| format!("{}/api/v1/oauth/exchange", url))
 }
@@ -254,11 +259,15 @@ pub fn meeting_api_base_url() -> Result<String, String> {
 
 pub fn meeting_api_client() -> Result<videocall_meeting_client::MeetingApiClient, String> {
     let base_url = meeting_api_base_url()?;
-    // When an id_token is stored in sessionStorage (OAuth exchange complete),
-    // use Bearer token auth so the meeting-api can validate the provider token
-    // via JWKS.  Fall back to Cookie mode for deployments without OAuth
-    // (the server still accepts legacy session JWTs in that configuration).
-    let auth_mode = crate::auth::get_stored_id_token()
+    // Bearer token priority:
+    //   1. access_token — the OAuth access token intended for resource servers.
+    //      Sent as-is; the meeting-api validates it via JWKS.
+    //   2. id_token — fallback for tabs where only the id_token was stored
+    //      (e.g. sessions from before the access_token was introduced).
+    //   3. Cookie mode — for deployments that do not use an external OAuth
+    //      provider (the server still accepts legacy HMAC session JWTs).
+    let auth_mode = crate::auth::get_stored_access_token()
+        .or_else(|| crate::auth::get_stored_id_token())
         .map(videocall_meeting_client::AuthMode::Bearer)
         .unwrap_or(videocall_meeting_client::AuthMode::Cookie);
     Ok(videocall_meeting_client::MeetingApiClient::new(

@@ -92,7 +92,7 @@ services:
       - REGION=us-east
       - SERVER_ID=server-1
       - SERVICE_TYPE=websocket
-      - FEATURE_MEETING_MANAGEMENT=false
+      - FEATURE_MEETING_MANAGEMENT=true
       - JWT_SECRET=dev-jwt-secret-change-me
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1

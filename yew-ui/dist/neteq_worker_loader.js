@@ -1,0 +1,1 @@
+importScripts("./neteq_worker.js");wasm_bindgen("./neteq_worker_bg.wasm");

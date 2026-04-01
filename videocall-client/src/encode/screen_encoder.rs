@@ -60,10 +60,10 @@ use crate::diagnostics::EncoderBitrateController;
 ///
 /// This allows the UI to react to screen share lifecycle events without managing
 /// the MediaStream directly.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum ScreenShareEvent {
-    /// Screen share successfully started and encoding is active
-    Started,
+    /// Screen share successfully started and encoding is active, carrying the MediaStream
+    Started(MediaStream),
     /// User cancelled the browser picker dialog (no error dialog shown)
     Cancelled,
     /// Screen share ended normally (user clicked browser's "Stop sharing" or stream ended)
@@ -98,6 +98,12 @@ pub struct ScreenEncoder {
     /// When set to `true`, the next encoded frame will be forced as a keyframe.
     /// Used by the PLI (Picture Loss Indication) mechanism.
     force_keyframe: Arc<AtomicBool>,
+    /// Holds the *original* video track returned by getDisplayMedia so that `stop()` can call
+    /// `.stop()` on it directly.  The browser's native screen-share indicator bar (the
+    /// "You are sharing" bar with "Stop sharing" / "Hide") is only dismissed when the
+    /// original capture track is stopped; stopping a cloned track (e.g. from
+    /// `MediaStream::clone()`) does **not** affect the indicator.
+    active_video_track: Rc<RefCell<Option<MediaStreamTrack>>>,
 }
 
 impl ScreenEncoder {
@@ -128,6 +134,7 @@ impl ScreenEncoder {
             tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
+            active_video_track: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -185,6 +192,12 @@ impl ScreenEncoder {
                 }
             }
         });
+    }
+
+    /// Returns a handle to the active screen-share MediaStream.
+    /// The inner Option is None when no screen is being shared.
+    pub fn screen_stream(&self) -> Rc<RefCell<Option<MediaStream>>> {
+        self.screen_stream.clone()
     }
 
     /// Gets the current encoder output frame rate
@@ -246,10 +259,24 @@ impl ScreenEncoder {
         // set_screen_enabled(false) call (the enabled.swap guard returns false).
         self.client.set_screen_enabled(false);
 
-        // Synchronously stop all tracks from the stored stream so the browser
-        // releases the screen-capture indicator immediately.
+        // Stop the *original* capture track synchronously so the browser dismisses
+        // its native screen-share indicator bar ("Stop sharing" / "Hide") immediately.
+        // The stream stored in `screen_stream` is a *clone* of the original stream;
+        // its tracks are clones of the original tracks.  Stopping cloned tracks does
+        // NOT stop the underlying capture source — the indicator only goes away when
+        // the original track is stopped.  The encoding loop also calls
+        // `media_track.stop()` during cleanup, but that only happens after the next
+        // async read() resolves, which can be one frame-period later (or longer when
+        // the shared window is idle).  Stopping here is immediate.
+        if let Some(track) = self.active_video_track.borrow_mut().take() {
+            log::info!("stop: stopping original capture track to dismiss browser indicator");
+            track.stop();
+        }
+
+        // Synchronously stop all tracks from the stored (cloned) stream.
         // SAFETY: In WASM's single-threaded environment this lock can never be contended.
         let stream = self.screen_stream.borrow_mut().take();
+        log::info!("stop share media stream");
         if let Some(stream) = stream {
             for i in 0..stream.get_tracks().length() {
                 let track = stream
@@ -257,6 +284,15 @@ impl ScreenEncoder {
                     .get(i)
                     .unchecked_into::<web_sys::MediaStreamTrack>();
                 track.stop();
+            }
+            // Emit Stopped so the UI layer can clean up (e.g., detach preview srcObject).
+            // The encoding loop's end-of-loop cleanup will skip its own Stopped emission
+            // because enabled.swap(false) returns false (state.stop() already cleared it).
+            // The onended handler may also fire in browsers that dispatch "ended" on
+            // programmatic stop() calls (e.g., Chrome); duplicate Stopped events are
+            // harmless — the UI handlers are idempotent.
+            if let Some(ref callback) = self.on_state_change {
+                callback.emit(ScreenShareEvent::Stopped);
             }
         }
     }
@@ -285,6 +321,7 @@ impl ScreenEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
+        let active_video_track = self.active_video_track.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -434,6 +471,10 @@ impl ScreenEncoder {
                 .clone()
                 .unchecked_into::<MediaStreamTrack>();
 
+            // Store the original track so stop() can stop it synchronously, which
+            // is required to immediately dismiss the browser's capture indicator bar.
+            active_video_track.borrow_mut().replace(media_track.clone());
+
             // Set up onended handler to detect when user clicks browser's "Stop sharing" button
             // Keep the closure in scope until the encoding loop ends to avoid memory leak
             let _onended_handler = {
@@ -483,7 +524,7 @@ impl ScreenEncoder {
             // All setup complete - NOW emit Started event and notify peers
             client_for_state.set_screen_enabled(true);
             if let Some(ref callback) = on_state_change {
-                callback.emit(ScreenShareEvent::Started);
+                callback.emit(ScreenShareEvent::Started(screen_to_share.clone()));
             }
 
             let screen_reader = screen_processor
@@ -659,6 +700,8 @@ impl ScreenEncoder {
             }
 
             // At the end of the loop, ensure proper cleanup
+            // Clear the active track reference so stop() doesn't try to stop it again.
+            active_video_track.borrow_mut().take();
             // Clear the onended handler before dropping the closure to avoid dangling reference
             media_track.set_onended(None);
 

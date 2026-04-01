@@ -1,0 +1,9 @@
+apiVersion: v2
+name: meeting-api-ascend
+version: 0.1.0
+description: Meeting API server for Ascend region
+
+dependencies:
+  - name: meeting-api
+    version: 0.1.0
+    repository: file://../../../meeting-api

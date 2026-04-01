@@ -3,7 +3,7 @@ rustlemania-webtransport:
   nameOverride: "webtransport-us-east"
   fullnameOverride: "webtransport-us-east"
 
-  replicaCount: 1  # Higher replicas for primary region
+  replicaCount: 1
 
   command: ['webtransport_server']
   tlsSecret: webtransport-us-east-tls
@@ -17,7 +17,7 @@ rustlemania-webtransport:
     - name: RUST_LOG
       value: warn,quinn=warn,web-transport-quinn=warn,async_nats=warn
     - name: NATS_URL
-      value: nats-us-east:4222  # Connect to US East NATS cluster
+      value: nats-us-east:4222
     - name: LISTEN_URL
       value: 0.0.0.0:443
     - name: HEALTH_LISTEN_URL
@@ -41,9 +41,9 @@ rustlemania-webtransport:
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
     - name: TOKIO_WORKER_THREADS
-      value: "4"  # Optimal for 3500m CPU (WebTransport + crypto operations)
+      value: "4"
     - name: TOKIO_BLOCKING_THREADS
-      value: "2"  # Small pool for blocking crypto operations
+      value: "2"
     - name: JWT_SECRET
       valueFrom:
         secretKeyRef:
@@ -59,33 +59,29 @@ rustlemania-webtransport:
       memory: "256Mi"
 
   service:
-    type: LoadBalancer  # LoadBalancer for UDP traffic
+    type: LoadBalancer
     port: 443
     healthPort: 444
-    annotations:
-      service.beta.kubernetes.io/do-loadbalancer-name: "webtransport-us-east"
-      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "10"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
-      external-dns.alpha.kubernetes.io/hostname: "webtransport-us-east.webtransport.video"
 
   podAnnotations:
     prometheus.io/scrape: "true"
     prometheus.io/port: "444"
     prometheus.io/path: "/metrics"
 
-  autoscaling:
-    enabled: false
-    minReplicas: 1
-    maxReplicas: 10
-    targetCPUUtilizationPercentage: 70
+  # LB annotations — must be under loadBalancerAnnotations (not service.annotations)
+  # as that's what the loadbalancer.yaml template reads.
+  loadBalancerAnnotations:
+    external-dns.alpha.kubernetes.io/hostname: "webtransport-us-east.webtransport.video"
+    service.beta.kubernetes.io/do-loadbalancer-type: "REGIONAL_NETWORK"
+    service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "3"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "4"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "5"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
 
-  # Node selector for US East region
   nodeSelector:
     topology.kubernetes.io/region: "nyc1"
 
@@ -100,4 +96,4 @@ rustlemania-webtransport:
               operator: In
               values:
               - webtransport-us-east
-          topologyKey: kubernetes.io/hostname 
+          topologyKey: kubernetes.io/hostname

@@ -13,11 +13,18 @@ spec:
       app.kubernetes.io/component: server-stats
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.serverStats.service.targetPort }}"
+        prometheus.io/path: "/metrics"
+        {{- with .Values.serverStats.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       labels:
         {{- include "metrics-api.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: server-stats
     spec:
-      {{- with .Values.metricsApi.imagePullSecrets }}
+      {{- with .Values.serverStats.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}

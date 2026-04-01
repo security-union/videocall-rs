@@ -232,11 +232,11 @@ pub fn HostControls(
                             let fetch_admit = fetch_waiting_list.clone();
                             let fetch_reject = fetch_waiting_list.clone();
 
-                            let mut waiting_admit = waiting.clone();
-                            let mut waiting_reject = waiting.clone();
+                            let mut waiting_admit = waiting;
+                            let mut waiting_reject = waiting;
 
-                            let error_admit = error.clone();
-                            let error_reject = error.clone();
+                            let error_admit = error;
+                            let error_reject = error;
 
                             rsx! {
                                 div { key: "{uid_for_key}", class: "waiting-participant",
@@ -261,7 +261,7 @@ pub fn HostControls(
                                                 let uid = uid_admit.clone();
                                                 let meeting_id = meeting_id_admit.clone();
                                                 let fetch = fetch_admit.clone();
-                                                let mut error = error_admit.clone();
+                                                let mut error = error_admit;
 
                                                 spawn(async move {
                                                     match admit_participant(&meeting_id, &uid).await {
@@ -288,7 +288,7 @@ pub fn HostControls(
                                                 let uid = uid_reject.clone();
                                                 let meeting_id = meeting_id_reject.clone();
                                                 let fetch = fetch_reject.clone();
-                                                let mut error = error_reject.clone();
+                                                let mut error = error_reject;
 
                                                 spawn(async move {
                                                     match reject_participant(&meeting_id, &uid).await {

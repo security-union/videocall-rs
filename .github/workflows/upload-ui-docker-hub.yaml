@@ -1,8 +1,0 @@
-# Deprecated: Yew UI has been removed.
-# Dioxus UI is now published via upload-dioxus-ui-docker-hub.yaml
-name: "[DEPRECATED] Publish Yew UI to Docker image"
-
-on:
-  workflow_dispatch:
-
-jobs: {}

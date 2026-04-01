@@ -450,7 +450,7 @@ pub fn Diagnostics(
     let mut neteq_buffer_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut neteq_jitter_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut diag_task = use_signal(|| None::<Task>);
-    let mut backend_versions = use_signal(|| Vec::<serde_json::Value>::new());
+    let mut backend_versions = use_signal(Vec::<serde_json::Value>::new);
 
     // Subscribe to diagnostics events using Dioxus `spawn`.
     // `spawn` runs within the Dioxus runtime so signal mutations properly

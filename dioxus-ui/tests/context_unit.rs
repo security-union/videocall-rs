@@ -12,8 +12,9 @@ use wasm_bindgen_test::*;
 
 use dioxus_ui::context::{
     clear_display_name_from_storage, email_to_display_name, load_display_name_from_storage,
-    normalize_spaces, save_display_name_to_storage, validate_display_name, DISPLAY_NAME_MAX_LEN,
+    save_display_name_to_storage, validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
+use videocall_types::validation::normalize_spaces;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 

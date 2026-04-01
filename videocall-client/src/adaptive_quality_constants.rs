@@ -118,19 +118,23 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at "medium" (480p/25fps/600kbps) avoids wasting ~1.5 seconds of
-/// high-quality encoding on constrained devices before the first step-down.
-/// Medium is a safe starting point that can quickly step up on good
-/// connections or step down on bad ones.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "medium"
+/// Starting at the lowest tier ("minimal", 240p/10fps/150kbps) ensures the
+/// system only ever upgrades from the initial state. This eliminates the
+/// visible dimension-change oscillation that occurred when starting at
+/// "medium": the PID controller allocates ~300 kbps during warmup, but
+/// medium expects ~600 kbps, so bitrate_ratio drops below the degrade
+/// threshold and triggers a step-down. Starting at minimal means the first
+/// tier transition the user sees is a quality *improvement*, not a jarring
+/// resolution drop.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 3; // "minimal"
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at the highest tier (1080p/15fps/1500kbps) because
-/// screen content is resolution-sensitive -- text and fine UI details become
-/// unreadable at lower resolutions. The system can still step down if
-/// network conditions require it.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0; // "high"
+/// Screen share starts at the lowest tier ("low", 480p/5fps/250kbps) to
+/// match the camera strategy: only upgrade, never visibly downgrade. The
+/// PID controller will quickly ramp up resolution once it measures
+/// sufficient bandwidth, so text readability recovers within seconds.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 2; // "low"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
@@ -246,6 +250,15 @@ pub const STEP_DOWN_REACTION_TIME_MS: u64 = 1500;
 /// Prevents rapid toggling even if thresholds are crossed quickly.
 pub const MIN_TIER_TRANSITION_INTERVAL_MS: u64 = 3000;
 
+/// Warmup grace period after the quality manager is created (milliseconds).
+///
+/// During encoder startup, no frames have been produced yet so `fps_ratio`
+/// reads as 0.0, which triggers aggressive step-downs (high -> low -> minimal).
+/// Once frames start flowing the manager steps back up, causing visible
+/// aspect-ratio glitches. This warmup period suppresses all tier transitions
+/// until the encoder has had time to produce stable output.
+pub const QUALITY_WARMUP_MS: f64 = 5000.0;
+
 // ---------------------------------------------------------------------------
 // PID Controller Tuning
 // ---------------------------------------------------------------------------
@@ -306,11 +319,26 @@ pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
 /// Kept low so the first retry fires quickly after a transient drop.
 pub const RECONNECT_INITIAL_DELAY_MS: u64 = 500;
 
-/// Maximum reconnection delay (milliseconds). Exponential backoff caps here.
-/// Capped at 2 seconds so the user never waits long between attempts --
-/// a video call client should keep trying indefinitely but still back off
-/// enough to avoid hammering a downed server.
-pub const RECONNECT_MAX_DELAY_MS: u64 = 2000;
+/// Progressive reconnection delay caps (milliseconds).
+///
+/// Instead of a single flat cap, the backoff limit increases with the attempt
+/// count. This balances fast recovery for transient drops against server
+/// protection during extended outages:
+///
+/// - Attempts 1-5:  cap at 2s  (quick recovery for WiFi blips)
+/// - Attempts 6-15: cap at 10s (moderate backoff for longer disruptions)
+/// - Attempts 16+:  cap at 30s (gentle polling during extended outages)
+///
+/// Over a 5-minute outage, a single client now produces ~15 attempts instead
+/// of ~150, reducing server load by ~10x during widespread failures.
+pub const RECONNECT_MAX_DELAY_PHASE1_MS: u64 = 2000;
+pub const RECONNECT_MAX_DELAY_PHASE2_MS: u64 = 10000;
+pub const RECONNECT_MAX_DELAY_PHASE3_MS: u64 = 30000;
+
+/// Attempt thresholds for progressive backoff phases.
+/// Attempts <= PHASE1 use PHASE1 cap, <= PHASE2 use PHASE2 cap, else PHASE3.
+pub const RECONNECT_PHASE1_MAX_ATTEMPTS: u32 = 5;
+pub const RECONNECT_PHASE2_MAX_ATTEMPTS: u32 = 15;
 
 /// Backoff multiplier per attempt.
 pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
@@ -320,11 +348,26 @@ pub const RECONNECT_BACKOFF_MULTIPLIER: f64 = 2.0;
 /// indefinitely, this is the only hard stop: it catches auth failures and
 /// server rejections early, avoiding futile retries that waste resources and
 /// may trigger server-side rate limiting.
-pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 3;
+///
+/// Set to 10 (not 3) to tolerate WiFi handoffs and network transitions that
+/// can take 5-30 seconds. With the progressive backoff caps (2s -> 10s -> 30s),
+/// 10 attempts spans ~30-60 seconds of retries, which covers most real-world
+/// network disruptions.
+pub const RECONNECT_CONSECUTIVE_ZERO_LIMIT: u32 = 10;
 
 /// RTT degradation multiplier to trigger connection re-election.
-/// If current RTT > election_rtt * this multiplier, re-elect.
-pub const REELECTION_RTT_MULTIPLIER: f64 = 2.0;
+/// If current RTT > max(election_rtt * this multiplier, REELECTION_RTT_MIN_THRESHOLD_MS),
+/// re-elect.
+pub const REELECTION_RTT_MULTIPLIER: f64 = 3.0;
+
+/// Minimum absolute RTT degradation threshold (milliseconds).
+///
+/// On localhost or very fast networks the baseline RTT can be sub-millisecond
+/// (e.g. 0.5ms), making a pure multiplier-based threshold trigger on normal
+/// jitter (2-3ms). This floor guarantees that the threshold is never lower
+/// than this value, regardless of the baseline. The effective threshold is:
+///   `max(baseline * REELECTION_RTT_MULTIPLIER, REELECTION_RTT_MIN_THRESHOLD_MS)`
+pub const REELECTION_RTT_MIN_THRESHOLD_MS: f64 = 50.0;
 
 /// Number of consecutive degraded RTT samples before triggering re-election.
 pub const REELECTION_CONSECUTIVE_SAMPLES: u32 = 5;
@@ -354,6 +397,21 @@ pub const DIAGNOSTICS_REPORT_INTERVAL_MS: u64 = 1000;
 /// RTT probe interval during server election (milliseconds).
 pub const RTT_PROBE_ELECTION_INTERVAL_MS: u64 = 200;
 
+/// Minimum number of RTT samples a connection must have before it can be
+/// considered for election. On high-latency connections (200ms+ RTT, common
+/// in India, Africa, Southeast Asia, Australia), the QUIC/TLS or TCP+WS
+/// handshake alone can take 400-900ms, leaving too few probes for a reliable
+/// measurement within the default election period. Requiring multiple samples
+/// ensures the elected transport is chosen on stable data, not a single
+/// potentially anomalous measurement.
+pub const ELECTION_MIN_RTT_SAMPLES: usize = 2;
+
+/// Maximum number of 1-second deadline extensions allowed when the election
+/// timer expires but no connection has accumulated `ELECTION_MIN_RTT_SAMPLES`.
+/// This caps the total additional wait to avoid indefinitely delaying the
+/// election on networks where connections never complete their handshake.
+pub const ELECTION_MAX_EXTENSIONS: u32 = 2;
+
 /// RTT probe interval after server election (milliseconds).
 pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 
@@ -374,9 +432,18 @@ pub const DATAGRAM_MAX_SIZE: usize = 1200;
 // ---------------------------------------------------------------------------
 
 /// Enable redundant audio when FEC flag is set in AudioQualityTier.
-/// Each audio packet carries the previous frame as redundancy.
-/// Increases audio bandwidth by ~2x but provides loss recovery.
-pub const AUDIO_REDUNDANCY_ENABLED: bool = true;
+///
+/// **Disabled.** Reliable QUIC streams guarantee delivery, so there is no
+/// packet loss to recover from — RED provides zero benefit on this transport.
+/// RED doubles audio bandwidth (2x per stream) with no corresponding gain.
+/// At 100 participants this adds ~341 Mbps of unnecessary server outbound
+/// bandwidth. Worse, RED activates during congestion (medium/low/emergency
+/// tiers) which is exactly the wrong time to double bandwidth. NetEQ already
+/// handles gap concealment on the receiver side.
+///
+/// The implementation is retained behind this constant so RED can be
+/// re-enabled if the transport layer ever switches to unreliable delivery.
+pub const AUDIO_REDUNDANCY_ENABLED: bool = false;
 
 /// Default Opus frame duration in milliseconds.
 ///
@@ -701,7 +768,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
+        assert_eq!(tier.label, "minimal", "default tier should be 'minimal'");
     }
 
     #[test]

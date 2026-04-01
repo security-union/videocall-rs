@@ -1,6 +1,6 @@
 # US East Dioxus UI configuration
 videocall-ui:
-  fullnameOverride: "videocall-ui-dx-us-east"
+  fullnameOverride: "videocall-ui-us-east"
 
   replicaCount: 1
 
@@ -45,11 +45,11 @@ videocall-ui:
       cert-manager.io/issuer: "letsencrypt-prod"
       nginx.ingress.kubernetes.io/ssl-redirect: "true"
     hosts:
-      - host: app-dx.videocall.rs
+      - host: app.videocall.rs
         paths:
           - path: /
             pathType: Prefix
     tls:
-      - secretName: videocall-ui-dx-tls
+      - secretName: videocall-ui-tls
         hosts:
-          - app-dx.videocall.rs
+          - app.videocall.rs

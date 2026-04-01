@@ -36,6 +36,7 @@ wasm-bindgen-futures = { workspace = true }
 version = "0.3"
 features = [
     "BinaryType",
+    "CloseEvent",
     "Event",
     "MessageEvent",
     "ReadableStream",

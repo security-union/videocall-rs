@@ -17,6 +17,7 @@
  */
 
 use crate::{
+    constants::RECONNECT_GRACE_PERIOD,
     messages::{
         server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
         session::Message,
@@ -27,10 +28,12 @@ use crate::{
 
 use actix::{
     Actor, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
+    SpawnHandle,
 };
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -39,14 +42,30 @@ use videocall_types::SYSTEM_USER_ID;
 
 use super::session_logic::{ConnectionState, SessionId};
 
-/// Internal message to clean up active_subs when a spawned join task fails.
-/// This fixes a race condition where start_session could fail inside the spawned task,
-/// leaving a stale entry in active_subs that blocks future join attempts.
+/// Internal message sent via `notify_later` after the reconnection grace period
+/// expires. If the user has not reconnected by the time this message is handled,
+/// the actual `leave_rooms()` + PARTICIPANT_LEFT flow executes.
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
-struct CleanupFailedJoin {
+struct ExecutePendingDeparture {
     session: SessionId,
     room: String,
+    user_id: String,
+    display_name: String,
+}
+
+/// State stored while a departure is pending (waiting for possible reconnection).
+struct PendingDepartureState {
+    /// Handle returned by `ctx.notify_later()`, used to cancel the delayed
+    /// `ExecutePendingDeparture` message if the user reconnects in time.
+    spawn_handle: SpawnHandle,
+    /// The old session ID that disconnected — used for cleanup.
+    old_session: SessionId,
+    /// Whether the disconnecting session had been activated (Testing -> Active).
+    /// Only Active sessions should trigger PARTICIPANT_LEFT, because only Active
+    /// sessions had their PARTICIPANT_JOINED broadcast. Testing sessions (e.g.,
+    /// the losing connection during RTT election) never announced themselves.
+    was_active: bool,
 }
 
 pub struct ChatServer {
@@ -58,6 +77,15 @@ pub struct ChatServer {
     /// Track which sessions are in which room, with their user_id and display_name.
     /// Used to send PARTICIPANT_JOINED for existing peers to new joiners.
     room_members: HashMap<String, Vec<(SessionId, String, String)>>,
+    /// Pending departures keyed by `(room_id, user_id)`. When a session disconnects
+    /// we defer the PARTICIPANT_LEFT broadcast by [`RECONNECT_GRACE_PERIOD`]. If the
+    /// same user reconnects before the timer fires, the departure is cancelled
+    /// silently — no PARTICIPANT_LEFT or PARTICIPANT_JOINED is sent.
+    pending_departures: HashMap<(String, String), PendingDepartureState>,
+    /// Sessions that should NOT have PARTICIPANT_JOINED broadcast at activation.
+    /// This is used for reconnection sessions: the user never "left" from peers'
+    /// perspective, so announcing a "join" would be misleading.
+    suppress_join_broadcast: std::collections::HashSet<SessionId>,
 }
 
 impl ChatServer {
@@ -69,6 +97,8 @@ impl ChatServer {
             session_manager: SessionManager::new(),
             connection_states: HashMap::new(),
             room_members: HashMap::new(),
+            pending_departures: HashMap::new(),
+            suppress_join_broadcast: std::collections::HashSet::new(),
         }
     }
 
@@ -117,6 +147,16 @@ impl ChatServer {
                     }
                 });
                 return;
+            }
+
+            if let Some(state) = self.connection_states.get(session_id) {
+                if *state != ConnectionState::Active {
+                    info!(
+                        "Skipping PARTICIPANT_LEFT for non-active session {}",
+                        session_id
+                    );
+                    return;
+                }
             }
 
             tokio::spawn(async move {
@@ -196,17 +236,77 @@ impl Handler<Disconnect> for ChatServer {
             display_name,
             observer,
         }: Disconnect,
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
     ) -> Self::Result {
-        self.leave_rooms(
-            &session,
-            Some(&room),
-            Some(&user_id),
-            Some(&display_name),
-            observer,
-        );
+        // Clean up session-level state immediately — the transport is gone.
+        // Capture whether the session was Active before removing the state,
+        // so we can store it in PendingDepartureState for the grace period.
+        let was_active = self
+            .connection_states
+            .get(&session)
+            .map(|s| *s == ConnectionState::Active)
+            .unwrap_or(false);
         let _ = self.sessions.remove(&session);
         let _ = self.connection_states.remove(&session);
+        let _ = self.suppress_join_broadcast.remove(&session);
+
+        // Observers and non-active sessions bypass the grace period — they
+        // never triggered PARTICIPANT_JOINED, so there is nothing to defer.
+        if observer {
+            self.leave_rooms(
+                &session,
+                Some(&room),
+                Some(&user_id),
+                Some(&display_name),
+                true,
+            );
+            return;
+        }
+
+        // Remove the NATS subscription task immediately so the old session
+        // stops receiving media. Keep room_members intact for now — they
+        // will be cleaned up either on reconnection or when the grace
+        // period expires.
+        if let Some(task) = self.active_subs.remove(&session) {
+            task.abort();
+        }
+
+        // If there is already a pending departure for this (room, user_id),
+        // cancel the old timer and replace it. This handles the edge case of
+        // rapid disconnect-reconnect-disconnect cycles.
+        let key = (room.clone(), user_id.clone());
+        if let Some(old) = self.pending_departures.remove(&key) {
+            ctx.cancel_future(old.spawn_handle);
+            info!(
+                "Replaced existing pending departure for user {} in room {} (old session {})",
+                user_id, room, old.old_session
+            );
+        }
+
+        info!(
+            "Deferring PARTICIPANT_LEFT for user {} (session {}) in room {} — \
+             grace period {:?}",
+            user_id, session, room, RECONNECT_GRACE_PERIOD
+        );
+
+        let handle = ctx.notify_later(
+            ExecutePendingDeparture {
+                session,
+                room: room.clone(),
+                user_id: user_id.clone(),
+                display_name,
+            },
+            RECONNECT_GRACE_PERIOD,
+        );
+
+        self.pending_departures.insert(
+            key,
+            PendingDepartureState {
+                spawn_handle: handle,
+                old_session: session,
+                was_active,
+            },
+        );
     }
 }
 
@@ -222,6 +322,19 @@ impl Handler<Leave> for ChatServer {
         }: Leave,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
+        // Cancel any pending departure for this (room, user_id) to avoid a
+        // duplicate PARTICIPANT_LEFT when the grace-period timer fires later.
+        // We don't need ctx.cancel_future() because ExecutePendingDeparture::handle
+        // already checks whether the entry exists in pending_departures — once
+        // removed, the timer becomes a no-op.
+        let key = (room.clone(), user_id.clone());
+        if self.pending_departures.remove(&key).is_some() {
+            info!(
+                "Cancelled pending departure for user {} in room {} — explicit Leave received",
+                user_id, room
+            );
+        }
+
         // Leave is always a real participant, never an observer.
         // No display_name available from Leave message; leave_rooms will
         // fall back to user_id.
@@ -232,12 +345,15 @@ impl Handler<Leave> for ChatServer {
 impl Handler<ActivateConnection> for ChatServer {
     type Result = ();
 
-    fn handle(&mut self, msg: ActivateConnection, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: ActivateConnection, ctx: &mut Self::Context) -> Self::Result {
         let ActivateConnection { session } = msg;
-        if let Some(state) = self.connection_states.get_mut(&session) {
+        let was_testing = if let Some(state) = self.connection_states.get_mut(&session) {
             if *state == ConnectionState::Testing {
                 *state = ConnectionState::Active;
                 info!("Session {} activated (Testing -> Active)", session);
+                true
+            } else {
+                false
             }
         } else {
             self.connection_states
@@ -245,6 +361,138 @@ impl Handler<ActivateConnection> for ChatServer {
             info!(
                 "Session {} activated (state was missing, created as Active)",
                 session
+            );
+            // Treat missing state as a Testing -> Active transition so we
+            // still broadcast PARTICIPANT_JOINED.
+            true
+        };
+
+        // Broadcast PARTICIPANT_JOINED now that this connection is confirmed
+        // as the elected/active one. During JoinRoom, the broadcast was deferred
+        // to avoid ghost join events from Testing connections (e.g., the losing
+        // connection during RTT election).
+        //
+        // Skip the broadcast for sessions marked in suppress_join_broadcast
+        // (reconnection sessions and observer sessions).
+        let suppressed = self.suppress_join_broadcast.remove(&session);
+        if was_testing && !suppressed {
+            // Look up the session's room, user_id, and display_name from room_members.
+            let mut found: Option<(String, String, String)> = None;
+            for (room_id, members) in &self.room_members {
+                for (sid, uid, dname) in members {
+                    if *sid == session {
+                        found = Some((room_id.clone(), uid.clone(), dname.clone()));
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+
+            if let Some((room_id, user_id, display_name)) = found {
+                let bytes = SessionManager::build_peer_joined_packet(
+                    &room_id,
+                    &user_id,
+                    session,
+                    &display_name,
+                );
+                let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                info!(
+                    "Publishing deferred PARTICIPANT_JOINED for {} (display={}, session={}) to {}",
+                    user_id, display_name, session, subject
+                );
+                let nc = self.nats_connection.clone();
+                let fut = async move {
+                    if let Err(e) = nc.publish(subject, bytes.into()).await {
+                        error!("Error publishing deferred PARTICIPANT_JOINED: {}", e);
+                    }
+                };
+                let fut = actix::fut::wrap_future::<_, Self>(fut);
+                ctx.spawn(fut);
+            } else {
+                // This can happen for observer sessions (not tracked in room_members)
+                // or if the session was cleaned up before activation. Not an error.
+                info!(
+                    "Session {} activated but not found in room_members — \
+                     skipping PARTICIPANT_JOINED (likely observer or already cleaned up)",
+                    session
+                );
+            }
+        }
+    }
+}
+
+/// Handler for deferred departure execution.
+/// Runs after [`RECONNECT_GRACE_PERIOD`] unless cancelled by a reconnection.
+impl Handler<ExecutePendingDeparture> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        ExecutePendingDeparture {
+            session,
+            room,
+            user_id,
+            display_name,
+        }: ExecutePendingDeparture,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        let key = (room.clone(), user_id.clone());
+
+        // Only execute if this departure is still pending. It may have been
+        // cancelled by a reconnection or replaced by a newer disconnect.
+        if let Some(pending) = self.pending_departures.remove(&key) {
+            if pending.old_session != session {
+                // A newer disconnect replaced this one — do nothing, the newer
+                // timer will handle it.
+                info!(
+                    "Stale pending departure for user {} in room {} (session {} != {}), skipping",
+                    user_id, room, session, pending.old_session
+                );
+                // Re-insert the newer pending state.
+                self.pending_departures.insert(key, pending);
+                return;
+            }
+
+            // Only broadcast PARTICIPANT_LEFT if the session was Active when it
+            // disconnected. Testing sessions (e.g., the losing connection during
+            // RTT election) never had PARTICIPANT_JOINED broadcast, so emitting
+            // PARTICIPANT_LEFT would cause ghost leave events for other participants.
+            if !pending.was_active {
+                info!(
+                    "Grace period expired for user {} (session {}) in room {} — \
+                     skipping PARTICIPANT_LEFT (session was never activated)",
+                    user_id, session, room
+                );
+                // Still clean up room_members for the old session.
+                if let Some(members) = self.room_members.get_mut(&room) {
+                    members.retain(|(sid, _, _)| *sid != session);
+                    if members.is_empty() {
+                        self.room_members.remove(&room);
+                    }
+                }
+                return;
+            }
+
+            info!(
+                "Grace period expired for user {} (session {}) in room {} — \
+                 executing PARTICIPANT_LEFT",
+                user_id, session, room
+            );
+            // Observer sessions bypass the grace period entirely (handled
+            // directly in Disconnect), so this path is always non-observer.
+            self.leave_rooms(
+                &session,
+                Some(&room),
+                Some(&user_id),
+                Some(&display_name),
+                false,
+            );
+        } else {
+            info!(
+                "Pending departure for user {} in room {} already cancelled (reconnected)",
+                user_id, room
             );
         }
     }
@@ -334,7 +582,37 @@ impl Handler<JoinRoom> for ChatServer {
             return MessageResult(Ok(()));
         }
 
-        let session_manager = self.session_manager.clone();
+        // --- Reconnection grace period: cancel pending departure ---
+        // If the same user_id is reconnecting to the same room within
+        // the grace window, suppress both PARTICIPANT_LEFT (already deferred)
+        // and the PARTICIPANT_JOINED that would normally follow.
+        let departure_key = (room.clone(), user_id.clone());
+        let is_reconnection = if let Some(pending) = self.pending_departures.remove(&departure_key)
+        {
+            ctx.cancel_future(pending.spawn_handle);
+
+            // Clean up stale room_members entry from the old session
+            if let Some(members) = self.room_members.get_mut(&room) {
+                members.retain(|(sid, _, _)| *sid != pending.old_session);
+            }
+
+            info!(
+                "Reconnection detected for user {} in room {} — cancelled pending \
+                 PARTICIPANT_LEFT (old session {}, new session {})",
+                user_id, room, pending.old_session, session
+            );
+            true
+        } else {
+            false
+        };
+
+        // Mark reconnection and observer sessions so ActivateConnection does not
+        // broadcast PARTICIPANT_JOINED for them. Reconnection sessions never
+        // "left" from peers' perspective; observers are never announced.
+        if is_reconnection || observer {
+            self.suppress_join_broadcast.insert(session);
+        }
+
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
         let display_name_clone = display_name.clone();
@@ -350,12 +628,19 @@ impl Handler<JoinRoom> for ChatServer {
             }
         };
 
-        // Collect existing non-observer room members for notifying the new joiner
+        // Collect existing non-observer room members for notifying the new joiner.
+        // On reconnection, we still send the existing member list so the
+        // reconnecting client knows who is in the room.
         let existing_members: Vec<(SessionId, String, String)> = if !observer {
             self.room_members.get(&room).cloned().unwrap_or_default()
         } else {
             Vec::new()
         };
+
+        // True when the room had no non-observer participants before this join.
+        // Used to gate the NATS MEETING_STARTED broadcast (the transport actors
+        // already send MEETING_STARTED directly to every connecting client).
+        let is_first_in_room = existing_members.is_empty() && !observer;
 
         // Track this session in room_members (only for non-observers)
         if !observer {
@@ -372,99 +657,85 @@ impl Handler<JoinRoom> for ChatServer {
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
 
-        // Get ChatServer address for cleanup on failure
-        let chat_server_addr = ctx.address();
-        let session_for_cleanup = session;
-
         let handle = tokio::spawn(async move {
-            // Start session using SessionManager - await result before subscribing
-            match session_manager
-                .start_session(&room_clone, &user_id_clone, session_id)
-                .await
-            {
-                Ok(result) => {
-                    info!(
-                        "Session started for room {} (first: {}) at {} by creator {} (session {})",
-                        room_clone,
-                        result.is_first_participant,
-                        result.start_time_ms,
-                        result.creator_id,
-                        session_id,
+            // start_session is called by the transport actors (ws_chat_session /
+            // wt_chat_session) in their started() method, which blocks with
+            // ctx.wait() before this JoinRoom handler runs. We do NOT call it
+            // again here to avoid double-counting if SessionManager ever
+            // acquires stateful tracking (room capacity, DB records, etc.).
+            //
+            // The reserved-user-ID check is performed synchronously at the top
+            // of this handler, so we can proceed directly to NATS setup.
+
+            let start_time_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            info!(
+                "JoinRoom task running for user {} in room {} (session {})",
+                user_id_clone, room_clone, session_id,
+            );
+
+            // SESSION_ASSIGNED is sent by ws_chat_session / wt_chat_session
+            // in their started() method before this JoinRoom handler runs.
+
+            // Only broadcast MEETING_STARTED via NATS for the first
+            // participant. The transport actors already send it directly
+            // to every connecting client, so subsequent joins would just
+            // produce redundant events for existing participants.
+            if is_first_in_room {
+                send_meeting_info(&nc, &room_clone, start_time_ms, &user_id_clone).await;
+            }
+
+            // PARTICIPANT_JOINED broadcast is deferred until
+            // ActivateConnection is received. This prevents ghost join
+            // events from Testing connections during RTT election — only
+            // the elected (activated) connection announces itself.
+            //
+            // Reconnection joins also skip the broadcast (the user never
+            // "left" from peers' perspective), and observer joins are
+            // never broadcast either.
+            if is_reconnection {
+                info!(
+                    "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {} \
+                     (deferred broadcast also skipped)",
+                    user_id_clone, room_clone
+                );
+            } else if observer {
+                info!(
+                    "Skipping PARTICIPANT_JOINED for observer {} in room {}",
+                    user_id_clone, room_clone
+                );
+            } else {
+                info!(
+                    "Deferring PARTICIPANT_JOINED for {} (display={}) in room {} \
+                     until ActivateConnection (session {})",
+                    user_id_clone, display_name_clone, room_clone, session_id
+                );
+            }
+
+            // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
+            // This ensures the new joiner learns about all participants already in the room.
+            for (existing_sid, existing_uid, existing_display_name) in &existing_members {
+                let existing_bytes = SessionManager::build_peer_joined_packet(
+                    &room_clone,
+                    existing_uid,
+                    *existing_sid,
+                    existing_display_name,
+                );
+                info!(
+                    "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
+                    existing_uid, existing_display_name, user_id_clone
+                );
+                if let Err(e) = new_joiner_recipient.try_send(Message {
+                    msg: existing_bytes,
+                    session: *existing_sid,
+                }) {
+                    warn!(
+                        "Failed to send existing PARTICIPANT_JOINED for {} to new joiner {}: {}",
+                        existing_uid, user_id_clone, e
                     );
-
-                    // SESSION_ASSIGNED is sent by ws_chat_session / wt_chat_session
-                    // in their started() method before this JoinRoom handler runs.
-
-                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
-                        .await;
-
-                    // Notify existing participants about the new joiner.
-                    // Observer sessions (waiting room) should NOT trigger this.
-                    if !observer {
-                        let bytes = SessionManager::build_peer_joined_packet(
-                            &room_clone,
-                            &user_id_clone,
-                            session_id,
-                            &display_name_clone,
-                        );
-                        let subject = format!("room.{}.system", room_clone.replace(' ', "_"));
-                        info!(
-                            "Publishing PARTICIPANT_JOINED for {} (display={}) to {}",
-                            user_id_clone, display_name_clone, subject
-                        );
-                        let subject_for_log = subject.clone();
-                        if let Err(e) = nc.publish(subject, bytes.into()).await {
-                            error!("Error publishing PARTICIPANT_JOINED: {}", e);
-                        } else {
-                            info!(
-                                "Successfully published PARTICIPANT_JOINED for {} to {}",
-                                user_id_clone, subject_for_log
-                            );
-                        }
-                    } else {
-                        info!(
-                            "Skipping PARTICIPANT_JOINED for observer {} in room {}",
-                            user_id_clone, room_clone
-                        );
-                    }
-
-                    // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
-                    // This ensures the new joiner learns about all participants already in the room.
-                    for (existing_sid, existing_uid, existing_display_name) in &existing_members {
-                        let existing_bytes = SessionManager::build_peer_joined_packet(
-                            &room_clone,
-                            existing_uid,
-                            *existing_sid,
-                            existing_display_name,
-                        );
-                        info!(
-                            "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
-                            existing_uid, existing_display_name, user_id_clone
-                        );
-                        if let Err(e) = new_joiner_recipient.try_send(Message {
-                            msg: existing_bytes,
-                            session: *existing_sid,
-                        }) {
-                            warn!(
-                                "Failed to send existing PARTICIPANT_JOINED for {} to new joiner {}: {}",
-                                existing_uid, user_id_clone, e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Error starting session for room {}: {} - rejecting join",
-                        room_clone, e
-                    );
-                    // Session rejected - notify ChatServer to clean up active_subs
-                    // This fixes the race condition where a failed start_session would
-                    // leave a stale entry in active_subs, blocking future join attempts.
-                    let _ = chat_server_addr.try_send(CleanupFailedJoin {
-                        session: session_for_cleanup,
-                        room: room_clone.clone(),
-                    });
-                    return;
                 }
             }
 
@@ -491,31 +762,6 @@ impl Handler<JoinRoom> for ChatServer {
         self.active_subs.insert(session, handle);
 
         MessageResult(Ok(()))
-    }
-}
-
-/// Handler for cleaning up failed join attempts.
-/// When start_session fails inside the spawned task, it sends this message
-/// to remove the stale entry from active_subs.
-impl Handler<CleanupFailedJoin> for ChatServer {
-    type Result = ();
-
-    fn handle(&mut self, msg: CleanupFailedJoin, _ctx: &mut Self::Context) -> Self::Result {
-        if let Some(task) = self.active_subs.remove(&msg.session) {
-            // Abort the task (though it should already be finished/returned)
-            task.abort();
-            warn!(
-                "Cleaned up failed join for session {} from active_subs",
-                msg.session
-            );
-        }
-        // Also remove from room_members since the join failed
-        if let Some(members) = self.room_members.get_mut(&msg.room) {
-            members.retain(|(sid, _, _)| *sid != msg.session);
-            if members.is_empty() {
-                self.room_members.remove(&msg.room);
-            }
-        }
     }
 }
 
@@ -557,10 +803,13 @@ fn handle_msg(
             session,
         };
 
-        session_recipient.try_send(message).map_err(|e| {
-            error!("error sending message to session {}: {}", session, e);
-            std::io::Error::other(e)
-        })
+        if let Err(e) = session_recipient.try_send(message) {
+            warn!(
+                "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
+                session, e
+            );
+        }
+        Ok(())
     }
 }
 
@@ -738,14 +987,13 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: CleanupFailedJoin allows retry after spawn failure
+    // TEST: Duplicate join with same session returns Ok
     // ==========================================================================
-    // This test verifies the race condition fix: when start_session fails inside
-    // the spawned task, the CleanupFailedJoin message removes the stale entry
-    // from active_subs, allowing subsequent join attempts to proceed.
+    // Verifies that a second JoinRoom for the same session_id returns Ok
+    // immediately because the session is already tracked in active_subs.
     #[actix_rt::test]
     #[serial]
-    async fn test_cleanup_failed_join_allows_retry() {
+    async fn test_duplicate_join_same_session_returns_ok() {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
@@ -1289,10 +1537,12 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: Non-observer JoinRoom DOES publish PARTICIPANT_JOINED
+    // TEST: Non-observer JoinRoom + ActivateConnection publishes PARTICIPANT_JOINED
     // ==========================================================================
-    // When a real participant joins a room, the server should publish a
-    // PARTICIPANT_JOINED event to NATS so other peers are notified.
+    // When a real participant joins a room and their connection is activated,
+    // the server should publish a PARTICIPANT_JOINED event to NATS so other
+    // peers are notified. The broadcast is deferred from JoinRoom to
+    // ActivateConnection to avoid ghost join events during RTT election.
     #[actix_rt::test]
     #[serial]
     async fn test_non_observer_join_publishes_participant_joined() {
@@ -1357,7 +1607,7 @@ mod tests {
             .await
             .expect("Connect should succeed");
 
-        // Join as non-observer - SHOULD publish PARTICIPANT_JOINED
+        // Join as non-observer
         let result = chat_server
             .send(JoinRoom {
                 session: session_id,
@@ -1371,12 +1621,218 @@ mod tests {
 
         assert!(result.is_ok(), "Non-observer JoinRoom should succeed");
 
-        // Wait for the spawned async task to publish PARTICIPANT_JOINED
+        // Activate the connection — this triggers the deferred PARTICIPANT_JOINED
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Wait for the async task to publish PARTICIPANT_JOINED
         sleep(Duration::from_millis(1000)).await;
 
         assert!(
             participant_joined_received.load(Ordering::Relaxed),
-            "Non-observer join SHOULD publish PARTICIPANT_JOINED to NATS"
+            "Non-observer join + activate SHOULD publish PARTICIPANT_JOINED to NATS"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: JoinRoom without ActivateConnection does NOT publish PARTICIPANT_JOINED
+    // ==========================================================================
+    // When a connection joins but is never activated (e.g., the losing connection
+    // during RTT election), PARTICIPANT_JOINED should NOT be broadcast.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_without_activate_does_not_publish_participant_joined() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 3001u64;
+        let room = "test-room-no-activate";
+
+        // Subscribe to the system subject for this room BEFORE join
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let participant_joined_received = Arc::new(AtomicBool::new(false));
+        let flag = participant_joined_received.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        tokio::spawn(async move {
+            use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+            use videocall_types::protos::meeting_packet::MeetingPacket;
+
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(1500), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Register session
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Join as non-observer but do NOT activate
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "testing-user@example.com".to_string(),
+                display_name: "testing-user@example.com".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(result.is_ok(), "JoinRoom should succeed");
+
+        // Wait — no ActivateConnection sent
+        sleep(Duration::from_millis(1500)).await;
+
+        assert!(
+            !participant_joined_received.load(Ordering::Relaxed),
+            "JoinRoom without ActivateConnection should NOT publish PARTICIPANT_JOINED"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: Testing session disconnect does NOT publish PARTICIPANT_LEFT
+    // ==========================================================================
+    // When a Testing session disconnects (e.g., the losing connection during
+    // RTT election), PARTICIPANT_LEFT should NOT be broadcast because
+    // PARTICIPANT_JOINED was never broadcast for it.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_testing_session_disconnect_does_not_publish_participant_left() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 3002u64;
+        let room = "test-room-testing-dc";
+
+        // Register and join (Testing state, never activated)
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "testing-dc@example.com".to_string(),
+                display_name: "testing-dc@example.com".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+        assert!(result.is_ok(), "JoinRoom should succeed");
+
+        // Wait for session setup
+        sleep(Duration::from_millis(300)).await;
+
+        // Subscribe to system subject to watch for PARTICIPANT_LEFT
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let participant_left_received = Arc::new(AtomicBool::new(false));
+        let flag = participant_left_received.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        tokio::spawn(async move {
+            use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+            use videocall_types::protos::meeting_packet::MeetingPacket;
+
+            while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(6), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Disconnect while still in Testing state (never activated)
+        chat_server
+            .send(Disconnect {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "testing-dc@example.com".to_string(),
+                display_name: "testing-dc@example.com".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Wait for grace period to expire plus buffer
+        sleep(Duration::from_secs(4)).await;
+
+        assert!(
+            !participant_left_received.load(Ordering::Relaxed),
+            "Testing session disconnect should NOT publish PARTICIPANT_LEFT \
+             (was_active=false prevents ghost leave event)"
         );
     }
 
@@ -1487,11 +1943,12 @@ mod tests {
     }
 
     // ==========================================================================
-    // TEST: Non-observer Disconnect publishes PARTICIPANT_LEFT (or meeting event)
+    // TEST: Non-observer Disconnect publishes PARTICIPANT_LEFT after grace period
     // ==========================================================================
-    // When a real participant disconnects, the server should invoke the full
-    // leave_rooms flow which may publish PARTICIPANT_LEFT for MeetingContinues,
-    // MEETING_ENDED for HostEndedMeeting, or nothing for LastParticipantLeft.
+    // When a real participant disconnects, the server defers the PARTICIPANT_LEFT
+    // broadcast by RECONNECT_GRACE_PERIOD. If no reconnection occurs, the event
+    // is published after the grace period expires. This test uses
+    // ExecutePendingDeparture directly to avoid waiting for the full grace period.
     #[actix_rt::test]
     #[serial]
     async fn test_non_observer_disconnect_publishes_event() {
@@ -1540,6 +1997,14 @@ mod tests {
             .expect("Message delivery should succeed");
         assert!(result.is_ok(), "Non-observer JoinRoom should succeed");
 
+        // Activate the connection so the state is Active before disconnect
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
         // Wait for session setup
         sleep(Duration::from_millis(300)).await;
 
@@ -1552,12 +2017,13 @@ mod tests {
             .await
             .expect("Failed to subscribe to system subject");
 
+        // Use a longer timeout to accommodate the reconnect grace period.
+        // The NATS subscriber waits up to 6s (grace period is 2s + buffer).
         tokio::spawn(async move {
             use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
             use videocall_types::protos::meeting_packet::MeetingPacket;
 
-            while let Ok(Some(msg)) =
-                tokio::time::timeout(Duration::from_millis(1500), sub.next()).await
+            while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(6), sub.next()).await
             {
                 if let Ok(wrapper) =
                     <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
@@ -1575,7 +2041,9 @@ mod tests {
             }
         });
 
-        // Disconnect as non-observer - should invoke the full leave flow
+        // Disconnect as non-observer — the departure is deferred by
+        // RECONNECT_GRACE_PERIOD (2s). The PARTICIPANT_LEFT event will
+        // not be published until the grace period expires.
         chat_server
             .send(Disconnect {
                 session: session_id,
@@ -1587,21 +2055,17 @@ mod tests {
             .await
             .expect("Disconnect should succeed");
 
-        // Wait for the leave flow to complete
-        // Note: depending on SessionManager::end_session result, a meeting event
-        // may or may not be published. The key assertion is that the code PATH
-        // for non-observer is exercised (it does not early-return like observer).
-        // With the current SessionManager returning MeetingContinues { remaining_count: 0 },
-        // this actually maps to the MeetingContinues branch which publishes PARTICIPANT_LEFT.
-        sleep(Duration::from_millis(1000)).await;
+        // Wait for the grace period to expire plus some buffer.
+        // RECONNECT_GRACE_PERIOD is 2s, we wait 4s to give the deferred
+        // execution and NATS publish time to complete.
+        sleep(Duration::from_secs(4)).await;
 
         // The non-observer path should have attempted to publish via the full
-        // end_session flow (not the observer early-return path).
-        // Current SessionManager returns MeetingContinues { remaining_count: 0 }
-        // which triggers PARTICIPANT_LEFT publish.
+        // end_session flow after the grace period expired.
         assert!(
             meeting_event_received.load(Ordering::Relaxed),
-            "Non-observer disconnect should publish a meeting event (PARTICIPANT_LEFT or MEETING_ENDED)"
+            "Non-observer disconnect should publish a meeting event after grace period \
+             (PARTICIPANT_LEFT or MEETING_ENDED)"
         );
     }
 

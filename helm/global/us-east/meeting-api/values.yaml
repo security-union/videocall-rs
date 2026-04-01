@@ -36,7 +36,7 @@ meeting-api:
     - name: COOKIE_DOMAIN
       value: ".videocall.rs"
     - name: CORS_ALLOWED_ORIGIN
-      value: "https://app.videocall.rs,https://app-dx.videocall.rs"
+      value: "https://app.videocall.rs"
     # --- OAuth / OIDC ---
     - name: OAUTH_CLIENT_ID
       valueFrom:
@@ -60,9 +60,9 @@ meeting-api:
     - name: AFTER_LOGIN_URL
       value: "https://app.videocall.rs"
     - name: ALLOWED_REDIRECT_URLS
-      value: "https://app.videocall.rs,https://app-dx.videocall.rs"
+      value: "https://app.videocall.rs"
     - name: SERVICE_VERSION_URLS
-      value: "http://websocket-us-east:8080/version,http://webtransport-us-east:444/version,http://videocall-ui-dx-us-east:80/version.json"
+      value: "http://websocket-us-east:8080/version,http://webtransport-us-east:444/version,http://videocall-ui-us-east:80/version.json"
 
   resources:
     limits:

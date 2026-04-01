@@ -1,42 +1,4 @@
 services:
-  yew-ui:
-    volumes:
-      - type: bind
-        source: ../
-        target: /app
-      - nix-store-yew:/nix
-      - rustlemania-yew-ui-cargo-registry-cache:/root/.cargo/registry
-      - rustlemania-yew-ui-cargo-git-cache:/root/.cargo/git
-      - rustlemania-yew-ui-cache:/app/yew-ui/target
-    build:
-      dockerfile: docker/Dockerfile.yew.dev
-      context: ../
-    working_dir: /app/yew-ui
-    command: >
-      nix develop /app#yew-ui --command bash -c
-      "/app/docker/start-yew.sh"
-    environment:
-      - NIX_CONFIG=experimental-features = nix-command flakes
-      - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
-      - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
-      - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
-      - ENABLE_OAUTH=${ENABLE_OAUTH:-false}
-      - API_BASE_URL=${API_BASE_URL:-http://localhost:8081}
-      - LOGIN_URL=http://localhost:8081/login
-      - RUSTFLAGS=--cfg=web_sys_unstable_apis
-      - RUST_BACKTRACE=1
-      - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
-      - E2EE_ENABLED=${E2EE_ENABLED:-false}
-      - FIREFOX_ENABLED=${FIREFOX_ENABLED:-false}
-      - USERS_ALLOWED_TO_STREAM=${USERS_ALLOWED_TO_STREAM:-}
-      - CARGO_TARGET_DIR=/app/yew-ui/target
-      - CARGO_INCREMENTAL=1
-      - CARGO_NET_OFFLINE=false
-      - OAUTH_PROVIDER=${OAUTH_PROVIDER:-google}
-      - UI_URL=${UI_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
-    ports:
-      - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
-
   dioxus-ui:
     volumes:
       - type: bind
@@ -51,7 +13,7 @@ services:
       context: ../
     working_dir: /app/dioxus-ui
     command: >
-      nix develop /app#yew-ui --command bash -c
+      nix develop /app#frontend --command bash -c
       "/app/docker/start-dioxus.sh"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
@@ -115,7 +77,7 @@ services:
       - CARGO_NET_OFFLINE=false
     ports:
       - "4600:4600"
-  
+
   meeting-api:
     build:
       dockerfile: docker/Dockerfile.actix.dev
@@ -144,9 +106,9 @@ services:
       - OAUTH_USERINFO_URL=${OAUTH_USERINFO_URL:-}
       - OAUTH_END_SESSION_URL=${OAUTH_END_SESSION_URL:-}
       - OAUTH_SCOPES=${OAUTH_SCOPES:-openid email profile}
-      - AFTER_LOGIN_URL=${AFTER_LOGIN_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
-      - AFTER_LOGOUT_URL=${AFTER_LOGOUT_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
-      - ALLOWED_REDIRECT_URLS=${ALLOWED_REDIRECT_URLS:-http://localhost:${TRUNK_SERVE_PORT:-80},http://localhost:${DIOXUS_SERVE_PORT:-3001}}
+      - AFTER_LOGIN_URL=${AFTER_LOGIN_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
+      - AFTER_LOGOUT_URL=${AFTER_LOGOUT_URL:-http://localhost:${TRUNK_SERVE_PORT:-3001}}
+      - ALLOWED_REDIRECT_URLS=${ALLOWED_REDIRECT_URLS:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
       - NATS_URL=nats:4222
       - RUST_LOG=debug
       - CARGO_TARGET_DIR=/app/meeting-api/target
@@ -177,7 +139,7 @@ services:
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
       - ACTIX_PORT=${ACTIX_PORT:-8080}
-      - UI_ENDPOINT=${UI_ENDPOINT:-http://localhost:80}
+      - UI_ENDPOINT=${UI_ENDPOINT:-http://localhost:3001}
       - DATABASE_ENABLED=false
       - RUST_LOG=debug,async_nats=info
       - NATS_URL=nats:4222
@@ -394,10 +356,9 @@ services:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
-  
+
 
 volumes:
-  nix-store-yew:
   nix-store-website:
   nix-store-meeting-api:
   nix-store-websocket-api:
@@ -411,9 +372,6 @@ volumes:
   rustlemania-actix-web-cargo-registry-cache:
   rustlemania-actix-web-cargo-git-cache:
   rustlemania-actix-web-target-cache:
-  rustlemania-yew-ui-cargo-registry-cache:
-  rustlemania-yew-ui-cargo-git-cache:
-  rustlemania-yew-ui-cache:
   nix-store-dioxus:
   rustlemania-dioxus-ui-cargo-registry-cache:
   rustlemania-dioxus-ui-cargo-git-cache:

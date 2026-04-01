@@ -1077,8 +1077,9 @@ pub fn AttendantsComponent(
                                                 }
                                                 saving.set(true);
                                                 let meeting_id = meeting_id.clone();
+                                                let aca = if new_val { Some(admitted_can_admit_toggle()) } else { Some(false) };
                                                 wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val, None).await {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val, aca).await {
                                                         Ok(updated) => {
                                                             waiting_room_toggle.set(updated.waiting_room_enabled);
                                                             admitted_can_admit_toggle.set(updated.admitted_can_admit);
@@ -1087,6 +1088,42 @@ pub fn AttendantsComponent(
                                                         Err(e) => {
                                                             log::error!("Failed to update waiting room setting: {e}");
                                                             waiting_room_toggle.set(!new_val);
+                                                            saving.set(false);
+                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        },
+                                    }
+                                }
+                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white; opacity: {
+                                  };",
+                                    span { style: "font-size: 0.9rem;", "Admitted can admit" }
+                                    crate::components::toggle_switch::ToggleSwitch {
+                                        enabled: admitted_can_admit_toggle(),
+                                        disabled: saving() || !waiting_room_toggle(),
+                                        on_toggle: {
+                                            let meeting_id = meeting_id_for_toggle.clone();
+                                            move |new_val: bool| {
+                                                if saving() || !waiting_room_toggle() {
+                                                    return;
+                                                }
+                                                toggle_error.set(None);
+                                                admitted_can_admit_toggle.set(new_val);
+                                                saving.set(true);
+                                                let meeting_id = meeting_id.clone();
+                                                let wr = waiting_room_toggle();
+                                                wasm_bindgen_futures::spawn_local(async move {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, wr, Some(new_val)).await {
+                                                        Ok(updated) => {
+                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                            admitted_can_admit_toggle.set(updated.admitted_can_admit);
+                                                            saving.set(false);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("Failed to update admitted_can_admit setting: {e}");
+                                                            admitted_can_admit_toggle.set(!new_val);
                                                             saving.set(false);
                                                             toggle_error.set(Some(format!("Failed to update setting: {e}")));
                                                         }

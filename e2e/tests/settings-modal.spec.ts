@@ -53,7 +53,7 @@ test.describe("Device settings modal", () => {
     await expect(page.locator("#modal-video-select")).toHaveCount(0);
 
     // Switch to Video
-    await page.getByRole("button", { name: "Video" }).click();
+    await page.getByRole("tab", { name: "Video" }).click();
 
     await expect(page.locator(".settings-nav-button.active")).toContainText("Video");
     await expect(page.locator("#modal-video-select")).toBeVisible();

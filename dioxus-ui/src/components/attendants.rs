@@ -25,6 +25,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::PeerList,
     peer_tile::PeerTile,
+    update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
         CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
         PeerListButton, ScreenShareButton,
@@ -34,7 +35,9 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap};
+use crate::context::{
+    save_display_name_to_storage, DisplayNameCtx, MeetingTime, PeerMediaState, PeerStatusMap,
+};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
@@ -402,7 +405,10 @@ pub fn AttendantsComponent(
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
+    let mut display_name_modal_open = use_signal(|| false);
     let current_display_name = use_signal(|| display_name.clone());
+    let display_name_ctx = use_context::<DisplayNameCtx>();
+    let display_name_ctx_signal = display_name_ctx.0;
     let mut meeting_joined = use_signal(|| false);
     let mut show_copy_toast = use_signal(|| false);
     let mut meeting_start_time_server = use_signal(|| None::<f64>);
@@ -431,6 +437,8 @@ pub fn AttendantsComponent(
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
+    let peer_display_name_version = use_signal(|| 0u32);
+
     // Container dimensions — updated on every window resize so compute_grid
     // reacts to viewport changes without any JS ResizeObserver boilerplate.
     let mut container_w = use_signal(|| {
@@ -479,6 +487,8 @@ pub fn AttendantsComponent(
 
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
+
+        let user_id_for_display_name_changed = user_id.clone();
 
         let opts = VideoCallClientOptions {
             user_id: user_id
@@ -641,12 +651,29 @@ pub fn AttendantsComponent(
                     move |(display_name, user_id): (String, String)| {
                         log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
 
-                        let suppress_toast = false;
+                        let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
+                            if client.is_reconnecting() {
+                                log::debug!(
+                                    "Suppressing join toast for {} (reconnecting)",
+                                    user_id
+                                );
+                                true
+                            } else if client.has_peer_with_user_id(&user_id) {
+                                log::debug!(
+                                    "Suppressing join toast for {} (already in peer list)",
+                                    user_id
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
 
                         let mut toast_counter = toast_counter;
                         let mut peer_toasts = peer_toasts;
                         let mut toast_version = toast_version;
-                        // Remove any pending "left" toast for this user (waiting room admission).
                         let mut current = peer_toasts.peek().clone();
                         current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
 
@@ -660,7 +687,6 @@ pub fn AttendantsComponent(
                                 let v = *toast_version.peek();
                                 toast_version.set(v + 1);
                             }
-                            // Schedule toast removal after 8 seconds.
                             Timeout::new(8_000, move || {
                                 let updated: Vec<_> = peer_toasts
                                     .peek()
@@ -679,8 +705,6 @@ pub fn AttendantsComponent(
                             peer_toasts.set(current);
                         }
 
-                        // Always force tile re-render so display names appear,
-                        // even when the toast is suppressed.
                         {
                             let mut v = peer_list_version;
                             v.set(v() + 1);
@@ -688,6 +712,33 @@ pub fn AttendantsComponent(
                     },
                 ))
             },
+            on_display_name_changed: Some(VcCallback::from(
+                move |(changed_user_id, new_display_name): (String, String)| {
+                    log::info!(
+                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\"",
+                        changed_user_id,
+                        new_display_name,
+                    );
+
+                    if user_id_for_display_name_changed.as_deref() == Some(changed_user_id.as_str())
+                    {
+                        log::info!(
+                            "DIOXUS-UI: Local user display name confirmed by server: {}",
+                            new_display_name
+                        );
+                        save_display_name_to_storage(&new_display_name);
+                        let mut current_display_name = current_display_name;
+                        current_display_name.set(new_display_name.clone());
+                        let mut dn_ctx = display_name_ctx_signal;
+                        dn_ctx.set(Some(new_display_name.clone()));
+                        log::debug!("DIOXUS-UI: current_display_name signal updated");
+                    }
+
+                    let mut v = peer_display_name_version;
+                    v.set(v() + 1);
+                    log::debug!("DIOXUS-UI: peer_display_name_version bumped");
+                },
+            )),
         };
 
         let client = VideoCallClient::new(opts);
@@ -919,6 +970,7 @@ pub fn AttendantsComponent(
     let _ = peer_list_version(); // subscribe to trigger re-renders when peers change
     let _ = toast_version(); // subscribe to trigger re-renders when toasts change
     let _ = screen_share_version(); // subscribe to trigger re-renders when screen-share state changes
+    let _ = peer_display_name_version();
     let display_peers = client.sorted_peer_keys();
     let peers_for_display: Vec<String> = display_peers
         .iter()
@@ -1547,6 +1599,10 @@ pub fn AttendantsComponent(
                             },
                             host_display_name: host_display_name.clone(),
                             host_user_id: host_user_id.clone(),
+                            local_user_display_name: current_display_name(),
+                            on_edit_self_name: {move |_| {
+                                display_name_modal_open.set(true);
+                            }},
                         }
                     }
                 }
@@ -1558,6 +1614,27 @@ pub fn AttendantsComponent(
                         is_admitted: true,
                         waiting_room_version,
                     }
+                }
+
+                UpdateDisplayNameModal {
+                    visible: display_name_modal_open(),
+                    current_display_name: current_display_name(),
+                    meeting_id: id.clone(),
+                    on_close: move |_| {
+                        display_name_modal_open.set(false);
+                    },
+                    on_success: move |new_name: String| {
+                        // Update local UI immediately — do NOT wait for server broadcast.
+                        // The server will broadcast PARTICIPANT_DISPLAY_NAME_CHANGED moments later,
+                        // which will be handled by on_display_name_changed callback and will
+                        // confirm the same value. This ensures no perceived lag for the user.
+                        log::info!("RENAME: on_success called with new_name: {}", new_name);
+                        let mut current_name = current_display_name;
+                        current_name.set(new_name.clone());
+                        let mut dn_ctx = display_name_ctx_signal;
+                        dn_ctx.set(Some(new_name.clone()));
+                        display_name_modal_open.set(false);
+                    },
                 }
 
                 // Meeting ended overlay

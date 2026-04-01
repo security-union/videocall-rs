@@ -185,6 +185,7 @@ pub fn generate_for_peer(
     let peer_display_name = client
         .get_peer_display_name(key)
         .unwrap_or_else(|| peer_user_id.clone());
+
     // Compare authenticated user_id (from JWT/DB) instead of user-chosen display name
     // to prevent spoofing the host crown icon.
     let is_host = host_user_id.map(|h| h == peer_user_id).unwrap_or(false);

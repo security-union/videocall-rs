@@ -103,6 +103,23 @@ Dashboards are provisioned from JSON files in `helm/global/us-east/grafana/dashb
 | `kubernetes-nodes-cadvisor` | Kubelet | 15s | Container CPU/memory (filtered) |
 | `kubernetes-service-endpoints` | Auto-discovered | 15s | kube-state-metrics (filtered) |
 
+### Scrape interval and Grafana alignment
+
+The default Prometheus scrape interval for videocall pods is **15 seconds**, set via pod annotations (`prometheus.io/scrape-interval: "15s"`) or the global scrape config. The Grafana Prometheus datasource has a **minimum step** (`timeInterval`) that must match.
+
+If `timeInterval` is larger than the scrape interval (e.g., 30s vs 15s), Grafana ignores every other data point, creating visual gaps in graphs even though the data exists in Prometheus. If Grafana's dashboard refresh rate is faster than the scrape interval (e.g., 5s refresh vs 15s scrape), it re-queries the same stale data repeatedly.
+
+**Correct settings:**
+| Setting | Value | Where |
+|---|---|---|
+| Prometheus scrape interval | 15s | Pod annotation or `additionalScrapeConfigs` in Prometheus config |
+| Grafana datasource `timeInterval` | 15s | Datasource settings → Scrape interval (or provisioning ConfigMap `jsonData.timeInterval`) |
+| Grafana dashboard refresh | 15s | Dashboard time picker (top right) |
+
+**Standalone Prometheus** (us-east): set `scrape_interval: 15s` in `helm/global/us-east/prometheus/values.yaml` under the relevant scrape job.
+
+**kube-prometheus-stack** (Ascend): the datasource is provisioned as a read-only ConfigMap (`kube-prometheus-stack-grafana-datasource`). To change `timeInterval`, either patch the ConfigMap and restart Grafana, or set `prometheus.prometheusSpec.scrapeInterval` in the helm values (this controls both the global scrape interval and the Grafana `timeInterval`).
+
 ### Metric filtering
 All non-application scrape jobs use `metric_relabel_configs` to drop unused metrics (~96% reduction). Only container CPU/memory, resource limits, and essential kubelet metrics are kept.
 

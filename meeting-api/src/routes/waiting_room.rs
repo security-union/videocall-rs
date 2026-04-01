@@ -28,16 +28,33 @@ use crate::error::AppError;
 use crate::nats_events;
 use crate::state::AppState;
 
-/// Verify that the requester is the meeting host (authorization check).
-async fn require_host(state: &AppState, meeting_id: i32, user_id: &str) -> Result<(), AppError> {
+/// Verify that the requester is the meeting host, or an admitted participant
+/// when `admitted_can_admit` is enabled (authorization check).
+async fn require_host_or_can_admit(
+    state: &AppState,
+    meeting_id: i32,
+    user_id: &str,
+    admitted_can_admit: bool,
+) -> Result<(), AppError> {
     let row = db_participants::get_status(&state.db, meeting_id, user_id)
         .await?
         .ok_or_else(AppError::not_host)?;
 
-    if row.status != "admitted" || !row.is_host {
+    if row.status != "admitted" {
         return Err(AppError::not_host());
     }
-    Ok(())
+
+    // Host can always manage the waiting room
+    if row.is_host {
+        return Ok(());
+    }
+
+    // Non-host admitted participants can manage if the meeting allows it
+    if admitted_can_admit {
+        return Ok(());
+    }
+
+    Err(AppError::not_host())
 }
 
 /// GET /api/v1/meetings/{meeting_id}/waiting
@@ -50,7 +67,7 @@ pub async fn get_waiting_room(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
     let rows = db_participants::get_waiting(&state.db, meeting.id).await?;
     let waiting: Vec<ParticipantStatusResponse> = rows
@@ -75,7 +92,7 @@ pub async fn admit_participant(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
     let row = db_participants::admit(&state.db, meeting.id, &body.user_id)
         .await?
@@ -99,7 +116,7 @@ pub async fn admit_all(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
     let rows = db_participants::admit_all(&state.db, meeting.id).await?;
     let admitted_count = rows.len();
@@ -133,7 +150,7 @@ pub async fn reject_participant(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
     let row = db_participants::reject(&state.db, meeting.id, &body.user_id)
         .await?

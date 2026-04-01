@@ -19,7 +19,7 @@ use axum::{
 };
 use chrono::Utc;
 use videocall_meeting_types::{
-    requests::JoinMeetingRequest,
+    requests::{JoinMeetingRequest, UpdateDisplayNameRequest},
     responses::{APIResponse, ParticipantStatusResponse},
 };
 
@@ -80,6 +80,7 @@ pub async fn join_meeting(
 
         let mut resp = row.into_participant_status(Some(token));
         resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+        resp.admitted_can_admit = Some(meeting.admitted_can_admit);
         resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
@@ -102,6 +103,7 @@ pub async fn join_meeting(
                 room_token: None,
                 observer_token: Some(observer),
                 waiting_room_enabled: Some(meeting.waiting_room_enabled),
+                admitted_can_admit: Some(meeting.admitted_can_admit),
                 host_display_name: meeting.host_display_name,
                 host_user_id: meeting.creator_id,
             };
@@ -141,6 +143,7 @@ pub async fn join_meeting(
             nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id).await;
         }
         resp.waiting_room_enabled = Some(waiting_room_enabled);
+        resp.admitted_can_admit = Some(meeting.admitted_can_admit);
         resp.host_display_name = meeting.host_display_name;
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
@@ -183,6 +186,7 @@ pub async fn get_my_status(
 
     let mut resp = row.into_participant_status(token);
     resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -214,6 +218,46 @@ pub async fn leave_meeting(
     }
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
+}
+
+/// PUT /api/v1/meetings/{meeting_id}/display-name
+///
+/// Update the participant's display name during an active meeting.
+/// Broadcasts the change to all connected participants via NATS.
+pub async fn update_display_name(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(meeting_id): Path<String>,
+    Json(body): Json<UpdateDisplayNameRequest>,
+) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    // Validate the participant exists and is in the meeting
+    db_participants::get_status(&state.db, meeting.id, &user_id)
+        .await?
+        .ok_or_else(AppError::not_in_meeting)?;
+
+    // Update the display name in the database
+    let updated_row =
+        db_participants::update_display_name(&state.db, meeting.id, &user_id, &body.display_name)
+            .await?
+            .ok_or_else(AppError::not_in_meeting)?;
+
+    // Broadcast the display name change to all participants in the meeting
+    nats_events::publish_participant_display_name_changed(
+        state.nats.as_ref(),
+        &meeting_id,
+        &user_id,
+        &body.display_name,
+    )
+    .await;
+
+    // Return the updated participant status
+    Ok(Json(APIResponse::ok(
+        updated_row.into_participant_status(None),
+    )))
 }
 
 /// GET /api/v1/meetings/{meeting_id}/participants

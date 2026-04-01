@@ -86,6 +86,9 @@ pub struct ChatServer {
     /// This is used for reconnection sessions: the user never "left" from peers'
     /// perspective, so announcing a "join" would be misleading.
     suppress_join_broadcast: std::collections::HashSet<SessionId>,
+    /// Maps `instance_id` → `SessionId` for the current active session of each
+    /// client instance. Used to find and evict stale sessions on reconnection.
+    instance_index: HashMap<String, SessionId>,
 }
 
 impl ChatServer {
@@ -99,6 +102,7 @@ impl ChatServer {
             room_members: HashMap::new(),
             pending_departures: HashMap::new(),
             suppress_join_broadcast: std::collections::HashSet::new(),
+            instance_index: HashMap::new(),
         }
     }
 
@@ -114,6 +118,11 @@ impl ChatServer {
         if let Some(task) = self.active_subs.remove(session_id) {
             task.abort();
         }
+
+        // Clean up instance_index: remove any entry that still points to this
+        // session. If the entry was already replaced by a newer session (eviction),
+        // this is a no-op.
+        self.instance_index.retain(|_, sid| *sid != *session_id);
 
         // Remove from room_members tracking
         if let Some(room_id) = room {
@@ -238,6 +247,19 @@ impl Handler<Disconnect> for ChatServer {
         }: Disconnect,
         ctx: &mut Self::Context,
     ) -> Self::Result {
+        // If the session was already evicted (by a reconnecting instance_id),
+        // its entries in sessions/connection_states were removed during eviction.
+        // Ignore the stale Disconnect so it doesn't clobber a newer session's
+        // pending departure for the same (room, user_id) key.
+        let was_present = self.sessions.remove(&session).is_some();
+        if !was_present {
+            info!(
+                "Disconnect for already-evicted session {} (user {} in room {}) — ignoring",
+                session, user_id, room
+            );
+            return;
+        }
+
         // Clean up session-level state immediately — the transport is gone.
         // Capture whether the session was Active before removing the state,
         // so we can store it in PendingDepartureState for the grace period.
@@ -246,7 +268,6 @@ impl Handler<Disconnect> for ChatServer {
             .get(&session)
             .map(|s| *s == ConnectionState::Active)
             .unwrap_or(false);
-        let _ = self.sessions.remove(&session);
         let _ = self.connection_states.remove(&session);
         let _ = self.suppress_join_broadcast.remove(&session);
 
@@ -465,13 +486,14 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                      skipping PARTICIPANT_LEFT (session was never activated)",
                     user_id, session, room
                 );
-                // Still clean up room_members for the old session.
+                // Still clean up room_members and instance_index for the old session.
                 if let Some(members) = self.room_members.get_mut(&room) {
                     members.retain(|(sid, _, _)| *sid != session);
                     if members.is_empty() {
                         self.room_members.remove(&room);
                     }
                 }
+                self.instance_index.retain(|_, sid| *sid != session);
                 return;
             }
 
@@ -568,7 +590,7 @@ impl Handler<JoinRoom> for ChatServer {
             user_id,
             display_name,
             observer,
-            previous_session_id,
+            instance_id,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -583,60 +605,68 @@ impl Handler<JoinRoom> for ChatServer {
             return MessageResult(Ok(()));
         }
 
-        // --- Live session eviction by previous_session_id ---
-        // If the client provides the session_id from its previous connection,
-        // look it up directly in room_members. If found (and it belongs to the
-        // same user), evict the stale session silently so peers don't see a
-        // spurious leave/join. This handles the common case where the client
-        // reconnects before the server's heartbeat timeout detects the old
-        // session is dead.
+        // Sanitize instance_id: reject oversized values to prevent memory abuse.
+        let instance_id = instance_id.filter(|iid| !iid.is_empty() && iid.len() <= 64);
+
+        // --- Live session eviction by instance_id ---
+        // If the client provides an instance_id (stable UUID per tab/meeting),
+        // look up the instance_index to find the previous session for this
+        // client instance. If found (and it belongs to the same user), evict
+        // the stale session silently so peers don't see a spurious leave/join.
+        // This handles the common case where the client reconnects before the
+        // server's heartbeat timeout detects the old session is dead.
         let mut evicted_old_session = false;
-        if let Some(prev_sid) = previous_session_id {
-            // Verify the previous session belongs to the same user_id
-            let user_matches = self
-                .room_members
-                .get(&room)
-                .map(|members| {
-                    members
-                        .iter()
-                        .any(|(sid, uid, _)| *sid == prev_sid && uid == &user_id)
-                })
-                .unwrap_or(false);
+        if let Some(ref iid) = instance_id {
+            if let Some(&prev_sid) = self.instance_index.get(iid) {
+                // Verify the previous session belongs to the same user_id
+                let user_matches = self
+                    .room_members
+                    .get(&room)
+                    .map(|members| {
+                        members
+                            .iter()
+                            .any(|(sid, uid, _)| *sid == prev_sid && uid == &user_id)
+                    })
+                    .unwrap_or(false);
 
-            if user_matches && prev_sid != session {
-                info!(
-                    "Live session eviction: user {} in room {} — evicting previous \
-                     session {} in favour of new session {}",
-                    user_id, room, prev_sid, session
-                );
+                if user_matches && prev_sid != session {
+                    info!(
+                        "Live session eviction: user {} in room {} — evicting previous \
+                         session {} (instance {}) in favour of new session {}",
+                        user_id, room, prev_sid, iid, session
+                    );
 
-                // Remove old session from room_members
-                if let Some(members) = self.room_members.get_mut(&room) {
-                    members.retain(|(sid, _, _)| *sid != prev_sid);
+                    // Remove old session from room_members
+                    if let Some(members) = self.room_members.get_mut(&room) {
+                        members.retain(|(sid, _, _)| *sid != prev_sid);
+                    }
+
+                    // Abort old NATS subscription
+                    if let Some(task) = self.active_subs.remove(&prev_sid) {
+                        task.abort();
+                    }
+
+                    // Remove old session from sessions map.
+                    // The actor will stop on its own when the transport closes
+                    // or the heartbeat times out.
+                    let _ = self.sessions.remove(&prev_sid);
+
+                    // Clean up state maps
+                    let _ = self.connection_states.remove(&prev_sid);
+                    let _ = self.suppress_join_broadcast.remove(&prev_sid);
+
+                    // Cancel any pending departure for this (room, user_id)
+                    let departure_key = (room.clone(), user_id.clone());
+                    if let Some(pending) = self.pending_departures.remove(&departure_key) {
+                        ctx.cancel_future(pending.spawn_handle);
+                    }
+
+                    evicted_old_session = true;
                 }
-
-                // Abort old NATS subscription
-                if let Some(task) = self.active_subs.remove(&prev_sid) {
-                    task.abort();
-                }
-
-                // Remove old session from sessions map.
-                // The actor will stop on its own when the transport closes
-                // or the heartbeat times out.
-                let _ = self.sessions.remove(&prev_sid);
-
-                // Clean up state maps
-                let _ = self.connection_states.remove(&prev_sid);
-                let _ = self.suppress_join_broadcast.remove(&prev_sid);
-
-                // Cancel any pending departure for this (room, user_id)
-                let departure_key = (room.clone(), user_id.clone());
-                if let Some(pending) = self.pending_departures.remove(&departure_key) {
-                    ctx.cancel_future(pending.spawn_handle);
-                }
-
-                evicted_old_session = true;
             }
+
+            // Register/update this instance_id → session mapping
+            self.instance_index.insert(iid.clone(), session);
         }
 
         // --- Reconnection grace period: cancel pending departure ---
@@ -940,7 +970,7 @@ mod tests {
                 user_id: SYSTEM_USER_ID.to_string(),
                 display_name: SYSTEM_USER_ID.to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1000,7 +1030,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1032,7 +1062,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1092,7 +1122,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1108,7 +1138,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1155,7 +1185,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
-            None, // no previous_session_id
+            None, // no instance_id
         );
 
         let session2 = SessionLogic::new(
@@ -1167,7 +1197,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
-            None, // no previous_session_id
+            None, // no instance_id
         );
 
         // Verify they have different session IDs
@@ -1478,7 +1508,7 @@ mod tests {
                 user_id: "alice@example.com".to_string(),
                 display_name: "alice@example.com".to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1587,7 +1617,7 @@ mod tests {
                 user_id: "observer-user@example.com".to_string(),
                 display_name: "observer-user@example.com".to_string(),
                 observer: true,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1682,7 +1712,7 @@ mod tests {
                 user_id: "real-user@example.com".to_string(),
                 display_name: "real-user@example.com".to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1783,7 +1813,7 @@ mod tests {
                 user_id: "testing-user@example.com".to_string(),
                 display_name: "testing-user@example.com".to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1848,7 +1878,7 @@ mod tests {
                 user_id: "testing-dc@example.com".to_string(),
                 display_name: "testing-dc@example.com".to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1955,7 +1985,7 @@ mod tests {
                 user_id: "observer-dc@example.com".to_string(),
                 display_name: "observer-dc@example.com".to_string(),
                 observer: true,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2063,7 +2093,7 @@ mod tests {
                 user_id: "real-dc@example.com".to_string(),
                 display_name: "real-dc@example.com".to_string(),
                 observer: false,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2184,7 +2214,7 @@ mod tests {
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
                 observer: true,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2202,7 +2232,7 @@ mod tests {
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
                 observer: true,
-                previous_session_id: None,
+                instance_id: None,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2313,7 +2343,7 @@ mod tests {
         room: &str,
         user_id: &str,
         addr: actix::Recipient<Message>,
-        previous_session_id: Option<u64>,
+        instance_id: Option<String>,
     ) {
         chat_server
             .send(Connect {
@@ -2330,7 +2360,7 @@ mod tests {
                 user_id: user_id.to_string(),
                 display_name: user_id.to_string(),
                 observer: false,
-                previous_session_id,
+                instance_id,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2342,14 +2372,14 @@ mod tests {
     }
 
     // ======================================================================
-    // Session eviction via previous_session_id — integration tests
+    // Session eviction via instance_id — integration tests
     // ======================================================================
 
     // ------------------------------------------------------------------
-    // TEST 1: Basic eviction — Session B evicts Session A (same user_id)
+    // TEST 1: Basic eviction — Session B evicts Session A (same instance_id)
     // ------------------------------------------------------------------
-    // Session A joins a room. Session B joins the same room with the same
-    // user_id and previous_session_id = A's session. Verify:
+    // Session A joins a room with instance_id="inst-1". Session B joins the
+    // same room with the same user_id and instance_id="inst-1". Verify:
     //   - Session A is removed from room_members
     //   - Session B is present in room_members
     //   - PARTICIPANT_JOINED is suppressed for Session B
@@ -2374,10 +2404,11 @@ mod tests {
 
         let room = "eviction-basic";
         let user_id = "alice@example.com";
+        let instance_id = "inst-alice-1".to_string();
         let session_a: SessionId = 5001;
         let session_b: SessionId = 5002;
 
-        // Session A joins normally (no previous_session_id)
+        // Session A joins with instance_id
         let dummy_a = DummySession.start();
         connect_and_join(
             &chat_server,
@@ -2385,7 +2416,7 @@ mod tests {
             room,
             user_id,
             dummy_a.recipient(),
-            None,
+            Some(instance_id.clone()),
         )
         .await;
 
@@ -2402,7 +2433,7 @@ mod tests {
         assert_eq!(members.len(), 1, "Room should have exactly 1 member");
         assert_eq!(members[0].0, session_a, "Session A should be in the room");
 
-        // Session B joins with previous_session_id = session_a (same user)
+        // Session B joins with same instance_id (same user reconnecting)
         let dummy_b = DummySession.start();
         connect_and_join(
             &chat_server,
@@ -2410,7 +2441,7 @@ mod tests {
             room,
             user_id,
             dummy_b.recipient(),
-            Some(session_a),
+            Some(instance_id),
         )
         .await;
 
@@ -2467,9 +2498,9 @@ mod tests {
     // ------------------------------------------------------------------
     // TEST 2: Different user_id — no eviction
     // ------------------------------------------------------------------
-    // Session A joins (user "alice"). Session B joins (user "bob") with
-    // previous_session_id = A's session. Session A must NOT be evicted
-    // because the user_id does not match.
+    // Session A joins (user "alice") with instance_id="inst-1". Session B
+    // joins (user "bob") with the same instance_id="inst-1". Session A must
+    // NOT be evicted because the user_id does not match.
     #[actix_rt::test]
     #[serial]
     async fn test_eviction_different_user_no_eviction() {
@@ -2490,10 +2521,11 @@ mod tests {
         }
 
         let room = "eviction-diff-user";
+        let instance_id = "inst-shared".to_string();
         let session_a: SessionId = 6001;
         let session_b: SessionId = 6002;
 
-        // Session A joins as "alice"
+        // Session A joins as "alice" with instance_id
         let dummy_a = DummySession.start();
         connect_and_join(
             &chat_server,
@@ -2501,13 +2533,14 @@ mod tests {
             room,
             "alice@example.com",
             dummy_a.recipient(),
-            None,
+            Some(instance_id.clone()),
         )
         .await;
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Session B joins as "bob" with previous_session_id pointing to alice's session
+        // Session B joins as "bob" with the same instance_id
+        // (should NOT evict because user_id differs)
         let dummy_b = DummySession.start();
         connect_and_join(
             &chat_server,
@@ -2515,7 +2548,7 @@ mod tests {
             room,
             "bob@example.com",
             dummy_b.recipient(),
-            Some(session_a),
+            Some(instance_id),
         )
         .await;
 
@@ -2566,13 +2599,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // TEST 3: No previous_session_id — normal join flow
+    // TEST 3: No instance_id — normal join flow
     // ------------------------------------------------------------------
-    // Session joins with previous_session_id = None. Verify it follows
+    // Session joins with instance_id = None. Verify it follows
     // the normal PARTICIPANT_JOINED flow (not suppressed).
     #[actix_rt::test]
     #[serial]
-    async fn test_no_previous_session_id_normal_join() {
+    async fn test_no_instance_id_normal_join() {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
@@ -2627,18 +2660,18 @@ mod tests {
             .expect("IsSuppressedJoinBroadcast should succeed");
         assert!(
             !suppressed,
-            "Normal join (no previous_session_id) should NOT suppress PARTICIPANT_JOINED"
+            "Normal join (no instance_id) should NOT suppress PARTICIPANT_JOINED"
         );
     }
 
     // ------------------------------------------------------------------
-    // TEST 4: Non-existent previous_session_id — no crash, normal join
+    // TEST 4: New instance_id (no prior session) — normal join
     // ------------------------------------------------------------------
-    // Session joins with previous_session_id = 99999 which does not exist
-    // in room_members. Verify no panic and the join proceeds normally.
+    // Session joins with an instance_id that has no prior entry in the
+    // instance_index. Verify no panic and the join proceeds normally.
     #[actix_rt::test]
     #[serial]
-    async fn test_nonexistent_previous_session_id_no_crash() {
+    async fn test_new_instance_id_normal_join() {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
@@ -2655,7 +2688,7 @@ mod tests {
             fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
         }
 
-        let room = "eviction-nonexistent";
+        let room = "eviction-new-instance";
         let session_id: SessionId = 8001;
 
         let dummy = DummySession.start();
@@ -2665,13 +2698,13 @@ mod tests {
             room,
             "dave@example.com",
             dummy.recipient(),
-            Some(99999), // non-existent previous session
+            Some("inst-brand-new".to_string()), // instance_id with no prior session
         )
         .await;
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Session should be in room_members despite bogus previous_session_id
+        // Session should be in room_members (first-time join with this instance_id)
         let members = chat_server
             .send(GetRoomMembers {
                 room: room.to_string(),
@@ -2681,7 +2714,7 @@ mod tests {
         assert_eq!(
             members.len(),
             1,
-            "Room should have exactly 1 member after join with non-existent previous_session_id"
+            "Room should have exactly 1 member after first join with new instance_id"
         );
         assert_eq!(
             members[0].0, session_id,
@@ -2697,17 +2730,17 @@ mod tests {
             .expect("IsSuppressedJoinBroadcast should succeed");
         assert!(
             !suppressed,
-            "Join with non-existent previous_session_id should NOT suppress PARTICIPANT_JOINED"
+            "First join with new instance_id should NOT suppress PARTICIPANT_JOINED"
         );
     }
 
     // ------------------------------------------------------------------
-    // TEST 5: Multi-device safe — same user, no previous_session_id
+    // TEST 5: Multi-device safe — same user, different instance_ids
     // ------------------------------------------------------------------
-    // Session A joins (user "alice", session 100). Session B joins
-    // (user "alice", session 200, previous_session_id = None). Both
-    // should coexist in room_members because multi-device usage is
-    // intentional when no previous_session_id is provided.
+    // Session A joins (user "alice", instance_id="inst-tab1"). Session B
+    // joins (user "alice", instance_id="inst-tab2"). Both should coexist
+    // in room_members because different instance_ids mean different
+    // browser tabs / devices.
     #[actix_rt::test]
     #[serial]
     async fn test_multi_device_safe_coexistence() {
@@ -2732,7 +2765,7 @@ mod tests {
         let session_a: SessionId = 9001;
         let session_b: SessionId = 9002;
 
-        // Session A joins normally
+        // Session A joins with instance_id for tab 1
         let dummy_a = DummySession.start();
         connect_and_join(
             &chat_server,
@@ -2740,14 +2773,14 @@ mod tests {
             room,
             user_id,
             dummy_a.recipient(),
-            None,
+            Some("inst-tab1".to_string()),
         )
         .await;
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Session B joins with the same user_id but NO previous_session_id
-        // (multi-device scenario — second tab, second laptop, etc.)
+        // Session B joins with a different instance_id for tab 2
+        // (multi-device scenario — different UUIDs = different KV keys)
         let dummy_b = DummySession.start();
         connect_and_join(
             &chat_server,
@@ -2755,7 +2788,7 @@ mod tests {
             room,
             user_id,
             dummy_b.recipient(),
-            None,
+            Some("inst-tab2".to_string()),
         )
         .await;
 
@@ -2771,7 +2804,7 @@ mod tests {
         assert_eq!(
             members.len(),
             2,
-            "Room should have 2 members (multi-device, same user, no eviction)"
+            "Room should have 2 members (different instance_ids, same user, no eviction)"
         );
 
         let session_ids: Vec<SessionId> = members.iter().map(|(sid, _, _)| *sid).collect();
@@ -2811,7 +2844,7 @@ mod tests {
             .expect("IsSuppressedJoinBroadcast should succeed");
         assert!(
             !suppressed_b,
-            "Session B (multi-device, no previous_session_id) should NOT suppress PARTICIPANT_JOINED"
+            "Session B (different instance_id) should NOT suppress PARTICIPANT_JOINED"
         );
     }
 }

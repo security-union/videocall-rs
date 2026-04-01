@@ -44,10 +44,10 @@ pub struct JoinRoom {
     /// When true, this is an observer session (waiting room) and should NOT
     /// trigger PARTICIPANT_JOINED notifications.
     pub observer: bool,
-    /// Session ID from a previous connection by the same client.
-    /// When present, the server can evict the stale session immediately
-    /// rather than waiting for the heartbeat timeout.
-    pub previous_session_id: Option<u64>,
+    /// Stable client instance identifier (UUID). Generated once per meeting join,
+    /// survives reconnects. When present, the server uses it to find and evict
+    /// the stale session from a previous connection by the same client instance.
+    pub instance_id: Option<String>,
 }
 
 #[derive(ActixMessage)]

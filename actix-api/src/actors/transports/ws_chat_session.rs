@@ -64,7 +64,7 @@ impl WsChatSession {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
-        previous_session_id: Option<u64>,
+        instance_id: Option<String>,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -75,7 +75,7 @@ impl WsChatSession {
             tracker_sender,
             session_manager,
             observer,
-            previous_session_id,
+            instance_id,
         );
 
         WsChatSession {
@@ -369,7 +369,7 @@ mod tests {
                                     tracker_sender,
                                     session_manager,
                                     false, // tests use non-observer sessions
-                                    None,  // no previous_session_id
+                                    None,  // no instance_id
                                 );
                                 ws::start(actor, &req, stream)
                                     .map_err(actix_web::error::ErrorInternalServerError)

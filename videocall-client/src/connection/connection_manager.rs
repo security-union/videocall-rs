@@ -124,6 +124,10 @@ pub struct ConnectionManagerOptions {
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
     pub election_period_ms: u64,
+    /// Stable client instance identifier (UUID). Generated once per meeting join,
+    /// survives reconnects, dies on tab close. Sent to the server so it can
+    /// correlate reconnections and silently evict stale sessions.
+    pub instance_id: String,
 }
 
 /// Tracks the state of automatic reconnection after connection loss.
@@ -306,15 +310,11 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Append `&previous_session_id=<id>` (or `?previous_session_id=<id>`)
-    /// to a URL when reconnecting so the server can evict the stale session.
-    fn append_previous_session_id(&self, url: &str) -> String {
-        if let Some(sid) = *self.own_session_id.borrow() {
-            let separator = if url.contains('?') { '&' } else { '?' };
-            format!("{url}{separator}previous_session_id={sid}")
-        } else {
-            url.to_string()
-        }
+    /// Append `&instance_id=<uuid>` to a lobby URL so the server can correlate
+    /// reconnections from the same client instance and silently evict stale sessions.
+    fn append_instance_id(&self, url: &str) -> String {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}instance_id={}", self.options.instance_id)
     }
 
     /// Create connections to all configured servers
@@ -322,7 +322,7 @@ impl ConnectionManager {
         // Create WebSocket connections
         for (i, base_url) in self.options.websocket_urls.iter().enumerate() {
             let conn_id = format!("ws_{i}");
-            let url = self.append_previous_session_id(base_url);
+            let url = self.append_instance_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: url.clone(),
                 webtransport_url: String::new(), // Not used for WebSocket
@@ -359,7 +359,7 @@ impl ConnectionManager {
         // Create WebTransport connections
         for (i, base_url) in self.options.webtransport_urls.iter().enumerate() {
             let conn_id = format!("wt_{i}");
-            let url = self.append_previous_session_id(base_url);
+            let url = self.append_instance_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: String::new(), // Not used for WebTransport
                 webtransport_url: url.clone(),

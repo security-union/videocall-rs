@@ -17,6 +17,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "{{ .Values.service.healthPort }}"
         prometheus.io/path: "/metrics"
+        prometheus.io/scrape-interval: "15s"
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

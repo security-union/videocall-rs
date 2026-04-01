@@ -647,6 +647,7 @@ pub fn AttendantsComponent(
                 ))
             },
             on_peer_joined: {
+                let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
                     move |(display_name, user_id): (String, String)| {
                         log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
@@ -1057,6 +1058,7 @@ pub fn AttendantsComponent(
                     if is_owner {
                         {
                             let meeting_id_for_toggle = id.clone();
+                            let aca_opacity = if waiting_room_toggle() { "1" } else { "0.5" };
                             rsx! {
                                 div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
                                     span { style: "font-size: 0.9rem;", "Waiting Room" }
@@ -1097,8 +1099,7 @@ pub fn AttendantsComponent(
                                         },
                                     }
                                 }
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white; opacity: {
-                                  };",
+                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white; opacity: {aca_opacity};",
                                     span { style: "font-size: 0.9rem;", "Admitted can admit" }
                                     crate::components::toggle_switch::ToggleSwitch {
                                         enabled: admitted_can_admit_toggle(),

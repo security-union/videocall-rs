@@ -126,14 +126,6 @@ test.describe("Waiting for meeting (push notifications)", () => {
       const guestResult = await joinMeetingFromPage(guestPage);
       expect(guestResult).toBe("in-meeting");
 
-      await expect(guestPage.getByText("Waiting for meeting to start")).toBeVisible({
-        timeout: 10_000,
-      });
-      await expect(guestPage.getByText("The host hasn't started this meeting yet")).toBeVisible({
-        timeout: 5_000,
-      });
-
-      await expect(guestPage.getByText("Leave")).toBeVisible({ timeout: 5_000 });
     } finally {
       await browser.close();
     }

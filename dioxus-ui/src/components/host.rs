@@ -29,13 +29,13 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use crate::components::{
     canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
 };
-use crate::context::{
-    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    VideoCallClientCtx,
-};
+use crate::context::VideoCallClientCtx;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
+use web_sys::MediaStream;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -149,6 +149,14 @@ pub fn Host(
         });
         let screen_state_cell = screen_state_handler.clone();
         let screen_state_cb = VcCallback::from(move |event: ScreenShareEvent| {
+            match &event {
+                ScreenShareEvent::Started(stream) => {
+                    attach_screen_preview(stream);
+                }
+                _ => {
+                    detach_screen_preview();
+                }
+            }
             if let Some(handler) = screen_state_cell.borrow().as_ref() {
                 handler.call(event);
             }
@@ -368,6 +376,7 @@ pub fn Host(
             s.prev_share_screen = share_screen;
             if share_screen {
                 s.screen.set_enabled(true);
+                log::info!("Start screen share encoder");
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
                     state_clone.borrow_mut().screen.start();
@@ -376,6 +385,7 @@ pub fn Host(
             } else {
                 s.screen.set_enabled(false);
                 s.screen.stop();
+                detach_screen_preview();
                 s.encoder_settings.screen = None;
             }
         }
@@ -492,11 +502,6 @@ pub fn Host(
         })
     };
 
-    // Change name state
-    let mut show_change_name = use_signal(|| false);
-    let mut pending_name = use_signal(String::new);
-    let mut change_name_error = use_signal(|| None::<String>);
-
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -518,24 +523,11 @@ pub fn Host(
         div {
             class: "host-video-wrapper",
             style: if video_enabled {
-                "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; pointer-events:auto;"
+                "position:relative; width:100%; height:auto; opacity:1; overflow:hidden; pointer-events:auto;"
             } else {
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
-            button {
-                class: "change-name-fab",
-                title: "Change name",
-                onclick: move |_| {
-                    pending_name.set(load_display_name_from_storage().unwrap_or_default());
-                    show_change_name.set(true);
-                    change_name_error.set(None);
-                },
-                svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    path { d: "M12 20h9" }
-                    path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
-                }
-            }
             // Glow overlay renders ON TOP of the video element
             if video_enabled {
                 div {
@@ -544,28 +536,27 @@ pub fn Host(
                 }
             }
         }
+        // Always-mounted screen share preview — toggled via style so the element
+        // exists in the DOM before attach_screen_preview() runs.
+        // Positioned AFTER the camera so the preview appears below it.
+        video {
+            id: "screen-share-preview",
+            class: "screen-share-preview",
+            style: if share_screen { "display:block;" } else { "display:none;" },
+            autoplay: true,
+            muted: true,
+            playsinline: "true",
+            controls: false,
+        }
         if !video_enabled {
             div {
-                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent;",
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent; width:100%; aspect-ratio:16/9;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
                         line { x1: "1", y1: "1", x2: "23", y2: "23" }
                     }
                     span { class: "placeholder-text", "Camera Off" }
-                }
-                button {
-                    class: "change-name-fab",
-                    title: "Change name",
-                    onclick: move |_| {
-                        pending_name.set(load_display_name_from_storage().unwrap_or_default());
-                        show_change_name.set(true);
-                        change_name_error.set(None);
-                    },
-                    svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                        path { d: "M12 20h9" }
-                        path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
-                    }
                 }
                 // Glow overlay renders ON TOP of content
                 div {
@@ -607,77 +598,6 @@ pub fn Host(
                 }
             }
         }
-
-        // Change Name Modal
-        if show_change_name() {
-            div {
-                class: "glass-backdrop",
-                onkeydown: move |e: Event<KeyboardData>| {
-                    let key = e.key();
-                    if key == Key::Escape {
-                        show_change_name.set(false);
-                        change_name_error.set(None);
-                    } else if key == Key::Enter {
-                        let new_name = pending_name().trim().to_string();
-                        match validate_display_name(&new_name) {
-                            Ok(valid_name) => {
-                                save_display_name_to_storage(&valid_name);
-                                if let Some(win) = web_sys::window() {
-                                    let _ = win.location().reload();
-                                }
-                            }
-                            Err(message) => {
-                                change_name_error.set(Some(message));
-                            }
-                        }
-                    }
-                },
-                div { class: "card-apple", style: "width: 380px;",
-                    h3 { style: "margin-top:0;", "Change your name" }
-                    p { style: "color:#AEAEB2; margin-top:0.25rem;", "This name will be visible to others in the meeting." }
-                    input {
-                        class: "input-apple",
-                        value: "{pending_name}",
-                        oninput: move |e: Event<FormData>| {
-                            pending_name.set(e.value());
-                        },
-                        placeholder: "Enter new name",
-                        autofocus: true,
-                    }
-                    if let Some(err) = change_name_error() {
-                        p { style: "color:#FF453A; margin-top:6px; font-size:12px;", "{err}" }
-                    }
-                    div { style: "display:flex; gap:8px; justify-content:flex-end; margin-top:12px;",
-                        button {
-                            class: "btn-apple btn-secondary btn-sm",
-                            onclick: move |_| {
-                                show_change_name.set(false);
-                                change_name_error.set(None);
-                            },
-                            "Cancel"
-                        }
-                        button {
-                            class: "btn-apple btn-primary btn-sm",
-                            onclick: move |_| {
-                                let new_name = pending_name().trim().to_string();
-                                match validate_display_name(&new_name) {
-                                    Ok(valid_name) => {
-                                        save_display_name_to_storage(&valid_name);
-                                        if let Some(win) = web_sys::window() {
-                                            let _ = win.location().reload();
-                                        }
-                                    }
-                                    Err(message) => {
-                                        change_name_error.set(Some(message));
-                                    }
-                                }
-                            },
-                            "Save"
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -692,4 +612,40 @@ struct HostState {
     prev_video_enabled: bool,
     initialized: bool,
     last_reload_counter: u32,
+}
+
+fn attach_screen_preview(stream: &MediaStream) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("screen-share-preview"))
+    {
+        let video: web_sys::HtmlVideoElement = el.unchecked_into();
+        // Explicitly set the muted property (not just the HTML attribute) so that
+        // Chrome's autoplay policy recognises the element as muted and allows play().
+        video.set_muted(true);
+        video.set_src_object(Some(stream));
+        // Properly await the play() Promise via spawn_local.
+        // Dropping the Promise with `let _` causes Chrome to silently abort
+        // playback for display-capture streams; Edge is more lenient.
+        wasm_bindgen_futures::spawn_local(async move {
+            match video.play() {
+                Ok(promise) => {
+                    if let Err(e) = JsFuture::from(promise).await {
+                        log::warn!("Screen preview play() rejected: {:?}", e);
+                    }
+                }
+                Err(e) => log::warn!("Screen preview play() error: {:?}", e),
+            }
+        });
+    }
+}
+
+fn detach_screen_preview() {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("screen-share-preview"))
+    {
+        let video: web_sys::HtmlVideoElement = el.unchecked_into();
+        video.set_src_object(None);
+    }
 }

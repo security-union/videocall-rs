@@ -38,12 +38,15 @@ env:
         key: secret
 resources:
   limits:
-    cpu: "500m"
+    cpu: "1000m"
     memory: "256Mi"
   requests:
     cpu: "100m"
     memory: "32Mi"
-podAnnotations: {}
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "444"
+  prometheus.io/path: "/metrics"
 podSecurityContext: {}
 securityContext: {}
 service:

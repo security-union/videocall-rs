@@ -482,6 +482,7 @@ pub fn AttendantsComponent(
             user_id: user_id
                 .clone()
                 .unwrap_or_else(|| initial_display_name.clone()),
+            display_name: initial_display_name.clone(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,

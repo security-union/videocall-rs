@@ -2,9 +2,9 @@
 metricsApi:
   # Image configuration
   image:
-    repository: securityunion/videocall-media-server
+    repository: jboyd01/videocall-media-server
     pullPolicy: Always
-    tag: latest
+    tag: 0757fe80afb16b3e5ccd130cb7de3efa09a3e25d
   
   # Minimal resources for cost optimization
   resources:
@@ -27,7 +27,7 @@ metricsApi:
   # Environment variables
   env:
     METRICS_PORT: "9091"
-    NATS_URL: "nats://nats-us-east:4222"
+    NATS_URL: "nats://nats:4222"
     REGION: "us-east"
     SERVICE_TYPE: "metrics"
     RUST_LOG: "warn,async_nats=warn"
@@ -53,24 +53,18 @@ metricsApi:
     failureThreshold: 3
   
   # Security context
-  securityContext:
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000
-  
+  securityContext: {}
+
   # Pod security context
-  podSecurityContext:
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000
+  podSecurityContext: {}
 
 # Separate Server Stats pod for connection tracking (stateless snapshot approach)
 serverStats:
   # Image configuration (same as metrics-api but different binary)
   image:
-    repository: securityunion/videocall-media-server
+    repository: jboyd01/videocall-media-server
     pullPolicy: Always
-    tag: latest
+    tag: 0757fe80afb16b3e5ccd130cb7de3efa09a3e25d
   
   # Minimal resources for server connection tracking
   resources:
@@ -93,7 +87,7 @@ serverStats:
   # Environment variables for server stats
   env:
     METRICS_PORT: "9092"
-    NATS_URL: "nats://nats-us-east:4222"
+    NATS_URL: "nats://nats:4222"
     REGION: "us-east"
     SERVICE_TYPE: "server-stats"
     RUST_LOG: "debug,async_nats=info"
@@ -122,13 +116,7 @@ serverStats:
     failureThreshold: 3
   
   # Security context
-  securityContext:
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000
-  
+  securityContext: {}
+
   # Pod security context
-  podSecurityContext:
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000 
+  podSecurityContext: {}

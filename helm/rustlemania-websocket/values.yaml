@@ -33,9 +33,12 @@ resources:
     cpu: "500m"
     memory: "256Mi"
   requests:
-    cpu: "100m"
-    memory: "32Mi"
-podAnnotations: {}
+    cpu: "20m"
+    memory: "16Mi"
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
 podSecurityContext: {}
 securityContext: {}
 service:

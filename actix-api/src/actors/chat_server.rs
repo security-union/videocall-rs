@@ -36,6 +36,8 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
+
+use crate::metrics::{RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
@@ -547,8 +549,13 @@ impl Handler<ClientMessage> for ChatServer {
 
         let b = bytes::Bytes::from(packet_bytes);
         let fut = async move {
+            let start = std::time::Instant::now();
             match nc.publish(subject.clone(), b).await {
-                Ok(_) => trace!("published message to {subject}"),
+                Ok(_) => {
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    RELAY_NATS_PUBLISH_LATENCY_MS.observe(elapsed_ms);
+                    trace!("published message to {subject}");
+                }
                 Err(e) => error!("error publishing message to {subject}: {e}"),
             }
         };
@@ -804,6 +811,9 @@ fn handle_msg(
         };
 
         if let Err(e) = session_recipient.try_send(message) {
+            RELAY_PACKET_DROPS_TOTAL
+                .with_label_values(&[&room, "nats_delivery", "mailbox_full"])
+                .inc();
             warn!(
                 "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
                 session, e
@@ -1092,6 +1102,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
+            "websocket",
         );
 
         let session2 = SessionLogic::new(
@@ -1103,6 +1114,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
+            "websocket",
         );
 
         // Verify they have different session IDs

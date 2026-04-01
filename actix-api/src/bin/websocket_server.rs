@@ -23,8 +23,9 @@ use actix_web::{
         time::{Duration, OffsetDateTime},
         Cookie, SameSite,
     },
-    error, get, web, App, Error, HttpRequest, HttpResponse, HttpServer,
+    error, get, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
+use prometheus::Encoder;
 use reqwest::header::LOCATION;
 use sec_api::{
     actors::chat_server::ChatServer,
@@ -263,6 +264,16 @@ async fn logout() -> Result<HttpResponse, Error> {
     Ok(response.finish())
 }
 
+async fn metrics_responder() -> impl Responder {
+    let encoder = prometheus::TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4")
+        .body(buffer)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
@@ -323,6 +334,7 @@ async fn main() -> std::io::Result<()> {
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
                 }))
+                .route("/metrics", web::get().to(metrics_responder))
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
@@ -349,6 +361,7 @@ async fn main() -> std::io::Result<()> {
                     after_login_url: after_login_url.clone(),
                 }))
                 .wrap(cors)
+                .route("/metrics", web::get().to(metrics_responder))
                 .service(handle_google_oauth_callback)
                 .service(login)
                 .service(check_session)
@@ -368,6 +381,7 @@ async fn main() -> std::io::Result<()> {
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
                 }))
+                .route("/metrics", web::get().to(metrics_responder))
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)

@@ -12,4 +12,5 @@ spec:
       protocol: TCP
       name: http
   selector:
-    {{- include "metrics-api.selectorLabels" . | nindent 4 }} 
+    {{- include "metrics-api.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: client-metrics

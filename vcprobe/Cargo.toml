@@ -1,0 +1,31 @@
+[package]
+name = "vcprobe"
+version = "0.1.0"
+edition = "2021"
+description = "videocall.rs meeting diagnostic probe"
+
+[[bin]]
+name = "vcprobe"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_health_publisher"
+path = "test_health_publisher.rs"
+
+[dependencies]
+videocall-types = { path = "../videocall-types" }
+web-transport-quinn = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+native-tls = "0.2"
+tokio = { version = "1", features = ["full"] }
+protobuf = "=3.7.1"
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+log = "0.4"
+env_logger = "0.11"
+url = "2"
+futures-util = "0.3"
+chrono = "0.4"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+async-nats = "0.42.0"

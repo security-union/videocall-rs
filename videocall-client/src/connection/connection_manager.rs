@@ -35,6 +35,8 @@ use protobuf::Message;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -175,6 +177,19 @@ pub struct ConnectionManager {
     /// Set to `true` when the user explicitly calls `disconnect()`. Checked by
     /// the reconnection loop to prevent reconnecting after an intentional leave.
     intentionally_disconnected: Rc<RefCell<bool>>,
+    /// Counter for total packets received (incremented on each inbound packet)
+    packets_received: Arc<AtomicU64>,
+    /// Counter for total packets sent (incremented on each outbound packet)
+    packets_sent: Arc<AtomicU64>,
+    /// Timestamp of last metrics calculation
+    last_metrics_timestamp_ms: Rc<RefCell<f64>>,
+    /// Last calculated packets received per second
+    packets_received_per_sec: Rc<RefCell<f64>>,
+    /// Last calculated packets sent per second
+    packets_sent_per_sec: Rc<RefCell<f64>>,
+    /// Previous counter values for rate calculation
+    prev_packets_received: Rc<RefCell<u64>>,
+    prev_packets_sent: Rc<RefCell<u64>>,
 }
 
 impl ConnectionManager {
@@ -213,6 +228,13 @@ impl ConnectionManager {
             reelection_in_progress: false,
             old_active_connection: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
+            packets_received: Arc::new(AtomicU64::new(0)),
+            packets_sent: Arc::new(AtomicU64::new(0)),
+            last_metrics_timestamp_ms: Rc::new(RefCell::new(js_sys::Date::now())),
+            packets_received_per_sec: Rc::new(RefCell::new(0.0)),
+            packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
+            prev_packets_received: Rc::new(RefCell::new(0)),
+            prev_packets_sent: Rc::new(RefCell::new(0)),
         };
 
         Ok(manager)
@@ -400,8 +422,11 @@ impl ConnectionManager {
         let own_session_id = self.own_session_id.clone();
         let pending_session_ids = self.pending_session_ids.clone();
         let active_connection_id = self.active_connection_id.clone();
+        let packets_received = self.packets_received.clone();
 
         Callback::from(move |packet: PacketWrapper| {
+            // Increment packets received counter for all packets
+            packets_received.fetch_add(1, Ordering::Relaxed);
             // Intercept SESSION_ASSIGNED before anything else
             if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
                 let sid = packet.session_id;
@@ -593,6 +618,10 @@ impl ConnectionManager {
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
         connection.send_packet_datagram(rtt_packet);
+        // Count RTT probes in packets_sent so the sent/received rates are symmetric.
+        // packets_received already counts inbound RTT echoes; excluding probes from
+        // packets_sent made the two rates incomparable (ratio was meaningless).
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
         debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
@@ -709,6 +738,17 @@ impl ConnectionManager {
                         if let Some(connection) = self.connections.get(&connection_id) {
                             connection.set_session_id(sid);
                         }
+
+                        // Emit a synthetic SESSION_ASSIGNED packet so that the
+                        // VideoCallClient (and HealthReporter) learn the real
+                        // session_id.  The normal path (line 317) only fires
+                        // when SESSION_ASSIGNED arrives *after* election; in the
+                        // common case the packet arrives during RTT-testing and is
+                        // buffered here, so we must re-emit it now.
+                        let mut session_pkt = PacketWrapper::new();
+                        session_pkt.packet_type = PacketType::SESSION_ASSIGNED.into();
+                        session_pkt.session_id = sid;
+                        self.options.on_inbound_media.emit(session_pkt);
                     }
                 }
                 self.pending_session_ids.borrow_mut().clear();
@@ -1467,12 +1507,16 @@ impl ConnectionManager {
             // Try the main connections HashMap first.
             if let Some(connection) = self.connections.get(active_id) {
                 connection.send_packet(packet);
+                // Increment packets sent counter
+                self.packets_sent.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
             // During re-election, the old connection lives in old_active_connection.
             if let Some((ref old_id, ref old_conn)) = self.old_active_connection {
                 if old_id == active_id {
                     old_conn.send_packet(packet);
+                    // Increment packets sent counter
+                    self.packets_sent.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
             }
@@ -1716,6 +1760,58 @@ impl ConnectionManager {
                     .map(|m| m.url.clone()),
             },
         }
+    }
+
+    /// Calculate packet rates per second
+    pub fn calculate_packet_rates(&self) {
+        let now_ms = js_sys::Date::now();
+        let last_timestamp = *self.last_metrics_timestamp_ms.borrow();
+        let elapsed_sec = (now_ms - last_timestamp) / 1000.0;
+
+        // Avoid division by zero and very small intervals
+        if elapsed_sec < 0.1 {
+            return;
+        }
+
+        let current_received = self.packets_received.load(Ordering::Relaxed);
+        let current_sent = self.packets_sent.load(Ordering::Relaxed);
+
+        let prev_received = *self.prev_packets_received.borrow();
+        let prev_sent = *self.prev_packets_sent.borrow();
+
+        // Calculate rates
+        let received_diff = current_received.saturating_sub(prev_received);
+        let sent_diff = current_sent.saturating_sub(prev_sent);
+
+        let received_per_sec = received_diff as f64 / elapsed_sec;
+        let sent_per_sec = sent_diff as f64 / elapsed_sec;
+
+        // Update stored values
+        *self.packets_received_per_sec.borrow_mut() = received_per_sec;
+        *self.packets_sent_per_sec.borrow_mut() = sent_per_sec;
+        *self.prev_packets_received.borrow_mut() = current_received;
+        *self.prev_packets_sent.borrow_mut() = current_sent;
+        *self.last_metrics_timestamp_ms.borrow_mut() = now_ms;
+    }
+
+    /// Get packets received per second (should be called after calculate_packet_rates)
+    pub fn get_packets_received_per_sec(&self) -> f64 {
+        *self.packets_received_per_sec.borrow()
+    }
+
+    /// Get packets sent per second (should be called after calculate_packet_rates)
+    pub fn get_packets_sent_per_sec(&self) -> f64 {
+        *self.packets_sent_per_sec.borrow()
+    }
+
+    /// Get send queue depth from the active connection (bufferedAmount for WebSocket)
+    pub fn get_send_queue_depth(&self) -> Option<u64> {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            if let Some(connection) = self.connections.get(active_id) {
+                return connection.get_send_queue_depth();
+            }
+        }
+        None
     }
 }
 

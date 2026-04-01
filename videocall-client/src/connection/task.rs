@@ -64,4 +64,11 @@ impl Task {
             Task::WebTransport(wt) => wt.send_packet_datagram(packet),
         }
     }
+
+    pub fn get_send_queue_depth(&self) -> Option<u64> {
+        match self {
+            Task::WebSocket(ws) => ws.get_buffered_amount(),
+            Task::WebTransport(_) => None, // WebTransport doesn't expose bufferedAmount
+        }
+    }
 }

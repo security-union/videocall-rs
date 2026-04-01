@@ -28,6 +28,15 @@ enum Focus {
     Events,
 }
 
+struct ViewState {
+    table_state: TableState,
+    use_utc: bool,
+    show_help: bool,
+    sort_by_quality: bool,
+    focus: Focus,
+    event_scroll: usize,
+}
+
 // ── Terminal setup / teardown ─────────────────────────────────────────────────
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -60,15 +69,17 @@ async fn run_inner(
     use_utc: bool,
 ) -> Result<()> {
     let mut state = MeetingState::new(meeting_id);
-    let mut table_state = TableState::default();
+    let mut view = ViewState {
+        table_state: TableState::default(),
+        use_utc,
+        show_help: false,
+        sort_by_quality: false,
+        focus: Focus::Participants,
+        event_scroll: 0,
+    };
     let mut event_stream = EventStream::new();
     let mut render_tick = time::interval(Duration::from_millis(100));
     let mut stale_tick = time::interval(Duration::from_secs(1));
-    let mut show_help = false;
-    let mut sort_by_quality = false; // Default to alphabetical
-    let mut focus = Focus::Participants;
-    // event_scroll: lines scrolled back from the bottom (0 = auto-scroll to newest)
-    let mut event_scroll: usize = 0;
     let mut prev_event_count: usize = 0;
 
     loop {
@@ -79,7 +90,7 @@ async fn run_inner(
                     Some(raw) => {
                         state.process_packet(&raw);
                         // Auto-scroll to bottom when new events arrive, unless user scrolled up
-                        if state.events.len() > prev_event_count && event_scroll == 0 {
+                        if state.events.len() > prev_event_count && view.event_scroll == 0 {
                             // already at bottom, stays there
                         }
                         prev_event_count = state.events.len();
@@ -92,7 +103,7 @@ async fn run_inner(
             maybe_event = event_stream.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) => {
-                        if handle_key(key, &mut table_state, &state, &mut show_help, &mut sort_by_quality, &mut focus, &mut event_scroll) {
+                        if handle_key(key, &state, &mut view) {
                             break;
                         }
                     }
@@ -104,12 +115,12 @@ async fn run_inner(
             // Prune stale participants
             _ = stale_tick.tick() => {
                 state.tick();
-                clamp_selection(&mut table_state, state.participants.len());
+                clamp_selection(&mut view.table_state, state.participants.len());
             }
 
             // Render
             _ = render_tick.tick() => {
-                terminal.draw(|f| render(f, &state, &mut table_state, use_utc, show_help, sort_by_quality, focus, event_scroll))?;
+                terminal.draw(|f| render(f, &state, &mut view))?;
             }
         }
     }
@@ -117,91 +128,71 @@ async fn run_inner(
     Ok(())
 }
 
-fn handle_key(
-    key: KeyEvent,
-    table_state: &mut TableState,
-    state: &MeetingState,
-    show_help: &mut bool,
-    sort_by_quality: &mut bool,
-    focus: &mut Focus,
-    event_scroll: &mut usize,
-) -> bool {
+fn handle_key(key: KeyEvent, state: &MeetingState, view: &mut ViewState) -> bool {
     match key.code {
         KeyCode::Char('q') => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Esc => return true,
         KeyCode::Char('h') | KeyCode::Char('?') => {
-            *show_help = !*show_help;
+            view.show_help = !view.show_help;
         }
         KeyCode::Tab => {
-            *focus = match *focus {
+            view.focus = match view.focus {
                 Focus::Participants => Focus::Events,
                 Focus::Events => Focus::Participants,
             };
         }
         KeyCode::Char('s') | KeyCode::Char('S') => {
-            *sort_by_quality = !*sort_by_quality;
+            view.sort_by_quality = !view.sort_by_quality;
             if !state.participants.is_empty() {
-                table_state.select(Some(0));
+                view.table_state.select(Some(0));
             }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            match *focus {
-                Focus::Participants => {
-                    let n = state.participants.len();
-                    if n > 0 {
-                        let next = match table_state.selected() {
-                            Some(i) => (i + 1).min(n - 1),
-                            None => 0,
-                        };
-                        table_state.select(Some(next));
-                    }
-                }
-                Focus::Events => {
-                    // Scroll toward newer events (reduce offset, min 0)
-                    *event_scroll = event_scroll.saturating_sub(1);
-                }
-            }
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            match *focus {
-                Focus::Participants => {
-                    let prev = match table_state.selected() {
-                        Some(0) | None => 0,
-                        Some(i) => i - 1,
+        KeyCode::Down | KeyCode::Char('j') => match view.focus {
+            Focus::Participants => {
+                let n = state.participants.len();
+                if n > 0 {
+                    let next = match view.table_state.selected() {
+                        Some(i) => (i + 1).min(n - 1),
+                        None => 0,
                     };
-                    table_state.select(Some(prev));
-                }
-                Focus::Events => {
-                    // Scroll toward older events (increase offset, capped by history)
-                    let max_scroll = state.events.len().saturating_sub(1);
-                    *event_scroll = (*event_scroll + 1).min(max_scroll);
+                    view.table_state.select(Some(next));
                 }
             }
-        }
-        KeyCode::Home => {
-            match *focus {
-                Focus::Participants => table_state.select(Some(0)),
-                Focus::Events => {
-                    // Jump to oldest events
-                    *event_scroll = state.events.len().saturating_sub(1);
+            Focus::Events => {
+                view.event_scroll = view.event_scroll.saturating_sub(1);
+            }
+        },
+        KeyCode::Up | KeyCode::Char('k') => match view.focus {
+            Focus::Participants => {
+                let prev = match view.table_state.selected() {
+                    Some(0) | None => 0,
+                    Some(i) => i - 1,
+                };
+                view.table_state.select(Some(prev));
+            }
+            Focus::Events => {
+                let max_scroll = state.events.len().saturating_sub(1);
+                view.event_scroll = (view.event_scroll + 1).min(max_scroll);
+            }
+        },
+        KeyCode::Home => match view.focus {
+            Focus::Participants => view.table_state.select(Some(0)),
+            Focus::Events => {
+                view.event_scroll = state.events.len().saturating_sub(1);
+            }
+        },
+        KeyCode::End => match view.focus {
+            Focus::Participants => {
+                let n = state.participants.len();
+                if n > 0 {
+                    view.table_state.select(Some(n - 1));
                 }
             }
-        }
-        KeyCode::End => {
-            match *focus {
-                Focus::Participants => {
-                    let n = state.participants.len();
-                    if n > 0 {
-                        table_state.select(Some(n - 1));
-                    }
-                }
-                Focus::Events => {
-                    // Jump to newest events
-                    *event_scroll = 0;
-                }
+            Focus::Events => {
+                view.event_scroll = 0;
             }
-        }
+        },
         _ => {}
     }
     false
@@ -219,16 +210,7 @@ fn clamp_selection(table_state: &mut TableState, len: usize) {
 
 // ── Top-level render ──────────────────────────────────────────────────────────
 
-fn render(
-    f: &mut Frame,
-    state: &MeetingState,
-    table_state: &mut TableState,
-    use_utc: bool,
-    show_help: bool,
-    sort_by_quality: bool,
-    focus: Focus,
-    event_scroll: usize,
-) {
+fn render(f: &mut Frame, state: &MeetingState, view: &mut ViewState) {
     let area = f.area();
 
     // Require minimum terminal size to avoid panics from zero-height areas
@@ -239,16 +221,16 @@ fn render(
         return;
     }
 
-    let participants = state.sorted_participants(sort_by_quality);
+    let participants = state.sorted_participants(view.sort_by_quality);
 
     // Adaptive detail height: show it only when someone is selected
-    let detail_h = if table_state.selected().is_some() {
+    let detail_h = if view.table_state.selected().is_some() {
         7u16
     } else {
         0u16
     };
     // Events panel: taller when focused so there's room to scroll
-    let events_h = if focus == Focus::Events {
+    let events_h = if view.focus == Focus::Events {
         Constraint::Min(10)
     } else {
         Constraint::Length(6)
@@ -265,16 +247,23 @@ fn render(
         ])
         .split(area);
 
-    render_header(f, chunks[0], state, use_utc, sort_by_quality);
-    render_participants(f, chunks[1], state, &participants, table_state);
+    render_header(f, chunks[0], state, view.use_utc, view.sort_by_quality);
+    render_participants(f, chunks[1], state, &participants, &mut view.table_state);
     if detail_h > 0 {
-        render_detail(f, chunks[2], &participants, table_state.selected());
+        render_detail(f, chunks[2], &participants, view.table_state.selected());
     }
-    render_events(f, chunks[3], state, use_utc, focus, event_scroll);
-    render_footer(f, chunks[4], focus);
+    render_events(
+        f,
+        chunks[3],
+        state,
+        view.use_utc,
+        view.focus,
+        view.event_scroll,
+    );
+    render_footer(f, chunks[4], view.focus);
 
     // Overlay help screen if active
-    if show_help {
+    if view.show_help {
         render_help(f, area);
     }
 }
@@ -1175,9 +1164,13 @@ fn conceal_display(cps: f64, pkts_per_sec: f64) -> (String, Color) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
     }
 }

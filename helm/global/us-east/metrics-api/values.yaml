@@ -2,10 +2,10 @@
 metricsApi:
   # Image configuration
   image:
-    repository: jboyd01/videocall-media-server
+    repository: securityunion/videocall-media-server
     pullPolicy: Always
-    tag: 0757fe80afb16b3e5ccd130cb7de3efa09a3e25d
-  
+    tag: latest
+
   # Minimal resources for cost optimization
   resources:
     limits:
@@ -52,19 +52,22 @@ metricsApi:
     timeoutSeconds: 3
     failureThreshold: 3
   
-  # Security context
-  securityContext: {}
+  # Security context — run as non-root
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
 
   # Pod security context
-  podSecurityContext: {}
+  podSecurityContext:
+    runAsNonRoot: true
 
 # Separate Server Stats pod for connection tracking (stateless snapshot approach)
 serverStats:
   # Image configuration (same as metrics-api but different binary)
   image:
-    repository: jboyd01/videocall-media-server
+    repository: securityunion/videocall-media-server
     pullPolicy: Always
-    tag: 0757fe80afb16b3e5ccd130cb7de3efa09a3e25d
+    tag: latest
   
   # Minimal resources for server connection tracking
   resources:
@@ -115,8 +118,11 @@ serverStats:
     timeoutSeconds: 3
     failureThreshold: 3
   
-  # Security context
-  securityContext: {}
+  # Security context — run as non-root
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
 
   # Pod security context
-  podSecurityContext: {}
+  podSecurityContext:
+    runAsNonRoot: true

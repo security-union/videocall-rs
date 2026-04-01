@@ -18,11 +18,27 @@
 
 //! Centralized Prometheus metrics for the videocall API
 
+use actix_web::{HttpResponse, Responder};
 use lazy_static::lazy_static;
 use prometheus::{
     register_counter, register_counter_vec, register_gauge_vec, register_histogram, Counter,
-    CounterVec, GaugeVec, Histogram,
+    CounterVec, Encoder, GaugeVec, Histogram,
 };
+
+/// Shared Prometheus metrics HTTP handler for relay server binaries.
+pub async fn metrics_responder() -> impl Responder {
+    let encoder = prometheus::TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let mut buffer = Vec::new();
+    match encoder.encode(&metric_families, &mut buffer) {
+        Ok(()) => HttpResponse::Ok()
+            .content_type("text/plain; version=0.0.4")
+            .body(buffer),
+        Err(e) => {
+            HttpResponse::InternalServerError().body(format!("Failed to encode metrics: {e}"))
+        }
+    }
+}
 
 lazy_static! {
     /// Total number of health reports received
@@ -354,6 +370,15 @@ lazy_static! {
     .expect("Failed to create client_tab_throttled metric");
 
     // ===== RELAY SERVER-SIDE METRICS (in-process on relay binaries) =====
+    //
+    // CARDINALITY NOTE: These metrics use `room` (meeting_id) as a label.
+    // Meeting IDs are user-provided so the label space is unbounded.
+    // GaugeVec metrics (queue depth, active sessions) are cleaned up on
+    // session disconnect. CounterVec metrics (drops, bytes) cannot be
+    // cleaned per-label; over time with many unique rooms, series count
+    // will grow. Mitigated by Prometheus metric_relabel_configs that
+    // filter ~96% of series. If cardinality becomes a problem, switch
+    // counters to room-less aggregates or add periodic label cleanup.
 
     /// Total packet drops from try_send() failures on outbound channels/mailboxes
     pub static ref RELAY_PACKET_DROPS_TOTAL: CounterVec = register_counter_vec!(

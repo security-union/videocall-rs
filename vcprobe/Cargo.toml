@@ -8,9 +8,9 @@ description = "videocall.rs meeting diagnostic probe"
 name = "vcprobe"
 path = "src/main.rs"
 
-[[bin]]
+[[example]]
 name = "test_health_publisher"
-path = "test_health_publisher.rs"
+path = "examples/test_health_publisher.rs"
 
 [dependencies]
 videocall-types = { path = "../videocall-types" }

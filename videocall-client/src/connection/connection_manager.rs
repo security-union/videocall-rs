@@ -32,11 +32,9 @@ use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
 use log::{debug, error, info, warn};
 use protobuf::Message;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -178,9 +176,9 @@ pub struct ConnectionManager {
     /// the reconnection loop to prevent reconnecting after an intentional leave.
     intentionally_disconnected: Rc<RefCell<bool>>,
     /// Counter for total packets received (incremented on each inbound packet)
-    packets_received: Arc<AtomicU64>,
+    packets_received: Rc<Cell<u64>>,
     /// Counter for total packets sent (incremented on each outbound packet)
-    packets_sent: Arc<AtomicU64>,
+    packets_sent: Rc<Cell<u64>>,
     /// Timestamp of last metrics calculation
     last_metrics_timestamp_ms: Rc<RefCell<f64>>,
     /// Last calculated packets received per second
@@ -228,8 +226,8 @@ impl ConnectionManager {
             reelection_in_progress: false,
             old_active_connection: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
-            packets_received: Arc::new(AtomicU64::new(0)),
-            packets_sent: Arc::new(AtomicU64::new(0)),
+            packets_received: Rc::new(Cell::new(0)),
+            packets_sent: Rc::new(Cell::new(0)),
             last_metrics_timestamp_ms: Rc::new(RefCell::new(js_sys::Date::now())),
             packets_received_per_sec: Rc::new(RefCell::new(0.0)),
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
@@ -426,7 +424,7 @@ impl ConnectionManager {
 
         Callback::from(move |packet: PacketWrapper| {
             // Increment packets received counter for all packets
-            packets_received.fetch_add(1, Ordering::Relaxed);
+            packets_received.set(packets_received.get() + 1);
             // Intercept SESSION_ASSIGNED before anything else
             if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
                 let sid = packet.session_id;
@@ -621,7 +619,7 @@ impl ConnectionManager {
         // Count RTT probes in packets_sent so the sent/received rates are symmetric.
         // packets_received already counts inbound RTT echoes; excluding probes from
         // packets_sent made the two rates incomparable (ratio was meaningless).
-        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.packets_sent.set(self.packets_sent.get() + 1);
         debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
@@ -1508,7 +1506,7 @@ impl ConnectionManager {
             if let Some(connection) = self.connections.get(active_id) {
                 connection.send_packet(packet);
                 // Increment packets sent counter
-                self.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.packets_sent.set(self.packets_sent.get() + 1);
                 return Ok(());
             }
             // During re-election, the old connection lives in old_active_connection.
@@ -1516,7 +1514,7 @@ impl ConnectionManager {
                 if old_id == active_id {
                     old_conn.send_packet(packet);
                     // Increment packets sent counter
-                    self.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    self.packets_sent.set(self.packets_sent.get() + 1);
                     return Ok(());
                 }
             }
@@ -1773,8 +1771,8 @@ impl ConnectionManager {
             return;
         }
 
-        let current_received = self.packets_received.load(Ordering::Relaxed);
-        let current_sent = self.packets_sent.load(Ordering::Relaxed);
+        let current_received = self.packets_received.get();
+        let current_sent = self.packets_sent.get();
 
         let prev_received = *self.prev_packets_received.borrow();
         let prev_sent = *self.prev_packets_sent.borrow();

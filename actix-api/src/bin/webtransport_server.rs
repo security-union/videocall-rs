@@ -20,10 +20,10 @@ use std::net::ToSocketAddrs;
 
 use actix::Actor;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use prometheus::Encoder;
 use tracing::{error, info};
 
 use sec_api::actors::chat_server::ChatServer;
+use sec_api::metrics::metrics_responder;
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
 use sec_api::version;
@@ -31,16 +31,6 @@ use sec_api::webtransport::{self, Certs};
 
 async fn health_responder() -> impl Responder {
     HttpResponse::Ok().body("Ok")
-}
-
-async fn metrics_responder() -> impl Responder {
-    let encoder = prometheus::TextEncoder::new();
-    let metric_families = prometheus::gather();
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    HttpResponse::Ok()
-        .content_type("text/plain; version=0.0.4")
-        .body(buffer)
 }
 
 #[actix_rt::main]

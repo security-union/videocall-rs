@@ -450,10 +450,10 @@ impl Peer {
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
-                    // self.is_speaking = metadata.is_speaking; // Field not in proto currently
-                    // if !metadata.is_speaking {
-                    //     self.audio_level = 0.0;
-                    // }
+                    self.is_speaking = metadata.is_speaking;
+                    if !metadata.is_speaking {
+                        self.audio_level = 0.0;
+                    }
 
                     // Flush video decoder when video is turned off
                     if video_turned_off {

@@ -23,9 +23,8 @@ use actix_web::{
         time::{Duration, OffsetDateTime},
         Cookie, SameSite,
     },
-    error, get, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
+    error, get, web, App, Error, HttpRequest, HttpResponse, HttpServer,
 };
-use prometheus::Encoder;
 use reqwest::header::LOCATION;
 use sec_api::{
     actors::chat_server::ChatServer,
@@ -35,6 +34,7 @@ use sec_api::{
     },
     db::{get_pool, PostgresPool},
     lobby::{ws_connect, ws_connect_authenticated},
+    metrics::metrics_responder,
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
@@ -262,16 +262,6 @@ async fn logout() -> Result<HttpResponse, Error> {
     response.cookie(email_cookie);
     response.cookie(name_cookie);
     Ok(response.finish())
-}
-
-async fn metrics_responder() -> impl Responder {
-    let encoder = prometheus::TextEncoder::new();
-    let metric_families = prometheus::gather();
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    HttpResponse::Ok()
-        .content_type("text/plain; version=0.0.4")
-        .body(buffer)
 }
 
 #[actix_web::main]

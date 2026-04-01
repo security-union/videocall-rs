@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
@@ -139,7 +139,7 @@ pub struct MeetingState {
     pub meeting_id: String,
     pub started_at: Instant,
     pub participants: HashMap<String, Participant>,
-    pub events: Vec<Event>,
+    pub events: VecDeque<Event>,
     /// Stores display_name for sessions whose PARTICIPANT_JOINED arrived before MEDIA/HEALTH.
     pending_display_names: HashMap<String, String>,
 }
@@ -150,7 +150,7 @@ impl MeetingState {
             meeting_id,
             started_at: Instant::now(),
             participants: HashMap::new(),
-            events: Vec::new(),
+            events: VecDeque::new(),
             pending_display_names: HashMap::new(),
         }
     }
@@ -379,12 +379,12 @@ impl MeetingState {
     }
 
     fn push_event(&mut self, msg: String) {
-        self.events.push(Event {
+        self.events.push_back(Event {
             when: Local::now(),
             msg,
         });
         if self.events.len() > 500 {
-            self.events.remove(0);
+            self.events.pop_front();
         }
     }
 

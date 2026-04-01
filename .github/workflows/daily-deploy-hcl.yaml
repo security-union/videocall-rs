@@ -369,7 +369,7 @@ jobs:
             --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[1].valueFrom.secretKeyRef.key=secret" \
             --set "env[2].name=CORS_ALLOWED_ORIGIN" \
-            --set "env[2].value=https://app-dx.videocall.fnxlabs.com" \
+            --set "env[2].value=https://app.videocall.fnxlabs.com" \
             --set "env[3].name=COOKIE_DOMAIN" \
             --set "env[3].value=.videocall.fnxlabs.com" \
             --set "env[4].name=OAUTH_ISSUER" \
@@ -381,11 +381,11 @@ jobs:
             --set "env[7].name=OAUTH_REDIRECT_URL" \
             --set "env[7].value=https://api.videocall.fnxlabs.com/login/callback" \
             --set "env[8].name=AFTER_LOGIN_URL" \
-            --set "env[8].value=https://app-dx.videocall.fnxlabs.com" \
+            --set "env[8].value=https://app.videocall.fnxlabs.com" \
             --set "env[9].name=OAUTH_SCOPES" \
             --set "env[9].value=openid email profile" \
             --set "env[10].name=ALLOWED_REDIRECT_URLS" \
-            --set "env[10].value=https://app-dx.videocall.fnxlabs.com" \
+            --set "env[10].value=https://app.videocall.fnxlabs.com" \
             --set "env[11].name=LISTEN_ADDR" \
             --set "env[11].value=0.0.0.0:8081" \
             --set "env[12].name=RUST_LOG" \
@@ -435,11 +435,11 @@ jobs:
             --set "runtimeConfig.audioBitrateKbps=65" \
             --set "runtimeConfig.videoBitrateKbps=1000" \
             --set "runtimeConfig.screenBitrateKbps=1000" \
-            --set "ingress.hosts[0].host=app-dx.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].host=app.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.tls[0].secretName=dioxus-ui-tls" \
-            --set "ingress.tls[0].hosts[0]=app-dx.videocall.fnxlabs.com" \
+            --set "ingress.tls[0].hosts[0]=app.videocall.fnxlabs.com" \
             --set "ingress.annotations.cert-manager\.io/issuer=letsencrypt-prod" \
             --set "ingress.annotations.cert-manager\.io/issuer-kind=Issuer" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
@@ -471,7 +471,7 @@ jobs:
           echo "Deployed image tag: ${TAG}"
           echo ""
           echo "Production URLs:"
-          echo "  - Dioxus UI:     https://app-dx.videocall.fnxlabs.com"
+          echo "  - Dioxus UI:     https://app.videocall.fnxlabs.com"
           echo "  - API:           https://api.videocall.fnxlabs.com"
           echo "  - WebSocket:     wss://websocket.videocall.fnxlabs.com"
           echo "  - WebTransport:  https://webtransport.videocall.fnxlabs.com (NodePort 52311)"
@@ -502,7 +502,7 @@ jobs:
           WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           if [ "${{ job.status }}" = "success" ]; then
-            MESSAGE="✅ *Production Deployment Complete*\n\n📦 Tag: \`${TAG}\`\n🌐 URL: https://app-dx.videocall.fnxlabs.com\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n\n_Deployed to videocall namespace_"
+            MESSAGE="✅ *Production Deployment Complete*\n\n📦 Tag: \`${TAG}\`\n🌐 URL: https://app.videocall.fnxlabs.com\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n\n_Deployed to videocall namespace_"
           else
             MESSAGE="❌ *Production Deployment Failed*\n\n📦 Tag: \`${TAG}\`\n🌿 Branch: \`${BRANCH}\`\n📝 Commit: \`${SHORT_SHA}\`\n🔗 Logs: ${WORKFLOW_URL}\n\n_Check workflow logs for details_"
           fi

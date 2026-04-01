@@ -108,7 +108,7 @@ jobs:
             **Phase 1: Build Docker images (5-7 minutes)**
             - Media Server (WebSocket/WebTransport)
             - Meeting API (REST backend)
-            - Web UI (WASM frontend)
+            - Dioxus UI (WASM frontend)
 
             **Phase 2: Deploy to slot (3-5 minutes)**
             - Assign deployment slot (1-${maxSlots} available)
@@ -196,7 +196,6 @@ jobs:
             **Images:**
             - \`${registry}/videocall-media-server:pr-${prNumber}\`
             - \`${registry}/videocall-meeting-api:pr-${prNumber}\`
-            - \`${registry}/videocall-web-ui:pr-${prNumber}\`
             - \`${registry}/videocall-dioxus-ui:pr-${prNumber}\`
 
             🚀 **Deploying to preview environment now...**

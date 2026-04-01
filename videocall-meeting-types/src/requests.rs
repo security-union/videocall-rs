@@ -64,6 +64,13 @@ pub struct JoinMeetingRequest {
     pub display_name: Option<String>,
 }
 
+/// Request body for `PUT /api/v1/meetings/{meeting_id}/display-name`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpdateDisplayNameRequest {
+    /// New display name for the participant.
+    pub display_name: String,
+}
+
 /// Request body for `POST /api/v1/meetings/{meeting_id}/admit`
 /// and `POST /api/v1/meetings/{meeting_id}/reject`.
 #[derive(Debug, Serialize, Deserialize, Clone)]

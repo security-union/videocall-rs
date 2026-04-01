@@ -18,12 +18,14 @@
 
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
+    canvas_generator::TileMode,
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::PeerList,
     peer_tile::PeerTile,
+    update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
         CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
         PeerListButton, ScreenShareButton,
@@ -33,7 +35,9 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap};
+use crate::context::{
+    save_display_name_to_storage, DisplayNameCtx, MeetingTime, PeerMediaState, PeerStatusMap,
+};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
@@ -194,7 +198,7 @@ fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
 fn schedule_reconnect(
     client_cell: Rc<RefCell<Option<VideoCallClient>>>,
     meeting_id: String,
-    display_name: String,
+    current_display_name: Signal<String>,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
     attempt: u32,
@@ -221,7 +225,8 @@ fn schedule_reconnect(
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
-                    let (ws, wt) = build_lobby_urls(&new_token, &display_name, &meeting_id);
+                    let latest_display_name = current_display_name();
+                    let (ws, wt) = build_lobby_urls(&new_token, &latest_display_name, &meeting_id);
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
                         if let Err(e) = client.connect() {
@@ -238,7 +243,7 @@ fn schedule_reconnect(
                     schedule_reconnect(
                         client_cell,
                         meeting_id,
-                        display_name,
+                        current_display_name,
                         connection_error,
                         meeting_ended_message,
                         attempt + 1,
@@ -291,6 +296,7 @@ fn schedule_reconnect_no_jwt(
                 true
             }
         };
+
         if reconnect_needed {
             schedule_reconnect_no_jwt(client_cell, connection_error, attempt + 1);
         }
@@ -390,6 +396,7 @@ pub fn AttendantsComponent(
 
     // --- State signals ---
     let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
+
     let mut mic_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
@@ -398,6 +405,10 @@ pub fn AttendantsComponent(
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
+    let mut display_name_modal_open = use_signal(|| false);
+    let current_display_name = use_signal(|| display_name.clone());
+    let display_name_ctx = use_context::<DisplayNameCtx>();
+    let display_name_ctx_signal = display_name_ctx.0;
     let mut meeting_joined = use_signal(|| false);
     let mut show_copy_toast = use_signal(|| false);
     let mut meeting_start_time_server = use_signal(|| None::<f64>);
@@ -405,6 +416,7 @@ pub fn AttendantsComponent(
     let meeting_ended_message = use_signal(|| None::<String>);
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
+    let mut screen_share_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
     let mic_error = use_signal(|| None::<MediaErrorState>);
     let video_error = use_signal(|| None::<MediaErrorState>);
@@ -425,6 +437,7 @@ pub fn AttendantsComponent(
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
+    let peer_display_name_version = use_signal(|| 0u32);
 
     // Container dimensions — updated on every window resize so compute_grid
     // reacts to viewport changes without any JS ResizeObserver boilerplate.
@@ -462,19 +475,25 @@ pub fn AttendantsComponent(
         #[cfg(not(feature = "media-server-jwt-auth"))]
         let token = String::new();
 
-        let (websocket_urls, webtransport_urls) = build_lobby_urls(&token, &display_name, &id);
+        let initial_display_name = current_display_name();
+        let (websocket_urls, webtransport_urls) =
+            build_lobby_urls(&token, &initial_display_name, &id);
 
         log::info!(
             "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
-            display_name,
+            initial_display_name,
             id
         );
 
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
 
+        let user_id_for_display_name_changed = user_id.clone();
+
         let opts = VideoCallClientOptions {
-            user_id: user_id.clone().unwrap_or_else(|| display_name.clone()),
+            user_id: user_id
+                .clone()
+                .unwrap_or_else(|| initial_display_name.clone()),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -491,10 +510,10 @@ pub fn AttendantsComponent(
             }),
             on_connection_lost: {
                 let id = id.clone();
-                let display_name = display_name.clone();
                 let client_cell = client_for_reconnect.clone();
-                VcCallback::from(move |_| {
-                    log::warn!("DIOXUS-UI: Connection lost");
+                VcCallback::from(move |reason: wasm_bindgen::JsValue| {
+                    let reason_str = reason.as_string().unwrap_or_else(|| format!("{reason:?}"));
+                    log::warn!("DIOXUS-UI: Connection lost — reason: {reason_str}");
                     let mut connection_error = connection_error;
                     let meeting_ended_message = meeting_ended_message;
                     connection_error.set(Some("Connection lost, reconnecting...".to_string()));
@@ -503,11 +522,11 @@ pub fn AttendantsComponent(
                     {
                         let client_cell = client_cell.clone();
                         let meeting_id = id.clone();
-                        let display_name = display_name.clone();
+                        let current_display_name = current_display_name;
                         schedule_reconnect(
                             client_cell,
                             meeting_id,
-                            display_name,
+                            current_display_name,
                             connection_error,
                             meeting_ended_message,
                             0,
@@ -585,39 +604,9 @@ pub fn AttendantsComponent(
                 v.set(v() + 1);
             })),
             on_peer_left: {
-                let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
                     move |(display_name, user_id): (String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
-
-                        // Suppress toast if the client is reconnecting — the server
-                        // replays the full member list on each connect, so leave
-                        // events during reconnection are not genuine departures.
-                        let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
-                            if client.is_reconnecting() {
-                                log::debug!(
-                                    "Suppressing leave toast for {} (reconnecting)",
-                                    user_id
-                                );
-                                true
-                            } else if !client.has_peer_with_user_id(&user_id) {
-                                // Peer is not in the tracked list (already removed
-                                // by a previous event) — no toast needed.
-                                log::debug!(
-                                    "Suppressing leave toast for {} (not in peer list)",
-                                    user_id
-                                );
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if suppress_toast {
-                            return;
-                        }
 
                         let mut toast_counter = toast_counter;
                         let mut peer_toasts = peer_toasts;
@@ -658,16 +647,10 @@ pub fn AttendantsComponent(
                 ))
             },
             on_peer_joined: {
-                let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
                     move |(display_name, user_id): (String, String)| {
                         log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
 
-                        // Suppress toast if the client is reconnecting — the server
-                        // replays the full member list as PARTICIPANT_JOINED events
-                        // on each connect, so these are not genuine new arrivals.
-                        // Also suppress if this participant is already tracked in the
-                        // peer list (they reconnected, not newly joined).
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
                             if client.is_reconnecting() {
                                 log::debug!(
@@ -691,7 +674,6 @@ pub fn AttendantsComponent(
                         let mut toast_counter = toast_counter;
                         let mut peer_toasts = peer_toasts;
                         let mut toast_version = toast_version;
-                        // Remove any pending "left" toast for this user (waiting room admission).
                         let mut current = peer_toasts.peek().clone();
                         current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
 
@@ -705,7 +687,6 @@ pub fn AttendantsComponent(
                                 let v = *toast_version.peek();
                                 toast_version.set(v + 1);
                             }
-                            // Schedule toast removal after 8 seconds.
                             Timeout::new(8_000, move || {
                                 let updated: Vec<_> = peer_toasts
                                     .peek()
@@ -724,8 +705,6 @@ pub fn AttendantsComponent(
                             peer_toasts.set(current);
                         }
 
-                        // Always force tile re-render so display names appear,
-                        // even when the toast is suppressed.
                         {
                             let mut v = peer_list_version;
                             v.set(v() + 1);
@@ -733,6 +712,33 @@ pub fn AttendantsComponent(
                     },
                 ))
             },
+            on_display_name_changed: Some(VcCallback::from(
+                move |(changed_user_id, new_display_name): (String, String)| {
+                    log::info!(
+                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\"",
+                        changed_user_id,
+                        new_display_name,
+                    );
+
+                    if user_id_for_display_name_changed.as_deref() == Some(changed_user_id.as_str())
+                    {
+                        log::info!(
+                            "DIOXUS-UI: Local user display name confirmed by server: {}",
+                            new_display_name
+                        );
+                        save_display_name_to_storage(&new_display_name);
+                        let mut current_display_name = current_display_name;
+                        current_display_name.set(new_display_name.clone());
+                        let mut dn_ctx = display_name_ctx_signal;
+                        dn_ctx.set(Some(new_display_name.clone()));
+                        log::debug!("DIOXUS-UI: current_display_name signal updated");
+                    }
+
+                    let mut v = peer_display_name_version;
+                    v.set(v() + 1);
+                    log::debug!("DIOXUS-UI: peer_display_name_version bumped");
+                },
+            )),
         };
 
         let client = VideoCallClient::new(opts);
@@ -886,11 +892,21 @@ pub fn AttendantsComponent(
                     if let Some(mut sig) = existing {
                         // Update the per-peer signal only if the state changed.
                         if *sig.peek() != state {
+                            // If screen-sharing state changed, bump the layout version.
+                            if sig.peek().screen_enabled != state.screen_enabled {
+                                let next = *screen_share_version.peek() + 1;
+                                screen_share_version.set(next);
+                            }
                             sig.set(state);
                         }
                     } else {
                         // First event for this peer — create a new signal.
+                        let screen_enabled = state.screen_enabled;
                         let sig = Signal::new(state);
+                        if screen_enabled {
+                            let next = *screen_share_version.peek() + 1;
+                            screen_share_version.set(next);
+                        }
                         peer_status_map.write().insert(peer_id, sig);
                     }
                 }
@@ -953,6 +969,8 @@ pub fn AttendantsComponent(
     // --- Derived values ---
     let _ = peer_list_version(); // subscribe to trigger re-renders when peers change
     let _ = toast_version(); // subscribe to trigger re-renders when toasts change
+    let _ = screen_share_version(); // subscribe to trigger re-renders when screen-share state changes
+    let _ = peer_display_name_version();
     let display_peers = client.sorted_peer_keys();
     let peers_for_display: Vec<String> = display_peers
         .iter()
@@ -970,15 +988,45 @@ pub fn AttendantsComponent(
     let ch = container_h();
     let (cols, rows) = compute_grid(num_display_peers.min(CANVAS_LIMIT), cw, ch);
 
-    let container_style = format!(
+    // --- Screen share stack: tracks the order of peer screen shares (LIFO) ---
+    let mut screen_share_stack: Signal<Vec<String>> = use_signal(Vec::new);
+    let active_screen_sharer: Option<String> = {
+        let mut stack = screen_share_stack.write();
+        // Remove peers who stopped sharing or left
+        stack.retain(|pid| {
+            display_peers.contains(pid) && client.is_screen_share_enabled_for_peer(pid)
+        });
+        // Add new sharers to the end (most recent = last)
+        for pid in &display_peers {
+            if client.is_screen_share_enabled_for_peer(pid) && !stack.contains(pid) {
+                // Skip self — local screen share is shown in the host preview
+                let peer_user_id = client.get_peer_user_id(pid).unwrap_or_else(|| pid.clone());
+                if user_id.as_deref() != Some(peer_user_id.as_str()) {
+                    stack.push(pid.clone());
+                }
+            }
+        }
+        stack.last().cloned()
+    };
+    let has_screen_share = active_screen_sharer.is_some();
+
+    let container_style = if has_screen_share {
+        // 2/3 screen-share panel on the left, 1/3 peer panel on the right
         "position: absolute; inset: 0; width: 100%; height: 100%; \
-         --num-peers: {}; \
-         grid-template-columns: repeat({}, 1fr); \
-         grid-template-rows: repeat({}, 1fr);",
-        num_peers_for_styling.max(1),
-        cols,
-        rows,
-    );
+         display: flex; flex-direction: row; gap: 10px; padding: 16px; \
+         align-items: center; box-sizing: border-box;"
+            .to_string()
+    } else {
+        format!(
+            "position: absolute; inset: 0; width: 100%; height: 100%; \
+             --num-peers: {}; \
+             grid-template-columns: repeat({}, 1fr); \
+             grid-template-rows: repeat({}, 1fr);",
+            num_peers_for_styling.max(1),
+            cols,
+            rows,
+        )
+    };
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
@@ -986,17 +1034,14 @@ pub fn AttendantsComponent(
     };
 
     let is_allowed = users_allowed_to_stream().unwrap_or_default();
-    let effective_user_id = user_id.as_deref().unwrap_or(&display_name);
+    let latest_display_name = current_display_name();
+    let effective_user_id = user_id.as_deref().unwrap_or(&latest_display_name);
     let can_stream =
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
-    let admitted_toggle_opacity = if waiting_room_toggle() { "1.0" } else { "0.4" };
-
     // --- Pre-join screen ---
     if !meeting_joined() {
         return rsx! {
-            div {
-                id: "main-container",
-                class: "meeting-page",
+            div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
                 div {
                     id: "join-meeting-container",
@@ -1052,7 +1097,8 @@ pub fn AttendantsComponent(
                                         },
                                     }
                                 }
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white; opacity: {admitted_toggle_opacity};",
+                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white; opacity: {
+                                  };",
                                     span { style: "font-size: 0.9rem;", "Admitted can admit" }
                                     crate::components::toggle_switch::ToggleSwitch {
                                         enabled: admitted_can_admit_toggle(),
@@ -1088,9 +1134,7 @@ pub fn AttendantsComponent(
                                     }
                                 }
                                 if let Some(err) = toggle_error() {
-                                    p { class: "toggle-error",
-                                        "{err}"
-                                    }
+                                    p { class: "toggle-error", "{err}" }
                                 }
                                 p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-bottom: 1.5rem; margin-top: -0.75rem;",
                                     if waiting_room_toggle() {
@@ -1107,17 +1151,21 @@ pub fn AttendantsComponent(
                         onclick: move |_| {
                             mda.borrow().request();
                         },
-                        if is_owner { "Start Meeting" } else { "Join Meeting" }
+                        if is_owner {
+                            "Start Meeting"
+                        } else {
+                            "Join Meeting"
+                        }
                     }
                     if show_device_warning() {
                         div { class: "modal-overlay",
                             div { class: "modal-window",
                                 h3 { "Device access problem" }
                                 if let Some(err) = mic_error.read().as_ref() {
-                                    { render_single_device_error("Microphone", err) }
+                                    {render_single_device_error("Microphone", err)}
                                 }
                                 if let Some(err) = video_error.read().as_ref() {
-                                    { render_single_device_error("Camera", err) }
+                                    {render_single_device_error("Camera", err)}
                                 }
                                 {
                                     let mut client = client.clone();
@@ -1155,19 +1203,24 @@ pub fn AttendantsComponent(
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
-            div {
-                id: "main-container",
-                class: "meeting-page",
+            div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
                 if !peer_toasts().is_empty() {
-                    div {
-                        class: "peer-toasts",
-                        for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
+                    div { class: "peer-toasts",
+                        for (id , display_name , _ , is_joined) in peer_toasts().iter().cloned() {
                             {
-                                let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
-                                let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
+                                let variant_class = if is_joined {
+                                    "peer-toast toast-joined"
+                                } else {
+                                    "peer-toast toast-left"
+                                };
+                                let action_text = if is_joined {
+                                    "joined the meeting"
+                                } else {
+                                    "left the meeting"
+                                };
                                 rsx! {
                                     div { key: "{id}", class: "{variant_class}",
                                         span { class: "toast-icon",
@@ -1183,8 +1236,18 @@ pub fn AttendantsComponent(
                                                     stroke_linejoin: "round",
                                                     path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
                                                     circle { cx: "9", cy: "7", r: "4" }
-                                                    line { x1: "19", y1: "8", x2: "19", y2: "14" }
-                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
+                                                    line {
+                                                        x1: "19",
+                                                        y1: "8",
+                                                        x2: "19",
+                                                        y2: "14",
+                                                    }
+                                                    line {
+                                                        x1: "22",
+                                                        y1: "11",
+                                                        x2: "16",
+                                                        y2: "11",
+                                                    }
                                                 }
                                             } else {
                                                 svg {
@@ -1198,7 +1261,12 @@ pub fn AttendantsComponent(
                                                     stroke_linejoin: "round",
                                                     path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
                                                     circle { cx: "9", cy: "7", r: "4" }
-                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
+                                                    line {
+                                                        x1: "22",
+                                                        y1: "11",
+                                                        x2: "16",
+                                                        y2: "11",
+                                                    }
                                                 }
                                             }
                                         }
@@ -1214,81 +1282,122 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                div {
-                    id: "grid-container",
-                    style: "{container_style}",
+                div { id: "grid-container", style: "{container_style}",
 
-                    // Peer tiles
-                    for (i, peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
-                        {
-                            let full_bleed = display_peers.len() == 1
-                                && !client.is_screen_share_enabled_for_peer(peer_id);
-                            rsx! {
+                    if has_screen_share {
+                        // ---- Split layout: active screen share (left 2/3) + peer videos (right 1/3) ----
+                        // Left panel — ONLY the most recent (active) screen sharer
+                        div { style: "flex: 2; min-width: 0; height: 100%; display: flex; flex-direction: column; \
+                                    align-items: center; justify-content: center; overflow: hidden;",
+                            if let Some(ref active_peer) = active_screen_sharer {
                                 PeerTile {
-                                    key: "tile-{i}-{peer_id}",
-                                    peer_id: peer_id.clone(),
-                                    full_bleed: full_bleed,
+                                    key: "ss-active-{active_peer}",
+                                    peer_id: active_peer.clone(),
+                                    full_bleed: true,
                                     host_user_id: host_user_id.clone(),
+                                    render_mode: TileMode::ScreenOnly,
+                                    my_peer_id: user_id.clone(),
                                 }
                             }
                         }
-                    }
-
-                    // Invitation overlay when no peers
-                    if num_display_peers == 0 {
-                        div {
-                            id: "invite-overlay",
-                            class: "card-apple",
-                            style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
-                            h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                            p { style: "font-size: 0.9rem; opacity: 0.8;", "Share this meeting link with others you want in the meeting" }
-                            div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
-                                input {
-                                    id: "meeting-link-input",
-                                    value: "{meeting_link}",
-                                    readonly: true,
-                                    class: "input-apple",
-                                    style: "flex:1; overflow:hidden; text-overflow: ellipsis;",
+                        // Right panel — all peer video tiles stacked vertically
+                        div { style: "flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;",
+                            for (i , peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
+                                PeerTile {
+                                    key: "vid-{i}-{peer_id}",
+                                    peer_id: peer_id.clone(),
+                                    full_bleed: false,
+                                    host_user_id: host_user_id.clone(),
+                                    render_mode: TileMode::VideoOnly,
+                                    my_peer_id: user_id.clone(),
                                 }
-                                button {
-                                    class: if show_copy_toast() { "btn-apple btn-primary btn-sm copy-button btn-pop-animate" } else { "btn-apple btn-primary btn-sm copy-button" },
-                                    style: "margin-left: 0.5rem;",
-                                    onclick: {
-                                        let meeting_link = meeting_link.clone();
-                                        move |_| {
-                                            if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) {
-                                                let _ = clipboard.write_text(&meeting_link);
-                                                show_copy_toast.set(true);
-                                                Timeout::new(1640, move || {
-                                                    show_copy_toast.set(false);
-                                                }).forget();
-                                            }
-                                        }
-                                    },
-                                    "Copy"
-                                    if show_copy_toast() {
-                                        div { class: "sparkles", "aria-hidden": "true",
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                        }
+                            }
+                        }
+                    } else {
+                        // ---- Normal grid layout ----
+                        for (i , peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
+                            {
+                                let full_bleed = display_peers.len() == 1
+                                    && !client.is_screen_share_enabled_for_peer(peer_id);
+                                rsx! {
+                                    PeerTile {
+                                        key: "tile-{i}-{peer_id}",
+                                        peer_id: peer_id.clone(),
+                                        full_bleed,
+                                        host_user_id: host_user_id.clone(),
+                                        my_peer_id: user_id.clone(),
                                     }
                                 }
                             }
-                            p { style: "font-size: 0.8rem; opacity: 0.7;", "People who use this meeting link must get your permission before they can join." }
+                        }
+
+                        // Invitation overlay when no peers
+                        if num_display_peers == 0 {
                             div {
-                                class: if show_copy_toast() { "copy-toast copy-toast--visible" } else { "copy-toast" },
-                                role: "alert",
-                                "aria-live": "assertive",
-                                "Link copied to clipboard"
+                                id: "invite-overlay",
+                                class: "card-apple",
+                                style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
+                                h4 { style: "margin-top:0;", "Your meeting is ready!" }
+                                p { style: "font-size: 0.9rem; opacity: 0.8;",
+                                    "Share this meeting link with others you want in the meeting"
+                                }
+                                div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
+                                    input {
+                                        id: "meeting-link-input",
+                                        value: "{meeting_link}",
+                                        readonly: true,
+                                        class: "input-apple",
+                                        style: "flex:1; overflow:hidden; text-overflow: ellipsis;",
+                                    }
+                                    button {
+                                        class: if show_copy_toast() { "btn-apple btn-primary btn-sm copy-button btn-pop-animate" } else { "btn-apple btn-primary btn-sm copy-button" },
+                                        style: "margin-left: 0.5rem;",
+                                        onclick: {
+                                            let meeting_link = meeting_link.clone();
+                                            move |_| {
+                                                if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard())
+                                                {
+                                                    let _ = clipboard.write_text(&meeting_link);
+                                                    show_copy_toast.set(true);
+                                                    Timeout::new(
+                                                            1640,
+                                                            move || {
+                                                                show_copy_toast.set(false);
+                                                            },
+                                                        )
+                                                        .forget();
+                                                }
+                                            }
+                                        },
+                                        "Copy"
+                                        if show_copy_toast() {
+                                            div {
+                                                class: "sparkles",
+                                                "aria-hidden": "true",
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                            }
+                                        }
+                                    }
+                                }
+                                p { style: "font-size: 0.8rem; opacity: 0.7;",
+                                    "People who use this meeting link must get your permission before they can join."
+                                }
+                                div {
+                                    class: if show_copy_toast() { "copy-toast copy-toast--visible" } else { "copy-toast" },
+                                    role: "alert",
+                                    "aria-live": "assertive",
+                                    "Link copied to clipboard"
+                                }
                             }
                         }
-                    }
+                    } // end of else (normal grid layout)
 
                     // Controls nav
                     if can_stream {
@@ -1475,8 +1584,12 @@ pub fn AttendantsComponent(
                                     on_screen_share_state: move |event: ScreenShareEvent| {
                                         log::info!("Screen share state changed: {event:?}");
                                         match event {
-                                            ScreenShareEvent::Started => screen_share_state.set(ScreenShareState::Active),
-                                            ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => screen_share_state.set(ScreenShareState::Idle),
+                                            ScreenShareEvent::Started(_stream) => {
+                                                screen_share_state.set(ScreenShareState::Active);
+                                            }
+                                            ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
+                                                screen_share_state.set(ScreenShareState::Idle);
+                                            }
                                             ScreenShareEvent::Failed(ref msg) => {
                                                 log::error!("Screen share failed: {msg}");
                                                 screen_share_state.set(ScreenShareState::Idle);
@@ -1523,6 +1636,10 @@ pub fn AttendantsComponent(
                             },
                             host_display_name: host_display_name.clone(),
                             host_user_id: host_user_id.clone(),
+                            local_user_display_name: current_display_name(),
+                            on_edit_self_name: {move |_| {
+                                display_name_modal_open.set(true);
+                            }},
                         }
                     }
                 }
@@ -1532,13 +1649,34 @@ pub fn AttendantsComponent(
                     HostControls {
                         meeting_id: id.clone(),
                         is_admitted: true,
-                        waiting_room_version: waiting_room_version,
+                        waiting_room_version,
                     }
+                }
+
+                UpdateDisplayNameModal {
+                    visible: display_name_modal_open(),
+                    current_display_name: current_display_name(),
+                    meeting_id: id.clone(),
+                    on_close: move |_| {
+                        display_name_modal_open.set(false);
+                    },
+                    on_success: move |new_name: String| {
+                        // Update local UI immediately — do NOT wait for server broadcast.
+                        // The server will broadcast PARTICIPANT_DISPLAY_NAME_CHANGED moments later,
+                        // which will be handled by on_display_name_changed callback and will
+                        // confirm the same value. This ensures no perceived lag for the user.
+                        log::info!("RENAME: on_success called with new_name: {}", new_name);
+                        let mut current_name = current_display_name;
+                        current_name.set(new_name.clone());
+                        let mut dn_ctx = display_name_ctx_signal;
+                        dn_ctx.set(Some(new_name.clone()));
+                        display_name_modal_open.set(false);
+                    },
                 }
 
                 // Meeting ended overlay
                 if let Some(message) = meeting_ended_message() {
-                    MeetingEndedOverlay { message: message }
+                    MeetingEndedOverlay { message }
                 }
 
                 // Diagnostics sidebar

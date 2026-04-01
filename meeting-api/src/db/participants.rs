@@ -250,6 +250,29 @@ pub async fn leave(
         .await
 }
 
+/// Update a participant's display name.
+pub async fn update_display_name(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: &str,
+) -> Result<Option<ParticipantRow>, sqlx::Error> {
+    let query = format!(
+        r#"
+        UPDATE meeting_participants
+        SET display_name = $3, updated_at = NOW()
+        WHERE meeting_id = $1 AND user_id = $2
+        RETURNING {PARTICIPANT_COLUMNS}
+        "#
+    );
+    sqlx::query_as::<_, ParticipantRow>(&query)
+        .bind(meeting_id)
+        .bind(user_id)
+        .bind(display_name)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Count admitted participants in a meeting.
 pub async fn count_admitted(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(

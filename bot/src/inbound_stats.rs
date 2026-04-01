@@ -74,7 +74,9 @@ impl InboundStats {
             return;
         };
 
-        let sender = String::from_utf8_lossy(&media.user_id).to_string();
+        // The relay populates wrapper.user_id but strips media.user_id,
+        // so use the wrapper-level user_id for per-sender tracking.
+        let sender = String::from_utf8_lossy(&wrapper.user_id).to_string();
 
         match media.media_type.enum_value() {
             Ok(MediaType::AUDIO) => {

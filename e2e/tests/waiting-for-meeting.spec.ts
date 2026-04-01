@@ -125,7 +125,6 @@ test.describe("Waiting for meeting (push notifications)", () => {
 
       const guestResult = await joinMeetingFromPage(guestPage);
       expect(guestResult).toBe("in-meeting");
-
     } finally {
       await browser.close();
     }

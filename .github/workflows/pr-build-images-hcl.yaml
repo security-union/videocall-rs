@@ -94,7 +94,7 @@ jobs:
             **Building (in parallel):**
             - Media Server (WebSocket/WebTransport)
             - Meeting API (REST backend)
-            - Web UI (WASM frontend)
+            - Dioxus UI (WASM frontend)
 
             ⏱️ Build typically takes 5-7 minutes. I'll post another comment when the build is complete.
 
@@ -155,7 +155,6 @@ jobs:
             **Images:**
             - \`${registry}/videocall-media-server:pr-${prNumber}\`
             - \`${registry}/videocall-meeting-api:pr-${prNumber}\`
-            - \`${registry}/videocall-web-ui:pr-${prNumber}\`
             - \`${registry}/videocall-dioxus-ui:pr-${prNumber}\`
 
             Comment \`/deploy\` to create a preview environment.`

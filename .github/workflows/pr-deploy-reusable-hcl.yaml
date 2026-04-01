@@ -240,7 +240,6 @@ jobs:
           REPOS=(
             "videocall-media-server"
             "videocall-meeting-api"
-            "videocall-web-ui"
             "videocall-dioxus-ui"
           )
 
@@ -545,7 +544,7 @@ jobs:
             --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[1].valueFrom.secretKeyRef.key=secret" \
             --set "env[2].name=CORS_ALLOWED_ORIGIN" \
-            --set "env[2].value=https://pr${SLOT}.preview.videocall.fnxlabs.com\,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "env[2].value=https://pr${SLOT}.preview.videocall.fnxlabs.com" \
             --set "env[3].name=COOKIE_DOMAIN" \
             --set "env[3].value=.preview.videocall.fnxlabs.com" \
             --set "env[4].name=OAUTH_ISSUER" \
@@ -561,7 +560,7 @@ jobs:
             --set "env[9].name=OAUTH_SCOPES" \
             --set "env[9].value=openid email profile" \
             --set "env[10].name=ALLOWED_REDIRECT_URLS" \
-            --set "env[10].value=https://pr${SLOT}.preview.videocall.fnxlabs.com\,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "env[10].value=https://pr${SLOT}.preview.videocall.fnxlabs.com" \
             --set "env[11].name=LISTEN_ADDR" \
             --set "env[11].value=0.0.0.0:8081" \
             --set "env[12].name=RUST_LOG" \
@@ -569,7 +568,7 @@ jobs:
             --set "env[13].name=COOKIE_NAME" \
             --set "env[13].value=pr${SLOT}-session" \
             --set "env[14].name=SERVICE_VERSION_URLS" \
-            --set "env[14].value=http://websocket-pr-${PR_NUM}:8080/version\,http://dx-pr-${PR_NUM}:80/version.json\,http://ui-pr-${PR_NUM}:80/version.json" \
+            --set "env[14].value=http://websocket-pr-${PR_NUM}:8080/version\,http://dx-pr-${PR_NUM}:80/version.json" \
             --set "ingress.hosts[0].host=pr${SLOT}-api.preview.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -582,49 +581,6 @@ jobs:
             --wait --timeout 5m
 
           echo "✅ Meeting API deployed to slot ${SLOT} with OAuth"
-
-      - name: Deploy UI
-        run: |
-          PR_NUM=${{ inputs.pr_number }}
-          SLOT=${{ steps.assign-slot.outputs.SLOT }}
-          NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
-
-          echo "Deploying UI to slot ${SLOT} with OAuth enabled..."
-
-          helm upgrade --install preview-${PR_NUM}-ui helm/rustlemania-ui/ \
-            --namespace ${NAMESPACE} \
-            --set image.repository=${REGISTRY}/videocall-web-ui \
-            --set image.tag=pr-${PR_NUM} \
-            --set imagePullSecrets[0].name=harbor-pull-secret \
-            --set fullnameOverride=ui-pr-${PR_NUM} \
-            --set ingress.redirect=false \
-            --set "runtimeConfig.apiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
-            --set "runtimeConfig.meetingApiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
-            --set "runtimeConfig.wsUrl=wss://pr${SLOT}-ws.preview.videocall.fnxlabs.com" \
-            --set "runtimeConfig.webTransportHost=" \
-            --set-string "runtimeConfig.webTransportEnabled=false" \
-            --set-string "runtimeConfig.oauthEnabled=true" \
-            --set-string "runtimeConfig.e2eeEnabled=false" \
-            --set-string "runtimeConfig.firefoxEnabled=false" \
-            --set "runtimeConfig.usersAllowedToStream=" \
-            --set "runtimeConfig.serverElectionPeriodMs=2000" \
-            --set "runtimeConfig.audioBitrateKbps=65" \
-            --set "runtimeConfig.videoBitrateKbps=1000" \
-            --set "runtimeConfig.screenBitrateKbps=1000" \
-            --set "ingress.hosts[0].host=pr${SLOT}.preview.videocall.fnxlabs.com" \
-            --set "ingress.hosts[0].paths[0].path=/" \
-            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
-            --set "ingress.hosts[0].paths[0].service.name=ui-pr-${PR_NUM}" \
-            --set "ingress.hosts[0].paths[0].service.port.number=80" \
-            --set "ingress.tls[0].secretName=preview-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr${SLOT}.preview.videocall.fnxlabs.com" \
-            --set "ingress.annotations.cert-manager\.io/issuer=null" \
-            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
-            --wait --timeout 5m
-
-          echo "✅ UI deployed to slot ${SLOT} with OAuth"
 
       - name: Deploy Dioxus UI
         run: |
@@ -656,11 +612,11 @@ jobs:
             --set "runtimeConfig.audioBitrateKbps=65" \
             --set "runtimeConfig.videoBitrateKbps=1000" \
             --set "runtimeConfig.screenBitrateKbps=1000" \
-            --set "ingress.hosts[0].host=pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].host=pr${SLOT}.preview.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.tls[0].secretName=preview-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}.preview.videocall.fnxlabs.com" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
@@ -676,7 +632,6 @@ jobs:
           echo "Verifying rollout status for slot ${SLOT}..."
           kubectl rollout status deployment/websocket-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
           kubectl rollout status deployment/api-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
-          kubectl rollout status deployment/ui-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
           kubectl rollout status deployment/dx-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
           echo "✅ All deployments rolled out in slot ${SLOT}"
 
@@ -715,8 +670,7 @@ jobs:
               body: `✅ **Preview ${deploymentType} to slot ${slot}** ${slotStatus}
 
             🌐 **Preview URLs:**
-            - **Yew UI:** https://pr${slot}.preview.videocall.fnxlabs.com
-            - **Dioxus UI:** https://pr${slot}-dx.preview.videocall.fnxlabs.com
+            - **Dioxus UI:** https://pr${slot}.preview.videocall.fnxlabs.com
             - **API:** https://pr${slot}-api.preview.videocall.fnxlabs.com
             - **WebSocket:** wss://pr${slot}-ws.preview.videocall.fnxlabs.com
 

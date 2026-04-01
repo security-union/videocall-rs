@@ -180,6 +180,118 @@ main.rs
 
 Both audio and video producers derive their position from the same `Instant` epoch and wrap at the same `loop_duration`, preventing drift. Video uses a global monotonic PTS (never wraps) for VP9 encoding while selecting source frames by loop-relative position.
 
+## What This Bot Measures (and What It Doesn't)
+
+The bot is a **relay and transport diagnostic tool**, not an end-to-end quality benchmark.
+
+### What it measures
+
+- **Relay forwarding performance**: how quickly the server fans packets between participants
+- **Transport protocol differences**: TCP (WebSocket) vs QUIC/UDP (WebTransport) at the wire level
+- **Network path characteristics**: jitter, reordering, and loss on the bot → relay → bot path
+- **Server-side bugs**: e.g., incorrect packet routing, missing fields, relay regressions
+
+### What it does NOT measure
+
+The bot is a **native Rust binary** — it bypasses the entire browser stack that real users experience:
+
+| Layer | Bot | Browser client |
+|-------|-----|----------------|
+| WebTransport API | Native `quinn` (QUIC library) | Browser WebTransport API |
+| WebSocket API | `tokio-tungstenite` | Browser WebSocket API |
+| Execution | Native x86_64, tokio async runtime | WASM in browser sandbox |
+| Encode | Pre-encoded VP9/Opus, minimal CPU | `getUserMedia` → WebCodecs/libvpx |
+| Decode | **None** — only timestamps arrivals | VP9/Opus decode → render pipeline |
+| Jitter buffer | **None** — raw packet arrival analysis | Client-side reorder + playout buffer |
+| Rendering | **None** | Canvas/WebGL + audio playout |
+| GC / event loop | None (Rust, no GC) | Browser GC pauses, event loop contention |
+
+Because the bot skips decode, jitter buffering, and rendering, its jitter and gap numbers reflect **transport-level behavior only**. In the browser:
+
+- Audio "gaps" from UDP reordering would be absorbed by the jitter buffer and never heard
+- Jitter numbers would be higher due to WASM overhead, GC pauses, and decode time
+- A/V sync would include decode + render latency, not just packet arrival delta
+- The relative WT-vs-WS difference might be dwarfed by client-side overhead
+
+### When to use this bot
+
+- Validating relay correctness after server changes
+- Comparing transport protocol behavior in isolation
+- Load testing (multiple bots to stress-test the relay)
+- Smoke-testing a deployment (do packets flow at all?)
+
+### When you need browser-level testing instead
+
+- Measuring real user-perceived quality (MOS, end-to-end latency)
+- Testing codec performance under browser constraints
+- Evaluating jitter buffer effectiveness
+- Benchmarking WASM client decode/render pipeline
+
+## Future: Headless Chrome Browser-Level Testing
+
+The bot measures transport and relay behavior in isolation. For true end-to-end quality metrics through the full browser stack (WASM decode, jitter buffer, canvas rendering), a Playwright + headless Chrome approach is feasible.
+
+### How it would work
+
+1. **Playwright launches headless Chrome instances** with fake media devices:
+   ```
+   --use-fake-device-for-media-stream
+   --use-file-for-fake-video-capture=test-pattern.y4m
+   --use-file-for-fake-audio-capture=test-tone.wav
+   ```
+2. Each instance navigates to the Dioxus UI and joins a meeting (JWT injection already works in the e2e harness)
+3. The WASM client exposes internal metrics to JavaScript via `wasm-bindgen`
+4. Playwright collects metrics periodically via `page.evaluate(() => window.getVideoCallStats())`
+
+### Instrumentation points in videocall-client
+
+The WASM client already tracks most of the data internally — it just needs to be surfaced to JS:
+
+| Component | File | What to expose |
+|-----------|------|----------------|
+| **Connection** | `connection/connection_manager.rs` | `packets_received`, `packets_sent`, RTT measurements |
+| **Video decode** | `decode/peer_decoder.rs` | Decode latency (WebCodecs `VideoDecoder` → canvas render), keyframe wait time, decode error count |
+| **Audio decode** | `decode/neteq_audio_decoder.rs` | Jitter buffer depth, playout delay, concealment events (silence insertion), buffer underruns |
+| **Bitrate controller** | `diagnostics/encoder_bitrate_controller.rs` | Encode FPS jitter (already calculated), target vs actual bitrate, PID adjustments |
+| **Per-peer stats** | `decode/peer_decode_manager.rs` | Per-sender packet counts, last-received timestamps, A/V sync delta |
+
+### Implementation sketch
+
+```rust
+// In videocall-client, add a stats export:
+#[wasm_bindgen]
+pub fn get_videocall_stats() -> JsValue {
+    // Collect from ConnectionManager, PeerDecodeManager, NetEqAudioPeerDecoder
+    // Return as JSON-serializable JsValue
+}
+```
+
+```typescript
+// In Playwright test:
+const stats = await page.evaluate(() => (window as any).getVideoCallStats());
+// stats.audio_jitter_buffer_ms, stats.video_decode_latency_ms, etc.
+```
+
+### What this would add over the native bot
+
+| Metric | Native bot | Headless Chrome |
+|--------|-----------|-----------------|
+| Transport jitter | Yes | Yes |
+| Decode latency | No | Yes |
+| Jitter buffer behavior | No | Yes (NetEQ concealment, buffer depth) |
+| Render-to-display time | No | Yes (canvas draw timing) |
+| WASM overhead | No | Yes (real wasm32 execution) |
+| Encode pipeline | No | Yes (getUserMedia → WebCodecs → send) |
+| GC/event loop stalls | No | Yes (real browser runtime) |
+
+### Prerequisites
+
+- Existing e2e infrastructure (`docker/docker-compose.e2e.yaml`, Playwright config, JWT auth bypass)
+- Chrome flag support in Playwright for fake media devices
+- A `wasm-bindgen`-exported stats function in `videocall-client`
+
+The existing Playwright e2e harness handles browser launch, JWT injection, and meeting join. The main new work is the `wasm-bindgen` stats export and a Playwright test that collects and reports the metrics over a timed run.
+
 ## Development
 
 ```bash

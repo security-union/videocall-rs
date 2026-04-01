@@ -22,6 +22,7 @@
 //! to `SessionLogic`. It handles WebTransport-specific I/O via channels.
 
 use crate::actors::chat_server::ChatServer;
+use crate::actors::packet_handler::DATAGRAM_MAX_SIZE;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
 use crate::messages::server::{ActivateConnection, Packet};
@@ -33,9 +34,12 @@ use actix::{
     Handler, Message as ActixMessage, Running, WrapFuture,
 };
 use bytes::Bytes;
+use protobuf::Message as ProtobufMessage;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
@@ -52,6 +56,16 @@ pub enum WtOutbound {
     UniStream(Bytes),
     /// Send via Datagram (unreliable, unordered, low latency)
     Datagram(Bytes),
+}
+
+/// Result of attempting to send an outbound message to the WebTransport channel.
+enum WtSendResult {
+    /// Message sent successfully.
+    Sent,
+    /// Channel is full; message was dropped.
+    Dropped,
+    /// Channel is closed; connection is dead.
+    Dead,
 }
 
 /// Source of inbound data
@@ -124,7 +138,7 @@ impl WtChatSession {
         }
     }
 
-    /// Send outbound message via the channel.
+    /// Send outbound message via the channel (reliable unidirectional stream).
     /// Returns false if the channel is closed (connection dead).
     fn send(&self, data: Vec<u8>) -> bool {
         match self
@@ -145,6 +159,44 @@ impl WtChatSession {
                     self.logic.id
                 );
                 true // Channel still open, just full
+            }
+        }
+    }
+
+    /// Send outbound message, automatically choosing datagram or stream.
+    ///
+    /// Control packets (heartbeats, RTT probes, diagnostics) that fit within
+    /// the datagram MTU are sent via unreliable datagrams — they are periodic
+    /// and expendable, so lower overhead matters more than guaranteed delivery.
+    ///
+    /// Media packets (VIDEO, AUDIO, SCREEN) use reliable unidirectional streams
+    /// to avoid visual/audio artifacts from packet loss.
+    ///
+    /// The `is_media` hint is pre-computed by the caller from an already-parsed
+    /// `PacketWrapper`, avoiding a redundant protobuf parse on every outbound
+    /// packet.
+    fn send_auto(&self, data: Vec<u8>, is_media: bool) -> WtSendResult {
+        let outbound = if !is_media && data.len() <= DATAGRAM_MAX_SIZE {
+            WtOutbound::Datagram(data.into())
+        } else {
+            WtOutbound::UniStream(data.into())
+        };
+
+        match self.outbound_tx.try_send(outbound) {
+            Ok(()) => WtSendResult::Sent,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!(
+                    "Outbound channel closed for session {}, connection dead",
+                    self.logic.id
+                );
+                WtSendResult::Dead
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                error!(
+                    "Outbound channel full for session {}, dropping message",
+                    self.logic.id
+                );
+                WtSendResult::Dropped
             }
         }
     }
@@ -222,9 +274,6 @@ impl Actor for WtChatSession {
             }),
         );
 
-        // Start heartbeat
-        self.start_heartbeat(ctx);
-
         // Register with ChatServer
         let addr = ctx.address();
         self.logic
@@ -242,6 +291,10 @@ impl Actor for WtChatSession {
 
         // Join room
         self.join_room(ctx);
+
+        // Start heartbeat AFTER all initialization is complete to avoid
+        // premature timeout if Connect/JoinRoom are slow under load.
+        self.start_heartbeat(ctx);
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
@@ -254,15 +307,48 @@ impl Actor for WtChatSession {
 // Message Handlers
 // =============================================================================
 
-/// Handle outbound messages from ChatServer
+/// Handle outbound messages from ChatServer.
+///
+/// Uses `send_auto` to route control packets (heartbeats, RTT, diagnostics)
+/// via datagrams (periodic and expendable) and media packets (VIDEO, AUDIO,
+/// SCREEN) via reliable streams (avoids visual/audio artifacts).
+///
+/// The outbound `msg.msg` is a serialized `PacketWrapper`. We parse it once
+/// to extract both the sender's `session_id` (for congestion tracking) and
+/// the `packet_type` (for datagram vs. stream routing), avoiding a second
+/// parse inside `send_auto`.
+///
+/// Note: `msg.session` is the **receiver's** session ID (set by
+/// `chat_server::handle_msg`), NOT the sender's. The sender's session ID
+/// lives inside the serialized `PacketWrapper.session_id` field.
 impl Handler<Message> for WtChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         let bytes = self.logic.handle_outbound(&msg);
-        if !self.send(bytes) {
-            // Channel closed - connection is dead, stop the actor
-            ctx.stop();
+
+        // Parse the PacketWrapper once to extract the sender's session_id
+        // and packet_type. This avoids a redundant parse in send_auto and
+        // ensures congestion tracking targets the correct (sender) session.
+        let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
+        let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
+        let is_media = parsed
+            .as_ref()
+            .map(|pw| pw.packet_type == PacketType::MEDIA.into())
+            .unwrap_or(false);
+
+        match self.send_auto(bytes, is_media) {
+            WtSendResult::Sent => {}
+            WtSendResult::Dead => {
+                ctx.stop();
+            }
+            WtSendResult::Dropped => {
+                // Outbound channel full -- record the drop for the actual sender
+                // so we can send CONGESTION feedback when the threshold is exceeded.
+                if sender_session_id != 0 {
+                    self.logic.on_outbound_drop(sender_session_id);
+                }
+            }
         }
     }
 }

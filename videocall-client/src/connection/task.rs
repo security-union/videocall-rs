@@ -21,7 +21,7 @@
 //
 // Handles rollover of connection from WebTransport to WebSocket
 //
-use log::{debug, error};
+use log::debug;
 use videocall_transport::websocket::WebSocketTask;
 use videocall_transport::webtransport::WebTransportTask;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -39,19 +39,29 @@ impl Task {
     pub fn connect(webtransport: bool, options: ConnectOptions) -> anyhow::Result<Self> {
         if webtransport {
             debug!("Task::connect trying WebTransport");
-            match WebTransportTask::connect(options.clone()) {
-                Ok(task) => return Ok(Task::WebTransport(task)),
-                Err(_e) => error!("WebTransport connect failed, falling back to WebSocket"),
-            }
+            WebTransportTask::connect(options).map(Task::WebTransport)
+        } else {
+            debug!("Task::connect trying WebSocket");
+            WebSocketTask::connect(options).map(Task::WebSocket)
         }
-        debug!("Task::connect trying WebSocket");
-        WebSocketTask::connect(options).map(Task::WebSocket)
     }
 
     pub fn send_packet(&self, packet: PacketWrapper) {
         match self {
             Task::WebSocket(ws) => ws.send_packet(packet),
             Task::WebTransport(wt) => wt.send_packet(packet),
+        }
+    }
+
+    /// Send a packet via datagram (unreliable, low-latency) when supported.
+    ///
+    /// For WebTransport, this uses datagrams for small packets and falls back
+    /// to streams for oversized packets. For WebSocket, this is equivalent to
+    /// `send_packet()` since WebSocket has no datagram concept.
+    pub fn send_packet_datagram(&self, packet: PacketWrapper) {
+        match self {
+            Task::WebSocket(ws) => ws.send_packet(packet),
+            Task::WebTransport(wt) => wt.send_packet_datagram(packet),
         }
     }
 }

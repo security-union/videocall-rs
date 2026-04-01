@@ -152,6 +152,8 @@ impl AudioProducer {
                 audio_position += 1;
             }
 
+            let user_id_bytes = user_id.clone().into_bytes();
+
             // Encode to Opus
             let mut encoded = vec![0u8; 4000];
             match opus_encoder.encode_float(&packet_samples, &mut encoded) {
@@ -160,7 +162,7 @@ impl AudioProducer {
 
                     // Create media packet
                     let media_packet = MediaPacket {
-                        email: user_id.clone(),
+                        user_id: user_id_bytes.clone(),
                         media_type: MediaType::AUDIO.into(),
                         data: encoded,
                         frame_type: "key".to_string(),
@@ -176,7 +178,7 @@ impl AudioProducer {
                     // Wrap in packet wrapper
                     let packet_wrapper = PacketWrapper {
                         data: media_packet.write_to_bytes()?,
-                        email: user_id.clone(),
+                        user_id: user_id_bytes,
                         packet_type: PacketType::MEDIA.into(),
                         ..Default::default()
                     };

@@ -126,12 +126,16 @@ pub fn Host(
                 handler.call(err);
             }
         });
-        let mut microphone = create_microphone_encoder(
+        // Microphone encoder is created after camera so it can share the
+        // camera's audio tier atomics (avoiding a duplicate quality manager).
+        let microphone = create_microphone_encoder(
             client.clone(),
             audio_bitrate,
             mic_settings_cb,
             mic_error_cb,
             vad_threshold().ok(),
+            Some(camera.shared_audio_tier_bitrate()),
+            Some(camera.shared_audio_tier_fec()),
         );
 
         let screen_settings_cell = screen_settings_handler.clone();
@@ -153,14 +157,17 @@ pub fn Host(
             screen_state_cb,
         );
 
-        // Wire up encoder controls
+        // Wire up congestion step-down and PLI keyframe flags
+        camera.set_congestion_step_down_flag(client.congestion_step_down_flag());
+        camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
+        screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
+
+        // Wire up encoder controls. The microphone encoder no longer needs
+        // its own diagnostics channel — it reads audio tier settings from
+        // the camera encoder's shared atomics.
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
         camera.set_encoder_control(rx);
-
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
-        microphone.set_encoder_control(rx);
 
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);

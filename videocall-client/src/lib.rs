@@ -124,6 +124,8 @@
 //!     Callback::noop(),
 //!     Callback::noop(),
 //!     None, // vad_threshold
+//!     Some(camera.shared_audio_tier_bitrate()),
+//!     Some(camera.shared_audio_tier_fec()),
 //! );
 //! let mut screen = ScreenEncoder::new(
 //!     client,
@@ -182,6 +184,7 @@
 //!
 //! ```
 
+pub mod adaptive_quality_constants;
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;
@@ -197,6 +200,7 @@ mod media_devices;
 pub mod utils;
 mod wrappers;
 pub use client::{VideoCallClient, VideoCallClientOptions};
+pub use connection::ConnectionState;
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };

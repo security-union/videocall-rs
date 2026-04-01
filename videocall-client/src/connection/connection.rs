@@ -22,6 +22,7 @@
 ///
 use super::task::Task;
 use super::ConnectOptions;
+use crate::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
 use protobuf::Message;
@@ -124,7 +125,7 @@ impl Connection {
         let is_speaking = Rc::clone(&self.is_speaking);
         let session_id = Rc::clone(&self.session_id);
 
-        self.heartbeat = Some(Interval::new(1000, move || {
+        self.heartbeat = Some(Interval::new(HEARTBEAT_KEEPALIVE_INTERVAL_MS, move || {
             if let Some(packet_wrapper) = build_heartbeat_packet(
                 &userid,
                 &video_enabled,
@@ -135,7 +136,10 @@ impl Connection {
                 &session_id,
             ) {
                 if let Status::Connected = status.get() {
-                    task.send_packet(packet_wrapper);
+                    // Heartbeats are periodic and expendable — use datagrams
+                    // for lower overhead. A missed heartbeat is harmless; the
+                    // next one arrives within HEARTBEAT_KEEPALIVE_INTERVAL_MS.
+                    task.send_packet_datagram(packet_wrapper);
                 }
             }
         }));
@@ -153,6 +157,18 @@ impl Connection {
     pub fn send_packet(&self, packet: PacketWrapper) {
         if let Status::Connected = self.status.get() {
             self.task.send_packet(packet);
+        }
+    }
+
+    /// Send a packet via datagram (unreliable, low-latency) when supported.
+    ///
+    /// Used for control packets (heartbeats, RTT probes, diagnostics) that are
+    /// periodic and expendable — lower overhead matters more than guaranteed
+    /// delivery. Falls back to reliable stream for WebSocket connections or
+    /// oversized packets.
+    pub fn send_packet_datagram(&self, packet: PacketWrapper) {
+        if let Status::Connected = self.status.get() {
+            self.task.send_packet_datagram(packet);
         }
     }
 
@@ -187,7 +203,11 @@ impl Connection {
     }
 
     /// Send a heartbeat packet immediately so peers learn about state changes
-    /// without waiting for the next 1-second heartbeat tick.
+    /// without waiting for the next keepalive heartbeat tick.
+    ///
+    /// Uses datagrams for consistency with the periodic heartbeat path.
+    /// Heartbeats are expendable — a missed immediate heartbeat is followed
+    /// by the next periodic one within HEARTBEAT_KEEPALIVE_INTERVAL_MS.
     fn send_immediate_heartbeat(&self) {
         let userid = match self.userid.borrow().as_ref() {
             Some(id) => id.clone(),
@@ -207,13 +227,18 @@ impl Connection {
             &self.aes,
             &self.session_id,
         ) {
-            self.task.send_packet(packet_wrapper);
+            self.task.send_packet_datagram(packet_wrapper);
         }
     }
 
     pub fn set_speaking(&self, speaking: bool) {
-        self.is_speaking
-            .store(speaking, std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .is_speaking
+            .swap(speaking, std::sync::atomic::Ordering::Relaxed);
+        if prev != speaking {
+            log::debug!("Speaking changed: {prev} -> {speaking}");
+            self.send_immediate_heartbeat();
+        }
     }
 
     pub fn set_session_id(&self, session_id: u64) {

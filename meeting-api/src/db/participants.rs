@@ -291,6 +291,7 @@ impl ParticipantRow {
             room_token,
             observer_token: None,
             waiting_room_enabled: None,
+            admitted_can_admit: None,
             host_display_name: None,
             host_user_id: None,
         }

@@ -80,6 +80,7 @@ pub async fn join_meeting(
 
         let mut resp = row.into_participant_status(Some(token));
         resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+        resp.admitted_can_admit = Some(meeting.admitted_can_admit);
         resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
@@ -102,6 +103,7 @@ pub async fn join_meeting(
                 room_token: None,
                 observer_token: Some(observer),
                 waiting_room_enabled: Some(meeting.waiting_room_enabled),
+                admitted_can_admit: Some(meeting.admitted_can_admit),
                 host_display_name: meeting.host_display_name,
                 host_user_id: meeting.creator_id,
             };
@@ -141,6 +143,7 @@ pub async fn join_meeting(
             nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id).await;
         }
         resp.waiting_room_enabled = Some(waiting_room_enabled);
+        resp.admitted_can_admit = Some(meeting.admitted_can_admit);
         resp.host_display_name = meeting.host_display_name;
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
@@ -183,6 +186,7 @@ pub async fn get_my_status(
 
     let mut resp = row.into_participant_status(token);
     resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))

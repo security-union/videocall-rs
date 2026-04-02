@@ -27,7 +27,7 @@ pub fn handle_packet(raw: &[u8], verbose: bool, use_utc: bool) {
     match pt {
         PacketType::MEDIA => {
             if let Ok(media) = MediaPacket::parse_from_bytes(&pkt.data) {
-                print_media(&media, verbose, use_utc);
+                print_media(&media, &pkt.user_id, verbose, use_utc);
             } else if verbose {
                 println!(
                     "? MEDIA parse error from {} ({} bytes)",
@@ -100,14 +100,17 @@ pub fn handle_packet(raw: &[u8], verbose: bool, use_utc: bool) {
     }
 }
 
-fn print_media(media: &MediaPacket, verbose: bool, use_utc: bool) {
+fn print_media(media: &MediaPacket, wrapper_user_id: &[u8], verbose: bool, use_utc: bool) {
     let now = ts(use_utc);
     let sender_str;
-    let sender = if media.user_id.is_empty() {
-        "?"
-    } else {
+    let sender = if !media.user_id.is_empty() {
         sender_str = user_id_bytes_to_string(&media.user_id);
         &sender_str
+    } else if !wrapper_user_id.is_empty() {
+        sender_str = user_id_bytes_to_string(wrapper_user_id);
+        &sender_str
+    } else {
+        "?"
     };
     let size = media.data.len();
     let mt = media

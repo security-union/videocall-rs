@@ -390,6 +390,7 @@ pub fn AttendantsComponent(
     #[props(default)] room_token: String,
     #[props(default = true)] waiting_room_enabled: bool,
     #[props(default)] admitted_can_admit: bool,
+    #[props(default = false)] allow_guests: bool,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -431,6 +432,7 @@ pub fn AttendantsComponent(
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
     let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
+    let mut allow_guests_toggle = use_signal(move || allow_guests);
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
@@ -1080,8 +1082,9 @@ pub fn AttendantsComponent(
                                                 saving.set(true);
                                                 let meeting_id = meeting_id.clone();
                                                 let aca = if new_val { Some(admitted_can_admit_toggle()) } else { Some(false) };
+                                                let current_allow_guests = allow_guests_toggle();
                                                 wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val, aca).await {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val, aca, Some(current_allow_guests)).await {
                                                         Ok(updated) => {
                                                             waiting_room_toggle.set(updated.waiting_room_enabled);
                                                             admitted_can_admit_toggle.set(updated.admitted_can_admit);
@@ -1115,8 +1118,9 @@ pub fn AttendantsComponent(
                                                 saving.set(true);
                                                 let meeting_id = meeting_id.clone();
                                                 let wr = waiting_room_toggle();
+                                                let current_allow_guests = allow_guests_toggle();
                                                 wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, wr, Some(new_val)).await {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, wr, Some(new_val), Some(current_allow_guests)).await {
                                                         Ok(updated) => {
                                                             waiting_room_toggle.set(updated.waiting_room_enabled);
                                                             admitted_can_admit_toggle.set(updated.admitted_can_admit);

@@ -35,6 +35,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut waiting_room_toggle = use_signal(|| false);
     let mut admitted_can_admit_toggle = use_signal(|| false);
+    let mut allow_guests_toggle = use_signal(|| false);
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let mut ending = use_signal(|| false);
@@ -182,8 +183,9 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         } else {
             Some(false)
         };
+        let current_allow_guests = allow_guests_toggle();
         spawn(async move {
-            match update_meeting(&meeting_id, new_val, aca).await {
+            match update_meeting(&meeting_id, new_val, aca, Some(current_allow_guests)).await {
                 Ok(updated) => {
                     waiting_room_toggle.set(updated.waiting_room_enabled);
                     admitted_can_admit_toggle.set(updated.admitted_can_admit);
@@ -209,8 +211,9 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         saving.set(true);
         let meeting_id = meeting_id_toggle2.clone();
         let wr = waiting_room_toggle();
+        let current_allow_guests = allow_guests_toggle();
         spawn(async move {
-            match update_meeting(&meeting_id, wr, Some(new_val)).await {
+            match update_meeting(&meeting_id, wr, Some(new_val), Some(current_allow_guests)).await {
                 Ok(updated) => {
                     waiting_room_toggle.set(updated.waiting_room_enabled);
                     admitted_can_admit_toggle.set(updated.admitted_can_admit);

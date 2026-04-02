@@ -42,6 +42,11 @@ pub struct CreateMeetingRequest {
     /// Whether admitted participants can also admit others from the waiting room.
     #[serde(default)]
     pub admitted_can_admit: Option<bool>,
+
+    /// Whether guests (non-authenticated users) are allowed to join. Defaults
+    /// to `false` on the server when omitted.
+    #[serde(default)]
+    pub allow_guests: Option<bool>,
 }
 
 /// Request body for `PATCH /api/v1/meetings/{meeting_id}`.
@@ -54,6 +59,10 @@ pub struct UpdateMeetingRequest {
     /// Toggle whether admitted participants can admit others.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admitted_can_admit: Option<bool>,
+
+    /// Toggle guest access on or off.
+    #[serde(default)]
+    pub allow_guests: Option<bool>,
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/join`.

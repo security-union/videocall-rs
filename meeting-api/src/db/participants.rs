@@ -66,7 +66,7 @@ pub async fn upsert_host(
 
 /// Atomically join a meeting as an attendee, respecting the current `waiting_room_enabled`
 /// setting. Locks the meeting row with `FOR UPDATE` to serialize against concurrent
-/// waiting room toggles via `update_waiting_room_enabled`.
+/// waiting room toggles via `update_meeting_settings`.
 ///
 /// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where `auto_admitted`
 /// is `true` when the participant was immediately admitted (waiting room disabled).

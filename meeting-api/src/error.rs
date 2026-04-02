@@ -103,6 +103,13 @@ impl AppError {
             APIError::internal_error(detail),
         )
     }
+
+    pub fn guests_not_allowed(meeting_id: &str) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            APIError::guests_not_allowed(meeting_id),
+        )
+    }
 }
 
 impl IntoResponse for AppError {

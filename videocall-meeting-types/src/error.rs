@@ -133,6 +133,14 @@ impl APIError {
             engineering_error: Some(detail.to_string()),
         }
     }
+
+    pub fn guests_not_allowed(meeting_id: &str) -> Self {
+        Self {
+            code: "GUESTS_NOT_ALLOWED".to_string(),
+            message: format!("Meeting '{meeting_id}' does not allow guest attendees"),
+            engineering_error: None,
+        }
+    }
 }
 
 impl std::fmt::Display for APIError {

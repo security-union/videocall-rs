@@ -363,7 +363,7 @@ pub fn Home() -> Element {
                 }
 
                 div { class: "content-separator" }
-            
+
             // div { class: "grid grid-cols-1 md:grid-cols-2 gap-8", style: "margin-top:1em",
             //     div {
             //         button {

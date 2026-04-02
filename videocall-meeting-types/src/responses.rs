@@ -81,6 +81,7 @@ pub struct CreateMeetingResponse {
     pub has_password: bool,
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
+    pub allow_guests: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}`.
@@ -106,6 +107,7 @@ pub struct MeetingInfoResponse {
     pub ended_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub your_status: Option<ParticipantStatusResponse>,
+    pub allow_guests: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings`.
@@ -138,6 +140,7 @@ pub struct MeetingSummary {
     pub waiting_count: i64,
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
+    pub allow_guests: bool,
 }
 
 /// Participant status returned by join, status, admit, reject, and leave endpoints.

@@ -45,6 +45,25 @@ impl MeetingApiClient {
         parse_api_response(response).await
     }
 
+    /// Join a meeting as a guest (unauthenticated).
+    ///
+    /// Calls `POST /api/v1/meetings/{meeting_id}/join_guest`.
+    ///
+    /// The meeting must have `allow_guests` enabled. `display_name` is required.
+    /// Guests are never hosts and cannot auto-create meetings.
+    pub async fn join_meeting_as_guest(
+        &self,
+        meeting_id: &str,
+        display_name: &str,
+    ) -> Result<ParticipantStatusResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/join_guest");
+        let body = JoinMeetingRequest {
+            display_name: Some(display_name.to_string()),
+        };
+        let response = self.post(&path).json(&body).send().await?;
+        parse_api_response(response).await
+    }
+
     /// Check your current status in a meeting. This is the primary polling
     /// endpoint for attendees in the waiting room.
     ///

@@ -1310,6 +1310,20 @@ impl Inner {
                             if meeting_packet.session_id != 0 {
                                 self.peer_decode_manager
                                     .delete_peer(meeting_packet.session_id);
+                                // Also remove from health reporter — delete_peer
+                                // cleans connected_peers and fps_trackers, but
+                                // peer_health_data is maintained separately by
+                                // the health reporter and must be cleaned
+                                // explicitly. Without this, departed peers
+                                // persist in the health packet's peer_stats,
+                                // inflating the peer count indefinitely.
+                                if let Some(hr) = &self.health_reporter {
+                                    if let Ok(reporter) = hr.try_borrow() {
+                                        reporter.remove_peer(
+                                            &meeting_packet.session_id.to_string(),
+                                        );
+                                    }
+                                }
                             }
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();

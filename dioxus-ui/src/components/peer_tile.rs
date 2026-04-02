@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::components::canvas_generator::generate_for_peer;
+use crate::components::canvas_generator::{generate_for_peer, AudioLevels, TileMode};
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
 use futures::future::AbortHandle;
@@ -33,6 +33,8 @@ pub fn PeerTile(
     peer_id: String,
     #[props(default = false)] full_bleed: bool,
     #[props(default)] host_user_id: Option<String>,
+    #[props(default)] render_mode: TileMode,
+    #[props(default)] my_peer_id: Option<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -102,7 +104,18 @@ pub fn PeerTile(
     let level = audio_level();
     let mic_level = mic_audio_level();
 
-    generate_for_peer(&client, &peer_id, full_bleed, level, mic_level, host_uid)
+    generate_for_peer(
+        &client,
+        &peer_id,
+        full_bleed,
+        AudioLevels {
+            raw: level,
+            mic: mic_level,
+        },
+        host_uid,
+        render_mode,
+        my_peer_id.as_deref(),
+    )
 }
 
 /// Extract the audio level from a diagnostics event, falling back to

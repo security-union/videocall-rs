@@ -1,6 +1,9 @@
 {
   "goog:chromeOptions": {
     "args": [
+      "--headless=new",
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
       "--use-fake-device-for-media-stream",
       "--use-fake-ui-for-media-stream"
     ]

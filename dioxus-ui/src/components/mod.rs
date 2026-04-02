@@ -19,6 +19,7 @@ pub mod neteq_chart;
 pub mod okta_sign_in_button;
 pub mod toggle_switch;
 pub mod top_bar;
+pub mod update_display_name_modal;
 pub mod video_control_buttons;
 pub mod waiting_room;
 

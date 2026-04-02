@@ -62,6 +62,7 @@ pub struct CreateMeetingResponse {
     pub attendees: Vec<String>,
     pub has_password: bool,
     pub waiting_room_enabled: bool,
+    pub admitted_can_admit: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}`.
@@ -76,6 +77,7 @@ pub struct MeetingInfoResponse {
     pub host_user_id: Option<String>,
     pub has_password: bool,
     pub waiting_room_enabled: bool,
+    pub admitted_can_admit: bool,
     pub participant_count: i64,
     pub waiting_count: i64,
     pub started_at: i64,
@@ -109,6 +111,7 @@ pub struct MeetingSummary {
     pub ended_at: Option<i64>,
     pub waiting_count: i64,
     pub waiting_room_enabled: bool,
+    pub admitted_can_admit: bool,
 }
 
 /// Participant status returned by join, status, admit, reject, and leave
@@ -129,6 +132,10 @@ pub struct ParticipantStatusResponse {
     pub observer_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_room_enabled: Option<bool>,
+    /// Meeting-level: whether admitted participants can also admit others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admitted_can_admit: Option<bool>,
+    /// Meeting-level: the host's display name. Present in join/status responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -20,7 +20,7 @@ pub mod waiting_room;
 
 use axum::{
     extract::State,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 
@@ -142,6 +142,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}/status",
             get(participants::get_my_status),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/display-name",
+            put(participants::update_display_name),
         )
         .route(
             "/api/v1/meetings/{meeting_id}/participants",

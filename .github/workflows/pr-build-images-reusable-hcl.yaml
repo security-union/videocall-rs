@@ -74,7 +74,7 @@ jobs:
           echo "🚀 Starting parallel builds for 3 images..."
           echo "   - Media Server (WebSocket/WebTransport)"
           echo "   - Meeting API (REST backend)"
-          echo "   - Web UI (WASM frontend)"
+          echo "   - Dioxus UI (WASM frontend)"
           echo ""
 
           # Clean up old log directories (older than 24 hours) to prevent accumulation
@@ -103,7 +103,7 @@ jobs:
           echo "Started background builds:"
           echo "  - Media Server: PID $PID_MEDIA"
           echo "  - Meeting API:  PID $PID_API"
-          echo "  - Web UI:       PID $PID_UI"
+          echo "  - Dioxus UI:    PID $PID_UI"
           echo ""
 
           # Wait for all builds to complete

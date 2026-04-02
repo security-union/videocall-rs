@@ -276,9 +276,25 @@ impl Handler<Disconnect> for ChatServer {
         // If there is already a pending departure for this (room, user_id),
         // cancel the old timer and replace it. This handles the edge case of
         // rapid disconnect-reconnect-disconnect cycles.
+        //
+        // BUG FIX (introduced by 0844f062 / batch merge of PRs #793 et al.):
+        // The original code cancelled the old timer but did NOT remove the
+        // replaced session from room_members. During RTT election, N candidate
+        // connections all call JoinRoom (adding N room_members entries for the
+        // same user_id). When the N-1 losers disconnect in rapid succession,
+        // each Disconnect replaces the previous pending departure — but only
+        // the *last* replacement's session gets cleaned up when the grace
+        // period expires. The earlier sessions become permanent orphans in
+        // room_members, appearing as phantom peers that trigger PLI storms
+        // and freeze real participants' video.
         let key = (room.clone(), user_id.clone());
         if let Some(old) = self.pending_departures.remove(&key) {
             ctx.cancel_future(old.spawn_handle);
+            // Clean up the replaced session's room_members entry to prevent
+            // orphaned phantom peers.
+            if let Some(members) = self.room_members.get_mut(&room) {
+                members.retain(|(sid, _, _)| *sid != old.old_session);
+            }
             info!(
                 "Replaced existing pending departure for user {} in room {} (old session {})",
                 user_id, room, old.old_session

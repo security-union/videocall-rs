@@ -92,7 +92,7 @@ impl VideoEncoderBuilder {
         cfg.rc_target_bitrate = self.bitrate_kbps;
         cfg.rc_min_quantizer = self.min_quantizer;
         cfg.rc_max_quantizer = self.max_quantizer;
-        cfg.g_threads = 2;
+        cfg.g_threads = 1;
         cfg.g_lag_in_frames = 1;
         cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
         cfg.g_pass = vpx_enc_pass::VPX_RC_ONE_PASS;

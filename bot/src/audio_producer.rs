@@ -172,6 +172,7 @@ impl AudioProducer {
         // Global monotonic counter — packet metadata needs strictly increasing
         // values even when the audio loop wraps.
         let mut global_sequence: u64 = 0;
+        let user_id_bytes = user_id.clone().into_bytes();
 
         loop {
             if quit.load(Ordering::Relaxed) {
@@ -193,8 +194,6 @@ impl AudioProducer {
             for (i, item) in packet_samples.iter_mut().enumerate() {
                 *item = audio_data[(audio_position + i) % audio_data.len()];
             }
-
-            let user_id_bytes = user_id.clone().into_bytes();
 
             // Encode to Opus
             let mut encoded = vec![0u8; 4000];
@@ -220,7 +219,7 @@ impl AudioProducer {
                     // Wrap in packet wrapper
                     let packet_wrapper = PacketWrapper {
                         data: media_packet.write_to_bytes()?,
-                        user_id: user_id_bytes,
+                        user_id: user_id_bytes.clone(),
                         packet_type: PacketType::MEDIA.into(),
                         ..Default::default()
                     };

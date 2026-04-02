@@ -113,6 +113,11 @@ impl VideoProducer {
         let mut prev_frame_index: Option<usize> = None;
         let mut global_sequence: u64 = 0;
 
+        // Pre-allocate reusable buffers to avoid per-frame heap allocation
+        let mut frame_buf = renderer.create_frame_buffer();
+        let mut i420_buf = vec![0u8; (width * height * 3 / 2) as usize];
+        let user_id_bytes = user_id.clone().into_bytes();
+
         loop {
             if quit.load(Ordering::Relaxed) {
                 info!("Video producer stopping for {}", user_id);
@@ -152,8 +157,8 @@ impl VideoProducer {
             } else {
                 0.0
             };
-            let img = renderer.render_frame_rgb(rms_value, max_rms, frame_in_loop);
-            let frame_data = rgb_to_i420(&img);
+            renderer.render_frame_rgb_into(&mut frame_buf, rms_value, max_rms, frame_in_loop);
+            rgb_to_i420_into(&frame_buf, &mut i420_buf);
 
             // Encode to VP9
             let frames_result = if force_keyframe {
@@ -161,16 +166,16 @@ impl VideoProducer {
                     "Forcing keyframe for {} (seq={})",
                     user_id, global_sequence
                 );
-                video_encoder.encode_keyframe(global_sequence as i64, &frame_data)?
+                video_encoder.encode_keyframe(global_sequence as i64, &i420_buf)?
             } else {
-                video_encoder.encode(global_sequence as i64, &frame_data)?
+                video_encoder.encode(global_sequence as i64, &i420_buf)?
             };
 
             for frame in frames_result {
                 let media_packet = MediaPacket {
                     media_type: MediaType::VIDEO.into(),
                     data: frame.data.to_vec(),
-                    user_id: user_id.clone().into_bytes(),
+                    user_id: user_id_bytes.clone(),
                     frame_type: if frame.key { "key" } else { "delta" }.to_string(),
                     timestamp: get_timestamp_ms(),
                     duration: (1000.0 / framerate as f64),
@@ -185,7 +190,7 @@ impl VideoProducer {
 
                 let packet_wrapper = PacketWrapper {
                     packet_type: PacketType::MEDIA.into(),
-                    user_id: user_id.clone().into_bytes(),
+                    user_id: user_id_bytes.clone(),
                     data: media_packet.write_to_bytes()?,
                     ..Default::default()
                 };
@@ -239,10 +244,10 @@ impl Drop for VideoProducer {
     }
 }
 
-fn rgb_to_i420(image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Vec<u8> {
+fn rgb_to_i420_into(image: &ImageBuffer<Rgb<u8>, Vec<u8>>, i420_data: &mut [u8]) {
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let mut i420_data = vec![0u8; width * height * 3 / 2];
+    debug_assert_eq!(i420_data.len(), width * height * 3 / 2);
 
     let rgb = image.as_raw();
     let (y_plane, uv_planes) = i420_data.split_at_mut(width * height);
@@ -268,8 +273,6 @@ fn rgb_to_i420(image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Vec<u8> {
             }
         }
     }
-
-    i420_data
 }
 
 fn get_timestamp_ms() -> f64 {

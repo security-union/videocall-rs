@@ -46,21 +46,26 @@ impl EkgRenderer {
 
     /// Render a single frame as an RGB ImageBuffer.
     /// Used by the video producer for on-the-fly rendering in the encode loop.
-    pub fn render_frame_rgb(
+    /// Render a single frame into a pre-allocated ImageBuffer.
+    ///
+    /// Caller should create the buffer once via `EkgRenderer::create_frame_buffer()`
+    /// and reuse it across frames to avoid per-frame heap allocation.
+    pub fn render_frame_rgb_into(
         &self,
+        img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
         rms_value: f32,
         max_rms: f32,
         frame_idx: usize,
-    ) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+    ) {
         let w = self.width as usize;
         let h = self.height as usize;
         let center_y = h / 2;
 
-        let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(
-            self.width,
-            self.height,
-            |_, _| Rgb(BG_COLOR),
-        );
+        // Clear to background (memset-like fill instead of per-pixel closure)
+        let bg = Rgb(BG_COLOR);
+        for pixel in img.pixels_mut() {
+            *pixel = bg;
+        }
 
         // Grid lines
         let mut dy: i32 = -300;
@@ -139,7 +144,11 @@ impl EkgRenderer {
             }
         }
 
-        img
+    }
+
+    /// Create a reusable frame buffer for `render_frame_rgb_into`.
+    pub fn create_frame_buffer(&self) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+        ImageBuffer::from_pixel(self.width, self.height, Rgb(BG_COLOR))
     }
 }
 

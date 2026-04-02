@@ -45,9 +45,9 @@ pub struct InboundStats {
     /// Arrival times for jitter calculation
     video_arrivals: Vec<f64>,
     audio_arrivals: Vec<f64>,
-    /// Last audio and video timestamps for A/V sync measurement
-    last_audio_ts: Option<f64>,
-    last_video_ts: Option<f64>,
+    /// Last audio and video timestamps per sender for A/V sync measurement
+    last_audio_ts: HashMap<String, f64>,
+    last_video_ts: HashMap<String, f64>,
     av_sync_deltas: Vec<f64>,
     parse_errors: u64,
 }
@@ -83,7 +83,7 @@ impl InboundStats {
                 self.audio_packets += 1;
                 self.audio_bytes += media.data.len() as u64;
                 self.audio_arrivals.push(now_ms);
-                self.last_audio_ts = Some(media.timestamp);
+                self.last_audio_ts.insert(sender.clone(), media.timestamp);
 
                 if let Some(meta) = media.audio_metadata.as_ref() {
                     let seq = meta.sequence;
@@ -92,11 +92,11 @@ impl InboundStats {
                             self.audio_seq_gaps += seq - prev - 1;
                         }
                     }
-                    self.last_audio_seq.insert(sender, seq);
+                    self.last_audio_seq.insert(sender.clone(), seq);
                 }
 
-                // A/V sync: if we have a recent video timestamp, measure delta
-                if let Some(vts) = self.last_video_ts {
+                // A/V sync: compare against same sender's last video timestamp
+                if let Some(vts) = self.last_video_ts.get(&sender) {
                     self.av_sync_deltas.push(media.timestamp - vts);
                 }
             }
@@ -104,7 +104,7 @@ impl InboundStats {
                 self.video_packets += 1;
                 self.video_bytes += media.data.len() as u64;
                 self.video_arrivals.push(now_ms);
-                self.last_video_ts = Some(media.timestamp);
+                self.last_video_ts.insert(sender.clone(), media.timestamp);
 
                 if media.frame_type == "key" {
                     self.video_keyframes += 1;

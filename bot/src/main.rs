@@ -215,7 +215,9 @@ async fn run_client(
     };
 
     let lobby_url = TransportClient::build_lobby_url(&bot_config, &client_config)?;
-    info!("Lobby URL: {}", lobby_url);
+    // Redact JWT token from log output
+    let display_url = lobby_url.as_str().split("?token=").next().unwrap_or(lobby_url.as_str());
+    info!("Lobby URL: {}{}", display_url, if lobby_url.query().is_some() { "?token=<redacted>" } else { "" });
 
     let mut client = TransportClient::new(&bot_config.transport, client_config.clone());
     client.connect(&lobby_url, insecure).await?;
@@ -289,9 +291,11 @@ fn load_wav_samples(path: &str) -> anyhow::Result<Vec<f32>> {
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => reader
             .samples::<i16>()
-            .map(|s| s.unwrap() as f32 / 32768.0)
-            .collect(),
-        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+            .map(|s| Ok(s? as f32 / 32768.0))
+            .collect::<Result<_, hound::Error>>()?,
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()?,
     };
 
     Ok(samples)

@@ -1,4 +1,4 @@
 target
 conversation/
 voices/
-config-cc7.yaml
+config*.yaml

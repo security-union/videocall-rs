@@ -44,12 +44,7 @@ impl EkgRenderer {
         }
     }
 
-    /// Render a single frame as JPEG bytes.
-    ///
-    /// - `rms_value`: RMS audio energy for this frame (0.0 = silent)
-    /// - `max_rms`: peak RMS across the whole clip (for normalization)
-    /// - `frame_idx`: frame counter (controls animation phase)
-    /// Render a single frame as an RGB ImageBuffer (no JPEG encoding).
+    /// Render a single frame as an RGB ImageBuffer.
     /// Used by the video producer for on-the-fly rendering in the encode loop.
     pub fn render_frame_rgb(
         &self,

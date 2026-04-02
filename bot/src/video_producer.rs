@@ -106,6 +106,10 @@ impl VideoProducer {
         video_encoder.update_bitrate_kbps(500)?;
 
         let loop_duration_us = loop_duration.as_micros() as u64;
+        if loop_duration_us == 0 {
+            warn!("Video producer for {} has zero loop duration, exiting", user_id);
+            return Ok(());
+        }
         let mut prev_frame_index: Option<usize> = None;
         let mut global_sequence: u64 = 0;
 

@@ -146,12 +146,21 @@ impl AudioProducer {
         media_start: Instant,
         loop_duration: Duration,
     ) -> anyhow::Result<()> {
+        if audio_data.is_empty() {
+            warn!("Audio producer for {} has no audio data, exiting", user_id);
+            return Ok(());
+        }
+
         // Audio configuration - targeting 50fps (20ms packets)
         let sample_rate = 48000u32;
         let channels = 1u8;
         let samples_per_packet = (sample_rate as f32 * 0.02) as usize; // 960 samples = 20ms
         let packet_interval_us: u64 = 20_000; // 20ms in microseconds
         let loop_duration_us = loop_duration.as_micros() as u64;
+        if loop_duration_us == 0 {
+            warn!("Audio producer for {} has zero loop duration, exiting", user_id);
+            return Ok(());
+        }
 
         // Create Opus encoder
         let mut opus_encoder = OpusEncoder::new(sample_rate, OpusChannels::Mono, OpusApp::Voip)?;

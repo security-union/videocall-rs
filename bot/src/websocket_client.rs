@@ -23,7 +23,7 @@ use protobuf::Message;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{self as tokio_mpsc, Receiver};
 use tokio::time;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, warn};
@@ -44,14 +44,20 @@ pub struct WebSocketClient {
     config: ClientConfig,
     /// Sending half — stored here after connect, moved into packet_sender task.
     write: Option<futures_util::stream::SplitSink<WsStream, WsMessage>>,
+    /// Channel for forwarding Pong responses from the read half to the write half.
+    pong_rx: Option<tokio_mpsc::Receiver<Vec<u8>>>,
+    pong_tx: tokio_mpsc::Sender<Vec<u8>>,
     quit: Arc<AtomicBool>,
 }
 
 impl WebSocketClient {
     pub fn new(config: ClientConfig) -> Self {
+        let (pong_tx, pong_rx) = tokio_mpsc::channel(4);
         Self {
             config,
             write: None,
+            pong_rx: Some(pong_rx),
+            pong_tx,
             quit: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -68,11 +74,7 @@ impl WebSocketClient {
         let (write, read) = ws_stream.split();
         self.write = Some(write);
 
-        // Heartbeat is handled by spawn_heartbeat_producer() in main.rs via the
-        // shared mpsc channel — no separate heartbeat task needed here.
-        info!("Heartbeat started for {}", self.config.user_id);
-
-        // Start inbound consumer (drain incoming frames)
+        // Start inbound consumer (drain incoming frames, forward pongs)
         self.start_inbound_consumer(read).await;
         info!("Inbound consumer started for {}", self.config.user_id);
 
@@ -82,6 +84,7 @@ impl WebSocketClient {
     async fn start_inbound_consumer(&self, mut read: futures_util::stream::SplitStream<WsStream>) {
         let user_id = self.config.user_id.clone();
         let quit = self.quit.clone();
+        let pong_tx = self.pong_tx.clone();
 
         tokio::spawn(async move {
             let mut stats = InboundStats::default();
@@ -105,7 +108,7 @@ impl WebSocketClient {
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
                         debug!("Received WS ping for {}", user_id);
-                        let _ = data;
+                        let _ = pong_tx.try_send(data);
                     }
                     Some(Ok(WsMessage::Pong(_))) => {}
                     Some(Ok(WsMessage::Close(_))) => {
@@ -135,16 +138,34 @@ impl WebSocketClient {
             .expect("connect() must be called before start_packet_sender()");
         let user_id = self.config.user_id.clone();
         let quit = self.quit.clone();
+        let mut pong_rx = self.pong_rx.take();
 
         tokio::spawn(async move {
-            while let Some(packet_data) = packet_receiver.recv().await {
+            loop {
                 if quit.load(Ordering::Relaxed) {
                     break;
                 }
-
-                if let Err(e) = write.send(WsMessage::Binary(packet_data)).await {
-                    warn!("Failed to send WS packet for {}: {}", user_id, e);
-                    break;
+                tokio::select! {
+                    packet = packet_receiver.recv() => {
+                        let Some(packet_data) = packet else { break };
+                        if let Err(e) = write.send(WsMessage::Binary(packet_data)).await {
+                            warn!("Failed to send WS packet for {}: {}", user_id, e);
+                            break;
+                        }
+                    }
+                    pong = async {
+                        match pong_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(data) = pong {
+                            if let Err(e) = write.send(WsMessage::Pong(data)).await {
+                                warn!("Failed to send WS pong for {}: {}", user_id, e);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             info!("Packet sender stopped for {}", user_id);

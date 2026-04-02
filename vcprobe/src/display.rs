@@ -205,9 +205,9 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
     if verbose {
         // Verbose mode: show full details including browser state
         let tab = if health.is_tab_visible {
-            "👁️ "
+            "visible"
         } else {
-            "👁️🚫"
+            "hidden "
         };
         let mem_info = match (health.memory_used_bytes, health.memory_total_bytes) {
             (Some(used), Some(total)) => {

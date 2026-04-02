@@ -59,7 +59,7 @@ async fn metrics_handler(
     session_tracker: web::Data<SessionTracker>,
     display_name_map: web::Data<DisplayNameMap>,
 ) -> Result<HttpResponse> {
-    drop(data.lock().unwrap());
+    drop(data.lock().unwrap_or_else(|e| e.into_inner()));
 
     // Clean up stale sessions before processing metrics
     cleanup_stale_sessions(&session_tracker, &display_name_map);
@@ -89,7 +89,7 @@ async fn metrics_handler(
 /// and prune display_name_map entries for sessions no longer active.
 fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &DisplayNameMap) {
     use std::time::Duration;
-    let mut tracker = session_tracker.lock().unwrap();
+    let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     let timeout = Duration::from_secs(30); // 30 second timeout
 
@@ -121,7 +121,7 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
             .values()
             .map(|info| info.session_id.as_str())
             .collect();
-        let mut dn_map = display_name_map.lock().unwrap();
+        let mut dn_map = display_name_map.lock().unwrap_or_else(|e| e.into_inner());
         dn_map.retain(|sid, _| active_session_ids.contains(sid.as_str()));
     }
 }
@@ -297,7 +297,7 @@ fn process_health_packet_to_metrics_pb(
 
     // Register this session's display name so peers can be resolved later
     {
-        let mut dn_map = display_name_map.lock().unwrap();
+        let mut dn_map = display_name_map.lock().unwrap_or_else(|e| e.into_inner());
         dn_map.insert(session_id.to_string(), reporter_display_name.clone());
     }
 
@@ -306,7 +306,7 @@ fn process_health_packet_to_metrics_pb(
     // across packets. The previous tracker.insert() reset them every packet, causing a leak
     // where peers that left mid-session had their Prometheus labels written but never cleaned up.
     {
-        let mut tracker = session_tracker.lock().unwrap();
+        let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
         let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
         let info = tracker.entry(session_key).or_insert_with(|| SessionInfo {
             session_id: session_id.to_string(),
@@ -377,7 +377,7 @@ fn process_health_packet_to_metrics_pb(
 
             // Track server info used for cleanup
             {
-                let mut tracker = session_tracker.lock().unwrap();
+                let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
                 let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                 if let Some(info) = tracker.get_mut(&key) {
                     info.active_servers
@@ -510,7 +510,7 @@ fn process_health_packet_to_metrics_pb(
         if !health_packet.peer_stats.is_empty() {
             // Snapshot display_name_map once (avoids locking per peer in the loop)
             let peer_display_names: HashMap<String, String> = {
-                let dn_map = display_name_map.lock().unwrap();
+                let dn_map = display_name_map.lock().unwrap_or_else(|e| e.into_inner());
                 health_packet
                     .peer_stats
                     .keys()
@@ -523,7 +523,7 @@ fn process_health_packet_to_metrics_pb(
 
             // Detect display_name changes and remove stale series (one tracker lock)
             {
-                let mut tracker = session_tracker.lock().unwrap();
+                let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
                 let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                 if let Some(info) = tracker.get_mut(&key) {
                     for (peer_id, new_dn) in &peer_display_names {
@@ -741,7 +741,7 @@ async fn handle_health_message(
 
     // Store latest health data using topic as key
     {
-        let mut store = health_store.lock().unwrap();
+        let mut store = health_store.lock().unwrap_or_else(|e| e.into_inner());
         let json_val = json!({
             "session_id": health_packet.session_id,
             "meeting_id": health_packet.meeting_id,
@@ -994,7 +994,7 @@ mod tests {
 
         // Test inserting a session
         {
-            let mut tracker_guard = tracker.lock().unwrap();
+            let mut tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "meeting_1_session_1_alice".to_string();
             let session_info = SessionInfo {
                 session_id: "session_1".to_string(),
@@ -1014,7 +1014,7 @@ mod tests {
 
         // Test updating session timestamp
         {
-            let mut tracker_guard = tracker.lock().unwrap();
+            let mut tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "meeting_1_session_1_alice".to_string();
             if let Some(session_info) = tracker_guard.get_mut(&session_key) {
                 session_info.last_seen = Instant::now();
@@ -1024,7 +1024,7 @@ mod tests {
 
         // Test removing a session
         {
-            let mut tracker_guard = tracker.lock().unwrap();
+            let mut tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "meeting_1_session_1_alice".to_string();
             tracker_guard.remove(&session_key);
             assert_eq!(tracker_guard.len(), 0);
@@ -1038,7 +1038,7 @@ mod tests {
 
         // Add a fresh session
         {
-            let mut tracker_guard = tracker.lock().unwrap();
+            let mut tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "meeting_1_session_1_alice".to_string();
             let session_info = SessionInfo {
                 session_id: "session_1".to_string(),
@@ -1056,7 +1056,7 @@ mod tests {
 
         // Add a stale session (simulated by setting old timestamp)
         {
-            let mut tracker_guard = tracker.lock().unwrap();
+            let mut tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "meeting_1_session_2_bob".to_string();
             let mut session_info = SessionInfo {
                 session_id: "session_2".to_string(),
@@ -1076,7 +1076,7 @@ mod tests {
 
         // Verify we have 2 sessions before cleanup
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(tracker_guard.len(), 2);
         }
 
@@ -1085,7 +1085,7 @@ mod tests {
 
         // Verify only the fresh session remains
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(tracker_guard.len(), 1);
             assert!(tracker_guard.contains_key("meeting_1_session_1_alice"));
             assert!(!tracker_guard.contains_key("meeting_1_session_2_bob"));
@@ -1114,7 +1114,7 @@ mod tests {
 
         // Verify session was tracked
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "meeting_456_session_123_alice".to_string();
             assert!(tracker_guard.contains_key(&session_key));
 
@@ -1209,7 +1209,7 @@ mod tests {
         peer_stats.insert(peer_id, peer_stat);
 
         {
-            let mut store = health_store.lock().unwrap();
+            let mut store = health_store.lock().unwrap_or_else(|e| e.into_inner());
             // Store a dummy JSON value; cached store is not used for metrics anyway
             store.insert(
                 "health.diagnostics.test".to_string(),
@@ -1233,7 +1233,7 @@ mod tests {
             });
         }
 
-        let guard = tracker.lock().unwrap();
+        let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
         assert!(guard.is_empty());
     }
 
@@ -1271,7 +1271,7 @@ mod tests {
         // Remove and ensure it disappears
         let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
         let info = {
-            let guard = tracker.lock().unwrap();
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             guard.get(&session_key).unwrap().clone()
         };
         remove_session_metrics(&info);
@@ -1315,7 +1315,7 @@ mod tests {
 
         // Verify session tracking
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "meeting_999_session_789_alice".to_string();
             assert!(tracker_guard.contains_key(&session_key));
         }
@@ -1342,7 +1342,7 @@ mod tests {
 
         // Add multiple sessions with different timestamps
         {
-            let mut tracker_guard = tracker.lock().unwrap();
+            let mut tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
 
             // Fresh session
             let session_key1 = "meeting_1_session_1_alice".to_string();
@@ -1393,7 +1393,7 @@ mod tests {
 
         // Verify initial state
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(tracker_guard.len(), 3);
         }
 
@@ -1402,7 +1402,7 @@ mod tests {
 
         // Verify cleanup results
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(tracker_guard.len(), 2);
             assert!(tracker_guard.contains_key("meeting_1_session_1_alice"));
             assert!(!tracker_guard.contains_key("meeting_1_session_2_bob")); // Should be cleaned up
@@ -1436,7 +1436,7 @@ mod tests {
 
         // Simulate concurrent access (though this is simplified since we're using Mutex)
         let handle = std::thread::spawn(move || {
-            let mut tracker_guard = tracker_clone.lock().unwrap();
+            let mut tracker_guard = tracker_clone.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "concurrent_session".to_string();
             let session_info = SessionInfo {
                 session_id: "session_concurrent".to_string(),
@@ -1457,7 +1457,7 @@ mod tests {
 
         // Verify the session was added
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             assert!(tracker_guard.contains_key("concurrent_session"));
         }
     }
@@ -1481,7 +1481,7 @@ mod tests {
 
         // Verify session was still tracked even with empty peer stats
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "meeting_empty_session_empty_alice".to_string();
             assert!(tracker_guard.contains_key(&session_key));
         }
@@ -1515,7 +1515,7 @@ mod tests {
         // Verify server info was tracked
         let session_key = "meet_rtt_sess_rtt_alice";
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_info = tracker_guard.get(session_key).unwrap();
             assert!(session_info.active_servers.contains(&(
                 "wss://server.example.com".to_string(),
@@ -1548,7 +1548,7 @@ mod tests {
 
         // Remove session metrics
         let info = {
-            let guard = tracker.lock().unwrap();
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             guard.get(session_key).unwrap().clone()
         };
         remove_session_metrics(&info);
@@ -1583,7 +1583,7 @@ mod tests {
 
         // Add session exactly at timeout boundary
         {
-            let mut tracker_guard = tracker.lock().unwrap();
+            let mut tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let session_key = "boundary_session".to_string();
             let mut session_info = SessionInfo {
                 session_id: "session_boundary".to_string(),
@@ -1606,7 +1606,7 @@ mod tests {
 
         // Session should be cleaned up (>= 30 seconds is considered stale)
         {
-            let tracker_guard = tracker.lock().unwrap();
+            let tracker_guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(tracker_guard.len(), 0);
         }
     }
@@ -1705,7 +1705,7 @@ mod tests {
 
         // Now the peer sends their own health packet, populating the display_name_map
         {
-            let mut map = dn_map.lock().unwrap();
+            let mut map = dn_map.lock().unwrap_or_else(|e| e.into_inner());
             map.insert("12345".to_string(), "Bob".to_string());
         }
 
@@ -1848,14 +1848,14 @@ mod tests {
 
         // Populate the display_name_map with some entries
         {
-            let mut map = dn_map.lock().unwrap();
+            let mut map = dn_map.lock().unwrap_or_else(|e| e.into_inner());
             map.insert("active_session".to_string(), "Alice".to_string());
             map.insert("stale_session".to_string(), "Bob".to_string());
         }
 
         // Only add active_session to the tracker
         {
-            let mut t = tracker.lock().unwrap();
+            let mut t = tracker.lock().unwrap_or_else(|e| e.into_inner());
             t.insert(
                 "m1_active_session_alice".to_string(),
                 SessionInfo {
@@ -1875,7 +1875,7 @@ mod tests {
         // Run cleanup — both sessions should be removed (active_session is stale too)
         cleanup_stale_sessions(&tracker, &dn_map);
 
-        let map = dn_map.lock().unwrap();
+        let map = dn_map.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             map.is_empty(),
             "All display_name_map entries should be cleaned since all sessions are stale"

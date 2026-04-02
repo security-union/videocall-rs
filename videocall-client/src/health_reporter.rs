@@ -602,14 +602,15 @@ impl HealthReporter {
             }
         }
 
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        const STATS_STALE_MS: u64 = 5_000;
+
         for (peer_id, health_data) in health_map.iter() {
             // Freshness gate: stats older than 5s are stale (FPS/NetEQ trackers stop
             // emitting DiagEvents when no frames arrive, so timestamps stop advancing).
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            const STATS_STALE_MS: u64 = 5_000;
             let audio_fresh = health_data.last_audio_update_ms > 0
                 && now_ms.saturating_sub(health_data.last_audio_update_ms) < STATS_STALE_MS;
             let video_fresh = health_data.last_video_update_ms > 0

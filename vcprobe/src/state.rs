@@ -77,7 +77,6 @@ pub struct Participant {
     pub packets_received_per_sec: Option<f64>,
     /// Outbound packet rate (packets/sec)
     pub packets_sent_per_sec: Option<f64>,
-    pub _joined_at: Instant,
 }
 
 impl Participant {
@@ -99,7 +98,6 @@ impl Participant {
             send_queue_bytes: None,
             packets_received_per_sec: None,
             packets_sent_per_sec: None,
-            _joined_at: Instant::now(),
         }
     }
 
@@ -376,6 +374,10 @@ impl MeetingState {
                 &sid[sid.len().saturating_sub(4)..]
             ));
         }
+
+        // Prune pending display names for sessions that no longer exist
+        self.pending_display_names
+            .retain(|sid, _| self.participants.contains_key(sid));
     }
 
     fn push_event(&mut self, msg: String) {

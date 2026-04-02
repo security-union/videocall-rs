@@ -18,7 +18,7 @@
 
 //! EKG-style video frame renderer.
 //!
-//! Generates animated waveform frames in memory (JPEG bytes) that visually
+//! Generates animated waveform frames in memory (RGB ImageBuffers) that visually
 //! indicate when a participant is speaking vs listening. Ported from the
 //! Python `render_frame()` function in generate-conversation-edge.py.
 

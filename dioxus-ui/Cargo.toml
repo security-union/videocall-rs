@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 dioxus = { version = "0.7.3", default-features = false, features = ["web", "router", "launch", "logger", "lib"] }
+dioxus-sdk-storage = "0.7.0"
 wasm-bindgen = { workspace = true }
 videocall-client = { path = "../videocall-client", version = "4.0.5", default-features = false }
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.3" }

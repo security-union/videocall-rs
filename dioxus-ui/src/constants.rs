@@ -267,7 +267,7 @@ pub fn meeting_api_client() -> Result<videocall_meeting_client::MeetingApiClient
     //   3. Cookie mode — for deployments that do not use an external OAuth
     //      provider (the server still accepts legacy HMAC session JWTs).
     let auth_mode = crate::auth::get_stored_access_token()
-        .or_else(|| crate::auth::get_stored_id_token())
+        .or_else(crate::auth::get_stored_id_token)
         .map(videocall_meeting_client::AuthMode::Bearer)
         .unwrap_or(videocall_meeting_client::AuthMode::Cookie);
     Ok(videocall_meeting_client::MeetingApiClient::new(

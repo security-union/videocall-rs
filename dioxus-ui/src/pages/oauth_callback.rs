@@ -58,6 +58,7 @@ use crate::constants::{
 use crate::context::{email_to_display_name, save_display_name_to_storage, validate_display_name};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use dioxus::prelude::*;
+use dioxus_sdk_storage::{SessionStorage, StorageBacking};
 use gloo_utils::window;
 use serde::Deserialize;
 
@@ -107,6 +108,9 @@ struct OidcDiscovery {
 /// Cached sessionStorage key for the discovered token endpoint URL.
 /// Avoids re-fetching the discovery document on every callback within the
 /// same browser tab.
+/// Cached session-storage key for the discovered token endpoint URL.
+/// Avoids re-fetching the discovery document on every callback within the
+/// same session.
 const CACHED_TOKEN_ENDPOINT_KEY: &str = "vc_cached_token_endpoint";
 
 /// Resolve the provider's token endpoint URL.
@@ -114,7 +118,8 @@ const CACHED_TOKEN_ENDPOINT_KEY: &str = "vc_cached_token_endpoint";
 /// Priority:
 ///
 /// 1. `window.__APP_CONFIG.oauthTokenUrl` (explicit env var `OAUTH_TOKEN_URL`).
-/// 2. Per-tab sessionStorage cache set by a previous call to this function.
+/// 2. Per-session cache set by a previous call to this function (browser
+///    `sessionStorage` on web; in-memory on native).
 /// 3. OIDC well-known discovery: `GET {oauthIssuer}/.well-known/openid-configuration`.
 /// 4. Backend fallback: `GET /api/v1/oauth/provider-config` — the meeting-api
 ///    exposes the post-discovery `token_url` field.
@@ -124,16 +129,13 @@ async fn resolve_token_endpoint() -> Result<String, String> {
         return Ok(url);
     }
 
-    // 2. Per-tab cache from a previous discovery call.
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        if let Some(cached) = storage
-            .get_item(CACHED_TOKEN_ENDPOINT_KEY)
-            .ok()
+    // 2. Per-session cache from a previous discovery call.
+    if let Some(cached) =
+        SessionStorage::get::<Option<String>>(&CACHED_TOKEN_ENDPOINT_KEY.to_string())
             .flatten()
             .filter(|s| !s.is_empty())
-        {
-            return Ok(cached);
-        }
+    {
+        return Ok(cached);
     }
 
     // 3. OIDC well-known discovery.
@@ -246,9 +248,10 @@ async fn fetch_token_endpoint_from_backend() -> Result<String, String> {
 }
 
 fn cache_token_endpoint(url: &str) {
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let _: Result<_, _> = storage.set_item(CACHED_TOKEN_ENDPOINT_KEY, url);
-    }
+    SessionStorage::set(
+        CACHED_TOKEN_ENDPOINT_KEY.to_string(),
+        &Some(url.to_string()),
+    );
 }
 
 // ---------------------------------------------------------------------------

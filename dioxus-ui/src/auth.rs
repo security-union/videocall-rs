@@ -32,7 +32,12 @@
 //! After the provider redirects back to `/auth/callback`, that page exchanges
 //! the authorization code for tokens via `POST /api/v1/oauth/exchange`
 //! (server-to-server, keeping the secret private) and stores the returned
-//! `id_token` in `sessionStorage["vc_id_token"]`.
+//! `id_token` in session-scoped storage under the key `"vc_id_token"`.
+//!
+//! Storage is managed through [`dioxus_sdk_storage::SessionStorage`], which
+//! maps to the browser's `sessionStorage` on web (tab-scoped, discarded when
+//! the tab closes) and to an in-memory store on native platforms.  This
+//! ensures tokens never outlive the session and are never persisted to disk.
 //!
 //! Every call to [`meeting_api_client`](crate::constants::meeting_api_client)
 //! reads the stored token and creates a client in `Bearer` mode.
@@ -49,6 +54,7 @@ use crate::constants::{
 };
 use crate::pkce::{self};
 use anyhow::anyhow;
+use dioxus_sdk_storage::{SessionStorage, StorageBacking};
 use gloo_utils::window;
 use serde::Deserialize;
 use videocall_meeting_types::responses::ProfileResponse;
@@ -59,14 +65,14 @@ pub type UserProfile = ProfileResponse;
 // sessionStorage key for id_token
 // ---------------------------------------------------------------------------
 
-/// `sessionStorage` key for the provider id_token JWT.
+/// Session-storage key for the provider id_token JWT.
 ///
-/// Using `sessionStorage` (not `localStorage`) limits token lifetime to the
-/// current browser tab and prevents the token from persisting after the user
-/// closes the window.
+/// Using session-scoped storage (browser `sessionStorage` on web; in-memory
+/// on native) limits token lifetime to the current session and prevents the
+/// token from persisting after the user closes the tab or the app exits.
 const ID_TOKEN_KEY: &str = "vc_id_token";
 
-/// `sessionStorage` key for the provider access token.
+/// Session-storage key for the provider access token.
 ///
 /// The access token is stored alongside the id_token.  It is sent as the
 /// `Authorization: Bearer` credential on all meeting-api requests.  The id_token
@@ -74,15 +80,15 @@ const ID_TOKEN_KEY: &str = "vc_id_token";
 /// (display name, user ID) — the access token is treated as opaque.
 const ACCESS_TOKEN_KEY: &str = "vc_access_token";
 
-/// `sessionStorage` key for the user's canonical identifier extracted from the
+/// Session-storage key for the user's canonical identifier extracted from the
 /// validated id_token payload (email if present, otherwise `sub`).
 const PROFILE_USER_ID_KEY: &str = "vc_profile_user_id";
 
-/// `sessionStorage` key for the user's display name extracted from the
+/// Session-storage key for the user's display name extracted from the
 /// validated id_token payload.
 const PROFILE_DISPLAY_NAME_KEY: &str = "vc_profile_display_name";
 
-/// `sessionStorage` key for the cached provider auth URL (set when the value
+/// Session-storage key for the cached provider auth URL (set when the value
 /// was obtained from `GET /api/v1/oauth/provider-config` rather than from
 /// `window.__APP_CONFIG`).
 const CACHED_AUTH_URL_KEY: &str = "vc_oauth_cached_auth_url";
@@ -92,68 +98,57 @@ const CACHED_CLIENT_ID_KEY: &str = "vc_oauth_cached_client_id";
 // Token storage
 // ---------------------------------------------------------------------------
 
-/// Read the stored provider id_token from `sessionStorage`.
+/// Read the stored provider id_token from session-scoped storage.
+///
+/// On web this reads from the browser's `sessionStorage`.  On native it reads
+/// from the in-memory session store.
 pub fn get_stored_id_token() -> Option<String> {
-    window()
-        .session_storage()
-        .ok()
+    SessionStorage::get::<Option<String>>(&ID_TOKEN_KEY.to_string())
         .flatten()
-        .and_then(|s| s.get_item(ID_TOKEN_KEY).ok().flatten())
         .filter(|t| !t.is_empty())
 }
 
-/// Store the provider id_token in `sessionStorage`.
+/// Store the provider id_token in session-scoped storage.
 pub fn store_id_token(token: &str) {
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let _ = storage.set_item(ID_TOKEN_KEY, token);
-    }
+    SessionStorage::set(ID_TOKEN_KEY.to_string(), &Some(token.to_string()));
 }
 
-/// Remove the stored id_token from `sessionStorage`.
+/// Clear the stored id_token from session-scoped storage.
 pub fn clear_id_token() {
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let _ = storage.remove_item(ID_TOKEN_KEY);
-    }
+    SessionStorage::set(ID_TOKEN_KEY.to_string(), &None::<String>);
 }
 
 // ---------------------------------------------------------------------------
 // Access-token storage
 // ---------------------------------------------------------------------------
 
-/// Read the stored provider access token from `sessionStorage`.
+/// Read the stored provider access token from session-scoped storage.
 ///
 /// Returns `None` when no OAuth exchange has been completed in the current
-/// tab or when `sessionStorage` is unavailable.
+/// session or when the token was explicitly cleared.
 ///
 /// The access token is **opaque** from the UI's perspective — it is passed
 /// through as-is to the meeting-api and never decoded or inspected by the
 /// browser.
 pub fn get_stored_access_token() -> Option<String> {
-    window()
-        .session_storage()
-        .ok()
+    SessionStorage::get::<Option<String>>(&ACCESS_TOKEN_KEY.to_string())
         .flatten()
-        .and_then(|s| s.get_item(ACCESS_TOKEN_KEY).ok().flatten())
         .filter(|t| !t.is_empty())
 }
 
-/// Store the provider access token in `sessionStorage`.
+/// Store the provider access token in session-scoped storage.
 ///
 /// Called by the OAuth callback page after a successful token exchange.
 pub fn store_access_token(token: &str) {
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let _ = storage.set_item(ACCESS_TOKEN_KEY, token);
-    }
+    SessionStorage::set(ACCESS_TOKEN_KEY.to_string(), &Some(token.to_string()));
 }
 
-/// Remove the stored access token from `sessionStorage`.
+/// Clear the stored access token from session-scoped storage.
 ///
 /// Called on logout so subsequent requests are unauthenticated immediately,
 /// even before the browser navigation to the logout endpoint completes.
 pub fn clear_access_token() {
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let _ = storage.remove_item(ACCESS_TOKEN_KEY);
-    }
+    SessionStorage::set(ACCESS_TOKEN_KEY.to_string(), &None::<String>);
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +156,7 @@ pub fn clear_access_token() {
 // ---------------------------------------------------------------------------
 
 /// Persist the user profile claims extracted from a validated id_token to
-/// `sessionStorage`.
+/// session-scoped storage.
 ///
 /// Called by the OAuth callback page immediately after
 /// `decode_and_validate_id_token` succeeds.  Storing the claims here lets
@@ -173,41 +168,35 @@ pub fn clear_access_token() {
 /// `display_name` is the raw display name resolved from the token's `name`,
 /// `given_name`/`family_name`, `email`, or `sub` claims in that order.
 pub fn store_user_profile(user_id: &str, display_name: &str) {
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let _ = storage.set_item(PROFILE_USER_ID_KEY, user_id);
-        let _ = storage.set_item(PROFILE_DISPLAY_NAME_KEY, display_name);
-    }
+    SessionStorage::set(PROFILE_USER_ID_KEY.to_string(), &Some(user_id.to_string()));
+    SessionStorage::set(
+        PROFILE_DISPLAY_NAME_KEY.to_string(),
+        &Some(display_name.to_string()),
+    );
 }
 
-/// Read the cached user profile from `sessionStorage`.
+/// Read the cached user profile from session-scoped storage.
 ///
 /// Returns `Some(UserProfile)` when both `user_id` and `display_name` are
 /// present (set by the OAuth callback page after a successful token exchange).
 /// Returns `None` when no profile has been cached yet.
 pub fn get_stored_user_profile() -> Option<UserProfile> {
-    let storage = window().session_storage().ok().flatten()?;
-    let user_id = storage
-        .get_item(PROFILE_USER_ID_KEY)
-        .ok()
+    let user_id = SessionStorage::get::<Option<String>>(&PROFILE_USER_ID_KEY.to_string())
         .flatten()
         .filter(|s| !s.is_empty())?;
-    let name = storage
-        .get_item(PROFILE_DISPLAY_NAME_KEY)
-        .ok()
+    let name = SessionStorage::get::<Option<String>>(&PROFILE_DISPLAY_NAME_KEY.to_string())
         .flatten()
         .unwrap_or_default();
     Some(UserProfile { user_id, name })
 }
 
-/// Remove the cached user profile from `sessionStorage`.
+/// Clear the cached user profile from session-scoped storage.
 ///
 /// Called on logout so stale profile data cannot be observed after the
 /// user signs out.
 pub fn clear_user_profile() {
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let _ = storage.remove_item(PROFILE_USER_ID_KEY);
-        let _ = storage.remove_item(PROFILE_DISPLAY_NAME_KEY);
-    }
+    SessionStorage::set(PROFILE_USER_ID_KEY.to_string(), &None::<String>);
+    SessionStorage::set(PROFILE_DISPLAY_NAME_KEY.to_string(), &None::<String>);
 }
 
 // ---------------------------------------------------------------------------
@@ -320,26 +309,18 @@ async fn resolve_oauth_params() -> Result<OAuthParams, String> {
         });
     }
 
-    // Try the in-tab cache to avoid a redundant fetch in the same session.
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let cached_url = storage
-            .get_item(CACHED_AUTH_URL_KEY)
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty());
-        let cached_id = storage
-            .get_item(CACHED_CLIENT_ID_KEY)
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty());
-        if let (Some(auth_url), Some(client_id)) = (cached_url, cached_id) {
-            return Ok(OAuthParams {
-                auth_url,
-                client_id,
-                redirect_url,
-                scopes,
-            });
-        }
+    // Try the per-session cache to avoid a redundant fetch in the same session.
+    let cached_url =
+        SessionStorage::get::<Option<String>>(&CACHED_AUTH_URL_KEY.to_string()).flatten();
+    let cached_id =
+        SessionStorage::get::<Option<String>>(&CACHED_CLIENT_ID_KEY.to_string()).flatten();
+    if let (Some(auth_url), Some(client_id)) = (cached_url, cached_id) {
+        return Ok(OAuthParams {
+            auth_url,
+            client_id,
+            redirect_url,
+            scopes,
+        });
     }
 
     // Fall back to the backend discovery endpoint.
@@ -377,11 +358,15 @@ async fn resolve_oauth_params() -> Result<OAuthParams, String> {
 
     let result = parsed.result;
 
-    // Cache for subsequent flows in the same tab.
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let _ = storage.set_item(CACHED_AUTH_URL_KEY, &result.auth_url);
-        let _ = storage.set_item(CACHED_CLIENT_ID_KEY, &result.client_id);
-    }
+    // Cache for subsequent flows in the same session.
+    SessionStorage::set(
+        CACHED_AUTH_URL_KEY.to_string(),
+        &Some(result.auth_url.clone()),
+    );
+    SessionStorage::set(
+        CACHED_CLIENT_ID_KEY.to_string(),
+        &Some(result.client_id.clone()),
+    );
 
     let scopes = if !result.scopes.is_empty() {
         result.scopes
@@ -563,18 +548,14 @@ pub fn logout() -> Result<(), String> {
 
 /// Resolve the `returnTo` value used by [`do_login`].
 fn resolve_return_to_for_do_login() -> Option<String> {
-    // 1. sessionStorage (preferred — set by protected pages before navigating).
-    if let Some(storage) = window().session_storage().ok().flatten() {
-        let val = storage
-            .get_item(pkce::RETURN_TO_KEY)
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty());
-        if val.is_some() {
-            // Consume it — do_login owns the return_to from here.
-            let _ = storage.remove_item(pkce::RETURN_TO_KEY);
-            return val;
-        }
+    // 1. Session-scoped storage (preferred — set by protected pages before navigating).
+    let val = SessionStorage::get::<Option<String>>(&pkce::RETURN_TO_KEY.to_string())
+        .flatten()
+        .filter(|s| !s.is_empty());
+    if val.is_some() {
+        // Consume it — do_login owns the return_to from here.
+        SessionStorage::set(pkce::RETURN_TO_KEY.to_string(), &None::<String>);
+        return val;
     }
 
     // 2. URL search string (e.g. direct navigation to `/login?returnTo=…`).

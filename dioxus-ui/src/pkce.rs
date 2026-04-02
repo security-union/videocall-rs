@@ -1,17 +1,30 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! PKCE (Proof Key for Code Exchange, RFC 7636) helpers for the browser-side
-//! OIDC flow.
+//! PKCE (Proof Key for Code Exchange, RFC 7636) helpers for the OIDC flow.
 //!
 //! ## Responsibilities
 //!
 //! - Generate a cryptographically random `code_verifier`, derive the
 //!   `code_challenge` (Base64url-SHA-256), and produce random `state` and
-//!   `nonce` values using `window.crypto.getRandomValues`.
-//! - Persist the generated values in `sessionStorage` so they survive the
+//!   `nonce` values using `getrandom` (which delegates to
+//!   `window.crypto.getRandomValues` on WASM and the OS CSPRNG on native).
+//! - Persist the generated values in session-scoped storage (browser
+//!   `sessionStorage` on web; in-memory store on native) so they survive the
 //!   redirect to the identity provider and can be retrieved by the
 //!   `/auth/callback` page.
 //! - Validate the CSRF `state` parameter echoed back by the provider.
+//!
+//! ## Storage backend
+//!
+//! Storage is managed through [`dioxus_sdk_storage::SessionStorage`], which
+//! maps to the browser's `sessionStorage` on web (tab-scoped, discarded when
+//! the tab closes, inaccessible to cross-origin scripts) and to an
+//! in-memory store on native platforms.  Neither backend persists data
+//! across sessions, which is the correct property for one-time PKCE values.
+//!
+//! Values are stored as `Option<String>` serialised with CBOR+zlib.  Setting
+//! a key to `None` is the "clear/remove" operation — reading it back with
+//! `.flatten()` gives `None` just like a missing key.
 //!
 //! ## Security properties
 //!
@@ -21,16 +34,13 @@
 //! | `code_challenge` | SHA-256 of verifier | Base64url (no padding) | Sent in auth request |
 //! | `state` | 16 bytes | hex | CSRF protection (validated in callback) |
 //! | `nonce` | 16 bytes | hex | Binds id_token to this session |
-//!
-//! All values are stored in `sessionStorage` (tab-scoped, not persisted after
-//! the tab closes, inaccessible to cross-origin scripts).
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use gloo_utils::window;
+use dioxus_sdk_storage::{SessionStorage, StorageBacking};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
-// sessionStorage keys
+// Storage keys
 // ---------------------------------------------------------------------------
 
 pub const PKCE_VERIFIER_KEY: &str = "vc_pkce_verifier";
@@ -48,11 +58,11 @@ pub const RETURN_TO_KEY: &str = "vc_oauth_return_to";
 ///
 /// # Panics
 ///
-/// Panics when the Web Crypto API is unavailable (should never happen in a
-/// modern browser).
+/// Panics when the underlying CSPRNG is unavailable (should never happen in a
+/// modern browser or standard OS environment).
 fn get_random_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
-    getrandom::getrandom(&mut buf).expect("window.crypto.getRandomValues failed");
+    getrandom::getrandom(&mut buf).expect("CSPRNG unavailable");
     buf
 }
 
@@ -117,41 +127,43 @@ pub fn generate_pkce_params() -> PkceParams {
 }
 
 // ---------------------------------------------------------------------------
-// sessionStorage persistence
+// Session-storage persistence
 // ---------------------------------------------------------------------------
 
-/// Persist the PKCE parameters and optional `return_to` URL in
-/// `sessionStorage` so they survive the redirect to the provider.
+/// Persist the PKCE parameters and optional `return_to` URL in session-scoped
+/// storage so they survive the redirect to the provider.
+///
+/// On web this writes to the browser's `sessionStorage`.  On native it writes
+/// to an in-memory store that lives for the duration of the process.
 ///
 /// Existing values are overwritten — each call to `start_oauth_flow` starts a
 /// fresh PKCE session.
 pub fn save_pkce_state(params: &PkceParams, return_to: Option<&str>) {
-    let Some(storage) = window().session_storage().ok().flatten() else {
-        log::error!("sessionStorage unavailable — PKCE state cannot be saved");
-        return;
-    };
-    let _ = storage.set_item(PKCE_VERIFIER_KEY, &params.code_verifier);
-    let _ = storage.set_item(PKCE_STATE_KEY, &params.state);
-    let _ = storage.set_item(PKCE_NONCE_KEY, &params.nonce);
+    SessionStorage::set(
+        PKCE_VERIFIER_KEY.to_string(),
+        &Some(params.code_verifier.clone()),
+    );
+    SessionStorage::set(PKCE_STATE_KEY.to_string(), &Some(params.state.clone()));
+    SessionStorage::set(PKCE_NONCE_KEY.to_string(), &Some(params.nonce.clone()));
     if let Some(rt) = return_to {
-        let _ = storage.set_item(RETURN_TO_KEY, rt);
+        SessionStorage::set(RETURN_TO_KEY.to_string(), &Some(rt.to_string()));
     } else {
-        // Clear a stale return_to from a previous attempt.
-        let _ = storage.remove_item(RETURN_TO_KEY);
+        // Clear any stale return_to from a previous attempt.
+        SessionStorage::set(RETURN_TO_KEY.to_string(), &None::<String>);
     }
 }
 
-/// Load the saved PKCE state from `sessionStorage`.
+/// Load the saved PKCE state from session-scoped storage.
 ///
 /// Returns `None` when any required key is missing (e.g. the user opened a
 /// fresh tab directly on `/auth/callback` without going through the login
-/// flow).
+/// flow, or the session was cleared).
 pub fn load_pkce_state() -> Option<SavedPkceState> {
-    let storage = window().session_storage().ok().flatten()?;
-    let verifier = storage.get_item(PKCE_VERIFIER_KEY).ok().flatten()?;
-    let state = storage.get_item(PKCE_STATE_KEY).ok().flatten()?;
-    let nonce = storage.get_item(PKCE_NONCE_KEY).ok().flatten()?;
-    let return_to = storage.get_item(RETURN_TO_KEY).ok().flatten();
+    let verifier =
+        SessionStorage::get::<Option<String>>(&PKCE_VERIFIER_KEY.to_string()).flatten()?;
+    let state = SessionStorage::get::<Option<String>>(&PKCE_STATE_KEY.to_string()).flatten()?;
+    let nonce = SessionStorage::get::<Option<String>>(&PKCE_NONCE_KEY.to_string()).flatten()?;
+    let return_to = SessionStorage::get::<Option<String>>(&RETURN_TO_KEY.to_string()).flatten();
     Some(SavedPkceState {
         code_verifier: verifier,
         state,
@@ -160,25 +172,24 @@ pub fn load_pkce_state() -> Option<SavedPkceState> {
     })
 }
 
-/// Remove all PKCE keys from `sessionStorage`.
+/// Clear all PKCE keys from session-scoped storage.
 ///
 /// Called by the callback page after successfully exchanging the code so the
-/// one-time values cannot be replayed.
+/// one-time values cannot be replayed.  Setting to `None` rather than
+/// removing the key is semantically equivalent for subsequent reads
+/// (`.flatten()` on `Some(None)` yields `None`, same as a missing key).
 pub fn clear_pkce_state() {
-    let Some(storage) = window().session_storage().ok().flatten() else {
-        return;
-    };
-    let _ = storage.remove_item(PKCE_VERIFIER_KEY);
-    let _ = storage.remove_item(PKCE_STATE_KEY);
-    let _ = storage.remove_item(PKCE_NONCE_KEY);
-    let _ = storage.remove_item(RETURN_TO_KEY);
+    SessionStorage::set(PKCE_VERIFIER_KEY.to_string(), &None::<String>);
+    SessionStorage::set(PKCE_STATE_KEY.to_string(), &None::<String>);
+    SessionStorage::set(PKCE_NONCE_KEY.to_string(), &None::<String>);
+    SessionStorage::set(RETURN_TO_KEY.to_string(), &None::<String>);
 }
 
 // ---------------------------------------------------------------------------
 // State type returned by load_pkce_state
 // ---------------------------------------------------------------------------
 
-/// PKCE values retrieved from `sessionStorage` in the callback page.
+/// PKCE values retrieved from session-scoped storage in the callback page.
 #[derive(Debug, Clone)]
 pub struct SavedPkceState {
     /// The original code verifier — sent to the token endpoint.

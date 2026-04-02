@@ -22,12 +22,15 @@ vcprobe https://webtransport.example.com/lobby/observer/meeting-1
 vcprobe wss://websocket.example.com/lobby/observer/meeting-1
 
 # NATS (subscribe to health packets — no session join)
+# This requires access to your NATS server, either locally or perhaps via
+# portforwarding
 vcprobe --nats nats://localhost:4222 --meeting meeting-1
 ```
 
 ### Proctor mode (full-screen TUI dashboard)
 
-Live participant table with video/mic status, call quality scores, and an event log:
+Live participant table with video/mic status, call quality scores, and an event log.
+This option requires connectivity to your NATS server (here I'm using `kubectl` port forwarding)
 
 ```bash
 vcprobe --nats nats://localhost:4222 --meeting meeting-1 --proctor
@@ -85,6 +88,18 @@ The proctor TUI displays:
 - **Event log**: join/leave events, quality changes, connection events
 
 Quality scores are color-coded: green (75-100), yellow (40-74), red (0-39).
+
+### Proctor mode dashboard
+
+![vcprobe proctor dashboard](screen-shots/vcprobe1.jpg)
+
+### Proctor mode help overlay
+
+![vcprobe proctor help overlay](screen-shots/vcprobe2.jpg)
+
+### NATS packet log view
+
+![vcprobe NATS packet log](screen-shots/vcprobe3.jpg)
 
 ## Architecture
 

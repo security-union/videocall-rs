@@ -20,9 +20,9 @@ use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEnco
 use protobuf::Message;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
-use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
@@ -38,6 +38,7 @@ pub struct AudioProducer {
 
 impl AudioProducer {
     /// Read WAV file duration without loading all samples.
+    #[allow(dead_code)]
     pub fn wav_duration(wav_path: &str) -> anyhow::Result<Duration> {
         let reader = hound::WavReader::open(wav_path)?;
         let spec = reader.spec();
@@ -57,7 +58,7 @@ impl AudioProducer {
         let quit_clone = quit.clone();
         let user_id_clone = user_id.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = thread::spawn(move || {
             if let Err(e) = Self::audio_loop(
                 user_id_clone,
                 audio_data,
@@ -65,9 +66,7 @@ impl AudioProducer {
                 quit_clone,
                 media_start,
                 loop_duration,
-            )
-            .await
-            {
+            ) {
                 error!("Audio producer error: {}", e);
             }
         });
@@ -79,6 +78,7 @@ impl AudioProducer {
         })
     }
 
+    #[allow(dead_code)]
     pub fn from_wav_file(
         user_id: String,
         wav_path: &str,
@@ -138,7 +138,7 @@ impl AudioProducer {
         )
     }
 
-    async fn audio_loop(
+    fn audio_loop(
         user_id: String,
         audio_data: Vec<f32>,
         packet_sender: Sender<Vec<u8>>,
@@ -150,7 +150,8 @@ impl AudioProducer {
         let sample_rate = 48000u32;
         let channels = 1u8;
         let samples_per_packet = (sample_rate as f32 * 0.02) as usize; // 960 samples = 20ms
-        let loop_duration_ms = loop_duration.as_millis() as u64;
+        let packet_interval_us: u64 = 20_000; // 20ms in microseconds
+        let loop_duration_us = loop_duration.as_micros() as u64;
 
         // Create Opus encoder
         let mut opus_encoder = OpusEncoder::new(sample_rate, OpusChannels::Mono, OpusApp::Voip)?;
@@ -171,26 +172,12 @@ impl AudioProducer {
 
             // Position within the loop, derived from shared media clock.
             // Both audio and video wrap at loop_duration so they never drift apart.
-            let elapsed_ms = media_start.elapsed().as_millis() as u64;
-            let position_in_loop_ms = elapsed_ms % loop_duration_ms;
-            let packet_in_loop = position_in_loop_ms / 20;
-            let audio_position = (position_in_loop_ms as usize * sample_rate as usize / 1000)
+            // Position is read AFTER any sleep so it reflects the actual send time,
+            // matching the video producer's pattern (encode-then-sleep).
+            let elapsed_us = media_start.elapsed().as_micros() as u64;
+            let position_in_loop_us = elapsed_us % loop_duration_us;
+            let audio_position = (position_in_loop_us as usize * sample_rate as usize / 1_000_000)
                 .min(audio_data.len().saturating_sub(samples_per_packet));
-
-            // Sleep until next packet deadline
-            let next_packet_ms = (packet_in_loop + 1) * 20;
-            // If next packet crosses the loop boundary, sleep until loop restart
-            let sleep_target_ms = if next_packet_ms >= loop_duration_ms {
-                loop_duration_ms
-            } else {
-                next_packet_ms
-            };
-            let absolute_target = media_start
-                + Duration::from_millis((elapsed_ms - position_in_loop_ms) + sleep_target_ms);
-            let now = Instant::now();
-            if now < absolute_target {
-                tokio::time::sleep(absolute_target - now).await;
-            }
 
             // Extract 20ms worth of samples from the time-derived position
             let mut packet_samples = vec![0.0f32; samples_per_packet];
@@ -241,6 +228,22 @@ impl AudioProducer {
                     error!("Opus encoding failed for {}: {}", user_id, e);
                 }
             }
+
+            // Sleep until next packet deadline (microsecond precision)
+            let packet_in_loop = position_in_loop_us / packet_interval_us;
+            let next_packet_us = (packet_in_loop + 1) * packet_interval_us;
+            let sleep_target_us = if next_packet_us >= loop_duration_us {
+                loop_duration_us
+            } else {
+                next_packet_us
+            };
+            let loop_base_us = elapsed_us - position_in_loop_us;
+            let absolute_target =
+                media_start + Duration::from_micros(loop_base_us + sleep_target_us);
+            let now = Instant::now();
+            if now < absolute_target {
+                thread::sleep(absolute_target - now);
+            }
         }
 
         Ok(())
@@ -249,7 +252,7 @@ impl AudioProducer {
     pub fn stop(&mut self) {
         self.quit.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
-            handle.abort();
+            let _ = handle.join();
         }
     }
 }

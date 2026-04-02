@@ -99,7 +99,7 @@ impl VideoEncoderBuilder {
         cfg.g_profile = self.profile;
         cfg.rc_end_usage = vpx_rc_mode::VPX_VBR;
         cfg.kf_max_dist = 150;
-        cfg.kf_min_dist = 150;
+        cfg.kf_min_dist = 0;
         cfg.kf_mode = vpx_kf_mode::VPX_KF_AUTO;
 
         let ctx = MaybeUninit::zeroed();

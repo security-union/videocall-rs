@@ -16,22 +16,20 @@
  * conditions.
  */
 
+use crate::ekg_renderer::EkgRenderer;
 use crate::video_encoder::VideoEncoderBuilder;
-use image::imageops::FilterType;
-use image::{ImageBuffer, ImageReader, Rgb};
+use image::{ImageBuffer, Rgb};
 use protobuf::Message;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetadata};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-
-// Real VP9 encoder - exactly same approach as videocall-cli
 
 pub struct VideoProducer {
     #[allow(dead_code)]
@@ -41,9 +39,15 @@ pub struct VideoProducer {
 }
 
 impl VideoProducer {
-    pub fn from_image_sequence(
+    /// Create a video producer that renders EKG frames on-the-fly.
+    ///
+    /// No pre-generation needed — each frame is rendered from RMS data
+    /// directly in the video loop (~0.5ms per frame vs ~5ms for VP9 encode).
+    pub fn from_ekg(
         user_id: String,
-        image_dir: &str,
+        renderer: EkgRenderer,
+        rms: Vec<f32>,
+        max_rms: f32,
         packet_sender: Sender<Vec<u8>>,
         media_start: Instant,
         loop_duration: Duration,
@@ -51,12 +55,13 @@ impl VideoProducer {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
         let user_id_clone = user_id.clone();
-        let image_dir = image_dir.to_string();
 
         let handle = thread::spawn(move || {
-            if let Err(e) = Self::video_loop(
+            if let Err(e) = Self::ekg_video_loop(
                 user_id_clone,
-                &image_dir,
+                renderer,
+                rms,
+                max_rms,
                 packet_sender,
                 quit_clone,
                 media_start,
@@ -73,87 +78,35 @@ impl VideoProducer {
         })
     }
 
-    fn video_loop(
+    fn ekg_video_loop(
         user_id: String,
-        image_dir: &str,
+        renderer: EkgRenderer,
+        rms: Vec<f32>,
+        max_rms: f32,
         packet_sender: Sender<Vec<u8>>,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
     ) -> anyhow::Result<()> {
-        // Video configuration - 15fps (~66ms packets)
-        // Lower fps makes small A/V timing offsets less perceptible.
         let width = 1280u32;
         let height = 720u32;
         let framerate = 15u32;
-        let packet_interval = Duration::from_millis(1000 / framerate as u64);
+        // Use microseconds to avoid truncation drift (1000/15 = 66.667ms,
+        // truncating to 66ms drifts ~10ms/sec = ~840ms over 84s).
+        let frame_interval_us: u64 = 1_000_000 / framerate as u64; // 66666us
 
         info!(
-            "Video producer started for {} ({}x{} @ {}fps)",
+            "Video producer started for {} ({}x{} @ {}fps, on-the-fly EKG)",
             user_id, width, height, framerate
         );
 
-        // Load image sequence — try frame_NNNNN.jpg pattern first, fall back to legacy
-        let mut frame_paths: Vec<std::path::PathBuf> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(image_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("frame_") && name.ends_with(".jpg") {
-                        frame_paths.push(p);
-                    }
-                }
-            }
-        }
-        frame_paths.sort();
-
-        // Fall back to legacy output_120..124 pattern
-        if frame_paths.is_empty() {
-            for i in 120..125 {
-                let p = std::path::PathBuf::from(format!("{image_dir}/output_{i}.jpg"));
-                if p.exists() {
-                    frame_paths.push(p);
-                }
-            }
-        }
-
-        // Load raw JPEG bytes into memory (much smaller than decoded I420).
-        // Frames are decoded on-the-fly during encoding to avoid OOM with large sequences.
-        let mut jpeg_frames: Vec<Vec<u8>> = Vec::new();
-        for path in &frame_paths {
-            match std::fs::read(path) {
-                Ok(img_data) => {
-                    jpeg_frames.push(img_data);
-                    debug!("Loaded frame: {}", path.display());
-                }
-                Err(e) => {
-                    warn!("Failed to load frame {}: {}", path.display(), e);
-                }
-            }
-        }
-
-        if jpeg_frames.is_empty() {
-            return Err(anyhow::anyhow!("No frames loaded from {image_dir}"));
-        }
-
-        info!(
-            "Loaded {} frames for {} ({:.1} MB compressed)",
-            jpeg_frames.len(),
-            user_id,
-            jpeg_frames.iter().map(|f| f.len()).sum::<usize>() as f64 / 1_048_576.0
-        );
-
-        // Initialize VP9 encoder (exactly same as videocall-cli)
-        let mut video_encoder = VideoEncoderBuilder::new(framerate, 5) // cpu_used=5 like videocall-cli
+        let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
             .set_resolution(width, height)
             .build()?;
-        video_encoder.update_bitrate_kbps(500)?; // 500kbps default like videocall-cli
+        video_encoder.update_bitrate_kbps(500)?;
 
-        let interval_ms = packet_interval.as_millis() as u64;
-        let loop_duration_ms = loop_duration.as_millis() as u64;
+        let loop_duration_us = loop_duration.as_micros() as u64;
         let mut prev_frame_index: Option<usize> = None;
-        // Global monotonic counter — VP9 encoder and packet metadata need
-        // strictly increasing values. Only frame_index wraps with the loop.
         let mut global_sequence: u64 = 0;
 
         loop {
@@ -162,53 +115,46 @@ impl VideoProducer {
                 break;
             }
 
-            // Position within the loop, derived from shared media clock.
-            // Both audio and video wrap at loop_duration so they never drift apart.
-            let elapsed_ms = media_start.elapsed().as_millis() as u64;
-            let position_in_loop_ms = elapsed_ms % loop_duration_ms;
-            let frame_in_loop = position_in_loop_ms / interval_ms;
-            let frame_index = (frame_in_loop as usize).min(jpeg_frames.len() - 1);
+            let elapsed_us = media_start.elapsed().as_micros() as u64;
+            let position_in_loop_us = elapsed_us % loop_duration_us;
+            let frame_in_loop = (position_in_loop_us / frame_interval_us) as usize;
 
-            // Detect loop wrap: frame_index jumped backwards → force a keyframe
-            // so the browser's VP9 decoder can immediately show the new content.
-            let force_keyframe = match prev_frame_index {
-                Some(prev) => frame_index < prev,
-                None => true, // first frame is always a keyframe
+            // Force keyframe at loop wrap, first frame, or every 5 seconds
+            let at_loop_wrap = match prev_frame_index {
+                Some(prev) => frame_in_loop < prev,
+                None => true,
             };
-            prev_frame_index = Some(frame_index);
+            let periodic_keyframe = global_sequence % (framerate as u64 * 5) == 0;
+            let force_keyframe = at_loop_wrap || periodic_keyframe;
+            prev_frame_index = Some(frame_in_loop);
 
-            // Periodic diagnostics (every 5 seconds)
             if global_sequence.is_multiple_of(framerate as u64 * 5) {
-                let loop_num = elapsed_ms / loop_duration_ms;
+                let loop_num = elapsed_us / loop_duration_us;
                 info!(
-                    "[{}] seq={}, frame={}/{}, loop={}, pos={:.1}s/{}s{}",
+                    "[{}] seq={}, frame={}, loop={}, pos={:.1}s/{:.1}s{}",
                     user_id,
                     global_sequence,
-                    frame_index,
-                    jpeg_frames.len(),
+                    frame_in_loop,
                     loop_num,
-                    position_in_loop_ms as f64 / 1000.0,
-                    loop_duration_ms / 1000,
+                    position_in_loop_us as f64 / 1_000_000.0,
+                    loop_duration_us as f64 / 1_000_000.0,
                     if force_keyframe { " KEYFRAME" } else { "" }
                 );
             }
 
-            // Decode the frame corresponding to current elapsed time
-            let jpeg_data = &jpeg_frames[frame_index];
-
-            let img = ImageReader::new(std::io::Cursor::new(jpeg_data))
-                .with_guessed_format()?
-                .decode()?;
-            let img = img.resize_exact(width, height, FilterType::Nearest);
-            let img = img.to_rgb8();
+            // Render EKG frame on-the-fly (< 1ms)
+            let rms_value = if frame_in_loop < rms.len() {
+                rms[frame_in_loop]
+            } else {
+                0.0
+            };
+            let img = renderer.render_frame_rgb(rms_value, max_rms, frame_in_loop);
             let frame_data = rgb_to_i420(&img);
 
-            // Encode to VP9 — force keyframe at loop boundaries.
-            // PTS must be monotonically increasing (global_sequence), NOT the
-            // loop-relative frame index, or the encoder drops/corrupts frames.
+            // Encode to VP9
             let frames_result = if force_keyframe {
                 info!(
-                    "Forcing keyframe at loop boundary for {} (seq={})",
+                    "Forcing keyframe for {} (seq={})",
                     user_id, global_sequence
                 );
                 video_encoder.encode_keyframe(global_sequence as i64, &frame_data)?
@@ -256,16 +202,16 @@ impl VideoProducer {
 
             global_sequence += 1;
 
-            // Sleep until next frame deadline
-            let next_frame_ms = (frame_in_loop + 1) * interval_ms;
-            let sleep_target_ms = if next_frame_ms >= loop_duration_ms {
-                loop_duration_ms
+            // Sleep until next frame deadline (microsecond precision)
+            let next_frame_us = (frame_in_loop as u64 + 1) * frame_interval_us;
+            let sleep_target_us = if next_frame_us >= loop_duration_us {
+                loop_duration_us
             } else {
-                next_frame_ms
+                next_frame_us
             };
-            let loop_base_ms = elapsed_ms - position_in_loop_ms;
+            let loop_base_us = elapsed_us - position_in_loop_us;
             let absolute_target =
-                media_start + Duration::from_millis(loop_base_ms + sleep_target_ms);
+                media_start + Duration::from_micros(loop_base_us + sleep_target_us);
             let now = Instant::now();
             if now < absolute_target {
                 thread::sleep(absolute_target - now);
@@ -289,9 +235,6 @@ impl Drop for VideoProducer {
     }
 }
 
-// VP9 encoder implemented using exact same approach as videocall-cli
-
-// Convert RGB image to I420 format (same as videocall-cli)
 fn rgb_to_i420(image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Vec<u8> {
     let width = image.width() as usize;
     let height = image.height() as usize;
@@ -308,7 +251,6 @@ fn rgb_to_i420(image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Vec<u8> {
             let g = rgb[rgb_index + 1] as f32;
             let b = rgb[rgb_index + 2] as f32;
 
-            // Calculate Y, U, V components
             let y_value = (0.257 * r + 0.504 * g + 0.098 * b + 16.0).round() as u8;
             let u_value = (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).round() as u8;
             let v_value = (0.439 * r - 0.368 * g - 0.071 * b + 128.0).round() as u8;

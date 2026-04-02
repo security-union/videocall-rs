@@ -1,26 +1,15 @@
-# Conversation bot configuration
+# Example bot configuration
 #
-# Two bots with pre-baked interleaved audio + synced EKG video.
-# Generate assets first: python3 generate-conversation.py
+# Generate assets first: python3 generate-conversation-edge.py
+#
+# Usage:
+#   bot --config config.yaml --users 5
 
 transport: "websocket"
-ramp_up_delay_ms: 0
-server_url: "https://websocket.example.com"
+server_url: "wss://websocket.example.com"
+meeting_id: "1"
+conversation_dir: "conversation"
+ramp_up_delay_ms: 500
 
 # Set jwt_secret here or via JWT_SECRET env var
 # jwt_secret: "your-base64-secret-here"
-
-clients:
-  - user_id: "alice"
-    meeting_id: "1"
-    enable_audio: true
-    enable_video: true
-    audio_file: "conversation/conversation-alice.wav"
-    image_dir: "conversation/frames-alice"
-
-  - user_id: "bob"
-    meeting_id: "1"
-    enable_audio: true
-    enable_video: true
-    audio_file: "conversation/conversation-bob.wav"
-    image_dir: "conversation/frames-bob"

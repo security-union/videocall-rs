@@ -325,20 +325,7 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Match .grid-item's radius so .glow-overlay { border-radius: inherit } works. */
   border-radius: 10px;
-}
-
-/* Transparent overlay that sits on top of the video canvas so the speaking
-   glow (box-shadow ring + inset glow) is not hidden behind the video element.
-   border-radius: inherit picks up the 10px from .canvas-container, producing
-   a ring that matches the tile's rounded corners exactly. */
-.glow-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 20;
-  pointer-events: none;
-  border-radius: inherit;
 }
 
 canvas {
@@ -356,11 +343,11 @@ canvas {
   bottom: clamp(1rem, 2vh, 1.5rem);
   right: clamp(1rem, 2vw, 1.5rem);
   width: clamp(10rem, 18vw, 15rem);
-  height: calc(clamp(10rem, 18vw, 15rem) *  0.5625);
+  height: calc(clamp(10rem, 18vw, 15rem) * 0.5625);
   max-width: 240px;
   max-height: 180px;
   border: 2px solid #444;
-  border-radius: 8px;
+  border-radius: 10px;
   z-index: 10;
   background-color: #1c1c1c;
   display: flex;

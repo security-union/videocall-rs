@@ -1430,7 +1430,7 @@ pub fn AttendantsComponent(
                                     share_screen: screen_share_state().is_sharing(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
-                                    audio_level: if pinned_panel().is_some() { 0.0 } else { local_audio_level() },
+                                    audio_level: local_audio_level(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {

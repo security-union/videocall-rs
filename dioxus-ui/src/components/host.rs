@@ -507,7 +507,7 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
-    let glow = speak_style(audio_level);
+    let glow = speak_style(audio_level, false);
 
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
@@ -518,9 +518,12 @@ pub fn Host(
         div {
             class: "host-video-wrapper",
             style: if video_enabled {
-                "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; pointer-events:auto;"
+                format!(
+                    "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; border-radius:inherit; pointer-events:auto; {}",
+                    glow
+                )
             } else {
-                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
+                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; border-radius:inherit; pointer-events:none;".to_string()
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
             button {
@@ -536,17 +539,13 @@ pub fn Host(
                     path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
                 }
             }
-            // Glow overlay renders ON TOP of the video element
-            if video_enabled {
-                div {
-                    style: "{glow}",
-                    class: "glow-overlay",
-                }
-            }
         }
         if !video_enabled {
             div {
-                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: inherit; position:relative;",
+                style: format!(
+                    "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius:inherit; overflow:hidden; position:relative; {}",
+                    glow
+                ),
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
@@ -566,11 +565,6 @@ pub fn Host(
                         path { d: "M12 20h9" }
                         path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
                     }
-                }
-                // Glow overlay renders ON TOP of content
-                div {
-                    style: "{glow}",
-                    class: "glow-overlay",
                 }
             }
         }

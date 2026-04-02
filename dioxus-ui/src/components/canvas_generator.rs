@@ -33,29 +33,29 @@ use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObser
 /// Compute the inline CSS for the speaking glow on the canvas container.
 /// Always returns explicit values so the glow is fully self-contained in the
 /// inline style with zero dependency on CSS classes.
-pub(crate) fn speak_style(audio_level: f32) -> String {
-    if audio_level <= 0.0 {
-        // Explicitly force off — no reliance on CSS class removal
-        return "box-shadow: none; transition: box-shadow 1.5s ease-out;".to_string();
+pub(crate) fn speak_style(audio_level: f32, is_suppressed: bool) -> String {
+    if is_suppressed {
+        return "box-shadow: none; transition: none;".to_string();
     }
+    if audio_level <= 0.0 {
+        return "box-shadow: none; transition: box-shadow 0.6s ease-out;".to_string();
+    }
+
     let i = audio_level.clamp(0.0, 1.0);
-    // The first shadow (`0 0 0 1.5px`) is a zero-blur, 1.5px-spread outer
-    // box-shadow that acts as a solid ring rendered just outside the overlay's
-    // border-box.  Using box-shadow instead of `border` ensures the ring sits
-    // at the tile's edge rather than 1.5px inside it (CSS `border` renders
-    // inward, eating into the element's own box).
+
     format!(
-        "box-shadow: 0 0 0 1.5px rgba(0, 255, 65, {:.2}), \
-                     inset 0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}), \
-                     0 0 {:.0}px {:.0}px rgba(0, 255, 65, {:.2}); \
-         transition: box-shadow 0.15s ease-in;",
-        0.4 + i * 0.6,   // ring alpha: 0.4–1.0
-        15.0 + i * 25.0, // inset blur: 15–40
-        5.0 + i * 10.0,  // inset spread: 5–15
-        0.3 + i * 0.5,   // inset alpha: 0.3–0.8
-        15.0 + i * 35.0, // outer blur: 15–50
-        3.0 + i * 10.0,  // outer spread: 3–13
-        0.2 + i * 0.4    // outer alpha: 0.2–0.6
+        "box-shadow: \
+            0 0 0 1px rgba(120, 255, 160, {:.2}), \
+            inset 0 0 {:.0}px {:.0}px rgba(120, 255, 160, {:.2}), \
+            0 0 {:.0}px {:.0}px rgba(120, 255, 160, {:.2}); \
+         transition: box-shadow 0.18s ease-in-out;",
+        0.10 + i * 0.12,
+        7.0 + i * 10.0,
+        2.0 + i * 4.0,
+        0.12 + i * 0.18,
+        10.0 + i * 16.0,
+        2.0 + i * 5.0,
+        0.10 + i * 0.14
     )
 }
 
@@ -68,7 +68,11 @@ pub(crate) fn speak_style(audio_level: f32) -> String {
 ///
 /// This way the icon stays green briefly after speech stops (via the held signal)
 /// while the drop-shadow glow tracks the border glow exactly.
-fn mic_style(mic_audio_level: f32, glow_audio_level: f32) -> String {
+fn mic_style(mic_audio_level: f32, glow_audio_level: f32, is_suppressed: bool) -> String {
+    if is_suppressed {
+        // Forced suppression: immediate off with no transition
+        return "color: inherit; filter: none; transition: none;".to_string();
+    }
     if mic_audio_level <= 0.0 && glow_audio_level <= 0.0 {
         // Fully silent: fade out both color and filter
         return "color: inherit; filter: none; transition: color 5.0s ease-out, filter 1.5s ease-out;".to_string();
@@ -169,8 +173,8 @@ pub fn generate_for_peer(
 
     // Compute inline styles: border glow uses raw audio_level,
     // mic icon uses mic_audio_level (held for 1s after silence in Rust)
-    let tile_style = speak_style(audio_level);
-    let mic_inline_style = mic_style(mic_audio_level, audio_level);
+    let tile_style = speak_style(audio_level, suppress_peer);
+    let mic_inline_style = mic_style(mic_audio_level, audio_level, suppress_peer);
 
     // Pre-compute pinned state for this peer's panels so the CSS class is
     // derived from the signal, surviving re-renders.
@@ -206,6 +210,7 @@ pub fn generate_for_peer(
                 id: "{peer_video_div_id}",
                 div {
                     class: "{full_bleed_class}",
+                    style: "{tile_style}",
                     onclick: move |_| {
                         if is_mobile_viewport() {
                             toggle_pinned(pinned_panel, &pin_fb_mobile);
@@ -247,12 +252,6 @@ pub fn generate_for_peer(
                         class: "pin-icon",
                         PushPinIcon {}
                     }
-                    // Glow overlay renders ON TOP of video content so the
-                    // inset box-shadow is not hidden behind the canvas element.
-                    div {
-                        style: "{tile_style}",
-                        class: "glow-overlay",
-                    }
                 }
             }
         };
@@ -291,6 +290,7 @@ pub fn generate_for_peer(
                 id: "{screen_share_div_id}",
                 div {
                     class: "canvas-container video-on",
+                    style: "{tile_style}",
                     onclick: move |_| {
                         if is_mobile_viewport() {
                             toggle_pinned(pinned_panel, &pin_ss_mobile);
@@ -336,6 +336,7 @@ pub fn generate_for_peer(
                     // One canvas for the User Video
                     div {
                         class: "{grid_class}",
+                        style: "{grid_tile_style}",
                         onclick: move |_| {
                             if is_mobile_viewport() {
                                 toggle_pinned(pinned_panel, &pin_pv_mobile);
@@ -372,11 +373,6 @@ pub fn generate_for_peer(
                             onclick: move |_| toggle_pinned(pinned_panel, &pin_pv_btn),
                             class: "pin-icon",
                             PushPinIcon {}
-                        }
-                        // Glow overlay renders ON TOP of video content
-                        div {
-                            style: "{grid_tile_style}",
-                            class: "glow-overlay",
                         }
                     }
                 }

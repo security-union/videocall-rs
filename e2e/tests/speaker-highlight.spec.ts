@@ -161,11 +161,11 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const peerTile = hostPage.locator("#grid-container .canvas-container");
       await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
 
-      // The glow inline style lives on the child .glow-overlay div.
-      const glowOverlay = peerTile.first().locator(".glow-overlay");
+      // The glow inline style lives directly on the .canvas-container.
+      const glowOverlay = peerTile.first();
       await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
 
-      // When silent: no border, box-shadow is none.
+      // When silent: no outer glow, box-shadow shows inner ambient glow only.
       const style = await glowOverlay.getAttribute("style");
       expect(style).toBeTruthy();
       expect(style).toContain("border: 1.5px solid transparent");
@@ -215,8 +215,8 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const peerTile = hostPage.locator("#grid-container .canvas-container");
       await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
 
-      // The glow inline style lives on the child .glow-overlay div.
-      const glowOverlay = peerTile.first().locator(".glow-overlay");
+      // The glow inline style lives directly on the .canvas-container.
+      const glowOverlay = peerTile.first();
       await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
 
       // The inline style should contain a transition property for the
@@ -252,14 +252,24 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const result = await joinMeetingFromPage(page);
       expect(result).toBe("in-meeting");
 
+<<<<<<< HEAD
       // Wait for ANY visible .glow-overlay on the page. With fake devices
       // in E2E, video may be off so the glow-overlay can render outside
       // .host-video-wrapper.
       const glowOverlay = page.locator(".glow-overlay").first();
       await expect(glowOverlay).toBeVisible({ timeout: 15_000 });
+=======
+      // Wait for the host's own video wrapper to appear
+      const hostWrapper = page.locator(".host-video-wrapper");
+      await expect(hostWrapper.first()).toBeVisible({ timeout: 15_000 });
+
+      // The glow inline style now lives directly on .host-video-wrapper.
+      const hostVidWrapper = hostWrapper.first();
+      await expect(hostVidWrapper).toBeVisible({ timeout: 10_000 });
+>>>>>>> 21d89ba9 (Fix: the green border is visible on the pinned screen for the first few seconds)
 
       // The host's own tile should also have silent-state inline styles.
-      const style = await glowOverlay.getAttribute("style");
+      const style = await hostVidWrapper.getAttribute("style");
       expect(style).toBeTruthy();
       expect(style).toContain("border: 1.5px solid transparent");
     } finally {
@@ -421,6 +431,13 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const peerGridItem = hostPage.locator("#grid-container .grid-item").first();
       await expect(peerGridItem).toBeVisible({ timeout: 30_000 });
 
+      // Before pinning: the peer tile glow should have normal styles
+      const peerGlowBefore = peerGridItem.locator(".canvas-container").first();
+      await expect(peerGlowBefore).toBeVisible({ timeout: 10_000 });
+      const peerStyleBefore = await peerGlowBefore.getAttribute("style");
+      expect(peerStyleBefore).toBeTruthy();
+      expect(peerStyleBefore).toContain("box-shadow: none");
+
       // Pin the peer tile
       const pinButton = peerGridItem.locator(".pin-icon");
       await expect(pinButton).toBeVisible({ timeout: 10_000 });
@@ -430,18 +447,20 @@ test.describe("Speaker highlight glow on video tiles", () => {
       // Verify the pinned tile has the class
       await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
 
-      // The host's own tile glow overlay should have suppressed
-      // indicator styles (transparent border, no box-shadow) while
-      // another panel is pinned fullscreen.
+      // The pinned tile's glow should still be visible (it is the pinned tile)
+      const pinnedGlow = peerGridItem.locator(".canvas-container").first();
+      await expect(pinnedGlow).toBeVisible({ timeout: 10_000 });
+
+      // The host's own tile glow should NOT be suppressed (local self-preview always shows feedback)
       const hostWrapper = hostPage.locator(".host-video-wrapper");
       await expect(hostWrapper.first()).toBeVisible({ timeout: 15_000 });
-      const hostGlow = hostWrapper.first().locator(".glow-overlay");
+      const hostGlow = hostWrapper.first();
       await expect(hostGlow).toBeVisible({ timeout: 10_000 });
 
       const hostStyle = await hostGlow.getAttribute("style");
       expect(hostStyle).toBeTruthy();
-      // Speaking indicators must be suppressed: no shadow.
-      expect(hostStyle).toContain("box-shadow: none");
+      // Host's speaking indicators are NOT suppressed: should have normal styles
+      expect(hostStyle).toContain("box-shadow: none"); // Since silent
 
       // Unpin the peer tile
       await pinButton.click();
@@ -503,9 +522,9 @@ test.describe("Speaker highlight glow on video tiles", () => {
       // Verify the pinned tile has the class
       await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
 
-      // The peer tile's own glow overlay should still be visible (it is the pinned tile)
-      const pinnedGlow = peerGridItem.locator(".glow-overlay").first();
-      await expect(pinnedGlow).toBeVisible({ timeout: 10_000 });
+      // The peer tile's own .canvas-container should still show inner glow (it is the pinned tile)
+      const pinnedCanvas = peerGridItem.first().locator(".canvas-container");
+      await expect(pinnedCanvas).toBeVisible({ timeout: 10_000 });
 
       // The host tile's audio-indicator should NOT have the "speaking"
       // class — speaking indicators are suppressed on non-pinned tiles

@@ -195,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_client(
     bot_config: BotConfig,
     user_id: String,

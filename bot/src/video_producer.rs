@@ -78,6 +78,7 @@ impl VideoProducer {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ekg_video_loop(
         user_id: String,
         renderer: EkgRenderer,
@@ -133,7 +134,7 @@ impl VideoProducer {
                 Some(prev) => frame_in_loop < prev,
                 None => true,
             };
-            let periodic_keyframe = global_sequence % (framerate as u64 * 5) == 0;
+            let periodic_keyframe = global_sequence.is_multiple_of(framerate as u64 * 5);
             let force_keyframe = at_loop_wrap || periodic_keyframe;
             prev_frame_index = Some(frame_in_loop);
 

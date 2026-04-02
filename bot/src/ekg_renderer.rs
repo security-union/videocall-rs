@@ -174,10 +174,10 @@ pub fn compute_rms_per_frame(audio: &[f32], sample_rate: u32, fps: u32) -> Vec<f
     let smooth_frames = (0.3 * fps as f32) as usize;
     if smooth_frames > 1 && rms.len() > 1 {
         let mut smoothed = vec![0.0f32; rms.len()];
-        for i in 0..rms.len() {
+        for (i, val) in smoothed.iter_mut().enumerate() {
             let start = i.saturating_sub(smooth_frames / 2);
             let end = (i + smooth_frames / 2 + 1).min(rms.len());
-            smoothed[i] = rms[start..end].iter().sum::<f32>() / (end - start) as f32;
+            *val = rms[start..end].iter().sum::<f32>() / (end - start) as f32;
         }
         return smoothed;
     }

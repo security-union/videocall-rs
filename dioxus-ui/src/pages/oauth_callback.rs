@@ -56,7 +56,10 @@ use crate::constants::{
     meeting_api_base_url, oauth_client_id, oauth_issuer, oauth_redirect_url, oauth_token_url,
 };
 use crate::context::{email_to_display_name, save_display_name_to_storage, validate_display_name};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use crate::id_token::decode_and_validate_id_token;
+#[cfg(test)]
+use crate::id_token::IdTokenClaims;
+use crate::pkce::exchange_code_with_provider;
 use dioxus::prelude::*;
 use dioxus_sdk_storage::{SessionStorage, StorageBacking};
 use gloo_utils::window;
@@ -183,68 +186,32 @@ async fn fetch_token_endpoint_from_discovery(discovery_url: &str) -> Result<Stri
     Ok(doc.token_endpoint)
 }
 
-/// Partial response from `GET /api/v1/oauth/provider-config`.
-#[derive(Debug, Deserialize)]
-struct ProviderConfigResult {
-    #[serde(default)]
-    token_url: String,
-    #[serde(default)]
-    issuer: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProviderConfigResponse {
-    success: bool,
-    result: ProviderConfigResult,
-}
-
 async fn fetch_token_endpoint_from_backend() -> Result<String, String> {
-    let base =
-        meeting_api_base_url().map_err(|e| format!("Cannot build provider-config URL: {e}"))?;
-    let url = format!("{base}/api/v1/oauth/provider-config");
+    // Delegate to the shared provider-config fetch (handles its own cache).
+    let cfg = crate::provider_config::fetch_provider_config().await?;
 
-    let resp = reqwest::get(&url)
-        .await
-        .map_err(|e| format!("Failed to fetch provider config from backend: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Backend provider-config returned HTTP {status}: {body}"
-        ));
+    if !cfg.token_url.is_empty() {
+        cache_token_endpoint(&cfg.token_url);
+        return Ok(cfg.token_url);
     }
 
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read provider-config response: {e}"))?;
-
-    let parsed: ProviderConfigResponse = serde_json::from_str(&text)
-        .map_err(|e| format!("Failed to parse provider-config response: {e} — body: {text}"))?;
-
-    if !parsed.success || parsed.result.token_url.is_empty() {
-        // If token_url is missing but issuer is present, try discovery.
-        if let Some(issuer) = parsed.result.issuer.filter(|s| !s.is_empty()) {
-            let discovery_url = format!(
-                "{}/.well-known/openid-configuration",
-                issuer.trim_end_matches('/')
-            );
-            let url = fetch_token_endpoint_from_discovery(&discovery_url).await?;
-            cache_token_endpoint(&url);
-            return Ok(url);
-        }
-        return Err(
-            "Cannot resolve token endpoint: set OAUTH_TOKEN_URL or OAUTH_ISSUER in the \
-             dioxus-ui environment, or ensure the backend has OAUTH_TOKEN_URL / OAUTH_ISSUER \
-             configured."
-                .to_string(),
+    // token_url empty but issuer present — try OIDC well-known discovery.
+    if let Some(issuer) = cfg.issuer.filter(|s| !s.is_empty()) {
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
         );
+        let url = fetch_token_endpoint_from_discovery(&discovery_url).await?;
+        cache_token_endpoint(&url);
+        return Ok(url);
     }
 
-    let token_url = parsed.result.token_url;
-    cache_token_endpoint(&token_url);
-    Ok(token_url)
+    Err(
+        "Cannot resolve token endpoint: set OAUTH_TOKEN_URL or OAUTH_ISSUER in the \
+         dioxus-ui environment, or ensure the backend has OAUTH_TOKEN_URL / OAUTH_ISSUER \
+         configured."
+            .to_string(),
+    )
 }
 
 fn cache_token_endpoint(url: &str) {
@@ -255,217 +222,14 @@ fn cache_token_endpoint(url: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Provider token exchange
+// Provider token exchange and id_token validation
 // ---------------------------------------------------------------------------
-
-/// Response from the provider's token endpoint.
-#[derive(Debug, Deserialize)]
-struct ProviderTokenResponse {
-    #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    id_token: Option<String>,
-    // error fields — present when the exchange fails
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)] // logged via `error` field
-    error_description: Option<String>,
-}
-
-/// POST to the provider's token endpoint with PKCE parameters.
-///
-/// No `client_secret` is included — this is the public-client PKCE flow.
-/// The provider validates the `code_verifier` against the `code_challenge`
-/// that was sent in the authorization request.
-async fn exchange_code_with_provider(
-    token_endpoint: &str,
-    code: &str,
-    code_verifier: &str,
-    client_id: &str,
-    redirect_uri: &str,
-) -> Result<ProviderTokenResponse, String> {
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("code_verifier", code_verifier),
-        ("client_id", client_id),
-        ("redirect_uri", redirect_uri),
-    ];
-
-    let resp = reqwest::Client::new()
-        .post(token_endpoint)
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "Token exchange request to {token_endpoint} failed: {e}. \
-                 Ensure the provider allows CORS requests from this origin."
-            )
-        })?;
-
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read token response body: {e}"))?;
-
-    let token_resp: ProviderTokenResponse = serde_json::from_str(&body).map_err(|e| {
-        format!("Failed to parse token response (HTTP {status}): {e} — body: {body}")
-    })?;
-
-    if let Some(ref err) = token_resp.error {
-        let desc = token_resp
-            .error_description
-            .as_deref()
-            .unwrap_or("no description");
-        return Err(format!("Token endpoint error '{err}': {desc}"));
-    }
-
-    if !status.is_success() {
-        return Err(format!("Token endpoint returned HTTP {status}: {body}"));
-    }
-
-    Ok(token_resp)
-}
-
-// ---------------------------------------------------------------------------
-// id_token payload parsing and validation
-// ---------------------------------------------------------------------------
-
-/// Claims we extract from the id_token payload.  We do not verify the
-/// signature here — that is the meeting-api's job on every API call.
-#[derive(Debug, Deserialize)]
-struct IdTokenClaims {
-    #[serde(default)]
-    sub: Option<String>,
-    #[serde(default)]
-    email: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    given_name: Option<String>,
-    #[serde(default)]
-    family_name: Option<String>,
-    #[serde(default)]
-    preferred_username: Option<String>,
-    #[serde(default)]
-    nonce: Option<String>,
-    #[serde(default)]
-    exp: Option<u64>,
-    /// Can be a string (single audience) or an array — both are valid per
-    /// the OIDC spec.
-    #[serde(default)]
-    aud: serde_json::Value,
-}
-
-impl IdTokenClaims {
-    /// Return the best display name available in the token.
-    fn display_name(&self) -> String {
-        if let Some(ref n) = self.name {
-            if !n.is_empty() {
-                return n.clone();
-            }
-        }
-        let given_family = match (&self.given_name, &self.family_name) {
-            (Some(g), Some(f)) if !g.is_empty() => Some(format!("{g} {f}")),
-            (Some(g), _) if !g.is_empty() => Some(g.clone()),
-            _ => None,
-        };
-        if let Some(name) = given_family {
-            return name;
-        }
-        if let Some(ref e) = self.email {
-            if !e.is_empty() {
-                return e.clone();
-            }
-        }
-        if let Some(ref u) = self.preferred_username {
-            if !u.is_empty() {
-                return u.clone();
-            }
-        }
-        self.sub.clone().unwrap_or_default()
-    }
-
-    /// Return the canonical user identifier: email if present, otherwise sub.
-    fn user_id(&self) -> Option<String> {
-        self.email
-            .as_deref()
-            .filter(|e| !e.is_empty())
-            .map(str::to_string)
-            .or_else(|| self.sub.clone())
-    }
-
-    /// Does the `aud` claim contain `client_id`?
-    fn audience_contains(&self, client_id: &str) -> bool {
-        match &self.aud {
-            serde_json::Value::String(s) => s == client_id,
-            serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(client_id)),
-            // Null / missing aud — be permissive (some providers omit it for
-            // implicit flows, but we still accept to avoid hard failures).
-            _ => true,
-        }
-    }
-}
-
-/// Decode and lightly validate the id_token payload.
-///
-/// Validates: `nonce`, `exp`, `aud`.
-/// Does NOT validate the signature — that is done by the meeting-api JWKS
-/// check on every API call.
-fn decode_and_validate_id_token(
-    id_token: &str,
-    expected_nonce: &str,
-    client_id: &str,
-) -> Result<IdTokenClaims, String> {
-    // JWT structure: header.payload.signature (three base64url segments)
-    let mut parts = id_token.splitn(3, '.');
-    let _ = parts.next(); // header — skip
-    let payload_b64 = parts
-        .next()
-        .ok_or("id_token has fewer than two dot-separated parts")?;
-
-    let payload_bytes = URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .map_err(|e| format!("Failed to base64url-decode id_token payload: {e}"))?;
-
-    let claims: IdTokenClaims = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| format!("Failed to parse id_token claims JSON: {e}"))?;
-
-    // Validate nonce (anti-replay).
-    match &claims.nonce {
-        Some(n) if n == expected_nonce => {}
-        Some(n) => {
-            return Err(format!(
-                "id_token nonce mismatch: expected '{expected_nonce}', got '{n}'"
-            ));
-        }
-        None => {
-            // Some providers omit the nonce when none was sent.  Since we
-            // always send one, treat a missing nonce as an error.
-            return Err("id_token is missing the nonce claim".to_string());
-        }
-    }
-
-    // Validate expiry using the browser's current time.
-    if let Some(exp) = claims.exp {
-        let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-        if now_secs > exp {
-            return Err(format!("id_token has expired (exp={exp}, now={now_secs})"));
-        }
-    }
-
-    // Validate audience.
-    if !claims.audience_contains(client_id) {
-        return Err(format!(
-            "id_token audience does not contain the configured client_id '{client_id}'"
-        ));
-    }
-
-    Ok(claims)
-}
+//
+// `exchange_code_with_provider` and `ProviderTokenResponse` live in
+// `crate::pkce` and are imported at the top of this file.
+//
+// `IdTokenClaims` and `decode_and_validate_id_token` live in
+// `crate::id_token` and are imported at the top of this file.
 
 // ---------------------------------------------------------------------------
 // Backend user registration (graceful)
@@ -815,128 +579,7 @@ mod tests {
         );
     }
 
-    // --- decode_and_validate_id_token ---
-
-    fn make_jwt_payload(claims: serde_json::Value) -> String {
-        let json = serde_json::to_string(&claims).unwrap();
-        let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
-        // Fake header and signature — we only care about the payload.
-        format!("eyJhbGciOiJSUzI1NiJ9.{encoded}.fakesig")
-    }
-
-    #[test]
-    fn valid_claims_decode_successfully() {
-        let exp = (js_sys::Date::now() / 1000.0) as u64 + 3600;
-        let token = make_jwt_payload(serde_json::json!({
-            "sub": "user123",
-            "email": "user@example.com",
-            "nonce": "testnonce",
-            "exp": exp,
-            "aud": "my-client-id",
-        }));
-        let claims = decode_and_validate_id_token(&token, "testnonce", "my-client-id");
-        assert!(claims.is_ok(), "should decode valid claims");
-        let c = claims.unwrap();
-        assert_eq!(c.email.as_deref(), Some("user@example.com"));
-    }
-
-    #[test]
-    fn wrong_nonce_rejected() {
-        let exp = (js_sys::Date::now() / 1000.0) as u64 + 3600;
-        let token = make_jwt_payload(serde_json::json!({
-            "sub": "user123",
-            "nonce": "correct-nonce",
-            "exp": exp,
-            "aud": "client",
-        }));
-        let result = decode_and_validate_id_token(&token, "wrong-nonce", "client");
-        assert!(result.is_err(), "wrong nonce must be rejected");
-    }
-
-    #[test]
-    fn expired_token_rejected() {
-        let past_exp = 1_000_000u64; // long expired
-        let token = make_jwt_payload(serde_json::json!({
-            "sub": "user123",
-            "nonce": "n",
-            "exp": past_exp,
-            "aud": "client",
-        }));
-        let result = decode_and_validate_id_token(&token, "n", "client");
-        assert!(result.is_err(), "expired token must be rejected");
-    }
-
-    #[test]
-    fn wrong_audience_rejected() {
-        let exp = (js_sys::Date::now() / 1000.0) as u64 + 3600;
-        let token = make_jwt_payload(serde_json::json!({
-            "sub": "user123",
-            "nonce": "n",
-            "exp": exp,
-            "aud": "other-client",
-        }));
-        let result = decode_and_validate_id_token(&token, "n", "my-client");
-        assert!(result.is_err(), "wrong audience must be rejected");
-    }
-
-    #[test]
-    fn array_audience_accepted_when_client_id_present() {
-        let exp = (js_sys::Date::now() / 1000.0) as u64 + 3600;
-        let token = make_jwt_payload(serde_json::json!({
-            "sub": "user123",
-            "nonce": "n",
-            "exp": exp,
-            "aud": ["my-client", "other-client"],
-        }));
-        let result = decode_and_validate_id_token(&token, "n", "my-client");
-        assert!(result.is_ok(), "client_id in array aud should be accepted");
-    }
-
-    #[test]
-    fn display_name_prefers_name_claim() {
-        let claims = IdTokenClaims {
-            sub: Some("sub".into()),
-            email: Some("e@e.com".into()),
-            name: Some("Full Name".into()),
-            given_name: Some("First".into()),
-            family_name: Some("Last".into()),
-            preferred_username: None,
-            nonce: None,
-            exp: None,
-            aud: serde_json::Value::Null,
-        };
-        assert_eq!(claims.display_name(), "Full Name");
-    }
-
-    #[test]
-    fn display_name_falls_back_to_given_family() {
-        let claims = IdTokenClaims {
-            sub: Some("sub".into()),
-            email: Some("e@e.com".into()),
-            name: None,
-            given_name: Some("First".into()),
-            family_name: Some("Last".into()),
-            preferred_username: None,
-            nonce: None,
-            exp: None,
-            aud: serde_json::Value::Null,
-        };
-        assert_eq!(claims.display_name(), "First Last");
-    }
-
-    #[test]
-    fn display_name_falls_back_to_email() {
-        let claims = IdTokenClaims {
-            sub: Some("sub".into()),
-            email: Some("user@example.com".into()),
-            name: None,
-            given_name: None,
-            family_name: None,
-            preferred_username: None,
-            nonce: None,
-            exp: None,
-            aud: serde_json::Value::Null,
-        };
-        assert_eq!(claims.display_name(), "user@example.com");
-    }
+    // Tests for `parse_query_param` only.
+    // Tests for `decode_and_validate_id_token` and `IdTokenClaims` live
+    // in `crate::id_token` (see `src/id_token.rs`).
 }

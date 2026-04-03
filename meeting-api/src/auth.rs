@@ -476,6 +476,7 @@ mod tests {
             allowed_redirect_urls: vec![],
             end_session_endpoint: None,
             after_logout_url: None,
+            browser_pkce: false,
         }
     }
 

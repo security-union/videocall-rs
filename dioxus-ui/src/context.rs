@@ -150,6 +150,13 @@ pub fn migrate_legacy_storage() {
     #[cfg(target_family = "wasm")]
     {
         // If the new CBOR format already has a value, nothing to migrate.
+        //
+        // Note: `load_display_name_from_storage()` returns `None` for both
+        // "key absent" **and** "key present but encoded in the old plain-string
+        // format" — dioxus_sdk_storage silently returns `None` on a CBOR
+        // deserialisation failure.  That dual-None behaviour is exactly what
+        // makes this guard correct: the early return fires only when new-format
+        // data already exists, never for stale plain-string data.
         if load_display_name_from_storage().is_some() {
             return;
         }

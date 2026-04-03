@@ -11,29 +11,41 @@
  * at your option.
  */
 
-//! OAuth route handlers: login, callback (legacy), exchange, session, profile, logout.
+//! OAuth route handlers: login, callback, exchange, session, profile, logout.
 //!
-//! ## New authentication flow (dioxus-ui)
+//! ## Authentication modes
+//!
+//! ### Legacy mode (`OAUTH_BROWSER_PKCE=false`, the default)
+//!
+//! `OAUTH_REDIRECT_URL` points at the **backend** `/login/callback` route.
+//! After a successful token exchange the handler issues a signed session JWT
+//! inside an `HttpOnly; Secure; SameSite=Lax` cookie named `session`.
+//! JavaScript cannot read the cookie; the browser sends it automatically on
+//! every subsequent request.  Existing deployments use this mode and require
+//! no configuration change.
+//!
+//! ### Browser PKCE mode (`OAUTH_BROWSER_PKCE=true`)
+//!
+//! `OAUTH_REDIRECT_URL` points at the **dioxus-ui** `/auth/callback` route.
+//! The flow is:
 //!
 //! 1. Browser navigates to `GET /login?returnTo=<url>` — the server generates
 //!    PKCE + CSRF material, stores them in the DB, and redirects to the
-//!    identity provider.  `OAUTH_REDIRECT_URL` must now point to the **UI**
-//!    callback route (e.g. `http://localhost:3001/auth/callback`), not the
-//!    backend.
+//!    identity provider.
 //!
-//! 2. Provider redirects to the UI callback with `?code=...&state=...`.
+//! 2. Provider redirects to the UI `/auth/callback` with `?code=...&state=...`.
 //!
-//! 3. UI calls `POST /api/v1/oauth/exchange` with `{ code, state }`.  The
-//!    server validates CSRF, performs the server-to-server token exchange
-//!    (keeping `client_secret` private), verifies the id_token via JWKS, and
-//!    returns `{ user_id, display_name, id_token, access_token, return_to }`.
+//! 3. The UI exchanges the code directly with the provider (public-client PKCE,
+//!    no `client_secret` in the browser) and stores the returned tokens in
+//!    `sessionStorage`.
 //!
-//! 4. UI stores the `id_token` in `sessionStorage` and presents it as
-//!    `Authorization: Bearer <id_token>` on subsequent API requests.
+//! 4. The UI calls `POST /api/v1/user/register` with `Authorization: Bearer
+//!    <id_token>` to upsert the user record on the backend.
 //!
-//! **Session cookies are no longer issued.**  The legacy `GET /login/callback`
-//! handler still performs the exchange and upserts the user, but it redirects
-//! without setting a `Set-Cookie` header.
+//! In browser PKCE mode **no session cookie is issued**.  If the provider
+//! accidentally sends the code to the backend `/login/callback` route while
+//! `OAUTH_BROWSER_PKCE=true`, the handler logs a warning and redirects
+//! without setting a cookie so the deployment degrades gracefully.
 
 use axum::{
     extract::{Query, State},
@@ -54,10 +66,35 @@ use crate::db::oauth as db_oauth;
 use crate::error::AppError;
 use crate::oauth;
 use crate::state::AppState;
+use crate::token;
 
 // ---------------------------------------------------------------------------
-// Cookie helpers (used only for logout / clear-cookie responses)
+// Cookie helpers
 // ---------------------------------------------------------------------------
+
+/// Build a `Set-Cookie` header value for the session JWT.
+///
+/// Used by the legacy `GET /login/callback` handler when `OAUTH_BROWSER_PKCE`
+/// is `false` (the default).  Attributes match OWASP session-cookie guidance:
+/// `HttpOnly` (JavaScript cannot read it), `SameSite=Lax` (CSRF mitigation),
+/// `Secure` when `cookie_secure` is `true` (HTTPS-only transmission),
+/// and `Max-Age` for an explicit TTL so the browser expires it correctly.
+fn build_session_cookie(
+    name: &str,
+    jwt: &str,
+    ttl_secs: i64,
+    domain: Option<&str>,
+    secure: bool,
+) -> String {
+    let mut cookie = format!("{name}={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    if let Some(d) = domain {
+        cookie.push_str(&format!("; Domain={d}"));
+    }
+    cookie
+}
 
 /// Build a `Set-Cookie` header that clears the session cookie.
 fn build_clear_session_cookie(name: &str, domain: Option<&str>, secure: bool) -> String {
@@ -145,17 +182,22 @@ pub async fn login(
 
 /// GET /login/callback?state=...&code=...
 ///
-/// **Legacy handler** — kept for backward compatibility when `OAUTH_REDIRECT_URL`
-/// still points to the backend.  For new deployments set `OAUTH_REDIRECT_URL`
-/// to the UI's `/auth/callback` route and use `POST /api/v1/oauth/exchange`.
+/// Handles the OAuth callback from the identity provider.
 ///
-/// Exchanges the authorization code, validates the id_token, and upserts the
-/// user, then redirects to `AFTER_LOGIN_URL`.
+/// ## Legacy mode (`OAUTH_BROWSER_PKCE=false`, default)
 ///
-/// **Session cookies are no longer issued.**  Clients that previously relied
-/// on the `Set-Cookie: session=...` header from this handler must migrate to
-/// `/api/v1/oauth/exchange`, which returns the id_token in the JSON body for
-/// client-side storage.
+/// Issues a signed session JWT inside an `HttpOnly` cookie after a successful
+/// token exchange.  The browser sends the cookie automatically on every
+/// subsequent request.  Use this mode when `OAUTH_REDIRECT_URL` still points
+/// at the backend `/login/callback` route (all existing deployments).
+///
+/// ## Browser PKCE mode (`OAUTH_BROWSER_PKCE=true`)
+///
+/// Skips cookie issuance.  In this mode `OAUTH_REDIRECT_URL` should point at
+/// the dioxus-ui `/auth/callback` route so the provider sends the code to the
+/// browser, not here.  If the code arrives here despite the setting, the
+/// handler logs a warning and redirects without a cookie so the deployment
+/// degrades gracefully rather than silently.
 pub async fn callback(
     State(state): State<AppState>,
     Query(query): Query<CallbackQuery>,
@@ -250,47 +292,89 @@ pub async fn callback(
         None => oauth_cfg.after_login_url.clone(),
     };
 
-    tracing::info!(
-        "Legacy OAuth callback for {} ({}), redirecting to {} \
-         (no session cookie issued; migrate to /api/v1/oauth/exchange)",
-        display_name,
-        email,
-        redirect_url,
-    );
-
-    // Redirect without a session cookie. Cookie issuance has been disabled;
-    // clients must use /api/v1/oauth/exchange.
-    Ok(Redirect::to(&redirect_url).into_response())
+    if oauth_cfg.browser_pkce {
+        // Browser PKCE mode: the provider should have sent the code to the
+        // UI's /auth/callback route, not here.  If it arrived here anyway,
+        // redirect without a session cookie so the failure is loud in logs
+        // but does not produce a confusing half-authenticated state.
+        tracing::warn!(
+            user_id = %email,
+            display_name = %display_name,
+            redirect_url = %redirect_url,
+            "OAUTH_BROWSER_PKCE is enabled but the provider redirected to the \
+             backend /login/callback route — no session cookie will be issued. \
+             Verify that OAUTH_REDIRECT_URL is set to the dioxus-ui /auth/callback route.",
+        );
+        Ok(Redirect::to(&redirect_url).into_response())
+    } else {
+        // Legacy mode: issue a signed session JWT inside an HttpOnly cookie.
+        let session_jwt = token::generate_session_token(
+            &state.jwt_secret,
+            &email,
+            &display_name,
+            state.session_ttl_secs,
+        )?;
+        let session_cookie = build_session_cookie(
+            &state.cookie_name,
+            &session_jwt,
+            state.session_ttl_secs,
+            state.cookie_domain.as_deref(),
+            state.cookie_secure,
+        );
+        tracing::info!(
+            user_id = %email,
+            display_name = %display_name,
+            redirect_url = %redirect_url,
+            "OAuth login successful, redirecting with session cookie",
+        );
+        let mut response = Redirect::to(&redirect_url).into_response();
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&session_cookie)
+                .map_err(|_| AppError::internal("failed to build session cookie header"))?,
+        );
+        Ok(response)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Exchange endpoint — used by the dioxus-ui /auth/callback route
+// Exchange endpoint — server-mediated PKCE (for confidential clients)
 // ---------------------------------------------------------------------------
 
 /// Request body for `POST /api/v1/oauth/exchange`.
 ///
-/// ## Client-side PKCE flow (new — dioxus-ui)
+/// This endpoint performs a **server-mediated** token exchange: the server
+/// calls the identity provider's token endpoint directly, keeping
+/// `client_secret` private.  It supports two sub-modes:
 ///
-/// The UI generates the PKCE verifier and nonce locally via
-/// `window.crypto.getRandomValues`, sends them here so the server can perform
-/// the server-to-server token exchange without ever exposing the
-/// `client_secret` to the browser.
+/// ## Hybrid PKCE (caller-generated verifier)
+///
+/// The caller generates the PKCE verifier and nonce locally and sends them
+/// here alongside the authorization code.  The server performs the exchange
+/// using the caller-supplied verifier.  Intended for clients (e.g. native
+/// apps, confidential providers) that need the server to hold `client_secret`
+/// but also want PKCE protection.
+///
+/// > **Note:** The dioxus-ui does **not** use this path.  It exchanges tokens
+/// > directly with the identity provider (public-client PKCE) and then calls
+/// > `POST /api/v1/user/register`.  This mode exists for future native clients
+/// > or providers that require a `client_secret` even for PKCE.
 ///
 /// ```json
 /// { "code": "…", "code_verifier": "…", "nonce": "…" }
 /// ```
 ///
-/// ## Server-side PKCE flow (legacy — backend `/login` endpoint)
+/// ## Server-side PKCE (server-generated verifier, legacy)
 ///
-/// The backend generated the PKCE material and stored it in the DB keyed by
-/// the CSRF `state`.  The UI sends only `{ "code": "…", "state": "…" }` and
-/// the server looks up the verifier.
+/// The backend generated the PKCE material during `GET /login` and stored it
+/// in the DB keyed by the CSRF `state`.  The caller sends only
+/// `{ "code": "…", "state": "…" }` and the server looks up the verifier.
 ///
 /// ```json
 /// { "code": "…", "state": "…" }
 /// ```
 ///
-/// Both forms are accepted; `code_verifier` takes precedence when present.
+/// Both forms are accepted; `code_verifier` takes precedence when non-empty.
 #[derive(Debug, Deserialize)]
 pub struct ExchangeRequest {
     /// Authorization code received from the identity provider.
@@ -311,14 +395,23 @@ pub struct ExchangeRequest {
 
 /// POST /api/v1/oauth/exchange
 ///
-/// Dual-mode token exchange endpoint:
+/// Server-mediated token exchange endpoint.  The server calls the identity
+/// provider on behalf of the caller, keeping `client_secret` private.
 ///
-/// **Client-side PKCE (new):** the UI sends `code`, `code_verifier`, and
-/// optionally `nonce`.  The server uses the provided verifier for the PKCE
-/// exchange and skips the DB lookup.  CSRF protection is the client's
-/// responsibility (state stored in `sessionStorage`).
+/// > **Note:** The dioxus-ui does **not** call this endpoint.  It exchanges
+/// > tokens directly with the identity provider (public-client PKCE) and then
+/// > calls `POST /api/v1/user/register` to upsert the user record.  This
+/// > endpoint exists for clients that need server-side exchange — e.g.
+/// > confidential OIDC clients where the provider requires a `client_secret`
+/// > even for PKCE, or native clients that cannot reach the provider directly.
 ///
-/// **Server-side PKCE (legacy):** the UI sends `code` and `state`.  The
+/// Two exchange modes are accepted (see [`ExchangeRequest`]):
+///
+/// **Hybrid PKCE:** caller provides `code` + `code_verifier` + optional
+/// `nonce`.  The server uses the caller-supplied verifier and skips the DB
+/// lookup.
+///
+/// **Server-side PKCE (legacy):** caller provides `code` + `state`.  The
 /// server atomically fetches-and-deletes the stored PKCE request from the DB,
 /// validates CSRF, and uses the stored verifier.
 ///
@@ -340,7 +433,7 @@ pub async fn exchange(
 
     // --- Resolve PKCE verifier and expected nonce ---
     //
-    // Client-side PKCE flow: code_verifier was generated in the browser.
+    // Hybrid PKCE flow: code_verifier was generated by the caller.
     // Server-side PKCE flow: code_verifier is stored in the DB, keyed by state.
     let (pkce_verifier, stored_nonce, return_to) =
         if let Some(verifier) = body.code_verifier.filter(|v| !v.is_empty()) {
@@ -924,7 +1017,58 @@ mod tests {
             allowed_redirect_urls: vec![],
             end_session_endpoint,
             after_logout_url,
+            browser_pkce: false,
         }
+    }
+
+    // --- build_session_cookie ---
+
+    #[test]
+    fn session_cookie_contains_name_and_jwt() {
+        let cookie = build_session_cookie("session", "my.jwt.token", 3600, None, false);
+        assert!(cookie.starts_with("session=my.jwt.token;"));
+    }
+
+    #[test]
+    fn session_cookie_custom_name() {
+        let cookie = build_session_cookie("pr1-session", "my.jwt.token", 3600, None, false);
+        assert!(cookie.starts_with("pr1-session=my.jwt.token;"));
+        // Must not be mistakable for a plain "session=" cookie.
+        assert!(!cookie.starts_with("session="));
+    }
+
+    #[test]
+    fn session_cookie_includes_required_attributes() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=3600"));
+    }
+
+    #[test]
+    fn session_cookie_secure_flag_added_when_true() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, true);
+        assert!(cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn session_cookie_no_secure_flag_when_false() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(!cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn session_cookie_domain_appended() {
+        let cookie =
+            build_session_cookie("session", "tok", 3600, Some(".sandbox.videocall.rs"), false);
+        assert!(cookie.contains("Domain=.sandbox.videocall.rs"));
+    }
+
+    #[test]
+    fn session_cookie_no_domain_when_none() {
+        let cookie = build_session_cookie("session", "tok", 3600, None, false);
+        assert!(!cookie.contains("Domain="));
     }
 
     #[test]

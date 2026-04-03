@@ -75,6 +75,17 @@ pub struct RuntimeConfig {
     #[serde(rename = "oauthIssuer")]
     #[serde(default)]
     pub oauth_issuer: Option<String>,
+    /// Optional `prompt` parameter appended to the authorization URL.
+    /// Written from the `OAUTH_PROMPT` environment variable.
+    ///
+    /// Common values: `"login"` (force re-authentication), `"consent"`,
+    /// `"select_account"` (Google/Okta/Entra).  Leave empty (the default)
+    /// for maximum provider compatibility — the parameter is omitted
+    /// entirely when blank so it does not cause errors on providers that
+    /// do not recognise it.
+    #[serde(rename = "oauthPrompt")]
+    #[serde(default)]
+    pub oauth_prompt: Option<String>,
     #[serde(rename = "serverElectionPeriodMs")]
     pub server_election_period_ms: u64,
     #[serde(rename = "audioBitrateKbps")]
@@ -139,16 +150,6 @@ pub fn login_url() -> Result<String, String> {
 }
 pub fn logout_url() -> Result<String, String> {
     meeting_api_base_url().map(|url| format!("{}/logout", url))
-}
-/// URL of the `POST /api/v1/oauth/exchange` endpoint.
-///
-/// This is the **legacy** server-side PKCE exchange path.  The dioxus-ui
-/// callback now exchanges the code directly with the provider, so this
-/// function is no longer called by the UI itself but is kept for external
-/// clients that may still use the server-side flow.
-#[allow(dead_code)]
-pub fn oauth_exchange_url() -> Result<String, String> {
-    meeting_api_base_url().map(|url| format!("{}/api/v1/oauth/exchange", url))
 }
 pub fn actix_websocket_base() -> Result<String, String> {
     app_config().map(|c| c.ws_url)
@@ -246,6 +247,20 @@ pub fn oauth_issuer() -> Option<String> {
     app_config()
         .ok()
         .and_then(|c| c.oauth_issuer)
+        .filter(|s| !s.is_empty())
+}
+
+/// Optional `prompt` value appended to the OIDC authorization URL, read from
+/// `window.__APP_CONFIG.oauthPrompt` (written from `OAUTH_PROMPT`).
+///
+/// Returns `None` when the variable is empty or unset; the parameter is then
+/// omitted from the authorization URL so it does not cause errors on providers
+/// that do not recognise it.  Set to e.g. `"select_account"` or `"login"` to
+/// force the provider to show the account-chooser or re-authentication screen.
+pub fn oauth_prompt() -> Option<String> {
+    app_config()
+        .ok()
+        .and_then(|c| c.oauth_prompt)
         .filter(|s| !s.is_empty())
 }
 

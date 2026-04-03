@@ -201,12 +201,17 @@ pub struct OAuthProviderConfigResponse {
 
 /// Response payload for `POST /api/v1/oauth/exchange`.
 ///
-/// Returned after the server successfully exchanges the authorization code
-/// for provider tokens and validates the id_token via JWKS.
+/// Returned when the server performs a token exchange on the caller's behalf
+/// (server-mediated PKCE path).  Store `access_token` (preferred) or
+/// `id_token` in session-scoped storage and present it as
+/// `Authorization: Bearer <token>` on subsequent meeting-api requests.
+/// No session cookie is issued.
 ///
-/// The client **must** store `id_token` (e.g. in `sessionStorage`) and present
-/// it as `Authorization: Bearer <id_token>` on every subsequent API request.
-/// No session cookie is issued by the server.
+/// ## Not used by the dioxus-ui
+///
+/// The dioxus-ui `/auth/callback` page exchanges tokens **directly with the
+/// identity provider** (public-client PKCE) and calls
+/// `POST /api/v1/user/register` instead — it never receives this type.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OAuthExchangeResponse {
     /// The user's canonical identifier (email address from the id_token).

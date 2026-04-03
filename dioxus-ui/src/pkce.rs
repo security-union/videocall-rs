@@ -186,6 +186,90 @@ pub fn clear_pkce_state() {
 }
 
 // ---------------------------------------------------------------------------
+// Provider token exchange (browser-side PKCE flow)
+// ---------------------------------------------------------------------------
+
+/// Response from the identity provider's token endpoint.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ProviderTokenResponse {
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub id_token: Option<String>,
+    // Error fields — present when the provider rejects the exchange.
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)] // surfaced through the `error` message
+    pub error_description: Option<String>,
+}
+
+/// POST the authorization code to the provider's token endpoint.
+///
+/// This is the **public-client** PKCE exchange: no `client_secret` is sent.
+/// The provider validates the `code_verifier` against the `code_challenge`
+/// that was included in the original authorization request.
+///
+/// ## CORS requirement
+///
+/// The provider's token endpoint must include CORS headers that allow the
+/// browser origin.  All major OIDC providers (Google, Okta, Keycloak,
+/// Microsoft Entra) do this for public clients.  Providers that require a
+/// `client_secret` even for PKCE (confidential clients) cannot use this
+/// flow — use `POST /api/v1/oauth/exchange` instead.
+pub(crate) async fn exchange_code_with_provider(
+    token_endpoint: &str,
+    code: &str,
+    code_verifier: &str,
+    client_id: &str,
+    redirect_uri: &str,
+) -> Result<ProviderTokenResponse, String> {
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("code_verifier", code_verifier),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+    ];
+
+    let resp = reqwest::Client::new()
+        .post(token_endpoint)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "Token exchange request to {token_endpoint} failed: {e}. \
+                 Ensure the provider allows CORS requests from this origin."
+            )
+        })?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read token response body: {e}"))?;
+
+    let token_resp: ProviderTokenResponse = serde_json::from_str(&body).map_err(|e| {
+        format!("Failed to parse token response (HTTP {status}): {e} — body: {body}")
+    })?;
+
+    if let Some(ref err) = token_resp.error {
+        let desc = token_resp
+            .error_description
+            .as_deref()
+            .unwrap_or("no description");
+        return Err(format!("Token endpoint error '{err}': {desc}"));
+    }
+
+    if !status.is_success() {
+        return Err(format!("Token endpoint returned HTTP {status}: {body}"));
+    }
+
+    Ok(token_resp)
+}
+
+// ---------------------------------------------------------------------------
 // State type returned by load_pkce_state
 // ---------------------------------------------------------------------------
 

@@ -30,9 +30,9 @@
 //! ## Token storage
 //!
 //! After the provider redirects back to `/auth/callback`, that page exchanges
-//! the authorization code for tokens via `POST /api/v1/oauth/exchange`
-//! (server-to-server, keeping the secret private) and stores the returned
-//! `id_token` in session-scoped storage under the key `"vc_id_token"`.
+//! the authorization code **directly with the identity provider** (public-client
+//! PKCE — no `client_secret` in the browser) and stores the returned tokens in
+//! `sessionStorage` under `"vc_access_token"` and `"vc_id_token"`.
 //!
 //! Storage is managed through [`dioxus_sdk_storage::SessionStorage`], which
 //! maps to the browser's `sessionStorage` on web (tab-scoped, discarded when
@@ -49,14 +49,13 @@
 //! (RP-initiated logout via `end_session_endpoint` when configured).
 
 use crate::constants::{
-    login_url, logout_url, meeting_api_base_url, meeting_api_client, oauth_auth_url,
-    oauth_client_id, oauth_enabled, oauth_redirect_url, oauth_scopes,
+    login_url, logout_url, meeting_api_client, oauth_auth_url, oauth_client_id, oauth_enabled,
+    oauth_prompt, oauth_redirect_url, oauth_scopes,
 };
 use crate::pkce::{self};
 use anyhow::anyhow;
 use dioxus_sdk_storage::{SessionStorage, StorageBacking};
 use gloo_utils::window;
-use serde::Deserialize;
 use videocall_meeting_types::responses::ProfileResponse;
 
 pub type UserProfile = ProfileResponse;
@@ -87,12 +86,6 @@ const PROFILE_USER_ID_KEY: &str = "vc_profile_user_id";
 /// Session-storage key for the user's display name extracted from the
 /// validated id_token payload.
 const PROFILE_DISPLAY_NAME_KEY: &str = "vc_profile_display_name";
-
-/// Session-storage key for the cached provider auth URL (set when the value
-/// was obtained from `GET /api/v1/oauth/provider-config` rather than from
-/// `window.__APP_CONFIG`).
-const CACHED_AUTH_URL_KEY: &str = "vc_oauth_cached_auth_url";
-const CACHED_CLIENT_ID_KEY: &str = "vc_oauth_cached_client_id";
 
 // ---------------------------------------------------------------------------
 // Token storage
@@ -221,22 +214,31 @@ pub async fn check_session() -> anyhow::Result<()> {
 
 /// Return the authenticated user's profile.
 ///
-/// **Fast-path (OAuth):** returns the profile cached in `sessionStorage` by
-/// the OAuth callback page.  The callback stores the `user_id` and
-/// `display_name` extracted from the validated id_token immediately after a
-/// successful token exchange, so this function can return without any network
-/// request.
+/// **Fast-path (OAuth):** returns the profile cached by the OAuth callback page,
+/// but only when at least one token is still present.  If both tokens are absent
+/// (e.g. after an explicit logout) the cache is stale and must not be returned.
+///
+/// > **Contract:** call [`check_session`] before this function on any protected
+/// > page.  `check_session` validates the token server-side (detecting expiry)
+/// > and redirects to login before this function is reached when the session is
+/// > invalid.
 ///
 /// **Fallback (no OAuth / no cached profile):** calls `GET /profile` on the
-/// meeting-api.  This path is taken for deployments that do not use an
-/// external OAuth provider (legacy HMAC session JWT mode) or in the unlikely
-/// event that the cache is absent despite a valid session.
+/// meeting-api.  This path is taken for legacy HMAC session JWT deployments or
+/// in the unlikely event that the profile cache is absent despite a valid session.
 pub async fn get_user_profile() -> anyhow::Result<UserProfile> {
-    // Return the profile cached by the OAuth callback whenever it is present.
-    // This avoids a network round-trip and works even before the first API
-    // call completes.
-    if let Some(profile) = get_stored_user_profile() {
-        return Ok(profile);
+    // Fast-path: cached profile from the OAuth callback page.
+    //
+    // Guard: only serve the cache when at least one token is present.  Tokens
+    // and the profile cache are cleared together on logout; if both are absent
+    // the user has signed out and the cached profile is stale.
+    if oauth_enabled().unwrap_or(false) {
+        if get_stored_access_token().is_some() || get_stored_id_token().is_some() {
+            if let Some(profile) = get_stored_user_profile() {
+                return Ok(profile);
+            }
+        }
+        // Token present but no cached profile — fall through to the API call.
     }
 
     // Fallback: ask the meeting-api.
@@ -247,23 +249,6 @@ pub async fn get_user_profile() -> anyhow::Result<UserProfile> {
 // ---------------------------------------------------------------------------
 // OAuth provider config resolution
 // ---------------------------------------------------------------------------
-
-/// Response body of `GET /api/v1/oauth/provider-config`.
-#[derive(Debug, Deserialize)]
-struct ProviderConfigResponse {
-    success: bool,
-    result: ProviderConfigResult,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProviderConfigResult {
-    #[serde(default)]
-    auth_url: String,
-    #[serde(default)]
-    client_id: String,
-    #[serde(default)]
-    scopes: String,
-}
 
 /// Resolved OAuth parameters needed to build the authorization URL.
 #[derive(Debug, Clone)]
@@ -278,16 +263,11 @@ pub struct OAuthParams {
 /// authorization URL.
 ///
 /// Priority:
-/// 1. `window.__APP_CONFIG` (values injected at container start from env vars).
-/// 2. A previously cached value in `sessionStorage` (set by a prior call to
-///    this function).
-/// 3. `GET /api/v1/oauth/provider-config` — the meeting-api returns the
-///    post-OIDC-discovery values.  The response is cached in `sessionStorage`
-///    so subsequent flows within the same tab are free.
+/// 1. `window.__APP_CONFIG` (injected at container start from env vars).
+/// 2. `GET /api/v1/oauth/provider-config` via the shared
+///    [`crate::provider_config::fetch_provider_config`] helper, which caches
+///    the response in `sessionStorage` for the lifetime of the tab.
 async fn resolve_oauth_params() -> Result<OAuthParams, String> {
-    // The redirect URL is always the dioxus-ui `/auth/callback` route; we
-    // derive it from config or fall back to constructing it from the current
-    // origin.
     let redirect_url = oauth_redirect_url().unwrap_or_else(|| {
         window()
             .location()
@@ -298,8 +278,7 @@ async fn resolve_oauth_params() -> Result<OAuthParams, String> {
 
     let scopes = oauth_scopes();
 
-    // --- Auth URL & Client ID ---
-    // Try config.js first (fast, synchronous).
+    // Fast path: both values present in config.js.
     if let (Some(auth_url), Some(client_id)) = (oauth_auth_url(), oauth_client_id()) {
         return Ok(OAuthParams {
             auth_url,
@@ -309,46 +288,12 @@ async fn resolve_oauth_params() -> Result<OAuthParams, String> {
         });
     }
 
-    // Try the per-session cache to avoid a redundant fetch in the same session.
-    let cached_url =
-        SessionStorage::get::<Option<String>>(&CACHED_AUTH_URL_KEY.to_string()).flatten();
-    let cached_id =
-        SessionStorage::get::<Option<String>>(&CACHED_CLIENT_ID_KEY.to_string()).flatten();
-    if let (Some(auth_url), Some(client_id)) = (cached_url, cached_id) {
-        return Ok(OAuthParams {
-            auth_url,
-            client_id,
-            redirect_url,
-            scopes,
-        });
-    }
-
-    // Fall back to the backend discovery endpoint.
-    let base =
-        meeting_api_base_url().map_err(|e| format!("Cannot build provider-config URL: {e}"))?;
-    let url = format!("{base}/api/v1/oauth/provider-config");
-
-    let resp = reqwest::get(&url)
+    // Backend fallback — shared fetch + cache.
+    let cfg = crate::provider_config::fetch_provider_config()
         .await
-        .map_err(|e| format!("Failed to fetch provider config: {e}"))?;
+        .map_err(|e| format!("Provider config unavailable: {e}"))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Provider config endpoint returned HTTP {status}: {body}"
-        ));
-    }
-
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read provider config response: {e}"))?;
-
-    let parsed: ProviderConfigResponse = serde_json::from_str(&text)
-        .map_err(|e| format!("Failed to parse provider config: {e} — body: {text}"))?;
-
-    if !parsed.success || parsed.result.auth_url.is_empty() {
+    if cfg.auth_url.is_empty() || cfg.client_id.is_empty() {
         return Err(
             "OAuth is not configured on the server, or OAUTH_AUTH_URL was not resolved. \
              Set OAUTH_AUTH_URL in the dioxus-ui environment."
@@ -356,27 +301,15 @@ async fn resolve_oauth_params() -> Result<OAuthParams, String> {
         );
     }
 
-    let result = parsed.result;
-
-    // Cache for subsequent flows in the same session.
-    SessionStorage::set(
-        CACHED_AUTH_URL_KEY.to_string(),
-        &Some(result.auth_url.clone()),
-    );
-    SessionStorage::set(
-        CACHED_CLIENT_ID_KEY.to_string(),
-        &Some(result.client_id.clone()),
-    );
-
-    let scopes = if !result.scopes.is_empty() {
-        result.scopes
+    let scopes = if !cfg.scopes.is_empty() {
+        cfg.scopes
     } else {
         scopes
     };
 
     Ok(OAuthParams {
-        auth_url: result.auth_url,
-        client_id: result.client_id,
+        auth_url: cfg.auth_url,
+        client_id: cfg.client_id,
         redirect_url,
         scopes,
     })
@@ -431,8 +364,12 @@ pub async fn start_oauth_flow(return_to: Option<String>) {
 
 /// Build the authorization URL by appending required OIDC / PKCE query
 /// parameters to the provider's `auth_url`.
+///
+/// The optional `prompt` parameter is included only when `OAUTH_PROMPT` is
+/// non-empty.  Omitting it when it is empty preserves compatibility with
+/// providers that do not recognise non-standard prompt values.
 fn build_auth_url(params: &OAuthParams, pkce: &pkce::PkceParams) -> String {
-    format!(
+    let mut url = format!(
         "{auth_url}\
          ?response_type=code\
          &client_id={client_id}\
@@ -441,8 +378,7 @@ fn build_auth_url(params: &OAuthParams, pkce: &pkce::PkceParams) -> String {
          &state={state}\
          &nonce={nonce}\
          &code_challenge={challenge}\
-         &code_challenge_method=S256\
-         &prompt=select_account",
+         &code_challenge_method=S256",
         auth_url = params.auth_url,
         client_id = urlencoding::encode(&params.client_id),
         redirect_uri = urlencoding::encode(&params.redirect_url),
@@ -450,7 +386,11 @@ fn build_auth_url(params: &OAuthParams, pkce: &pkce::PkceParams) -> String {
         state = pkce.state,
         nonce = pkce.nonce,
         challenge = pkce.code_challenge,
-    )
+    );
+    if let Some(prompt) = oauth_prompt() {
+        url.push_str(&format!("&prompt={}", urlencoding::encode(&prompt)));
+    }
+    url
 }
 
 // ---------------------------------------------------------------------------
@@ -548,13 +488,18 @@ pub fn logout() -> Result<(), String> {
 
 /// Resolve the `returnTo` value used by [`do_login`].
 fn resolve_return_to_for_do_login() -> Option<String> {
-    // 1. Session-scoped storage (preferred — set by protected pages before navigating).
+    // 1. Session-scoped storage (preferred — written by protected pages before
+    //    they redirect to /login).
+    //
+    //    Read but do NOT clear here.  If start_oauth_flow fails before
+    //    save_pkce_state is called (e.g. provider config unreachable), the
+    //    value survives for the user's next login attempt.  It is overwritten
+    //    by save_pkce_state on a successful redirect and cleared by
+    //    clear_pkce_state after a completed exchange.
     let val = SessionStorage::get::<Option<String>>(&pkce::RETURN_TO_KEY.to_string())
         .flatten()
         .filter(|s| !s.is_empty());
     if val.is_some() {
-        // Consume it — do_login owns the return_to from here.
-        SessionStorage::set(pkce::RETURN_TO_KEY.to_string(), &None::<String>);
         return val;
     }
 

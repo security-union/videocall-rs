@@ -2,7 +2,7 @@ window.__APP_CONFIG = Object.freeze({
   apiBaseUrl: "http://localhost:8081",
   wsUrl: "ws://localhost:8080",
   webTransportHost: "https://127.0.0.1:4433",
-  oauthEnabled: "true",
+  oauthEnabled: "false",
   e2eeEnabled: "false",
   webTransportEnabled: "false",
   firefoxEnabled: "false",
@@ -11,12 +11,13 @@ window.__APP_CONFIG = Object.freeze({
   audioBitrateKbps: 65,
   videoBitrateKbps: 100,
   screenBitrateKbps: 100,
-  oauthProvider: "foundation",
+  oauthProvider: "google",
   vadThreshold: 0.02,
   oauthAuthUrl: "",
-  oauthClientId: "client_01KME50QGE1QKKGX5SSY4ZZYV6",
+  oauthClientId: "",
   oauthRedirectUrl: "http://localhost:3001/auth/callback",
   oauthScopes: "openid email profile",
   oauthTokenUrl: "",
-  oauthIssuer: "http://host.docker.internal:8086"
+  oauthIssuer: "",
+  oauthPrompt: ""
 });

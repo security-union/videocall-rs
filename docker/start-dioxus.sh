@@ -24,7 +24,8 @@ window.__APP_CONFIG = Object.freeze({
   oauthRedirectUrl: "${OAUTH_REDIRECT_URL:-}",
   oauthScopes: "${OAUTH_SCOPES:-openid email profile}",
   oauthTokenUrl: "${OAUTH_TOKEN_URL:-}",
-  oauthIssuer: "${OAUTH_ISSUER:-}"
+  oauthIssuer: "${OAUTH_ISSUER:-}",
+  oauthPrompt: "${OAUTH_PROMPT:-}"
 });
 EOF
 

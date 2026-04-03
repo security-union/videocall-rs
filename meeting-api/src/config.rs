@@ -90,6 +90,16 @@ pub struct OAuthConfig {
     /// Configured via `AFTER_LOGOUT_URL`. When not set, the parameter is
     /// omitted from the end-session redirect.
     pub after_logout_url: Option<String>,
+    /// When `true`, the `GET /login/callback` handler skips session-cookie
+    /// issuance after a successful token exchange.  Set this only after
+    /// pointing `OAUTH_REDIRECT_URL` at the dioxus-ui `/auth/callback` route
+    /// (browser PKCE mode) and verifying the UI handles its own token storage.
+    ///
+    /// **Default: `false`** — existing deployments that route the provider
+    /// callback through the backend (`/login/callback`) continue to receive a
+    /// session cookie and require no configuration change.  Flip to `true`
+    /// only once `OAUTH_REDIRECT_URL` has been updated to the UI route.
+    pub browser_pkce: bool,
 }
 
 impl Config {
@@ -108,7 +118,7 @@ impl Config {
     /// - OAuth: `OAUTH_CLIENT_ID`, `OAUTH_SECRET` (optional), `OAUTH_REDIRECT_URL`,
     ///   `OAUTH_ISSUER`, `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_JWKS_URL`,
     ///   `OAUTH_USERINFO_URL`, `OAUTH_SCOPES` (default: `"openid email profile"`),
-    ///   `AFTER_LOGIN_URL`
+    ///   `AFTER_LOGIN_URL`, `OAUTH_BROWSER_PKCE` (default: `false`)
     /// - OIDC logout: `OAUTH_END_SESSION_URL` (manual override; auto-discovered
     ///   from `OAUTH_ISSUER` when not set), `AFTER_LOGOUT_URL` (sent as
     ///   `post_logout_redirect_uri` to the provider's end-session endpoint)
@@ -174,6 +184,13 @@ impl Config {
                 // post_logout_redirect_uri sent to the provider's end-session endpoint.
                 let after_logout_url = env::var("AFTER_LOGOUT_URL").ok().filter(|s| !s.is_empty());
 
+                // When true, GET /login/callback will not issue a session cookie.
+                // Leave false (the default) for any deployment still routing the
+                // provider redirect through the backend /login/callback handler.
+                let browser_pkce = env::var("OAUTH_BROWSER_PKCE")
+                    .map(|v| v.to_lowercase() == "true" || v == "1")
+                    .unwrap_or(false);
+
                 // When no issuer is set, auth_url and token_url must be provided manually.
                 let auth_url = match auth_url {
                     Some(u) => u,
@@ -226,6 +243,7 @@ impl Config {
                     },
                     end_session_endpoint: end_session_url,
                     after_logout_url,
+                    browser_pkce,
                 })
             })
             .transpose()?;

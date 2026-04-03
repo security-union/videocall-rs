@@ -592,9 +592,39 @@ pub fn AttendantsComponent(
                 v.set(v() + 1);
             })),
             on_peer_left: {
+                let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
                     move |(display_name, user_id): (String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+
+                        // Suppress toast if the client is reconnecting — the server
+                        // replays the full member list on each connect, so leave
+                        // events during reconnection are not genuine departures.
+                        let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
+                            if client.is_reconnecting() {
+                                log::debug!(
+                                    "Suppressing leave toast for {} (reconnecting)",
+                                    user_id
+                                );
+                                true
+                            } else if !client.has_peer_with_user_id(&user_id) {
+                                // Peer is not in the tracked list (already removed
+                                // by a previous event) — no toast needed.
+                                log::debug!(
+                                    "Suppressing leave toast for {} (not in peer list)",
+                                    user_id
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if suppress_toast {
+                            return;
+                        }
 
                         let mut toast_counter = toast_counter;
                         let mut peer_toasts = peer_toasts;
@@ -635,11 +665,35 @@ pub fn AttendantsComponent(
                 ))
             },
             on_peer_joined: {
+                let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
                     move |(display_name, user_id): (String, String)| {
                         log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
 
-                        let suppress_toast = false;
+                        // Suppress toast if the client is reconnecting — the server
+                        // replays the full member list as PARTICIPANT_JOINED events
+                        // on each connect, so these are not genuine new arrivals.
+                        // Also suppress if this participant is already tracked in the
+                        // peer list (they reconnected, not newly joined).
+                        let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
+                            if client.is_reconnecting() {
+                                log::debug!(
+                                    "Suppressing join toast for {} (reconnecting)",
+                                    user_id
+                                );
+                                true
+                            } else if client.has_peer_with_user_id(&user_id) {
+                                log::debug!(
+                                    "Suppressing join toast for {} (already in peer list)",
+                                    user_id
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
 
                         let mut toast_counter = toast_counter;
                         let mut peer_toasts = peer_toasts;

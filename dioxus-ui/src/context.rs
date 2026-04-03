@@ -153,6 +153,88 @@ pub fn migrate_legacy_storage() {
 }
 
 // ---------------------------------------------------------------------------
+// Transport preference
+// ---------------------------------------------------------------------------
+
+/// User-facing transport protocol preference.
+///
+/// Stored in `localStorage` under `vc_transport_preference` and read at
+/// connection time to override the server-provided WebTransport flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TransportPreference {
+    /// Honour the server-side `webTransportEnabled` flag (default behaviour).
+    #[default]
+    Auto,
+    /// Force WebTransport — WebSocket URLs are cleared.
+    WebTransportOnly,
+    /// Force WebSocket — WebTransport is disabled.
+    WebSocketOnly,
+}
+
+impl std::fmt::Display for TransportPreference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            TransportPreference::Auto => "auto",
+            TransportPreference::WebTransportOnly => "webtransport",
+            TransportPreference::WebSocketOnly => "websocket",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for TransportPreference {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(TransportPreference::Auto),
+            "webtransport" => Ok(TransportPreference::WebTransportOnly),
+            "websocket" => Ok(TransportPreference::WebSocketOnly),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Context wrapper for the transport preference signal.
+#[derive(Clone, Copy)]
+pub struct TransportPreferenceCtx(pub Signal<TransportPreference>);
+
+const TRANSPORT_PREF_KEY: &str = "vc_transport_preference";
+
+/// Load the persisted transport preference from `localStorage`.
+pub fn load_transport_preference() -> TransportPreference {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(TRANSPORT_PREF_KEY).ok().flatten())
+        .and_then(|val| val.parse::<TransportPreference>().ok())
+        .unwrap_or_default()
+}
+
+/// Persist the transport preference to `localStorage`.
+pub fn save_transport_preference(pref: TransportPreference) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(TRANSPORT_PREF_KEY, &pref.to_string());
+    }
+}
+
+/// Resolve effective transport configuration from the user's preference and
+/// the server-provided WebTransport flag.
+///
+/// Returns `(enable_webtransport, websocket_urls, webtransport_urls)`.
+pub fn resolve_transport_config(
+    pref: TransportPreference,
+    server_wt_enabled: bool,
+    ws_urls: Vec<String>,
+    wt_urls: Vec<String>,
+) -> (bool, Vec<String>, Vec<String>) {
+    match pref {
+        TransportPreference::Auto => (server_wt_enabled, ws_urls, wt_urls),
+        TransportPreference::WebTransportOnly => (true, vec![], wt_urls),
+        TransportPreference::WebSocketOnly => (false, ws_urls, vec![]),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Validation helpers (re-exported from shared crate)
 // ---------------------------------------------------------------------------
 

@@ -20,10 +20,7 @@ use crate::components::{
     canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
 };
 use crate::constants::*;
-use crate::context::{
-    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    LocalAudioLevelCtx, VideoCallClientCtx,
-};
+use crate::context::{LocalAudioLevelCtx, VideoCallClientCtx};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;

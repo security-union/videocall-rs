@@ -386,7 +386,6 @@ pub fn AttendantsComponent(
     #[props(default)] is_owner: bool,
     #[props(default)] room_token: String,
     #[props(default = true)] waiting_room_enabled: bool,
-    #[props(default)] admitted_can_admit: bool,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -424,7 +423,6 @@ pub fn AttendantsComponent(
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
-    let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
@@ -983,7 +981,6 @@ pub fn AttendantsComponent(
     let effective_user_id = user_id.as_deref().unwrap_or(&latest_display_name);
     let can_stream =
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
-    let admitted_toggle_opacity = if waiting_room_toggle() { "1.0" } else { "0.4" };
 
     // --- Pre-join screen ---
     if !meeting_joined() {
@@ -1020,10 +1017,6 @@ pub fn AttendantsComponent(
                                                 }
                                                 toggle_error.set(None);
                                                 waiting_room_toggle.set(new_val);
-                                                // When disabling waiting room, also disable admitted_can_admit
-                                                if !new_val {
-                                                    admitted_can_admit_toggle.set(false);
-                                                }
                                                 saving.set(true);
                                                 let meeting_id = meeting_id.clone();
                                                                 wasm_bindgen_futures::spawn_local(async move {
@@ -1035,40 +1028,6 @@ pub fn AttendantsComponent(
                                                         Err(e) => {
                                                             log::error!("Failed to update waiting room setting: {e}");
                                                             waiting_room_toggle.set(!new_val);
-                                                            saving.set(false);
-                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        },
-                                    }
-                                }
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white; opacity: {admitted_toggle_opacity};",
-                                    span { style: "font-size: 0.9rem;", "Admitted can admit" }
-                                    crate::components::toggle_switch::ToggleSwitch {
-                                        enabled: admitted_can_admit_toggle(),
-                                        disabled: saving() || !waiting_room_toggle(),
-                                        on_toggle: {
-                                            let meeting_id = meeting_id_for_toggle.clone();
-                                            move |new_val: bool| {
-                                                if saving() || !waiting_room_toggle() {
-                                                    return;
-                                                }
-                                                toggle_error.set(None);
-                                                admitted_can_admit_toggle.set(new_val);
-                                                saving.set(true);
-                                                let meeting_id = meeting_id.clone();
-                                                let wr = waiting_room_toggle();
-                                                wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, wr).await {
-                                                        Ok(updated) => {
-                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
-                                                            saving.set(false);
-                                                        }
-                                                        Err(e) => {
-                                                            log::error!("Failed to update admitted_can_admit setting: {e}");
-                                                            admitted_can_admit_toggle.set(!new_val);
                                                             saving.set(false);
                                                             toggle_error.set(Some(format!("Failed to update setting: {e}")));
                                                         }
@@ -1553,8 +1512,8 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                // Waiting room controls (host or admitted participants when allowed)
-                if is_owner || admitted_can_admit {
+                // Waiting room controls (host only)
+                if is_owner {
                     HostControls {
                         meeting_id: id.clone(),
                         is_admitted: true,

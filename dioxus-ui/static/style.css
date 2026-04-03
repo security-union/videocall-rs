@@ -155,37 +155,6 @@ h3 {
   flex-shrink: 0;
 }
 
-.peer_item_name_container {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-
-.peer_item_edit_btn {
-  flex-shrink: 0;
-  background: none;
-  border: none;
-  cursor: pointer;
-  padding: 2px 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 3px;
-  opacity: 0.5;
-  transition: opacity 0.2s, background-color 0.2s;
-  color: currentColor;
-}
-
-.peer_item_edit_btn:hover {
-  opacity: 1;
-  background-color: rgba(255, 255, 255, 0.1);
-}
-
-.peer_item_edit_btn:active {
-  opacity: 0.8;
-}
-
 #grid-container {
   /* Basic grid setup */
   display: grid;

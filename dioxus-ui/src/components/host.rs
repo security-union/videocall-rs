@@ -34,11 +34,6 @@ use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
-use crate::components::{
-    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
-};
-use crate::context::VideoCallClientCtx;
-
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;

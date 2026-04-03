@@ -948,11 +948,7 @@ pub fn AttendantsComponent(
         // Add new sharers to the end (most recent = last)
         for pid in &display_peers {
             if client.is_screen_share_enabled_for_peer(pid) && !stack.contains(pid) {
-                // Skip self — local screen share is shown in the host preview
-                let peer_user_id = client.get_peer_user_id(pid).unwrap_or_else(|| pid.clone());
-                if user_id.as_deref() != Some(peer_user_id.as_str()) {
-                    stack.push(pid.clone());
-                }
+                stack.push(pid.clone());
             }
         }
         stack.last().cloned()
@@ -1227,7 +1223,6 @@ pub fn AttendantsComponent(
                                     full_bleed: true,
                                     host_user_id: host_user_id.clone(),
                                     render_mode: TileMode::ScreenOnly,
-                                    my_peer_id: user_id.clone(),
                                 }
                             }
                         }
@@ -1241,7 +1236,6 @@ pub fn AttendantsComponent(
                                     full_bleed: false,
                                     host_user_id: host_user_id.clone(),
                                     render_mode: TileMode::VideoOnly,
-                                    my_peer_id: user_id.clone(),
                                 }
                             }
                         }
@@ -1257,7 +1251,6 @@ pub fn AttendantsComponent(
                                         peer_id: peer_id.clone(),
                                         full_bleed: full_bleed,
                                         host_user_id: host_user_id.clone(),
-                                        my_peer_id: user_id.clone(),
                                     }
                                 }
                             }

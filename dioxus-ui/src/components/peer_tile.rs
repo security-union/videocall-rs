@@ -34,7 +34,6 @@ pub fn PeerTile(
     #[props(default = false)] full_bleed: bool,
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] render_mode: TileMode,
-    #[props(default)] my_peer_id: Option<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -114,7 +113,6 @@ pub fn PeerTile(
         },
         host_uid,
         render_mode,
-        my_peer_id.as_deref(),
     )
 }
 

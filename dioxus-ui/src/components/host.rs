@@ -16,9 +16,17 @@
  * conditions.
  */
 
+use crate::components::{
+    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
+};
 use crate::constants::*;
+use crate::context::{
+    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
+    LocalAudioLevelCtx, VideoCallClientCtx,
+};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
@@ -26,16 +34,11 @@ use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
-use crate::components::{
-    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
-};
-use crate::context::{
-    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    VideoCallClientCtx,
-};
-
 use std::cell::RefCell;
 use std::rc::Rc;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
+use web_sys::MediaStream;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -66,7 +69,6 @@ pub fn Host(
     share_screen: bool,
     mic_enabled: bool,
     video_enabled: bool,
-    #[props(default)] audio_level: f32,
     on_encoder_settings_update: EventHandler<String>,
     device_settings_open: bool,
     on_device_settings_toggle: EventHandler<()>,
@@ -76,6 +78,8 @@ pub fn Host(
     reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
+    let audio_level = use_context::<LocalAudioLevelCtx>().0;
+    let mut glow_el = use_signal(|| None::<web_sys::Element>);
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -149,6 +153,14 @@ pub fn Host(
         });
         let screen_state_cell = screen_state_handler.clone();
         let screen_state_cb = VcCallback::from(move |event: ScreenShareEvent| {
+            match &event {
+                ScreenShareEvent::Started(stream) => {
+                    attach_screen_preview(stream);
+                }
+                _ => {
+                    detach_screen_preview();
+                }
+            }
             if let Some(handler) = screen_state_cell.borrow().as_ref() {
                 handler.call(event);
             }
@@ -368,6 +380,7 @@ pub fn Host(
             s.prev_share_screen = share_screen;
             if share_screen {
                 s.screen.set_enabled(true);
+                log::info!("Start screen share encoder");
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
                     state_clone.borrow_mut().screen.start();
@@ -376,6 +389,7 @@ pub fn Host(
             } else {
                 s.screen.set_enabled(false);
                 s.screen.stop();
+                detach_screen_preview();
                 s.encoder_settings.screen = None;
             }
         }
@@ -395,6 +409,7 @@ pub fn Host(
                 s.microphone.stop();
                 s.encoder_settings.microphone = None;
             }
+            client.set_audio_enabled(mic_enabled);
         }
 
         // Camera
@@ -414,11 +429,9 @@ pub fn Host(
                 s.camera.stop();
                 s.encoder_settings.camera = None;
             }
+            client.set_video_enabled(video_enabled);
         }
 
-        // Update client flags
-        client.set_audio_enabled(mic_enabled);
-        client.set_video_enabled(video_enabled);
         drop(s);
     }
 
@@ -507,7 +520,16 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
-    let glow = speak_style(audio_level);
+    // Update glow overlay style directly on the DOM element — no component
+    // re-render needed.  The effect subscribes to both `audio_level` (fires on
+    // every mic callback) and `glow_el` (fires when video toggles and a new
+    // overlay element mounts).
+    use_effect(move || {
+        let level = audio_level();
+        if let Some(el) = glow_el() {
+            let _ = el.set_attribute("style", &speak_style(level));
+        }
+    });
 
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
@@ -518,7 +540,7 @@ pub fn Host(
         div {
             class: "host-video-wrapper",
             style: if video_enabled {
-                "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; pointer-events:auto;"
+                "position:relative; width:100%; height:auto; opacity:1; overflow:hidden; pointer-events:auto;"
             } else {
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
@@ -539,14 +561,30 @@ pub fn Host(
             // Glow overlay renders ON TOP of the video element
             if video_enabled {
                 div {
-                    style: "{glow}",
                     class: "glow-overlay",
+                    onmounted: move |evt| {
+                        if let Some(elem) = evt.try_as_web_event() {
+                            glow_el.set(Some(elem));
+                        }
+                    },
                 }
             }
         }
+        // Always-mounted screen share preview — toggled via style so the element
+        // exists in the DOM before attach_screen_preview() runs.
+        // Positioned AFTER the camera so the preview appears below it.
+        video {
+            id: "screen-share-preview",
+            class: "screen-share-preview",
+            style: if share_screen { "display:block;" } else { "display:none;" },
+            autoplay: true,
+            muted: true,
+            playsinline: "true",
+            controls: false,
+        }
         if !video_enabled {
             div {
-                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent;",
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent; width:100%; aspect-ratio:16/9;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
@@ -569,8 +607,12 @@ pub fn Host(
                 }
                 // Glow overlay renders ON TOP of content
                 div {
-                    style: "{glow}",
                     class: "glow-overlay",
+                    onmounted: move |evt| {
+                        if let Some(elem) = evt.try_as_web_event() {
+                            glow_el.set(Some(elem));
+                        }
+                    },
                 }
             }
         }
@@ -692,4 +734,40 @@ struct HostState {
     prev_video_enabled: bool,
     initialized: bool,
     last_reload_counter: u32,
+}
+
+fn attach_screen_preview(stream: &MediaStream) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("screen-share-preview"))
+    {
+        let video: web_sys::HtmlVideoElement = el.unchecked_into();
+        // Explicitly set the muted property (not just the HTML attribute) so that
+        // Chrome's autoplay policy recognises the element as muted and allows play().
+        video.set_muted(true);
+        video.set_src_object(Some(stream));
+        // Properly await the play() Promise via spawn_local.
+        // Dropping the Promise with `let _` causes Chrome to silently abort
+        // playback for display-capture streams; Edge is more lenient.
+        wasm_bindgen_futures::spawn_local(async move {
+            match video.play() {
+                Ok(promise) => {
+                    if let Err(e) = JsFuture::from(promise).await {
+                        log::warn!("Screen preview play() rejected: {:?}", e);
+                    }
+                }
+                Err(e) => log::warn!("Screen preview play() error: {:?}", e),
+            }
+        });
+    }
+}
+
+fn detach_screen_preview() {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("screen-share-preview"))
+    {
+        let video: web_sys::HtmlVideoElement = el.unchecked_into();
+        video.set_src_object(None);
+    }
 }

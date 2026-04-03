@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.13...videocall-codecs-v0.1.14) - 2026-04-03
+
+### Other
+
+- Misc fixes from full review of webtransport and websocket video conferencing app ([#793](https://github.com/security-union/videocall-rs/pull/793))
+
 ## [0.1.13](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.12...videocall-codecs-v0.1.13) - 2026-02-19
 
 ### Other

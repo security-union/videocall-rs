@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.6](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.5...videocall-client-v4.0.6) - 2026-04-03
+
+### Added
+
+- refine speaker highlight ([#746](https://github.com/security-union/videocall-rs/pull/746))
+
+### Fixed
+
+- resolve clippy warnings and fmt issues across workspace ([#794](https://github.com/security-union/videocall-rs/pull/794))
+- stop media tracks after permission check to release camera/mic hardware ([#764](https://github.com/security-union/videocall-rs/pull/764))
+- email, userid, session usage confusion ([#724](https://github.com/security-union/videocall-rs/pull/724))
+- performance improvements ([#705](https://github.com/security-union/videocall-rs/pull/705))
+
+### Other
+
+- Update share screen functionality ([#817](https://github.com/security-union/videocall-rs/pull/817))
+- Disable RED audio ([#787](https://github.com/security-union/videocall-rs/pull/787))
+- Misc fixes from full review of webtransport and websocket video conferencing app ([#793](https://github.com/security-union/videocall-rs/pull/793))
+- Revert "Revert "perf 05: encoder adaptation, client wiring, and UI integratio…" ([#773](https://github.com/security-union/videocall-rs/pull/773))
+- Revert "Revert "Perf stack ([#767](https://github.com/security-union/videocall-rs/pull/767))" ([#772](https://github.com/security-union/videocall-rs/pull/772))" ([#774](https://github.com/security-union/videocall-rs/pull/774))
+- Revert "Perf stack ([#767](https://github.com/security-union/videocall-rs/pull/767))" ([#772](https://github.com/security-union/videocall-rs/pull/772))
+- Revert "perf 05: encoder adaptation, client wiring, and UI integration ([#762](https://github.com/security-union/videocall-rs/pull/762))" ([#771](https://github.com/security-union/videocall-rs/pull/771))
+- Perf stack ([#767](https://github.com/security-union/videocall-rs/pull/767))
+- perf 05: encoder adaptation, client wiring, and UI integration ([#762](https://github.com/security-union/videocall-rs/pull/762))
+- perf 04: decoder improvements - PLI keyframe requests, RED audio unpack, visibility skip ([#761](https://github.com/security-union/videocall-rs/pull/761))
+- perf 01: adaptive quality foundation - constants, quality manager, PID integration ([#758](https://github.com/security-union/videocall-rs/pull/758))
+- Feature/highlight speaker refinement ([#750](https://github.com/security-union/videocall-rs/pull/750))
+- Feature/highlight speaker refinement ([#748](https://github.com/security-union/videocall-rs/pull/748))
+- Upgrade PID controller (pidgeon 0.3.1) and fix adaptive bitrate control ([#747](https://github.com/security-union/videocall-rs/pull/747))
+- Feature/UI tile 594 ([#730](https://github.com/security-union/videocall-rs/pull/730)) ([#745](https://github.com/security-union/videocall-rs/pull/745))
+- Fix display name input suggestions and validation ([#642](https://github.com/security-union/videocall-rs/pull/642))
+- Feature/highlighting speaker ([#704](https://github.com/security-union/videocall-rs/pull/704))
+- Revert NIX backend images from prod ([#668](https://github.com/security-union/videocall-rs/pull/668))
+- Revert "Publish all images for both arm and amd ([#663](https://github.com/security-union/videocall-rs/pull/663))" ([#665](https://github.com/security-union/videocall-rs/pull/665))
+- Publish all images for both arm and amd ([#663](https://github.com/security-union/videocall-rs/pull/663))
+- Fix phantom user appears in meeting ([#658](https://github.com/security-union/videocall-rs/pull/658))
+
 ## [4.0.5](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.4...videocall-client-v4.0.5) - 2026-02-23
 
 ### Other

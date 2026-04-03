@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.10](https://github.com/security-union/videocall-rs/compare/videocall-cli-v3.0.9...videocall-cli-v3.0.10) - 2026-04-03
+
+### Fixed
+
+- email, userid, session usage confusion ([#724](https://github.com/security-union/videocall-rs/pull/724))
+
 ## [3.0.9](https://github.com/security-union/videocall-rs/compare/videocall-cli-v3.0.8...videocall-cli-v3.0.9) - 2026-02-23
 
 ### Other

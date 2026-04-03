@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/security-union/videocall-rs/compare/videocall-diagnostics-v0.1.3...videocall-diagnostics-v0.1.4) - 2026-04-03
+
+### Fixed
+
+- performance improvements ([#705](https://github.com/security-union/videocall-rs/pull/705))
+
+### Other
+
+- remove yew-ui ([#788](https://github.com/security-union/videocall-rs/pull/788)) ([#789](https://github.com/security-union/videocall-rs/pull/789))
+
 ## [0.1.3](https://github.com/security-union/videocall-rs/compare/videocall-diagnostics-v0.1.2...videocall-diagnostics-v0.1.3) - 2025-11-30
 
 ### Other

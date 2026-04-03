@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/security-union/videocall-rs/compare/videocall-meeting-client-v0.1.1...videocall-meeting-client-v0.1.2) - 2026-04-03
+
+### Added
+
+- allow host to set waiting room option ([#696](https://github.com/security-union/videocall-rs/pull/696))
+
+### Fixed
+
+- email, userid, session usage confusion ([#724](https://github.com/security-union/videocall-rs/pull/724))
+- performance improvements ([#705](https://github.com/security-union/videocall-rs/pull/705))
+
+### Other
+
+- remove yew-ui ([#788](https://github.com/security-union/videocall-rs/pull/788)) ([#789](https://github.com/security-union/videocall-rs/pull/789))
+- meeting settings page ([#699](https://github.com/security-union/videocall-rs/pull/699))
+
 ## [0.1.1](https://github.com/security-union/videocall-rs/compare/videocall-meeting-client-v0.1.0...videocall-meeting-client-v0.1.1) - 2026-02-23
 
 ### Other

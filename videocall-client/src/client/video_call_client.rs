@@ -34,9 +34,12 @@ use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -147,6 +150,15 @@ struct Inner {
     /// short time window to avoid firing duplicate toast notifications.
     /// Key: (event_type_str, target_user_id), Value: timestamp_ms
     recent_peer_events: HashMap<(String, String), f64>,
+    /// Flag set by incoming KEYFRAME_REQUEST for camera video. The
+    /// `CameraEncoder` checks this flag each frame and forces a keyframe.
+    force_camera_keyframe: Arc<AtomicBool>,
+    /// Flag set by incoming KEYFRAME_REQUEST for screen share.
+    force_screen_keyframe: Arc<AtomicBool>,
+    /// Flag set when a CONGESTION signal is received from the server.
+    /// The camera encoder's diagnostics loop checks this flag and calls
+    /// `force_video_step_down()` on the `EncoderBitrateController`.
+    congestion_step_down_requested: Arc<AtomicBool>,
 }
 
 /// The main client handle for a video call session.
@@ -236,6 +248,10 @@ impl VideoCallClient {
         let connection_controller: Rc<RefCell<Option<ConnectionController>>> =
             Rc::new(RefCell::new(None));
 
+        let force_camera_keyframe = Arc::new(AtomicBool::new(false));
+        let force_screen_keyframe = Arc::new(AtomicBool::new(false));
+        let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -268,11 +284,28 @@ impl VideoCallClient {
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
                 recent_peer_events: HashMap::new(),
+                force_camera_keyframe: force_camera_keyframe.clone(),
+                force_screen_keyframe: force_screen_keyframe.clone(),
+                congestion_step_down_requested: congestion_step_down_requested.clone(),
             })),
             connection_controller,
             aes,
             _diagnostics: diagnostics.clone(),
         };
+
+        // Wire up the send-packet callback on PeerDecodeManager so it can
+        // send KEYFRAME_REQUEST packets back through the connection.
+        {
+            let client_for_pli = client.clone();
+            if let Ok(mut inner) = client.inner.try_borrow_mut() {
+                inner.peer_decode_manager.set_send_packet_callback(
+                    Callback::from(move |packet: PacketWrapper| {
+                        client_for_pli.send_packet(packet);
+                    }),
+                    options.user_id.clone(),
+                );
+            }
+        }
 
         if let Some(diagnostics) = &diagnostics {
             let client_clone = client.clone();
@@ -299,6 +332,34 @@ impl VideoCallClient {
     }
 
     pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
+        // Idempotency guard: if a ConnectionController already exists we need
+        // to decide whether to skip (actively connecting/connected) or tear
+        // down a stale controller (failed state) before reconnecting.
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                let state = controller.get_connection_state();
+                match state {
+                    // Election running, connection active, or manager is
+                    // already handling its own reconnection — skip.
+                    ConnectionState::Testing { .. }
+                    | ConnectionState::Connected { .. }
+                    | ConnectionState::Reconnecting { .. } => {
+                        info!(
+                            "connect() called but ConnectionController is in {state:?} state — skipping duplicate connection"
+                        );
+                        return Ok(());
+                    }
+                    // Connection permanently failed — tear down the stale
+                    // controller and create a fresh one below.
+                    ConnectionState::Failed { .. } => {
+                        drop(cc);
+                        info!("connect() called with failed ConnectionController — disconnecting before reconnect");
+                        let _ = self.disconnect();
+                    }
+                }
+            }
+        }
+
         let websocket_count = self.options.websocket_urls.len();
         let webtransport_count = if self.options.enable_webtransport {
             self.options.webtransport_urls.len()
@@ -458,6 +519,32 @@ impl VideoCallClient {
         }
     }
 
+    /// Send a media packet via reliable stream.
+    ///
+    /// Used for VIDEO, AUDIO, and SCREEN packets where reliable delivery is
+    /// required to avoid visual/audio artifacts from packet loss. Control
+    /// packets (heartbeats, RTT probes, diagnostics) use datagrams instead
+    /// since they are periodic and expendable.
+    pub(crate) fn send_media_packet(&self, media: PacketWrapper) {
+        let packet_type = media.packet_type.enum_value();
+        match self.connection_controller.try_borrow() {
+            Ok(cc) => {
+                if let Some(controller) = cc.as_ref() {
+                    if let Err(e) = controller.send_packet(media) {
+                        debug!("Failed to send {packet_type:?} media packet: {e}");
+                    }
+                } else {
+                    error!("No connection manager available for {packet_type:?} media packet");
+                }
+            }
+            Err(_) => {
+                error!(
+                    "Unable to borrow connection_controller -- dropping {packet_type:?} media packet"
+                )
+            }
+        }
+    }
+
     /// Returns `true` if the client has an active, elected connection.
     pub fn is_connected(&self) -> bool {
         if let Ok(cc) = self.connection_controller.try_borrow() {
@@ -597,18 +684,43 @@ impl VideoCallClient {
         false
     }
 
-    pub fn is_speaking_for_peer(&self, key: &String) -> bool {
+    pub fn is_speaking_for_peer(&self, key: &str) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             return inner.peer_decode_manager.is_peer_speaking(key);
         }
         false
     }
 
-    pub fn audio_level_for_peer(&self, key: &String) -> f32 {
+    pub fn audio_level_for_peer(&self, key: &str) -> f32 {
         if let Ok(inner) = self.inner.try_borrow() {
             return inner.peer_decode_manager.peer_audio_level(key);
         }
         0.0
+    }
+
+    /// Returns a shared reference to the camera force-keyframe flag.
+    ///
+    /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets
+    /// can force the encoder to produce an immediate keyframe.
+    pub fn force_camera_keyframe_flag(&self) -> Arc<AtomicBool> {
+        self.inner.borrow().force_camera_keyframe.clone()
+    }
+
+    /// Returns a shared reference to the screen force-keyframe flag.
+    ///
+    /// Pass this to `ScreenEncoder` so that incoming KEYFRAME_REQUEST packets
+    /// can force the encoder to produce an immediate keyframe.
+    pub fn force_screen_keyframe_flag(&self) -> Arc<AtomicBool> {
+        self.inner.borrow().force_screen_keyframe.clone()
+    }
+
+    /// Returns a shared reference to the congestion step-down flag.
+    ///
+    /// Pass this to `CameraEncoder` so that incoming CONGESTION signals from
+    /// the server trigger an immediate quality tier step-down via the
+    /// `EncoderBitrateController`.
+    pub fn congestion_step_down_flag(&self) -> Arc<AtomicBool> {
+        self.inner.borrow().congestion_step_down_requested.clone()
     }
 
     pub(crate) fn aes(&self) -> Rc<Aes128State> {
@@ -626,6 +738,36 @@ impl VideoCallClient {
             }
         }
         None
+    }
+
+    /// Returns `true` if the client is currently in a reconnecting state.
+    ///
+    /// During reconnection, the server replays the full participant list as
+    /// PARTICIPANT_JOINED events.  The UI can use this to suppress toast
+    /// notifications for these replayed events.
+    pub fn is_reconnecting(&self) -> bool {
+        matches!(
+            self.get_connection_state(),
+            Some(ConnectionState::Reconnecting { .. })
+        )
+    }
+
+    /// Returns `true` if any peer with the given `user_id` is currently
+    /// tracked in the peer decode manager.
+    ///
+    /// This is useful for the UI to decide whether a PARTICIPANT_JOINED
+    /// event represents a genuinely new participant or a reconnection of
+    /// an already-known participant.
+    pub fn has_peer_with_user_id(&self, user_id: &str) -> bool {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.sorted_keys().iter().any(|sid| {
+                inner
+                    .peer_decode_manager
+                    .get(sid)
+                    .is_some_and(|peer| peer.user_id == user_id)
+            }),
+            Err(_) => false,
+        }
     }
 
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
@@ -695,6 +837,22 @@ impl VideoCallClient {
                 .set_peer_screen_canvas(sid, canvas)
         } else {
             Err(JsValue::from_str("Failed to borrow inner state"))
+        }
+    }
+
+    /// Update the visibility state for a peer. When `visible` is `false`,
+    /// video and screen decoding is paused to save CPU. Audio is always
+    /// decoded regardless of visibility.
+    ///
+    /// Called by the UI layer when an `IntersectionObserver` detects that a
+    /// peer's canvas element has scrolled in or out of the viewport.
+    pub fn set_peer_visibility(&self, peer_id: &str, visible: bool) {
+        let sid: u64 = match peer_id.parse() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.peer_decode_manager.set_peer_visibility(sid, visible);
         }
     }
 
@@ -838,25 +996,69 @@ impl VideoCallClient {
 }
 
 impl Inner {
-    /// Returns `true` if this peer event was already seen recently (within 5 s).
+    /// Returns `true` if this peer event was already seen recently (within 30 s).
     ///
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so the same PARTICIPANT_JOINED / PARTICIPANT_LEFT event can
     /// arrive twice.  This helper deduplicates them so the UI only fires one
     /// toast notification per actual event.
+    ///
+    /// The 30-second window is chosen to outlast the reconnection backoff
+    /// schedule (which can exceed 5 seconds).  A shorter window would allow
+    /// stale "existing member" PARTICIPANT_JOINED events to slip through
+    /// after a reconnect because the dedup entry had already expired.
     fn is_duplicate_peer_event(&mut self, event_type: &str, target_user_id: &str) -> bool {
         let now = js_sys::Date::now();
         let key = (event_type.to_string(), target_user_id.to_string());
 
-        // Evict stale entries (older than 5 seconds).
-        self.recent_peer_events.retain(|_, ts| now - *ts < 5000.0);
+        // Evict stale entries (older than 30 seconds).
+        self.recent_peer_events.retain(|_, ts| now - *ts < 30_000.0);
 
-        if self.recent_peer_events.contains_key(&key) {
-            true // duplicate
-        } else {
-            self.recent_peer_events.insert(key, now);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.recent_peer_events.entry(key) {
+            e.insert(now);
             false // first occurrence
+        } else {
+            true // duplicate
         }
+    }
+
+    /// Try to handle the packet as a KEYFRAME_REQUEST. Returns `true` if it
+    /// was a keyframe request and was handled, `false` otherwise.
+    ///
+    /// A KEYFRAME_REQUEST is a MEDIA packet whose inner `MediaPacket` has
+    /// `media_type == KEYFRAME_REQUEST`. The `data` field contains the stream
+    /// type (`"VIDEO"` or `"SCREEN"`) that needs the keyframe.
+    fn try_handle_keyframe_request(&self, response: &PacketWrapper) -> bool {
+        // Parse the inner MediaPacket to check its media_type.
+        let media_packet = match MediaPacket::parse_from_bytes(&response.data) {
+            Ok(mp) => mp,
+            Err(_) => return false,
+        };
+
+        if media_packet.media_type.enum_value() != Ok(MediaType::KEYFRAME_REQUEST) {
+            return false;
+        }
+
+        let requested_stream = String::from_utf8_lossy(&media_packet.data);
+        info!(
+            "Received KEYFRAME_REQUEST from {} for {}",
+            String::from_utf8_lossy(&response.user_id),
+            requested_stream,
+        );
+
+        match requested_stream.as_ref() {
+            "VIDEO" => {
+                self.force_camera_keyframe.store(true, Ordering::Release);
+            }
+            "SCREEN" => {
+                self.force_screen_keyframe.store(true, Ordering::Release);
+            }
+            other => {
+                warn!("Unknown KEYFRAME_REQUEST stream type: {other}");
+            }
+        }
+
+        true
     }
 
     fn on_inbound_media(&mut self, response: PacketWrapper) {
@@ -947,6 +1149,14 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEDIA) => {
+                // Check if this is a KEYFRAME_REQUEST targeted at us (the sender).
+                // These arrive as MEDIA packets; we intercept them here before
+                // they reach the peer decode manager which would just skip them.
+                if self.try_handle_keyframe_request(&response) {
+                    // Handled -- do not forward to peer_decode_manager.
+                    return;
+                }
+
                 let peer_session_id = response.session_id;
 
                 if let Err(e) = self
@@ -1151,6 +1361,24 @@ impl Inner {
                     error!("Failed to parse MeetingPacket: {e}");
                 }
             },
+            Ok(PacketType::CONGESTION) => {
+                // Server-side congestion feedback: the server is dropping
+                // packets destined for a receiver because the outbound channel
+                // is full. Only act on it if the target session matches ours.
+                if self.own_session_id == Some(response.session_id) {
+                    warn!(
+                        "Received CONGESTION signal from server (receiver: {}), requesting quality step-down",
+                        String::from_utf8_lossy(&response.user_id),
+                    );
+                    self.congestion_step_down_requested
+                        .store(true, Ordering::Release);
+                } else {
+                    debug!(
+                        "Ignoring CONGESTION signal targeted at session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
+                    );
+                }
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

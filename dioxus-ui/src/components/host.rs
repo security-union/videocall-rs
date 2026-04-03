@@ -16,24 +16,23 @@
  * conditions.
  */
 
+use crate::components::{
+    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
+};
 use crate::constants::*;
+use crate::context::{
+    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
+    LocalAudioLevelCtx, VideoCallClientCtx,
+};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-
-use crate::components::{
-    canvas_generator::speak_style, device_selector::DeviceSelector,
-    device_settings_modal::DeviceSettingsModal,
-};
-use crate::context::{
-    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    VideoCallClientCtx,
-};
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -67,16 +66,17 @@ pub fn Host(
     share_screen: bool,
     mic_enabled: bool,
     video_enabled: bool,
-    #[props(default)] audio_level: f32,
     on_encoder_settings_update: EventHandler<String>,
     device_settings_open: bool,
-    on_device_settings_toggle: EventHandler<MouseEvent>,
+    on_device_settings_toggle: EventHandler<()>,
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
     reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
+    let audio_level = use_context::<LocalAudioLevelCtx>().0;
+    let mut glow_el = use_signal(|| None::<web_sys::Element>);
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -130,12 +130,16 @@ pub fn Host(
                 handler.call(err);
             }
         });
-        let mut microphone = create_microphone_encoder(
+        // Microphone encoder is created after camera so it can share the
+        // camera's audio tier atomics (avoiding a duplicate quality manager).
+        let microphone = create_microphone_encoder(
             client.clone(),
             audio_bitrate,
             mic_settings_cb,
             mic_error_cb,
             vad_threshold().ok(),
+            Some(camera.shared_audio_tier_bitrate()),
+            Some(camera.shared_audio_tier_fec()),
         );
 
         let screen_settings_cell = screen_settings_handler.clone();
@@ -157,14 +161,17 @@ pub fn Host(
             screen_state_cb,
         );
 
-        // Wire up encoder controls
+        // Wire up congestion step-down and PLI keyframe flags
+        camera.set_congestion_step_down_flag(client.congestion_step_down_flag());
+        camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
+        screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
+
+        // Wire up encoder controls. The microphone encoder no longer needs
+        // its own diagnostics channel — it reads audio tier settings from
+        // the camera encoder's shared atomics.
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
         camera.set_encoder_control(rx);
-
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
-        microphone.set_encoder_control(rx);
 
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
@@ -389,6 +396,7 @@ pub fn Host(
                 s.microphone.stop();
                 s.encoder_settings.microphone = None;
             }
+            client.set_audio_enabled(mic_enabled);
         }
 
         // Camera
@@ -408,11 +416,9 @@ pub fn Host(
                 s.camera.stop();
                 s.encoder_settings.camera = None;
             }
+            client.set_video_enabled(video_enabled);
         }
 
-        // Update client flags
-        client.set_audio_enabled(mic_enabled);
-        client.set_video_enabled(video_enabled);
         drop(s);
     }
 
@@ -501,7 +507,16 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
-    let glow = speak_style(audio_level);
+    // Update glow overlay style directly on the DOM element — no component
+    // re-render needed.  The effect subscribes to both `audio_level` (fires on
+    // every mic callback) and `glow_el` (fires when video toggles and a new
+    // overlay element mounts).
+    use_effect(move || {
+        let level = audio_level();
+        if let Some(el) = glow_el() {
+            let _ = el.set_attribute("style", &speak_style(level));
+        }
+    });
 
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
@@ -512,9 +527,9 @@ pub fn Host(
         div {
             class: "host-video-wrapper",
             style: if video_enabled {
-                "position:relative; width:auto; height:auto; opacity:1; overflow:hidden; pointer-events:auto;".to_string()
+                "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; pointer-events:auto;"
             } else {
-                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;".to_string()
+                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
             button {
@@ -533,8 +548,12 @@ pub fn Host(
             // Glow overlay renders ON TOP of the video element
             if video_enabled {
                 div {
-                    style: "{glow}",
                     class: "glow-overlay",
+                    onmounted: move |evt| {
+                        if let Some(elem) = evt.try_as_web_event() {
+                            glow_el.set(Some(elem));
+                        }
+                    },
                 }
             }
         }
@@ -563,8 +582,12 @@ pub fn Host(
                 }
                 // Glow overlay renders ON TOP of content
                 div {
-                    style: "{glow}",
                     class: "glow-overlay",
+                    onmounted: move |evt| {
+                        if let Some(elem) = evt.try_as_web_event() {
+                            glow_el.set(Some(elem));
+                        }
+                    },
                 }
             }
         }
@@ -572,34 +595,12 @@ pub fn Host(
         // Device Settings Menu Button
         button {
             class: "device-settings-menu-button btn-apple btn-secondary",
-            onclick: move |e| on_device_settings_toggle.call(e),
+            onclick: move |_| on_device_settings_toggle.call(()),
             title: "Device Settings",
             svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                 circle { cx: "12", cy: "12", r: "3" }
-                path { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" }
-            }
-        }
-
-        // Desktop Device Selector
-        {
-            let on_mic = on_mic_change.clone();
-            let on_cam = on_cam_change.clone();
-            let on_spk = on_speaker_change.clone();
-            rsx! {
-                div { class: "desktop-device-selector",
-                    DeviceSelector {
-                        microphones: microphones.clone(),
-                        cameras: cameras.clone(),
-                        speakers: speakers.clone(),
-                        selected_microphone_id: selected_microphone_id.clone(),
-                        selected_camera_id: selected_camera_id.clone(),
-                        selected_speaker_id: selected_speaker_id.clone(),
-                        on_microphone_select: move |d: DeviceInfo| on_mic(d),
-                        on_camera_select: move |d: DeviceInfo| on_cam(d),
-                        on_speaker_select: move |d: DeviceInfo| on_spk(d),
-                    }
-                }
-            }
+                 path { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" }
+             }
         }
 
         // Mobile Device Settings Modal
@@ -619,7 +620,7 @@ pub fn Host(
                     on_camera_select: move |d: DeviceInfo| on_cam(d),
                     on_speaker_select: move |d: DeviceInfo| on_spk(d),
                     visible: device_settings_open,
-                    on_close: move |e| on_device_settings_toggle.call(e),
+                    on_close: move |_| on_device_settings_toggle.call(())
                 }
             }
         }

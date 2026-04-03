@@ -261,8 +261,9 @@ async fn device_settings_modal_hidden_when_not_visible() {
 }
 
 #[wasm_bindgen_test]
-async fn device_settings_modal_renders_dropdowns_when_visible() {
+async fn device_settings_modal_renders_audio_section_dropdowns_when_visible() {
     let mount = create_mount_point();
+
     fn wrapper() -> Element {
         let mics = vec![mock_mic("m1", "Mic 1")];
         let cams = vec![mock_camera("c1", "Cam 1")];
@@ -283,6 +284,7 @@ async fn device_settings_modal_renders_dropdowns_when_visible() {
             }
         }
     }
+
     render_into(&mount, wrapper);
     yield_now().await;
 
@@ -291,21 +293,21 @@ async fn device_settings_modal_renders_dropdowns_when_visible() {
             .query_selector("#modal-audio-select")
             .unwrap()
             .is_some(),
-        "audio select"
-    );
-    assert!(
-        mount
-            .query_selector("#modal-video-select")
-            .unwrap()
-            .is_some(),
-        "video select"
+        "audio select should be visible in default Audio section"
     );
     assert!(
         mount
             .query_selector("#modal-speaker-select")
             .unwrap()
             .is_some(),
-        "speaker select"
+        "speaker select should be visible in default Audio section"
+    );
+    assert!(
+        mount
+            .query_selector("#modal-video-select")
+            .unwrap()
+            .is_none(),
+        "video select should not be visible until Video section is opened"
     );
 
     cleanup(&mount);
@@ -335,11 +337,268 @@ async fn device_settings_modal_close_button_present() {
     yield_now().await;
 
     let btn = mount.query_selector(".close-button").unwrap().unwrap();
+
     assert_eq!(
-        btn.text_content().unwrap(),
-        "\u{00d7}",
-        "close button should display multiplication sign"
+        btn.get_attribute("type").unwrap_or_default(),
+        "button",
+        "close button should have type=button"
     );
+    assert_eq!(
+        btn.get_attribute("aria-label").unwrap_or_default(),
+        "Close settings",
+        "close button should expose an accessible label"
+    );
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn device_settings_modal_defaults_to_audio_section() {
+    let mount = create_mount_point();
+
+    fn wrapper() -> Element {
+        let mics = vec![mock_mic("m1", "Mic 1")];
+        let cams = vec![mock_camera("c1", "Cam 1")];
+        let spks = vec![mock_speaker("s1", "Speaker 1")];
+
+        rsx! {
+            DeviceSettingsModal {
+                microphones: mics,
+                cameras: cams,
+                speakers: spks,
+                selected_microphone_id: None::<String>,
+                selected_camera_id: None::<String>,
+                selected_speaker_id: None::<String>,
+                on_microphone_select: move |_| {},
+                on_camera_select: move |_| {},
+                on_speaker_select: move |_| {},
+                visible: true,
+                on_close: move |_| {},
+            }
+        }
+    }
+
+    render_into(&mount, wrapper);
+    yield_now().await;
+
+    let audio_btn = mount
+        .query_selector("[data-testid='settings-nav-audio']")
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        audio_btn.class_list().contains("active"),
+        "Audio section should be active by default"
+    );
+
+    assert!(
+        mount
+            .query_selector("#modal-audio-select")
+            .unwrap()
+            .is_some(),
+        "microphone select should be visible in Audio section"
+    );
+
+    assert!(
+        mount
+            .query_selector("#modal-speaker-select")
+            .unwrap()
+            .is_some(),
+        "speaker select should be visible in Audio section"
+    );
+
+    assert!(
+        mount
+            .query_selector("#modal-video-select")
+            .unwrap()
+            .is_none(),
+        "camera select should not be visible in Audio section"
+    );
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn device_settings_modal_switches_to_video_section_on_click() {
+    let mount = create_mount_point();
+
+    fn wrapper() -> Element {
+        let mics = vec![mock_mic("m1", "Mic 1")];
+        let cams = vec![mock_camera("c1", "Cam 1")];
+        let spks = vec![mock_speaker("s1", "Speaker 1")];
+
+        rsx! {
+            DeviceSettingsModal {
+                microphones: mics,
+                cameras: cams,
+                speakers: spks,
+                selected_microphone_id: None::<String>,
+                selected_camera_id: None::<String>,
+                selected_speaker_id: None::<String>,
+                on_microphone_select: move |_| {},
+                on_camera_select: move |_| {},
+                on_speaker_select: move |_| {},
+                visible: true,
+                on_close: move |_| {},
+            }
+        }
+    }
+
+    render_into(&mount, wrapper);
+    yield_now().await;
+
+    let video_btn = mount
+        .query_selector("[data-testid='settings-nav-video']")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<web_sys::HtmlElement>()
+        .unwrap();
+
+    video_btn.click();
+    yield_now().await;
+
+    assert!(
+        mount
+            .query_selector("#modal-video-select")
+            .unwrap()
+            .is_some(),
+        "camera select should be visible after switching to Video section"
+    );
+
+    assert!(
+        mount
+            .query_selector("#modal-audio-select")
+            .unwrap()
+            .is_none(),
+        "microphone select should not be visible in Video section"
+    );
+
+    assert!(
+        mount
+            .query_selector("#modal-speaker-select")
+            .unwrap()
+            .is_none(),
+        "speaker select should not be visible in Video section"
+    );
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn device_settings_modal_updates_active_nav_highlighting() {
+    let mount = create_mount_point();
+
+    fn wrapper() -> Element {
+        let mics = vec![mock_mic("m1", "Mic 1")];
+        let cams = vec![mock_camera("c1", "Cam 1")];
+        let spks = vec![mock_speaker("s1", "Speaker 1")];
+
+        rsx! {
+            DeviceSettingsModal {
+                microphones: mics,
+                cameras: cams,
+                speakers: spks,
+                selected_microphone_id: None::<String>,
+                selected_camera_id: None::<String>,
+                selected_speaker_id: None::<String>,
+                on_microphone_select: move |_| {},
+                on_camera_select: move |_| {},
+                on_speaker_select: move |_| {},
+                visible: true,
+                on_close: move |_| {},
+            }
+        }
+    }
+
+    render_into(&mount, wrapper);
+    yield_now().await;
+
+    let audio_btn = mount
+        .query_selector("[data-testid='settings-nav-audio']")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<web_sys::HtmlElement>()
+        .unwrap();
+
+    let video_btn = mount
+        .query_selector("[data-testid='settings-nav-video']")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<web_sys::HtmlElement>()
+        .unwrap();
+
+    assert!(
+        audio_btn.class_list().contains("active"),
+        "Audio should start active"
+    );
+    assert!(
+        !video_btn.class_list().contains("active"),
+        "Video should start inactive"
+    );
+
+    video_btn.click();
+    yield_now().await;
+
+    let audio_btn = mount
+        .query_selector("[data-testid='settings-nav-audio']")
+        .unwrap()
+        .unwrap();
+
+    let video_btn = mount
+        .query_selector("[data-testid='settings-nav-video']")
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        !audio_btn.class_list().contains("active"),
+        "Audio should no longer be active after switching"
+    );
+    assert!(
+        video_btn.class_list().contains("active"),
+        "Video should be active after switching"
+    );
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn device_settings_modal_renders_only_audio_and_video_navigation() {
+    let mount = create_mount_point();
+
+    fn wrapper() -> Element {
+        rsx! {
+            DeviceSettingsModal {
+                microphones: Vec::<web_sys::MediaDeviceInfo>::new(),
+                cameras: Vec::<web_sys::MediaDeviceInfo>::new(),
+                speakers: Vec::<web_sys::MediaDeviceInfo>::new(),
+                selected_microphone_id: None::<String>,
+                selected_camera_id: None::<String>,
+                selected_speaker_id: None::<String>,
+                on_microphone_select: move |_| {},
+                on_camera_select: move |_| {},
+                on_speaker_select: move |_| {},
+                visible: true,
+                on_close: move |_| {},
+            }
+        }
+    }
+
+    render_into(&mount, wrapper);
+    yield_now().await;
+
+    let nav_buttons = mount.query_selector_all(".settings-nav-button").unwrap();
+    assert_eq!(
+        nav_buttons.length(),
+        2,
+        "should render exactly two nav buttons"
+    );
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(text.contains("Audio"), "should render Audio nav");
+    assert!(text.contains("Video"), "should render Video nav");
+    assert!(!text.contains("Devices"), "should not render Devices nav");
+    assert!(!text.contains("Profile"), "should not render Profile nav");
+    assert!(!text.contains("Advanced"), "should not render Advanced nav");
 
     cleanup(&mount);
 }

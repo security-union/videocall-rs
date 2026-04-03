@@ -1,6 +1,6 @@
 [package]
-name = "videocall-ui-dioxus"
-version = "0.1.0"
+name = "videocall-ui"
+version = "1.1.42"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A Dioxus UI for the videocall project"
@@ -66,6 +66,9 @@ features = [
     "HtmlInputElement",
     "HtmlSelectElement",
     "HtmlVideoElement",
+    "IntersectionObserver",
+    "IntersectionObserverEntry",
+    "IntersectionObserverInit",
     "MediaDeviceInfo",
     "MediaDeviceKind",
     "MediaDevices",

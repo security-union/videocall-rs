@@ -22,6 +22,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use js_sys::Date;
 
+use crate::adaptive_quality_constants::{
+    AudioQualityTier, VideoQualityTier, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
+    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
+    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
+};
+use crate::diagnostics::adaptive_quality_manager::AdaptiveQualityManager;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -225,21 +231,63 @@ pub struct EncoderBitrateController {
     diagnostic_packets: DiagnosticPackets,
     last_correction_time: f64,
     correction_throttle_ms: f64,
+    /// Adaptive quality state machine for tier selection.
+    quality_manager: AdaptiveQualityManager,
+    /// Set to `true` after any tier transition, cleared by the caller via
+    /// [`Self::take_tier_changed`].
+    tier_changed: bool,
 }
 
 impl EncoderBitrateController {
+    /// Create a new bitrate controller using the default `VIDEO_QUALITY_TIERS`.
     pub fn new(ideal_bitrate_kbps: u32, target_fps: Rc<AtomicU32>) -> Self {
+        let quality_manager = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
+    }
+
+    /// Create a new bitrate controller for screen share.
+    ///
+    /// Uses `SCREEN_QUALITY_TIERS` starting at the highest tier (1080p) via
+    /// [`AdaptiveQualityManager::new_for_screen`]. The initial
+    /// `ideal_bitrate_kbps` is synced from the starting tier so the PID
+    /// controller does not make an unnecessary correction on the first update.
+    pub fn new_for_screen(
+        target_fps: Rc<AtomicU32>,
+        video_tiers: &'static [VideoQualityTier],
+    ) -> Self {
+        let quality_manager = AdaptiveQualityManager::new_for_screen(video_tiers);
+        let tier_ideal = quality_manager.current_video_tier().ideal_bitrate_kbps;
+        Self::build(tier_ideal, target_fps, quality_manager)
+    }
+
+    /// Create a new bitrate controller using a custom video tier array
+    /// (e.g., `SCREEN_QUALITY_TIERS` for screen share).
+    pub fn new_with_tiers(
+        ideal_bitrate_kbps: u32,
+        target_fps: Rc<AtomicU32>,
+        video_tiers: &'static [VideoQualityTier],
+    ) -> Self {
+        let quality_manager = AdaptiveQualityManager::new(video_tiers);
+        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
+    }
+
+    /// Internal constructor shared by `new`, `new_with_tiers`, and `new_for_screen`.
+    fn build(
+        ideal_bitrate_kbps: u32,
+        target_fps: Rc<AtomicU32>,
+        quality_manager: AdaptiveQualityManager,
+    ) -> Self {
         let initial_target = target_fps.load(Ordering::Relaxed) as f64;
 
         // Configure PID: setpoint = target FPS, process_value = received FPS.
         // The controller computes error = setpoint − process_value internally.
         let controller_config = pidgeon::ControllerConfig::builder()
-            .with_kp(0.2)
-            .with_ki(0.05)
-            .with_kd(0.02)
+            .with_kp(PID_KP)
+            .with_ki(PID_KI)
+            .with_kd(PID_KD)
             .with_setpoint(initial_target)
-            .with_deadband(0.5)
-            .with_output_limits(0.0, 50.0)
+            .with_deadband(PID_DEADBAND_FPS)
+            .with_output_limits(PID_OUTPUT_MIN, PID_OUTPUT_MAX)
             .with_anti_windup(true)
             .build()
             .expect("PID controller config is valid");
@@ -252,12 +300,14 @@ impl EncoderBitrateController {
             last_update: Date::now(),
             ideal_bitrate_kbps,
             target_fps,
-            fps_history: std::collections::VecDeque::with_capacity(10),
-            max_history_size: 10,
+            fps_history: std::collections::VecDeque::with_capacity(PID_FPS_HISTORY_SIZE),
+            max_history_size: PID_FPS_HISTORY_SIZE,
             initialization_complete: false,
             diagnostic_packets,
             last_correction_time: 0.0,
-            correction_throttle_ms: 1000.0,
+            correction_throttle_ms: PID_CORRECTION_THROTTLE_MS,
+            quality_manager,
+            tier_changed: false,
         }
     }
 
@@ -350,7 +400,7 @@ impl EncoderBitrateController {
         // The PID integral never decays on its own when error is within deadband.
         // Reset the controller when conditions are good so bitrate can recover.
         let current_error = target_fps - fps_received;
-        if current_error.abs() <= 0.5 && pid_output > 0.0 {
+        if current_error.abs() <= PID_DEADBAND_FPS && pid_output > 0.0 {
             self.pid.reset();
         }
 
@@ -358,14 +408,14 @@ impl EncoderBitrateController {
         let min_bitrate = base_bitrate * 0.1;
         let max_bitrate = base_bitrate * 1.5;
 
-        // Map PID output [0, 50] → bitrate reduction [0%, 90%].
-        let reduction_pct = pid_output / 50.0 * 0.9;
+        // Map PID output [0, PID_OUTPUT_MAX] -> bitrate reduction [0%, 90%].
+        let reduction_pct = pid_output / PID_OUTPUT_MAX * 0.9;
         let after_pid = base_bitrate * (1.0 - reduction_pct);
 
-        // Additional jitter penalty: up to 30% reduction at maximum jitter.
+        // Additional jitter penalty: up to PID_MAX_JITTER_PENALTY reduction at maximum jitter.
         let normalized_jitter = jitter / target_fps;
         let jitter_factor = (normalized_jitter * 5.0).min(1.0);
-        let jitter_reduction = after_pid * (jitter_factor * 0.3);
+        let jitter_reduction = after_pid * (jitter_factor * PID_MAX_JITTER_PENALTY);
         let corrected_bitrate = after_pid - jitter_reduction;
 
         let current_error = target_fps - fps_received;
@@ -391,8 +441,33 @@ impl EncoderBitrateController {
             corrected_bitrate.clamp(min_bitrate, max_bitrate)
         };
 
+        // --- Adaptive quality manager: tier selection ---
+        // Feed the same signals to the quality manager for tier transitions.
+        let tier = self.quality_manager.current_video_tier();
+        let ideal_for_tier = tier.ideal_bitrate_kbps as f64;
+        let tier_changed = self.quality_manager.update(
+            fps_received,
+            target_fps,
+            final_bitrate,
+            ideal_for_tier,
+            now,
+        );
+        if tier_changed {
+            self.tier_changed = true;
+            // Update internal ideal bitrate to match the new tier so PID
+            // operates within the new tier's range going forward.
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+        }
+
+        // Clamp the PID output to the current tier's bitrate bounds.
+        let tier = self.quality_manager.current_video_tier();
+        let tier_min = tier.min_bitrate_kbps as f64;
+        let tier_max = tier.max_bitrate_kbps as f64;
+        let tier_clamped = final_bitrate.clamp(tier_min, tier_max);
+
         self.last_correction_time = now;
-        Some(final_bitrate)
+        Some(tier_clamped)
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
@@ -407,6 +482,48 @@ impl EncoderBitrateController {
     // Get all active peer IDs
     pub fn peer_ids(&self) -> Vec<String> {
         self.diagnostic_packets.get_peer_ids()
+    }
+
+    /// Returns `true` if a tier transition occurred since the last call to this
+    /// method, then resets the flag. Callers should use this to detect when
+    /// encoder settings (resolution, fps, keyframe interval) need updating.
+    pub fn take_tier_changed(&mut self) -> bool {
+        std::mem::take(&mut self.tier_changed)
+    }
+
+    /// Get the current video quality tier recommendation.
+    pub fn current_video_tier(&self) -> &'static VideoQualityTier {
+        self.quality_manager.current_video_tier()
+    }
+
+    /// Get the current audio quality tier recommendation.
+    pub fn current_audio_tier(&self) -> &'static AudioQualityTier {
+        self.quality_manager.current_audio_tier()
+    }
+
+    /// Get the current video tier index.
+    pub fn video_tier_index(&self) -> usize {
+        self.quality_manager.video_tier_index()
+    }
+
+    /// Get the current audio tier index.
+    pub fn audio_tier_index(&self) -> usize {
+        self.quality_manager.audio_tier_index()
+    }
+
+    /// Force an immediate video quality step-down due to server congestion.
+    ///
+    /// Delegates to [`AdaptiveQualityManager::force_video_step_down`].
+    /// Returns `true` if the tier actually changed.
+    pub fn force_video_step_down(&mut self) -> bool {
+        let now = Date::now();
+        let changed = self.quality_manager.force_video_step_down(now);
+        if changed {
+            self.tier_changed = true;
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+        }
+        changed
     }
 }
 
@@ -1121,6 +1238,25 @@ mod tests {
         assert!(
             (min_bitrate..=max_bitrate).contains(&bitrate),
             "Bitrate should be within bounds even with tiny dt, got {bitrate}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_new_for_screen_starts_at_highest_tier() {
+        use crate::adaptive_quality_constants::{DEFAULT_SCREEN_TIER_INDEX, SCREEN_QUALITY_TIERS};
+
+        let target_fps = Rc::new(AtomicU32::new(15));
+        let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
+
+        // Should start at the highest screen tier (index 0, "high")
+        assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
+        assert_eq!(controller.current_video_tier().label, "high");
+
+        // The ideal_bitrate_kbps should be synced with the starting tier
+        let expected_bitrate = SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].ideal_bitrate_kbps;
+        assert_eq!(
+            controller.ideal_bitrate_kbps, expected_bitrate,
+            "Initial ideal_bitrate_kbps should match the starting tier's ideal_bitrate_kbps"
         );
     }
 }

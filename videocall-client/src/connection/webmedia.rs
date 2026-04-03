@@ -39,7 +39,19 @@ pub struct ConnectOptions {
 
 pub(super) trait WebMedia<TASK> {
     fn connect(options: ConnectOptions) -> anyhow::Result<TASK>;
+
+    /// Send bytes via a reliable, ordered unidirectional stream.
     fn send_bytes(&self, bytes: Vec<u8>);
+
+    /// Send bytes via an unreliable, unordered datagram (WebTransport only).
+    ///
+    /// For transports that do not support datagrams (e.g., WebSocket), this
+    /// falls back to the reliable send path.
+    fn send_bytes_datagram(&self, bytes: Vec<u8>) {
+        // Default implementation falls back to reliable stream.
+        // WebTransportTask overrides this to use actual datagrams.
+        self.send_bytes(bytes);
+    }
 
     fn send_packet(&self, packet: PacketWrapper) {
         match packet
@@ -50,6 +62,21 @@ pub(super) trait WebMedia<TASK> {
             Err(e) => {
                 let packet_type = packet.packet_type.enum_value_or_default();
                 error!("error sending {packet_type} packet: {e:?}");
+            }
+        }
+    }
+
+    /// Send a packet via datagram if the transport supports it, otherwise
+    /// fall back to reliable stream.
+    fn send_packet_datagram(&self, packet: PacketWrapper) {
+        match packet
+            .write_to_bytes()
+            .map_err(|w| JsValue::from(format!("{w:?}")))
+        {
+            Ok(bytes) => self.send_bytes_datagram(bytes),
+            Err(e) => {
+                let packet_type = packet.packet_type.enum_value_or_default();
+                error!("error sending {packet_type} packet via datagram: {e:?}");
             }
         }
     }

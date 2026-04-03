@@ -4,7 +4,7 @@ window.__APP_CONFIG = Object.freeze({
   webTransportHost: "https://127.0.0.1:4433",
   oauthEnabled: "true",
   e2eeEnabled: "false",
-  webTransportEnabled: "false",
+  webTransportEnabled: "true",
   firefoxEnabled: "false",
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,

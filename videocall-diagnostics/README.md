@@ -20,7 +20,7 @@ A lightweight diagnostics event bus for the videocall-rs project. This crate pro
 This crate is used throughout the videocall-rs project to provide observability and debugging capabilities:
 
 - **videocall-client**: Core client library emits connection, codec, and transport metrics
-- **yew-ui**: Web frontend subscribes to diagnostics for real-time monitoring and debugging
+- **dioxus-ui**: Web frontend subscribes to diagnostics for real-time monitoring and debugging
 - **Other subsystems**: Any component can emit diagnostic events for centralized collection
 
 ### Basic Usage

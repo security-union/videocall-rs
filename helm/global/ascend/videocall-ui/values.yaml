@@ -7,21 +7,13 @@ videocall-ui:
     - name: hclcr-pull-secret
   resources:
     limits:
-      cpu: 50m
       memory: 128Mi
-    requests:
-      cpu: 20m
-      memory: 10Mi
   runtimeConfig:
     apiBaseUrl: "https://api.videocall.conceptcar7.com"
     wsUrl: "wss://websocket.videocall.conceptcar7.com"
     webTransportHost: "https://webtransport.videocall.conceptcar7.com:30056"
     oauthEnabled: "true"
     oauthProvider: "google"
-    e2eeEnabled: "false"
-    webTransportEnabled: "true"
-    usersAllowedToStream: ""
-    serverElectionPeriodMs: 2000
     audioBitrateKbps: 16
     videoBitrateKbps: 160
     screenBitrateKbps: 160

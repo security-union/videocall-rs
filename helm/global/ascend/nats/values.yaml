@@ -16,14 +16,3 @@ nats:
       requests:
         cpu: 400m
         memory: 600Mi
-
-service:
-  name: nats-ascend
-  ports:
-    client:
-      enabled: true
-      port: 4222
-    monitor:
-      enabled: true
-      port: 8222
-  type: ClusterIP

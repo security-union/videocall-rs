@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, MetricValue};
+use web_sys;
 
 // Serializable versions of DiagEvent structures
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -443,7 +444,7 @@ pub fn Diagnostics(
     share_screen: bool,
     encoder_settings: Option<String>,
 ) -> Element {
-    let mut transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut selected_peer = use_signal(|| "All Peers".to_string());
     let mut diagnostics_data = use_signal(|| None::<String>);
     let mut sender_stats = use_signal(|| None::<String>);
@@ -772,8 +773,20 @@ pub fn Diagnostics(
                             class: "peer-selector",
                             onchange: move |evt: Event<FormData>| {
                                 let pref = evt.value().parse::<TransportPreference>().unwrap_or_default();
-                                save_transport_preference(pref);
-                                (transport_pref_ctx.0).set(pref);
+                                if pref == (transport_pref_ctx.0)() {
+                                    return;
+                                }
+                                let confirmed = web_sys::window()
+                                    .and_then(|w| w.confirm_with_message(
+                                        "Changing the transport protocol will reload the page and disconnect the current call. Continue?"
+                                    ).ok())
+                                    .unwrap_or(false);
+                                if confirmed {
+                                    save_transport_preference(pref);
+                                    if let Some(w) = web_sys::window() {
+                                        let _ = w.location().reload();
+                                    }
+                                }
                             },
                             option {
                                 value: "auto",
@@ -793,7 +806,7 @@ pub fn Diagnostics(
                         }
                     }
                     p { class: "transport-preference-note",
-                        "Takes effect on next connection."
+                        "Changing protocol will reload the page."
                     }
                 }
                 if available_peers.len() > 1 {

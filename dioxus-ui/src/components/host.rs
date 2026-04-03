@@ -80,7 +80,7 @@ pub fn Host(
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let audio_level = use_context::<LocalAudioLevelCtx>().0;
-    let mut transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut glow_el = use_signal(|| None::<web_sys::Element>);
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
@@ -650,8 +650,20 @@ pub fn Host(
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
                     on_transport_preference_change: Some(EventHandler::new(move |pref: TransportPreference| {
-                        save_transport_preference(pref);
-                        (transport_pref_ctx.0).set(pref);
+                        if pref == (transport_pref_ctx.0)() {
+                            return;
+                        }
+                        let confirmed = web_sys::window()
+                            .and_then(|w| w.confirm_with_message(
+                                "Changing the transport protocol will reload the page and disconnect the current call. Continue?"
+                            ).ok())
+                            .unwrap_or(false);
+                        if confirmed {
+                            save_transport_preference(pref);
+                            if let Some(w) = web_sys::window() {
+                                let _ = w.location().reload();
+                            }
+                        }
                     })),
                 }
             }

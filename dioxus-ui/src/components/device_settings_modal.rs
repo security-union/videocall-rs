@@ -321,7 +321,7 @@ pub fn DeviceSettingsModal(
                                     }
 
                                     p { class: "transport-preference-note",
-                                        "Takes effect on next connection."
+                                        "Changing protocol will reload the page."
                                     }
                                 }
                             },

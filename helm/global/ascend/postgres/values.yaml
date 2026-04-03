@@ -1,5 +1,6 @@
 global:
   security:
+    # ECR public mirror images are not signed; required to pull bitnami/postgresql
     allowInsecureImages: true
 
 postgresql:

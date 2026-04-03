@@ -31,7 +31,7 @@ use crate::components::{
 };
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    VideoCallClientCtx,
+    LocalAudioLevelCtx, VideoCallClientCtx,
 };
 
 use std::cell::RefCell;
@@ -66,7 +66,6 @@ pub fn Host(
     share_screen: bool,
     mic_enabled: bool,
     video_enabled: bool,
-    #[props(default)] audio_level: f32,
     on_encoder_settings_update: EventHandler<String>,
     device_settings_open: bool,
     on_device_settings_toggle: EventHandler<()>,
@@ -76,6 +75,9 @@ pub fn Host(
     reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
+    // Read audio level from context — subscribes only this component,
+    // not the parent AttendantsComponent.
+    let audio_level = use_context::<LocalAudioLevelCtx>().0;
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -358,7 +360,7 @@ pub fn Host(
             s.last_reload_counter = reload_devices_counter;
         }
 
-        log::info!(
+        log::trace!(
             "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
             s.prev_video_enabled, s.prev_mic_enabled, s.prev_share_screen,
         );
@@ -395,6 +397,7 @@ pub fn Host(
                 s.microphone.stop();
                 s.encoder_settings.microphone = None;
             }
+            client.set_audio_enabled(mic_enabled);
         }
 
         // Camera
@@ -414,11 +417,9 @@ pub fn Host(
                 s.camera.stop();
                 s.encoder_settings.camera = None;
             }
+            client.set_video_enabled(video_enabled);
         }
 
-        // Update client flags
-        client.set_audio_enabled(mic_enabled);
-        client.set_video_enabled(video_enabled);
         drop(s);
     }
 
@@ -507,7 +508,7 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
-    let glow = speak_style(audio_level);
+    let glow = speak_style(audio_level());
 
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.

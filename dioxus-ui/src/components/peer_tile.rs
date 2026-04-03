@@ -43,6 +43,13 @@ pub fn PeerTile(
     // Separate signal for mic icon: holds the last positive value for 1s after
     // audio drops to zero, so the mic stays green briefly after speech ends.
     let mut mic_audio_level = use_signal(|| 0.0_f32);
+    // Debounced speaking state: once audio goes above 0.01, keep the speaking-tile
+    // gradient visible for 400ms even after audio drops below threshold. This prevents
+    // flicker during natural speech pauses and creates smooth visual continuity.
+    let mut speaking_visual = use_signal(|| false);
+    // Holds the pending speaking-visual timeout so it can be cancelled if audio resumes.
+    let speaking_hold_timeout: Rc<RefCell<Option<Timeout>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
     // Holds the pending silence timeout so it can be cancelled if new audio arrives.
     let mic_hold_timeout: Rc<RefCell<Option<Timeout>>> = use_hook(|| Rc::new(RefCell::new(None)));
 
@@ -67,6 +74,7 @@ pub fn PeerTile(
 
         let peer_id_inner = peer_id_owned.clone();
         let mic_hold = mic_hold_for_effect.clone();
+        let speaking_hold = speaking_hold_timeout.clone();
 
         // Subscribe to global diagnostics for peer_status updates
         let (abort_handle, abort_reg) = AbortHandle::new_pair();
@@ -84,6 +92,8 @@ pub fn PeerTile(
                     &mut audio_level,
                     &mut mic_audio_level,
                     &mic_hold,
+                    &speaking_hold,
+                    &mut speaking_visual,
                 );
             }
         };
@@ -118,6 +128,7 @@ pub fn PeerTile(
     let _ = screen_enabled();
     let level = audio_level();
     let mic_level = mic_audio_level();
+    let is_speaking = speaking_visual();
 
     generate_for_peer(
         &client,
@@ -127,6 +138,7 @@ pub fn PeerTile(
         mic_level,
         host_uid,
         pinned_panel,
+        is_speaking,
     )
 }
 
@@ -150,6 +162,8 @@ fn handle_diagnostics_event(
     audio_level: &mut Signal<f32>,
     mic_audio_level: &mut Signal<f32>,
     mic_hold_timeout: &Rc<RefCell<Option<Timeout>>>,
+    speaking_hold_timeout: &Rc<RefCell<Option<Timeout>>>,
+    speaking_visual: &mut Signal<bool>,
 ) {
     match evt.subsystem {
         "peer_status" => {
@@ -194,6 +208,20 @@ fn handle_diagnostics_event(
                 let prev = *audio_level.peek();
                 if (lvl == 0.0 && prev != 0.0) || (lvl - prev).abs() > UI_AUDIO_LEVEL_DELTA {
                     audio_level.set(lvl);
+                    // Debounce speaking visual: keep it ON for 400ms after audio drops below threshold.
+                    // This prevents flicker during natural pauses in speech.
+                    if lvl > 0.01 {
+                        speaking_visual.set(true);
+                        // Cancel any pending timeout since new audio arrived
+                        speaking_hold_timeout.borrow_mut().take();
+                    } else if *speaking_visual.peek() && speaking_hold_timeout.borrow().is_none() {
+                        // Audio dropped below threshold; schedule visual off after 400ms
+                        let mut visual = *speaking_visual;
+                        let timeout = Timeout::new(400, move || {
+                            visual.set(false);
+                        });
+                        speaking_hold_timeout.borrow_mut().replace(timeout);
+                    }
                 }
                 update_mic_audio_level(lvl, mic_audio_level, mic_hold_timeout);
             }
@@ -219,6 +247,17 @@ fn handle_diagnostics_event(
                 let prev = *audio_level.peek();
                 if (lvl == 0.0 && prev != 0.0) || (lvl - prev).abs() > UI_AUDIO_LEVEL_DELTA {
                     audio_level.set(lvl);
+                    // Same debounce logic as peer_status branch
+                    if lvl > 0.01 {
+                        speaking_visual.set(true);
+                        speaking_hold_timeout.borrow_mut().take();
+                    } else if *speaking_visual.peek() && speaking_hold_timeout.borrow().is_none() {
+                        let mut visual = *speaking_visual;
+                        let timeout = Timeout::new(400, move || {
+                            visual.set(false);
+                        });
+                        speaking_hold_timeout.borrow_mut().replace(timeout);
+                    }
                 }
                 update_mic_audio_level(lvl, mic_audio_level, mic_hold_timeout);
             }

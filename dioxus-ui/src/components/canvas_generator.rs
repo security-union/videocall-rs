@@ -30,9 +30,11 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry};
 
-/// Compute the inline CSS for the speaking glow on the canvas container.
-/// Always returns explicit values so the glow is fully self-contained in the
-/// inline style with zero dependency on CSS classes.
+/// Compute the inline CSS for the speaking glow on the tile shell.
+/// Controls **only box-shadow** glow intensity, which scales with audio level.
+/// Border appearance (rotating mint-gradient) is handled by the CSS class
+/// `speaking-tile`, toggled by the caller when `audio_level > 0`.
+/// All shadow layers use spread 0 so glow blooms from blur only.
 pub(crate) fn speak_style(audio_level: f32, is_suppressed: bool) -> String {
     if is_suppressed {
         return "box-shadow: none; transition: none;".to_string();
@@ -43,19 +45,27 @@ pub(crate) fn speak_style(audio_level: f32, is_suppressed: bool) -> String {
 
     let i = audio_level.clamp(0.0, 1.0);
 
+    // Shadow colour is fixed to a dominant green in the CSS gradient (#70B652)
+    // so the glow hue always coordinates with the animated border.
     format!(
         "box-shadow: \
-            0 0 0 1px rgba(120, 255, 160, {:.2}), \
-            inset 0 0 {:.0}px {:.0}px rgba(120, 255, 160, {:.2}), \
-            0 0 {:.0}px {:.0}px rgba(120, 255, 160, {:.2}); \
+            0 0 {tight_blur:.0}px 0 rgba(112, 182, 82, {tight_a:.2}), \
+            0 0 {wide_blur:.0}px 0 rgba(112, 182, 82, {wide_a:.2}), \
+            inset 0 0 {inset_blur:.0}px 0 rgba(112, 182, 82, {inset_a:.2}), \
+            inset 0 0 {deep_blur:.0}px 0 rgba(112, 182, 82, {deep_a:.2}); \
          transition: box-shadow 0.18s ease-in-out;",
-        0.10 + i * 0.12,
-        7.0 + i * 10.0,
-        2.0 + i * 4.0,
-        0.12 + i * 0.18,
-        10.0 + i * 16.0,
-        2.0 + i * 5.0,
-        0.10 + i * 0.14
+        // Tight outer glow hugging the border
+        tight_blur = 8.0 + i * 16.0, // 8–24 px
+        tight_a = 0.30 + i * 0.40,   // 0.30–0.70
+        // Wider ambient bloom
+        wide_blur = 22.0 + i * 30.0, // 22–52 px
+        wide_a = 0.12 + i * 0.22,    // 0.12–0.34
+        // Inset edge glow — interior border luminance
+        inset_blur = 10.0 + i * 14.0, // 10–24 px
+        inset_a = 0.12 + i * 0.28,    // 0.12–0.40
+        // Deep inset wash — glass-card interior depth
+        deep_blur = 28.0 + i * 22.0, // 28–50 px
+        deep_a = 0.04 + i * 0.10,    // 0.04–0.14
     )
 }
 
@@ -85,8 +95,8 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, is_suppressed: bool) -
         let glow_i = clamped.sqrt();
         return format!(
             "color: inherit; \
-             filter: drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})) \
-                     drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})); \
+             filter: drop-shadow(0 0 {:.0}px rgba(112, 182, 82, {:.2})) \
+                     drop-shadow(0 0 {:.0}px rgba(112, 182, 82, {:.2})); \
              transition: color 5.0s ease-out, filter 0.15s ease-in;",
             8.0 + glow_i * 16.0,
             0.7 + glow_i * 0.3,
@@ -96,15 +106,15 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, is_suppressed: bool) -
     }
     if mic_audio_level > 0.0 && glow_audio_level <= 0.0 {
         // Held color (still green) but raw glow has faded — no drop-shadow
-        return "color: #00ff41; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;".to_string();
+        return "color: #70B652; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;".to_string();
     }
     // Both positive: green color + scaled drop-shadow glow
     let clamped = glow_audio_level.clamp(0.0, 1.0);
     let glow_i = clamped.sqrt();
     format!(
-        "color: #00ff41; \
-         filter: drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})) \
-                 drop-shadow(0 0 {:.0}px rgba(0, 255, 65, {:.2})); \
+        "color: #70B652; \
+         filter: drop-shadow(0 0 {:.0}px rgba(112, 182, 82, {:.2})) \
+                 drop-shadow(0 0 {:.0}px rgba(112, 182, 82, {:.2})); \
          transition: color 0.05s ease-in, filter 0.15s ease-in;",
         8.0 + glow_i * 16.0, // primary drop-shadow blur: 8–24px
         0.7 + glow_i * 0.3,  // primary drop-shadow alpha: 0.7–1.0
@@ -134,6 +144,7 @@ pub fn generate_for_peer(
     mic_audio_level: f32,
     host_user_id: Option<&str>,
     pinned_panel: PinnedPanelCtx,
+    is_speaking: bool,
 ) -> Element {
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
     let peer_display_name = client
@@ -163,7 +174,7 @@ pub fn generate_for_peer(
     let audio_level = if suppress_peer { 0.0 } else { audio_level };
     let mic_audio_level = if suppress_peer { 0.0 } else { mic_audio_level };
 
-    let is_speaking = mic_audio_level > 0.0;
+    let is_speaking = if suppress_peer { false } else { is_speaking };
 
     let audio_speaking_class = if is_speaking {
         "audio-indicator speaking"
@@ -199,18 +210,19 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
-        let fb_grid_class = if is_pv_pinned {
-            "grid-item full-bleed grid-item-pinned"
-        } else {
-            "grid-item full-bleed"
+        let fb_grid_class = match (is_pv_pinned, is_speaking) {
+            (true, true) => "grid-item full-bleed grid-item-pinned speaking-tile",
+            (true, false) => "grid-item full-bleed grid-item-pinned",
+            (false, true) => "grid-item full-bleed speaking-tile",
+            (false, false) => "grid-item full-bleed",
         };
         return rsx! {
             div {
                 class: "{fb_grid_class}",
                 id: "{peer_video_div_id}",
+                style: "{tile_style}",
                 div {
                     class: "{full_bleed_class}",
-                    style: "{tile_style}",
                     onclick: move |_| {
                         if is_mobile_viewport() {
                             toggle_pinned(pinned_panel, &pin_fb_mobile);
@@ -290,7 +302,6 @@ pub fn generate_for_peer(
                 id: "{screen_share_div_id}",
                 div {
                     class: "canvas-container video-on",
-                    style: "{tile_style}",
                     onclick: move |_| {
                         if is_mobile_viewport() {
                             toggle_pinned(pinned_panel, &pin_ss_mobile);
@@ -324,19 +335,20 @@ pub fn generate_for_peer(
             };
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
-            let pv_grid_class = if is_pv_pinned {
-                "grid-item grid-item-pinned"
-            } else {
-                "grid-item"
+            let pv_grid_class = match (is_pv_pinned, is_speaking) {
+                (true, true) => "grid-item grid-item-pinned speaking-tile",
+                (true, false) => "grid-item grid-item-pinned",
+                (false, true) => "grid-item speaking-tile",
+                (false, false) => "grid-item",
             };
             rsx! {
                 div {
                     class: "{pv_grid_class}",
                     id: "{peer_video_div_id}",
+                    style: "{grid_tile_style}",
                     // One canvas for the User Video
                     div {
                         class: "{grid_class}",
-                        style: "{grid_tile_style}",
                         onclick: move |_| {
                             if is_mobile_viewport() {
                                 toggle_pinned(pinned_panel, &pin_pv_mobile);

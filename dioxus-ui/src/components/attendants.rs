@@ -18,6 +18,7 @@
 
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
+    canvas_generator::speak_style,
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
@@ -414,6 +415,11 @@ pub fn AttendantsComponent(
     let connecting = use_signal(|| false);
     let local_speaking = use_signal(|| false);
     let local_audio_level = use_signal(|| 0.0f32);
+    // Debounced host speaking visual: keeps the gradient visible for 400ms after
+    // audio drops, preventing flicker during natural speech pauses.
+    let mut host_speaking_visual = use_signal(|| false);
+    let host_speaking_hold_timeout: Rc<RefCell<Option<Timeout>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
@@ -587,6 +593,21 @@ pub fn AttendantsComponent(
             on_audio_level_changed: Some(VcCallback::from(move |level: f32| {
                 let mut s = local_audio_level;
                 s.set(level);
+
+                // Debounce the speaking visual: hold the gradient visible for 400ms
+                // after audio drops, preventing flicker during natural speech pauses.
+                let mut visual = host_speaking_visual;
+                if level > 0.01 {
+                    visual.set(true);
+                    // Cancel any pending timeout
+                    host_speaking_hold_timeout.borrow_mut().take();
+                } else if visual() {
+                    // Schedule 400ms hold before hiding
+                    let timeout = Timeout::new(400, move || {
+                        visual.set(false);
+                    });
+                    host_speaking_hold_timeout.borrow_mut().replace(timeout);
+                }
             })),
             vad_threshold: crate::constants::vad_threshold().ok(),
             on_meeting_activated: None,
@@ -1193,13 +1214,13 @@ pub fn AttendantsComponent(
                     style: "{container_style}",
 
                     // Peer tiles
-                    for (i, peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
+                    for peer_id in display_peers.iter().take(CANVAS_LIMIT) {
                         {
                             let full_bleed = display_peers.len() == 1
                                 && !client.is_screen_share_enabled_for_peer(peer_id);
                             rsx! {
                                 PeerTile {
-                                    key: "tile-{i}-{peer_id}",
+                                    key: "tile-{peer_id}",
                                     peer_id: peer_id.clone(),
                                     full_bleed: full_bleed,
                                     host_user_id: host_user_id.clone(),
@@ -1266,7 +1287,9 @@ pub fn AttendantsComponent(
 
                     // Controls nav
                     if can_stream {
-                        nav { class: "host",
+                        nav {
+                            class: if host_speaking_visual() { "host speaking-tile" } else { "host" },
+                            style: "{speak_style(local_audio_level(), false)}",
                             div { class: "controls",
                                 nav { class: "video-controls-container",
                                     {

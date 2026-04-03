@@ -26,9 +26,7 @@ use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
-use crate::components::{
-    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
-};
+use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
     VideoCallClientCtx,
@@ -507,8 +505,6 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
-    let glow = speak_style(audio_level, false);
-
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
         // The camera encoder attaches srcObject via JS; if Dioxus recreates
@@ -518,10 +514,7 @@ pub fn Host(
         div {
             class: "host-video-wrapper",
             style: if video_enabled {
-                format!(
-                    "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; border-radius:inherit; pointer-events:auto; {}",
-                    glow
-                )
+                "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; border-radius:inherit; pointer-events:auto;".to_string()
             } else {
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; border-radius:inherit; pointer-events:none;".to_string()
             },
@@ -542,10 +535,7 @@ pub fn Host(
         }
         if !video_enabled {
             div {
-                style: format!(
-                    "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius:inherit; overflow:hidden; position:relative; {}",
-                    glow
-                ),
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius:inherit; overflow:hidden; position:relative;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }

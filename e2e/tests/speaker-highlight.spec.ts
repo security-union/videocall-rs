@@ -158,17 +158,17 @@ test.describe("Speaker highlight glow on video tiles", () => {
       await admitGuestIfNeeded(hostPage, guestPage, guestResult);
 
       // Wait for peer tile to appear on the host side
-      const peerTile = hostPage.locator("#grid-container .canvas-container");
+      const peerTile = hostPage.locator("#grid-container .grid-item");
       await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
 
-      // The glow inline style lives directly on the .canvas-container.
+      // The glow inline style lives directly on the .grid-item.
       const glowOverlay = peerTile.first();
       await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
 
-      // When silent: no outer glow, box-shadow shows inner ambient glow only.
+      // When silent: idle border-color and no glow.
       const style = await glowOverlay.getAttribute("style");
       expect(style).toBeTruthy();
-      expect(style).toContain("border: 1.5px solid transparent");
+      expect(style).toContain("border-color:");
       expect(style).toContain("box-shadow: none");
     } finally {
       await browser1.close();
@@ -212,10 +212,10 @@ test.describe("Speaker highlight glow on video tiles", () => {
       await admitGuestIfNeeded(hostPage, guestPage, guestResult);
 
       // Wait for peer tile to appear
-      const peerTile = hostPage.locator("#grid-container .canvas-container");
+      const peerTile = hostPage.locator("#grid-container .grid-item");
       await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
 
-      // The glow inline style lives directly on the .canvas-container.
+      // The glow inline style lives directly on the .grid-item.
       const glowOverlay = peerTile.first();
       await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
 
@@ -252,26 +252,15 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const result = await joinMeetingFromPage(page);
       expect(result).toBe("in-meeting");
 
-<<<<<<< HEAD
-      // Wait for ANY visible .glow-overlay on the page. With fake devices
-      // in E2E, video may be off so the glow-overlay can render outside
-      // .host-video-wrapper.
-      const glowOverlay = page.locator(".glow-overlay").first();
-      await expect(glowOverlay).toBeVisible({ timeout: 15_000 });
-=======
-      // Wait for the host's own video wrapper to appear
-      const hostWrapper = page.locator(".host-video-wrapper");
-      await expect(hostWrapper.first()).toBeVisible({ timeout: 15_000 });
+      // The glow inline style now lives on the controls nav.host bar.
+      const hostNav = page.locator("nav.host");
+      await expect(hostNav.first()).toBeVisible({ timeout: 15_000 });
 
-      // The glow inline style now lives directly on .host-video-wrapper.
-      const hostVidWrapper = hostWrapper.first();
-      await expect(hostVidWrapper).toBeVisible({ timeout: 10_000 });
->>>>>>> 21d89ba9 (Fix: the green border is visible on the pinned screen for the first few seconds)
-
-      // The host's own tile should also have silent-state inline styles.
-      const style = await hostVidWrapper.getAttribute("style");
+      // The host's own controls bar should have silent-state inline styles.
+      const style = await hostNav.first().getAttribute("style");
       expect(style).toBeTruthy();
-      expect(style).toContain("border: 1.5px solid transparent");
+      expect(style).toContain("border-color:");
+      expect(style).toContain("box-shadow: none");
     } finally {
       await browser.close();
     }
@@ -432,9 +421,8 @@ test.describe("Speaker highlight glow on video tiles", () => {
       await expect(peerGridItem).toBeVisible({ timeout: 30_000 });
 
       // Before pinning: the peer tile glow should have normal styles
-      const peerGlowBefore = peerGridItem.locator(".canvas-container").first();
-      await expect(peerGlowBefore).toBeVisible({ timeout: 10_000 });
-      const peerStyleBefore = await peerGlowBefore.getAttribute("style");
+      // Style now lives on .grid-item itself, not .canvas-container.
+      const peerStyleBefore = await peerGridItem.getAttribute("style");
       expect(peerStyleBefore).toBeTruthy();
       expect(peerStyleBefore).toContain("box-shadow: none");
 
@@ -448,16 +436,14 @@ test.describe("Speaker highlight glow on video tiles", () => {
       await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
 
       // The pinned tile's glow should still be visible (it is the pinned tile)
-      const pinnedGlow = peerGridItem.locator(".canvas-container").first();
-      await expect(pinnedGlow).toBeVisible({ timeout: 10_000 });
+      // Style is on .grid-item itself; just verify the element is still present.
+      await expect(peerGridItem).toBeVisible({ timeout: 10_000 });
 
-      // The host's own tile glow should NOT be suppressed (local self-preview always shows feedback)
-      const hostWrapper = hostPage.locator(".host-video-wrapper");
-      await expect(hostWrapper.first()).toBeVisible({ timeout: 15_000 });
-      const hostGlow = hostWrapper.first();
-      await expect(hostGlow).toBeVisible({ timeout: 10_000 });
+      // The host's own glow now lives on the controls nav.host bar, not .host-video-wrapper.
+      const hostNav = hostPage.locator("nav.host");
+      await expect(hostNav.first()).toBeVisible({ timeout: 15_000 });
 
-      const hostStyle = await hostGlow.getAttribute("style");
+      const hostStyle = await hostNav.first().getAttribute("style");
       expect(hostStyle).toBeTruthy();
       // Host's speaking indicators are NOT suppressed: should have normal styles
       expect(hostStyle).toContain("box-shadow: none"); // Since silent
@@ -597,6 +583,10 @@ test.describe("Speaker highlight glow on video tiles", () => {
       await hostPage.waitForTimeout(500);
       await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
 
+      // Tag the pinned element so we can detect DOM remount (recreation).
+      // If Dioxus recreates the element, this attribute will be lost.
+      await peerGridItem.evaluate((el) => el.setAttribute("data-e2e-pin-marker", "1"));
+
       // A third user joins — this triggers peer_list_version bump & re-render
       const thirdCtx = await createAuthenticatedContext(
         browser3,
@@ -624,6 +614,11 @@ test.describe("Speaker highlight glow on video tiles", () => {
       // Pin must STILL be present after the third peer departs
       await expect(peerGridItem).toHaveClass(/grid-item-pinned/, { timeout: 5_000 });
 
+      // The marker attribute must still be present — proves the DOM element
+      // was NOT destroyed and recreated (no remount/flicker).
+      const marker = await peerGridItem.getAttribute("data-e2e-pin-marker");
+      expect(marker).toBe("1");
+
       // Finally unpin manually to confirm toggle still works
       await pinButton.click();
       await hostPage.waitForTimeout(500);
@@ -633,5 +628,44 @@ test.describe("Speaker highlight glow on video tiles", () => {
       await browser2.close();
       await browser3.close();
     }
+  });
+
+  // --- Screen-share tile tests ---
+  // These require getDisplayMedia() to be mockable in headless Chrome.
+  // The approach: use page.addInitScript() to replace getDisplayMedia with
+  // a fake canvas.captureStream(), trigger Share Screen via the UI button,
+  // then assert on the viewer's DOM.
+
+  test("screen-share tile never has speaking-tile class or speaking glow style", async ({
+    baseURL: _baseURL,
+  }) => {
+    // In canvas_generator.rs the screen-share div uses screen_share_css
+    // ("grid-item" / "grid-item hidden" / "grid-item grid-item-pinned")
+    // — never "speaking-tile". No inline box-shadow style is applied.
+    //
+    // Assertions when infra is available:
+    //   div[id^="screen-share-"] must NOT contain class "speaking-tile"
+    //   div[id^="screen-share-"] must NOT have inline style with box-shadow rgba
+    test.fixme(true, "Requires getDisplayMedia mock to trigger screen sharing in headless Chrome");
+  });
+
+  test("pinned screen-share tile does not remount when unrelated peer leaves", async ({
+    baseURL: _baseURL2,
+  }) => {
+    // With a screen share active and pinned (grid-item-pinned on
+    // div#screen-share-{peer}-div), a third peer joining then leaving must
+    // NOT recreate the pinned element. The Dioxus key "tile-{peer_id}"
+    // ensures stable identity.
+    //
+    // Verification plan:
+    //   1. Mock getDisplayMedia on the sharer, trigger screen share.
+    //   2. On the viewer, pin the screen-share tile.
+    //   3. Tag it with data-e2e-pin-marker.
+    //   4. Third peer joins then leaves.
+    //   5. Assert grid-item-pinned class AND data-e2e-pin-marker persist.
+    test.fixme(
+      true,
+      "Requires getDisplayMedia mock to trigger and pin screen sharing in headless Chrome",
+    );
   });
 });

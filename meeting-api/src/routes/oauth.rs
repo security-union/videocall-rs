@@ -526,7 +526,6 @@ pub async fn exchange(
         .filter(|e| !e.is_empty())
         .ok_or_else(|| AppError::internal("Email not available from ID token or UserInfo"))?;
 
-    // Upsert: preferred_display_name initialised on first insert only.
     db_oauth::upsert_user(
         &state.db,
         &email,

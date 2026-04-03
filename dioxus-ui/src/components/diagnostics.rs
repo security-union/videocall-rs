@@ -736,6 +736,11 @@ pub fn Diagnostics(
                             span { class: "build-info-cell", "Commit" }
                             span { class: "build-info-cell", "Branch" }
                         }
+                        div { class: "build-info-row",
+                            span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
+                            span { class: "build-info-cell monospace", "" }
+                            span { class: "build-info-cell", "" }
+                        }
                         for comp in backend_versions() {
                             {
                                 let svc = comp["service"].as_str().unwrap_or("?").to_string();

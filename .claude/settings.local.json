@@ -53,7 +53,8 @@
       "WebFetch(domain:crates.io)",
       "Bash(cargo clippy:*)",
       "Bash(openssl x509:*)",
-      "Bash(docker exec:*)"
+      "Bash(docker exec:*)",
+      "WebFetch(domain:streams.spec.whatwg.org)"
     ]
   }
 }

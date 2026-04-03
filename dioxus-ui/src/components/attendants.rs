@@ -36,7 +36,8 @@ use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{
-    save_display_name_to_storage, DisplayNameCtx, MeetingTime, PeerMediaState, PeerStatusMap,
+    save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
+    PeerStatusMap,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -871,6 +872,7 @@ pub fn AttendantsComponent(
     use_context_provider(|| client.clone());
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
+    use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
 
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
@@ -1199,6 +1201,8 @@ pub fn AttendantsComponent(
         call_start_time: call_start_time(),
         meeting_start_time: meeting_start_time_server(),
     });
+
+    info!("Rendering meeting view with {} peers", display_peers.len());
 
     rsx! {
         div {
@@ -1566,7 +1570,6 @@ pub fn AttendantsComponent(
                                     share_screen: screen_share_state().is_sharing(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
-                                    audio_level: local_audio_level(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {

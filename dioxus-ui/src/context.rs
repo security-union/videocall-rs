@@ -12,6 +12,12 @@ use videocall_client::VideoCallClient;
 #[derive(Clone, Copy)]
 pub struct DisplayNameCtx(pub Signal<Option<String>>);
 
+/// Local user's audio level signal, provided as context so that child
+/// components (e.g. Host) can subscribe to audio-level updates without
+/// forcing the parent AttendantsComponent to re-render.
+#[derive(Clone, Copy)]
+pub struct LocalAudioLevelCtx(pub Signal<f32>);
+
 /// VideoCallClient context for sharing the client instance across components.
 pub type VideoCallClientCtx = VideoCallClient;
 

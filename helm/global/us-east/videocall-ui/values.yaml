@@ -22,8 +22,8 @@ videocall-ui:
 
   runtimeConfig:
     apiBaseUrl: "https://api.videocall.rs"
-    wsUrl: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
-    webTransportHost: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"
+    wsUrl: "wss://websocket-us-east.webtransport.video"
+    webTransportHost: "https://webtransport-us-east.webtransport.video"
     oauthEnabled: "true"
     oauthProvider: "google"
     e2eeEnabled: "false"

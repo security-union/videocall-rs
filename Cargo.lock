@@ -8223,7 +8223,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "videocall-ui-dioxus"
+name = "videocall-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",

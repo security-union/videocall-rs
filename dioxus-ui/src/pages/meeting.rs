@@ -17,8 +17,8 @@ use crate::constants::{
     actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled, webtransport_host_base,
 };
 use crate::context::{
-    get_or_create_local_user_id, load_display_name_from_storage, save_display_name_to_storage,
-    validate_display_name, DisplayNameCtx,
+    get_or_create_local_user_id, load_display_name_from_storage, resolve_transport_config,
+    save_display_name_to_storage, validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
 };
 use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
@@ -54,6 +54,7 @@ pub enum MeetingStatus {
 
 #[component]
 pub fn MeetingPage(id: String) -> Element {
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut auth_checked = use_signal(|| false);
     let navigator = use_navigator();
@@ -168,6 +169,15 @@ pub fn MeetingPage(id: String) -> Element {
                 .map(&lobby_url)
                 .collect();
 
+            // Apply user's transport preference
+            let (effective_wt_enabled, websocket_urls, webtransport_urls) =
+                resolve_transport_config(
+                    (transport_pref_ctx.0)(),
+                    webtransport_enabled().unwrap_or(false),
+                    websocket_urls,
+                    webtransport_urls,
+                );
+
             // Use the user's ID so the server can match
             // push-notification `target_user_id` to this observer client.
             let user_id_for_client = current_user_id().unwrap_or_else(|| display_name.clone());
@@ -178,7 +188,7 @@ pub fn MeetingPage(id: String) -> Element {
                 websocket_urls,
                 webtransport_urls,
                 enable_e2ee: false,
-                enable_webtransport: webtransport_enabled().unwrap_or(false),
+                enable_webtransport: effective_wt_enabled,
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting for meeting)");
                 }),
@@ -478,7 +488,6 @@ pub fn MeetingPage(id: String) -> Element {
                 AttendantsComponent {
                     display_name: username.clone(),
                     id: id.clone(),
-                    webtransport_enabled: webtransport_enabled().unwrap_or(false),
                     e2ee_enabled: e2ee_enabled().unwrap_or(false),
                     user_name: user_profile().as_ref().map(|p| p.name.clone()),
                     user_id: current_user_id()

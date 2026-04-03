@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v5.0.0...videocall-types-v6.0.0) - 2026-04-03
+
+### Fixed
+
+- email, userid, session usage confusion ([#724](https://github.com/security-union/videocall-rs/pull/724))
+- performance improvements ([#705](https://github.com/security-union/videocall-rs/pull/705))
+
+### Other
+
+- perf 04: decoder improvements - PLI keyframe requests, RED audio unpack, visibility skip ([#761](https://github.com/security-union/videocall-rs/pull/761))
+- Fix display name input suggestions and validation ([#642](https://github.com/security-union/videocall-rs/pull/642))
+- Feature/highlighting speaker ([#704](https://github.com/security-union/videocall-rs/pull/704))
+
 ## [5.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v4.0.1...videocall-types-v5.0.0) - 2026-02-23
 
 ### Other

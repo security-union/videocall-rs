@@ -36,6 +36,9 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
+use web_sys::MediaStream;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -150,6 +153,14 @@ pub fn Host(
         });
         let screen_state_cell = screen_state_handler.clone();
         let screen_state_cb = VcCallback::from(move |event: ScreenShareEvent| {
+            match &event {
+                ScreenShareEvent::Started(stream) => {
+                    attach_screen_preview(stream);
+                }
+                _ => {
+                    detach_screen_preview();
+                }
+            }
             if let Some(handler) = screen_state_cell.borrow().as_ref() {
                 handler.call(event);
             }
@@ -369,6 +380,7 @@ pub fn Host(
             s.prev_share_screen = share_screen;
             if share_screen {
                 s.screen.set_enabled(true);
+                log::info!("Start screen share encoder");
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
                     state_clone.borrow_mut().screen.start();
@@ -377,6 +389,7 @@ pub fn Host(
             } else {
                 s.screen.set_enabled(false);
                 s.screen.stop();
+                detach_screen_preview();
                 s.encoder_settings.screen = None;
             }
         }
@@ -527,7 +540,7 @@ pub fn Host(
         div {
             class: "host-video-wrapper",
             style: if video_enabled {
-                "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; pointer-events:auto;"
+                "position:relative; width:100%; height:auto; opacity:1; overflow:hidden; pointer-events:auto;"
             } else {
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
@@ -557,9 +570,21 @@ pub fn Host(
                 }
             }
         }
+        // Always-mounted screen share preview — toggled via style so the element
+        // exists in the DOM before attach_screen_preview() runs.
+        // Positioned AFTER the camera so the preview appears below it.
+        video {
+            id: "screen-share-preview",
+            class: "screen-share-preview",
+            style: if share_screen { "display:block;" } else { "display:none;" },
+            autoplay: true,
+            muted: true,
+            playsinline: "true",
+            controls: false,
+        }
         if !video_enabled {
             div {
-                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent;",
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent; width:100%; aspect-ratio:16/9;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
@@ -709,4 +734,40 @@ struct HostState {
     prev_video_enabled: bool,
     initialized: bool,
     last_reload_counter: u32,
+}
+
+fn attach_screen_preview(stream: &MediaStream) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("screen-share-preview"))
+    {
+        let video: web_sys::HtmlVideoElement = el.unchecked_into();
+        // Explicitly set the muted property (not just the HTML attribute) so that
+        // Chrome's autoplay policy recognises the element as muted and allows play().
+        video.set_muted(true);
+        video.set_src_object(Some(stream));
+        // Properly await the play() Promise via spawn_local.
+        // Dropping the Promise with `let _` causes Chrome to silently abort
+        // playback for display-capture streams; Edge is more lenient.
+        wasm_bindgen_futures::spawn_local(async move {
+            match video.play() {
+                Ok(promise) => {
+                    if let Err(e) = JsFuture::from(promise).await {
+                        log::warn!("Screen preview play() rejected: {:?}", e);
+                    }
+                }
+                Err(e) => log::warn!("Screen preview play() error: {:?}", e),
+            }
+        });
+    }
+}
+
+fn detach_screen_preview() {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("screen-share-preview"))
+    {
+        let video: web_sys::HtmlVideoElement = el.unchecked_into();
+        video.set_src_object(None);
+    }
 }

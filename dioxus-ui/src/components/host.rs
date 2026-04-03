@@ -21,9 +21,8 @@ use crate::components::{
 };
 use crate::constants::*;
 use crate::context::{
-    load_display_name_from_storage, save_display_name_to_storage, save_transport_preference,
-    validate_display_name, LocalAudioLevelCtx, TransportPreference, TransportPreferenceCtx,
-    VideoCallClientCtx,
+    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
+    LocalAudioLevelCtx, TransportPreferenceCtx, VideoCallClientCtx,
 };
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
@@ -649,22 +648,6 @@ pub fn Host(
                     visible: device_settings_open,
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
-                    on_transport_preference_change: Some(EventHandler::new(move |pref: TransportPreference| {
-                        if pref == (transport_pref_ctx.0)() {
-                            return;
-                        }
-                        let confirmed = web_sys::window()
-                            .and_then(|w| w.confirm_with_message(
-                                "Changing the transport protocol will reload the page and disconnect the current call. Continue?"
-                            ).ok())
-                            .unwrap_or(false);
-                        if confirmed {
-                            save_transport_preference(pref);
-                            if let Some(w) = web_sys::window() {
-                                let _ = w.location().reload();
-                            }
-                        }
-                    })),
                 }
             }
         }

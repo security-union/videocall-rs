@@ -19,14 +19,13 @@
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
-use crate::context::{save_transport_preference, TransportPreference, TransportPreferenceCtx};
+use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
 use dioxus::prelude::*;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, MetricValue};
-use web_sys;
 
 // Serializable versions of DiagEvent structures
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -770,23 +769,14 @@ pub fn Diagnostics(
                     h3 { "Transport Preference" }
                     div { class: "device-setting-group",
                         select {
+                            id: "diagnostics-transport-select",
                             class: "peer-selector",
                             onchange: move |evt: Event<FormData>| {
-                                let pref = evt.value().parse::<TransportPreference>().unwrap_or_default();
-                                if pref == (transport_pref_ctx.0)() {
-                                    return;
-                                }
-                                let confirmed = web_sys::window()
-                                    .and_then(|w| w.confirm_with_message(
-                                        "Changing the transport protocol will reload the page and disconnect the current call. Continue?"
-                                    ).ok())
-                                    .unwrap_or(false);
-                                if confirmed {
-                                    save_transport_preference(pref);
-                                    if let Some(w) = web_sys::window() {
-                                        let _ = w.location().reload();
-                                    }
-                                }
+                                confirm_transport_change(
+                                    &evt.value(),
+                                    (transport_pref_ctx.0)(),
+                                    "diagnostics-transport-select",
+                                );
                             },
                             option {
                                 value: "auto",

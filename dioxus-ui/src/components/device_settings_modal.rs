@@ -2,7 +2,7 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
-use crate::context::TransportPreference;
+use crate::context::{confirm_transport_change, TransportPreference};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
@@ -86,8 +86,7 @@ pub fn DeviceSettingsModal(
     on_speaker_select: EventHandler<DeviceInfo>,
     visible: bool,
     on_close: EventHandler<()>,
-    #[props(default = TransportPreference::Auto)] transport_preference: TransportPreference,
-    #[props(default)] on_transport_preference_change: Option<EventHandler<TransportPreference>>,
+    #[props(default)] transport_preference: TransportPreference,
 ) -> Element {
     let is_ios_safari = is_ios();
     let mut active_section = use_signal(|| SettingsSection::Audio);
@@ -296,11 +295,11 @@ pub fn DeviceSettingsModal(
                                             id: "modal-transport-select",
                                             class: "device-selector-modal",
                                             onchange: move |evt: Event<FormData>| {
-                                                let val = evt.value();
-                                                let pref = val.parse::<TransportPreference>().unwrap_or_default();
-                                                if let Some(handler) = &on_transport_preference_change {
-                                                    handler.call(pref);
-                                                }
+                                                confirm_transport_change(
+                                                    &evt.value(),
+                                                    transport_preference,
+                                                    "modal-transport-select",
+                                                );
                                             },
                                             option {
                                                 value: "auto",

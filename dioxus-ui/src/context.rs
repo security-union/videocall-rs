@@ -234,6 +234,41 @@ pub fn resolve_transport_config(
     }
 }
 
+/// Handle a transport preference change from a `<select>` element.
+///
+/// Shows a confirmation dialog. If the user confirms, saves the preference and
+/// reloads the page. If cancelled, resets the `<select>` element back to the
+/// current value so the dropdown doesn't show a stale selection.
+pub fn confirm_transport_change(new_value: &str, current: TransportPreference, select_id: &str) {
+    use wasm_bindgen::JsCast;
+
+    let pref = new_value.parse::<TransportPreference>().unwrap_or_default();
+    if pref == current {
+        return;
+    }
+    let confirmed = web_sys::window()
+        .and_then(|w| {
+            w.confirm_with_message(
+                "Changing the transport protocol will reload the page \
+                 and disconnect the current call. Continue?",
+            )
+            .ok()
+        })
+        .unwrap_or(false);
+    if confirmed {
+        save_transport_preference(pref);
+        if let Some(w) = web_sys::window() {
+            let _ = w.location().reload();
+        }
+    } else if let Some(select) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(select_id))
+        .and_then(|el| el.dyn_into::<web_sys::HtmlSelectElement>().ok())
+    {
+        select.set_value(&current.to_string());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validation helpers (re-exported from shared crate)
 // ---------------------------------------------------------------------------

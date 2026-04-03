@@ -241,7 +241,7 @@ jobs:
             --set imagePullSecrets[0].name=harbor-pull-secret \
             --set fullnameOverride=videocall-webtransport \
             --set service.type=NodePort \
-            --set service.port=52311 \
+            --set service.port=4433 \
             --set service.nodePort=52311 \
             --set service.healthPort=444 \
             --set "command[0]=webtransport_server" \
@@ -255,7 +255,7 @@ jobs:
             --set "env[2].name=NATS_URL" \
             --set "env[2].value=nats:4222" \
             --set "env[3].name=LISTEN_URL" \
-            --set "env[3].value=0.0.0.0:52311" \
+            --set "env[3].value=0.0.0.0:4433" \
             --set "env[4].name=HEALTH_LISTEN_URL" \
             --set "env[4].value=0.0.0.0:444" \
             --set "env[5].name=CERT_PATH" \
@@ -424,7 +424,7 @@ jobs:
             --set "runtimeConfig.apiBaseUrl=https://api.videocall.fnxlabs.com" \
             --set "runtimeConfig.meetingApiBaseUrl=https://api.videocall.fnxlabs.com" \
             --set "runtimeConfig.wsUrl=wss://websocket.videocall.fnxlabs.com" \
-            --set "runtimeConfig.webTransportHost=webtransport.videocall.fnxlabs.com" \
+            --set "runtimeConfig.webTransportHost=https://webtransport.videocall.fnxlabs.com:4433" \
             --set-string "runtimeConfig.webTransportEnabled=true" \
             --set-string "runtimeConfig.oauthEnabled=true" \
             --set-string "runtimeConfig.oauthProvider=google" \

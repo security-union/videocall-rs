@@ -562,7 +562,7 @@ async fn device_settings_modal_updates_active_nav_highlighting() {
 }
 
 #[wasm_bindgen_test]
-async fn device_settings_modal_renders_only_audio_and_video_navigation() {
+async fn device_settings_modal_renders_expected_navigation_tabs() {
     let mount = create_mount_point();
 
     fn wrapper() -> Element {
@@ -589,13 +589,14 @@ async fn device_settings_modal_renders_only_audio_and_video_navigation() {
     let nav_buttons = mount.query_selector_all(".settings-nav-button").unwrap();
     assert_eq!(
         nav_buttons.length(),
-        2,
-        "should render exactly two nav buttons"
+        3,
+        "should render exactly three nav buttons (Audio, Video, Network)"
     );
 
     let text = mount.text_content().unwrap_or_default();
     assert!(text.contains("Audio"), "should render Audio nav");
     assert!(text.contains("Video"), "should render Video nav");
+    assert!(text.contains("Network"), "should render Network nav");
     assert!(!text.contains("Devices"), "should not render Devices nav");
     assert!(!text.contains("Profile"), "should not render Profile nav");
     assert!(!text.contains("Advanced"), "should not render Advanced nav");

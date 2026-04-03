@@ -55,8 +55,8 @@ rustlemania-webtransport:
       cpu: "3500m"
       memory: "6000Mi"
     requests:
-      cpu: "3500m"
-      memory: "6000Mi"
+      cpu: "200m"
+      memory: "256Mi"
 
   service:
     type: LoadBalancer  # LoadBalancer for UDP traffic
@@ -73,6 +73,11 @@ rustlemania-webtransport:
       service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
       service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
       external-dns.alpha.kubernetes.io/hostname: "webtransport-us-east.webtransport.video"
+
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "444"
+    prometheus.io/path: "/metrics"
 
   autoscaling:
     enabled: false

@@ -16,20 +16,23 @@
  * conditions.
  */
 
+use crate::components::{
+    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
+};
 use crate::constants::*;
+use crate::context::{
+    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
+    LocalAudioLevelCtx, TransportPreferenceCtx, VideoCallClientCtx,
+};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-
-use crate::components::{
-    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
-};
-use crate::context::VideoCallClientCtx;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -66,7 +69,6 @@ pub fn Host(
     share_screen: bool,
     mic_enabled: bool,
     video_enabled: bool,
-    #[props(default)] audio_level: f32,
     on_encoder_settings_update: EventHandler<String>,
     device_settings_open: bool,
     on_device_settings_toggle: EventHandler<()>,
@@ -76,6 +78,9 @@ pub fn Host(
     reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
+    let audio_level = use_context::<LocalAudioLevelCtx>().0;
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let mut glow_el = use_signal(|| None::<web_sys::Element>);
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -405,6 +410,7 @@ pub fn Host(
                 s.microphone.stop();
                 s.encoder_settings.microphone = None;
             }
+            client.set_audio_enabled(mic_enabled);
         }
 
         // Camera
@@ -424,11 +430,9 @@ pub fn Host(
                 s.camera.stop();
                 s.encoder_settings.camera = None;
             }
+            client.set_video_enabled(video_enabled);
         }
 
-        // Update client flags
-        client.set_audio_enabled(mic_enabled);
-        client.set_video_enabled(video_enabled);
         drop(s);
     }
 
@@ -512,7 +516,16 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
-    let glow = speak_style(audio_level);
+    // Update glow overlay style directly on the DOM element — no component
+    // re-render needed.  The effect subscribes to both `audio_level` (fires on
+    // every mic callback) and `glow_el` (fires when video toggles and a new
+    // overlay element mounts).
+    use_effect(move || {
+        let level = audio_level();
+        if let Some(el) = glow_el() {
+            let _ = el.set_attribute("style", &speak_style(level));
+        }
+    });
 
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
@@ -531,8 +544,12 @@ pub fn Host(
             // Glow overlay renders ON TOP of the video element
             if video_enabled {
                 div {
-                    style: "{glow}",
                     class: "glow-overlay",
+                    onmounted: move |evt| {
+                        if let Some(elem) = evt.try_as_web_event() {
+                            glow_el.set(Some(elem));
+                        }
+                    },
                 }
             }
         }
@@ -560,8 +577,12 @@ pub fn Host(
                 }
                 // Glow overlay renders ON TOP of content
                 div {
-                    style: "{glow}",
                     class: "glow-overlay",
+                    onmounted: move |evt| {
+                        if let Some(elem) = evt.try_as_web_event() {
+                            glow_el.set(Some(elem));
+                        }
+                    },
                 }
             }
         }
@@ -594,7 +615,8 @@ pub fn Host(
                     on_camera_select: move |d: DeviceInfo| on_cam(d),
                     on_speaker_select: move |d: DeviceInfo| on_spk(d),
                     visible: device_settings_open,
-                    on_close: move |_| on_device_settings_toggle.call(())
+                    on_close: move |_| on_device_settings_toggle.call(()),
+                    transport_preference: (transport_pref_ctx.0)(),
                 }
             }
         }

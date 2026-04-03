@@ -46,6 +46,7 @@ pub enum MeetingStatus {
         host_user_id: Option<String>,
         room_token: String,
         waiting_room_enabled: bool,
+        admitted_can_admit: bool,
     },
     Rejected,
     Error(String),
@@ -235,6 +236,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     let determined_host = response.host_display_name.clone();
                                     let determined_host_uid = response.host_user_id.clone();
                                     let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
+                                    let aca = response.admitted_can_admit.unwrap_or(false);
                                     host_display_name.set(determined_host.clone());
                                     host_user_id.set(determined_host_uid.clone());
                                     match response.status.as_str() {
@@ -246,6 +248,7 @@ pub fn MeetingPage(id: String) -> Element {
                                                     host_user_id: determined_host_uid,
                                                     room_token: token,
                                                     waiting_room_enabled: wr_enabled,
+                                                    admitted_can_admit: aca,
                                                 });
                                             } else {
                                                 meeting_status.set(MeetingStatus::Error(
@@ -288,6 +291,7 @@ pub fn MeetingPage(id: String) -> Element {
                 vad_threshold: None,
                 on_peer_left: None,
                 on_peer_joined: None,
+                on_display_name_changed: None,
             };
 
             let mut client = VideoCallClient::new(opts);
@@ -352,6 +356,7 @@ pub fn MeetingPage(id: String) -> Element {
                             }
                         });
                         let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
+                        let aca = response.admitted_can_admit.unwrap_or(false);
                         host_display_name.set(determined_host.clone());
                         host_user_id.set(determined_host_uid.clone());
                         match response.status.as_str() {
@@ -364,6 +369,7 @@ pub fn MeetingPage(id: String) -> Element {
                                         host_user_id: determined_host_uid,
                                         room_token: token,
                                         waiting_room_enabled: wr_enabled,
+                                        admitted_can_admit: aca,
                                     });
                                 } else {
                                     meeting_status.set(MeetingStatus::Error(
@@ -421,6 +427,7 @@ pub fn MeetingPage(id: String) -> Element {
             let determined_host = status.host_display_name.clone();
             let determined_host_uid = status.host_user_id.clone();
             let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
+            let aca = status.admitted_can_admit.unwrap_or(false);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
             host_user_id.set(determined_host_uid.clone());
@@ -431,6 +438,7 @@ pub fn MeetingPage(id: String) -> Element {
                 host_user_id: determined_host_uid,
                 room_token: token,
                 waiting_room_enabled: wr_enabled,
+                admitted_can_admit: aca,
             });
         }
     };
@@ -476,7 +484,7 @@ pub fn MeetingPage(id: String) -> Element {
     rsx! {
         match (&maybe_username, &current_meeting_status) {
             // User is admitted - show the meeting
-            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled }) => rsx! {
+            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled, admitted_can_admit }) => rsx! {
                 AttendantsComponent {
                     display_name: username.clone(),
                     id: id.clone(),
@@ -492,6 +500,7 @@ pub fn MeetingPage(id: String) -> Element {
                     is_owner: *is_host,
                     room_token: room_token.clone(),
                     waiting_room_enabled: *waiting_room_enabled,
+                    admitted_can_admit: *admitted_can_admit,
                 }
             },
 

@@ -133,18 +133,20 @@ pub(crate) enum TileDecision {
     FallThrough,
 }
 
-/// Pure decision function: given the tile mode and whether the peer is
-/// screen-sharing, returns which rendering path to take.
+/// Pure decision function: given the tile mode, whether the peer is
+/// screen-sharing, and whether the peer is the local user, returns
+/// which rendering path to take.
 ///
 /// Extracted so that the branching logic can be tested without requiring
 /// a `VideoCallClient`, DOM, or any WASM environment.
 pub(crate) fn split_layout_decision(
     mode: &TileMode,
     is_screen_share_enabled: bool,
+    is_self_peer: bool,
 ) -> TileDecision {
     match mode {
         TileMode::ScreenOnly => {
-            if !is_screen_share_enabled {
+            if !is_screen_share_enabled || is_self_peer {
                 TileDecision::Empty
             } else {
                 TileDecision::RenderScreenShare
@@ -175,6 +177,7 @@ pub fn generate_for_peer(
     audio_levels: AudioLevels,
     host_user_id: Option<&str>,
     mode: TileMode,
+    my_peer_id: Option<&str>,
 ) -> Element {
     let audio_level = audio_levels.raw;
     let mic_audio_level = audio_levels.mic;
@@ -182,6 +185,7 @@ pub fn generate_for_peer(
     let peer_display_name = client
         .get_peer_display_name(key)
         .unwrap_or_else(|| peer_user_id.clone());
+
     // Compare authenticated user_id (from JWT/DB) instead of user-chosen display name
     // to prevent spoofing the host crown icon.
     let is_host = host_user_id.map(|h| h == peer_user_id).unwrap_or(false);
@@ -207,8 +211,17 @@ pub fn generate_for_peer(
     let tile_style = speak_style(audio_level);
     let mic_inline_style = mic_style(mic_audio_level, audio_level);
 
+    // ---- Split-layout: screen-share left panel --------------------------------
+    if matches!(mode, TileMode::ScreenOnly) {
+        // Don't render the local user's own screen share
+        if !is_screen_share_enabled_for_peer || my_peer_id == Some(peer_user_id.as_str()) {
+            return rsx! {};
+        }
+    }
+
     // ---- Split-layout: early return for ScreenOnly / VideoOnly ----------------
-    let decision = split_layout_decision(&mode, is_screen_share_enabled_for_peer);
+    let is_self_peer = my_peer_id == Some(peer_user_id.as_str());
+    let decision = split_layout_decision(&mode, is_screen_share_enabled_for_peer, is_self_peer);
 
     if decision == TileDecision::Empty {
         return rsx! {};
@@ -410,9 +423,13 @@ pub fn generate_for_peer(
         peer_user_id.clone()
     };
 
+    // Derive flat &str values so the rsx! condition is a simple != comparison.
+    let peer_id = peer_user_id.as_str();
+    let my_peer_id = my_peer_id.unwrap_or("");
+
     rsx! {
         // Canvas for Screen share.
-        if is_screen_share_enabled_for_peer {
+        if peer_id != my_peer_id && is_screen_share_enabled_for_peer {
             div {
                 class: "{screen_share_css}",
                 id: "{screen_share_div_id}",
@@ -699,20 +716,39 @@ fn toggle_canvas_crop(canvas_id: &str) {
 mod tests {
     use super::*;
 
-    // -- ScreenOnly: peer IS screen-sharing → render screen share -------------
+    // -- ScreenOnly: remote peer IS screen-sharing → render screen share ------
     #[test]
-    fn screen_only_sharing_renders_screen() {
+    fn screen_only_remote_sharing_renders_screen() {
         assert_eq!(
-            split_layout_decision(&TileMode::ScreenOnly, true),
+            split_layout_decision(&TileMode::ScreenOnly, true, false),
             TileDecision::RenderScreenShare,
         );
     }
 
-    // -- ScreenOnly: peer is NOT screen-sharing → empty -----------------------
+    // -- ScreenOnly: remote peer is NOT screen-sharing → empty ----------------
     #[test]
-    fn screen_only_not_sharing_returns_empty() {
+    fn screen_only_remote_not_sharing_returns_empty() {
         assert_eq!(
-            split_layout_decision(&TileMode::ScreenOnly, false),
+            split_layout_decision(&TileMode::ScreenOnly, false, false),
+            TileDecision::Empty,
+        );
+    }
+
+    // -- ScreenOnly: local (self) peer IS screen-sharing → empty (never show
+    //    own screen share in the split panel) ---------------------------------
+    #[test]
+    fn screen_only_self_peer_sharing_returns_empty() {
+        assert_eq!(
+            split_layout_decision(&TileMode::ScreenOnly, true, true),
+            TileDecision::Empty,
+        );
+    }
+
+    // -- ScreenOnly: local peer, not sharing → empty --------------------------
+    #[test]
+    fn screen_only_self_peer_not_sharing_returns_empty() {
+        assert_eq!(
+            split_layout_decision(&TileMode::ScreenOnly, false, true),
             TileDecision::Empty,
         );
     }
@@ -721,7 +757,15 @@ mod tests {
     #[test]
     fn video_only_renders_video() {
         assert_eq!(
-            split_layout_decision(&TileMode::VideoOnly, false),
+            split_layout_decision(&TileMode::VideoOnly, false, false),
+            TileDecision::RenderVideo,
+        );
+    }
+
+    #[test]
+    fn video_only_self_peer_renders_video() {
+        assert_eq!(
+            split_layout_decision(&TileMode::VideoOnly, false, true),
             TileDecision::RenderVideo,
         );
     }
@@ -729,7 +773,15 @@ mod tests {
     #[test]
     fn video_only_with_screen_share_renders_video() {
         assert_eq!(
-            split_layout_decision(&TileMode::VideoOnly, true),
+            split_layout_decision(&TileMode::VideoOnly, true, false),
+            TileDecision::RenderVideo,
+        );
+    }
+
+    #[test]
+    fn video_only_self_peer_with_screen_share_renders_video() {
+        assert_eq!(
+            split_layout_decision(&TileMode::VideoOnly, true, true),
             TileDecision::RenderVideo,
         );
     }
@@ -738,7 +790,7 @@ mod tests {
     #[test]
     fn full_mode_falls_through() {
         assert_eq!(
-            split_layout_decision(&TileMode::Full, false),
+            split_layout_decision(&TileMode::Full, false, false),
             TileDecision::FallThrough,
         );
     }
@@ -746,7 +798,15 @@ mod tests {
     #[test]
     fn full_mode_with_screen_share_falls_through() {
         assert_eq!(
-            split_layout_decision(&TileMode::Full, true),
+            split_layout_decision(&TileMode::Full, true, false),
+            TileDecision::FallThrough,
+        );
+    }
+
+    #[test]
+    fn full_mode_self_peer_falls_through() {
+        assert_eq!(
+            split_layout_decision(&TileMode::Full, false, true),
             TileDecision::FallThrough,
         );
     }

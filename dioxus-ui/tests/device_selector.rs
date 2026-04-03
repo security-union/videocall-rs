@@ -600,6 +600,5 @@ async fn device_settings_modal_renders_expected_navigation_tabs() {
     assert!(!text.contains("Devices"), "should not render Devices nav");
     assert!(!text.contains("Profile"), "should not render Profile nav");
     assert!(!text.contains("Advanced"), "should not render Advanced nav");
-
     cleanup(&mount);
 }

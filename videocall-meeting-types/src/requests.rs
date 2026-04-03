@@ -38,6 +38,10 @@ pub struct CreateMeetingRequest {
     /// when omitted.
     #[serde(default)]
     pub waiting_room_enabled: Option<bool>,
+
+    /// Whether admitted participants can also admit others from the waiting room.
+    #[serde(default)]
+    pub admitted_can_admit: Option<bool>,
 }
 
 /// Request body for `PATCH /api/v1/meetings/{meeting_id}`.
@@ -46,6 +50,10 @@ pub struct UpdateMeetingRequest {
     /// Toggle the waiting room on or off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_room_enabled: Option<bool>,
+
+    /// Toggle whether admitted participants can admit others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admitted_can_admit: Option<bool>,
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/join`.
@@ -54,6 +62,13 @@ pub struct JoinMeetingRequest {
     /// Display name shown in the meeting UI.
     #[serde(default)]
     pub display_name: Option<String>,
+}
+
+/// Request body for `PUT /api/v1/meetings/{meeting_id}/display-name`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpdateDisplayNameRequest {
+    /// New display name for the participant.
+    pub display_name: String,
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/admit`

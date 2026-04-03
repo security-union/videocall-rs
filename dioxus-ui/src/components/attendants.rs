@@ -33,7 +33,7 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::{MeetingTime, PeerMediaState, PeerStatusMap};
+use crate::context::{LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerStatusMap};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
@@ -862,6 +862,7 @@ pub fn AttendantsComponent(
     use_context_provider(|| client.clone());
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
+    use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
 
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
@@ -1107,6 +1108,8 @@ pub fn AttendantsComponent(
         meeting_start_time: meeting_start_time_server(),
     });
 
+    info!("Rendering meeting view with {} peers", display_peers.len());
+
     rsx! {
         div {
             // Provide MeetingTime context
@@ -1175,13 +1178,13 @@ pub fn AttendantsComponent(
                     style: "{container_style}",
 
                     // Peer tiles
-                    for (i, peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
+                    for peer_id in display_peers.iter().take(CANVAS_LIMIT) {
                         {
                             let full_bleed = display_peers.len() == 1
                                 && !client.is_screen_share_enabled_for_peer(peer_id);
                             rsx! {
                                 PeerTile {
-                                    key: "tile-{i}-{peer_id}",
+                                    key: "tile-{peer_id}",
                                     peer_id: peer_id.clone(),
                                     full_bleed: full_bleed,
                                     host_user_id: host_user_id.clone(),
@@ -1412,7 +1415,6 @@ pub fn AttendantsComponent(
                                     share_screen: screen_share_state().is_sharing(),
                                     mic_enabled: mic_enabled(),
                                     video_enabled: video_enabled(),
-                                    audio_level: local_audio_level(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     on_device_settings_toggle: move |_| {

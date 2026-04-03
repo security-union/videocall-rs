@@ -22,7 +22,7 @@ use crate::components::{
 use crate::constants::*;
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    LocalAudioLevelCtx, VideoCallClientCtx,
+    LocalAudioLevelCtx, TransportPreferenceCtx, VideoCallClientCtx,
 };
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
@@ -79,6 +79,7 @@ pub fn Host(
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let audio_level = use_context::<LocalAudioLevelCtx>().0;
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut glow_el = use_signal(|| None::<web_sys::Element>);
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
@@ -614,7 +615,8 @@ pub fn Host(
                     on_camera_select: move |d: DeviceInfo| on_cam(d),
                     on_speaker_select: move |d: DeviceInfo| on_spk(d),
                     visible: device_settings_open,
-                    on_close: move |_| on_device_settings_toggle.call(())
+                    on_close: move |_| on_device_settings_toggle.call(()),
+                    transport_preference: (transport_pref_ctx.0)(),
                 }
             }
         }

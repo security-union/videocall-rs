@@ -11,7 +11,10 @@ mod routing;
 mod types;
 
 use crate::routing::Route;
-use context::{load_display_name_from_storage, migrate_legacy_storage, DisplayNameCtx};
+use context::{
+    load_display_name_from_storage, load_transport_preference, migrate_legacy_storage,
+    DisplayNameCtx, TransportPreferenceCtx,
+};
 use dioxus::prelude::*;
 use matomo_logger::{MatomoConfig, MatomoLogger};
 
@@ -37,6 +40,9 @@ fn main() {
 fn App() -> Element {
     let display_name = use_signal(load_display_name_from_storage);
     use_context_provider(|| DisplayNameCtx(display_name));
+
+    let transport_pref = use_signal(load_transport_preference);
+    use_context_provider(|| TransportPreferenceCtx(transport_pref));
 
     rsx! {
         Router::<Route> {}

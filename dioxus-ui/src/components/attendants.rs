@@ -36,8 +36,8 @@ use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{
-    save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerStatusMap,
+    resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
+    MeetingTime, PeerMediaState, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -202,6 +202,7 @@ fn schedule_reconnect(
     current_display_name: Signal<String>,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
+    transport_pref_signal: Signal<TransportPreference>,
     attempt: u32,
 ) {
     let delay_ms = match reconnect_delay_ms(attempt) {
@@ -228,6 +229,15 @@ fn schedule_reconnect(
                     log::info!("Room token refreshed, reconnecting with new token");
                     let latest_display_name = current_display_name();
                     let (ws, wt) = build_lobby_urls(&new_token, &latest_display_name, &meeting_id);
+
+                    // Apply the user's transport preference so the reconnection
+                    // honours the same protocol selection as the initial connection.
+                    let pref = transport_pref_signal();
+                    let server_wt_enabled =
+                        crate::constants::webtransport_enabled().unwrap_or(false);
+                    let (_enable_wt, ws, wt) =
+                        resolve_transport_config(pref, server_wt_enabled, ws, wt);
+
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
                         if let Err(e) = client.connect() {
@@ -247,6 +257,7 @@ fn schedule_reconnect(
                         current_display_name,
                         connection_error,
                         meeting_ended_message,
+                        transport_pref_signal,
                         attempt + 1,
                     );
                 }
@@ -380,7 +391,6 @@ pub fn AttendantsComponent(
     #[props(default)] id: String,
     #[props(default)] display_name: String,
     e2ee_enabled: bool,
-    webtransport_enabled: bool,
     #[props(default)] user_name: Option<String>,
     #[props(default)] user_id: Option<String>,
     #[props(default)] on_logout: Option<EventHandler<()>>,
@@ -459,6 +469,11 @@ pub fn AttendantsComponent(
     // on_peer_removed callback inside use_hook below.
     let mut peer_status_map: PeerStatusMap = use_signal(HashMap::new);
 
+    // Read transport preference from context BEFORE use_hook (hooks must not
+    // be called inside the hook closure).
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let transport_pref = (transport_pref_ctx.0)();
+
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
     // callback can access the client for reconnection. The cell is populated
@@ -480,6 +495,15 @@ pub fn AttendantsComponent(
         let (websocket_urls, webtransport_urls) =
             build_lobby_urls(&token, &initial_display_name, &id);
 
+        // Apply user's transport preference
+        let server_wt_enabled = crate::constants::webtransport_enabled().unwrap_or(false);
+        let (effective_wt_enabled, websocket_urls, webtransport_urls) = resolve_transport_config(
+            transport_pref,
+            server_wt_enabled,
+            websocket_urls,
+            webtransport_urls,
+        );
+
         log::info!(
             "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
             initial_display_name,
@@ -499,7 +523,7 @@ pub fn AttendantsComponent(
             websocket_urls,
             webtransport_urls,
             enable_e2ee: e2ee_enabled,
-            enable_webtransport: webtransport_enabled,
+            enable_webtransport: effective_wt_enabled,
             on_connected: VcCallback::from(move |_| {
                 log::info!("DIOXUS-UI: Connection established");
                 let mut connection_error = connection_error;
@@ -530,6 +554,7 @@ pub fn AttendantsComponent(
                             current_display_name,
                             connection_error,
                             meeting_ended_message,
+                            transport_pref_ctx.0,
                             0,
                         );
                     }

@@ -2,6 +2,7 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
+use crate::context::{confirm_transport_change, TransportPreference};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
@@ -11,6 +12,7 @@ use web_sys::MediaDeviceInfo;
 enum SettingsSection {
     Audio,
     Video,
+    Network,
 }
 
 impl SettingsSection {
@@ -18,6 +20,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "Audio",
             SettingsSection::Video => "Video",
+            SettingsSection::Network => "Network",
         }
     }
 
@@ -25,6 +28,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-tab-audio",
             SettingsSection::Video => "settings-tab-video",
+            SettingsSection::Network => "settings-tab-network",
         }
     }
 
@@ -32,6 +36,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-panel-audio",
             SettingsSection::Video => "settings-panel-video",
+            SettingsSection::Network => "settings-panel-network",
         }
     }
 
@@ -39,24 +44,31 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-nav-audio",
             SettingsSection::Video => "settings-nav-video",
+            SettingsSection::Network => "settings-nav-network",
         }
     }
 
-    fn all() -> [SettingsSection; 2] {
-        [SettingsSection::Audio, SettingsSection::Video]
+    fn all() -> [SettingsSection; 3] {
+        [
+            SettingsSection::Audio,
+            SettingsSection::Video,
+            SettingsSection::Network,
+        ]
     }
 
     fn next(self) -> Self {
         match self {
             SettingsSection::Audio => SettingsSection::Video,
-            SettingsSection::Video => SettingsSection::Audio,
+            SettingsSection::Video => SettingsSection::Network,
+            SettingsSection::Network => SettingsSection::Audio,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            SettingsSection::Audio => SettingsSection::Video,
+            SettingsSection::Audio => SettingsSection::Network,
             SettingsSection::Video => SettingsSection::Audio,
+            SettingsSection::Network => SettingsSection::Video,
         }
     }
 }
@@ -74,6 +86,7 @@ pub fn DeviceSettingsModal(
     on_speaker_select: EventHandler<DeviceInfo>,
     visible: bool,
     on_close: EventHandler<()>,
+    #[props(default)] transport_preference: TransportPreference,
 ) -> Element {
     let is_ios_safari = is_ios();
     let mut active_section = use_signal(|| SettingsSection::Audio);
@@ -261,6 +274,53 @@ pub fn DeviceSettingsModal(
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                            },
+                            SettingsSection::Network => rsx! {
+                                div {
+                                    id: SettingsSection::Network.panel_id(),
+                                    class: "settings-section",
+                                    role: "tabpanel",
+                                    "aria-labelledby": SettingsSection::Network.tab_id(),
+
+                                    h3 { class: "settings-section-title", "Network" }
+                                    p { class: "settings-section-description",
+                                        "Choose the transport protocol for media connections."
+                                    }
+
+                                    div { class: "device-setting-group",
+                                        label { r#for: "modal-transport-select", "Protocol" }
+                                        select {
+                                            id: "modal-transport-select",
+                                            class: "device-selector-modal",
+                                            onchange: move |evt: Event<FormData>| {
+                                                confirm_transport_change(
+                                                    &evt.value(),
+                                                    transport_preference,
+                                                    "modal-transport-select",
+                                                );
+                                            },
+                                            option {
+                                                value: "auto",
+                                                selected: transport_preference == TransportPreference::Auto,
+                                                "Auto"
+                                            }
+                                            option {
+                                                value: "webtransport",
+                                                selected: transport_preference == TransportPreference::WebTransportOnly,
+                                                "WebTransport"
+                                            }
+                                            option {
+                                                value: "websocket",
+                                                selected: transport_preference == TransportPreference::WebSocketOnly,
+                                                "WebSocket"
+                                            }
+                                        }
+                                    }
+
+                                    p { class: "transport-preference-note",
+                                        "Changing protocol will reload the page."
                                     }
                                 }
                             },

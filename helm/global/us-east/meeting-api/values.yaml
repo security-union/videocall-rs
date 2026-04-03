@@ -62,7 +62,7 @@ meeting-api:
     - name: ALLOWED_REDIRECT_URLS
       value: "https://app.videocall.rs"
     - name: SERVICE_VERSION_URLS
-      value: "http://websocket-us-east:8080/version,http://webtransport-us-east:444/version,http://videocall-ui-us-east:80/version.json"
+      value: "http://websocket-us-east:8080/version,http://webtransport-us-east-lb:444/version,http://videocall-ui-us-east:80/version.json"
 
   resources:
     limits:

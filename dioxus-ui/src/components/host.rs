@@ -16,23 +16,23 @@
  * conditions.
  */
 
+use crate::components::{
+    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
+};
 use crate::constants::*;
+use crate::context::{
+    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
+    LocalAudioLevelCtx, VideoCallClientCtx,
+};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-
-use crate::components::{
-    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
-};
-use crate::context::{
-    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    LocalAudioLevelCtx, VideoCallClientCtx,
-};
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -75,9 +75,8 @@ pub fn Host(
     reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
-    // Read audio level from context — subscribes only this component,
-    // not the parent AttendantsComponent.
     let audio_level = use_context::<LocalAudioLevelCtx>().0;
+    let mut glow_el = use_signal(|| None::<web_sys::Element>);
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -360,7 +359,7 @@ pub fn Host(
             s.last_reload_counter = reload_devices_counter;
         }
 
-        log::trace!(
+        log::info!(
             "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
             s.prev_video_enabled, s.prev_mic_enabled, s.prev_share_screen,
         );
@@ -508,7 +507,16 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
-    let glow = speak_style(audio_level());
+    // Update glow overlay style directly on the DOM element — no component
+    // re-render needed.  The effect subscribes to both `audio_level` (fires on
+    // every mic callback) and `glow_el` (fires when video toggles and a new
+    // overlay element mounts).
+    use_effect(move || {
+        let level = audio_level();
+        if let Some(el) = glow_el() {
+            let _ = el.set_attribute("style", &speak_style(level));
+        }
+    });
 
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
@@ -540,8 +548,12 @@ pub fn Host(
             // Glow overlay renders ON TOP of the video element
             if video_enabled {
                 div {
-                    style: "{glow}",
                     class: "glow-overlay",
+                    onmounted: move |evt| {
+                        if let Some(elem) = evt.try_as_web_event() {
+                            glow_el.set(Some(elem));
+                        }
+                    },
                 }
             }
         }
@@ -570,8 +582,12 @@ pub fn Host(
                 }
                 // Glow overlay renders ON TOP of content
                 div {
-                    style: "{glow}",
                     class: "glow-overlay",
+                    onmounted: move |evt| {
+                        if let Some(elem) = evt.try_as_web_event() {
+                            glow_el.set(Some(elem));
+                        }
+                    },
                 }
             }
         }

@@ -2351,61 +2351,30 @@ select {
 .peer_item_mic svg { width: 100%; height: 100%; }
 
 .peer_item_mic.speaking {
-  color: #00ff41;
-  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  color: #5bcf9f;
+  filter: drop-shadow(0 0 6px rgba(91, 207, 159, 0.8));
 }
-.peer_item_mic.speaking svg { stroke: #00ff41; }
+.peer_item_mic.speaking svg { stroke: #5bcf9f; }
 
 .host-video-wrapper { border-radius: inherit; overflow: hidden; border: none; box-shadow: none; }
 
-/* ============================================================
-   Animated gradient border for speaking / active tiles
-   ============================================================ */
-
-/* Houdini @property — lets the browser interpolate --rotate each frame so the
-   linear-gradient direction spins. Falls back gracefully: without @property
-   support the browser cannot transition the custom property, so it stays at
-   0deg (a static diagonal gradient) — still visible, no flash or error. */
-@property --rotate {
-  syntax: '<angle>';
-  initial-value: 0deg;
-  inherits: false;
-}
-
-/* Explicit from/to required by some browsers to pick up @property animation. */
-@keyframes border-spin {
-  0%   { --rotate: 0deg; }
-  100% { --rotate: 360deg; }
-}
-
-/* background-clip trick (works inside overflow:hidden):
-   - padding-box layer:  opaque dark fill covers the card interior
-   - border-box layer:   spinning linear-gradient shows only in the 2px border slot
-   The gradient direction rotates via --rotate, sweeping colour around the edge. */
+/* Solid mint border for speaking / active tiles. */
 .grid-item.speaking-tile {
-  border-color: transparent;
-  background:
-    linear-gradient(#2d2d2d, #2d2d2d) padding-box,
-    linear-gradient(var(--rotate), #274B07, #508621, #70B652, #ACD739, #97C426, #274B07) border-box;
-  animation: border-spin 8s linear infinite;
+  border-color: #5bcf9f;
 }
 
-/* Host self-view tile — same gradient, darker interior (#1c1c1c). */
+/* Host self-view tile — same solid mint border, darker interior (#1c1c1c). */
 .host.speaking-tile {
-  border-color: transparent;
-  background:
-    linear-gradient(#1c1c1c, #1c1c1c) padding-box,
-    linear-gradient(var(--rotate), #274B07, #508621, #70B652, #ACD739, #97C426, #274B07) border-box;
-  animation: border-spin 8s linear infinite;
+  border-color: #5bcf9f;
 }
 
 /* speak_style() in Rust drives box-shadow glow intensity via inline style.
-   Border gradient animation is driven by the .speaking-tile CSS class. */
+   Solid mint border is driven by the .speaking-tile CSS class. */
 
 .audio-indicator {
   transition: color 0.4s ease, filter 0.4s ease;
 }
-.audio-indicator.speaking svg { stroke: #00ff41; }
+.audio-indicator.speaking svg { stroke: #5bcf9f; }
 
 /* ── Participant join/leave toast notifications ─────────────────────── */
 

@@ -122,7 +122,7 @@ test.describe("Speaker highlight glow on video tiles", () => {
     await waitForServices();
   });
 
-  test("video tile has transparent border and no glow when silent", async ({ baseURL }) => {
+  test("video tile has no speaking class and no glow when silent", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_glow_peer_${Date.now()}`;
@@ -165,11 +165,11 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const glowOverlay = peerTile.first();
       await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
 
-      // When silent: idle border-color and no glow.
+      // When silent: no glow, and the border animation class should be absent.
       const style = await glowOverlay.getAttribute("style");
       expect(style).toBeTruthy();
-      expect(style).toContain("border-color:");
       expect(style).toContain("box-shadow: none");
+      await expect(glowOverlay).not.toHaveClass(/speaking-tile/);
     } finally {
       await browser1.close();
       await browser2.close();
@@ -230,7 +230,7 @@ test.describe("Speaker highlight glow on video tiles", () => {
     }
   });
 
-  test("host tile has transparent border when silent", async ({ baseURL }) => {
+  test("host tile has no speaking class and no glow when silent", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_glow_host_${Date.now()}`;
@@ -259,8 +259,8 @@ test.describe("Speaker highlight glow on video tiles", () => {
       // The host's own controls bar should have silent-state inline styles.
       const style = await hostNav.first().getAttribute("style");
       expect(style).toBeTruthy();
-      expect(style).toContain("border-color:");
       expect(style).toContain("box-shadow: none");
+      await expect(hostNav.first()).not.toHaveClass(/speaking-tile/);
     } finally {
       await browser.close();
     }

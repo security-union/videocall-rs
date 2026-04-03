@@ -32,7 +32,7 @@ use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObser
 
 /// Compute the inline CSS for the speaking glow on the tile shell.
 /// Controls **only box-shadow** glow intensity, which scales with audio level.
-/// Border appearance (rotating mint-gradient) is handled by the CSS class
+/// Border appearance (solid mint border) is handled by the CSS class
 /// `speaking-tile`, toggled by the caller when `audio_level > 0`.
 /// All shadow layers use spread 0 so glow blooms from blur only.
 pub(crate) fn speak_style(audio_level: f32, is_suppressed: bool) -> String {
@@ -45,14 +45,13 @@ pub(crate) fn speak_style(audio_level: f32, is_suppressed: bool) -> String {
 
     let i = audio_level.clamp(0.0, 1.0);
 
-    // Shadow colour is fixed to a dominant green in the CSS gradient (#70B652)
-    // so the glow hue always coordinates with the animated border.
+    // Shadow colour is a soft mint (#5bcf9f) matching the solid border.
     format!(
         "box-shadow: \
-            0 0 {tight_blur:.0}px 0 rgba(112, 182, 82, {tight_a:.2}), \
-            0 0 {wide_blur:.0}px 0 rgba(112, 182, 82, {wide_a:.2}), \
-            inset 0 0 {inset_blur:.0}px 0 rgba(112, 182, 82, {inset_a:.2}), \
-            inset 0 0 {deep_blur:.0}px 0 rgba(112, 182, 82, {deep_a:.2}); \
+            0 0 {tight_blur:.0}px 0 rgba(91, 207, 159, {tight_a:.2}), \
+            0 0 {wide_blur:.0}px 0 rgba(91, 207, 159, {wide_a:.2}), \
+            inset 0 0 {inset_blur:.0}px 0 rgba(91, 207, 159, {inset_a:.2}), \
+            inset 0 0 {deep_blur:.0}px 0 rgba(91, 207, 159, {deep_a:.2}); \
          transition: box-shadow 0.18s ease-in-out;",
         // Tight outer glow hugging the border
         tight_blur = 8.0 + i * 16.0, // 8–24 px
@@ -95,8 +94,8 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, is_suppressed: bool) -
         let glow_i = clamped.sqrt();
         return format!(
             "color: inherit; \
-             filter: drop-shadow(0 0 {:.0}px rgba(112, 182, 82, {:.2})) \
-                     drop-shadow(0 0 {:.0}px rgba(112, 182, 82, {:.2})); \
+             filter: drop-shadow(0 0 {:.0}px rgba(91, 207, 159, {:.2})) \
+                     drop-shadow(0 0 {:.0}px rgba(91, 207, 159, {:.2})); \
              transition: color 5.0s ease-out, filter 0.15s ease-in;",
             8.0 + glow_i * 16.0,
             0.7 + glow_i * 0.3,
@@ -106,15 +105,15 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, is_suppressed: bool) -
     }
     if mic_audio_level > 0.0 && glow_audio_level <= 0.0 {
         // Held color (still green) but raw glow has faded — no drop-shadow
-        return "color: #70B652; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;".to_string();
+        return "color: #5bcf9f; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;".to_string();
     }
     // Both positive: green color + scaled drop-shadow glow
     let clamped = glow_audio_level.clamp(0.0, 1.0);
     let glow_i = clamped.sqrt();
     format!(
-        "color: #70B652; \
-         filter: drop-shadow(0 0 {:.0}px rgba(112, 182, 82, {:.2})) \
-                 drop-shadow(0 0 {:.0}px rgba(112, 182, 82, {:.2})); \
+        "color: #5bcf9f; \
+         filter: drop-shadow(0 0 {:.0}px rgba(91, 207, 159, {:.2})) \
+                 drop-shadow(0 0 {:.0}px rgba(91, 207, 159, {:.2})); \
          transition: color 0.05s ease-in, filter 0.15s ease-in;",
         8.0 + glow_i * 16.0, // primary drop-shadow blur: 8–24px
         0.7 + glow_i * 0.3,  // primary drop-shadow alpha: 0.7–1.0

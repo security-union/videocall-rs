@@ -1,0 +1,29 @@
+[package]
+name = "videocall-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Serialization benchmarks: Protobuf vs Cap'n Proto vs FlatBuffers"
+
+[dependencies]
+protobuf = "=3.7.1"
+videocall-types = { path = "../videocall-types" }
+capnp = "0.20"
+flatbuffers = "24.12"
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[build-dependencies]
+capnpc = "0.20"
+
+[[bench]]
+name = "media_packet"
+harness = false
+
+[[bench]]
+name = "packet_wrapper"
+harness = false
+
+[[bench]]
+name = "health_packet"
+harness = false

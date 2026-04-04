@@ -1,0 +1,60 @@
+namespace videocall.bench;
+
+table NetEqOperationCounters {
+  normal_per_sec: float64;
+  expand_per_sec: float64;
+  accelerate_per_sec: float64;
+  fast_accelerate_per_sec: float64;
+  preemptive_expand_per_sec: float64;
+  merge_per_sec: float64;
+  comfort_noise_per_sec: float64;
+  dtmf_per_sec: float64;
+  undefined_per_sec: float64;
+}
+
+table NetEqNetwork {
+  operation_counters: NetEqOperationCounters;
+}
+
+table NetEqStats {
+  current_buffer_size_ms: float64;
+  packets_awaiting_decode: float64;
+  network: NetEqNetwork;
+  packets_per_sec: float64;
+}
+
+table VideoStats {
+  fps_received: float64;
+  frames_buffered: float64;
+  frames_decoded: uint64;
+  bitrate_kbps: uint64;
+}
+
+table PeerStats {
+  can_listen: bool;
+  can_see: bool;
+  audio_enabled: bool;
+  video_enabled: bool;
+  neteq_stats: NetEqStats;
+  video_stats: VideoStats;
+}
+
+table PeerStatsEntry {
+  key: string;
+  value: PeerStats;
+}
+
+table HealthPacket {
+  session_id: string;
+  meeting_id: string;
+  reporting_peer: string;
+  timestamp_ms: uint64;
+  reporting_audio_enabled: bool;
+  reporting_video_enabled: bool;
+  peer_stats: [PeerStatsEntry];
+  active_server_url: string;
+  active_server_type: string;
+  active_server_rtt_ms: float64;
+}
+
+root_type HealthPacket;

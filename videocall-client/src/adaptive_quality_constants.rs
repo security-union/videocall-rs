@@ -308,8 +308,18 @@ pub const SCREEN_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 pub const KEYFRAME_REQUEST_TIMEOUT_MS: u64 = 1000;
 
 /// Minimum interval between keyframe requests to the same sender (milliseconds).
-/// Prevents flooding the sender with PLI requests.
-pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
+/// Also used as the initial exponential backoff interval. Subsequent requests
+/// double this interval up to `KEYFRAME_REQUEST_MAX_BACKOFF_MS`.
+pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 1000;
+
+/// Maximum backoff interval between keyframe requests (milliseconds).
+/// The backoff doubles from `KEYFRAME_REQUEST_MIN_INTERVAL_MS` and caps here.
+pub const KEYFRAME_REQUEST_MAX_BACKOFF_MS: u64 = 8000;
+
+/// Maximum number of unanswered keyframe requests before giving up.
+/// After this many requests with no keyframe received, stop sending PLIs
+/// and wait for a natural keyframe from the sender.
+pub const KEYFRAME_REQUEST_MAX_UNANSWERED: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Reconnection

@@ -356,42 +356,32 @@ impl WebTransportTask {
     /// acquiring the lock) close the transport.
     pub fn send_datagram(transport: Rc<WebTransport>, data: Vec<u8>) {
         wasm_bindgen_futures::spawn_local(async move {
-            let transport = transport.clone();
-            let result: Result<(), anyhow::Error> = {
-                let transport = transport.clone();
-                async move {
-                    let stream = transport.datagrams();
-                    let stream: WritableStream = stream.writable();
-                    if stream.locked() {
-                        // Another datagram write is in progress. Datagrams are
-                        // expendable -- just drop this one silently. Do NOT close
-                        // the transport; the in-flight write will release the lock.
-                        return Err(anyhow::anyhow!("Datagram stream locked, dropping packet"));
-                    }
-                    let writer = stream.get_writer().map_err(|e| anyhow!("{:?}", e))?;
-                    let data = Uint8Array::from(data.as_slice());
-                    JsFuture::from(writer.ready())
-                        .await
-                        .map_err(|e| anyhow!("{:?}", e))?;
-                    JsFuture::from(writer.write_with_chunk(&data))
-                        .await
-                        .map_err(|e| anyhow!("{:?}", e))?;
-                    writer.release_lock();
-                    Ok(())
-                }
+            let stream = transport.datagrams();
+            let writable: WritableStream = stream.writable();
+            if writable.locked() {
+                log!("datagram dropped (stream busy)");
+                return;
             }
-            .await;
-            if let Err(e) = result {
-                let e_str = e.to_string();
-                if e_str.contains("locked") {
-                    // Stream was locked by a concurrent write -- not fatal.
-                    // The packet is expendable; just log at debug level.
-                    log!("datagram dropped (stream busy)");
-                } else {
-                    // Fatal transport error -- close the connection.
-                    log!("error: ", e_str);
+            let writer = match writable.get_writer() {
+                Ok(w) => w,
+                Err(e) => {
+                    log!("error: ", format!("{e:?}"));
                     transport.close();
+                    return;
                 }
+            };
+            let data = Uint8Array::from(data.as_slice());
+            let result = match JsFuture::from(writer.ready()).await {
+                Ok(_) => JsFuture::from(writer.write_with_chunk(&data)).await,
+                err => err,
+            };
+            writer.release_lock();
+            if let Err(e) = result {
+                log!(
+                    "datagram write failed, closing transport:",
+                    format!("{e:?}")
+                );
+                transport.close();
             }
         });
     }
@@ -404,32 +394,30 @@ impl WebTransportTask {
     /// the `closed` promise will detect it independently.
     pub fn send_unidirectional_stream(transport: Rc<WebTransport>, data: Vec<u8>) {
         wasm_bindgen_futures::spawn_local(async move {
-            let result: Result<(), anyhow::Error> = {
-                let transport = transport.clone();
-                async move {
-                    let _ = JsFuture::from(transport.ready())
+            let result: Result<(), anyhow::Error> = async {
+                JsFuture::from(transport.ready())
+                    .await
+                    .map_err(|e| anyhow!("{:?}", e))?;
+                let stream: WritableStream =
+                    JsFuture::from(transport.create_unidirectional_stream())
                         .await
-                        .map_err(|e| anyhow!("{:?}", e))?;
-                    let stream = JsFuture::from(transport.create_unidirectional_stream()).await;
-                    let stream: WritableStream = stream
                         .map_err(|e| anyhow!("failed to create Writeable stream {:?}", e))?
                         .unchecked_into();
-                    let writer = stream
-                        .get_writer()
-                        .map_err(|e| anyhow!("Error getting writer {:?}", e))?;
-                    let data = Uint8Array::from(data.as_slice());
-                    JsFuture::from(writer.ready())
-                        .await
-                        .map_err(|e| anyhow!("Error getting writer ready {:?}", e))?;
-                    let _ = JsFuture::from(writer.write_with_chunk(&data))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Error writing to stream: {:?}", e))?;
-                    writer.release_lock();
-                    JsFuture::from(stream.close())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Error closing stream {:?}", e))?;
-                    Ok(())
-                }
+                let writer = stream
+                    .get_writer()
+                    .map_err(|e| anyhow!("Error getting writer {:?}", e))?;
+                let data = Uint8Array::from(data.as_slice());
+                JsFuture::from(writer.ready())
+                    .await
+                    .map_err(|e| anyhow!("Error getting writer ready {:?}", e))?;
+                JsFuture::from(writer.write_with_chunk(&data))
+                    .await
+                    .map_err(|e| anyhow!("Error writing to stream: {:?}", e))?;
+                writer.release_lock();
+                JsFuture::from(stream.close())
+                    .await
+                    .map_err(|e| anyhow!("Error closing stream {:?}", e))?;
+                Ok(())
             }
             .await;
             if let Err(e) = result {

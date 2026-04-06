@@ -54,6 +54,25 @@ struct ExecutePendingDeparture {
     display_name: String,
 }
 
+/// NATS subject for cross-server stale session eviction.
+const EVICT_INSTANCE_SUBJECT: &str = "internal.evict_instance";
+
+/// Payload published to NATS for cross-server stale session eviction.
+/// When a client reconnects (possibly to a different server), the new server
+/// broadcasts this so the old server can clean up silently.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct EvictInstancePayload {
+    instance_id: String,
+    room: String,
+    user_id: String,
+    new_session_id: SessionId,
+}
+
+/// Internal actix message delivered when a NATS eviction message is received.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct EvictInstance(EvictInstancePayload);
+
 /// State stored while a departure is pending (waiting for possible reconnection).
 struct PendingDepartureState {
     /// Handle returned by `ctx.notify_later()`, used to cancel the delayed
@@ -217,10 +236,114 @@ impl ChatServer {
     pub fn session_manager(&self) -> &SessionManager {
         &self.session_manager
     }
+
+    /// Evict a stale session for the given `instance_id`, if present locally.
+    ///
+    /// Returns `true` if a session was evicted.
+    /// `skip_session_id` is the new session's ID — used as a self-delivery guard
+    /// to prevent the publishing server from double-evicting.
+    fn evict_stale_session(
+        &mut self,
+        instance_id: &str,
+        room: &str,
+        user_id: &str,
+        skip_session_id: SessionId,
+        ctx: &mut Context<Self>,
+    ) -> bool {
+        let prev_sid = match self.instance_index.get(instance_id) {
+            Some(&sid) => sid,
+            None => return false,
+        };
+
+        if prev_sid == skip_session_id {
+            return false;
+        }
+
+        let user_matches = self
+            .room_members
+            .get(room)
+            .map(|members| {
+                members
+                    .iter()
+                    .any(|(sid, uid, _)| *sid == prev_sid && uid == user_id)
+            })
+            .unwrap_or(false);
+
+        if !user_matches {
+            return false;
+        }
+
+        info!(
+            "Evicting stale session {} for instance {} (user {} in room {}) \
+             in favour of session {}",
+            prev_sid, instance_id, user_id, room, skip_session_id
+        );
+
+        if let Some(members) = self.room_members.get_mut(room) {
+            members.retain(|(sid, _, _)| *sid != prev_sid);
+        }
+
+        if let Some(task) = self.active_subs.remove(&prev_sid) {
+            task.abort();
+        }
+
+        let _ = self.sessions.remove(&prev_sid);
+        let _ = self.connection_states.remove(&prev_sid);
+        let _ = self.suppress_join_broadcast.remove(&prev_sid);
+
+        let departure_key = (room.to_string(), user_id.to_string());
+        if let Some(pending) = self.pending_departures.remove(&departure_key) {
+            ctx.cancel_future(pending.spawn_handle);
+        }
+
+        self.instance_index.remove(instance_id);
+
+        true
+    }
 }
 
 impl Actor for ChatServer {
     type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        info!(
+            "ChatServer started — subscribing to {}",
+            EVICT_INSTANCE_SUBJECT
+        );
+
+        let nc = self.nats_connection.clone();
+        let addr = ctx.address();
+
+        tokio::spawn(async move {
+            loop {
+                match nc.subscribe(EVICT_INSTANCE_SUBJECT).await {
+                    Ok(mut sub) => {
+                        while let Some(msg) = sub.next().await {
+                            match serde_json::from_slice::<EvictInstancePayload>(&msg.payload) {
+                                Ok(payload) => {
+                                    addr.do_send(EvictInstance(payload));
+                                }
+                                Err(e) => {
+                                    warn!("Failed to deserialize evict_instance payload: {}", e);
+                                }
+                            }
+                        }
+                        warn!(
+                            "{} subscription stream ended, re-subscribing in 1s",
+                            EVICT_INSTANCE_SUBJECT
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to subscribe to {}: {}, retrying in 1s",
+                            EVICT_INSTANCE_SUBJECT, e
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+    }
 }
 
 impl Handler<Connect> for ChatServer {
@@ -444,6 +567,44 @@ impl Handler<ActivateConnection> for ChatServer {
     }
 }
 
+/// Handle cross-server eviction requests received via NATS.
+impl Handler<EvictInstance> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: EvictInstance, ctx: &mut Self::Context) -> Self::Result {
+        let EvictInstancePayload {
+            instance_id,
+            room,
+            user_id,
+            new_session_id,
+        } = msg.0;
+
+        // Validate inbound fields — the JoinRoom path sanitizes instance_id to
+        // max 64 chars, but NATS messages come from untrusted peers.
+        if instance_id.is_empty()
+            || instance_id.len() > 64
+            || room.len() > 256
+            || user_id.len() > 256
+        {
+            warn!(
+                "Ignoring eviction with invalid field lengths (instance_id={}, room={}, user_id={})",
+                instance_id.len(),
+                room.len(),
+                user_id.len()
+            );
+            return;
+        }
+
+        if self.evict_stale_session(&instance_id, &room, &user_id, new_session_id, ctx) {
+            info!(
+                "Cross-server eviction completed: instance {} (user {} in room {}) — \
+                 new session {} is on another server",
+                instance_id, user_id, room, new_session_id
+            );
+        }
+    }
+}
+
 /// Handler for deferred departure execution.
 /// Runs after [`RECONNECT_GRACE_PERIOD`] unless cancelled by a reconnection.
 impl Handler<ExecutePendingDeparture> for ChatServer {
@@ -617,56 +778,35 @@ impl Handler<JoinRoom> for ChatServer {
         // server's heartbeat timeout detects the old session is dead.
         let mut evicted_old_session = false;
         if let Some(ref iid) = instance_id {
-            if let Some(&prev_sid) = self.instance_index.get(iid) {
-                // Verify the previous session belongs to the same user_id
-                let user_matches = self
-                    .room_members
-                    .get(&room)
-                    .map(|members| {
-                        members
-                            .iter()
-                            .any(|(sid, uid, _)| *sid == prev_sid && uid == &user_id)
-                    })
-                    .unwrap_or(false);
-
-                if user_matches && prev_sid != session {
-                    info!(
-                        "Live session eviction: user {} in room {} — evicting previous \
-                         session {} (instance {}) in favour of new session {}",
-                        user_id, room, prev_sid, iid, session
-                    );
-
-                    // Remove old session from room_members
-                    if let Some(members) = self.room_members.get_mut(&room) {
-                        members.retain(|(sid, _, _)| *sid != prev_sid);
-                    }
-
-                    // Abort old NATS subscription
-                    if let Some(task) = self.active_subs.remove(&prev_sid) {
-                        task.abort();
-                    }
-
-                    // Remove old session from sessions map.
-                    // The actor will stop on its own when the transport closes
-                    // or the heartbeat times out.
-                    let _ = self.sessions.remove(&prev_sid);
-
-                    // Clean up state maps
-                    let _ = self.connection_states.remove(&prev_sid);
-                    let _ = self.suppress_join_broadcast.remove(&prev_sid);
-
-                    // Cancel any pending departure for this (room, user_id)
-                    let departure_key = (room.clone(), user_id.clone());
-                    if let Some(pending) = self.pending_departures.remove(&departure_key) {
-                        ctx.cancel_future(pending.spawn_handle);
-                    }
-
-                    evicted_old_session = true;
-                }
-            }
+            evicted_old_session = self.evict_stale_session(iid, &room, &user_id, session, ctx);
 
             // Register/update this instance_id → session mapping
             self.instance_index.insert(iid.clone(), session);
+
+            // Broadcast eviction to other server replicas via NATS.
+            // Always publish (not just when local eviction succeeded) because
+            // another server may hold the stale session.
+            let payload = EvictInstancePayload {
+                instance_id: iid.clone(),
+                room: room.clone(),
+                user_id: user_id.clone(),
+                new_session_id: session,
+            };
+            match serde_json::to_vec(&payload) {
+                Ok(json) => {
+                    let nc = self.nats_connection.clone();
+                    let fut = async move {
+                        if let Err(e) = nc.publish(EVICT_INSTANCE_SUBJECT, json.into()).await {
+                            error!("Failed to publish eviction to NATS: {}", e);
+                        }
+                    };
+                    let fut = actix::fut::wrap_future::<_, Self>(fut);
+                    ctx.spawn(fut);
+                }
+                Err(e) => {
+                    error!("Failed to serialize EvictInstancePayload: {}", e);
+                }
+            }
         }
 
         // --- Reconnection grace period: cancel pending departure ---
@@ -2144,7 +2284,7 @@ mod tests {
         });
 
         // Disconnect as non-observer — the departure is deferred by
-        // RECONNECT_GRACE_PERIOD (2s). The PARTICIPANT_LEFT event will
+        // RECONNECT_GRACE_PERIOD (3s). The PARTICIPANT_LEFT event will
         // not be published until the grace period expires.
         chat_server
             .send(Disconnect {
@@ -2158,7 +2298,7 @@ mod tests {
             .expect("Disconnect should succeed");
 
         // Wait for the grace period to expire plus some buffer.
-        // RECONNECT_GRACE_PERIOD is 2s, we wait 4s to give the deferred
+        // RECONNECT_GRACE_PERIOD is 3s, we wait 4s to give the deferred
         // execution and NATS publish time to complete.
         sleep(Duration::from_secs(4)).await;
 
@@ -2846,5 +2986,355 @@ mod tests {
             !suppressed_b,
             "Session B (different instance_id) should NOT suppress PARTICIPANT_JOINED"
         );
+    }
+
+    // Test helper: inspect instance_index
+    #[derive(ActixMessage)]
+    #[rtype(result = "Option<SessionId>")]
+    struct GetInstanceSession {
+        instance_id: String,
+    }
+
+    impl Handler<GetInstanceSession> for ChatServer {
+        type Result = Option<SessionId>;
+
+        fn handle(&mut self, msg: GetInstanceSession, _ctx: &mut Self::Context) -> Self::Result {
+            self.instance_index.get(&msg.instance_id).copied()
+        }
+    }
+
+    // ==========================================================================
+    // TEST: EvictInstance handler evicts the correct session
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_evict_instance_evicts_correct_session() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 10001u64;
+        let instance_id = "cross-server-evict-test".to_string();
+        let room = "test-room-cross-evict".to_string();
+        let user_id = "alice@example.com".to_string();
+
+        // Register and join with instance_id
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.clone(),
+                user_id: user_id.clone(),
+                display_name: user_id.clone(),
+                observer: false,
+                instance_id: Some(instance_id.clone()),
+            })
+            .await
+            .expect("Message delivery should succeed");
+        assert!(result.is_ok(), "JoinRoom should succeed");
+
+        // Verify session is tracked
+        let stored = chat_server
+            .send(GetInstanceSession {
+                instance_id: instance_id.clone(),
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(stored, Some(session_id));
+
+        // Send EvictInstance with a DIFFERENT new_session_id (simulating cross-server)
+        chat_server
+            .send(EvictInstance(EvictInstancePayload {
+                instance_id: instance_id.clone(),
+                room: room.clone(),
+                user_id: user_id.clone(),
+                new_session_id: 99999,
+            }))
+            .await
+            .expect("EvictInstance should succeed");
+
+        // Verify session was evicted from instance_index
+        let stored = chat_server
+            .send(GetInstanceSession {
+                instance_id: instance_id.clone(),
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(stored, None, "Instance should be removed after eviction");
+
+        // Verify session is removed from sessions map
+        let has = chat_server
+            .send(HasSession {
+                session: session_id,
+            })
+            .await
+            .expect("Query should succeed");
+        assert!(!has, "Session should be removed from sessions map");
+    }
+
+    // ==========================================================================
+    // TEST: EvictInstance is no-op for unknown instance_id
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_evict_instance_noop_for_unknown() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 10002u64;
+        let instance_id = "known-inst".to_string();
+        let room = "test-room-noop".to_string();
+        let user_id = "bob@example.com".to_string();
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.clone(),
+                user_id: user_id.clone(),
+                display_name: user_id.clone(),
+                observer: false,
+                instance_id: Some(instance_id.clone()),
+            })
+            .await
+            .expect("JoinRoom should succeed")
+            .expect("JoinRoom should return Ok");
+
+        // Send eviction for UNKNOWN instance_id
+        chat_server
+            .send(EvictInstance(EvictInstancePayload {
+                instance_id: "unknown-inst".to_string(),
+                room: room.clone(),
+                user_id: user_id.clone(),
+                new_session_id: 99999,
+            }))
+            .await
+            .expect("EvictInstance should succeed");
+
+        // Original session should still be present
+        let stored = chat_server
+            .send(GetInstanceSession {
+                instance_id: instance_id.clone(),
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(
+            stored,
+            Some(session_id),
+            "Known instance should be unaffected"
+        );
+
+        let has = chat_server
+            .send(HasSession {
+                session: session_id,
+            })
+            .await
+            .expect("Query should succeed");
+        assert!(has, "Session should still exist");
+    }
+
+    // ==========================================================================
+    // TEST: Self-delivery guard prevents double eviction
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_evict_instance_self_delivery_guard() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 10003u64;
+        let instance_id = "self-delivery-test".to_string();
+        let room = "test-room-self".to_string();
+        let user_id = "charlie@example.com".to_string();
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.clone(),
+                user_id: user_id.clone(),
+                display_name: user_id.clone(),
+                observer: false,
+                instance_id: Some(instance_id.clone()),
+            })
+            .await
+            .expect("JoinRoom should succeed")
+            .expect("JoinRoom should return Ok");
+
+        // Send eviction with new_session_id == the SAME session (self-delivery)
+        chat_server
+            .send(EvictInstance(EvictInstancePayload {
+                instance_id: instance_id.clone(),
+                room: room.clone(),
+                user_id: user_id.clone(),
+                new_session_id: session_id, // SAME as stored — self-delivery
+            }))
+            .await
+            .expect("EvictInstance should succeed");
+
+        // Session should NOT be evicted (self-delivery guard)
+        let stored = chat_server
+            .send(GetInstanceSession {
+                instance_id: instance_id.clone(),
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(
+            stored,
+            Some(session_id),
+            "Self-delivery should not evict the session"
+        );
+
+        let has = chat_server
+            .send(HasSession {
+                session: session_id,
+            })
+            .await
+            .expect("Query should succeed");
+        assert!(has, "Session should still exist after self-delivery");
+    }
+
+    // ==========================================================================
+    // TEST: EvictInstance verifies user_id ownership
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_evict_instance_verifies_user_ownership() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 10004u64;
+        let instance_id = "ownership-test".to_string();
+        let room = "test-room-ownership".to_string();
+        let user_id = "alice@example.com".to_string();
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.clone(),
+                user_id: user_id.clone(),
+                display_name: user_id.clone(),
+                observer: false,
+                instance_id: Some(instance_id.clone()),
+            })
+            .await
+            .expect("JoinRoom should succeed")
+            .expect("JoinRoom should return Ok");
+
+        // Send eviction with DIFFERENT user_id (attacker scenario)
+        chat_server
+            .send(EvictInstance(EvictInstancePayload {
+                instance_id: instance_id.clone(),
+                room: room.clone(),
+                user_id: "mallory@example.com".to_string(), // WRONG user
+                new_session_id: 99999,
+            }))
+            .await
+            .expect("EvictInstance should succeed");
+
+        // Session should NOT be evicted (user_id mismatch)
+        let stored = chat_server
+            .send(GetInstanceSession {
+                instance_id: instance_id.clone(),
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(
+            stored,
+            Some(session_id),
+            "Session should not be evicted by different user"
+        );
+
+        let has = chat_server
+            .send(HasSession {
+                session: session_id,
+            })
+            .await
+            .expect("Query should succeed");
+        assert!(has, "Session should still exist (user_id mismatch)");
     }
 }

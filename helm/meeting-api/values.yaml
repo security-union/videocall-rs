@@ -84,11 +84,11 @@ env:
     value: ""
 resources:
   limits:
+    cpu: "200m"
+    memory: "256Mi"
+  requests:
     cpu: "100m"
     memory: "128Mi"
-  requests:
-    cpu: "25m"
-    memory: "16Mi"
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}

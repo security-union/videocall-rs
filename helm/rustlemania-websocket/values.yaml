@@ -33,8 +33,8 @@ resources:
     cpu: "500m"
     memory: "256Mi"
   requests:
-    cpu: "20m"
-    memory: "16Mi"
+    cpu: "100m"
+    memory: "32Mi"
 podAnnotations:
   prometheus.io/scrape: "true"
   prometheus.io/port: "8080"

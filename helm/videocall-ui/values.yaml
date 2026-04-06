@@ -11,9 +11,9 @@ image:
 resources:
   limits:
     cpu: "50m"
-    memory: "32Mi"
+    memory: "10Mi"
   requests:
-    cpu: "10m"
+    cpu: "20m"
     memory: "10Mi"
 
 podAnnotations: {}

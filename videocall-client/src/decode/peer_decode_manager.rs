@@ -138,14 +138,13 @@ impl SequenceTracker {
 
         if seq > high {
             // New highest -- shift window left and count losses.
-            let shift = (seq - high) as u32;
-            let new_lost = if shift >= 64 {
+            // Compare in u64 space first to avoid truncation on huge gaps.
+            let gap = seq - high;
+            let shift = gap.min(64) as u32;
+            let new_lost = if gap >= 64 {
                 // Entire window shifted out. Count unseen bits in old window.
-                let zeros = self.seen_bits.count_zeros();
-                // Cap: we can only lose as many as were actually in the window.
-                // The window tracks 64 positions, but some may have been beyond
-                // the stream's actual range (before the first packet).
-                zeros.min(64)
+                // count_zeros() on u64 returns at most 64 (the window size).
+                self.seen_bits.count_zeros()
             } else {
                 // Count the bits that will shift off (the top `shift` bits).
                 let mask = !((1u64 << (64 - shift)) - 1);
@@ -155,7 +154,7 @@ impl SequenceTracker {
                 self.seen_bits = (self.seen_bits << shift) | 1;
                 lost_in_shift
             };
-            if shift >= 64 {
+            if gap >= 64 {
                 self.seen_bits = 1; // only the new packet is seen
             }
             self.high_seq = Some(seq);
@@ -670,14 +669,17 @@ impl Peer {
             _ => return None,
         };
 
-        // If this is a keyframe, clear loss state -- we recovered.
+        // Record the sequence number first. This may detect new losses
+        // (packets that shifted off the window without being seen).
+        tracker.record_seq(seq);
+
+        // If this is a keyframe, clear loss state AFTER recording the seq.
+        // Ordering matters: record_seq may add losses from the window shift,
+        // but on_keyframe resets lost_count to 0. If we called on_keyframe
+        // first, record_seq would immediately re-add losses.
         if frame_type_str == "key" {
             tracker.on_keyframe();
         }
-
-        // Record the sequence number. This may detect new losses
-        // (packets that shifted off the window without being seen).
-        tracker.record_seq(seq);
 
         let now = now_ms();
         if tracker.should_request_keyframe(now) {

@@ -304,7 +304,7 @@ pub const CAMERA_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 pub const SCREEN_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 
 /// Max time to wait for a keyframe before requesting one (milliseconds).
-/// After a sequence gap, if no keyframe arrives within this window, send PLI.
+/// After packet loss is detected, if no keyframe arrives within this window, send PLI.
 pub const KEYFRAME_REQUEST_TIMEOUT_MS: u64 = 1000;
 
 /// Minimum interval between keyframe requests to the same sender (milliseconds).

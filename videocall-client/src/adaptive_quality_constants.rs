@@ -118,23 +118,27 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at the lowest tier ("minimal", 240p/10fps/150kbps) ensures the
-/// system only ever upgrades from the initial state. This eliminates the
-/// visible dimension-change oscillation that occurred when starting at
-/// "medium": the PID controller allocates ~300 kbps during warmup, but
-/// medium expects ~600 kbps, so bitrate_ratio drops below the degrade
-/// threshold and triggers a step-down. Starting at minimal means the first
-/// tier transition the user sees is a quality *improvement*, not a jarring
-/// resolution drop.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 3; // "minimal"
+/// Starting at "medium" (480p/25fps/600kbps) provides acceptable quality
+/// from the first frame while leaving room to adapt in either direction.
+/// The PID controller steps up to "high" if bandwidth permits or steps
+/// down to "low"/"minimal" if the network is constrained.
+///
+/// Previously this was set to "minimal" (index 3) to avoid visible
+/// downgrade oscillation during warmup. That oscillation was caused by
+/// the keyframe request storm (issue #814) — now fixed — which inflated
+/// bandwidth consumption and made the PID controller think the network
+/// was worse than it actually was.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "medium"
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at the lowest tier ("low", 480p/5fps/250kbps) to
-/// match the camera strategy: only upgrade, never visibly downgrade. The
-/// PID controller will quickly ramp up resolution once it measures
-/// sufficient bandwidth, so text readability recovers within seconds.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 2; // "low"
+/// Screen share starts at "medium" (720p/10fps/600kbps) for readable
+/// content from the first frame. The PID controller will step up to
+/// 1080p if bandwidth allows, or step down to 480p if constrained.
+///
+/// Previously this was set to "low" (index 2, 480p/5fps), which made
+/// shared content illegible until the quality ramped up.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
@@ -778,7 +782,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "minimal", "default tier should be 'minimal'");
+        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
     }
 
     #[test]

@@ -2701,10 +2701,8 @@ mod tests {
         //
         // For this test, just verify the late arrivals prevented loss for
         // the positions we actually cared about.
-        assert!(
-            tracker.lost_count >= 0,
-            "Some phantom losses from pre-stream positions are expected"
-        );
+        // Some phantom losses from pre-stream positions are expected (u32
+        // is always >= 0, so we just document the expectation here).
 
         // More importantly: verify that the 6 actual packets (0-5) were NOT
         // counted as lost. The lost_count should be exactly the phantom ones.

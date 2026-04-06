@@ -101,7 +101,11 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
     }
 
     fn send_bytes(&self, bytes: Vec<u8>) {
-        WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+        WebTransportTask::send_on_persistent_stream(
+            self.transport.clone(),
+            self.persistent_uni_writer.clone(),
+            bytes,
+        );
     }
 
     fn send_bytes_datagram(&self, bytes: Vec<u8>) {
@@ -113,14 +117,19 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             WebTransportTask::send_datagram(self.transport.clone(), bytes);
         } else {
             // Packet exceeds datagram size limit (e.g., a keyframe).
-            // Fall back to a reliable unidirectional stream to avoid
-            // implementing application-layer fragmentation.
+            // Fall back to the persistent unidirectional stream to avoid
+            // implementing application-layer fragmentation while preserving
+            // ordering with other reliable sends.
             debug!(
-                "Packet size {} exceeds datagram MTU {}, falling back to stream",
+                "Packet size {} exceeds datagram MTU {}, falling back to persistent stream",
                 bytes.len(),
                 DATAGRAM_MAX_SIZE
             );
-            WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+            WebTransportTask::send_on_persistent_stream(
+                self.transport.clone(),
+                self.persistent_uni_writer.clone(),
+                bytes,
+            );
         }
     }
 }

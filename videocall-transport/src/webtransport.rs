@@ -6,7 +6,7 @@
 
 use anyhow::{anyhow, Error};
 use futures::channel::oneshot::channel;
-use std::{fmt, rc::Rc};
+use std::{cell::RefCell, fmt, rc::Rc};
 use thiserror::Error as ThisError;
 use videocall_types::Callback;
 use wasm_bindgen_futures::JsFuture;
@@ -17,7 +17,7 @@ use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
     WebTransportCloseInfo, WebTransportDatagramDuplexStream, WebTransportReceiveStream,
-    WritableStream,
+    WritableStream, WritableStreamDefaultWriter,
 };
 
 /// Represents formatting errors.
@@ -54,6 +54,16 @@ pub enum WebTransportError {
     CreationError(String),
 }
 
+/// Holds a persistent unidirectional stream and its writer so the QUIC stream
+/// stays open across multiple sends, preserving packet ordering.
+pub struct PersistentStream {
+    /// The underlying `WritableStream` (QUIC send stream).  Kept alive so the
+    /// stream is not garbage-collected while the writer is in use.
+    _stream: WritableStream,
+    /// The writer acquired from `_stream`.  Reused for every reliable send.
+    writer: WritableStreamDefaultWriter,
+}
+
 /// A handle to control the WebTransport connection.
 ///
 /// When dropped, the underlying `WebTransport` is closed, which causes all
@@ -74,6 +84,10 @@ pub struct WebTransportTask {
     opened_closure: Closure<dyn FnMut(JsValue)>,
     #[allow(dead_code)]
     closed_closure: Rc<Closure<dyn FnMut(JsValue)>>,
+    /// Persistent unidirectional stream writer for ordered reliable delivery.
+    /// Lazily created on first `send_on_persistent_stream` call.  Cleared on
+    /// write error so the next send reopens a fresh stream.
+    pub persistent_uni_writer: Rc<RefCell<Option<PersistentStream>>>,
 }
 
 impl WebTransportTask {
@@ -90,6 +104,7 @@ impl WebTransportTask {
             listeners,
             opened_closure,
             closed_closure,
+            persistent_uni_writer: Rc::new(RefCell::new(None)),
         }
     }
 }
@@ -426,6 +441,76 @@ impl WebTransportTask {
                 // the entire connection for all participants.
                 log!(
                     "unidirectional stream send failed (frame dropped):",
+                    e.to_string()
+                );
+            }
+        });
+    }
+
+    /// Sends data on a persistent unidirectional stream, creating the stream
+    /// lazily on the first call.  All subsequent sends reuse the same QUIC
+    /// stream, which guarantees that packets arrive at the receiver in the order
+    /// they were written (QUIC provides per-stream ordering).
+    ///
+    /// On write error the cached writer is cleared so the next call will open a
+    /// fresh stream.  The transport itself is NOT closed -- transient stream
+    /// errors should not kill the session.
+    pub fn send_on_persistent_stream(
+        transport: Rc<WebTransport>,
+        persistent: Rc<RefCell<Option<PersistentStream>>>,
+        data: Vec<u8>,
+    ) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let result: Result<(), anyhow::Error> = async {
+                // --- Ensure a writer exists -----------------------------------
+                // We borrow briefly to check, then drop the borrow before any
+                // `.await` (RefCell borrows must not be held across yield points).
+                let needs_create = persistent.borrow().is_none();
+                if needs_create {
+                    JsFuture::from(transport.ready())
+                        .await
+                        .map_err(|e| anyhow!("{:?}", e))?;
+                    let stream: WritableStream =
+                        JsFuture::from(transport.create_unidirectional_stream())
+                            .await
+                            .map_err(|e| {
+                                anyhow!("failed to create unidirectional stream: {:?}", e)
+                            })?
+                            .unchecked_into();
+                    let writer = stream
+                        .get_writer()
+                        .map_err(|e| anyhow!("error getting writer: {:?}", e))?;
+                    *persistent.borrow_mut() = Some(PersistentStream {
+                        _stream: stream,
+                        writer,
+                    });
+                }
+
+                // --- Write on the existing writer -----------------------------
+                // Borrow, clone the writer JsValue so we can use it across await,
+                // then drop the borrow immediately.
+                let writer = {
+                    let guard = persistent.borrow();
+                    let ps = guard.as_ref().expect("writer was just created");
+                    ps.writer.clone()
+                };
+
+                let chunk = Uint8Array::from(data.as_slice());
+                JsFuture::from(writer.ready())
+                    .await
+                    .map_err(|e| anyhow!("writer.ready() failed: {:?}", e))?;
+                JsFuture::from(writer.write_with_chunk(&chunk))
+                    .await
+                    .map_err(|e| anyhow!("write_with_chunk failed: {:?}", e))?;
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = result {
+                // Clear the cached writer so the next send creates a fresh stream.
+                *persistent.borrow_mut() = None;
+                log!(
+                    "persistent stream send failed (stream reset, frame dropped):",
                     e.to_string()
                 );
             }

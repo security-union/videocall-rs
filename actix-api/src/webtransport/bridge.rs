@@ -167,6 +167,15 @@ impl WebTransportBridge {
     }
 
     /// Spawn Writer task.
+    ///
+    /// Uses a single persistent unidirectional QUIC stream for all
+    /// `WtOutbound::UniStream` messages. This guarantees that packets arrive at
+    /// the receiver in the order they were written (QUIC provides per-stream
+    /// ordering) and avoids the overhead of opening a new stream per packet.
+    ///
+    /// The stream is opened lazily on the first write and kept alive for the
+    /// duration of the session. On write error the cached stream is dropped and
+    /// a new one is opened on the next attempt (single retry).
     fn spawn_writer(
         join_set: &mut JoinSet<()>,
         session: Session,
@@ -174,27 +183,58 @@ impl WebTransportBridge {
         on_packet_sent: Option<PacketSentCallback>,
     ) {
         join_set.spawn(async move {
+            let mut persistent_stream: Option<web_transport_quinn::SendStream> = None;
+
             while let Some(msg) = outbound_rx.recv().await {
                 match msg {
-                    WtOutbound::UniStream(data) => match session.open_uni().await {
-                        Ok(mut stream) => {
-                            if let Err(e) = stream.write_all(&data).await {
-                                error!("Error writing to UniStream: {}", e);
+                    WtOutbound::UniStream(data) => {
+                        // Ensure we have a stream, opening one if needed.
+                        if persistent_stream.is_none() {
+                            match session.open_uni().await {
+                                Ok(stream) => {
+                                    persistent_stream = Some(stream);
+                                }
+                                Err(e) => {
+                                    error!("Error opening persistent UniStream: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Write to the persistent stream.
+                        let stream = persistent_stream.as_mut().expect("stream was just opened");
+                        if let Err(e) = stream.write_all(&data).await {
+                            warn!(
+                                "Error writing to persistent UniStream ({}), retrying with new stream",
+                                e
+                            );
+                            // Drop the broken stream and try once more with a fresh one.
+                            drop(persistent_stream.take());
+                            let mut new_stream = match session.open_uni().await {
+                                Ok(s) => s,
+                                Err(e2) => {
+                                    error!(
+                                        "Error opening new UniStream after retry: {}",
+                                        e2
+                                    );
+                                    break;
+                                }
+                            };
+                            if let Err(e2) = new_stream.write_all(&data).await {
+                                error!(
+                                    "Error writing to new UniStream after retry: {}",
+                                    e2
+                                );
                                 break;
                             }
-                            if let Err(e) = stream.finish() {
-                                error!("Error finishing UniStream: {}", e);
-                            }
-                            // Call packet sent callback if provided (for test instrumentation)
-                            if let Some(ref callback) = on_packet_sent {
-                                callback();
-                            }
+                            persistent_stream = Some(new_stream);
                         }
-                        Err(e) => {
-                            error!("Error opening UniStream: {}", e);
-                            break;
+
+                        // Call packet sent callback if provided (for test instrumentation)
+                        if let Some(ref callback) = on_packet_sent {
+                            callback();
                         }
-                    },
+                    }
                     WtOutbound::Datagram(data) => {
                         if let Err(e) = session.send_datagram(data) {
                             error!("Error sending datagram: {}", e);

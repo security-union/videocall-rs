@@ -1319,9 +1319,8 @@ impl Inner {
                                 // inflating the peer count indefinitely.
                                 if let Some(hr) = &self.health_reporter {
                                     if let Ok(reporter) = hr.try_borrow() {
-                                        reporter.remove_peer(
-                                            &meeting_packet.session_id.to_string(),
-                                        );
+                                        reporter
+                                            .remove_peer(&meeting_packet.session_id.to_string());
                                     }
                                 }
                             }

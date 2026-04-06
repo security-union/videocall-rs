@@ -1924,6 +1924,13 @@ mod tests {
             reelection_in_progress: false,
             old_active_connection: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
+            packets_received: Rc::new(Cell::new(0)),
+            packets_sent: Rc::new(Cell::new(0)),
+            last_metrics_timestamp_ms: Rc::new(RefCell::new(0.0)),
+            packets_received_per_sec: Rc::new(RefCell::new(0.0)),
+            packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
+            prev_packets_received: Rc::new(RefCell::new(0)),
+            prev_packets_sent: Rc::new(RefCell::new(0)),
         }
     }
 

@@ -374,16 +374,12 @@ pub fn OAuthCallback(query_params: String) -> Element {
 
     rsx! {
         div { style: "display: flex; align-items: center; justify-content: center; \
-                    height: 100vh; background: #0D131F; color: #fff; \
-                    font-family: system-ui, sans-serif;",
+                height: 100vh; background: #0D131F; color: #fff; \
+                font-family: system-ui, sans-serif;",
             match status() {
                 CallbackStatus::Loading => rsx! {
                     div { style: "text-align: center;",
-                        div { style: "width: 48px; height: 48px; \
-                                                                                                                    border: 4px solid rgba(255,255,255,0.2); \
-                                                                                                                    border-top-color: #7928CA; border-radius: 50%; \
-                                                                                                                    animation: spin 0.8s linear infinite; \
-                                                                                                                    margin: 0 auto 24px;" }
+                        div { style: "width: 48px; height: 48px; border: 4px solid rgba(255,255,255,0.2); border-top-color: #7928CA; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 24px;" }
                         p { style: "color: rgba(255,255,255,0.7); font-size: 1rem;", "Completing sign-in\u{2026}" }
                         style { "@keyframes spin {{ to {{ transform: rotate(360deg); }} }}" }
                     }
@@ -398,14 +394,11 @@ pub fn OAuthCallback(query_params: String) -> Element {
                     div { style: "text-align: center; max-width: 480px; padding: 2rem;",
                         div { style: "font-size: 2rem; margin-bottom: 1rem;", "\u{26a0}\u{fe0f}" }
                         h2 { style: "margin-bottom: 0.75rem; font-size: 1.25rem;", "Sign-in failed" }
-                        p { style: "color: rgba(255,255,255,0.65); font-size: 0.9rem; \
-                                                                                                                    margin-bottom: 1.5rem; line-height: 1.5;",
+                        p { style: "color: rgba(255,255,255,0.65); font-size: 0.9rem; margin-bottom: 1.5rem; line-height: 1.5;",
                             "{msg}"
                         }
                         button {
-                            style: "background: #7928CA; color: #fff; border: none; \
-                                                                                                                    padding: 0.6rem 1.5rem; border-radius: 8px; \
-                                                                                                                    cursor: pointer; font-size: 1rem;",
+                            style: "background: #7928CA; color: #fff; border: none; padding: 0.6rem 1.5rem; border-radius: 8px; cursor: pointer; font-size: 1rem;",
                             onclick: move |_| {
                                 if let Err(e) = window().location().set_href("/login") {
                                     log::error!("Failed to navigate to /login: {e:?}");

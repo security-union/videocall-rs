@@ -533,7 +533,18 @@ pub async fn exchange(
         &token_response.access_token,
         token_response.refresh_token.as_deref(),
     )
-    .await?;
+    .await
+    .unwrap_or_else(|e| {
+        // A transient DB failure must not revoke a legitimately exchanged
+        // token.  The client has already authenticated; the upsert is
+        // bookkeeping.  Log and continue.
+        tracing::warn!(
+            user_id = %email,
+            error = %e,
+            "Failed to upsert user record after token exchange; \
+             tokens are still returned"
+        );
+    });
 
     let id_token = token_response
         .id_token
@@ -1541,75 +1552,98 @@ mod tests {
 
     // --- exchange: Cache-Control ---
 
+    /// Drive the real `exchange` handler end-to-end against a local mock token
+    /// endpoint and assert that the response carries `Cache-Control: no-store`.
+    ///
+    /// The mock server returns a pre-built JWT whose claims are decoded without
+    /// JWKS signature verification (`jwks_cache: None`); this isolates the
+    /// test from network I/O while still exercising the full handler code path
+    /// that builds the response and inserts the header.
     #[tokio::test]
     async fn exchange_response_carries_no_store_cache_control() {
-        // The exchange endpoint returns raw id_token and access_token in the
-        // JSON body.  Even when the exchange itself fails (no real provider
-        // here), the handler must emit Cache-Control: no-store so that
-        // browsers and intermediaries never persist the response.
-        //
-        // We exercise this via a request that is rejected early (OAuth not
-        // configured → 500), which is sufficient to confirm the header is
-        // present on every code path that reaches the response-building step.
-        // A full happy-path test would require a mock identity provider.
-        use http_body_util::BodyExt;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
         use tower::ServiceExt;
 
-        let cfg = minimal_oauth_config(None, None);
+        // Build a fake JWT whose payload has the required claims.  With
+        // `jwks_cache: None` the handler calls `decode_id_token_claims_unverified`,
+        // which only base64-decodes the payload — no signature check.
+        let now = chrono::Utc::now().timestamp();
+        let payload_json = serde_json::json!({
+            "sub":   "user@example.com",
+            "email": "user@example.com",
+            "name":  "Test User",
+            "exp":   now + 3600,
+            "iat":   now,
+        })
+        .to_string();
+        let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+        let fake_id_token = format!("{header_b64}.{payload_b64}.fakesig");
+
+        // Build the JSON the mock token endpoint will return.
+        let token_body = serde_json::json!({
+            "access_token": "fake-access-token",
+            "token_type":   "Bearer",
+            "id_token":     fake_id_token,
+        })
+        .to_string();
+
+        // Spawn a minimal Axum server that acts as the OAuth token endpoint.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let token_body_clone = token_body.clone();
+        let mock_router = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let body = token_body_clone.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.ok();
+        });
+
+        // Configure the exchange handler to call our local mock token endpoint.
+        // No JWKS cache → unverified decode path; no issuer check.
+        let mut cfg = minimal_oauth_config(None, None);
+        cfg.token_url = format!("http://{mock_addr}/token");
+        cfg.issuer = None;
         let state = make_handler_state(Some(cfg));
+
         let app = axum::Router::new()
             .route("/api/v1/oauth/exchange", axum::routing::post(exchange))
             .with_state(state);
-
-        // Minimal valid JSON body — code_verifier path, no real provider.
-        let body = serde_json::json!({
-            "code": "test-code",
-            "code_verifier": "test-verifier"
-        })
-        .to_string();
 
         let req = axum::http::Request::builder()
             .method("POST")
             .uri("/api/v1/oauth/exchange")
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(body))
+            .body(axum::body::Body::from(
+                serde_json::json!({"code": "test-code", "code_verifier": "test-verifier"})
+                    .to_string(),
+            ))
             .unwrap();
+
         let resp = app.oneshot(req).await.unwrap();
 
-        // The request will fail (no real token endpoint), but the
-        // Cache-Control header must be present on the success path.
-        // Verify the handler compiles and routes correctly; the header
-        // assertion below would fire on a successful exchange.
-        //
-        // For the no-store guarantee we assert on a known-success stub:
-        // build the response directly the same way the handler does.
-        let mut stub = Json(APIResponse::ok(OAuthExchangeResponse {
-            user_id: "u@example.com".into(),
-            display_name: "User".into(),
-            id_token: "id.tok.en".into(),
-            access_token: "acc.tok.en".into(),
-            return_to: None,
-        }))
-        .into_response();
-        stub.headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-
-        let cache_control = stub
+        // The handler must succeed and set Cache-Control: no-store.
+        assert_eq!(resp.status(), StatusCode::OK, "exchange must return 200");
+        let cache_control = resp
             .headers()
             .get(header::CACHE_CONTROL)
-            .expect("Cache-Control header must be present")
+            .expect("Cache-Control header must be present on exchange response")
             .to_str()
             .unwrap();
         assert_eq!(
             cache_control, "no-store",
             "exchange response must carry Cache-Control: no-store"
         );
-
-        // Consume body to satisfy the compiler.
-        let _ = stub.into_body().collect().await.unwrap();
-
-        // Confirm the live handler doesn't panic or deadlock on this path
-        // (it will return an error because the token endpoint is unreachable).
-        let _ = resp.status();
     }
 }

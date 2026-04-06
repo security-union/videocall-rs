@@ -128,18 +128,17 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at "full_hd" (1080p/30fps) — 1080p is the expected baseline
-/// for modern video conferencing. The PID controller will step down to
-/// 720p or lower if bandwidth is constrained, but most users on
-/// broadband will stay at 1080p.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 0; // "full_hd"
+/// Starting at "high" (720p/30fps) — a middle ground that looks good on
+/// most connections. The PID controller steps up to 1080p if bandwidth
+/// allows, or steps down to 480p/360p if constrained.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "high"
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at "high" (1080p/15fps) for legible content from
-/// the first frame. Text and UI elements require high resolution to be
-/// readable. The PID controller steps down if bandwidth is constrained.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0; // "high"
+/// Screen share starts at "medium" (720p/10fps) — readable content from
+/// the first frame with room to step up to 1080p or down to 480p based
+/// on network conditions.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
@@ -783,7 +782,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "full_hd", "default tier should be 'full_hd'");
+        assert_eq!(tier.label, "high", "default tier should be 'high'");
     }
 
     #[test]

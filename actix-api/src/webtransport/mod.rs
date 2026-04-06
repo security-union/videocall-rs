@@ -486,6 +486,7 @@ mod tests {
         })
     }
 
+    #[allow(dead_code)]
     async fn wait_for_condition<F, Fut, T>(
         mut condition: F,
         timeout_duration: Duration,
@@ -602,48 +603,63 @@ mod tests {
     /// Wait for a session to receive its MEETING_STARTED packet.
     /// The server subscribes to NATS BEFORE sending MEETING_STARTED, so receiving
     /// this packet confirms the session is fully initialized and ready to relay packets.
+    ///
+    /// Returns the persistent `RecvStream` (if one was accepted) so the caller can
+    /// reuse it for subsequent reads. The bridge writer uses a single persistent
+    /// unidirectional stream for all `UniStream` packets, so `accept_uni()` will
+    /// only succeed once per session -- subsequent calls would block forever.
     async fn wait_for_session_ready(
         session: &web_transport_quinn::Session,
         name: &str,
-    ) -> Result<(), &'static str> {
+    ) -> Result<Option<web_transport_quinn::RecvStream>, &'static str> {
         println!("Waiting for {name} to receive MEETING_STARTED...");
-        let session_clone = session.clone();
-        wait_for_condition(
-            || {
-                let session = session_clone.clone();
-                async move {
-                    // Race between uni stream and datagram since non-MEDIA
-                    // packets (e.g., MEETING, AES_KEY) may arrive via datagrams
-                    // (send_auto routes small control packets as datagrams).
-                    let buf = tokio::select! {
-                        Ok(mut stream) = session.accept_uni() => {
-                            stream.read_to_end(usize::MAX).await.ok()
-                        }
-                        Ok(datagram) = session.read_datagram() => {
-                            Some(datagram.to_vec())
-                        }
-                        else => None,
-                    };
-                    if let Some(buf) = buf {
-                        if !buf.is_empty() {
-                            if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&buf) {
-                                if wrapper.packet_type
-                                    == videocall_types::protos::packet_wrapper::packet_wrapper::PacketType::MEETING.into()
-                                {
-                                    println!("✓ {name} received MEETING_STARTED - session ready");
-                                    return Some(());
-                                }
-                            }
-                        }
+
+        let mut persistent_stream: Option<web_transport_quinn::RecvStream> = None;
+        let mut accumulated = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let meeting_type: ::protobuf::EnumOrUnknown<VcPacketType> = VcPacketType::MEETING.into();
+
+        while std::time::Instant::now() < deadline {
+            let (data, stream) =
+                read_more_data(session, persistent_stream, Duration::from_millis(200)).await;
+            persistent_stream = stream;
+
+            if data.is_empty() {
+                continue;
+            }
+
+            // Data from a datagram (no persistent stream involved): try to parse
+            // directly since datagrams are self-contained.
+            if persistent_stream.is_none() && accumulated.is_empty() {
+                if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&data) {
+                    if wrapper.packet_type == meeting_type {
+                        println!("✓ {name} received MEETING_STARTED via datagram - session ready");
+                        return Ok(persistent_stream);
                     }
-                    None
                 }
-            },
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-        )
-        .await
-        .map(|_| ())
+                // Not MEETING_STARTED datagram -- keep waiting
+                continue;
+            }
+
+            // Data from the persistent stream: accumulate and try to parse.
+            // Multiple packets (SESSION_ASSIGNED, MEETING_STARTED) may be
+            // concatenated on the same stream. Protobuf's last-wins semantics
+            // for scalar fields means that parsing the entire accumulated
+            // buffer will yield packet_type = MEETING once MEETING_STARTED
+            // has been received (overriding any earlier SESSION_ASSIGNED).
+            accumulated.extend_from_slice(&data);
+
+            if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&accumulated) {
+                if wrapper.packet_type == meeting_type {
+                    println!(
+                        "✓ {name} received MEETING_STARTED via persistent stream - session ready"
+                    );
+                    return Ok(persistent_stream);
+                }
+            }
+        }
+
+        Err("Timed out waiting for MEETING_STARTED")
     }
 
     #[actix_rt::test]
@@ -699,11 +715,14 @@ mod tests {
         println!("Client B connected!");
 
         // Wait for both sessions to be fully ready (receive MEETING_STARTED)
-        // This confirms NATS subscriptions are established
-        wait_for_session_ready(&session_a, "client A")
+        // This confirms NATS subscriptions are established.
+        // Capture the persistent RecvStream from session_b so we can reuse it
+        // when reading relayed packets later (the bridge writer uses a single
+        // persistent uni stream, so accept_uni() only succeeds once).
+        let _stream_a = wait_for_session_ready(&session_a, "client A")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        wait_for_session_ready(&session_b, "client B")
+        let persistent_stream_b = wait_for_session_ready(&session_b, "client B")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -754,7 +773,7 @@ mod tests {
         // Control packets like PARTICIPANT_JOINED may arrive as datagrams.
         println!("Waiting for packet on B...");
         let mut received: Option<Vec<u8>> = None;
-        let mut persistent_stream: Option<web_transport_quinn::RecvStream> = None;
+        let mut persistent_stream: Option<web_transport_quinn::RecvStream> = persistent_stream_b;
         let mut accumulated = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
 
@@ -1376,11 +1395,13 @@ mod tests {
             .await
             .expect("connect receiver");
 
-        // Wait for both sessions to be fully ready (MEETING_STARTED via datagram)
-        wait_for_session_ready(&session_sender, "sender")
+        // Wait for both sessions to be fully ready (MEETING_STARTED).
+        // Capture the persistent RecvStream from the receiver so we can reuse
+        // it when reading sequenced packets later.
+        let _stream_sender = wait_for_session_ready(&session_sender, "sender")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        wait_for_session_ready(&session_receiver, "receiver")
+        let persistent_stream_receiver = wait_for_session_ready(&session_receiver, "receiver")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -1451,10 +1472,12 @@ mod tests {
         );
 
         // Read from receiver's session: accumulate bytes from the persistent
-        // uni stream and extract sequence markers.
+        // uni stream and extract sequence markers. Reuse the stream handle
+        // returned by wait_for_session_ready (the bridge writer opens only one).
         println!("Reading data from receiver session...");
         let mut accumulated = Vec::new();
-        let mut persistent_stream: Option<web_transport_quinn::RecvStream> = None;
+        let mut persistent_stream: Option<web_transport_quinn::RecvStream> =
+            persistent_stream_receiver;
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
 
         while std::time::Instant::now() < deadline {

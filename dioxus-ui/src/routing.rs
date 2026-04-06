@@ -16,16 +16,6 @@ pub enum Route {
     Home {},
     #[route("/login")]
     Login {},
-    /// OAuth callback route.
-    ///
-    /// The identity provider redirects here with `?code=<code>&state=<state>`
-    /// after the user authenticates.  The [`OAuthCallback`] component reads
-    /// those parameters, calls `POST /api/v1/oauth/exchange` on the
-    /// meeting-api, stores the returned id_token in `sessionStorage`, and
-    /// navigates to the post-login destination.
-    ///
-    /// Set `OAUTH_REDIRECT_URL` in the meeting-api configuration to this
-    /// route's absolute URL (e.g. `http://localhost:3001/auth/callback`).
     #[route("/auth/callback?:..query_params")]
     OAuthCallback { query_params: String },
     #[route("/meeting/:id/settings")]

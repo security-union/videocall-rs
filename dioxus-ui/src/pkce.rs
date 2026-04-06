@@ -251,7 +251,11 @@ pub(crate) async fn exchange_code_with_provider(
         .map_err(|e| format!("Failed to read token response body: {e}"))?;
 
     let token_resp: ProviderTokenResponse = serde_json::from_str(&body).map_err(|e| {
-        format!("Failed to parse token response (HTTP {status}): {e} — body: {body}")
+        log::error!("Failed to parse token response (HTTP {status}): {e} — body: {body}");
+        format!(
+            "The identity provider returned an unexpected response (HTTP {status}). \
+             Please try again."
+        )
     })?;
 
     if let Some(ref err) = token_resp.error {
@@ -263,7 +267,11 @@ pub(crate) async fn exchange_code_with_provider(
     }
 
     if !status.is_success() {
-        return Err(format!("Token endpoint returned HTTP {status}: {body}"));
+        log::error!("Token endpoint returned HTTP {status}: {body}");
+        return Err(format!(
+            "Sign-in failed: the identity provider returned HTTP {status}. \
+             Please try again."
+        ));
     }
 
     Ok(token_resp)

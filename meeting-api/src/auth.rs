@@ -23,10 +23,8 @@
 //! ```
 //!
 //! The extractor validates the id_token signature against the provider's JWKS
-//! (fetched and cached by [`crate::oauth::JwksCache`]), checks `exp`, `aud`,
-//! and optionally `iss`.  Session cookies are **not** issued or accepted in
-//! this mode.  The `email` claim from the validated id_token is used as the
-//! canonical user identity (`user_id`).
+//! (fetched and cached by [`crate::oauth::JwksCache`]), checks `exp` and `iss`,
+//! and optionally checks `aud` when `OAUTH_RESOURCE_SERVER_AUDIENCE` is set.
 //!
 //! ## Fallback — no external OAuth / JWKS configured
 //!
@@ -93,7 +91,15 @@ impl FromRequestParts<AppState> for AuthUser {
             let claims = crate::oauth::verify_and_decode_id_token(
                 jwks,
                 &token,
-                None, // skip aud — accepts both id_tokens and access tokens
+                // When OAUTH_RESOURCE_SERVER_AUDIENCE is set, every
+                // per-request Bearer token must carry that value in its `aud`
+                // claim.  Without it, audience validation is skipped so that
+                // both id_tokens (aud = client_id) and access tokens
+                // (aud = resource-server URL) are accepted.  Deployers sharing
+                // an IdP with other services should always set this variable
+                // to prevent tokens issued for other applications from being
+                // accepted here (RFC 8707 confused deputy mitigation).
+                oauth_cfg.resource_server_audience.as_deref(),
                 oauth_cfg.issuer.as_deref(),
                 // Nonce is validated only during the initial token exchange;
                 // re-validating on every request would require the server to
@@ -477,21 +483,30 @@ mod tests {
             end_session_endpoint: None,
             after_logout_url: None,
             browser_pkce: false,
+            resource_server_audience: None,
         }
     }
 
     /// Build an AppState that uses JWKS-based validation.
     fn make_jwks_state(jwks: Arc<JwksCache>) -> AppState {
+        make_jwks_state_with_audience(jwks, None)
+    }
+
+    /// Build an AppState that uses JWKS-based validation with an explicit
+    /// resource-server audience restriction.
+    fn make_jwks_state_with_audience(jwks: Arc<JwksCache>, audience: Option<&str>) -> AppState {
         let db = PgPoolOptions::new()
             .max_connections(1)
             .connect_lazy("postgres://localhost/unused")
             .expect("lazy pool");
+        let mut cfg = test_oauth_cfg();
+        cfg.resource_server_audience = audience.map(str::to_string);
         AppState {
             db,
             jwt_secret: TEST_SECRET.to_string(),
             token_ttl_secs: 600,
             session_ttl_secs: 3600,
-            oauth: Some(test_oauth_cfg()),
+            oauth: Some(cfg),
             jwks_cache: Some(jwks),
             cookie_domain: None,
             cookie_name: "session".to_string(),
@@ -700,5 +715,88 @@ mod tests {
 
         // user_id falls back to sub when email is absent
         assert_eq!(auth.user_id, "opaque-user-sub-12345");
+    }
+
+    // -----------------------------------------------------------------------
+    // OAUTH_RESOURCE_SERVER_AUDIENCE tests
+    //
+    // When resource_server_audience is configured, per-request Bearer tokens
+    // must carry that value in their `aud` claim.  Tokens for any other
+    // audience — even if correctly signed by the same provider — are rejected.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn jwks_path_correct_resource_audience_accepted() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        // Token carries the configured resource-server audience.
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = serde_json::json!({
+            "sub": "alice@example.com",
+            "email": "alice@example.com",
+            "name": "Alice",
+            "iss": "https://provider.example.com",
+            "aud": "https://api.videocall.rs",
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.clone());
+        let token = encode(&header, &claims, &enc).unwrap();
+
+        let state = make_jwks_state_with_audience(jwks, Some("https://api.videocall.rs"));
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let auth = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("token with correct audience should be accepted");
+        assert_eq!(auth.user_id, "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn jwks_path_wrong_resource_audience_rejected() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        // Token is signed by the same provider but carries a different
+        // service's audience (confused deputy scenario).
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = serde_json::json!({
+            "sub": "alice@example.com",
+            "email": "alice@example.com",
+            "name": "Alice",
+            "iss": "https://provider.example.com",
+            "aud": "https://other-service.example.com",  // wrong audience
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.clone());
+        let token = encode(&header, &claims, &enc).unwrap();
+
+        let state = make_jwks_state_with_audience(jwks, Some("https://api.videocall.rs"));
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+
+        // A valid signature for the wrong audience must be rejected.
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 }

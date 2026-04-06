@@ -57,8 +57,6 @@ use crate::constants::{
 };
 use crate::context::{email_to_display_name, save_display_name_to_storage, validate_display_name};
 use crate::id_token::decode_and_validate_id_token;
-#[cfg(test)]
-use crate::id_token::IdTokenClaims;
 use crate::pkce::exchange_code_with_provider;
 use dioxus::prelude::*;
 use dioxus_sdk_storage::{SessionStorage, StorageBacking};
@@ -108,9 +106,6 @@ struct OidcDiscovery {
     token_endpoint: String,
 }
 
-/// Cached sessionStorage key for the discovered token endpoint URL.
-/// Avoids re-fetching the discovery document on every callback within the
-/// same browser tab.
 /// Cached session-storage key for the discovered token endpoint URL.
 /// Avoids re-fetching the discovery document on every callback within the
 /// same session.
@@ -280,23 +275,74 @@ async fn register_user_with_backend(access_token: &str) {
 // Post-login navigation
 // ---------------------------------------------------------------------------
 
+/// Validates a `return_to` value so that post-login navigation is confined to
+/// the current browser origin.
+///
+/// Rules (mirroring the backend's `validate_return_to`):
+/// - Relative paths that start with `/` (but **not** `//`, which are
+///   protocol-relative and can redirect off-origin) are accepted unchanged.
+/// - Absolute `http://`/`https://` URLs whose origin (scheme + host + port)
+///   exactly matches `current_origin` are accepted unchanged.
+/// - Everything else — `javascript:`, `data:`, protocol-relative `//…`,
+///   other schemes, cross-origin absolute URLs, and URLs with embedded
+///   userinfo (`user@host`) — is rejected and returns `None`.
+///
+/// `current_origin` should be `window().location().origin().unwrap_or_default()`.
+/// This function is pure (no browser APIs) so it can be unit-tested natively.
+fn validate_return_to(raw: &str, current_origin: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Relative paths are safe as long as they are not protocol-relative.
+    if trimmed.starts_with('/') {
+        if trimmed.starts_with("//") {
+            log::warn!("Rejected protocol-relative returnTo URL.");
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+
+    // Absolute URLs — must be http or https.
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        log::warn!("Rejected returnTo URL with disallowed scheme.");
+        return None;
+    }
+
+    // Extract the origin (scheme://host:port) from the absolute URL using
+    // pure string operations so this function remains testable without a
+    // browser environment.
+    //
+    // Reject URLs with userinfo (`user:pass@host`): they are never valid
+    // `returnTo` values and would complicate origin comparison.
+    let after_scheme = trimmed.find("://").map(|i| i + 3)?;
+    let authority = &trimmed[after_scheme..];
+    if authority.contains('@') {
+        log::warn!("Rejected returnTo URL containing userinfo.");
+        return None;
+    }
+    let path_start = authority.find('/').unwrap_or(authority.len());
+    let candidate_origin = &trimmed[..after_scheme + path_start];
+
+    if candidate_origin == current_origin {
+        Some(trimmed.to_string())
+    } else {
+        log::warn!("Rejected cross-origin returnTo URL.");
+        None
+    }
+}
+
 fn do_post_login_navigate(return_to: Option<String>) {
-    match return_to {
-        Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
-            if let Err(e) = window().location().set_href(&url) {
-                log::error!("post-login navigation failed: {e:?}");
-                let _ = window().location().set_href("/");
-            }
-        }
-        Some(path) if path.starts_with('/') => {
-            if let Err(e) = window().location().set_href(&path) {
-                log::error!("post-login path navigation failed: {e:?}");
-                let _ = window().location().set_href("/");
-            }
-        }
-        _ => {
-            let _ = window().location().set_href("/");
-        }
+    let current_origin = window().location().origin().unwrap_or_default();
+    let target = return_to
+        .as_deref()
+        .and_then(|rt| validate_return_to(rt, &current_origin))
+        .unwrap_or_else(|| "/".to_string());
+
+    if let Err(e) = window().location().set_href(&target) {
+        log::error!("post-login navigation failed: {e:?}");
+        let _ = window().location().set_href("/");
     }
 }
 
@@ -307,8 +353,8 @@ fn do_post_login_navigate(return_to: Option<String>) {
 /// OAuth callback page — mounted at `/auth/callback`.
 ///
 /// Performs the token exchange directly with the identity provider, validates
-/// the id_token, stores it in `sessionStorage`, and navigates to the post-
-/// login destination.
+/// the id_token, stores it in local storage, calls "/api/v1/user/register" on
+/// the backend, and navigates to the post-login destination.
 #[component]
 pub fn OAuthCallback(query_params: String) -> Element {
     let mut status = use_signal(|| CallbackStatus::Loading);
@@ -327,55 +373,39 @@ pub fn OAuthCallback(query_params: String) -> Element {
     });
 
     rsx! {
-        div {
-            style: "display: flex; align-items: center; justify-content: center; \
+        div { style: "display: flex; align-items: center; justify-content: center; \
                     height: 100vh; background: #0D131F; color: #fff; \
                     font-family: system-ui, sans-serif;",
             match status() {
                 CallbackStatus::Loading => rsx! {
                     div { style: "text-align: center;",
-                        div {
-                            style: "width: 48px; height: 48px; \
-                                    border: 4px solid rgba(255,255,255,0.2); \
-                                    border-top-color: #7928CA; border-radius: 50%; \
-                                    animation: spin 0.8s linear infinite; \
-                                    margin: 0 auto 24px;",
-                        }
-                        p {
-                            style: "color: rgba(255,255,255,0.7); font-size: 1rem;",
-                            "Completing sign-in\u{2026}"
-                        }
-                        style {
-                            "@keyframes spin {{ to {{ transform: rotate(360deg); }} }}"
-                        }
+                        div { style: "width: 48px; height: 48px; \
+                                                                                                                    border: 4px solid rgba(255,255,255,0.2); \
+                                                                                                                    border-top-color: #7928CA; border-radius: 50%; \
+                                                                                                                    animation: spin 0.8s linear infinite; \
+                                                                                                                    margin: 0 auto 24px;" }
+                        p { style: "color: rgba(255,255,255,0.7); font-size: 1rem;", "Completing sign-in\u{2026}" }
+                        style { "@keyframes spin {{ to {{ transform: rotate(360deg); }} }}" }
                     }
                 },
                 CallbackStatus::Success => rsx! {
                     div { style: "text-align: center;",
                         p { style: "color: #4ade80; font-size: 1.2rem;", "Sign-in successful!" }
-                        p {
-                            style: "color: rgba(255,255,255,0.5); font-size: 0.9rem;",
-                            "Redirecting\u{2026}"
-                        }
+                        p { style: "color: rgba(255,255,255,0.5); font-size: 0.9rem;", "Redirecting\u{2026}" }
                     }
                 },
                 CallbackStatus::Error(msg) => rsx! {
-                    div {
-                        style: "text-align: center; max-width: 480px; padding: 2rem;",
+                    div { style: "text-align: center; max-width: 480px; padding: 2rem;",
                         div { style: "font-size: 2rem; margin-bottom: 1rem;", "\u{26a0}\u{fe0f}" }
-                        h2 {
-                            style: "margin-bottom: 0.75rem; font-size: 1.25rem;",
-                            "Sign-in failed"
-                        }
-                        p {
-                            style: "color: rgba(255,255,255,0.65); font-size: 0.9rem; \
-                                    margin-bottom: 1.5rem; line-height: 1.5;",
+                        h2 { style: "margin-bottom: 0.75rem; font-size: 1.25rem;", "Sign-in failed" }
+                        p { style: "color: rgba(255,255,255,0.65); font-size: 0.9rem; \
+                                                                                                                    margin-bottom: 1.5rem; line-height: 1.5;",
                             "{msg}"
                         }
                         button {
                             style: "background: #7928CA; color: #fff; border: none; \
-                                    padding: 0.6rem 1.5rem; border-radius: 8px; \
-                                    cursor: pointer; font-size: 1rem;",
+                                                                                                                    padding: 0.6rem 1.5rem; border-radius: 8px; \
+                                                                                                                    cursor: pointer; font-size: 1rem;",
                             onclick: move |_| {
                                 if let Err(e) = window().location().set_href("/login") {
                                     log::error!("Failed to navigate to /login: {e:?}");
@@ -412,10 +442,7 @@ async fn run_callback(query_params: String) -> Result<(), String> {
     // ── 3. CSRF state validation ──────────────────────────────────────────
     if url_state != pkce_state.state {
         clear_pkce_state();
-        log::error!(
-            "CSRF state mismatch: url_state={url_state} stored={}",
-            pkce_state.state
-        );
+        log::error!("CSRF state mismatch: url_state and stored state do not match.");
         return Err("Sign-in failed: the state parameter did not match. \
              This may indicate a CSRF attempt or an expired session. \
              Please sign in again."
@@ -582,4 +609,123 @@ mod tests {
     // Tests for `parse_query_param` only.
     // Tests for `decode_and_validate_id_token` and `IdTokenClaims` live
     // in `crate::id_token` (see `src/id_token.rs`).
+
+    // --- validate_return_to ---
+    // These tests exercise the pure-Rust branches of `validate_return_to`.
+    // The function is deliberately free of browser APIs so all branches can
+    // be covered by native unit tests.
+
+    const ORIGIN: &str = "https://app.example.com";
+
+    #[test]
+    fn vrt_relative_path_accepted() {
+        assert_eq!(
+            validate_return_to("/meeting/42", ORIGIN),
+            Some("/meeting/42".to_string())
+        );
+    }
+
+    #[test]
+    fn vrt_relative_root_accepted() {
+        assert_eq!(validate_return_to("/", ORIGIN), Some("/".to_string()));
+    }
+
+    #[test]
+    fn vrt_whitespace_trimmed_relative_accepted() {
+        assert_eq!(
+            validate_return_to("  /meeting/42  ", ORIGIN),
+            Some("/meeting/42".to_string())
+        );
+    }
+
+    #[test]
+    fn vrt_protocol_relative_rejected() {
+        assert_eq!(validate_return_to("//evil.com/phish", ORIGIN), None);
+    }
+
+    #[test]
+    fn vrt_javascript_scheme_rejected() {
+        assert_eq!(validate_return_to("javascript:alert(1)", ORIGIN), None);
+    }
+
+    #[test]
+    fn vrt_data_scheme_rejected() {
+        assert_eq!(
+            validate_return_to("data:text/html,<h1>hi</h1>", ORIGIN),
+            None
+        );
+    }
+
+    #[test]
+    fn vrt_empty_rejected() {
+        assert_eq!(validate_return_to("", ORIGIN), None);
+    }
+
+    #[test]
+    fn vrt_whitespace_only_rejected() {
+        assert_eq!(validate_return_to("   ", ORIGIN), None);
+    }
+
+    #[test]
+    fn vrt_same_origin_absolute_url_accepted() {
+        assert_eq!(
+            validate_return_to("https://app.example.com/meeting/42", ORIGIN),
+            Some("https://app.example.com/meeting/42".to_string())
+        );
+    }
+
+    #[test]
+    fn vrt_same_origin_no_path_accepted() {
+        assert_eq!(
+            validate_return_to("https://app.example.com", ORIGIN),
+            Some("https://app.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn vrt_cross_origin_rejected() {
+        assert_eq!(validate_return_to("https://evil.com/steal", ORIGIN), None);
+    }
+
+    #[test]
+    fn vrt_subdomain_rejected() {
+        // sub.app.example.com is a different origin.
+        assert_eq!(
+            validate_return_to("https://sub.app.example.com/x", ORIGIN),
+            None
+        );
+    }
+
+    #[test]
+    fn vrt_userinfo_rejected() {
+        // URL with embedded userinfo must be rejected even if host matches.
+        assert_eq!(
+            validate_return_to("https://evil.com@app.example.com/", ORIGIN),
+            None
+        );
+    }
+
+    #[test]
+    fn vrt_different_port_rejected() {
+        // Same host, different port — different origin.
+        assert_eq!(
+            validate_return_to("https://app.example.com:8443/x", ORIGIN),
+            None
+        );
+    }
+
+    #[test]
+    fn vrt_different_scheme_rejected() {
+        // http vs https — different origin.
+        assert_eq!(validate_return_to("http://app.example.com/x", ORIGIN), None);
+    }
+
+    #[test]
+    fn vrt_with_explicit_matching_port_accepted() {
+        const ORIGIN_WITH_PORT: &str = "https://app.example.com:3001";
+        assert_eq!(
+            validate_return_to("https://app.example.com:3001/meeting/1", ORIGIN_WITH_PORT),
+            Some("https://app.example.com:3001/meeting/1".to_string())
+        );
+    }
 }

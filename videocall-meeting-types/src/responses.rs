@@ -24,6 +24,21 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Top-level API response envelope.
+///
+/// All Meeting Backend endpoints wrap their payload in this structure so that
+/// clients always see a consistent `{ "success", "result" }` shape.
+///
+/// # Success example
+///
+/// ```json
+/// { "success": true, "result": { "meeting_id": "standup-2024", ... } }
+/// ```
+///
+/// # Error example
+///
+/// ```json
+/// { "success": false, "result": { "code": "MEETING_NOT_FOUND", "message": "..." } }
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct APIResponse<A: Serialize> {
     pub success: bool,
@@ -31,6 +46,7 @@ pub struct APIResponse<A: Serialize> {
 }
 
 impl<A: Serialize> APIResponse<A> {
+    /// Wrap a successful result.
     pub fn ok(result: A) -> Self {
         Self {
             success: true,
@@ -40,6 +56,7 @@ impl<A: Serialize> APIResponse<A> {
 }
 
 impl APIResponse<crate::error::APIError> {
+    /// Wrap an error result.
     pub fn error(err: crate::error::APIError) -> Self {
         Self {
             success: false,
@@ -57,6 +74,7 @@ impl APIResponse<crate::error::APIError> {
 pub struct CreateMeetingResponse {
     pub meeting_id: String,
     pub host: String,
+    /// Unix timestamp in seconds when the meeting was created.
     pub created_at: i64,
     pub state: String,
     pub attendees: Vec<String>,
@@ -73,6 +91,7 @@ pub struct MeetingInfoResponse {
     pub host: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_display_name: Option<String>,
+    /// The host's user_id (i.e. `creator_id`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_user_id: Option<String>,
     pub has_password: bool,
@@ -80,7 +99,9 @@ pub struct MeetingInfoResponse {
     pub admitted_can_admit: bool,
     pub participant_count: i64,
     pub waiting_count: i64,
+    /// Unix timestamp in milliseconds.
     pub started_at: i64,
+    /// Unix timestamp in milliseconds, or `null` if still active/idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,18 +125,25 @@ pub struct MeetingSummary {
     pub host: Option<String>,
     pub state: String,
     pub has_password: bool,
+    /// Unix timestamp in seconds when the meeting was created.
     pub created_at: i64,
     pub participant_count: i64,
+    /// Unix timestamp in seconds when the meeting started.
+    /// Same as `created_at` for meetings that were activated immediately.
     pub started_at: i64,
+    /// Unix timestamp in seconds when the meeting ended, or `null` if still active/idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<i64>,
+    /// Number of participants currently in the waiting room.
     pub waiting_count: i64,
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
 }
 
-/// Participant status returned by join, status, admit, reject, and leave
-/// endpoints.
+/// Participant status returned by join, status, admit, reject, and leave endpoints.
+///
+/// This is the canonical shape for any per-participant response. Fields that
+/// are not applicable for a given status are set to `null`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ParticipantStatusResponse {
     pub user_id: String,
@@ -123,13 +151,20 @@ pub struct ParticipantStatusResponse {
     pub display_name: Option<String>,
     pub status: String,
     pub is_host: bool,
+    /// Unix timestamp in seconds when the participant joined/entered the waiting room.
     pub joined_at: i64,
+    /// Unix timestamp in seconds when the participant was admitted, or `null`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admitted_at: Option<i64>,
+    /// Signed JWT room access token. Present only when `status` is `"admitted"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room_token: Option<String>,
+    /// Signed JWT observer token. Present when `status` is `"waiting"` or
+    /// `"waiting_for_meeting"`, allowing the client to open a read-only
+    /// connection for push notifications without polling.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observer_token: Option<String>,
+    /// Meeting-level: whether the waiting room is enabled. Present in join/status responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_room_enabled: Option<bool>,
     /// Meeting-level: whether admitted participants can also admit others.
@@ -138,6 +173,7 @@ pub struct ParticipantStatusResponse {
     /// Meeting-level: the host's display name. Present in join/status responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_display_name: Option<String>,
+    /// Meeting-level: the host's user_id (i.e. `creator_id`). Present in join/status responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_user_id: Option<String>,
 }

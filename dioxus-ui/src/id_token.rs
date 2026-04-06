@@ -15,6 +15,7 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Claims struct
@@ -90,14 +91,15 @@ impl IdTokenClaims {
 
     /// Return `true` when the `aud` claim contains `client_id`.
     ///
-    /// Per OIDC Core §2, `aud` may be a string or array.  A missing / null
-    /// `aud` is accepted permissively (some providers omit it for certain
-    /// flows); the server-side JWKS check is the authoritative guard.
+    /// Per OIDC Core §2, `aud` must be a string or an array of strings.
+    /// Any other JSON type (`Null`, `Bool`, `Number`, `Object`) or a missing
+    /// `aud` field (which deserialises to `Null` via `#[serde(default)]`)
+    /// returns `false` so the caller rejects the token.
     pub(crate) fn audience_contains(&self, client_id: &str) -> bool {
         match &self.aud {
             serde_json::Value::String(s) => s == client_id,
             serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(client_id)),
-            _ => true,
+            _ => false,
         }
     }
 }
@@ -105,6 +107,19 @@ impl IdTokenClaims {
 // ---------------------------------------------------------------------------
 // Decode and validate
 // ---------------------------------------------------------------------------
+
+/// Returns the current time as whole seconds since the Unix epoch.
+///
+/// Uses [`web_time`], which delegates to `js_sys::Date::now()` on `wasm32`
+/// and to `std::time::SystemTime` on native targets.  Both the production
+/// exp-check and the test suite therefore compile and run correctly on every
+/// target without `#[cfg]` guards.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// Decode and lightly validate the id_token payload.
 ///
@@ -145,9 +160,8 @@ pub(crate) fn decode_and_validate_id_token(
 
     // --- exp ---
     if let Some(exp) = claims.exp {
-        let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-        if now_secs > exp {
-            return Err(format!("id_token has expired (exp={exp}, now={now_secs})"));
+        if now_secs() > exp {
+            return Err(format!("id_token has expired (exp={exp})"));
         }
     }
 
@@ -169,6 +183,11 @@ pub(crate) fn decode_and_validate_id_token(
 mod tests {
     use super::*;
 
+    /// A far-future expiry (year ~2286) used wherever tests need a token that
+    /// is not expired.  A hardcoded constant keeps tests deterministic and
+    /// removes any dependency on `js_sys` or a live clock.
+    const FAR_FUTURE_EXP: u64 = 9_999_999_999;
+
     fn make_jwt_payload(claims: serde_json::Value) -> String {
         let json = serde_json::to_string(&claims).unwrap();
         let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -177,12 +196,11 @@ mod tests {
 
     #[test]
     fn valid_claims_decode_successfully() {
-        let exp = (js_sys::Date::now() / 1000.0) as u64 + 3600;
         let token = make_jwt_payload(serde_json::json!({
             "sub": "user123",
             "email": "user@example.com",
             "nonce": "testnonce",
-            "exp": exp,
+            "exp": FAR_FUTURE_EXP,
             "aud": "my-client-id",
         }));
         let claims = decode_and_validate_id_token(&token, "testnonce", "my-client-id");
@@ -193,11 +211,10 @@ mod tests {
 
     #[test]
     fn wrong_nonce_rejected() {
-        let exp = (js_sys::Date::now() / 1000.0) as u64 + 3600;
         let token = make_jwt_payload(serde_json::json!({
             "sub": "user123",
             "nonce": "correct-nonce",
-            "exp": exp,
+            "exp": FAR_FUTURE_EXP,
             "aud": "client",
         }));
         let result = decode_and_validate_id_token(&token, "wrong-nonce", "client");
@@ -219,11 +236,10 @@ mod tests {
 
     #[test]
     fn wrong_audience_rejected() {
-        let exp = (js_sys::Date::now() / 1000.0) as u64 + 3600;
         let token = make_jwt_payload(serde_json::json!({
             "sub": "user123",
             "nonce": "n",
-            "exp": exp,
+            "exp": FAR_FUTURE_EXP,
             "aud": "other-client",
         }));
         let result = decode_and_validate_id_token(&token, "n", "my-client");
@@ -232,15 +248,92 @@ mod tests {
 
     #[test]
     fn array_audience_accepted_when_client_id_present() {
-        let exp = (js_sys::Date::now() / 1000.0) as u64 + 3600;
         let token = make_jwt_payload(serde_json::json!({
             "sub": "user123",
             "nonce": "n",
-            "exp": exp,
+            "exp": FAR_FUTURE_EXP,
             "aud": ["my-client", "other-client"],
         }));
         let result = decode_and_validate_id_token(&token, "n", "my-client");
         assert!(result.is_ok(), "client_id in array aud should be accepted");
+    }
+
+    #[test]
+    fn array_audience_rejected_when_client_id_absent() {
+        let token = make_jwt_payload(serde_json::json!({
+            "sub": "user123",
+            "nonce": "n",
+            "exp": FAR_FUTURE_EXP,
+            "aud": ["other-client", "another-client"],
+        }));
+        let result = decode_and_validate_id_token(&token, "n", "my-client");
+        assert!(
+            result.is_err(),
+            "client_id absent from array aud must be rejected"
+        );
+    }
+
+    #[test]
+    fn null_audience_rejected() {
+        // `aud` absent from JSON deserialises to Null via #[serde(default)];
+        // an explicit null has the same effect.  Both must be rejected.
+        let token = make_jwt_payload(serde_json::json!({
+            "sub": "user123",
+            "nonce": "n",
+            "exp": FAR_FUTURE_EXP,
+            "aud": null,
+        }));
+        let result = decode_and_validate_id_token(&token, "n", "my-client");
+        assert!(result.is_err(), "null aud must be rejected");
+    }
+
+    #[test]
+    fn missing_audience_field_rejected() {
+        // When the `aud` key is entirely absent, serde deserialises it as
+        // Null (the Default for serde_json::Value), which must also be rejected.
+        let token = make_jwt_payload(serde_json::json!({
+            "sub": "user123",
+            "nonce": "n",
+            "exp": FAR_FUTURE_EXP,
+        }));
+        let result = decode_and_validate_id_token(&token, "n", "my-client");
+        assert!(result.is_err(), "missing aud must be rejected");
+    }
+
+    #[test]
+    fn boolean_audience_rejected() {
+        let token = make_jwt_payload(serde_json::json!({
+            "sub": "user123",
+            "nonce": "n",
+            "exp": FAR_FUTURE_EXP,
+            "aud": true,
+        }));
+        let result = decode_and_validate_id_token(&token, "n", "my-client");
+        assert!(result.is_err(), "boolean aud must be rejected");
+    }
+
+    #[test]
+    fn numeric_audience_rejected() {
+        let token = make_jwt_payload(serde_json::json!({
+            "sub": "user123",
+            "nonce": "n",
+            "exp": FAR_FUTURE_EXP,
+            "aud": 42,
+        }));
+        let result = decode_and_validate_id_token(&token, "n", "my-client");
+        assert!(result.is_err(), "numeric aud must be rejected");
+    }
+
+    #[test]
+    fn object_audience_rejected() {
+        let token = make_jwt_payload(serde_json::json!({
+            "sub": "user123",
+            "nonce": "n",
+            "exp": FAR_FUTURE_EXP,
+            "aud": {"client": "my-client"},
+        }));
+        let result = decode_and_validate_id_token(&token, "n", "my-client");
+        assert!(result.is_err(), "object aud must be rejected");
     }
 
     #[test]

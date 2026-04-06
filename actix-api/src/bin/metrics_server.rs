@@ -320,6 +320,7 @@ fn process_health_packet_to_metrics_pb(
             active_servers: HashSet::new(),
         });
         info.last_seen = Instant::now();
+        info.display_name = reporter_display_name.clone();
     }
 
     // Process metrics for this session

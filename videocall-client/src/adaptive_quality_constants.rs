@@ -75,6 +75,16 @@ pub struct VideoQualityTier {
 /// Video quality tiers, ordered from highest (index 0) to lowest.
 pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
     VideoQualityTier {
+        label: "full_hd",
+        max_width: 1920,
+        max_height: 1080,
+        target_fps: 30,
+        ideal_bitrate_kbps: 2500,
+        min_bitrate_kbps: 1500,
+        max_bitrate_kbps: 4000,
+        keyframe_interval_frames: 150, // ~5s at 30fps
+    },
+    VideoQualityTier {
         label: "high",
         max_width: 1280,
         max_height: 720,
@@ -118,27 +128,18 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at "medium" (480p/25fps/600kbps) provides acceptable quality
-/// from the first frame while leaving room to adapt in either direction.
-/// The PID controller steps up to "high" if bandwidth permits or steps
-/// down to "low"/"minimal" if the network is constrained.
-///
-/// Previously this was set to "minimal" (index 3) to avoid visible
-/// downgrade oscillation during warmup. That oscillation was caused by
-/// the keyframe request storm (issue #814) — now fixed — which inflated
-/// bandwidth consumption and made the PID controller think the network
-/// was worse than it actually was.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "medium"
+/// Starting at "full_hd" (1080p/30fps) — 1080p is the expected baseline
+/// for modern video conferencing. The PID controller will step down to
+/// 720p or lower if bandwidth is constrained, but most users on
+/// broadband will stay at 1080p.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 0; // "full_hd"
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at "medium" (720p/10fps/600kbps) for readable
-/// content from the first frame. The PID controller will step up to
-/// 1080p if bandwidth allows, or step down to 480p if constrained.
-///
-/// Previously this was set to "low" (index 2, 480p/5fps), which made
-/// shared content illegible until the quality ramped up.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
+/// Screen share starts at "high" (1080p/15fps) for legible content from
+/// the first frame. Text and UI elements require high resolution to be
+/// readable. The PID controller steps down if bandwidth is constrained.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0; // "high"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
@@ -782,7 +783,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
+        assert_eq!(tier.label, "full_hd", "default tier should be 'full_hd'");
     }
 
     #[test]

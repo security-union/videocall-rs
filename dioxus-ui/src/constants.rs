@@ -86,6 +86,12 @@ pub struct RuntimeConfig {
     #[serde(rename = "oauthPrompt")]
     #[serde(default)]
     pub oauth_prompt: Option<String>,
+    /// OAuth flow mode: `"pkce"` for client-side PKCE, any other value
+    /// (including absent/empty) for server-side OAuth where the backend
+    /// exchanges the authorization code using the client secret.
+    #[serde(rename = "oauthFlow")]
+    #[serde(default)]
+    pub oauth_flow: Option<String>,
     #[serde(rename = "serverElectionPeriodMs")]
     pub server_election_period_ms: u64,
     #[serde(rename = "audioBitrateKbps")]
@@ -262,6 +268,23 @@ pub fn oauth_prompt() -> Option<String> {
         .ok()
         .and_then(|c| c.oauth_prompt)
         .filter(|s| !s.is_empty())
+}
+
+/// OAuth flow mode, read from `window.__APP_CONFIG.oauthFlow`.
+/// Returns `Some("pkce")` for client-side PKCE flow.
+/// Any other value (including `None` / empty) means server-side flow.
+pub fn oauth_flow() -> Option<String> {
+    app_config()
+        .ok()
+        .and_then(|c| c.oauth_flow)
+        .filter(|s| !s.is_empty())
+}
+
+/// Returns `true` when OAuth is enabled AND the flow is explicitly set to
+/// `"pkce"`.  All code paths that decide between client-side PKCE and
+/// server-side OAuth should use this single predicate.
+pub fn is_pkce_flow() -> bool {
+    oauth_enabled().unwrap_or(false) && oauth_flow().as_deref() == Some("pkce")
 }
 
 pub fn meeting_api_base_url() -> Result<String, String> {

@@ -5,7 +5,7 @@ metricsApi:
     repository: securityunion/videocall-media-server
     pullPolicy: Always
     tag: latest
-  
+
   # Minimal resources for cost optimization
   resources:
     limits:
@@ -52,17 +52,14 @@ metricsApi:
     timeoutSeconds: 3
     failureThreshold: 3
   
-  # Security context
+  # Security context — run as non-root
   securityContext:
     runAsUser: 1000
     runAsGroup: 1000
-    fsGroup: 1000
-  
+
   # Pod security context
   podSecurityContext:
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000
+    runAsNonRoot: true
 
 # Separate Server Stats pod for connection tracking (stateless snapshot approach)
 serverStats:
@@ -121,14 +118,11 @@ serverStats:
     timeoutSeconds: 3
     failureThreshold: 3
   
-  # Security context
+  # Security context — run as non-root
   securityContext:
     runAsUser: 1000
     runAsGroup: 1000
-    fsGroup: 1000
-  
+
   # Pod security context
   podSecurityContext:
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000 
+    runAsNonRoot: true

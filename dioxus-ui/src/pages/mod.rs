@@ -3,3 +3,4 @@
 pub mod home;
 pub mod meeting;
 pub mod meeting_settings;
+pub mod oauth_callback;

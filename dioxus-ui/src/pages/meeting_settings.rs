@@ -2,7 +2,7 @@
 
 //! Dedicated meeting settings page — the full management hub for a meeting.
 
-use crate::auth::check_session;
+use crate::auth::{check_session, redirect_to_login};
 use crate::components::toggle_switch::ToggleSwitch;
 use crate::constants::oauth_enabled;
 use crate::meeting_api::{
@@ -47,9 +47,9 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                 match check_session().await {
                     Ok(_) => auth_checked.set(true),
                     Err(_) => {
-                        if let Some(win) = window() {
-                            let _ = win.location().set_href("/login");
-                        }
+                        // Encode the current settings page URL as `returnTo`
+                        // so the user is sent directly back here after sign-in.
+                        redirect_to_login();
                     }
                 }
             });

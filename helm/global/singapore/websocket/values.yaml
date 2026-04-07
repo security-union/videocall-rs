@@ -69,6 +69,11 @@ rustlemania-websocket:
         hosts:
           - websocket-singapore.webtransport.video
 
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+
   autoscaling:
     enabled: false
     minReplicas: 2

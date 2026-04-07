@@ -495,6 +495,7 @@ impl Peer {
                         self.broadcast_peer_status();
                     } else {
                         // Peer is muted per heartbeat; drop straggler audio to avoid audible glitch.
+                        // Note: Not counting this as a frame drop since it's intentional filtering
                         return Ok((media_type, DecodeStatus::SKIPPED, None));
                     }
                 }
@@ -874,13 +875,19 @@ impl PeerDecodeManager {
         }
     }
 
-    pub fn run_peer_monitor(&mut self) {
+    pub fn run_peer_monitor(&mut self) -> Vec<String> {
         let removed = self
             .connected_peers
             .remove_if_and_return(|peer| peer.check_heartbeat());
+        let mut removed_ids = Vec::new();
         for (_session_id, peer) in removed {
+            if let Some(diag) = &self.diagnostics {
+                diag.remove_peer(&peer.sid_str);
+            }
+            removed_ids.push(peer.sid_str.clone());
             self.on_peer_removed.emit(peer.sid_str);
         }
+        removed_ids
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
@@ -928,7 +935,15 @@ impl PeerDecodeManager {
 
                     Ok(())
                 }
-                Err(e) => peer.reset().map_err(|_| e),
+                Err(e) => {
+                    // Track decode errors (codec failures: keyframe miss, parse error, decoder reset).
+                    // Media type is not available in the error arm; default to VIDEO since that
+                    // is where the vast majority of decode errors occur in practice.
+                    if let Some(diagnostics) = &self.diagnostics {
+                        diagnostics.track_decode_error(&peer.sid_str, MediaType::VIDEO);
+                    }
+                    peer.reset().map_err(|_| e)
+                }
             }
         } else {
             Err(PeerDecodeError::NoSuchPeer(peer_session_id))
@@ -1021,6 +1036,9 @@ impl PeerDecodeManager {
 
     pub fn delete_peer(&mut self, session_id: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
+            if let Some(diag) = &self.diagnostics {
+                diag.remove_peer(&peer.sid_str);
+            }
             self.on_peer_removed.emit(peer.sid_str);
         }
     }
@@ -1032,6 +1050,9 @@ impl PeerDecodeManager {
     pub fn clear_all_peers(&mut self) {
         let removed = self.connected_peers.drain_all();
         for (_session_id, peer) in removed {
+            if let Some(diag) = &self.diagnostics {
+                diag.remove_peer(&peer.sid_str);
+            }
             self.on_peer_removed.emit(peer.sid_str);
         }
         // Clear the display name cache so stale names don't persist

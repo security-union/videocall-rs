@@ -9,10 +9,12 @@ spec:
   selector:
     matchLabels:
       {{- include "metrics-api.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: client-metrics
   template:
     metadata:
       labels:
         {{- include "metrics-api.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: client-metrics
     spec:
       securityContext:
         {{- toYaml .Values.metricsApi.podSecurityContext | nindent 8 }}
@@ -21,7 +23,6 @@ spec:
           image: "{{ .Values.metricsApi.image.repository }}:{{ .Values.metricsApi.image.tag }}"
           imagePullPolicy: {{ .Values.metricsApi.image.pullPolicy }}
           command: ["/usr/bin/metrics_server"]
-          workingDir: /app/actix-api
           ports:
             - name: http
               containerPort: {{ .Values.metricsApi.service.targetPort }}

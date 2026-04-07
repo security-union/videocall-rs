@@ -3,52 +3,35 @@
  * Licensed under MIT OR Apache-2.0
  */
 
-//! Login page component.
+//! Login page component and `do_login` helper.
 //!
-//! Renders a provider-branded sign-in button based on the `oauthProvider`
-//! value in `window.__APP_CONFIG`. Delegates to dedicated button components
-//! for each supported provider (Google, Okta) so branding stays isolated.
+//! ## Behaviour when OAuth is configured (`oauthEnabled = true`)
+//!
+//! The `Login` component **immediately starts the PKCE OIDC flow** on mount
+//! via a `use_effect`.  No button click is required.  A minimal loading screen
+//! is rendered while the browser navigates to the provider.
+//!
+//! [`do_login`] is the thin public entry point for starting the flow from
+//! other components (e.g. the home-page sign-in button, the meetings list
+//! unauthenticated prompt).  It delegates to [`crate::auth::do_login`].
+//!
+//! ## Behaviour when OAuth is **not** configured
+//!
+//! Renders a generic or provider-branded sign-in button.
 
 use dioxus::prelude::*;
-use gloo_utils::window;
 
 use crate::components::google_sign_in_button::GoogleSignInButton;
 use crate::components::okta_sign_in_button::OktaSignInButton;
-use crate::constants::{login_url, oauth_provider};
+use crate::constants::{oauth_enabled, oauth_provider};
 
-/// Build the login callback that redirects to the backend OAuth endpoint,
-/// forwarding any `returnTo` query parameter from the current URL.
+/// Start the OAuth / PKCE login flow.
+///
+/// This is a thin re-export of [`crate::auth::do_login`] kept in this module
+/// so callers that already import from `crate::components::login` don't need
+/// a new import path.
 pub fn do_login() {
-    match login_url() {
-        Ok(mut url) => {
-            // Prefer sessionStorage — the meeting page stores the return URL there
-            // before navigating to /login, because Dioxus 0.7's router strips
-            // unrecognized query params via history.replaceState on boot.
-            let stored_return_to = window().session_storage().ok().flatten().and_then(|s| {
-                let val = s.get_item("vc_oauth_return_to").ok().flatten();
-                if val.is_some() {
-                    let _ = s.remove_item("vc_oauth_return_to");
-                }
-                val
-            });
-
-            if let Some(return_to) = stored_return_to {
-                url = format!("{url}?returnTo={}", urlencoding::encode(&return_to));
-            } else if let Ok(search) = window().location().search() {
-                if !search.is_empty() {
-                    // Fallback: returnTo still in query string (direct /login?returnTo= navigation).
-                    url = format!("{url}{search}");
-                } else if let Ok(origin) = window().location().origin() {
-                    // No returnTo anywhere — tell the backend which frontend to return to.
-                    let value = format!("{origin}/");
-                    let encoded = urlencoding::encode(&value);
-                    url = format!("{url}?returnTo={encoded}");
-                }
-            }
-            let _ = window().location().set_href(&url);
-        }
-        Err(e) => log::error!("Failed to get login URL: {e:?}"),
-    }
+    crate::auth::do_login();
 }
 
 /// Render the sign-in button for the configured OAuth provider.
@@ -65,20 +48,67 @@ pub fn ProviderButton(onclick: EventHandler<MouseEvent>) -> Element {
     }
 }
 
+/// The `/login` route component.
+///
+/// When `oauthEnabled` is `true` this component **immediately** starts the
+/// PKCE OIDC flow on mount (via `use_effect`) so the user never sees an
+/// intermediate button page.
+///
+/// When OAuth is not configured the traditional sign-in button UI is rendered.
 #[component]
 pub fn Login() -> Element {
-    rsx! {
-        div { class: "login-container",
-            div { class: "login-card",
-                h1 { class: "login-title", "videocall.rs" }
+    use_effect(move || {
+        if oauth_enabled().unwrap_or(false) {
+            do_login();
+        }
+    });
 
-                ProviderButton { onclick: move |_| do_login() }
+    if oauth_enabled().unwrap_or(false) {
+        rsx! {
+            div { class: "login-container",
+                div { class: "login-card",
+                    h1 { class: "login-title", "videocall.rs" }
+                    div {
+                        style: "display: flex; flex-direction: column; \
+                                align-items: center; gap: 1rem; padding: 1rem 0;",
+                        div {
+                            style: "width: 36px; height: 36px; \
+                                    border: 3px solid rgba(255,255,255,0.2); \
+                                    border-top-color: #7928CA; border-radius: 50%; \
+                                    animation: spin 0.8s linear infinite;",
+                        }
+                        p {
+                            style: "color: rgba(255,255,255,0.65); \
+                                    font-size: 0.95rem; margin: 0;",
+                            "Redirecting to sign-in\u{2026}"
+                        }
+                        style {
+                            "@keyframes spin {{ to {{ transform: rotate(360deg); }} }}"
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        rsx! {
+            div { class: "login-container",
+                div { class: "login-card",
+                    h1 { class: "login-title", "videocall.rs" }
 
-                p { class: "login-footer",
-                    "By signing in, you agree to our "
-                    a { href: "https://github.com/security-union/videocall-rs", "Terms of Service" }
-                    " and "
-                    a { href: "https://github.com/security-union/videocall-rs", "Privacy Policy" }
+                    ProviderButton { onclick: move |_| do_login() }
+
+                    p { class: "login-footer",
+                        "By signing in, you agree to our "
+                        a {
+                            href: "https://github.com/security-union/videocall-rs",
+                            "Terms of Service"
+                        }
+                        " and "
+                        a {
+                            href: "https://github.com/security-union/videocall-rs",
+                            "Privacy Policy"
+                        }
+                    }
                 }
             }
         }

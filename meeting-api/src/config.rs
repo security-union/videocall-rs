@@ -77,6 +77,44 @@ pub struct OAuthConfig {
     /// "http://localhost:80,http://localhost:3001"). The origin of
     /// `after_login_url` is implicitly allowed.
     pub allowed_redirect_urls: Vec<String>,
+    /// End-session endpoint for RP-initiated logout (OIDC RP-Initiated Logout
+    /// 1.0). Discovered from the provider's OpenID Configuration when
+    /// `OAUTH_ISSUER` is set, or overridden via `OAUTH_END_SESSION_URL`.
+    ///
+    /// When set, `GET /logout` redirects the browser to this URL (with
+    /// `client_id` and optionally `post_logout_redirect_uri`) after clearing
+    /// the local session cookie, so the provider also terminates the session.
+    pub end_session_endpoint: Option<String>,
+    /// URL to redirect to after the provider has completed logout
+    /// (`post_logout_redirect_uri` sent to `end_session_endpoint`).
+    /// Configured via `AFTER_LOGOUT_URL`. When not set, the parameter is
+    /// omitted from the end-session redirect.
+    pub after_logout_url: Option<String>,
+    /// When `true`, the `GET /login/callback` handler skips session-cookie
+    /// issuance after a successful token exchange.  Set this only after
+    /// pointing `OAUTH_REDIRECT_URL` at the dioxus-ui `/auth/callback` route
+    /// (browser PKCE mode) and verifying the UI handles its own token storage.
+    ///
+    /// **Default: `false`** — existing deployments that route the provider
+    /// callback through the backend (`/login/callback`) continue to receive a
+    /// session cookie and require no configuration change.  Flip to `true`
+    /// only once `OAUTH_REDIRECT_URL` has been updated to the UI route.
+    pub browser_pkce: bool,
+    /// Audience value that per-request Bearer tokens must carry in their `aud`
+    /// claim.  When `Some`, every token validated by the `AuthUser` extractor
+    /// must list this value in `aud`; tokens whose `aud` does not match are
+    /// rejected with 401 regardless of signature validity.
+    ///
+    /// Set via `OAUTH_RESOURCE_SERVER_AUDIENCE`.  Recommended for deployments
+    /// that share an identity provider with other services (Keycloak, Okta,
+    /// Entra) — without this, any JWT signed by the same IdP is accepted,
+    /// including tokens issued for unrelated client applications (confused
+    /// deputy risk, RFC 8707).
+    ///
+    /// When `None` (the default), audience validation is skipped on the
+    /// per-request path so that both id_tokens (`aud = client_id`) and access
+    /// tokens (`aud = resource-server URL`) continue to work.
+    pub resource_server_audience: Option<String>,
 }
 
 impl Config {
@@ -95,7 +133,11 @@ impl Config {
     /// - OAuth: `OAUTH_CLIENT_ID`, `OAUTH_SECRET` (optional), `OAUTH_REDIRECT_URL`,
     ///   `OAUTH_ISSUER`, `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_JWKS_URL`,
     ///   `OAUTH_USERINFO_URL`, `OAUTH_SCOPES` (default: `"openid email profile"`),
-    ///   `AFTER_LOGIN_URL`
+    ///   `AFTER_LOGIN_URL`, `OAUTH_BROWSER_PKCE` (default: `false`),
+    ///   `OAUTH_RESOURCE_SERVER_AUDIENCE` (optional; restricts per-request `aud`)
+    /// - OIDC logout: `OAUTH_END_SESSION_URL` (manual override; auto-discovered
+    ///   from `OAUTH_ISSUER` when not set), `AFTER_LOGOUT_URL` (sent as
+    ///   `post_logout_redirect_uri` to the provider's end-session endpoint)
     /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"` or comma-separated for multiple origins)
     pub fn from_env() -> Result<Self, String> {
         let database_url = env::var("DATABASE_URL")
@@ -147,10 +189,30 @@ impl Config {
                 let userinfo_url = env::var("OAUTH_USERINFO_URL")
                     .ok()
                     .filter(|s| !s.is_empty());
+                let end_session_url = env::var("OAUTH_END_SESSION_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty());
                 let scopes = env::var("OAUTH_SCOPES")
                     .ok()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "openid email profile".to_string());
+
+                // post_logout_redirect_uri sent to the provider's end-session endpoint.
+                let after_logout_url = env::var("AFTER_LOGOUT_URL").ok().filter(|s| !s.is_empty());
+
+                // When true, GET /login/callback will not issue a session cookie.
+                // Leave false (the default) for any deployment still routing the
+                // provider redirect through the backend /login/callback handler.
+                let browser_pkce = env::var("OAUTH_BROWSER_PKCE")
+                    .map(|v| v.to_lowercase() == "true" || v == "1")
+                    .unwrap_or(false);
+
+                // Audience restriction for per-request Bearer token validation.
+                // When set, tokens whose `aud` claim does not contain this value
+                // are rejected (RFC 8707 / confused deputy mitigation).
+                let resource_server_audience = env::var("OAUTH_RESOURCE_SERVER_AUDIENCE")
+                    .ok()
+                    .filter(|s| !s.is_empty());
 
                 // When no issuer is set, auth_url and token_url must be provided manually.
                 let auth_url = match auth_url {
@@ -202,6 +264,10 @@ impl Config {
                         }
                         urls
                     },
+                    end_session_endpoint: end_session_url,
+                    after_logout_url,
+                    browser_pkce,
+                    resource_server_audience,
                 })
             })
             .transpose()?;
@@ -256,13 +322,18 @@ impl Config {
         if oauth.userinfo_url.is_none() {
             oauth.userinfo_url = endpoints.userinfo_endpoint;
         }
+        if oauth.end_session_endpoint.is_none() {
+            oauth.end_session_endpoint = endpoints.end_session_endpoint;
+        }
 
         tracing::info!(
-            "OIDC discovery complete: auth_url={}, token_url={}, jwks_url={:?}, userinfo_url={:?}",
+            "OIDC discovery complete: auth_url={}, token_url={}, jwks_url={:?}, \
+             userinfo_url={:?}, end_session_endpoint={:?}",
             oauth.auth_url,
             oauth.token_url,
             oauth.jwks_url,
-            oauth.userinfo_url
+            oauth.userinfo_url,
+            oauth.end_session_endpoint,
         );
 
         Ok(())

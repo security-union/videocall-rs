@@ -51,7 +51,15 @@ pub fn Home() -> Element {
     let mut meeting_id_value = use_signal(String::new);
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
 
-    let existing_username: String = if let Some(name) = (display_name_ctx.0)() {
+    // When OAuth is enabled the display name must not be pre-populated from
+    // local storage: the user may be signed out, and showing a stale name
+    // from a previous session is misleading.  The async session-check effect
+    // below restores the stored name once a valid session is confirmed.
+    // When OAuth is disabled there is no sign-out concept, so the stored name
+    // is always shown immediately.
+    let existing_username: String = if oauth_enabled().unwrap_or(false) {
+        String::new()
+    } else if let Some(name) = (display_name_ctx.0)() {
         name
     } else {
         load_display_name_from_storage().unwrap_or_default()
@@ -76,16 +84,31 @@ pub fn Home() -> Element {
         }
     });
 
-    // Fetch user profile when OAuth is enabled
+    // Fetch user profile when OAuth is enabled.
+    //
+    // Because the display name field starts empty for OAuth deployments (see
+    // above), this effect is responsible for restoring it once a valid session
+    // is confirmed.
+    //
+    // Flow:
+    //   • Session valid + stored name  → restore field from storage (user may
+    //     have customised it, so we prefer their choice over the profile name).
+    //   • Session valid + no stored name → derive from provider profile and
+    //     save so subsequent visits don't flash empty.
+    //   • Session invalid / check fails → field stays empty; sign-in button
+    //     is shown.
     use_effect(move || {
         if oauth_enabled().unwrap_or(false) {
             wasm_bindgen_futures::spawn_local(async move {
-                // Only fetch profile if session is valid
                 if check_session().await.is_ok() {
                     if let Ok(profile) = get_user_profile().await {
-                        // Auto-set display name from auth profile if not already saved
-                        if load_display_name_from_storage().is_none() {
-                            // Use the profile name directly; only transform if it looks like an email
+                        if let Some(stored_name) = load_display_name_from_storage() {
+                            // Session confirmed — restore the previously saved name.
+                            username_value.set(stored_name.clone());
+                            display_name_ctx.0.set(Some(stored_name.clone()));
+                            matomo_logger::set_user_id(&stored_name);
+                        } else {
+                            // No saved name yet — derive one from the provider profile.
                             let display_name = if profile.name.contains('@') {
                                 email_to_display_name(&profile.name)
                             } else {
@@ -94,25 +117,36 @@ pub fn Home() -> Element {
                             if let Ok(valid_name) = validate_display_name(&display_name) {
                                 save_display_name_to_storage(&valid_name);
                                 display_name_ctx.0.set(Some(valid_name.clone()));
-                                username_value.set(valid_name);
+                                username_value.set(valid_name.clone());
+                                matomo_logger::set_user_id(&valid_name);
                             }
                         }
                         user_profile.set(Some(profile));
                     }
+                    // Session valid but profile fetch failed → leave field empty.
                 }
+                // Session invalid → field stays empty; signed-out state.
             });
         }
     });
 
-    // Logout handler — clear profile state and display name, then stay on home page
+    // Logout handler: clear local state first, then navigate the browser to
+    // the meeting-api /logout endpoint.  The server clears the session cookie
+    // and, when an OIDC end_session_endpoint is configured, redirects to the
+    // provider's logout page (RP-initiated logout).  Doing a browser
+    // navigation — rather than a fetch() — ensures the provider redirect is
+    // followed as a real page load.
     let on_logout = move |_| {
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = logout().await;
-            user_profile.set(None);
-            clear_display_name_from_storage();
-            display_name_ctx.0.set(None);
-            username_value.set(String::new());
-        });
+        // Clear persisted display name before the page unloads so the user
+        // starts fresh after the OIDC provider redirects back.
+        clear_display_name_from_storage();
+        // Reset in-memory signals (best-effort; page unloads shortly after).
+        user_profile.set(None);
+        display_name_ctx.0.set(None);
+        username_value.set(String::new());
+        if let Err(e) = logout() {
+            log::error!("Logout navigation failed: {e}");
+        }
     };
 
     let get_meeting_id = move || -> String {
@@ -363,7 +397,7 @@ pub fn Home() -> Element {
                 }
 
                 div { class: "content-separator" }
-            
+
             // div { class: "grid grid-cols-1 md:grid-cols-2 gap-8", style: "margin-top:1em",
             //     div {
             //         button {

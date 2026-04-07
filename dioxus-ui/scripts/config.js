@@ -4,13 +4,20 @@ window.__APP_CONFIG = Object.freeze({
   webTransportHost: "https://127.0.0.1:4433",
   oauthEnabled: "true",
   e2eeEnabled: "false",
-  webTransportEnabled: "true",
+  webTransportEnabled: "false",
   firefoxEnabled: "false",
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,
   audioBitrateKbps: 65,
   videoBitrateKbps: 100,
   screenBitrateKbps: 100,
-  oauthProvider: "google",
-  vadThreshold: 0.02
+  oauthProvider: "",
+  vadThreshold: 0.02,
+  oauthAuthUrl: "",
+  oauthClientId: "",
+  oauthRedirectUrl: "http://localhost:3001/auth/callback",
+  oauthScopes: "openid email profile",
+  oauthTokenUrl: "",
+  oauthIssuer: "",
+  oauthPrompt: ""
 });

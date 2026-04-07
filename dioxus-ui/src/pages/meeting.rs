@@ -11,6 +11,7 @@
  * at your option.
  */
 
+use crate::auth::{check_session, get_user_profile, logout, redirect_to_login, UserProfile};
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
@@ -24,10 +25,6 @@ use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
-use web_sys::window;
-
-use crate::auth::{check_session, get_user_profile, logout, UserProfile};
-use crate::routing::Route;
 
 /// Meeting participant status from the API
 #[derive(Clone, PartialEq, Debug)]
@@ -57,7 +54,6 @@ pub fn MeetingPage(id: String) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut auth_checked = use_signal(|| false);
-    let navigator = use_navigator();
     let mut user_profile = use_signal(|| None::<UserProfile>);
     let mut meeting_status = use_signal(|| MeetingStatus::NotJoined);
     let mut host_display_name = use_signal(|| None::<String>);
@@ -86,28 +82,11 @@ pub fn MeetingPage(id: String) -> Element {
                 match check_session().await {
                     Ok(_) => auth_checked.set(true),
                     Err(_) => {
-                        if let Some(win) = window() {
-                            if let Ok(current_url) = win.location().href() {
-                                // Store the return URL in sessionStorage before
-                                // navigating to /login. Dioxus 0.7's router strips
-                                // unrecognized query params via history.replaceState,
-                                // so we cannot rely on ?returnTo= surviving in the URL.
-                                match win.session_storage() {
-                                    Ok(Some(storage)) => {
-                                        if storage
-                                            .set_item("vc_oauth_return_to", &current_url)
-                                            .is_err()
-                                        {
-                                            log::warn!("Failed to write vc_oauth_return_to to sessionStorage — post-login redirect will fall back to app root");
-                                        }
-                                    }
-                                    _ => {
-                                        log::warn!("sessionStorage unavailable — post-login redirect will fall back to app root");
-                                    }
-                                }
-                                let _ = win.location().set_href("/login");
-                            }
-                        }
+                        // Redirect straight to the backend OAuth login endpoint,
+                        // encoding the current meeting URL as `returnTo` so the
+                        // server bounces the user back here after sign-in.
+                        // This skips the intermediate /login SPA page entirely.
+                        redirect_to_login();
                     }
                 }
             });
@@ -302,13 +281,15 @@ pub fn MeetingPage(id: String) -> Element {
         });
     }
 
-    // Logout handler
+    // Logout handler: navigate the browser to the meeting-api /logout endpoint
+    // so the server can clear the session cookie and redirect to the OIDC
+    // provider's end_session_endpoint when configured.  The navigator.push()
+    // call that was here previously is no longer needed — the browser will
+    // unload the page as soon as the navigation starts.
     let on_logout = move |_| {
-        let navigator = navigator;
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = logout().await;
-            navigator.push(Route::Login {});
-        });
+        if let Err(e) = logout() {
+            log::error!("Logout navigation failed: {e}");
+        }
     };
 
     // Early return for auth check

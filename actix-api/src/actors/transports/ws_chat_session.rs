@@ -64,6 +64,7 @@ impl WsChatSession {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
+        instance_id: Option<String>,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -74,6 +75,7 @@ impl WsChatSession {
             tracker_sender,
             session_manager,
             observer,
+            instance_id,
             "websocket",
         );
 
@@ -368,6 +370,7 @@ mod tests {
                                     tracker_sender,
                                     session_manager,
                                     false, // tests use non-observer sessions
+                                    None,  // no instance_id
                                 );
                                 ws::start(actor, &req, stream)
                                     .map_err(actix_web::error::ErrorInternalServerError)

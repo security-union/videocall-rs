@@ -336,6 +336,7 @@ mod tests {
             on_state_changed: state_capture.callback(),
             peer_monitor: Callback::from(|_| {}),
             election_period_ms: 1000,
+            instance_id: "test-instance-id".to_string(),
         }
     }
 

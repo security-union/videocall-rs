@@ -131,6 +131,8 @@ features = [
     "IntersectionObserver",
     "IntersectionObserverEntry",
     "IntersectionObserverInit",
+    "Crypto",
+    "Window",
 ]
 
 [dependencies.pidgeon]

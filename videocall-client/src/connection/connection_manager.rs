@@ -124,6 +124,10 @@ pub struct ConnectionManagerOptions {
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
     pub election_period_ms: u64,
+    /// Stable client instance identifier (UUID). Generated once per meeting join,
+    /// survives reconnects, dies on tab close. Sent to the server so it can
+    /// correlate reconnections and silently evict stale sessions.
+    pub instance_id: String,
 }
 
 /// Tracks the state of automatic reconnection after connection loss.
@@ -326,11 +330,19 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Append `&instance_id=<uuid>` to a lobby URL so the server can correlate
+    /// reconnections from the same client instance and silently evict stale sessions.
+    fn append_instance_id(&self, url: &str) -> String {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}instance_id={}", self.options.instance_id)
+    }
+
     /// Create connections to all configured servers
     fn create_all_connections(&mut self) -> Result<()> {
         // Create WebSocket connections
-        for (i, url) in self.options.websocket_urls.iter().enumerate() {
+        for (i, base_url) in self.options.websocket_urls.iter().enumerate() {
             let conn_id = format!("ws_{i}");
+            let url = self.append_instance_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: url.clone(),
                 webtransport_url: String::new(), // Not used for WebSocket
@@ -365,8 +377,9 @@ impl ConnectionManager {
         }
 
         // Create WebTransport connections
-        for (i, url) in self.options.webtransport_urls.iter().enumerate() {
+        for (i, base_url) in self.options.webtransport_urls.iter().enumerate() {
             let conn_id = format!("wt_{i}");
+            let url = self.append_instance_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: String::new(), // Not used for WebTransport
                 webtransport_url: url.clone(),
@@ -1899,6 +1912,7 @@ mod tests {
             on_state_changed: Callback::from(|_: ConnectionState| {}),
             peer_monitor: Callback::from(|_: ()| {}),
             election_period_ms: 3000,
+            instance_id: "test-instance-id".to_string(),
         };
 
         ConnectionManager {

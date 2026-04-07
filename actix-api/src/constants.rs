@@ -29,7 +29,7 @@ pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// If the same user_id reconnects within this window, the departure is
 /// cancelled silently — no PARTICIPANT_LEFT or PARTICIPANT_JOINED is
 /// broadcast, avoiding false join/leave notification spam.
-pub const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(2);
+pub const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
 /// Regex pattern for validating usernames and room IDs
 /// Allows alphanumeric characters, underscores, and hyphens

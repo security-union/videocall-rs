@@ -20,7 +20,8 @@ use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
-    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
+    KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
+    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_SLOW_RETRY_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
 };
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
@@ -83,6 +84,156 @@ impl Display for PeerDecodeError {
     }
 }
 
+/// Tracks sequence numbers with a reorder-tolerant sliding window.
+///
+/// WebTransport sends each video packet on a separate unidirectional QUIC
+/// stream, so packets can arrive out-of-order across streams. A simple
+/// `seq > prev + 1` check would misinterpret every reordering as packet loss,
+/// triggering unnecessary keyframe requests.
+///
+/// This tracker uses a `u64` bitfield to remember the 64 most recent sequence
+/// positions. A packet is only declared lost when it shifts off the window
+/// without ever being marked as seen. This tolerates up to 63 positions of
+/// reordering before declaring loss.
+struct SequenceTracker {
+    /// Highest sequence number seen so far.
+    high_seq: Option<u64>,
+    /// Bitfield of recently seen sequences. Bit 0 = `high_seq` was seen,
+    /// bit 1 = `high_seq - 1`, etc. A 0 bit means that seq was not yet received.
+    seen_bits: u64,
+    /// Number of packets confirmed lost (shifted off the window unseen).
+    lost_count: u32,
+    /// Timestamp (ms) when loss was first detected. `None` if no loss.
+    loss_detected_at_ms: Option<u64>,
+    /// Last time a keyframe request was sent (ms). Used for rate-limiting.
+    last_keyframe_request_ms: u64,
+    /// Number of unanswered keyframe requests sent since last recovery.
+    unanswered_requests: u32,
+    /// Current backoff interval for keyframe requests (ms). Doubles after each request.
+    current_backoff_ms: u64,
+}
+
+impl SequenceTracker {
+    fn new() -> Self {
+        Self {
+            high_seq: None,
+            seen_bits: 0,
+            lost_count: 0,
+            loss_detected_at_ms: None,
+            last_keyframe_request_ms: 0,
+            unanswered_requests: 0,
+            current_backoff_ms: KEYFRAME_REQUEST_MIN_INTERVAL_MS,
+        }
+    }
+
+    /// Record a sequence number. Returns the number of NEW lost packets
+    /// detected (packets that shifted off the window unseen).
+    fn record_seq(&mut self, seq: u64) -> u32 {
+        let Some(high) = self.high_seq else {
+            // First packet -- initialize. Mark all window positions as "seen"
+            // so that pre-stream positions (negative sequence numbers that never
+            // existed) are not counted as lost when the window advances.
+            self.high_seq = Some(seq);
+            self.seen_bits = u64::MAX;
+            return 0;
+        };
+
+        if seq > high {
+            // New highest -- shift window left and count losses.
+            // Compare in u64 space first to avoid truncation on huge gaps.
+            let gap = seq - high;
+            let shift = gap.min(64) as u32;
+            let new_lost = if gap >= 64 {
+                // Entire window shifted out. Count unseen bits in old window.
+                // count_zeros() on u64 returns at most 64 (the window size).
+                self.seen_bits.count_zeros()
+            } else {
+                // Count the bits that will shift off (the top `shift` bits).
+                let mask = !((1u64 << (64 - shift)) - 1);
+                let shifting_out = self.seen_bits & mask;
+                let lost_in_shift = shift - shifting_out.count_ones();
+                // Shift and mark the new seq as seen.
+                self.seen_bits = (self.seen_bits << shift) | 1;
+                lost_in_shift
+            };
+            if gap >= 64 {
+                self.seen_bits = 1; // only the new packet is seen
+            }
+            self.high_seq = Some(seq);
+            self.lost_count += new_lost;
+            new_lost
+        } else if high - seq < 64 {
+            // Out-of-order but within window -- mark as seen (no loss).
+            let bit_pos = (high - seq) as u32;
+            self.seen_bits |= 1u64 << bit_pos;
+            0
+        } else {
+            // Too old (beyond window) -- ignore silently.
+            0
+        }
+    }
+
+    /// Check if a keyframe request should be sent. Returns `true` if yes.
+    ///
+    /// Implements exponential backoff: first request after
+    /// `KEYFRAME_REQUEST_TIMEOUT_MS`, then intervals double from
+    /// `KEYFRAME_REQUEST_MIN_INTERVAL_MS` up to `KEYFRAME_REQUEST_MAX_BACKOFF_MS`.
+    /// After `KEYFRAME_REQUEST_MAX_UNANSWERED` unanswered requests, switches to
+    /// a slow periodic retry (`KEYFRAME_REQUEST_SLOW_RETRY_MS`) to recover from
+    /// persistent loss without flooding the sender.
+    fn should_request_keyframe(&mut self, now: u64) -> bool {
+        if self.lost_count == 0 {
+            // No loss -- reset all request state.
+            self.loss_detected_at_ms = None;
+            self.unanswered_requests = 0;
+            self.current_backoff_ms = KEYFRAME_REQUEST_MIN_INTERVAL_MS;
+            return false;
+        }
+
+        // Record first loss detection time.
+        let loss_time = *self.loss_detected_at_ms.get_or_insert(now);
+        let elapsed_since_loss = now.saturating_sub(loss_time);
+        let elapsed_since_last_req = now.saturating_sub(self.last_keyframe_request_ms);
+
+        // Wait for initial timeout before first request.
+        if elapsed_since_loss < KEYFRAME_REQUEST_TIMEOUT_MS {
+            return false;
+        }
+
+        // After the initial backoff burst is exhausted, switch to slow
+        // periodic retry. Keyframes are 5-10x larger than delta frames
+        // and have a higher drop probability on lossy networks, so giving
+        // up permanently would leave frozen video with no recovery path.
+        if self.unanswered_requests >= KEYFRAME_REQUEST_MAX_UNANSWERED {
+            if elapsed_since_last_req < KEYFRAME_REQUEST_SLOW_RETRY_MS {
+                return false;
+            }
+            self.last_keyframe_request_ms = now;
+            return true;
+        }
+
+        // Exponential backoff between requests.
+        if elapsed_since_last_req < self.current_backoff_ms {
+            return false;
+        }
+
+        self.last_keyframe_request_ms = now;
+        self.unanswered_requests += 1;
+        // Double backoff for next request, capped.
+        self.current_backoff_ms =
+            (self.current_backoff_ms * 2).min(KEYFRAME_REQUEST_MAX_BACKOFF_MS);
+        true
+    }
+
+    /// Called when a keyframe is received -- resets loss/request state.
+    fn on_keyframe(&mut self) {
+        self.lost_count = 0;
+        self.loss_detected_at_ms = None;
+        self.unanswered_requests = 0;
+        self.current_backoff_ms = KEYFRAME_REQUEST_MIN_INTERVAL_MS;
+    }
+}
+
 pub struct Peer {
     pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
@@ -110,18 +261,10 @@ pub struct Peer {
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
-    /// Last seen video sequence number for gap detection.
-    last_video_seq: Option<u64>,
-    /// Last seen screen sequence number for gap detection.
-    last_screen_seq: Option<u64>,
-    /// Timestamp (ms) when a video gap was first detected. `None` if no gap.
-    video_gap_detected_at_ms: Option<u64>,
-    /// Timestamp (ms) when a screen gap was first detected. `None` if no gap.
-    screen_gap_detected_at_ms: Option<u64>,
-    /// Last time a video keyframe request was sent (ms). Used for rate-limiting.
-    last_video_keyframe_request_ms: u64,
-    /// Last time a screen keyframe request was sent (ms). Used for rate-limiting.
-    last_screen_keyframe_request_ms: u64,
+    /// Reorder-tolerant sequence tracker for video packets.
+    video_seq_tracker: SequenceTracker,
+    /// Reorder-tolerant sequence tracker for screen packets.
+    screen_seq_tracker: SequenceTracker,
 }
 
 use std::fmt::Debug;
@@ -174,12 +317,8 @@ impl Peer {
             context_initialized: false,
             vad_threshold,
             has_received_heartbeat: false,
-            last_video_seq: None,
-            last_screen_seq: None,
-            video_gap_detected_at_ms: None,
-            screen_gap_detected_at_ms: None,
-            last_video_keyframe_request_ms: 0,
-            last_screen_keyframe_request_ms: 0,
+            video_seq_tracker: SequenceTracker::new(),
+            screen_seq_tracker: SequenceTracker::new(),
         })
     }
 
@@ -399,15 +538,17 @@ impl Peer {
                 // If gap detection already requested a keyframe, use that.
                 // Otherwise, proactively request one when the screen decoder
                 // is still waiting for a keyframe (e.g., late joiner starting
-                // mid-stream, or returning from off-screen). Rate-limited to
-                // avoid spamming the sender.
+                // mid-stream, or returning from off-screen). Rate-limited via
+                // the screen tracker's last_keyframe_request_ms to avoid
+                // spamming the sender.
                 let effective_kf_request = if kf_request.is_some() {
                     kf_request
                 } else if self.screen.is_waiting_for_keyframe() {
                     let now = now_ms();
-                    let elapsed = now.saturating_sub(self.last_screen_keyframe_request_ms);
+                    let elapsed =
+                        now.saturating_sub(self.screen_seq_tracker.last_keyframe_request_ms);
                     if elapsed >= KEYFRAME_REQUEST_MIN_INTERVAL_MS {
-                        self.last_screen_keyframe_request_ms = now;
+                        self.screen_seq_tracker.last_keyframe_request_ms = now;
                         Some(MediaType::SCREEN)
                     } else {
                         None
@@ -514,15 +655,14 @@ impl Peer {
     }
 
     /// Track the sequence number of an incoming video/screen packet and detect
-    /// gaps. Returns `Some(media_type)` if a KEYFRAME_REQUEST should be sent
-    /// for this peer, or `None` if no request is needed.
+    /// genuine packet loss using a sliding-window reorder buffer.
     ///
-    /// Gap detection logic:
-    /// 1. When a gap is detected (seq > last_seq + 1), record the time.
-    /// 2. After `KEYFRAME_REQUEST_TIMEOUT_MS` with the gap still present,
-    ///    return the media type to request a keyframe for.
-    /// 3. Rate-limit to one request per `KEYFRAME_REQUEST_MIN_INTERVAL_MS`.
-    /// 4. When a keyframe arrives (frame_type == "key"), clear the gap state.
+    /// Returns `Some(media_type)` if a KEYFRAME_REQUEST should be sent for this
+    /// peer, or `None` if no request is needed.
+    ///
+    /// Unlike the previous implementation, out-of-order arrivals within a 64-
+    /// packet window are NOT treated as loss. Only packets that shift off the
+    /// window without ever being received are counted as genuinely lost.
     fn track_sequence(&mut self, media_type: MediaType, packet: &MediaPacket) -> Option<MediaType> {
         // Both VIDEO and SCREEN packets use `video_metadata` for sequence
         // tracking. This is correct: `transform_screen_chunk` in
@@ -535,60 +675,30 @@ impl Peer {
             return None;
         };
 
-        let (last_seq, gap_at, last_req) = match media_type {
-            MediaType::VIDEO => (
-                &mut self.last_video_seq,
-                &mut self.video_gap_detected_at_ms,
-                &mut self.last_video_keyframe_request_ms,
-            ),
-            MediaType::SCREEN => (
-                &mut self.last_screen_seq,
-                &mut self.screen_gap_detected_at_ms,
-                &mut self.last_screen_keyframe_request_ms,
-            ),
+        let tracker = match media_type {
+            MediaType::VIDEO => &mut self.video_seq_tracker,
+            MediaType::SCREEN => &mut self.screen_seq_tracker,
             _ => return None,
         };
 
-        let now = now_ms();
+        // Record the sequence number first. This may detect new losses
+        // (packets that shifted off the window without being seen).
+        tracker.record_seq(seq);
 
-        // If this is a keyframe, clear the gap state -- we recovered.
+        // If this is a keyframe, clear loss state AFTER recording the seq.
+        // Ordering matters: record_seq may add losses from the window shift,
+        // but on_keyframe resets lost_count to 0. If we called on_keyframe
+        // first, record_seq would immediately re-add losses.
         if frame_type_str == "key" {
-            *gap_at = None;
+            tracker.on_keyframe();
         }
 
-        if let Some(prev) = *last_seq {
-            if seq > prev + 1 {
-                // Gap detected. Record the time of first detection.
-                if gap_at.is_none() {
-                    *gap_at = Some(now);
-                    debug!(
-                        "Sequence gap detected for peer {} {:?}: expected {}, got {}",
-                        self.session_id,
-                        media_type,
-                        prev + 1,
-                        seq
-                    );
-                }
-            }
+        let now = now_ms();
+        if tracker.should_request_keyframe(now) {
+            Some(media_type)
+        } else {
+            None
         }
-
-        // Update the last seen sequence number.
-        *last_seq = Some(seq);
-
-        // Check if enough time has passed since gap detection to send a request.
-        if let Some(gap_time) = *gap_at {
-            let elapsed_since_gap = now.saturating_sub(gap_time);
-            let elapsed_since_last_req = now.saturating_sub(*last_req);
-
-            if elapsed_since_gap >= KEYFRAME_REQUEST_TIMEOUT_MS
-                && elapsed_since_last_req >= KEYFRAME_REQUEST_MIN_INTERVAL_MS
-            {
-                *last_req = now;
-                return Some(media_type);
-            }
-        }
-
-        None
     }
 
     /// Record inbound activity from this peer. Called for ALL successfully
@@ -1194,12 +1304,8 @@ mod tests {
             is_speaking: false,
             audio_level: 0.0,
             vad_threshold: None,
-            last_video_seq: None,
-            last_screen_seq: None,
-            video_gap_detected_at_ms: None,
-            screen_gap_detected_at_ms: None,
-            last_video_keyframe_request_ms: 0,
-            last_screen_keyframe_request_ms: 0,
+            video_seq_tracker: SequenceTracker::new(),
+            screen_seq_tracker: SequenceTracker::new(),
         };
         (peer, muted_handle)
     }
@@ -1587,14 +1693,15 @@ mod tests {
                 "Sequential seq={seq} should not trigger keyframe request"
             );
         }
-        // No gap should have been detected.
-        assert!(peer.video_gap_detected_at_ms.is_none());
+        // No loss should have been detected.
+        assert_eq!(peer.video_seq_tracker.lost_count, 0);
     }
 
-    /// A gap in video sequence numbers should record a gap timestamp but NOT
-    /// immediately trigger a keyframe request (timeout hasn't elapsed).
+    /// Genuine loss (packets shifting off the 64-packet window) should record
+    /// a loss timestamp but NOT immediately trigger a keyframe request because
+    /// the initial timeout hasn't elapsed.
     #[wasm_bindgen_test]
-    fn video_gap_detected_but_no_immediate_request() {
+    fn video_loss_detected_but_no_immediate_request() {
         let (mut peer, _muted) = make_test_peer(201);
 
         // Send seq 1.
@@ -1612,12 +1719,13 @@ mod tests {
         };
         let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
 
-        // Send seq 5 (gap: 2, 3, 4 missing).
-        let pkt5 = {
+        // Send seq 70 -- this shifts positions 2..6 off the 64-packet window,
+        // confirming them as genuinely lost (they never arrived).
+        let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 5,
+                    sequence: 70,
                     ..Default::default()
                 })
                 .into(),
@@ -1625,12 +1733,12 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &pkt5);
+        let result = peer.track_sequence(MediaType::VIDEO, &pkt70);
 
-        // Gap should be recorded.
+        // Loss should be recorded.
         assert!(
-            peer.video_gap_detected_at_ms.is_some(),
-            "Gap should be detected"
+            peer.video_seq_tracker.lost_count > 0,
+            "Loss should be detected"
         );
         // But timeout hasn't elapsed, so no request yet.
         assert!(
@@ -1639,10 +1747,10 @@ mod tests {
         );
     }
 
-    /// After a gap is detected and enough time has passed (simulated by
-    /// backdating gap_detected_at_ms), a keyframe request should fire.
+    /// After genuine loss is detected and enough time has passed (simulated by
+    /// backdating loss_detected_at_ms), a keyframe request should fire.
     #[wasm_bindgen_test]
-    fn video_gap_triggers_keyframe_after_timeout() {
+    fn video_loss_triggers_keyframe_after_timeout() {
         let (mut peer, _muted) = make_test_peer(202);
 
         // Establish baseline sequence.
@@ -1660,12 +1768,12 @@ mod tests {
         };
         let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
 
-        // Introduce a gap.
-        let pkt5 = {
+        // Introduce genuine loss: seq 70 shifts positions 2..6 off the window.
+        let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 5,
+                    sequence: 70,
                     ..Default::default()
                 })
                 .into(),
@@ -1673,22 +1781,22 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt5);
-        assert!(peer.video_gap_detected_at_ms.is_some());
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt70);
+        assert!(peer.video_seq_tracker.lost_count > 0);
 
-        // Simulate time having passed: backdate the gap detection timestamp
+        // Simulate time having passed: backdate the loss detection timestamp
         // so that the next call sees elapsed >= KEYFRAME_REQUEST_TIMEOUT_MS.
-        peer.video_gap_detected_at_ms =
+        peer.video_seq_tracker.loss_detected_at_ms =
             Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
         // Also ensure rate-limit is not in effect.
-        peer.last_video_keyframe_request_ms = 0;
+        peer.video_seq_tracker.last_keyframe_request_ms = 0;
 
-        // Next packet (still with gap present) should trigger a request.
-        let pkt6 = {
+        // Next packet should trigger a request.
+        let pkt71 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 6,
+                    sequence: 71,
                     ..Default::default()
                 })
                 .into(),
@@ -1696,7 +1804,7 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &pkt6);
+        let result = peer.track_sequence(MediaType::VIDEO, &pkt71);
         assert_eq!(
             result,
             Some(MediaType::VIDEO),
@@ -1704,13 +1812,13 @@ mod tests {
         );
     }
 
-    /// Rate-limiting: a second keyframe request within KEYFRAME_REQUEST_MIN_INTERVAL_MS
+    /// Rate-limiting: a second keyframe request within the backoff interval
     /// should be suppressed.
     #[wasm_bindgen_test]
     fn keyframe_request_rate_limited() {
         let (mut peer, _muted) = make_test_peer(203);
 
-        // Establish gap.
+        // Establish genuine loss: seq 1 -> seq 70.
         let pkt1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -1724,11 +1832,11 @@ mod tests {
             }
         };
         let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
-        let pkt5 = {
+        let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 5,
+                    sequence: 70,
                     ..Default::default()
                 })
                 .into(),
@@ -1736,19 +1844,19 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt5);
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt70);
 
-        // Backdate gap so timeout is satisfied.
-        peer.video_gap_detected_at_ms =
+        // Backdate loss so timeout is satisfied.
+        peer.video_seq_tracker.loss_detected_at_ms =
             Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
-        peer.last_video_keyframe_request_ms = 0;
+        peer.video_seq_tracker.last_keyframe_request_ms = 0;
 
         // First request should fire.
-        let pkt6 = {
+        let pkt71 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 6,
+                    sequence: 71,
                     ..Default::default()
                 })
                 .into(),
@@ -1756,16 +1864,16 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &pkt6);
+        let result = peer.track_sequence(MediaType::VIDEO, &pkt71);
         assert_eq!(result, Some(MediaType::VIDEO), "First request should fire");
 
-        // last_video_keyframe_request_ms is now set to ~now. A second call
-        // immediately should be suppressed by rate-limiting.
-        let pkt7 = {
+        // last_keyframe_request_ms is now set to ~now. A second call
+        // immediately should be suppressed by backoff.
+        let pkt72 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 7,
+                    sequence: 72,
                     ..Default::default()
                 })
                 .into(),
@@ -1773,19 +1881,21 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result2 = peer.track_sequence(MediaType::VIDEO, &pkt7);
+        let result2 = peer.track_sequence(MediaType::VIDEO, &pkt72);
         assert!(
             result2.is_none(),
             "Second request should be rate-limited (too soon)"
         );
     }
 
-    /// A keyframe ("key" frame_type) should clear the gap state.
+    /// A keyframe ("key" frame_type) should clear the loss state.
     #[wasm_bindgen_test]
-    fn keyframe_clears_gap_state() {
+    fn keyframe_clears_loss_state() {
         let (mut peer, _muted) = make_test_peer(204);
 
-        // Establish gap.
+        // Establish genuine loss: send seq 1, then fill the window to push
+        // the gap past the 64-packet boundary so it's counted as lost.
+        // seq 1 -> seq 3 (skip 2) -> seq 67 (shifts seq 2 off as lost)
         let pkt1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -1800,11 +1910,11 @@ mod tests {
         };
         let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
 
-        let pkt5 = {
+        let pkt3 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 5,
+                    sequence: 3,
                     ..Default::default()
                 })
                 .into(),
@@ -1812,15 +1922,30 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt5);
-        assert!(peer.video_gap_detected_at_ms.is_some(), "Gap should exist");
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt3);
 
-        // Now receive a keyframe — should clear the gap.
+        // Advance to seq 67 (shift = 64), pushing seq 2 off the window as lost.
+        let pkt67 = {
+            use videocall_types::protos::media_packet::VideoMetadata;
+            MediaPacket {
+                video_metadata: Some(VideoMetadata {
+                    sequence: 67,
+                    ..Default::default()
+                })
+                .into(),
+                frame_type: "delta".to_string(),
+                ..Default::default()
+            }
+        };
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt67);
+        assert!(peer.video_seq_tracker.lost_count > 0, "Loss should exist");
+
+        // Now receive a keyframe -- should clear the loss state.
         let key_pkt = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 6,
+                    sequence: 71,
                     ..Default::default()
                 })
                 .into(),
@@ -1830,9 +1955,13 @@ mod tests {
         };
         let result = peer.track_sequence(MediaType::VIDEO, &key_pkt);
         assert!(result.is_none(), "Keyframe should not trigger request");
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "Keyframe should clear loss state"
+        );
         assert!(
-            peer.video_gap_detected_at_ms.is_none(),
-            "Keyframe should clear gap state"
+            peer.video_seq_tracker.loss_detected_at_ms.is_none(),
+            "Keyframe should clear loss_detected_at_ms"
         );
     }
 
@@ -1857,9 +1986,9 @@ mod tests {
             };
             let _ = peer.track_sequence(MediaType::VIDEO, &pkt);
         }
-        assert!(peer.video_gap_detected_at_ms.is_none());
+        assert_eq!(peer.video_seq_tracker.lost_count, 0);
 
-        // Send screen seq 1, then seq 10 (gap).
+        // Send screen seq 1, then seq 70 (genuine loss: shifts 2-6 off window).
         let screen1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -1874,11 +2003,11 @@ mod tests {
         };
         let _ = peer.track_sequence(MediaType::SCREEN, &screen1);
 
-        let screen10 = {
+        let screen70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 10,
+                    sequence: 70,
                     ..Default::default()
                 })
                 .into(),
@@ -1886,21 +2015,21 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::SCREEN, &screen10);
+        let _ = peer.track_sequence(MediaType::SCREEN, &screen70);
 
-        // Video should have no gap, screen should have a gap.
-        assert!(
-            peer.video_gap_detected_at_ms.is_none(),
-            "Video should have no gap"
+        // Video should have no loss, screen should have loss.
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "Video should have no loss"
         );
         assert!(
-            peer.screen_gap_detected_at_ms.is_some(),
-            "Screen should have a gap"
+            peer.screen_seq_tracker.lost_count > 0,
+            "Screen should have loss"
         );
 
-        // Verify last_seq values are independent.
-        assert_eq!(peer.last_video_seq, Some(3));
-        assert_eq!(peer.last_screen_seq, Some(10));
+        // Verify high_seq values are independent.
+        assert_eq!(peer.video_seq_tracker.high_seq, Some(3));
+        assert_eq!(peer.screen_seq_tracker.high_seq, Some(70));
     }
 
     /// Different peers should have independent sequence tracking.
@@ -1909,7 +2038,7 @@ mod tests {
         let (mut peer_a, _) = make_test_peer(300);
         let (mut peer_b, _) = make_test_peer(301);
 
-        // Peer A: sequential (no gap).
+        // Peer A: sequential (no loss).
         for seq in 1..=5 {
             let pkt = {
                 use videocall_types::protos::media_packet::VideoMetadata;
@@ -1926,7 +2055,7 @@ mod tests {
             let _ = peer_a.track_sequence(MediaType::VIDEO, &pkt);
         }
 
-        // Peer B: gap (seq 1 -> seq 10).
+        // Peer B: genuine loss (seq 1 -> seq 70).
         let pkt1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -1940,11 +2069,11 @@ mod tests {
             }
         };
         let _ = peer_b.track_sequence(MediaType::VIDEO, &pkt1);
-        let pkt10 = {
+        let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 10,
+                    sequence: 70,
                     ..Default::default()
                 })
                 .into(),
@@ -1952,24 +2081,24 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer_b.track_sequence(MediaType::VIDEO, &pkt10);
+        let _ = peer_b.track_sequence(MediaType::VIDEO, &pkt70);
 
-        assert!(
-            peer_a.video_gap_detected_at_ms.is_none(),
-            "Peer A should have no gap"
+        assert_eq!(
+            peer_a.video_seq_tracker.lost_count, 0,
+            "Peer A should have no loss"
         );
         assert!(
-            peer_b.video_gap_detected_at_ms.is_some(),
-            "Peer B should have a gap"
+            peer_b.video_seq_tracker.lost_count > 0,
+            "Peer B should have loss"
         );
     }
 
-    /// SCREEN gap triggers keyframe request for SCREEN (not VIDEO).
+    /// SCREEN loss triggers keyframe request for SCREEN (not VIDEO).
     #[wasm_bindgen_test]
-    fn screen_gap_triggers_screen_keyframe_request() {
+    fn screen_loss_triggers_screen_keyframe_request() {
         let (mut peer, _muted) = make_test_peer(206);
 
-        // Establish screen gap.
+        // Establish screen loss: seq 1 -> seq 70.
         let pkt1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -1984,11 +2113,11 @@ mod tests {
         };
         let _ = peer.track_sequence(MediaType::SCREEN, &pkt1);
 
-        let pkt5 = {
+        let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 5,
+                    sequence: 70,
                     ..Default::default()
                 })
                 .into(),
@@ -1996,18 +2125,18 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::SCREEN, &pkt5);
+        let _ = peer.track_sequence(MediaType::SCREEN, &pkt70);
 
-        // Backdate gap and clear rate limit.
-        peer.screen_gap_detected_at_ms =
+        // Backdate loss and clear rate limit.
+        peer.screen_seq_tracker.loss_detected_at_ms =
             Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
-        peer.last_screen_keyframe_request_ms = 0;
+        peer.screen_seq_tracker.last_keyframe_request_ms = 0;
 
-        let pkt6 = {
+        let pkt71 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 6,
+                    sequence: 71,
                     ..Default::default()
                 })
                 .into(),
@@ -2015,11 +2144,11 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::SCREEN, &pkt6);
+        let result = peer.track_sequence(MediaType::SCREEN, &pkt71);
         assert_eq!(
             result,
             Some(MediaType::SCREEN),
-            "Screen gap should trigger SCREEN keyframe request"
+            "Screen loss should trigger SCREEN keyframe request"
         );
     }
 
@@ -2193,13 +2322,13 @@ mod tests {
         manager.set_peer_visibility(99999, false);
     }
 
-    /// Multiple gaps: after one gap triggers a keyframe request and the gap
-    /// is cleared by a keyframe, a new gap should be independently detected.
+    /// Multiple losses: after one loss triggers a keyframe request and the loss
+    /// is cleared by a keyframe, a new loss should be independently detected.
     #[wasm_bindgen_test]
-    fn multiple_gaps_handled_independently() {
+    fn multiple_losses_handled_independently() {
         let (mut peer, _muted) = make_test_peer(209);
 
-        // First gap: seq 1 -> 5.
+        // First loss: seq 1 -> seq 70 (shifts 2-6 off window).
         let pkt1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -2213,11 +2342,11 @@ mod tests {
             }
         };
         let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
-        let pkt5 = {
+        let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 5,
+                    sequence: 70,
                     ..Default::default()
                 })
                 .into(),
@@ -2225,18 +2354,18 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt5);
-        assert!(peer.video_gap_detected_at_ms.is_some());
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt70);
+        assert!(peer.video_seq_tracker.lost_count > 0);
 
         // Backdate and trigger request.
-        peer.video_gap_detected_at_ms =
+        peer.video_seq_tracker.loss_detected_at_ms =
             Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
-        peer.last_video_keyframe_request_ms = 0;
-        let pkt6 = {
+        peer.video_seq_tracker.last_keyframe_request_ms = 0;
+        let pkt71 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 6,
+                    sequence: 71,
                     ..Default::default()
                 })
                 .into(),
@@ -2244,15 +2373,15 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &pkt6);
+        let result = peer.track_sequence(MediaType::VIDEO, &pkt71);
         assert_eq!(result, Some(MediaType::VIDEO));
 
-        // Clear gap with a keyframe.
+        // Clear loss with a keyframe.
         let key = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 7,
+                    sequence: 72,
                     ..Default::default()
                 })
                 .into(),
@@ -2261,17 +2390,17 @@ mod tests {
             }
         };
         let _ = peer.track_sequence(MediaType::VIDEO, &key);
-        assert!(
-            peer.video_gap_detected_at_ms.is_none(),
-            "Gap should be cleared by keyframe"
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "Loss should be cleared by keyframe"
         );
 
-        // Second gap: seq 7 -> 20.
-        let pkt20 = {
+        // Second loss: seq 72 -> seq 140 (shifts positions off window again).
+        let pkt140 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 20,
+                    sequence: 140,
                     ..Default::default()
                 })
                 .into(),
@@ -2279,10 +2408,10 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt20);
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt140);
         assert!(
-            peer.video_gap_detected_at_ms.is_some(),
-            "Second gap should be detected independently"
+            peer.video_seq_tracker.lost_count > 0,
+            "Second loss should be detected independently"
         );
     }
 
@@ -2352,9 +2481,9 @@ mod tests {
         assert!(peer.screen.is_waiting_for_keyframe());
 
         // Ensure rate-limit is clear.
-        peer.last_screen_keyframe_request_ms = 0;
+        peer.screen_seq_tracker.last_keyframe_request_ms = 0;
 
-        // Send a screen frame — should trigger a proactive keyframe request.
+        // Send a screen frame -- should trigger a proactive keyframe request.
         let pkt = screen_frame_packet(230);
         let result = peer.decode(&pkt);
         assert!(result.is_ok());
@@ -2374,7 +2503,7 @@ mod tests {
         // Enable screen via heartbeat.
         let hb = heartbeat_packet(231, false, false, true);
         let _ = peer.decode(&hb);
-        peer.last_screen_keyframe_request_ms = 0;
+        peer.screen_seq_tracker.last_keyframe_request_ms = 0;
 
         // First frame — triggers proactive PLI.
         let pkt1 = screen_frame_packet(231);
@@ -2412,7 +2541,7 @@ mod tests {
 
         // Restore visibility.
         peer.visible = true;
-        peer.last_screen_keyframe_request_ms = 0;
+        peer.screen_seq_tracker.last_keyframe_request_ms = 0;
 
         // Next frame — decoder is waiting for keyframe, proactive PLI fires.
         let pkt2 = screen_frame_packet(232);
@@ -2426,11 +2555,11 @@ mod tests {
         );
     }
 
-    /// When invisible, gap detection keyframe requests should still be
+    /// When invisible, loss-based keyframe requests should still be
     /// propagated so the sender starts producing keyframes before the
     /// tile becomes visible again.
     #[wasm_bindgen_test]
-    fn invisible_screen_propagates_gap_keyframe_request() {
+    fn invisible_screen_propagates_loss_keyframe_request() {
         let (mut peer, _muted) = make_test_peer(233);
 
         // Enable screen via heartbeat.
@@ -2440,7 +2569,7 @@ mod tests {
         // Go invisible.
         peer.visible = false;
 
-        // Send sequential screen frames with video_metadata to establish baseline.
+        // Send screen frame with video_metadata to establish baseline.
         use videocall_types::protos::media_packet::VideoMetadata;
         let pkt1 = {
             let media = MediaPacket {
@@ -2459,14 +2588,14 @@ mod tests {
         };
         let _ = peer.decode(&pkt1);
 
-        // Introduce a gap.
-        let pkt10 = {
+        // Introduce genuine loss: seq 1 -> 70 shifts positions off window.
+        let pkt70 = {
             let media = MediaPacket {
                 media_type: MediaType::SCREEN.into(),
                 user_id: "test@test.com".into(),
                 data: vec![0u8; 10],
                 video_metadata: Some(VideoMetadata {
-                    sequence: 10,
+                    sequence: 70,
                     ..Default::default()
                 })
                 .into(),
@@ -2475,25 +2604,25 @@ mod tests {
             };
             wrap(&media, 233)
         };
-        let _ = peer.decode(&pkt10);
+        let _ = peer.decode(&pkt70);
         assert!(
-            peer.screen_gap_detected_at_ms.is_some(),
-            "Gap should be detected"
+            peer.screen_seq_tracker.lost_count > 0,
+            "Loss should be detected"
         );
 
-        // Backdate gap and clear rate limit.
-        peer.screen_gap_detected_at_ms =
+        // Backdate loss and clear rate limit.
+        peer.screen_seq_tracker.loss_detected_at_ms =
             Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
-        peer.last_screen_keyframe_request_ms = 0;
+        peer.screen_seq_tracker.last_keyframe_request_ms = 0;
 
-        // Next frame while invisible — keyframe request should still propagate.
-        let pkt11 = {
+        // Next frame while invisible -- keyframe request should still propagate.
+        let pkt71 = {
             let media = MediaPacket {
                 media_type: MediaType::SCREEN.into(),
                 user_id: "test@test.com".into(),
                 data: vec![0u8; 10],
                 video_metadata: Some(VideoMetadata {
-                    sequence: 11,
+                    sequence: 71,
                     ..Default::default()
                 })
                 .into(),
@@ -2502,14 +2631,286 @@ mod tests {
             };
             wrap(&media, 233)
         };
-        let result = peer.decode(&pkt11);
+        let result = peer.decode(&pkt71);
         assert!(result.is_ok());
         let (_, status, kf_req) = result.unwrap();
         assert!(!status.rendered, "Should still be invisible/skipped");
         assert_eq!(
             kf_req,
             Some(MediaType::SCREEN),
-            "Gap-based keyframe request should propagate even when invisible"
+            "Loss-based keyframe request should propagate even when invisible"
         );
+    }
+
+    // -- Sliding window / reorder tolerance tests ---------------------------
+
+    /// Out-of-order packets within the 64-packet window should NOT trigger
+    /// any keyframe request. This is the core fix: WebTransport delivers
+    /// packets out-of-order across streams, and the old code treated every
+    /// `seq > prev + 1` as loss.
+    #[wasm_bindgen_test]
+    fn out_of_order_within_window_no_keyframe_request() {
+        let (mut peer, _muted) = make_test_peer(400);
+
+        // Send packets out of order: 1, 5, 3, 2, 4.
+        let seqs = [1u64, 5, 3, 2, 4];
+        for &seq in &seqs {
+            let pkt = {
+                use videocall_types::protos::media_packet::VideoMetadata;
+                MediaPacket {
+                    video_metadata: Some(VideoMetadata {
+                        sequence: seq,
+                        ..Default::default()
+                    })
+                    .into(),
+                    frame_type: "delta".to_string(),
+                    ..Default::default()
+                }
+            };
+            let result = peer.track_sequence(MediaType::VIDEO, &pkt);
+            assert!(
+                result.is_none(),
+                "Out-of-order seq={seq} should not trigger keyframe request"
+            );
+        }
+        // No loss should have been detected.
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "No loss should be detected for out-of-order within window"
+        );
+    }
+
+    /// SequenceTracker::record_seq should correctly count lost packets
+    /// when they shift off the 64-packet window.
+    #[wasm_bindgen_test]
+    fn sequence_tracker_counts_losses_correctly() {
+        let mut tracker = SequenceTracker::new();
+
+        // Send seq 0.
+        let lost = tracker.record_seq(0);
+        assert_eq!(lost, 0);
+
+        // Send seq 2 (skip 1, but 1 is still in the 64-bit window).
+        let lost = tracker.record_seq(2);
+        assert_eq!(lost, 0, "seq 1 is still within window, not lost yet");
+        assert_eq!(tracker.lost_count, 0);
+
+        // Send seq 66 -- shifts the window by 64, pushing everything off.
+        // With u64::MAX initialization, after seq 0 and seq 2:
+        //   high_seq = 2, seen_bits = 0xFFFF_FFFF_FFFF_FFFD
+        //   (all bits set except bit 1, which is seq 1 — genuinely skipped)
+        // count_zeros() = 1 (only seq 1 was unseen).
+        let lost = tracker.record_seq(66);
+        assert_eq!(lost, 1, "Only seq 1 was genuinely skipped");
+        assert_eq!(tracker.lost_count, 1);
+    }
+
+    /// Late arrival (out-of-order) within the window should fill in the
+    /// gap and prevent that position from being counted as lost.
+    #[wasm_bindgen_test]
+    fn late_arrival_fills_gap_no_loss() {
+        let mut tracker = SequenceTracker::new();
+
+        // Send seq 0, then seq 5 (skip 1-4, still in window).
+        tracker.record_seq(0);
+        tracker.record_seq(5);
+        assert_eq!(tracker.lost_count, 0);
+
+        // Late arrivals fill in the gaps.
+        tracker.record_seq(1);
+        tracker.record_seq(2);
+        tracker.record_seq(3);
+        tracker.record_seq(4);
+        assert_eq!(tracker.lost_count, 0);
+
+        // Advance to seq 70 -- the entire window shifts out (gap=65 >= 64).
+        // With seen_bits initialized to u64::MAX on the first packet, all
+        // pre-stream positions are marked as "seen", so count_zeros = 0.
+        // No phantom losses.
+        let lost = tracker.record_seq(70);
+        assert_eq!(lost, 0, "No phantom losses with u64::MAX initialization");
+    }
+
+    /// Exponential backoff: the interval between keyframe requests should
+    /// double each time, capped at KEYFRAME_REQUEST_MAX_BACKOFF_MS.
+    #[wasm_bindgen_test]
+    fn exponential_backoff_increases_interval() {
+        let mut tracker = SequenceTracker::new();
+        // Simulate genuine loss.
+        tracker.lost_count = 5;
+        tracker.loss_detected_at_ms = Some(0); // detected at time 0
+
+        // First request at time >= KEYFRAME_REQUEST_TIMEOUT_MS.
+        let now = KEYFRAME_REQUEST_TIMEOUT_MS;
+        assert!(tracker.should_request_keyframe(now));
+        assert_eq!(tracker.unanswered_requests, 1);
+        // After first request, backoff doubles from initial (1000ms) to 2000ms.
+        assert_eq!(
+            tracker.current_backoff_ms,
+            KEYFRAME_REQUEST_MIN_INTERVAL_MS * 2
+        );
+
+        // Second request: need to wait current_backoff_ms (2000ms).
+        let now2 = now + KEYFRAME_REQUEST_MIN_INTERVAL_MS * 2;
+        assert!(tracker.should_request_keyframe(now2));
+        assert_eq!(tracker.unanswered_requests, 2);
+        // Backoff doubles to 4000ms.
+        assert_eq!(
+            tracker.current_backoff_ms,
+            KEYFRAME_REQUEST_MIN_INTERVAL_MS * 4
+        );
+
+        // Third request: need to wait 4000ms.
+        let now3 = now2 + KEYFRAME_REQUEST_MIN_INTERVAL_MS * 4;
+        assert!(tracker.should_request_keyframe(now3));
+        assert_eq!(tracker.unanswered_requests, 3);
+        // Backoff doubles to 8000ms (= MAX_BACKOFF).
+        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MAX_BACKOFF_MS);
+
+        // Fourth request: need to wait 8000ms (capped).
+        let now4 = now3 + KEYFRAME_REQUEST_MAX_BACKOFF_MS;
+        assert!(tracker.should_request_keyframe(now4));
+        assert_eq!(tracker.unanswered_requests, 4);
+        // Backoff stays capped at 8000ms.
+        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MAX_BACKOFF_MS);
+    }
+
+    /// After KEYFRAME_REQUEST_MAX_UNANSWERED requests with no keyframe,
+    /// the tracker should give up and stop requesting.
+    #[wasm_bindgen_test]
+    fn max_unanswered_switches_to_slow_retry() {
+        let mut tracker = SequenceTracker::new();
+        tracker.lost_count = 5;
+        tracker.loss_detected_at_ms = Some(0);
+
+        // Fire requests until we hit the limit.
+        let mut time = KEYFRAME_REQUEST_TIMEOUT_MS;
+        for i in 0..KEYFRAME_REQUEST_MAX_UNANSWERED {
+            // Ensure enough time for backoff.
+            time += tracker.current_backoff_ms;
+            assert!(
+                tracker.should_request_keyframe(time),
+                "Request {} should fire",
+                i + 1
+            );
+        }
+        assert_eq!(tracker.unanswered_requests, KEYFRAME_REQUEST_MAX_UNANSWERED);
+
+        // Shortly after exhaustion, should NOT fire (slow retry interval not elapsed).
+        time += 5000;
+        assert!(
+            !tracker.should_request_keyframe(time),
+            "Should not fire before slow retry interval"
+        );
+
+        // After KEYFRAME_REQUEST_SLOW_RETRY_MS, should fire again.
+        time += KEYFRAME_REQUEST_SLOW_RETRY_MS;
+        assert!(
+            tracker.should_request_keyframe(time),
+            "Should fire slow periodic retry after 15s"
+        );
+
+        // And again after another slow retry interval.
+        time += KEYFRAME_REQUEST_SLOW_RETRY_MS;
+        assert!(
+            tracker.should_request_keyframe(time),
+            "Slow retry should continue periodically"
+        );
+    }
+
+    /// A keyframe resets the backoff and unanswered count.
+    #[wasm_bindgen_test]
+    fn keyframe_resets_backoff_state() {
+        let mut tracker = SequenceTracker::new();
+        tracker.lost_count = 5;
+        tracker.loss_detected_at_ms = Some(0);
+        tracker.unanswered_requests = 3;
+        tracker.current_backoff_ms = 4000;
+        tracker.last_keyframe_request_ms = 5000;
+
+        tracker.on_keyframe();
+
+        assert_eq!(tracker.lost_count, 0);
+        assert!(tracker.loss_detected_at_ms.is_none());
+        assert_eq!(tracker.unanswered_requests, 0);
+        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MIN_INTERVAL_MS);
+    }
+
+    /// Verify that out-of-order packets across a realistic WebTransport
+    /// scenario (many small reorderings) produce zero false PLI requests.
+    #[wasm_bindgen_test]
+    fn realistic_webtransport_reordering_no_false_pli() {
+        let (mut peer, _muted) = make_test_peer(401);
+
+        // Simulate 100 packets arriving with slight reordering:
+        // each batch of 5 arrives in reverse order.
+        for batch in 0..20u64 {
+            let base = batch * 5 + 1;
+            // Arrive in order: base+4, base+3, base+2, base+1, base
+            for offset in (0..5).rev() {
+                let seq = base + offset;
+                let pkt = {
+                    use videocall_types::protos::media_packet::VideoMetadata;
+                    MediaPacket {
+                        video_metadata: Some(VideoMetadata {
+                            sequence: seq,
+                            ..Default::default()
+                        })
+                        .into(),
+                        frame_type: "delta".to_string(),
+                        ..Default::default()
+                    }
+                };
+                let result = peer.track_sequence(MediaType::VIDEO, &pkt);
+                assert!(
+                    result.is_none(),
+                    "Reordered seq={seq} should not trigger keyframe request"
+                );
+            }
+        }
+        // After all 100 packets, there should be no detected loss.
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "Realistic reordering should produce zero false losses"
+        );
+    }
+
+    /// Packets beyond the 64-position window (too old) should be silently
+    /// ignored and not cause any loss detection.
+    #[wasm_bindgen_test]
+    fn very_old_packet_ignored() {
+        let mut tracker = SequenceTracker::new();
+
+        // Establish high_seq at 100.
+        tracker.record_seq(100);
+
+        // A packet with seq 10 is 90 positions behind high_seq (> 64).
+        // It should be silently ignored.
+        let lost = tracker.record_seq(10);
+        assert_eq!(lost, 0, "Very old packet should be silently ignored");
+        assert_eq!(tracker.high_seq, Some(100), "high_seq should not change");
+    }
+
+    /// When lost_count drops to 0 (e.g., by keyframe reset), the tracker
+    /// should clear loss_detected_at_ms and reset backoff on the next
+    /// should_request_keyframe call.
+    #[wasm_bindgen_test]
+    fn zero_loss_resets_state_on_next_check() {
+        let mut tracker = SequenceTracker::new();
+        tracker.lost_count = 5;
+        tracker.loss_detected_at_ms = Some(1000);
+        tracker.unanswered_requests = 2;
+        tracker.current_backoff_ms = 4000;
+
+        // Simulate keyframe arrival clearing lost_count.
+        tracker.on_keyframe();
+        assert_eq!(tracker.lost_count, 0);
+
+        // Next check should return false and reset state.
+        let result = tracker.should_request_keyframe(99999);
+        assert!(!result);
+        assert!(tracker.loss_detected_at_ms.is_none());
+        assert_eq!(tracker.unanswered_requests, 0);
+        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MIN_INTERVAL_MS);
     }
 }

@@ -51,6 +51,30 @@ use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
 
+/// Generate a cryptographically random instance ID for correlating reconnections.
+/// Uses `crypto.getRandomValues()` for unpredictability since the instance_id
+/// is used for session eviction (a predictable ID could allow targeted eviction).
+fn generate_instance_id() -> String {
+    let mut buf = [0u8; 16];
+    if let Some(crypto) = web_sys::window().and_then(|w| w.crypto().ok()) {
+        let _ = crypto.get_random_values_with_u8_array(&mut buf);
+    } else {
+        // Fallback for environments without window.crypto (e.g., workers).
+        let rand = || (js_sys::Math::random() * 0xFFFF_FFFF_u32 as f64) as u32;
+        buf[0..4].copy_from_slice(&rand().to_be_bytes());
+        buf[4..8].copy_from_slice(&rand().to_be_bytes());
+        buf[8..12].copy_from_slice(&rand().to_be_bytes());
+        buf[12..16].copy_from_slice(&rand().to_be_bytes());
+    }
+    format!(
+        "{:08x}-{:08x}-{:08x}-{:08x}",
+        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+        u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
+    )
+}
+
 /// Configuration options for creating a [`VideoCallClient`].
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
@@ -471,6 +495,7 @@ impl VideoCallClient {
                 })
             },
             election_period_ms,
+            instance_id: generate_instance_id(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;

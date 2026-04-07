@@ -43,14 +43,37 @@ videocall.rs is designed for high efficiency across various deployment scenarios
 
 ## Network Requirements
 
-### Bandwidth Per Participant
+### Video Quality Tiers
 
-| Quality | Resolution | FPS | Outbound Bandwidth | Inbound Bandwidth (1 Peer) | Inbound Bandwidth (5 Peers) |
-|---------|------------|-----|--------------------|-----------------------------|------------------------------|
-| Low | 320x240 | 15 | 100-200 Kbps | 100-200 Kbps | 500-1000 Kbps |
-| Medium | 640x480 | 30 | 300-500 Kbps | 300-500 Kbps | 1.5-2.5 Mbps |
-| High | 1280x720 | 30 | 800-1200 Kbps | 800-1200 Kbps | 4-6 Mbps |
-| Very High | 1920x1080 | 30 | 1.5-2.5 Mbps | 1.5-2.5 Mbps | 7.5-12.5 Mbps |
+The adaptive quality system uses 8 tiers, stepping up or down based on network conditions. The default starting tier is **medium** (480p/25fps) to stay under 1 Mbps during the initial warmup period. The PID controller adapts from there.
+
+| Tier | Label | Resolution | FPS | Ideal Bitrate | Bitrate Range |
+|------|-------|-----------|-----|--------------|---------------|
+| 0 | full_hd | 1920x1080 | 30 | 2500 kbps | 1500-2500 kbps |
+| 1 | hd_plus | 1600x900 | 30 | 2000 kbps | 1200-2500 kbps |
+| 2 | hd | 1280x720 | 30 | 1500 kbps | 800-2000 kbps |
+| 3 | standard | 960x540 | 30 | 900 kbps | 500-1500 kbps |
+| 4 | **medium** | 854x480 | 25 | 600 kbps | 300-1000 kbps |
+| 5 | low | 640x360 | 20 | 400 kbps | 200-600 kbps |
+| 6 | very_low | 480x270 | 15 | 250 kbps | 100-400 kbps |
+| 7 | minimal | 426x240 | 10 | 150 kbps | 50-250 kbps |
+
+### Screen Share Quality Tiers
+
+| Tier | Label | Resolution | FPS | Ideal Bitrate | Bitrate Range |
+|------|-------|-----------|-----|--------------|---------------|
+| 0 | high | 1920x1080 | 15 | 1500 kbps | 800-2500 kbps |
+| 1 | **medium** | 1280x720 | 10 | 600 kbps | 300-1000 kbps |
+| 2 | low | 854x480 | 5 | 250 kbps | 100-400 kbps |
+
+### Bandwidth Per Participant (at default tier)
+
+| Stream | Outbound | Inbound (1 Peer) | Inbound (5 Peers) |
+|--------|----------|-------------------|-------------------|
+| Video (medium, 480p) | 300-1000 kbps | 300-1000 kbps | 1.5-5 Mbps |
+| Video (hd, 720p) | 800-2500 kbps | 800-2500 kbps | 4-12.5 Mbps |
+| Video (full_hd, 1080p) | 1500-2500 kbps | 1500-2500 kbps | 7.5-12.5 Mbps |
+| Screen Share (medium, 720p) | 300-1000 kbps | 300-1000 kbps | — |
 
 ### Latency Requirements
 

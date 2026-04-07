@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 dioxus = { version = "0.7.3", default-features = false, features = ["web", "router", "launch", "logger", "lib"] }
+dioxus-sdk-storage = "0.7.0"
 wasm-bindgen = { workspace = true }
 videocall-client = { path = "../videocall-client", version = "4.0.5", default-features = false }
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.3" }
@@ -44,6 +45,9 @@ serde-wasm-bindgen = "0.6"
 anyhow = "1.0"
 reqwest = { version = "0.12", features = ["json"] }
 urlencoding = "2.1"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = { version = "0.2", features = ["js"] }
 
 [dependencies.web-sys]
 version = "0.3.72"

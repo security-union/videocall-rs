@@ -11,16 +11,32 @@
  * at your option.
  */
 
-//! Axum extractor that authenticates the user via a signed session JWT.
+//! Axum extractor that authenticates the user.
 //!
-//! The JWT can be delivered in two ways (checked in order):
+//! ## When external OAuth / JWKS is configured
 //!
-//! 1. `Cookie: session=<JWT>` -- set by the OAuth callback as `HttpOnly`.
-//! 2. `Authorization: Bearer <JWT>` -- for non-browser clients.
+//! Every request must carry the provider-issued **id_token** as a Bearer
+//! token in the `Authorization` header:
 //!
-//! The extractor validates the JWT signature using the shared secret from
-//! [`AppState`](crate::state::AppState) and extracts the user's identity from
-//! the `sub` claim (the user ID).
+//! ```text
+//! Authorization: Bearer <id_token>
+//! ```
+//!
+//! The extractor validates the id_token signature against the provider's JWKS
+//! (fetched and cached by [`crate::oauth::JwksCache`]), checks `exp` and `iss`,
+//! and optionally checks `aud` when `OAUTH_RESOURCE_SERVER_AUDIENCE` is set.
+//!
+//! ## Fallback — no external OAuth / JWKS configured
+//!
+//! When `OAUTH_CLIENT_ID` is unset the extractor falls back to validating a
+//! server-issued session JWT (HMAC-SHA256).  The token is accepted via:
+//!
+//! 1. `Cookie: <cookie_name>=<JWT>` — set by the legacy OAuth callback as
+//!    `HttpOnly`.
+//! 2. `Authorization: Bearer <JWT>` — for non-browser clients.
+//!
+//! This path exists for backward compatibility with deployments that do not
+//! use an external identity provider.
 
 use axum::{
     extract::FromRequestParts,
@@ -32,8 +48,10 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::token;
 
-/// Extractor that resolves the authenticated user from a signed session JWT
-/// (cookie or Bearer header).
+/// Extractor that resolves the authenticated user from either:
+///
+/// - A provider id_token Bearer token (when JWKS is configured), or
+/// - A legacy server-issued session JWT (cookie or Bearer header).
 ///
 /// Usage in a handler:
 /// ```ignore
@@ -52,6 +70,69 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // ----------------------------------------------------------------
+        // Path 1 — external OAuth with JWKS (new mode)
+        //
+        // When both a JWKS cache and an OAuth config are present, every
+        // request must supply the provider id_token as a Bearer token.
+        // Session cookies are no longer issued or accepted in this mode.
+        // ----------------------------------------------------------------
+        if let (Some(jwks), Some(oauth_cfg)) = (state.jwks_cache.as_deref(), state.oauth.as_ref()) {
+            let token = extract_bearer_token(parts)
+                .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
+
+            // Validate the Bearer token via JWKS (signature, exp, iss).
+            //
+            // Audience (`aud`) validation is intentionally skipped here:
+            // id_tokens carry `aud == client_id`, but access tokens carry a
+            // resource-server audience that differs per provider.  Signature +
+            // issuer + expiry is sufficient for per-request authentication at
+            // a resource server.
+            let claims = crate::oauth::verify_and_decode_id_token(
+                jwks,
+                &token,
+                // When OAUTH_RESOURCE_SERVER_AUDIENCE is set, every
+                // per-request Bearer token must carry that value in its `aud`
+                // claim.  Without it, audience validation is skipped so that
+                // both id_tokens (aud = client_id) and access tokens
+                // (aud = resource-server URL) are accepted.  Deployers sharing
+                // an IdP with other services should always set this variable
+                // to prevent tokens issued for other applications from being
+                // accepted here (RFC 8707 confused deputy mitigation).
+                oauth_cfg.resource_server_audience.as_deref(),
+                oauth_cfg.issuer.as_deref(),
+                // Nonce is validated only during the initial token exchange;
+                // re-validating on every request would require the server to
+                // remember per-request nonces, which is stateful and complex.
+                None,
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!("Bearer token validation failed: {e:?}");
+                AppError::unauthorized_msg("invalid or expired bearer token")
+            })?;
+
+            let name = claims.display_name();
+
+            // Access tokens often omit the `email` claim; fall back to `sub`
+            // (subject), which is always present in both token types.
+            let user_id = claims
+                .email
+                .filter(|e| !e.is_empty())
+                .or_else(|| claims.sub.filter(|s| !s.is_empty()))
+                .ok_or_else(|| {
+                    AppError::unauthorized_msg("bearer token is missing both email and sub claims")
+                })?;
+
+            return Ok(AuthUser { user_id, name });
+        }
+
+        // ----------------------------------------------------------------
+        // Path 2 — legacy server-issued session JWT (fallback / no OAuth)
+        //
+        // Accepts the signed JWT from either the session cookie or the
+        // Authorization: Bearer header.
+        // ----------------------------------------------------------------
         let token = extract_session_token(parts, &state.cookie_name)
             .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
 
@@ -62,6 +143,23 @@ impl FromRequestParts<AppState> for AuthUser {
             name: claims.name,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Token extraction helpers
+// ---------------------------------------------------------------------------
+
+/// Extract an `Authorization: Bearer <token>` value from request headers.
+///
+/// Returns `None` when the header is absent, malformed, or empty.
+fn extract_bearer_token(parts: &Parts) -> Option<String> {
+    parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 /// Extract the raw session JWT from the request.
@@ -88,19 +186,7 @@ fn extract_session_token(parts: &Parts, cookie_name: &str) -> Option<String> {
         }
     }
     // 2. Fall back to `Authorization: Bearer <token>`.
-    if let Some(auth) = parts
-        .headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(token) = auth.strip_prefix("Bearer ") {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
-    }
-    None
+    extract_bearer_token(parts)
 }
 
 #[cfg(test)]
@@ -128,6 +214,7 @@ mod tests {
             jwt_secret: TEST_SECRET.to_string(),
             token_ttl_secs: 600,
             session_ttl_secs: 3600,
+            // oauth: None + jwks_cache: None → use legacy session JWT path.
             oauth: None,
             jwks_cache: None,
             cookie_domain: None,
@@ -363,5 +450,353 @@ mod tests {
             .await
             .expect("bearer should work regardless of cookie_name");
         assert_eq!(auth.user_id, "bob@test.com");
+    }
+
+    // -----------------------------------------------------------------------
+    // JWKS path tests
+    //
+    // These tests exercise the new provider id_token validation path
+    // (auth.rs Path 1) by constructing an AppState with a pre-loaded
+    // JwksCache and a minimal OAuthConfig.
+    // -----------------------------------------------------------------------
+
+    use crate::config::OAuthConfig;
+    use crate::oauth::JwksCache;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Generate a minimal OAuthConfig for unit tests.
+    fn test_oauth_cfg() -> OAuthConfig {
+        OAuthConfig {
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            redirect_url: "https://app.example.com/auth/callback".to_string(),
+            issuer: Some("https://provider.example.com".to_string()),
+            auth_url: "https://provider.example.com/auth".to_string(),
+            token_url: "https://provider.example.com/token".to_string(),
+            jwks_url: None,
+            userinfo_url: None,
+            scopes: "openid email profile".to_string(),
+            after_login_url: "https://app.example.com/".to_string(),
+            allowed_redirect_urls: vec![],
+            end_session_endpoint: None,
+            after_logout_url: None,
+            browser_pkce: false,
+            resource_server_audience: None,
+        }
+    }
+
+    /// Build an AppState that uses JWKS-based validation.
+    fn make_jwks_state(jwks: Arc<JwksCache>) -> AppState {
+        make_jwks_state_with_audience(jwks, None)
+    }
+
+    /// Build an AppState that uses JWKS-based validation with an explicit
+    /// resource-server audience restriction.
+    fn make_jwks_state_with_audience(jwks: Arc<JwksCache>, audience: Option<&str>) -> AppState {
+        let db = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost/unused")
+            .expect("lazy pool");
+        let mut cfg = test_oauth_cfg();
+        cfg.resource_server_audience = audience.map(str::to_string);
+        AppState {
+            db,
+            jwt_secret: TEST_SECRET.to_string(),
+            token_ttl_secs: 600,
+            session_ttl_secs: 3600,
+            oauth: Some(cfg),
+            jwks_cache: Some(jwks),
+            cookie_domain: None,
+            cookie_name: "session".to_string(),
+            cookie_secure: false,
+            nats: None,
+            service_version_urls: vec![],
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    /// Generate a temporary RSA keypair for signing test JWTs.
+    fn test_rsa_keypair() -> (EncodingKey, jsonwebtoken::DecodingKey, String) {
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
+        use rsa::RsaPrivateKey;
+
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let priv_pem = private_key
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap();
+        let enc = EncodingKey::from_rsa_pem(priv_pem.as_bytes()).unwrap();
+
+        let public_key = private_key.to_public_key();
+        let pub_pem = public_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap();
+        let dec = jsonwebtoken::DecodingKey::from_rsa_pem(pub_pem.as_bytes()).unwrap();
+
+        (enc, dec, "jwks-test-kid".to_string())
+    }
+
+    /// Sign a minimal id_token with the given RSA key.
+    fn sign_id_token(
+        enc: &EncodingKey,
+        kid: &str,
+        email: &str,
+        name: &str,
+        client_id: &str,
+        issuer: &str,
+        exp_delta: i64,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = serde_json::json!({
+            "sub": email,
+            "email": email,
+            "name": name,
+            "iss": issuer,
+            "aud": client_id,
+            "exp": (now as i64 + exp_delta) as u64,
+            "iat": now,
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        encode(&header, &claims, enc).unwrap()
+    }
+
+    #[tokio::test]
+    async fn jwks_path_valid_id_token_authenticates_user() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        let token = sign_id_token(
+            &enc,
+            &kid,
+            "alice@example.com",
+            "Alice",
+            "test-client",
+            "https://provider.example.com",
+            3600,
+        );
+
+        let state = make_jwks_state(jwks);
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let auth = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("valid id_token should authenticate");
+
+        assert_eq!(auth.user_id, "alice@example.com");
+        assert_eq!(auth.name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn jwks_path_expired_token_rejected() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        let token = sign_id_token(
+            &enc,
+            &kid,
+            "alice@example.com",
+            "Alice",
+            "test-client",
+            "https://provider.example.com",
+            -7200, // expired
+        );
+
+        let state = make_jwks_state(jwks);
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwks_path_missing_bearer_rejected() {
+        let (_, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        let state = make_jwks_state(jwks);
+        // No Authorization header at all
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwks_path_cookie_not_accepted_as_fallback() {
+        // When JWKS is configured, session cookies should NOT be accepted.
+        let (_, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        let state = make_jwks_state(jwks);
+        // A valid legacy session JWT in a cookie should be rejected because
+        // the JWKS path requires a provider id_token Bearer token.
+        let session_jwt =
+            generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::COOKIE, format!("session={session_jwt}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+
+        // Without a Bearer header the JWKS path returns 401 immediately.
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Access tokens often carry only `sub` (no `email`).  The extractor must
+    /// use `sub` as `user_id` in that case.
+    #[tokio::test]
+    async fn jwks_path_access_token_sub_only_authenticates_user() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        // Access token: has sub but no email; aud is the resource server URL,
+        // not the client_id.
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = serde_json::json!({
+            "sub": "opaque-user-sub-12345",
+            "iss": "https://provider.example.com",
+            "aud": "https://api.example.com",   // resource-server audience
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.clone());
+        let access_token = encode(&header, &claims, &enc).unwrap();
+
+        let state = make_jwks_state(jwks);
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let auth = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("sub-only access token should authenticate");
+
+        // user_id falls back to sub when email is absent
+        assert_eq!(auth.user_id, "opaque-user-sub-12345");
+    }
+
+    // -----------------------------------------------------------------------
+    // OAUTH_RESOURCE_SERVER_AUDIENCE tests
+    //
+    // When resource_server_audience is configured, per-request Bearer tokens
+    // must carry that value in their `aud` claim.  Tokens for any other
+    // audience — even if correctly signed by the same provider — are rejected.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn jwks_path_correct_resource_audience_accepted() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        // Token carries the configured resource-server audience.
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = serde_json::json!({
+            "sub": "alice@example.com",
+            "email": "alice@example.com",
+            "name": "Alice",
+            "iss": "https://provider.example.com",
+            "aud": "https://api.videocall.rs",
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.clone());
+        let token = encode(&header, &claims, &enc).unwrap();
+
+        let state = make_jwks_state_with_audience(jwks, Some("https://api.videocall.rs"));
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let auth = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("token with correct audience should be accepted");
+        assert_eq!(auth.user_id, "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn jwks_path_wrong_resource_audience_rejected() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), (Algorithm::RS256, dec));
+        let jwks = JwksCache::with_keys(keys);
+
+        // Token is signed by the same provider but carries a different
+        // service's audience (confused deputy scenario).
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = serde_json::json!({
+            "sub": "alice@example.com",
+            "email": "alice@example.com",
+            "name": "Alice",
+            "iss": "https://provider.example.com",
+            "aud": "https://other-service.example.com",  // wrong audience
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.clone());
+        let token = encode(&header, &claims, &enc).unwrap();
+
+        let state = make_jwks_state_with_audience(jwks, Some("https://api.videocall.rs"));
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+
+        // A valid signature for the wrong audience must be rejected.
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 }

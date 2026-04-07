@@ -34,6 +34,13 @@ services:
       - CARGO_NET_OFFLINE=false
       - OAUTH_PROVIDER=${OAUTH_PROVIDER:-google}
       - UI_URL=${UI_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
+      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-}
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
+      - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}/auth/callback}
+      - OAUTH_SCOPES=${OAUTH_SCOPES:-openid email profile}
+      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-}
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
+      - OAUTH_PROMPT=${OAUTH_PROMPT:-}
     ports:
       - "${DIOXUS_SERVE_PORT:-3001}:${DIOXUS_SERVE_PORT:-3001}"
 
@@ -88,8 +95,11 @@ services:
       - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-}
       - OAUTH_JWKS_URL=${OAUTH_JWKS_URL:-}
       - OAUTH_USERINFO_URL=${OAUTH_USERINFO_URL:-}
+      - OAUTH_END_SESSION_URL=${OAUTH_END_SESSION_URL:-}
       - OAUTH_SCOPES=${OAUTH_SCOPES:-openid email profile}
       - AFTER_LOGIN_URL=${AFTER_LOGIN_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
+      - AFTER_LOGOUT_URL=${AFTER_LOGOUT_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
+      - OAUTH_BROWSER_PKCE=${OAUTH_BROWSER_PKCE:-false}
       - ALLOWED_REDIRECT_URLS=${ALLOWED_REDIRECT_URLS:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
       - NATS_URL=nats:4222
       - RUST_LOG=debug

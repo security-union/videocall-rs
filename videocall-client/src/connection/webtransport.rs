@@ -205,8 +205,8 @@ fn handle_unidirectional_stream(
                         }
 
                         // Extract the complete packet payload, advance the buffer.
-                        let packet_data = pending[4..4 + len].to_vec();
-                        pending = pending[4 + len..].to_vec();
+                        // drain() avoids a second Vec allocation for the remainder.
+                        let packet_data: Vec<u8> = pending.drain(..4 + len).skip(4).collect();
                         callback.emit(packet_data);
                     }
 

@@ -201,9 +201,19 @@ impl WebTransportBridge {
                             }
                         }
 
+                        // Build the length-prefixed frame: [4-byte BE length][payload].
+                        // This lets the client reader know where each packet ends
+                        // on the persistent (never-finished) stream.
+                        let len_header = (data.len() as u32).to_be_bytes();
+
                         // Write to the persistent stream.
                         let stream = persistent_stream.as_mut().expect("stream was just opened");
-                        if let Err(e) = stream.write_all(&data).await {
+                        let write_result = stream.write_all(&len_header).await.err();
+                        let write_err = match write_result {
+                            Some(e) => Some(e),
+                            None => stream.write_all(&data).await.err(),
+                        };
+                        if let Some(e) = write_err {
                             warn!(
                                 "Error writing to persistent UniStream ({}), retrying with new stream",
                                 e
@@ -220,9 +230,17 @@ impl WebTransportBridge {
                                     break;
                                 }
                             };
+                            // Retry with the complete framed message (length + data).
+                            if let Err(e2) = new_stream.write_all(&len_header).await {
+                                error!(
+                                    "Error writing length header to new UniStream after retry: {}",
+                                    e2
+                                );
+                                break;
+                            }
                             if let Err(e2) = new_stream.write_all(&data).await {
                                 error!(
-                                    "Error writing to new UniStream after retry: {}",
+                                    "Error writing payload to new UniStream after retry: {}",
                                     e2
                                 );
                                 break;

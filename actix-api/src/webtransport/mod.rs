@@ -1234,20 +1234,45 @@ mod tests {
         packet.write_to_bytes().expect("serialize wrapper")
     }
 
-    /// Read data from a session by accepting either a uni stream or datagram.
-    /// Uses `read()` instead of `read_to_end()` so it works with the persistent
-    /// stream (which is never finished until the session ends). Returns whatever
-    /// data is immediately available.
+    /// Read a single length-prefixed frame from a persistent uni stream.
+    ///
+    /// Wire format: `[4-byte BE length][payload]`
+    ///
+    /// Returns the deframed payload bytes, or `None` if the stream is finished
+    /// or encounters an error (in which case the stream should be dropped).
+    async fn read_length_prefixed_frame(
+        stream: &mut web_transport_quinn::RecvStream,
+    ) -> Option<Vec<u8>> {
+        // Read the 4-byte big-endian length header.
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            return None;
+        }
+        let payload_len = u32::from_be_bytes(len_buf) as usize;
+        if payload_len == 0 {
+            return Some(Vec::new());
+        }
+        // Read exactly `payload_len` bytes.
+        let mut payload = vec![0u8; payload_len];
+        if stream.read_exact(&mut payload).await.is_err() {
+            return None;
+        }
+        Some(payload)
+    }
+
+    /// Accept a new uni stream or datagram from the session and read one frame.
+    ///
+    /// For uni streams the server uses length-prefix framing, so we read one
+    /// complete frame (4-byte header + payload). Datagrams are self-contained
+    /// and returned as-is.
     async fn read_available_data(
         session: &web_transport_quinn::Session,
     ) -> Option<(Vec<u8>, Option<web_transport_quinn::RecvStream>)> {
         tokio::select! {
             Ok(mut stream) = session.accept_uni() => {
-                let mut buf = vec![0u8; 65536];
-                match stream.read(&mut buf).await {
-                    Ok(Some(n)) => Some((buf[..n].to_vec(), Some(stream))),
-                    _ => None,
-                }
+                read_length_prefixed_frame(&mut stream)
+                    .await
+                    .map(|payload| (payload, Some(stream)))
             }
             Ok(datagram) = session.read_datagram() => {
                 Some((datagram.to_vec(), None))
@@ -1256,46 +1281,40 @@ mod tests {
         }
     }
 
-    /// Read more data from an already-accepted persistent uni stream, or fall back
-    /// to accepting a new stream / datagram. Returns data read and optionally the
-    /// (possibly updated) persistent stream handle.
+    /// Read one complete packet from an already-accepted persistent uni stream,
+    /// or fall back to accepting a new stream / datagram.
+    ///
+    /// The persistent stream uses length-prefix framing (`[4-byte BE len][payload]`),
+    /// so this reads one full frame and returns the deframed payload.
+    ///
+    /// Returns the data read and optionally the (possibly updated) persistent
+    /// stream handle.
     async fn read_more_data(
         session: &web_transport_quinn::Session,
         persistent: Option<web_transport_quinn::RecvStream>,
         timeout: Duration,
     ) -> (Vec<u8>, Option<web_transport_quinn::RecvStream>) {
-        let mut data = Vec::new();
-
         if let Some(mut stream) = persistent {
-            // Try reading from the persistent stream first with a short timeout.
-            let mut buf = vec![0u8; 65536];
-            match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
-                Ok(Ok(Some(n))) => {
-                    data.extend_from_slice(&buf[..n]);
-                    return (data, Some(stream));
+            // Try reading one length-prefixed frame from the persistent stream.
+            match tokio::time::timeout(timeout, read_length_prefixed_frame(&mut stream)).await {
+                Ok(Some(payload)) => {
+                    return (payload, Some(stream));
                 }
-                Ok(Ok(None)) => {
-                    // Stream finished
-                    return (data, None);
-                }
-                Ok(Err(_e)) => {
-                    // Stream error, drop it
-                    return (data, None);
+                Ok(None) => {
+                    // Stream finished or error, drop it
+                    return (Vec::new(), None);
                 }
                 Err(_) => {
                     // Timeout - no data available yet, return the stream for next time
-                    return (data, Some(stream));
+                    return (Vec::new(), Some(stream));
                 }
             }
         }
 
         // No persistent stream yet, accept one or read a datagram
         match tokio::time::timeout(timeout, read_available_data(session)).await {
-            Ok(Some((d, stream))) => {
-                data.extend_from_slice(&d);
-                (data, stream)
-            }
-            _ => (data, None),
+            Ok(Some((d, stream))) => (d, stream),
+            _ => (Vec::new(), None),
         }
     }
 

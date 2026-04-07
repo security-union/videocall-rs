@@ -19,5 +19,6 @@ window.__APP_CONFIG = Object.freeze({
   oauthScopes: "openid email profile",
   oauthTokenUrl: "",
   oauthIssuer: "",
-  oauthPrompt: ""
+  oauthPrompt: "",
+  oauthFlow: ""
 });

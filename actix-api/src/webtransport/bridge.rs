@@ -210,7 +210,10 @@ impl WebTransportBridge {
                         // Build the length-prefixed frame: [4-byte BE length][payload].
                         // This lets the client reader know where each packet ends
                         // on the persistent (never-finished) stream.
-                        let len_header = (data.len() as u32).to_be_bytes();
+                        let len: u32 = data.len().try_into().expect(
+                            "packet exceeds u32::MAX bytes; video frames should be well under 4GB",
+                        );
+                        let len_header = len.to_be_bytes();
 
                         // Write to the persistent stream.
                         let stream = persistent_stream.as_mut().expect("stream was just opened");

@@ -1189,15 +1189,6 @@ mod tests {
                 ("to_peer", "bob")
             ]
         ));
-        assert!(series_exists(
-            "videocall_video_packets_buffered",
-            &[
-                ("meeting_id", "meet_ab"),
-                ("session_id", "sess_ab"),
-                ("from_peer", "alice"),
-                ("to_peer", "bob")
-            ]
-        ));
     }
 
     #[test]

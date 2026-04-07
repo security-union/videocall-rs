@@ -128,10 +128,12 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at "high" (720p/30fps) — a middle ground that looks good on
-/// most connections. The PID controller steps up to 1080p if bandwidth
-/// allows, or steps down to 480p/360p if constrained.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "high"
+/// Starting at "medium" (480p/25fps/600kbps) keeps initial bandwidth
+/// under 1 Mbps, avoiding buffer bloat on constrained connections during
+/// the 5s warmup period when tier transitions are suppressed. The PID
+/// controller steps up to 720p/1080p if bandwidth permits, or steps
+/// down to 360p/240p if constrained.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 2; // "medium"
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
@@ -782,7 +784,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "high", "default tier should be 'high'");
+        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
     }
 
     #[test]

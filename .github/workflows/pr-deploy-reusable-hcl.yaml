@@ -464,6 +464,7 @@ jobs:
 
           helm upgrade --install preview-${PR_NUM}-ws helm/rustlemania-websocket/ \
             --namespace ${NAMESPACE} \
+            --set ingress.enabled=true \
             --set image.repository=${REGISTRY}/videocall-media-server \
             --set image.tag=pr-${PR_NUM} \
             --set imagePullSecrets[0].name=harbor-pull-secret \
@@ -534,6 +535,7 @@ jobs:
 
           helm upgrade --install preview-${PR_NUM}-api helm/meeting-api/ \
             --namespace ${NAMESPACE} \
+            --set ingress.enabled=true \
             --set image.repository=${REGISTRY}/videocall-meeting-api \
             --set image.tag=pr-${PR_NUM} \
             --set imagePullSecrets[0].name=harbor-pull-secret \

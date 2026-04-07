@@ -50,8 +50,8 @@ The adaptive quality system uses 8 tiers, stepping up or down based on network c
 | Tier | Label | Resolution | FPS | Ideal Bitrate | Bitrate Range |
 |------|-------|-----------|-----|--------------|---------------|
 | 0 | full_hd | 1920x1080 | 30 | 2500 kbps | 1500-2500 kbps |
-| 1 | hd_plus | 1600x900 | 30 | 2000 kbps | 1200-3000 kbps |
-| 2 | hd | 1280x720 | 30 | 1500 kbps | 800-2500 kbps |
+| 1 | hd_plus | 1600x900 | 30 | 2000 kbps | 1200-2500 kbps |
+| 2 | hd | 1280x720 | 30 | 1500 kbps | 800-2000 kbps |
 | 3 | standard | 960x540 | 30 | 900 kbps | 500-1500 kbps |
 | 4 | **medium** | 854x480 | 25 | 600 kbps | 300-1000 kbps |
 | 5 | low | 640x360 | 20 | 400 kbps | 200-600 kbps |

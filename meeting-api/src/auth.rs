@@ -13,30 +13,23 @@
 
 //! Axum extractor that authenticates the user.
 //!
-//! ## When external OAuth / JWKS is configured
+//! Authentication is checked in order:
 //!
-//! Every request must carry the provider-issued **id_token** as a Bearer
-//! token in the `Authorization` header:
+//! 1. **Bearer token with JWKS** — when JWKS is configured and the request
+//!    carries an `Authorization: Bearer <token>` header, the token is
+//!    validated against the provider's JWKS (signature, `exp`, `iss`, and
+//!    optionally `aud` via `OAUTH_RESOURCE_SERVER_AUDIENCE`).
 //!
-//! ```text
-//! Authorization: Bearer <id_token>
-//! ```
+//! 2. **Session cookie** — when no Bearer token is present (or JWKS is not
+//!    configured), the extractor looks for a server-issued session JWT in
+//!    `Cookie: <cookie_name>=<JWT>` (set by the `/login/callback` handler
+//!    in server-side OAuth mode) or in `Authorization: Bearer <JWT>`.
 //!
-//! The extractor validates the id_token signature against the provider's JWKS
-//! (fetched and cached by [`crate::oauth::JwksCache`]), checks `exp` and `iss`,
-//! and optionally checks `aud` when `OAUTH_RESOURCE_SERVER_AUDIENCE` is set.
-//!
-//! ## Fallback — no external OAuth / JWKS configured
-//!
-//! When `OAUTH_CLIENT_ID` is unset the extractor falls back to validating a
-//! server-issued session JWT (HMAC-SHA256).  The token is accepted via:
-//!
-//! 1. `Cookie: <cookie_name>=<JWT>` — set by the legacy OAuth callback as
-//!    `HttpOnly`.
-//! 2. `Authorization: Bearer <JWT>` — for non-browser clients.
-//!
-//! This path exists for backward compatibility with deployments that do not
-//! use an external identity provider.
+//! This two-step approach supports both deployment modes:
+//! - **Server-side OAuth** (default): the backend exchanges the code and
+//!   sets an `HttpOnly` session cookie — the browser sends it automatically.
+//! - **Client-side PKCE** (`oauthFlow: "pkce"`): the browser exchanges the
+//!   code directly and sends the provider id_token as a Bearer header.
 
 use axum::{
     extract::FromRequestParts,
@@ -71,67 +64,47 @@ impl FromRequestParts<AppState> for AuthUser {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         // ----------------------------------------------------------------
-        // Path 1 — external OAuth with JWKS (new mode)
+        // Path 1 — Bearer token with JWKS validation (PKCE / external OAuth)
         //
-        // When both a JWKS cache and an OAuth config are present, every
-        // request must supply the provider id_token as a Bearer token.
-        // Session cookies are no longer issued or accepted in this mode.
+        // When a JWKS cache and OAuth config are present AND the request
+        // carries a Bearer token, validate it against the provider's JWKS.
         // ----------------------------------------------------------------
         if let (Some(jwks), Some(oauth_cfg)) = (state.jwks_cache.as_deref(), state.oauth.as_ref()) {
-            let token = extract_bearer_token(parts)
-                .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
-
-            // Validate the Bearer token via JWKS (signature, exp, iss).
-            //
-            // Audience (`aud`) validation is intentionally skipped here:
-            // id_tokens carry `aud == client_id`, but access tokens carry a
-            // resource-server audience that differs per provider.  Signature +
-            // issuer + expiry is sufficient for per-request authentication at
-            // a resource server.
-            let claims = crate::oauth::verify_and_decode_id_token(
-                jwks,
-                &token,
-                // When OAUTH_RESOURCE_SERVER_AUDIENCE is set, every
-                // per-request Bearer token must carry that value in its `aud`
-                // claim.  Without it, audience validation is skipped so that
-                // both id_tokens (aud = client_id) and access tokens
-                // (aud = resource-server URL) are accepted.  Deployers sharing
-                // an IdP with other services should always set this variable
-                // to prevent tokens issued for other applications from being
-                // accepted here (RFC 8707 confused deputy mitigation).
-                oauth_cfg.resource_server_audience.as_deref(),
-                oauth_cfg.issuer.as_deref(),
-                // Nonce is validated only during the initial token exchange;
-                // re-validating on every request would require the server to
-                // remember per-request nonces, which is stateful and complex.
-                None,
-            )
-            .await
-            .map_err(|e| {
-                tracing::warn!("Bearer token validation failed: {e:?}");
-                AppError::unauthorized_msg("invalid or expired bearer token")
-            })?;
-
-            let name = claims.display_name();
-
-            // Access tokens often omit the `email` claim; fall back to `sub`
-            // (subject), which is always present in both token types.
-            let user_id = claims
-                .email
-                .filter(|e| !e.is_empty())
-                .or_else(|| claims.sub.filter(|s| !s.is_empty()))
-                .ok_or_else(|| {
-                    AppError::unauthorized_msg("bearer token is missing both email and sub claims")
+            if let Some(token) = extract_bearer_token(parts) {
+                let claims = crate::oauth::verify_and_decode_id_token(
+                    jwks,
+                    &token,
+                    oauth_cfg.resource_server_audience.as_deref(),
+                    oauth_cfg.issuer.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    tracing::warn!("Bearer token validation failed: {e:?}");
+                    AppError::unauthorized_msg("invalid or expired bearer token")
                 })?;
 
-            return Ok(AuthUser { user_id, name });
+                let name = claims.display_name();
+                let user_id = claims
+                    .email
+                    .filter(|e| !e.is_empty())
+                    .or_else(|| claims.sub.filter(|s| !s.is_empty()))
+                    .ok_or_else(|| {
+                        AppError::unauthorized_msg(
+                            "bearer token is missing both email and sub claims",
+                        )
+                    })?;
+
+                return Ok(AuthUser { user_id, name });
+            }
+            // No Bearer token — fall through to session cookie path below.
         }
 
         // ----------------------------------------------------------------
-        // Path 2 — legacy server-issued session JWT (fallback / no OAuth)
+        // Path 2 — server-issued session JWT (cookie or Bearer)
         //
-        // Accepts the signed JWT from either the session cookie or the
-        // Authorization: Bearer header.
+        // Used by server-side OAuth (cookie set by /login/callback) and
+        // deployments without an external identity provider.
         // ----------------------------------------------------------------
         let token = extract_session_token(parts, &state.cookie_name)
             .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
@@ -651,16 +624,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jwks_path_cookie_not_accepted_as_fallback() {
-        // When JWKS is configured, session cookies should NOT be accepted.
+    async fn jwks_path_session_cookie_accepted_as_fallback() {
+        // When JWKS is configured but no Bearer token is present, the
+        // extractor falls back to the session cookie.  This supports
+        // server-side OAuth where the backend issues an HttpOnly cookie
+        // after exchanging the authorization code.
         let (_, dec, kid) = test_rsa_keypair();
         let mut keys = HashMap::new();
         keys.insert(kid.clone(), (Algorithm::RS256, dec));
         let jwks = JwksCache::with_keys(keys);
 
         let state = make_jwks_state(jwks);
-        // A valid legacy session JWT in a cookie should be rejected because
-        // the JWKS path requires a provider id_token Bearer token.
         let session_jwt =
             generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
         let req = Request::builder()
@@ -670,12 +644,12 @@ mod tests {
             .body(())
             .unwrap();
         let (mut parts, _) = req.into_parts();
-        let err = AuthUser::from_request_parts(&mut parts, &state)
+        let auth = AuthUser::from_request_parts(&mut parts, &state)
             .await
-            .unwrap_err();
+            .expect("session cookie should be accepted when no Bearer token is present");
 
-        // Without a Bearer header the JWKS path returns 401 immediately.
-        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(auth.user_id, "alice@test.com");
+        assert_eq!(auth.name, "Alice");
     }
 
     /// Access tokens often carry only `sub` (no `email`).  The extractor must

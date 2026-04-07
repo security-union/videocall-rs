@@ -21,7 +21,7 @@ use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
     KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
-    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
+    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_SLOW_RETRY_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
 };
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
@@ -176,7 +176,9 @@ impl SequenceTracker {
     /// Implements exponential backoff: first request after
     /// `KEYFRAME_REQUEST_TIMEOUT_MS`, then intervals double from
     /// `KEYFRAME_REQUEST_MIN_INTERVAL_MS` up to `KEYFRAME_REQUEST_MAX_BACKOFF_MS`.
-    /// Gives up after `KEYFRAME_REQUEST_MAX_UNANSWERED` unanswered requests.
+    /// After `KEYFRAME_REQUEST_MAX_UNANSWERED` unanswered requests, switches to
+    /// a slow periodic retry (`KEYFRAME_REQUEST_SLOW_RETRY_MS`) to recover from
+    /// persistent loss without flooding the sender.
     fn should_request_keyframe(&mut self, now: u64) -> bool {
         if self.lost_count == 0 {
             // No loss -- reset all request state.
@@ -191,14 +193,21 @@ impl SequenceTracker {
         let elapsed_since_loss = now.saturating_sub(loss_time);
         let elapsed_since_last_req = now.saturating_sub(self.last_keyframe_request_ms);
 
-        // Don't send if we've given up (max unanswered requests reached).
-        if self.unanswered_requests >= KEYFRAME_REQUEST_MAX_UNANSWERED {
-            return false;
-        }
-
         // Wait for initial timeout before first request.
         if elapsed_since_loss < KEYFRAME_REQUEST_TIMEOUT_MS {
             return false;
+        }
+
+        // After the initial backoff burst is exhausted, switch to slow
+        // periodic retry. Keyframes are 5-10x larger than delta frames
+        // and have a higher drop probability on lossy networks, so giving
+        // up permanently would leave frozen video with no recovery path.
+        if self.unanswered_requests >= KEYFRAME_REQUEST_MAX_UNANSWERED {
+            if elapsed_since_last_req < KEYFRAME_REQUEST_SLOW_RETRY_MS {
+                return false;
+            }
+            self.last_keyframe_request_ms = now;
+            return true;
         }
 
         // Exponential backoff between requests.
@@ -2759,7 +2768,7 @@ mod tests {
     /// After KEYFRAME_REQUEST_MAX_UNANSWERED requests with no keyframe,
     /// the tracker should give up and stop requesting.
     #[wasm_bindgen_test]
-    fn max_unanswered_requests_gives_up() {
+    fn max_unanswered_switches_to_slow_retry() {
         let mut tracker = SequenceTracker::new();
         tracker.lost_count = 5;
         tracker.loss_detected_at_ms = Some(0);
@@ -2777,11 +2786,25 @@ mod tests {
         }
         assert_eq!(tracker.unanswered_requests, KEYFRAME_REQUEST_MAX_UNANSWERED);
 
-        // The next request should be suppressed (gave up).
-        time += tracker.current_backoff_ms + 10000;
+        // Shortly after exhaustion, should NOT fire (slow retry interval not elapsed).
+        time += 5000;
         assert!(
             !tracker.should_request_keyframe(time),
-            "Should give up after max unanswered requests"
+            "Should not fire before slow retry interval"
+        );
+
+        // After KEYFRAME_REQUEST_SLOW_RETRY_MS, should fire again.
+        time += KEYFRAME_REQUEST_SLOW_RETRY_MS;
+        assert!(
+            tracker.should_request_keyframe(time),
+            "Should fire slow periodic retry after 15s"
+        );
+
+        // And again after another slow retry interval.
+        time += KEYFRAME_REQUEST_SLOW_RETRY_MS;
+        assert!(
+            tracker.should_request_keyframe(time),
+            "Slow retry should continue periodically"
         );
     }
 

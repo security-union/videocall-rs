@@ -353,9 +353,16 @@ pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 1000;
 pub const KEYFRAME_REQUEST_MAX_BACKOFF_MS: u64 = 8000;
 
 /// Maximum number of unanswered keyframe requests before giving up.
-/// After this many requests with no keyframe received, stop sending PLIs
-/// and wait for a natural keyframe from the sender.
+/// After this many requests with no keyframe received, switch from
+/// exponential backoff to slow periodic retry.
 pub const KEYFRAME_REQUEST_MAX_UNANSWERED: u32 = 5;
+
+/// Slow periodic retry interval (milliseconds) after the initial backoff
+/// is exhausted. On lossy networks, keyframes (5-10x larger than delta
+/// frames) have a higher drop probability, so giving up permanently
+/// would leave the user with frozen video. A slow retry every 15 seconds
+/// balances recovery against bandwidth cost.
+pub const KEYFRAME_REQUEST_SLOW_RETRY_MS: u64 = 15000;
 
 // ---------------------------------------------------------------------------
 // Reconnection

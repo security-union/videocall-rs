@@ -81,7 +81,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         target_fps: 30,
         ideal_bitrate_kbps: 2500,
         min_bitrate_kbps: 1500,
-        max_bitrate_kbps: 4000,
+        max_bitrate_kbps: 2500,
         keyframe_interval_frames: 150, // ~5s at 30fps
     },
     VideoQualityTier {

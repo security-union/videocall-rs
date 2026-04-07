@@ -49,7 +49,7 @@ The adaptive quality system uses 8 tiers, stepping up or down based on network c
 
 | Tier | Label | Resolution | FPS | Ideal Bitrate | Bitrate Range |
 |------|-------|-----------|-----|--------------|---------------|
-| 0 | full_hd | 1920x1080 | 30 | 2500 kbps | 1500-4000 kbps |
+| 0 | full_hd | 1920x1080 | 30 | 2500 kbps | 1500-2500 kbps |
 | 1 | hd_plus | 1600x900 | 30 | 2000 kbps | 1200-3000 kbps |
 | 2 | hd | 1280x720 | 30 | 1500 kbps | 800-2500 kbps |
 | 3 | standard | 960x540 | 30 | 900 kbps | 500-1500 kbps |
@@ -72,7 +72,7 @@ The adaptive quality system uses 8 tiers, stepping up or down based on network c
 |--------|----------|-------------------|-------------------|
 | Video (medium, 480p) | 300-1000 kbps | 300-1000 kbps | 1.5-5 Mbps |
 | Video (hd, 720p) | 800-2500 kbps | 800-2500 kbps | 4-12.5 Mbps |
-| Video (full_hd, 1080p) | 1500-4000 kbps | 1500-4000 kbps | 7.5-20 Mbps |
+| Video (full_hd, 1080p) | 1500-2500 kbps | 1500-2500 kbps | 7.5-12.5 Mbps |
 | Screen Share (medium, 720p) | 300-1000 kbps | 300-1000 kbps | — |
 
 ### Latency Requirements

@@ -74,6 +74,7 @@ impl WsChatSession {
             tracker_sender,
             session_manager,
             observer,
+            "websocket",
         );
 
         WsChatSession {
@@ -105,7 +106,7 @@ impl Actor for WsChatSession {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         // Track connection start
-        self.logic.track_connection_start("websocket");
+        self.logic.track_connection_start();
 
         // Start session via SessionManager
         let session_manager = self.logic.session_manager.clone();

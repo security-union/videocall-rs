@@ -426,6 +426,11 @@ pub struct NetEqStats {
     ///  Number of audio packets received per second (rolling 1s window)
     // @@protoc_insertion_point(field:health_packet.NetEqStats.packets_per_sec)
     pub packets_per_sec: f64,
+    ///  Delay manager target delay — the algorithm's estimate of how much buffering is
+    ///  needed to absorb observed network jitter. This IS the network jitter metric;
+    ///  < 30ms = excellent, < 75ms = acceptable, >= 75ms = degraded.
+    // @@protoc_insertion_point(field:health_packet.NetEqStats.target_delay_ms)
+    pub target_delay_ms: f64,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.NetEqStats.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -443,7 +448,7 @@ impl NetEqStats {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut fields = ::std::vec::Vec::with_capacity(5);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "current_buffer_size_ms",
@@ -464,6 +469,11 @@ impl NetEqStats {
             "packets_per_sec",
             |m: &NetEqStats| { &m.packets_per_sec },
             |m: &mut NetEqStats| { &mut m.packets_per_sec },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "target_delay_ms",
+            |m: &NetEqStats| { &m.target_delay_ms },
+            |m: &mut NetEqStats| { &mut m.target_delay_ms },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<NetEqStats>(
             "NetEqStats",
@@ -495,6 +505,9 @@ impl ::protobuf::Message for NetEqStats {
                 33 => {
                     self.packets_per_sec = is.read_double()?;
                 },
+                41 => {
+                    self.target_delay_ms = is.read_double()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -520,6 +533,9 @@ impl ::protobuf::Message for NetEqStats {
         if self.packets_per_sec != 0. {
             my_size += 1 + 8;
         }
+        if self.target_delay_ms != 0. {
+            my_size += 1 + 8;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -537,6 +553,9 @@ impl ::protobuf::Message for NetEqStats {
         }
         if self.packets_per_sec != 0. {
             os.write_double(4, self.packets_per_sec)?;
+        }
+        if self.target_delay_ms != 0. {
+            os.write_double(5, self.target_delay_ms)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -559,6 +578,7 @@ impl ::protobuf::Message for NetEqStats {
         self.packets_awaiting_decode = 0.;
         self.network.clear();
         self.packets_per_sec = 0.;
+        self.target_delay_ms = 0.;
         self.special_fields.clear();
     }
 
@@ -568,6 +588,7 @@ impl ::protobuf::Message for NetEqStats {
             packets_awaiting_decode: 0.,
             network: ::protobuf::MessageField::none(),
             packets_per_sec: 0.,
+            target_delay_ms: 0.,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -786,6 +807,21 @@ pub struct PeerStats {
     pub neteq_stats: ::protobuf::MessageField<NetEqStats>,
     // @@protoc_insertion_point(field:health_packet.PeerStats.video_stats)
     pub video_stats: ::protobuf::MessageField<VideoStats>,
+    ///  Phase 1 metrics: Quality indicators (FIXED: use windowed rates)
+    // @@protoc_insertion_point(field:health_packet.PeerStats.frames_dropped_per_sec)
+    pub frames_dropped_per_sec: f64,
+    // @@protoc_insertion_point(field:health_packet.PeerStats.audio_packet_loss_pct)
+    pub audio_packet_loss_pct: f64,
+    // @@protoc_insertion_point(field:health_packet.PeerStats.avg_decode_latency_ms)
+    pub avg_decode_latency_ms: ::std::option::Option<f64>,
+    ///  Computed quality scores (0-100). Absent when the stream is inactive.
+    ///  100 = perfect, 0 = completely broken.
+    // @@protoc_insertion_point(field:health_packet.PeerStats.audio_quality_score)
+    pub audio_quality_score: ::std::option::Option<f64>,
+    // @@protoc_insertion_point(field:health_packet.PeerStats.video_quality_score)
+    pub video_quality_score: ::std::option::Option<f64>,
+    // @@protoc_insertion_point(field:health_packet.PeerStats.call_quality_score)
+    pub call_quality_score: ::std::option::Option<f64>,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.PeerStats.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -803,7 +839,7 @@ impl PeerStats {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(6);
+        let mut fields = ::std::vec::Vec::with_capacity(12);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "can_listen",
@@ -834,6 +870,36 @@ impl PeerStats {
             "video_stats",
             |m: &PeerStats| { &m.video_stats },
             |m: &mut PeerStats| { &mut m.video_stats },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "frames_dropped_per_sec",
+            |m: &PeerStats| { &m.frames_dropped_per_sec },
+            |m: &mut PeerStats| { &mut m.frames_dropped_per_sec },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "audio_packet_loss_pct",
+            |m: &PeerStats| { &m.audio_packet_loss_pct },
+            |m: &mut PeerStats| { &mut m.audio_packet_loss_pct },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "avg_decode_latency_ms",
+            |m: &PeerStats| { &m.avg_decode_latency_ms },
+            |m: &mut PeerStats| { &mut m.avg_decode_latency_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "audio_quality_score",
+            |m: &PeerStats| { &m.audio_quality_score },
+            |m: &mut PeerStats| { &mut m.audio_quality_score },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "video_quality_score",
+            |m: &PeerStats| { &m.video_quality_score },
+            |m: &mut PeerStats| { &mut m.video_quality_score },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "call_quality_score",
+            |m: &PeerStats| { &m.call_quality_score },
+            |m: &mut PeerStats| { &mut m.call_quality_score },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<PeerStats>(
             "PeerStats",
@@ -871,6 +937,24 @@ impl ::protobuf::Message for PeerStats {
                 50 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.video_stats)?;
                 },
+                57 => {
+                    self.frames_dropped_per_sec = is.read_double()?;
+                },
+                65 => {
+                    self.audio_packet_loss_pct = is.read_double()?;
+                },
+                73 => {
+                    self.avg_decode_latency_ms = ::std::option::Option::Some(is.read_double()?);
+                },
+                81 => {
+                    self.audio_quality_score = ::std::option::Option::Some(is.read_double()?);
+                },
+                89 => {
+                    self.video_quality_score = ::std::option::Option::Some(is.read_double()?);
+                },
+                97 => {
+                    self.call_quality_score = ::std::option::Option::Some(is.read_double()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -903,6 +987,24 @@ impl ::protobuf::Message for PeerStats {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
+        if self.frames_dropped_per_sec != 0. {
+            my_size += 1 + 8;
+        }
+        if self.audio_packet_loss_pct != 0. {
+            my_size += 1 + 8;
+        }
+        if let Some(v) = self.avg_decode_latency_ms {
+            my_size += 1 + 8;
+        }
+        if let Some(v) = self.audio_quality_score {
+            my_size += 1 + 8;
+        }
+        if let Some(v) = self.video_quality_score {
+            my_size += 1 + 8;
+        }
+        if let Some(v) = self.call_quality_score {
+            my_size += 1 + 8;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -927,6 +1029,24 @@ impl ::protobuf::Message for PeerStats {
         if let Some(v) = self.video_stats.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(6, v, os)?;
         }
+        if self.frames_dropped_per_sec != 0. {
+            os.write_double(7, self.frames_dropped_per_sec)?;
+        }
+        if self.audio_packet_loss_pct != 0. {
+            os.write_double(8, self.audio_packet_loss_pct)?;
+        }
+        if let Some(v) = self.avg_decode_latency_ms {
+            os.write_double(9, v)?;
+        }
+        if let Some(v) = self.audio_quality_score {
+            os.write_double(10, v)?;
+        }
+        if let Some(v) = self.video_quality_score {
+            os.write_double(11, v)?;
+        }
+        if let Some(v) = self.call_quality_score {
+            os.write_double(12, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -950,6 +1070,12 @@ impl ::protobuf::Message for PeerStats {
         self.video_enabled = false;
         self.neteq_stats.clear();
         self.video_stats.clear();
+        self.frames_dropped_per_sec = 0.;
+        self.audio_packet_loss_pct = 0.;
+        self.avg_decode_latency_ms = ::std::option::Option::None;
+        self.audio_quality_score = ::std::option::Option::None;
+        self.video_quality_score = ::std::option::Option::None;
+        self.call_quality_score = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -961,6 +1087,12 @@ impl ::protobuf::Message for PeerStats {
             video_enabled: false,
             neteq_stats: ::protobuf::MessageField::none(),
             video_stats: ::protobuf::MessageField::none(),
+            frames_dropped_per_sec: 0.,
+            audio_packet_loss_pct: 0.,
+            avg_decode_latency_ms: ::std::option::Option::None,
+            audio_quality_score: ::std::option::Option::None,
+            video_quality_score: ::std::option::Option::None,
+            call_quality_score: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -1011,6 +1143,28 @@ pub struct HealthPacket {
     pub active_server_type: ::std::string::String,
     // @@protoc_insertion_point(field:health_packet.HealthPacket.active_server_rtt_ms)
     pub active_server_rtt_ms: f64,
+    ///  Phase 1 metrics: Browser state and resource usage
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.is_tab_visible)
+    pub is_tab_visible: bool,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.memory_used_bytes)
+    pub memory_used_bytes: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.memory_total_bytes)
+    pub memory_total_bytes: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.avg_encode_latency_ms)
+    pub avg_encode_latency_ms: ::std::option::Option<f64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.is_tab_throttled)
+    pub is_tab_throttled: bool,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.send_queue_bytes)
+    pub send_queue_bytes: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.packets_received_per_sec)
+    pub packets_received_per_sec: ::std::option::Option<f64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.packets_sent_per_sec)
+    pub packets_sent_per_sec: ::std::option::Option<f64>,
+    ///  Display name as entered by the user in the UI (e.g. "Jay at work").
+    ///  Included in every health packet so observers (vcprobe, metrics_server)
+    ///  can learn display names without depending on one-shot PARTICIPANT_JOINED events.
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.display_name)
+    pub display_name: ::std::option::Option<::std::string::String>,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.HealthPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1028,7 +1182,7 @@ impl HealthPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(10);
+        let mut fields = ::std::vec::Vec::with_capacity(19);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "session_id",
@@ -1079,6 +1233,51 @@ impl HealthPacket {
             "active_server_rtt_ms",
             |m: &HealthPacket| { &m.active_server_rtt_ms },
             |m: &mut HealthPacket| { &mut m.active_server_rtt_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "is_tab_visible",
+            |m: &HealthPacket| { &m.is_tab_visible },
+            |m: &mut HealthPacket| { &mut m.is_tab_visible },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "memory_used_bytes",
+            |m: &HealthPacket| { &m.memory_used_bytes },
+            |m: &mut HealthPacket| { &mut m.memory_used_bytes },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "memory_total_bytes",
+            |m: &HealthPacket| { &m.memory_total_bytes },
+            |m: &mut HealthPacket| { &mut m.memory_total_bytes },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "avg_encode_latency_ms",
+            |m: &HealthPacket| { &m.avg_encode_latency_ms },
+            |m: &mut HealthPacket| { &mut m.avg_encode_latency_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "is_tab_throttled",
+            |m: &HealthPacket| { &m.is_tab_throttled },
+            |m: &mut HealthPacket| { &mut m.is_tab_throttled },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "send_queue_bytes",
+            |m: &HealthPacket| { &m.send_queue_bytes },
+            |m: &mut HealthPacket| { &mut m.send_queue_bytes },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "packets_received_per_sec",
+            |m: &HealthPacket| { &m.packets_received_per_sec },
+            |m: &mut HealthPacket| { &mut m.packets_received_per_sec },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "packets_sent_per_sec",
+            |m: &HealthPacket| { &m.packets_sent_per_sec },
+            |m: &mut HealthPacket| { &mut m.packets_sent_per_sec },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "display_name",
+            |m: &HealthPacket| { &m.display_name },
+            |m: &mut HealthPacket| { &mut m.display_name },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HealthPacket>(
             "HealthPacket",
@@ -1140,6 +1339,33 @@ impl ::protobuf::Message for HealthPacket {
                 81 => {
                     self.active_server_rtt_ms = is.read_double()?;
                 },
+                88 => {
+                    self.is_tab_visible = is.read_bool()?;
+                },
+                96 => {
+                    self.memory_used_bytes = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                104 => {
+                    self.memory_total_bytes = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                113 => {
+                    self.avg_encode_latency_ms = ::std::option::Option::Some(is.read_double()?);
+                },
+                120 => {
+                    self.is_tab_throttled = is.read_bool()?;
+                },
+                128 => {
+                    self.send_queue_bytes = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                137 => {
+                    self.packets_received_per_sec = ::std::option::Option::Some(is.read_double()?);
+                },
+                145 => {
+                    self.packets_sent_per_sec = ::std::option::Option::Some(is.read_double()?);
+                },
+                154 => {
+                    self.display_name = ::std::option::Option::Some(is.read_string()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -1186,6 +1412,33 @@ impl ::protobuf::Message for HealthPacket {
         if self.active_server_rtt_ms != 0. {
             my_size += 1 + 8;
         }
+        if self.is_tab_visible != false {
+            my_size += 1 + 1;
+        }
+        if let Some(v) = self.memory_used_bytes {
+            my_size += ::protobuf::rt::uint64_size(12, v);
+        }
+        if let Some(v) = self.memory_total_bytes {
+            my_size += ::protobuf::rt::uint64_size(13, v);
+        }
+        if let Some(v) = self.avg_encode_latency_ms {
+            my_size += 1 + 8;
+        }
+        if self.is_tab_throttled != false {
+            my_size += 1 + 1;
+        }
+        if let Some(v) = self.send_queue_bytes {
+            my_size += ::protobuf::rt::uint64_size(16, v);
+        }
+        if let Some(v) = self.packets_received_per_sec {
+            my_size += 2 + 8;
+        }
+        if let Some(v) = self.packets_sent_per_sec {
+            my_size += 2 + 8;
+        }
+        if let Some(v) = self.display_name.as_ref() {
+            my_size += ::protobuf::rt::string_size(19, &v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -1229,6 +1482,33 @@ impl ::protobuf::Message for HealthPacket {
         if self.active_server_rtt_ms != 0. {
             os.write_double(10, self.active_server_rtt_ms)?;
         }
+        if self.is_tab_visible != false {
+            os.write_bool(11, self.is_tab_visible)?;
+        }
+        if let Some(v) = self.memory_used_bytes {
+            os.write_uint64(12, v)?;
+        }
+        if let Some(v) = self.memory_total_bytes {
+            os.write_uint64(13, v)?;
+        }
+        if let Some(v) = self.avg_encode_latency_ms {
+            os.write_double(14, v)?;
+        }
+        if self.is_tab_throttled != false {
+            os.write_bool(15, self.is_tab_throttled)?;
+        }
+        if let Some(v) = self.send_queue_bytes {
+            os.write_uint64(16, v)?;
+        }
+        if let Some(v) = self.packets_received_per_sec {
+            os.write_double(17, v)?;
+        }
+        if let Some(v) = self.packets_sent_per_sec {
+            os.write_double(18, v)?;
+        }
+        if let Some(v) = self.display_name.as_ref() {
+            os.write_string(19, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -1256,6 +1536,15 @@ impl ::protobuf::Message for HealthPacket {
         self.active_server_url.clear();
         self.active_server_type.clear();
         self.active_server_rtt_ms = 0.;
+        self.is_tab_visible = false;
+        self.memory_used_bytes = ::std::option::Option::None;
+        self.memory_total_bytes = ::std::option::Option::None;
+        self.avg_encode_latency_ms = ::std::option::Option::None;
+        self.is_tab_throttled = false;
+        self.send_queue_bytes = ::std::option::Option::None;
+        self.packets_received_per_sec = ::std::option::Option::None;
+        self.packets_sent_per_sec = ::std::option::Option::None;
+        self.display_name = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -1294,52 +1583,75 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     tNoisePerSec\x12\x20\n\x0cdtmf_per_sec\x18\x08\x20\x01(\x01R\ndtmfPerSec\
     \x12*\n\x11undefined_per_sec\x18\t\x20\x01(\x01R\x0fundefinedPerSec\"d\n\
     \x0cNetEqNetwork\x12T\n\x12operation_counters\x18\x01\x20\x01(\x0b2%.hea\
-    lth_packet.NetEqOperationCountersR\x11operationCounters\"\xd8\x01\n\nNet\
+    lth_packet.NetEqOperationCountersR\x11operationCounters\"\x80\x02\n\nNet\
     EqStats\x123\n\x16current_buffer_size_ms\x18\x01\x20\x01(\x01R\x13curren\
     tBufferSizeMs\x126\n\x17packets_awaiting_decode\x18\x02\x20\x01(\x01R\
     \x15packetsAwaitingDecode\x125\n\x07network\x18\x03\x20\x01(\x0b2\x1b.he\
     alth_packet.NetEqNetworkR\x07network\x12&\n\x0fpackets_per_sec\x18\x04\
-    \x20\x01(\x01R\rpacketsPerSec\"\xa2\x01\n\nVideoStats\x12!\n\x0cfps_rece\
-    ived\x18\x01\x20\x01(\x01R\x0bfpsReceived\x12'\n\x0fframes_buffered\x18\
-    \x02\x20\x01(\x01R\x0eframesBuffered\x12%\n\x0eframes_decoded\x18\x03\
-    \x20\x01(\x04R\rframesDecoded\x12!\n\x0cbitrate_kbps\x18\x04\x20\x01(\
-    \x04R\x0bbitrateKbps\"\x85\x02\n\tPeerStats\x12\x1d\n\ncan_listen\x18\
-    \x01\x20\x01(\x08R\tcanListen\x12\x17\n\x07can_see\x18\x02\x20\x01(\x08R\
-    \x06canSee\x12#\n\raudio_enabled\x18\x03\x20\x01(\x08R\x0caudioEnabled\
-    \x12#\n\rvideo_enabled\x18\x04\x20\x01(\x08R\x0cvideoEnabled\x12:\n\x0bn\
-    eteq_stats\x18\x05\x20\x01(\x0b2\x19.health_packet.NetEqStatsR\nneteqSta\
-    ts\x12:\n\x0bvideo_stats\x18\x06\x20\x01(\x0b2\x19.health_packet.VideoSt\
-    atsR\nvideoStats\"\xb9\x04\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\
-    \x01\x20\x01(\tR\tsessionId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tm\
-    eetingId\x12*\n\x11reporting_user_id\x18\x03\x20\x01(\x0cR\x0freportingU\
-    serId\x12!\n\x0ctimestamp_ms\x18\x04\x20\x01(\x04R\x0btimestampMs\x126\n\
-    \x17reporting_audio_enabled\x18\x05\x20\x01(\x08R\x15reportingAudioEnabl\
-    ed\x126\n\x17reporting_video_enabled\x18\x06\x20\x01(\x08R\x15reportingV\
-    ideoEnabled\x12I\n\npeer_stats\x18\x07\x20\x03(\x0b2*.health_packet.Heal\
-    thPacket.PeerStatsEntryR\tpeerStats\x12*\n\x11active_server_url\x18\x08\
-    \x20\x01(\tR\x0factiveServerUrl\x12,\n\x12active_server_type\x18\t\x20\
-    \x01(\tR\x10activeServerType\x12/\n\x14active_server_rtt_ms\x18\n\x20\
-    \x01(\x01R\x11activeServerRttMs\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03ke\
-    y\x18\x01\x20\x01(\tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.h\
-    ealth_packet.PeerStatsR\x05value:\x028\x01J\xc5\x13\n\x06\x12\x04\0\0B\
-    \x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\x16\n\
-    \n\n\x02\x04\0\x12\x04\x04\0\x0e\x01\n\n\n\x03\x04\0\x01\x12\x03\x04\x08\
-    \x1e\n\x0b\n\x04\x04\0\x02\0\x12\x03\x05\x02\x1c\n\x0c\n\x05\x04\0\x02\0\
-    \x05\x12\x03\x05\x02\x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x05\t\x17\n\
-    \x0c\n\x05\x04\0\x02\0\x03\x12\x03\x05\x1a\x1b\n\x0b\n\x04\x04\0\x02\x01\
-    \x12\x03\x06\x02\x1c\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x06\x02\x08\n\
-    \x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x06\t\x17\n\x0c\n\x05\x04\0\x02\x01\
-    \x03\x12\x03\x06\x1a\x1b\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x07\x02\x20\n\
-    \x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x07\x02\x08\n\x0c\n\x05\x04\0\x02\
-    \x02\x01\x12\x03\x07\t\x1b\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x07\x1e\
-    \x1f\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x08\x02%\n\x0c\n\x05\x04\0\x02\
-    \x03\x05\x12\x03\x08\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x08\t\
-    \x20\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x08#$\n\x0b\n\x04\x04\0\x02\
-    \x04\x12\x03\t\x02'\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\t\x02\x08\n\
-    \x0c\n\x05\x04\0\x02\x04\x01\x12\x03\t\t\"\n\x0c\n\x05\x04\0\x02\x04\x03\
-    \x12\x03\t%&\n\x0b\n\x04\x04\0\x02\x05\x12\x03\n\x02\x1b\n\x0c\n\x05\x04\
-    \0\x02\x05\x05\x12\x03\n\x02\x08\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\n\
-    \t\x16\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\n\x19\x1a\n\x0b\n\x04\x04\0\
+    \x20\x01(\x01R\rpacketsPerSec\x12&\n\x0ftarget_delay_ms\x18\x05\x20\x01(\
+    \x01R\rtargetDelayMs\"\xa2\x01\n\nVideoStats\x12!\n\x0cfps_received\x18\
+    \x01\x20\x01(\x01R\x0bfpsReceived\x12'\n\x0fframes_buffered\x18\x02\x20\
+    \x01(\x01R\x0eframesBuffered\x12%\n\x0eframes_decoded\x18\x03\x20\x01(\
+    \x04R\rframesDecoded\x12!\n\x0cbitrate_kbps\x18\x04\x20\x01(\x04R\x0bbit\
+    rateKbps\"\xa3\x05\n\tPeerStats\x12\x1d\n\ncan_listen\x18\x01\x20\x01(\
+    \x08R\tcanListen\x12\x17\n\x07can_see\x18\x02\x20\x01(\x08R\x06canSee\
+    \x12#\n\raudio_enabled\x18\x03\x20\x01(\x08R\x0caudioEnabled\x12#\n\rvid\
+    eo_enabled\x18\x04\x20\x01(\x08R\x0cvideoEnabled\x12:\n\x0bneteq_stats\
+    \x18\x05\x20\x01(\x0b2\x19.health_packet.NetEqStatsR\nneteqStats\x12:\n\
+    \x0bvideo_stats\x18\x06\x20\x01(\x0b2\x19.health_packet.VideoStatsR\nvid\
+    eoStats\x123\n\x16frames_dropped_per_sec\x18\x07\x20\x01(\x01R\x13frames\
+    DroppedPerSec\x121\n\x15audio_packet_loss_pct\x18\x08\x20\x01(\x01R\x12a\
+    udioPacketLossPct\x126\n\x15avg_decode_latency_ms\x18\t\x20\x01(\x01H\0R\
+    \x12avgDecodeLatencyMs\x88\x01\x01\x123\n\x13audio_quality_score\x18\n\
+    \x20\x01(\x01H\x01R\x11audioQualityScore\x88\x01\x01\x123\n\x13video_qua\
+    lity_score\x18\x0b\x20\x01(\x01H\x02R\x11videoQualityScore\x88\x01\x01\
+    \x121\n\x12call_quality_score\x18\x0c\x20\x01(\x01H\x03R\x10callQualityS\
+    core\x88\x01\x01B\x18\n\x16_avg_decode_latency_msB\x16\n\x14_audio_quali\
+    ty_scoreB\x16\n\x14_video_quality_scoreB\x15\n\x13_call_quality_score\"\
+    \x93\t\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\x01(\tR\tsess\
+    ionId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tmeetingId\x12*\n\x11rep\
+    orting_user_id\x18\x03\x20\x01(\x0cR\x0freportingUserId\x12!\n\x0ctimest\
+    amp_ms\x18\x04\x20\x01(\x04R\x0btimestampMs\x126\n\x17reporting_audio_en\
+    abled\x18\x05\x20\x01(\x08R\x15reportingAudioEnabled\x126\n\x17reporting\
+    _video_enabled\x18\x06\x20\x01(\x08R\x15reportingVideoEnabled\x12I\n\npe\
+    er_stats\x18\x07\x20\x03(\x0b2*.health_packet.HealthPacket.PeerStatsEntr\
+    yR\tpeerStats\x12*\n\x11active_server_url\x18\x08\x20\x01(\tR\x0factiveS\
+    erverUrl\x12,\n\x12active_server_type\x18\t\x20\x01(\tR\x10activeServerT\
+    ype\x12/\n\x14active_server_rtt_ms\x18\n\x20\x01(\x01R\x11activeServerRt\
+    tMs\x12$\n\x0eis_tab_visible\x18\x0b\x20\x01(\x08R\x0cisTabVisible\x12/\
+    \n\x11memory_used_bytes\x18\x0c\x20\x01(\x04H\0R\x0fmemoryUsedBytes\x88\
+    \x01\x01\x121\n\x12memory_total_bytes\x18\r\x20\x01(\x04H\x01R\x10memory\
+    TotalBytes\x88\x01\x01\x126\n\x15avg_encode_latency_ms\x18\x0e\x20\x01(\
+    \x01H\x02R\x12avgEncodeLatencyMs\x88\x01\x01\x12(\n\x10is_tab_throttled\
+    \x18\x0f\x20\x01(\x08R\x0eisTabThrottled\x12-\n\x10send_queue_bytes\x18\
+    \x10\x20\x01(\x04H\x03R\x0esendQueueBytes\x88\x01\x01\x12<\n\x18packets_\
+    received_per_sec\x18\x11\x20\x01(\x01H\x04R\x15packetsReceivedPerSec\x88\
+    \x01\x01\x124\n\x14packets_sent_per_sec\x18\x12\x20\x01(\x01H\x05R\x11pa\
+    cketsSentPerSec\x88\x01\x01\x12&\n\x0cdisplay_name\x18\x13\x20\x01(\tH\
+    \x06R\x0bdisplayName\x88\x01\x01\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03k\
+    ey\x18\x01\x20\x01(\tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.\
+    health_packet.PeerStatsR\x05value:\x028\x01B\x14\n\x12_memory_used_bytes\
+    B\x15\n\x13_memory_total_bytesB\x18\n\x16_avg_encode_latency_msB\x13\n\
+    \x11_send_queue_bytesB\x1b\n\x19_packets_received_per_secB\x17\n\x15_pac\
+    kets_sent_per_secB\x0f\n\r_display_nameJ\xd0%\n\x06\x12\x04\0\0_\x01\n\
+    \x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\x16\n\n\n\
+    \x02\x04\0\x12\x04\x04\0\x0e\x01\n\n\n\x03\x04\0\x01\x12\x03\x04\x08\x1e\
+    \n\x0b\n\x04\x04\0\x02\0\x12\x03\x05\x02\x1c\n\x0c\n\x05\x04\0\x02\0\x05\
+    \x12\x03\x05\x02\x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x05\t\x17\n\x0c\
+    \n\x05\x04\0\x02\0\x03\x12\x03\x05\x1a\x1b\n\x0b\n\x04\x04\0\x02\x01\x12\
+    \x03\x06\x02\x1c\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x06\x02\x08\n\x0c\
+    \n\x05\x04\0\x02\x01\x01\x12\x03\x06\t\x17\n\x0c\n\x05\x04\0\x02\x01\x03\
+    \x12\x03\x06\x1a\x1b\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x07\x02\x20\n\x0c\
+    \n\x05\x04\0\x02\x02\x05\x12\x03\x07\x02\x08\n\x0c\n\x05\x04\0\x02\x02\
+    \x01\x12\x03\x07\t\x1b\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x07\x1e\x1f\
+    \n\x0b\n\x04\x04\0\x02\x03\x12\x03\x08\x02%\n\x0c\n\x05\x04\0\x02\x03\
+    \x05\x12\x03\x08\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x08\t\x20\
+    \n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x08#$\n\x0b\n\x04\x04\0\x02\x04\
+    \x12\x03\t\x02'\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\t\x02\x08\n\x0c\n\
+    \x05\x04\0\x02\x04\x01\x12\x03\t\t\"\n\x0c\n\x05\x04\0\x02\x04\x03\x12\
+    \x03\t%&\n\x0b\n\x04\x04\0\x02\x05\x12\x03\n\x02\x1b\n\x0c\n\x05\x04\0\
+    \x02\x05\x05\x12\x03\n\x02\x08\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\n\t\
+    \x16\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\n\x19\x1a\n\x0b\n\x04\x04\0\
     \x02\x06\x12\x03\x0b\x02#\n\x0c\n\x05\x04\0\x02\x06\x05\x12\x03\x0b\x02\
     \x08\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x0b\t\x1e\n\x0c\n\x05\x04\0\
     \x02\x06\x03\x12\x03\x0b!\"\n\x0b\n\x04\x04\0\x02\x07\x12\x03\x0c\x02\
@@ -1351,7 +1663,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x12\x04\x10\0\x12\x01\n\n\n\x03\x04\x01\x01\x12\x03\x10\x08\x14\n\x0b\n\
     \x04\x04\x01\x02\0\x12\x03\x11\x020\n\x0c\n\x05\x04\x01\x02\0\x06\x12\
     \x03\x11\x02\x18\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03\x11\x19+\n\x0c\n\
-    \x05\x04\x01\x02\0\x03\x12\x03\x11./\n\n\n\x02\x04\x02\x12\x04\x14\0\x1a\
+    \x05\x04\x01\x02\0\x03\x12\x03\x11./\n\n\n\x02\x04\x02\x12\x04\x14\0\x1e\
     \x01\n\n\n\x03\x04\x02\x01\x12\x03\x14\x08\x12\n\x0b\n\x04\x04\x02\x02\0\
     \x12\x03\x15\x02$\n\x0c\n\x05\x04\x02\x02\0\x05\x12\x03\x15\x02\x08\n\
     \x0c\n\x05\x04\x02\x02\0\x01\x12\x03\x15\t\x1f\n\x0c\n\x05\x04\x02\x02\0\
@@ -1365,71 +1677,146 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     ckets\x20received\x20per\x20second\x20(rolling\x201s\x20window)\n\n\x0c\
     \n\x05\x04\x02\x02\x03\x05\x12\x03\x19\x02\x08\n\x0c\n\x05\x04\x02\x02\
     \x03\x01\x12\x03\x19\t\x18\n\x0c\n\x05\x04\x02\x02\x03\x03\x12\x03\x19\
-    \x1b\x1c\n\n\n\x02\x04\x03\x12\x04\x1c\0!\x01\n\n\n\x03\x04\x03\x01\x12\
-    \x03\x1c\x08\x12\n\x0b\n\x04\x04\x03\x02\0\x12\x03\x1d\x02\x1a\n\x0c\n\
-    \x05\x04\x03\x02\0\x05\x12\x03\x1d\x02\x08\n\x0c\n\x05\x04\x03\x02\0\x01\
-    \x12\x03\x1d\t\x15\n\x0c\n\x05\x04\x03\x02\0\x03\x12\x03\x1d\x18\x19\n\
-    \x0b\n\x04\x04\x03\x02\x01\x12\x03\x1e\x02\x1d\n\x0c\n\x05\x04\x03\x02\
-    \x01\x05\x12\x03\x1e\x02\x08\n\x0c\n\x05\x04\x03\x02\x01\x01\x12\x03\x1e\
-    \t\x18\n\x0c\n\x05\x04\x03\x02\x01\x03\x12\x03\x1e\x1b\x1c\n\x0b\n\x04\
-    \x04\x03\x02\x02\x12\x03\x1f\x02\x1c\n\x0c\n\x05\x04\x03\x02\x02\x05\x12\
-    \x03\x1f\x02\x08\n\x0c\n\x05\x04\x03\x02\x02\x01\x12\x03\x1f\t\x17\n\x0c\
-    \n\x05\x04\x03\x02\x02\x03\x12\x03\x1f\x1a\x1b\n\x0b\n\x04\x04\x03\x02\
-    \x03\x12\x03\x20\x02\x1a\n\x0c\n\x05\x04\x03\x02\x03\x05\x12\x03\x20\x02\
-    \x08\n\x0c\n\x05\x04\x03\x02\x03\x01\x12\x03\x20\t\x15\n\x0c\n\x05\x04\
-    \x03\x02\x03\x03\x12\x03\x20\x18\x19\n\n\n\x02\x04\x04\x12\x04#\0/\x01\n\
-    \n\n\x03\x04\x04\x01\x12\x03#\x08\x11\n6\n\x04\x04\x04\x02\0\x12\x03%\
-    \x02\x16\x1a)\x20Receiver-observed\x20connectivity\x20booleans\n\n\x0c\n\
-    \x05\x04\x04\x02\0\x05\x12\x03%\x02\x06\n\x0c\n\x05\x04\x04\x02\0\x01\
-    \x12\x03%\x07\x11\n\x0c\n\x05\x04\x04\x02\0\x03\x12\x03%\x14\x15\n\x0b\n\
-    \x04\x04\x04\x02\x01\x12\x03&\x02\x13\n\x0c\n\x05\x04\x04\x02\x01\x05\
-    \x12\x03&\x02\x06\n\x0c\n\x05\x04\x04\x02\x01\x01\x12\x03&\x07\x0e\n\x0c\
-    \n\x05\x04\x04\x02\x01\x03\x12\x03&\x11\x12\nw\n\x04\x04\x04\x02\x02\x12\
-    \x03)\x02\x19\x1a9\x20Receiver-observed\x20sender\x20state\x20flags\x20(\
-    from\x20peer_status)\n\"/\x20true\x20if\x20receiver\x20reports\x20sender\
-    \x20audio\x20enabled\n\n\x0c\n\x05\x04\x04\x02\x02\x05\x12\x03)\x02\x06\
-    \n\x0c\n\x05\x04\x04\x02\x02\x01\x12\x03)\x07\x14\n\x0c\n\x05\x04\x04\
-    \x02\x02\x03\x12\x03)\x17\x18\n<\n\x04\x04\x04\x02\x03\x12\x03*\x02\x19\
-    \"/\x20true\x20if\x20receiver\x20reports\x20sender\x20video\x20enabled\n\
-    \n\x0c\n\x05\x04\x04\x02\x03\x05\x12\x03*\x02\x06\n\x0c\n\x05\x04\x04\
-    \x02\x03\x01\x12\x03*\x07\x14\n\x0c\n\x05\x04\x04\x02\x03\x03\x12\x03*\
-    \x17\x18\n\x1f\n\x04\x04\x04\x02\x04\x12\x03-\x02\x1d\x1a\x12\x20Structu\
-    red\x20stats\n\n\x0c\n\x05\x04\x04\x02\x04\x06\x12\x03-\x02\x0c\n\x0c\n\
-    \x05\x04\x04\x02\x04\x01\x12\x03-\r\x18\n\x0c\n\x05\x04\x04\x02\x04\x03\
-    \x12\x03-\x1b\x1c\n\x0b\n\x04\x04\x04\x02\x05\x12\x03.\x02\x1d\n\x0c\n\
-    \x05\x04\x04\x02\x05\x06\x12\x03.\x02\x0c\n\x0c\n\x05\x04\x04\x02\x05\
-    \x01\x12\x03.\r\x18\n\x0c\n\x05\x04\x04\x02\x05\x03\x12\x03.\x1b\x1c\n\n\
-    \n\x02\x04\x05\x12\x041\0B\x01\n\n\n\x03\x04\x05\x01\x12\x031\x08\x14\n\
-    \x0b\n\x04\x04\x05\x02\0\x12\x032\x02\x18\n\x0c\n\x05\x04\x05\x02\0\x05\
-    \x12\x032\x02\x08\n\x0c\n\x05\x04\x05\x02\0\x01\x12\x032\t\x13\n\x0c\n\
-    \x05\x04\x05\x02\0\x03\x12\x032\x16\x17\n\x0b\n\x04\x04\x05\x02\x01\x12\
-    \x033\x02\x18\n\x0c\n\x05\x04\x05\x02\x01\x05\x12\x033\x02\x08\n\x0c\n\
-    \x05\x04\x05\x02\x01\x01\x12\x033\t\x13\n\x0c\n\x05\x04\x05\x02\x01\x03\
-    \x12\x033\x16\x17\n\x0b\n\x04\x04\x05\x02\x02\x12\x034\x02\x1e\n\x0c\n\
-    \x05\x04\x05\x02\x02\x05\x12\x034\x02\x07\n\x0c\n\x05\x04\x05\x02\x02\
-    \x01\x12\x034\x08\x19\n\x0c\n\x05\x04\x05\x02\x02\x03\x12\x034\x1c\x1d\n\
-    \x0b\n\x04\x04\x05\x02\x03\x12\x035\x02\x1a\n\x0c\n\x05\x04\x05\x02\x03\
-    \x05\x12\x035\x02\x08\n\x0c\n\x05\x04\x05\x02\x03\x01\x12\x035\t\x15\n\
-    \x0c\n\x05\x04\x05\x02\x03\x03\x12\x035\x18\x19\n9\n\x04\x04\x05\x02\x04\
-    \x12\x038\x02#\x1a,\x20Sender\x20self-reported\x20state\x20(authoritativ\
-    e)\n\n\x0c\n\x05\x04\x05\x02\x04\x05\x12\x038\x02\x06\n\x0c\n\x05\x04\
-    \x05\x02\x04\x01\x12\x038\x07\x1e\n\x0c\n\x05\x04\x05\x02\x04\x03\x12\
-    \x038!\"\n\x0b\n\x04\x04\x05\x02\x05\x12\x039\x02#\n\x0c\n\x05\x04\x05\
-    \x02\x05\x05\x12\x039\x02\x06\n\x0c\n\x05\x04\x05\x02\x05\x01\x12\x039\
-    \x07\x1e\n\x0c\n\x05\x04\x05\x02\x05\x03\x12\x039!\"\n8\n\x04\x04\x05\
-    \x02\x06\x12\x03<\x02(\x1a+\x20Per-peer\x20stats\x20keyed\x20by\x20peer_\
-    id\x20(to_peer)\n\n\x0c\n\x05\x04\x05\x02\x06\x06\x12\x03<\x02\x18\n\x0c\
-    \n\x05\x04\x05\x02\x06\x01\x12\x03<\x19#\n\x0c\n\x05\x04\x05\x02\x06\x03\
-    \x12\x03<&'\n<\n\x04\x04\x05\x02\x07\x12\x03?\x02\x1f\x1a/\x20Active\x20\
-    connection\x20info\x20(client-side\x20measured)\n\n\x0c\n\x05\x04\x05\
-    \x02\x07\x05\x12\x03?\x02\x08\n\x0c\n\x05\x04\x05\x02\x07\x01\x12\x03?\t\
-    \x1a\n\x0c\n\x05\x04\x05\x02\x07\x03\x12\x03?\x1d\x1e\n+\n\x04\x04\x05\
-    \x02\x08\x12\x03@\x02\x20\"\x1e\x20\"webtransport\"\x20|\x20\"websocket\
-    \"\n\n\x0c\n\x05\x04\x05\x02\x08\x05\x12\x03@\x02\x08\n\x0c\n\x05\x04\
-    \x05\x02\x08\x01\x12\x03@\t\x1b\n\x0c\n\x05\x04\x05\x02\x08\x03\x12\x03@\
-    \x1e\x1f\n\x0b\n\x04\x04\x05\x02\t\x12\x03A\x02#\n\x0c\n\x05\x04\x05\x02\
-    \t\x05\x12\x03A\x02\x08\n\x0c\n\x05\x04\x05\x02\t\x01\x12\x03A\t\x1d\n\
-    \x0c\n\x05\x04\x05\x02\t\x03\x12\x03A\x20\"b\x06proto3\
+    \x1b\x1c\n\xec\x01\n\x04\x04\x02\x02\x04\x12\x03\x1d\x02\x1d\x1a\xde\x01\
+    \x20Delay\x20manager\x20target\x20delay\x20\xe2\x80\x94\x20the\x20algori\
+    thm's\x20estimate\x20of\x20how\x20much\x20buffering\x20is\n\x20needed\
+    \x20to\x20absorb\x20observed\x20network\x20jitter.\x20This\x20IS\x20the\
+    \x20network\x20jitter\x20metric;\n\x20<\x2030ms\x20=\x20excellent,\x20<\
+    \x2075ms\x20=\x20acceptable,\x20>=\x2075ms\x20=\x20degraded.\n\n\x0c\n\
+    \x05\x04\x02\x02\x04\x05\x12\x03\x1d\x02\x08\n\x0c\n\x05\x04\x02\x02\x04\
+    \x01\x12\x03\x1d\t\x18\n\x0c\n\x05\x04\x02\x02\x04\x03\x12\x03\x1d\x1b\
+    \x1c\n\n\n\x02\x04\x03\x12\x04\x20\0%\x01\n\n\n\x03\x04\x03\x01\x12\x03\
+    \x20\x08\x12\n\x0b\n\x04\x04\x03\x02\0\x12\x03!\x02\x1a\n\x0c\n\x05\x04\
+    \x03\x02\0\x05\x12\x03!\x02\x08\n\x0c\n\x05\x04\x03\x02\0\x01\x12\x03!\t\
+    \x15\n\x0c\n\x05\x04\x03\x02\0\x03\x12\x03!\x18\x19\n\x0b\n\x04\x04\x03\
+    \x02\x01\x12\x03\"\x02\x1d\n\x0c\n\x05\x04\x03\x02\x01\x05\x12\x03\"\x02\
+    \x08\n\x0c\n\x05\x04\x03\x02\x01\x01\x12\x03\"\t\x18\n\x0c\n\x05\x04\x03\
+    \x02\x01\x03\x12\x03\"\x1b\x1c\n\x0b\n\x04\x04\x03\x02\x02\x12\x03#\x02\
+    \x1c\n\x0c\n\x05\x04\x03\x02\x02\x05\x12\x03#\x02\x08\n\x0c\n\x05\x04\
+    \x03\x02\x02\x01\x12\x03#\t\x17\n\x0c\n\x05\x04\x03\x02\x02\x03\x12\x03#\
+    \x1a\x1b\n\x0b\n\x04\x04\x03\x02\x03\x12\x03$\x02\x1a\n\x0c\n\x05\x04\
+    \x03\x02\x03\x05\x12\x03$\x02\x08\n\x0c\n\x05\x04\x03\x02\x03\x01\x12\
+    \x03$\t\x15\n\x0c\n\x05\x04\x03\x02\x03\x03\x12\x03$\x18\x19\n\n\n\x02\
+    \x04\x04\x12\x04'\0>\x01\n\n\n\x03\x04\x04\x01\x12\x03'\x08\x11\n6\n\x04\
+    \x04\x04\x02\0\x12\x03)\x02\x16\x1a)\x20Receiver-observed\x20connectivit\
+    y\x20booleans\n\n\x0c\n\x05\x04\x04\x02\0\x05\x12\x03)\x02\x06\n\x0c\n\
+    \x05\x04\x04\x02\0\x01\x12\x03)\x07\x11\n\x0c\n\x05\x04\x04\x02\0\x03\
+    \x12\x03)\x14\x15\n\x0b\n\x04\x04\x04\x02\x01\x12\x03*\x02\x13\n\x0c\n\
+    \x05\x04\x04\x02\x01\x05\x12\x03*\x02\x06\n\x0c\n\x05\x04\x04\x02\x01\
+    \x01\x12\x03*\x07\x0e\n\x0c\n\x05\x04\x04\x02\x01\x03\x12\x03*\x11\x12\n\
+    w\n\x04\x04\x04\x02\x02\x12\x03-\x02\x19\x1a9\x20Receiver-observed\x20se\
+    nder\x20state\x20flags\x20(from\x20peer_status)\n\"/\x20true\x20if\x20re\
+    ceiver\x20reports\x20sender\x20audio\x20enabled\n\n\x0c\n\x05\x04\x04\
+    \x02\x02\x05\x12\x03-\x02\x06\n\x0c\n\x05\x04\x04\x02\x02\x01\x12\x03-\
+    \x07\x14\n\x0c\n\x05\x04\x04\x02\x02\x03\x12\x03-\x17\x18\n<\n\x04\x04\
+    \x04\x02\x03\x12\x03.\x02\x19\"/\x20true\x20if\x20receiver\x20reports\
+    \x20sender\x20video\x20enabled\n\n\x0c\n\x05\x04\x04\x02\x03\x05\x12\x03\
+    .\x02\x06\n\x0c\n\x05\x04\x04\x02\x03\x01\x12\x03.\x07\x14\n\x0c\n\x05\
+    \x04\x04\x02\x03\x03\x12\x03.\x17\x18\n\x1f\n\x04\x04\x04\x02\x04\x12\
+    \x031\x02\x1d\x1a\x12\x20Structured\x20stats\n\n\x0c\n\x05\x04\x04\x02\
+    \x04\x06\x12\x031\x02\x0c\n\x0c\n\x05\x04\x04\x02\x04\x01\x12\x031\r\x18\
+    \n\x0c\n\x05\x04\x04\x02\x04\x03\x12\x031\x1b\x1c\n\x0b\n\x04\x04\x04\
+    \x02\x05\x12\x032\x02\x1d\n\x0c\n\x05\x04\x04\x02\x05\x06\x12\x032\x02\
+    \x0c\n\x0c\n\x05\x04\x04\x02\x05\x01\x12\x032\r\x18\n\x0c\n\x05\x04\x04\
+    \x02\x05\x03\x12\x032\x1b\x1c\n\xbf\x01\n\x04\x04\x04\x02\x06\x12\x035\
+    \x02$\x1aA\x20Phase\x201\x20metrics:\x20Quality\x20indicators\x20(FIXED:\
+    \x20use\x20windowed\x20rates)\n\"o\x20Decode\x20errors\x20per\x20second\
+    \x20(codec\x20failures:\x20keyframe\x20miss,\x20parse\x20error,\x20decod\
+    er\x20reset).\x20NOT\x20CPU-pressure\x20drops.\n\n\x0c\n\x05\x04\x04\x02\
+    \x06\x05\x12\x035\x02\x08\n\x0c\n\x05\x04\x04\x02\x06\x01\x12\x035\t\x1f\
+    \n\x0c\n\x05\x04\x04\x02\x06\x03\x12\x035\"#\n7\n\x04\x04\x04\x02\x07\
+    \x12\x036\x02#\"*\x20Audio\x20packet\x20loss\x20percentage\x20(0.0-100.0\
+    )\n\n\x0c\n\x05\x04\x04\x02\x07\x05\x12\x036\x02\x08\n\x0c\n\x05\x04\x04\
+    \x02\x07\x01\x12\x036\t\x1e\n\x0c\n\x05\x04\x04\x02\x07\x03\x12\x036!\"\
+    \n+\n\x04\x04\x04\x02\x08\x12\x037\x02,\"\x1e\x20Average\x20decode\x20la\
+    tency\x20in\x20ms\n\n\x0c\n\x05\x04\x04\x02\x08\x04\x12\x037\x02\n\n\x0c\
+    \n\x05\x04\x04\x02\x08\x05\x12\x037\x0b\x11\n\x0c\n\x05\x04\x04\x02\x08\
+    \x01\x12\x037\x12'\n\x0c\n\x05\x04\x04\x02\x08\x03\x12\x037*+\n\xa9\x01\
+    \n\x04\x04\x04\x02\t\x12\x03;\x02+\x1am\x20Computed\x20quality\x20scores\
+    \x20(0-100).\x20Absent\x20when\x20the\x20stream\x20is\x20inactive.\n\x20\
+    100\x20=\x20perfect,\x200\x20=\x20completely\x20broken.\n\"-\x20Audio\
+    \x20quality;\x20absent\x20when\x20no\x20audio\x20flowing\n\n\x0c\n\x05\
+    \x04\x04\x02\t\x04\x12\x03;\x02\n\n\x0c\n\x05\x04\x04\x02\t\x05\x12\x03;\
+    \x0b\x11\n\x0c\n\x05\x04\x04\x02\t\x01\x12\x03;\x12%\n\x0c\n\x05\x04\x04\
+    \x02\t\x03\x12\x03;(*\n8\n\x04\x04\x04\x02\n\x12\x03<\x02+\"+\x20Video\
+    \x20quality;\x20absent\x20when\x20video\x20disabled\n\n\x0c\n\x05\x04\
+    \x04\x02\n\x04\x12\x03<\x02\n\n\x0c\n\x05\x04\x04\x02\n\x05\x12\x03<\x0b\
+    \x11\n\x0c\n\x05\x04\x04\x02\n\x01\x12\x03<\x12%\n\x0c\n\x05\x04\x04\x02\
+    \n\x03\x12\x03<(*\n<\n\x04\x04\x04\x02\x0b\x12\x03=\x02+\"/\x20min(audio\
+    ,\x20video)\x20\xe2\x80\x94\x20primary\x20alerting\x20metric\n\n\x0c\n\
+    \x05\x04\x04\x02\x0b\x04\x12\x03=\x02\n\n\x0c\n\x05\x04\x04\x02\x0b\x05\
+    \x12\x03=\x0b\x11\n\x0c\n\x05\x04\x04\x02\x0b\x01\x12\x03=\x12$\n\x0c\n\
+    \x05\x04\x04\x02\x0b\x03\x12\x03=(*\n\n\n\x02\x04\x05\x12\x04@\0_\x01\n\
+    \n\n\x03\x04\x05\x01\x12\x03@\x08\x14\n\x0b\n\x04\x04\x05\x02\0\x12\x03A\
+    \x02\x18\n\x0c\n\x05\x04\x05\x02\0\x05\x12\x03A\x02\x08\n\x0c\n\x05\x04\
+    \x05\x02\0\x01\x12\x03A\t\x13\n\x0c\n\x05\x04\x05\x02\0\x03\x12\x03A\x16\
+    \x17\n\x0b\n\x04\x04\x05\x02\x01\x12\x03B\x02\x18\n\x0c\n\x05\x04\x05\
+    \x02\x01\x05\x12\x03B\x02\x08\n\x0c\n\x05\x04\x05\x02\x01\x01\x12\x03B\t\
+    \x13\n\x0c\n\x05\x04\x05\x02\x01\x03\x12\x03B\x16\x17\n\x0b\n\x04\x04\
+    \x05\x02\x02\x12\x03C\x02\x1e\n\x0c\n\x05\x04\x05\x02\x02\x05\x12\x03C\
+    \x02\x07\n\x0c\n\x05\x04\x05\x02\x02\x01\x12\x03C\x08\x19\n\x0c\n\x05\
+    \x04\x05\x02\x02\x03\x12\x03C\x1c\x1d\n\x0b\n\x04\x04\x05\x02\x03\x12\
+    \x03D\x02\x1a\n\x0c\n\x05\x04\x05\x02\x03\x05\x12\x03D\x02\x08\n\x0c\n\
+    \x05\x04\x05\x02\x03\x01\x12\x03D\t\x15\n\x0c\n\x05\x04\x05\x02\x03\x03\
+    \x12\x03D\x18\x19\n9\n\x04\x04\x05\x02\x04\x12\x03G\x02#\x1a,\x20Sender\
+    \x20self-reported\x20state\x20(authoritative)\n\n\x0c\n\x05\x04\x05\x02\
+    \x04\x05\x12\x03G\x02\x06\n\x0c\n\x05\x04\x05\x02\x04\x01\x12\x03G\x07\
+    \x1e\n\x0c\n\x05\x04\x05\x02\x04\x03\x12\x03G!\"\n\x0b\n\x04\x04\x05\x02\
+    \x05\x12\x03H\x02#\n\x0c\n\x05\x04\x05\x02\x05\x05\x12\x03H\x02\x06\n\
+    \x0c\n\x05\x04\x05\x02\x05\x01\x12\x03H\x07\x1e\n\x0c\n\x05\x04\x05\x02\
+    \x05\x03\x12\x03H!\"\n8\n\x04\x04\x05\x02\x06\x12\x03K\x02(\x1a+\x20Per-\
+    peer\x20stats\x20keyed\x20by\x20peer_id\x20(to_peer)\n\n\x0c\n\x05\x04\
+    \x05\x02\x06\x06\x12\x03K\x02\x18\n\x0c\n\x05\x04\x05\x02\x06\x01\x12\
+    \x03K\x19#\n\x0c\n\x05\x04\x05\x02\x06\x03\x12\x03K&'\n<\n\x04\x04\x05\
+    \x02\x07\x12\x03N\x02\x1f\x1a/\x20Active\x20connection\x20info\x20(clien\
+    t-side\x20measured)\n\n\x0c\n\x05\x04\x05\x02\x07\x05\x12\x03N\x02\x08\n\
+    \x0c\n\x05\x04\x05\x02\x07\x01\x12\x03N\t\x1a\n\x0c\n\x05\x04\x05\x02\
+    \x07\x03\x12\x03N\x1d\x1e\n+\n\x04\x04\x05\x02\x08\x12\x03O\x02\x20\"\
+    \x1e\x20\"webtransport\"\x20|\x20\"websocket\"\n\n\x0c\n\x05\x04\x05\x02\
+    \x08\x05\x12\x03O\x02\x08\n\x0c\n\x05\x04\x05\x02\x08\x01\x12\x03O\t\x1b\
+    \n\x0c\n\x05\x04\x05\x02\x08\x03\x12\x03O\x1e\x1f\n\x0b\n\x04\x04\x05\
+    \x02\t\x12\x03P\x02#\n\x0c\n\x05\x04\x05\x02\t\x05\x12\x03P\x02\x08\n\
+    \x0c\n\x05\x04\x05\x02\t\x01\x12\x03P\t\x1d\n\x0c\n\x05\x04\x05\x02\t\
+    \x03\x12\x03P\x20\"\np\n\x04\x04\x05\x02\n\x12\x03S\x02\x1b\x1a3\x20Phas\
+    e\x201\x20metrics:\x20Browser\x20state\x20and\x20resource\x20usage\n\".\
+    \x20Tab\x20visibility\x20state\x20(true\x20=\x20visible/active)\n\n\x0c\
+    \n\x05\x04\x05\x02\n\x05\x12\x03S\x02\x06\n\x0c\n\x05\x04\x05\x02\n\x01\
+    \x12\x03S\x07\x15\n\x0c\n\x05\x04\x05\x02\n\x03\x12\x03S\x18\x1a\n0\n\
+    \x04\x04\x05\x02\x0b\x12\x03T\x02)\"#\x20JS\x20heap\x20memory\x20used\
+    \x20(Chrome\x20only)\n\n\x0c\n\x05\x04\x05\x02\x0b\x04\x12\x03T\x02\n\n\
+    \x0c\n\x05\x04\x05\x02\x0b\x05\x12\x03T\x0b\x11\n\x0c\n\x05\x04\x05\x02\
+    \x0b\x01\x12\x03T\x12#\n\x0c\n\x05\x04\x05\x02\x0b\x03\x12\x03T&(\n1\n\
+    \x04\x04\x05\x02\x0c\x12\x03U\x02*\"$\x20JS\x20heap\x20memory\x20limit\
+    \x20(Chrome\x20only)\n\n\x0c\n\x05\x04\x05\x02\x0c\x04\x12\x03U\x02\n\n\
+    \x0c\n\x05\x04\x05\x02\x0c\x05\x12\x03U\x0b\x11\n\x0c\n\x05\x04\x05\x02\
+    \x0c\x01\x12\x03U\x12$\n\x0c\n\x05\x04\x05\x02\x0c\x03\x12\x03U')\n+\n\
+    \x04\x04\x05\x02\r\x12\x03V\x02-\"\x1e\x20Average\x20encode\x20latency\
+    \x20in\x20ms\n\n\x0c\n\x05\x04\x05\x02\r\x04\x12\x03V\x02\n\n\x0c\n\x05\
+    \x04\x05\x02\r\x05\x12\x03V\x0b\x11\n\x0c\n\x05\x04\x05\x02\r\x01\x12\
+    \x03V\x12'\n\x0c\n\x05\x04\x05\x02\r\x03\x12\x03V*,\n+\n\x04\x04\x05\x02\
+    \x0e\x12\x03W\x02\x1d\"\x1e\x20Browser\x20tab\x20throttling\x20state\n\n\
+    \x0c\n\x05\x04\x05\x02\x0e\x05\x12\x03W\x02\x06\n\x0c\n\x05\x04\x05\x02\
+    \x0e\x01\x12\x03W\x07\x17\n\x0c\n\x05\x04\x05\x02\x0e\x03\x12\x03W\x1a\
+    \x1c\n*\n\x04\x04\x05\x02\x0f\x12\x03X\x02(\"\x1d\x20Bytes\x20queued\x20\
+    in\x20send\x20buffer\n\n\x0c\n\x05\x04\x05\x02\x0f\x04\x12\x03X\x02\n\n\
+    \x0c\n\x05\x04\x05\x02\x0f\x05\x12\x03X\x0b\x11\n\x0c\n\x05\x04\x05\x02\
+    \x0f\x01\x12\x03X\x12\"\n\x0c\n\x05\x04\x05\x02\x0f\x03\x12\x03X%'\n\"\n\
+    \x04\x04\x05\x02\x10\x12\x03Y\x020\"\x15\x20Inbound\x20packet\x20rate\n\
+    \n\x0c\n\x05\x04\x05\x02\x10\x04\x12\x03Y\x02\n\n\x0c\n\x05\x04\x05\x02\
+    \x10\x05\x12\x03Y\x0b\x11\n\x0c\n\x05\x04\x05\x02\x10\x01\x12\x03Y\x12*\
+    \n\x0c\n\x05\x04\x05\x02\x10\x03\x12\x03Y-/\n#\n\x04\x04\x05\x02\x11\x12\
+    \x03Z\x02,\"\x16\x20Outbound\x20packet\x20rate\n\n\x0c\n\x05\x04\x05\x02\
+    \x11\x04\x12\x03Z\x02\n\n\x0c\n\x05\x04\x05\x02\x11\x05\x12\x03Z\x0b\x11\
+    \n\x0c\n\x05\x04\x05\x02\x11\x01\x12\x03Z\x12&\n\x0c\n\x05\x04\x05\x02\
+    \x11\x03\x12\x03Z)+\n\xed\x01\n\x04\x04\x05\x02\x12\x12\x03^\x02$\x1a\
+    \xdf\x01\x20Display\x20name\x20as\x20entered\x20by\x20the\x20user\x20in\
+    \x20the\x20UI\x20(e.g.\x20\"Jay\x20at\x20work\").\n\x20Included\x20in\
+    \x20every\x20health\x20packet\x20so\x20observers\x20(vcprobe,\x20metrics\
+    _server)\n\x20can\x20learn\x20display\x20names\x20without\x20depending\
+    \x20on\x20one-shot\x20PARTICIPANT_JOINED\x20events.\n\n\x0c\n\x05\x04\
+    \x05\x02\x12\x04\x12\x03^\x02\n\n\x0c\n\x05\x04\x05\x02\x12\x05\x12\x03^\
+    \x0b\x11\n\x0c\n\x05\x04\x05\x02\x12\x01\x12\x03^\x12\x1e\n\x0c\n\x05\
+    \x04\x05\x02\x12\x03\x12\x03^!#b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

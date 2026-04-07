@@ -30,6 +30,7 @@ use crate::constants::{
 };
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
+use crate::metrics::{RELAY_ACTIVE_SESSIONS_PER_ROOM, RELAY_ROOM_BYTES_TOTAL};
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
 };
@@ -194,6 +195,8 @@ pub struct SessionLogic {
     /// When true, this session is observer-only: it can receive messages
     /// but cannot publish media to the room.
     pub observer: bool,
+    /// Transport type for this session ("websocket" or "webtransport")
+    pub transport: String,
     /// Tracks outbound packet drops per sender to generate CONGESTION feedback.
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
@@ -212,11 +215,12 @@ impl SessionLogic {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
+        transport: &str,
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
-            "new session: room={} user_id={} display_name={} session_id={} observer={}",
-            room, user_id, display_name, id, observer
+            "new session: room={} user_id={} display_name={} session_id={} observer={} transport={}",
+            room, user_id, display_name, id, observer, transport
         );
 
         SessionLogic {
@@ -229,6 +233,7 @@ impl SessionLogic {
             tracker_sender,
             session_manager,
             observer,
+            transport: transport.to_string(),
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
         }
@@ -239,13 +244,16 @@ impl SessionLogic {
     // =========================================================================
 
     /// Track connection start for metrics
-    pub fn track_connection_start(&self, transport: &str) {
+    pub fn track_connection_start(&self) {
+        RELAY_ACTIVE_SESSIONS_PER_ROOM
+            .with_label_values(&[&self.room, &self.transport])
+            .inc();
         send_connection_started(
             &self.tracker_sender,
             self.id,
             self.user_id.clone(),
             self.room.clone(),
-            transport.to_string(),
+            self.transport.clone(),
         );
     }
 
@@ -323,6 +331,9 @@ impl SessionLogic {
     /// Handle actor stopping - cleanup
     pub fn on_stopping(&self) {
         info!("Session stopping: {} in room {}", self.id, self.room);
+        RELAY_ACTIVE_SESSIONS_PER_ROOM
+            .with_label_values(&[&self.room, &self.transport])
+            .dec();
         send_connection_ended(&self.tracker_sender, self.id);
         self.addr.do_send(Disconnect {
             session: self.id,
@@ -350,6 +361,9 @@ impl SessionLogic {
     /// data packets are silently dropped.
     pub fn handle_inbound(&mut self, data: &[u8]) -> InboundAction {
         // Track received data
+        RELAY_ROOM_BYTES_TOTAL
+            .with_label_values(&[&self.room, "inbound"])
+            .inc_by(data.len() as f64);
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_received(self.id, data.len() as u64);
 
@@ -408,6 +422,9 @@ impl SessionLogic {
     ///
     /// Returns the bytes to send and tracks metrics.
     pub fn handle_outbound(&self, msg: &Message) -> Vec<u8> {
+        RELAY_ROOM_BYTES_TOTAL
+            .with_label_values(&[&self.room, "outbound"])
+            .inc_by(msg.msg.len() as f64);
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_sent(self.id, msg.msg.len() as u64);
         msg.msg.clone()

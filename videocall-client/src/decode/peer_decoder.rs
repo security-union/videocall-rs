@@ -371,6 +371,7 @@ impl PeerDecode for StandardAudioPeerDecoder {
                 );
                 if let Err(e) = self.decoder.decode(packet.clone()) {
                     log::error!("Error decoding audio packet: {e:?}");
+                    // Phase 1: This error will be caught and counted as a frame drop in peer_decode_manager
                     return Err(anyhow::anyhow!("Failed to decode audio packet"));
                 }
                 self.decoded = true;

@@ -268,6 +268,11 @@ impl WebSocketTask {
         self.ws.buffered_amount()
     }
 
+    /// Get the amount of data in bytes queued to be transmitted (bufferedAmount)
+    pub fn get_buffered_amount(&self) -> Option<u64> {
+        Some(self.ws.buffered_amount() as u64)
+    }
+
     /// Sends data to a WebSocket connection.
     pub fn send(&mut self, data: String) {
         if !self.is_active() {

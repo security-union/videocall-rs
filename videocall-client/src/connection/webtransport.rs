@@ -205,8 +205,8 @@ fn handle_unidirectional_stream(
                         }
 
                         // Extract the complete packet payload, advance the buffer.
-                        let packet_data = pending[4..4 + len].to_vec();
-                        pending = pending[4 + len..].to_vec();
+                        // drain() avoids a second Vec allocation for the remainder.
+                        let packet_data: Vec<u8> = pending.drain(..4 + len).skip(4).collect();
                         callback.emit(packet_data);
                     }
 
@@ -314,10 +314,8 @@ fn emit_packet(bytes: Vec<u8>, message_type: MessageType, callback: Callback<Pac
 }
 
 fn append_uint8_array_to_vec(rust_vec: &mut Vec<u8>, js_array: &Uint8Array) {
-    // Convert the Uint8Array into a Vec<u8>
-    let mut temp_vec = vec![0; js_array.length() as usize];
-    js_array.copy_to(&mut temp_vec);
-
-    // Append it to the existing Rust Vec<u8>
-    rust_vec.append(&mut temp_vec);
+    let start = rust_vec.len();
+    let len = js_array.length() as usize;
+    rust_vec.resize(start + len, 0);
+    js_array.copy_to(&mut rust_vec[start..]);
 }

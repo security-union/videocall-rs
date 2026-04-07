@@ -119,6 +119,12 @@ impl WebTransportBridge {
     }
 
     /// Spawn UniStream reader task.
+    ///
+    /// NOTE: This reader assumes the client sends one complete packet per uni
+    /// stream (open, write, finish). If the client switches to persistent
+    /// streams with length-prefix framing (like `spawn_writer` does for
+    /// server→client), this reader must be updated to parse length-prefixed
+    /// frames instead of calling `read_to_end`.
     fn spawn_unistream_reader<A>(join_set: &mut JoinSet<()>, session: Session, actor_addr: Addr<A>)
     where
         A: actix::Actor<Context = actix::Context<A>> + actix::Handler<WtInbound>,

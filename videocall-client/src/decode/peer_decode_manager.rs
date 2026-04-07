@@ -21,7 +21,7 @@ use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
     KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
-    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
+    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_SLOW_RETRY_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
 };
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
@@ -130,9 +130,11 @@ impl SequenceTracker {
     /// detected (packets that shifted off the window unseen).
     fn record_seq(&mut self, seq: u64) -> u32 {
         let Some(high) = self.high_seq else {
-            // First packet -- initialize.
+            // First packet -- initialize. Mark all window positions as "seen"
+            // so that pre-stream positions (negative sequence numbers that never
+            // existed) are not counted as lost when the window advances.
             self.high_seq = Some(seq);
-            self.seen_bits = 1; // bit 0 = high_seq seen
+            self.seen_bits = u64::MAX;
             return 0;
         };
 
@@ -176,7 +178,9 @@ impl SequenceTracker {
     /// Implements exponential backoff: first request after
     /// `KEYFRAME_REQUEST_TIMEOUT_MS`, then intervals double from
     /// `KEYFRAME_REQUEST_MIN_INTERVAL_MS` up to `KEYFRAME_REQUEST_MAX_BACKOFF_MS`.
-    /// Gives up after `KEYFRAME_REQUEST_MAX_UNANSWERED` unanswered requests.
+    /// After `KEYFRAME_REQUEST_MAX_UNANSWERED` unanswered requests, switches to
+    /// a slow periodic retry (`KEYFRAME_REQUEST_SLOW_RETRY_MS`) to recover from
+    /// persistent loss without flooding the sender.
     fn should_request_keyframe(&mut self, now: u64) -> bool {
         if self.lost_count == 0 {
             // No loss -- reset all request state.
@@ -191,14 +195,21 @@ impl SequenceTracker {
         let elapsed_since_loss = now.saturating_sub(loss_time);
         let elapsed_since_last_req = now.saturating_sub(self.last_keyframe_request_ms);
 
-        // Don't send if we've given up (max unanswered requests reached).
-        if self.unanswered_requests >= KEYFRAME_REQUEST_MAX_UNANSWERED {
-            return false;
-        }
-
         // Wait for initial timeout before first request.
         if elapsed_since_loss < KEYFRAME_REQUEST_TIMEOUT_MS {
             return false;
+        }
+
+        // After the initial backoff burst is exhausted, switch to slow
+        // periodic retry. Keyframes are 5-10x larger than delta frames
+        // and have a higher drop probability on lossy networks, so giving
+        // up permanently would leave frozen video with no recovery path.
+        if self.unanswered_requests >= KEYFRAME_REQUEST_MAX_UNANSWERED {
+            if elapsed_since_last_req < KEYFRAME_REQUEST_SLOW_RETRY_MS {
+                return false;
+            }
+            self.last_keyframe_request_ms = now;
+            return true;
         }
 
         // Exponential backoff between requests.
@@ -1861,7 +1872,9 @@ mod tests {
     fn keyframe_clears_loss_state() {
         let (mut peer, _muted) = make_test_peer(204);
 
-        // Establish genuine loss: seq 1 -> seq 70.
+        // Establish genuine loss: send seq 1, then fill the window to push
+        // the gap past the 64-packet boundary so it's counted as lost.
+        // seq 1 -> seq 3 (skip 2) -> seq 67 (shifts seq 2 off as lost)
         let pkt1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -1876,11 +1889,11 @@ mod tests {
         };
         let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
 
-        let pkt70 = {
+        let pkt3 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
                 video_metadata: Some(VideoMetadata {
-                    sequence: 70,
+                    sequence: 3,
                     ..Default::default()
                 })
                 .into(),
@@ -1888,7 +1901,22 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt70);
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt3);
+
+        // Advance to seq 67 (shift = 64), pushing seq 2 off the window as lost.
+        let pkt67 = {
+            use videocall_types::protos::media_packet::VideoMetadata;
+            MediaPacket {
+                video_metadata: Some(VideoMetadata {
+                    sequence: 67,
+                    ..Default::default()
+                })
+                .into(),
+                frame_type: "delta".to_string(),
+                ..Default::default()
+            }
+        };
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt67);
         assert!(peer.video_seq_tracker.lost_count > 0, "Loss should exist");
 
         // Now receive a keyframe -- should clear the loss state.
@@ -2646,22 +2674,14 @@ mod tests {
         assert_eq!(lost, 0, "seq 1 is still within window, not lost yet");
         assert_eq!(tracker.lost_count, 0);
 
-        // Send seq 66 -- shifts the window by 64, pushing seq 1 off.
-        // Positions 3..65 were never seen (63 positions), plus seq 1 (1 position) = 64 lost.
-        // Wait, let's think about this more carefully.
-        // After seq 0 and seq 2: high_seq = 2, seen_bits has bit 0 (seq 2) and bit 2 (seq 0) set.
-        // So seen_bits = 0b101 = 5.
-        // Now send seq 66: shift = 66 - 2 = 64. Since shift >= 64, we count
-        // zeros in the old seen_bits (which is 5 = 0b...0101).
-        // count_zeros() on u64 with value 5: 64 - 2 = 62 zeros.
-        // But we cap at 64 (min(62, 64) = 62).
-        // So 62 "lost" packets.
+        // Send seq 66 -- shifts the window by 64, pushing everything off.
+        // With u64::MAX initialization, after seq 0 and seq 2:
+        //   high_seq = 2, seen_bits = 0xFFFF_FFFF_FFFF_FFFD
+        //   (all bits set except bit 1, which is seq 1 — genuinely skipped)
+        // count_zeros() = 1 (only seq 1 was unseen).
         let lost = tracker.record_seq(66);
-        assert_eq!(
-            lost, 62,
-            "62 unseen positions should shift off as lost (seq 1 and 3-63)"
-        );
-        assert_eq!(tracker.lost_count, 62);
+        assert_eq!(lost, 1, "Only seq 1 was genuinely skipped");
+        assert_eq!(tracker.lost_count, 1);
     }
 
     /// Late arrival (out-of-order) within the window should fill in the
@@ -2682,34 +2702,12 @@ mod tests {
         tracker.record_seq(4);
         assert_eq!(tracker.lost_count, 0);
 
-        // Now advance to seq 70 -- everything in the window was seen, so
-        // no losses when they shift off.
+        // Advance to seq 70 -- the entire window shifts out (gap=65 >= 64).
+        // With seen_bits initialized to u64::MAX on the first packet, all
+        // pre-stream positions are marked as "seen", so count_zeros = 0.
+        // No phantom losses.
         let lost = tracker.record_seq(70);
-        // Only 6 positions (0-5) were seen out of the 64-bit window after seq 5.
-        // Positions 6-69 are new, but position 6-63 in the old window were never seen.
-        // Actually: high_seq was 5, seen_bits has bits 0-5 set (all filled).
-        // Shift = 70 - 5 = 65 >= 64, so entire window shifts out.
-        // seen_bits had 6 bits set, count_zeros = 64 - 6 = 58.
-        // But those 58 "unseen" positions represent seq numbers -58..-1
-        // which never existed. This is the edge case: the tracker doesn't
-        // know where the stream started.
-        //
-        // This is acceptable behavior: those phantom losses will trigger a
-        // keyframe request, which is the correct response to uncertainty.
-        // In practice, streams run for thousands of packets, so the window
-        // is always full of real sequence numbers after the initial warmup.
-        //
-        // For this test, just verify the late arrivals prevented loss for
-        // the positions we actually cared about.
-        // Some phantom losses from pre-stream positions are expected (u32
-        // is always >= 0, so we just document the expectation here).
-
-        // More importantly: verify that the 6 actual packets (0-5) were NOT
-        // counted as lost. The lost_count should be exactly the phantom ones.
-        // In the old window of 64 positions relative to high_seq=5:
-        //   bit 0 = seq 5 (seen), bit 1 = seq 4 (seen), ..., bit 5 = seq 0 (seen)
-        //   bits 6-63 = phantom (seq -1 to seq -58) = 58 unseen
-        assert_eq!(lost, 58, "Only phantom pre-stream positions should be lost");
+        assert_eq!(lost, 0, "No phantom losses with u64::MAX initialization");
     }
 
     /// Exponential backoff: the interval between keyframe requests should
@@ -2759,7 +2757,7 @@ mod tests {
     /// After KEYFRAME_REQUEST_MAX_UNANSWERED requests with no keyframe,
     /// the tracker should give up and stop requesting.
     #[wasm_bindgen_test]
-    fn max_unanswered_requests_gives_up() {
+    fn max_unanswered_switches_to_slow_retry() {
         let mut tracker = SequenceTracker::new();
         tracker.lost_count = 5;
         tracker.loss_detected_at_ms = Some(0);
@@ -2777,11 +2775,25 @@ mod tests {
         }
         assert_eq!(tracker.unanswered_requests, KEYFRAME_REQUEST_MAX_UNANSWERED);
 
-        // The next request should be suppressed (gave up).
-        time += tracker.current_backoff_ms + 10000;
+        // Shortly after exhaustion, should NOT fire (slow retry interval not elapsed).
+        time += 5000;
         assert!(
             !tracker.should_request_keyframe(time),
-            "Should give up after max unanswered requests"
+            "Should not fire before slow retry interval"
+        );
+
+        // After KEYFRAME_REQUEST_SLOW_RETRY_MS, should fire again.
+        time += KEYFRAME_REQUEST_SLOW_RETRY_MS;
+        assert!(
+            tracker.should_request_keyframe(time),
+            "Should fire slow periodic retry after 15s"
+        );
+
+        // And again after another slow retry interval.
+        time += KEYFRAME_REQUEST_SLOW_RETRY_MS;
+        assert!(
+            tracker.should_request_keyframe(time),
+            "Slow retry should continue periodically"
         );
     }
 

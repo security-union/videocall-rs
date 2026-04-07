@@ -81,17 +81,37 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         target_fps: 30,
         ideal_bitrate_kbps: 2500,
         min_bitrate_kbps: 1500,
-        max_bitrate_kbps: 4000,
+        max_bitrate_kbps: 2500,
         keyframe_interval_frames: 150, // ~5s at 30fps
     },
     VideoQualityTier {
-        label: "high",
+        label: "hd_plus",
+        max_width: 1600,
+        max_height: 900,
+        target_fps: 30,
+        ideal_bitrate_kbps: 2000,
+        min_bitrate_kbps: 1200,
+        max_bitrate_kbps: 3000,
+        keyframe_interval_frames: 150, // ~5s at 30fps
+    },
+    VideoQualityTier {
+        label: "hd",
         max_width: 1280,
         max_height: 720,
         target_fps: 30,
         ideal_bitrate_kbps: 1500,
         min_bitrate_kbps: 800,
         max_bitrate_kbps: 2500,
+        keyframe_interval_frames: 150, // ~5s at 30fps
+    },
+    VideoQualityTier {
+        label: "standard",
+        max_width: 960,
+        max_height: 540,
+        target_fps: 30,
+        ideal_bitrate_kbps: 900,
+        min_bitrate_kbps: 500,
+        max_bitrate_kbps: 1500,
         keyframe_interval_frames: 150, // ~5s at 30fps
     },
     VideoQualityTier {
@@ -108,10 +128,20 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         label: "low",
         max_width: 640,
         max_height: 360,
+        target_fps: 20,
+        ideal_bitrate_kbps: 400,
+        min_bitrate_kbps: 200,
+        max_bitrate_kbps: 600,
+        keyframe_interval_frames: 100, // ~5s at 20fps
+    },
+    VideoQualityTier {
+        label: "very_low",
+        max_width: 480,
+        max_height: 270,
         target_fps: 15,
-        ideal_bitrate_kbps: 300,
-        min_bitrate_kbps: 150,
-        max_bitrate_kbps: 500,
+        ideal_bitrate_kbps: 250,
+        min_bitrate_kbps: 100,
+        max_bitrate_kbps: 400,
         keyframe_interval_frames: 75, // ~5s at 15fps
     },
     VideoQualityTier {
@@ -128,10 +158,12 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at "high" (720p/30fps) — a middle ground that looks good on
-/// most connections. The PID controller steps up to 1080p if bandwidth
-/// allows, or steps down to 480p/360p if constrained.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "high"
+/// Starting at "medium" (480p/25fps/600kbps) keeps initial bandwidth
+/// under 1 Mbps, avoiding buffer bloat on constrained connections during
+/// the 5s warmup period when tier transitions are suppressed. The PID
+/// controller steps up to 720p/1080p if bandwidth permits, or steps
+/// down to 360p/240p if constrained.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
@@ -321,9 +353,16 @@ pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 1000;
 pub const KEYFRAME_REQUEST_MAX_BACKOFF_MS: u64 = 8000;
 
 /// Maximum number of unanswered keyframe requests before giving up.
-/// After this many requests with no keyframe received, stop sending PLIs
-/// and wait for a natural keyframe from the sender.
+/// After this many requests with no keyframe received, switch from
+/// exponential backoff to slow periodic retry.
 pub const KEYFRAME_REQUEST_MAX_UNANSWERED: u32 = 5;
+
+/// Slow periodic retry interval (milliseconds) after the initial backoff
+/// is exhausted. On lossy networks, keyframes (5-10x larger than delta
+/// frames) have a higher drop probability, so giving up permanently
+/// would leave the user with frozen video. A slow retry every 15 seconds
+/// balances recovery against bandwidth cost.
+pub const KEYFRAME_REQUEST_SLOW_RETRY_MS: u64 = 15000;
 
 // ---------------------------------------------------------------------------
 // Reconnection
@@ -782,7 +821,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "high", "default tier should be 'high'");
+        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
     }
 
     #[test]

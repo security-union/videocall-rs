@@ -511,6 +511,58 @@ impl Handler<ActivateConnection> for ChatServer {
             true
         };
 
+        // --- Cross-server eviction broadcast ---
+        // Deferred from JoinRoom to here so that only the elected connection
+        // (the winner of RTT election) publishes. Testing connections that
+        // lose the election never trigger a NATS eviction message.
+        if was_testing {
+            if let Some(iid) = self
+                .instance_index
+                .iter()
+                .find(|(_, &sid)| sid == session)
+                .map(|(iid, _)| iid.clone())
+            {
+                // Look up room and user_id from room_members.
+                let mut room_user: Option<(String, String)> = None;
+                for (room_id, members) in &self.room_members {
+                    for (sid, uid, _) in members {
+                        if *sid == session {
+                            room_user = Some((room_id.clone(), uid.clone()));
+                            break;
+                        }
+                    }
+                    if room_user.is_some() {
+                        break;
+                    }
+                }
+                if let Some((room_id, user_id)) = room_user {
+                    let payload = EvictInstancePayload {
+                        instance_id: iid,
+                        room: room_id,
+                        user_id,
+                        new_session_id: session,
+                    };
+                    match serde_json::to_vec(&payload) {
+                        Ok(json) => {
+                            let nc = self.nats_connection.clone();
+                            let fut = async move {
+                                if let Err(e) =
+                                    nc.publish(EVICT_INSTANCE_SUBJECT, json.into()).await
+                                {
+                                    error!("Failed to publish eviction to NATS: {}", e);
+                                }
+                            };
+                            let fut = actix::fut::wrap_future::<_, Self>(fut);
+                            ctx.spawn(fut);
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize EvictInstancePayload: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
         // Broadcast PARTICIPANT_JOINED now that this connection is confirmed
         // as the elected/active one. During JoinRoom, the broadcast was deferred
         // to avoid ghost join events from Testing connections (e.g., the losing
@@ -783,30 +835,10 @@ impl Handler<JoinRoom> for ChatServer {
             // Register/update this instance_id → session mapping
             self.instance_index.insert(iid.clone(), session);
 
-            // Broadcast eviction to other server replicas via NATS.
-            // Always publish (not just when local eviction succeeded) because
-            // another server may hold the stale session.
-            let payload = EvictInstancePayload {
-                instance_id: iid.clone(),
-                room: room.clone(),
-                user_id: user_id.clone(),
-                new_session_id: session,
-            };
-            match serde_json::to_vec(&payload) {
-                Ok(json) => {
-                    let nc = self.nats_connection.clone();
-                    let fut = async move {
-                        if let Err(e) = nc.publish(EVICT_INSTANCE_SUBJECT, json.into()).await {
-                            error!("Failed to publish eviction to NATS: {}", e);
-                        }
-                    };
-                    let fut = actix::fut::wrap_future::<_, Self>(fut);
-                    ctx.spawn(fut);
-                }
-                Err(e) => {
-                    error!("Failed to serialize EvictInstancePayload: {}", e);
-                }
-            }
+            // Cross-server eviction broadcast is deferred to ActivateConnection.
+            // During RTT election, multiple connections (WS + WT) fire JoinRoom,
+            // but only the winner activates. Publishing here would send 2-4
+            // unnecessary NATS messages per connect.
         }
 
         // --- Reconnection grace period: cancel pending departure ---

@@ -19,6 +19,7 @@
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
+use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
 use dioxus::prelude::*;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
@@ -442,6 +443,7 @@ pub fn Diagnostics(
     share_screen: bool,
     encoder_settings: Option<String>,
 ) -> Element {
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut selected_peer = use_signal(|| "All Peers".to_string());
     let mut diagnostics_data = use_signal(|| None::<String>);
     let mut sender_stats = use_signal(|| None::<String>);
@@ -736,6 +738,11 @@ pub fn Diagnostics(
                             span { class: "build-info-cell", "Commit" }
                             span { class: "build-info-cell", "Branch" }
                         }
+                        div { class: "build-info-row",
+                            span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
+                            span { class: "build-info-cell monospace", "" }
+                            span { class: "build-info-cell", "" }
+                        }
                         for comp in backend_versions() {
                             {
                                 let svc = comp["service"].as_str().unwrap_or("?").to_string();
@@ -757,6 +764,40 @@ pub fn Diagnostics(
                 div { class: "diagnostics-section",
                     h3 { "Connection Manager" }
                     ConnectionManagerDisplay { connection_manager_state: conn_state }
+                }
+                div { class: "diagnostics-section",
+                    h3 { "Transport Preference" }
+                    div { class: "device-setting-group",
+                        select {
+                            id: "diagnostics-transport-select",
+                            class: "peer-selector",
+                            onchange: move |evt: Event<FormData>| {
+                                confirm_transport_change(
+                                    &evt.value(),
+                                    (transport_pref_ctx.0)(),
+                                    "diagnostics-transport-select",
+                                );
+                            },
+                            option {
+                                value: "auto",
+                                selected: (transport_pref_ctx.0)() == TransportPreference::Auto,
+                                "Auto"
+                            }
+                            option {
+                                value: "webtransport",
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebTransportOnly,
+                                "WebTransport"
+                            }
+                            option {
+                                value: "websocket",
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebSocketOnly,
+                                "WebSocket"
+                            }
+                        }
+                    }
+                    p { class: "transport-preference-note",
+                        "Changing protocol will reload the page."
+                    }
                 }
                 if available_peers.len() > 1 {
                     div { class: "diagnostics-section",

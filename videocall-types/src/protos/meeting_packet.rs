@@ -335,6 +335,8 @@ pub mod meeting_packet {
         PARTICIPANT_REJECTED = 7,
         // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.WAITING_ROOM_UPDATED)
         WAITING_ROOM_UPDATED = 8,
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.PARTICIPANT_DISPLAY_NAME_CHANGED)
+        PARTICIPANT_DISPLAY_NAME_CHANGED = 9,
     }
 
     impl ::protobuf::Enum for MeetingEventType {
@@ -355,6 +357,7 @@ pub mod meeting_packet {
                 6 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_ADMITTED),
                 7 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_REJECTED),
                 8 => ::std::option::Option::Some(MeetingEventType::WAITING_ROOM_UPDATED),
+                9 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED),
                 _ => ::std::option::Option::None
             }
         }
@@ -370,6 +373,7 @@ pub mod meeting_packet {
                 "PARTICIPANT_ADMITTED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_ADMITTED),
                 "PARTICIPANT_REJECTED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_REJECTED),
                 "WAITING_ROOM_UPDATED" => ::std::option::Option::Some(MeetingEventType::WAITING_ROOM_UPDATED),
+                "PARTICIPANT_DISPLAY_NAME_CHANGED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED),
                 _ => ::std::option::Option::None
             }
         }
@@ -384,6 +388,7 @@ pub mod meeting_packet {
             MeetingEventType::PARTICIPANT_ADMITTED,
             MeetingEventType::PARTICIPANT_REJECTED,
             MeetingEventType::WAITING_ROOM_UPDATED,
+            MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED,
         ];
     }
 

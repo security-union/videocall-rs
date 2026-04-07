@@ -112,6 +112,10 @@ pub struct VideoCallClientOptions {
     /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
     pub on_peer_left: Option<Callback<(String, String)>>,
 
+    /// Callback triggered when a participant changes their display name.
+    /// Emits `(user_id, new_display_name)`.
+    pub on_display_name_changed: Option<Callback<(String, String)>>,
+
     /// Callback triggered when a remote participant joins the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_JOINED meeting event.
     pub on_peer_joined: Option<Callback<(String, String)>>,
@@ -130,6 +134,7 @@ struct InnerOptions {
     on_waiting_room_updated: Option<Callback<()>>,
     on_peer_left: Option<Callback<(String, String)>>,
     on_peer_joined: Option<Callback<(String, String)>>,
+    on_display_name_changed: Option<Callback<(String, String)>>,
 }
 
 #[derive(Debug)]
@@ -265,6 +270,7 @@ impl VideoCallClient {
                     on_participant_admitted: options.on_participant_admitted.clone(),
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
+                    on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
                 },
@@ -394,6 +400,8 @@ impl VideoCallClient {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
                             inner.on_inbound_media(packet);
+                        } else {
+                            warn!("on_inbound_media: transient borrow conflict, dropping packet");
                         }
                     }
                 })
@@ -430,7 +438,6 @@ impl VideoCallClient {
             },
             peer_monitor: {
                 let inner = Rc::downgrade(&self.inner);
-                let on_connection_lost = self.options.on_connection_lost.clone();
                 Callback::from(move |_| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         match inner.try_borrow_mut() {
@@ -438,9 +445,15 @@ impl VideoCallClient {
                                 inner.peer_decode_manager.run_peer_monitor();
                             }
                             Err(_) => {
-                                on_connection_lost.emit(JsValue::from_str(
-                                    "Unable to borrow inner -- not starting peer monitor",
-                                ));
+                                // Transient borrow conflict — another callback
+                                // (e.g. on_inbound_media) currently holds the
+                                // mutable borrow.  Skip this cycle; the next
+                                // 5-second interval will retry.  This must NOT
+                                // emit on_connection_lost which would trigger a
+                                // full reconnect.
+                                warn!(
+                                    "peer_monitor: transient borrow conflict, skipping this cycle"
+                                );
                             }
                         }
                     }
@@ -1248,8 +1261,6 @@ impl Inner {
                             }
                         }
                         Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                            // Check dedup before borrowing self.options to avoid
-                            // overlapping mutable/immutable borrows.
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
                             let display_name = if meeting_packet.display_name.is_empty() {
@@ -1257,23 +1268,32 @@ impl Inner {
                             } else {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()
                             };
-                            // Store the display name on the peer so the UI can
-                            // show it on tiles instead of the raw user_id/email.
+
                             self.peer_decode_manager.set_peer_display_name_by_user_id(
                                 &target_str,
                                 display_name.clone(),
                             );
+
+                            // NOTE: Do NOT emit on_display_name_changed here.
+                            // PARTICIPANT_JOINED carries the initial display name for bookkeeping
+                            // (set_peer_display_name_by_user_id above), but it is NOT a name-change
+                            // event.  Emitting the callback here would confuse the UI into treating
+                            // every peer join as a display-name mutation — and would spuriously
+                            // update the local user's own name signal on reconnect.
+                            // on_display_name_changed is reserved for PARTICIPANT_DISPLAY_NAME_CHANGED.
+
                             let should_emit = !meeting_packet.target_user_id.is_empty()
                                 && meeting_packet.target_user_id[..]
                                     != *self.options.user_id.as_bytes()
                                 && !self.is_duplicate_peer_event("joined", &target_str);
+
                             if should_emit {
                                 info!("Peer joined: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_joined {
                                     cb.emit((display_name, target_str));
                                 }
                             } else {
-                                debug!("Suppressed PARTICIPANT_JOINED for target={}", target_str,);
+                                debug!("Suppressed PARTICIPANT_JOINED for target={}", target_str);
                             }
                         }
                         Ok(MeetingEventType::PARTICIPANT_LEFT) => {
@@ -1344,6 +1364,34 @@ impl Inner {
                             );
                             if let Some(callback) = &self.options.on_waiting_room_updated {
                                 callback.emit(());
+                            }
+                        }
+                        Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            let new_display_name = if meeting_packet.display_name.is_empty() {
+                                target_str.clone()
+                            } else {
+                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
+                            };
+
+                            info!(
+                                "Received PARTICIPANT_DISPLAY_NAME_CHANGED: user={} new_name=\"{}\" (local_user={})",
+                                target_str, new_display_name, self.options.user_id
+                            );
+
+                            self.peer_decode_manager.set_peer_display_name_by_user_id(
+                                &target_str,
+                                new_display_name.clone(),
+                            );
+
+                            if let Some(cb) = &self.options.on_display_name_changed {
+                                debug!(
+                                    "Emitting on_display_name_changed callback for {}",
+                                    target_str
+                                );
+                                cb.emit((target_str, new_display_name));
+                                debug!("on_display_name_changed callback returned");
                             }
                         }
                         Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {

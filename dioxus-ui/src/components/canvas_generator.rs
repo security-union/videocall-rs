@@ -189,6 +189,7 @@ pub fn generate_for_peer(
     // Compare authenticated user_id (from JWT/DB) instead of user-chosen display name
     // to prevent spoofing the host crown icon.
     let is_host = host_user_id.map(|h| h == peer_user_id).unwrap_or(false);
+    let is_guest = peer_user_id.starts_with("guest:");
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.contains(&peer_user_id) {
         return rsx! {};
@@ -243,6 +244,9 @@ pub fn generate_for_peer(
                         title: "{ss_name_title}",
                         dir: "auto",
                         "{ss_name}"
+                        if is_guest {
+                            span { class: "guest-badge", "Guest" }
+                        }
                     }
                     button {
                         onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
@@ -301,6 +305,9 @@ pub fn generate_for_peer(
                         "{peer_display_name_vo}"
                         if is_host {
                             CrownIcon {}
+                        }
+                        if is_guest {
+                            span { class: "guest-badge", "Guest" }
                         }
                     }
                     div {
@@ -370,6 +377,9 @@ pub fn generate_for_peer(
                         "{peer_display_name_fb}"
                         if is_host {
                             CrownIcon {}
+                        }
+                        if is_guest {
+                            span { class: "guest-badge", "Guest" }
                         }
                     }
                     div {
@@ -446,6 +456,9 @@ pub fn generate_for_peer(
                         title: "{ss_name}",
                         dir: "auto",
                         "{ss_name}"
+                        if is_guest {
+                            span { class: "guest-badge", "Guest" }
+                        }
                     }
                     button {
                         onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
@@ -495,6 +508,9 @@ pub fn generate_for_peer(
                             "{peer_display_name_grid}"
                             if is_host {
                                 CrownIcon {}
+                            }
+                            if is_guest {
+                                span { class: "guest-badge", "Guest" }
                             }
                         }
                         div {

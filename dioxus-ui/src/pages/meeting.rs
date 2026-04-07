@@ -20,7 +20,7 @@ use crate::context::{
     get_or_create_local_user_id, load_display_name_from_storage, save_display_name_to_storage,
     validate_display_name, DisplayNameCtx,
 };
-use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
+use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -79,41 +79,39 @@ pub fn MeetingPage(id: String) -> Element {
     let mut input_value_state = use_signal(|| initial_username);
 
     // Auth check effect
-    use_effect(move || {
-        if oauth_enabled().unwrap_or(false) {
-            wasm_bindgen_futures::spawn_local(async move {
-                match check_session().await {
-                    Ok(_) => auth_checked.set(true),
-                    Err(_) => {
-                        if let Some(win) = window() {
-                            if let Ok(current_url) = win.location().href() {
-                                // Store the return URL in sessionStorage before
-                                // navigating to /login. Dioxus 0.7's router strips
-                                // unrecognized query params via history.replaceState,
-                                // so we cannot rely on ?returnTo= surviving in the URL.
-                                match win.session_storage() {
-                                    Ok(Some(storage)) => {
-                                        if storage
-                                            .set_item("vc_oauth_return_to", &current_url)
-                                            .is_err()
-                                        {
-                                            log::warn!("Failed to write vc_oauth_return_to to sessionStorage — post-login redirect will fall back to app root");
-                                        }
-                                    }
-                                    _ => {
-                                        log::warn!("sessionStorage unavailable — post-login redirect will fall back to app root");
-                                    }
+    {
+        let id_for_auth = id.clone();
+        use_effect(move || {
+            if oauth_enabled().unwrap_or(false) {
+                let id_for_auth = id_for_auth.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match check_session().await {
+                        Ok(_) => auth_checked.set(true),
+                        Err(_) => {
+                            // Check whether the meeting allows guests before deciding
+                            // where to send the unauthenticated user.
+                            let allow_guests = get_meeting_guest_info(&id_for_auth)
+                                .await
+                                .map(|info| info.allow_guests)
+                                .unwrap_or(false);
+                            log::info!("authenticated check");
+                            if let Some(win) = window() {
+                                if allow_guests {
+                                    let guest_url =
+                                        format!("/meeting/{}/guest", id_for_auth);
+                                    let _ = win.location().set_href(&guest_url);
+                                } else {
+                                    let _ = win.location().set_href("/login");
                                 }
-                                let _ = win.location().set_href("/login");
                             }
                         }
                     }
-                }
-            });
-        } else {
-            auth_checked.set(true);
-        }
-    });
+                });
+            } else {
+                auth_checked.set(true);
+            }
+        });
+    }
 
     // Fetch user profile
     use_effect(move || {
@@ -217,6 +215,7 @@ pub fn MeetingPage(id: String) -> Element {
 
                             match join_meeting(&meeting_id, Some(&display_name)).await {
                                 Ok(response) => {
+                                    log::info!("join was Ok");
                                     let effective_user_id = if response.user_id.is_empty() {
                                         get_or_create_local_user_id()
                                     } else {
@@ -266,7 +265,24 @@ pub fn MeetingPage(id: String) -> Element {
                                         ))),
                                     }
                                 }
+                                Err(JoinError::NotAuthenticated) => {
+                                    log::info!("Join::NotAuthenticated error");
+                                    let allow_guests = get_meeting_guest_info(&meeting_id)
+                                        .await
+                                        .map(|info| info.allow_guests)
+                                        .unwrap_or(false);
+                                    if let Some(win) = window() {
+                                        if allow_guests {
+                                            let guest_url =
+                                                format!("/meeting/{}/guest", meeting_id);
+                                            let _ = win.location().set_href(&guest_url);
+                                        } else {
+                                            let _ = win.location().set_href("/login");
+                                        }
+                                    }
+                                }
                                 Err(e) => {
+                                    log::info!("undefined error");
                                     meeting_status.set(MeetingStatus::Error(e.to_string()));
                                 }
                             }
@@ -321,6 +337,7 @@ pub fn MeetingPage(id: String) -> Element {
             wasm_bindgen_futures::spawn_local(async move {
                 match join_meeting(&meeting_id, Some(&display_name)).await {
                     Ok(response) => {
+                        log::info!("join was ok 2");
                         // Use the API-provided user_id when available;
                         // fall back to a locally-generated stable UUID
                         // so non-OAuth users still get a persistent identity.
@@ -402,7 +419,24 @@ pub fn MeetingPage(id: String) -> Element {
                             observer_token: String::new(),
                         });
                     }
+                    Err(JoinError::NotAuthenticated) => {
+                        log::info!("Not authenticated error and processing");
+                        observer_token_signal.set(None);
+                        let allow_guests = get_meeting_guest_info(&meeting_id)
+                            .await
+                            .map(|info| info.allow_guests)
+                            .unwrap_or(false);
+                        if let Some(win) = window() {
+                            if allow_guests {
+                                let guest_url = format!("/meeting/{}/guest", meeting_id);
+                                let _ = win.location().set_href(&guest_url);
+                            } else {
+                                let _ = win.location().set_href("/login");
+                            }
+                        }
+                    }
                     Err(e) => {
+                        log::info!("undefined error 2");
                         observer_token_signal.set(None);
                         meeting_status.set(MeetingStatus::Error(e.to_string()));
                     }

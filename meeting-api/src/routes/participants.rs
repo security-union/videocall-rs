@@ -29,6 +29,7 @@ use crate::error::AppError;
 use crate::nats_events;
 use crate::state::AppState;
 use crate::token::{generate_observer_token, generate_room_token};
+use crate::auth::GuestObserver;
 
 /// POST /api/v1/meetings/{meeting_id}/join
 ///
@@ -242,6 +243,49 @@ pub async fn get_my_status(
             &user_id,
             &meeting_id,
             row.is_host,
+            row.display_name.as_deref().unwrap_or(&user_id),
+        )?)
+    } else {
+        None
+    };
+
+    let mut resp = row.into_participant_status(token);
+    resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
+    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+    resp.host_display_name = meeting.host_display_name;
+    resp.host_user_id = meeting.creator_id;
+    Ok(Json(APIResponse::ok(resp)))
+}
+
+/// GET /api/v1/meetings/{meeting_id}/guest-status
+///
+/// Polling endpoint for guests (unauthenticated users who joined via
+/// `join_guest`). Authenticates via an observer JWT Bearer token.
+/// When `status == "admitted"` the response includes a fresh `room_token`.
+pub async fn get_guest_status(
+    State(state): State<AppState>,
+    GuestObserver { user_id, .. }: GuestObserver,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    if meeting.state.as_deref() == Some("ended") {
+        return Err(AppError::meeting_not_active(&meeting_id));
+    }
+
+    let row = db_participants::get_status(&state.db, meeting.id, &user_id)
+        .await?
+        .ok_or_else(AppError::not_in_meeting)?;
+
+    let token = if row.status == "admitted" {
+        Some(generate_room_token(
+            &state.jwt_secret,
+            state.token_ttl_secs,
+            &user_id,
+            &meeting_id,
+            false,
             row.display_name.as_deref().unwrap_or(&user_id),
         )?)
     } else {

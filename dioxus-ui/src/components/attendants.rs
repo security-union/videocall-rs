@@ -1138,6 +1138,43 @@ pub fn AttendantsComponent(
                                         },
                                     }
                                 }
+                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
+                                    span { style: "font-size: 0.9rem;", "Allow guests" }
+                                    crate::components::toggle_switch::ToggleSwitch {
+                                        enabled: allow_guests_toggle(),
+                                        disabled: saving(),
+                                        on_toggle: {
+                                            let meeting_id = meeting_id_for_toggle.clone();
+                                            move |new_val: bool| {
+                                                if saving() {
+                                                    return;
+                                                }
+                                                toggle_error.set(None);
+                                                allow_guests_toggle.set(new_val);
+                                                saving.set(true);
+                                                let meeting_id = meeting_id.clone();
+                                                let wr = waiting_room_toggle();
+                                                let aca = Some(admitted_can_admit_toggle());
+                                                wasm_bindgen_futures::spawn_local(async move {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, wr, aca, Some(new_val)).await {
+                                                        Ok(updated) => {
+                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                            admitted_can_admit_toggle.set(updated.admitted_can_admit);
+                                                            allow_guests_toggle.set(updated.allow_guests);
+                                                            saving.set(false);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("Failed to update allow_guests setting: {e}");
+                                                            allow_guests_toggle.set(!new_val);
+                                                            saving.set(false);
+                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        },
+                                    }
+                                }
                                 if let Some(err) = toggle_error() {
                                     p { class: "toggle-error", "{err}" }
                                 }
@@ -1604,6 +1641,9 @@ pub fn AttendantsComponent(
                                     },
                                     reload_devices_counter: reload_devices_counter(),
                                 }
+                            }
+                            if user_id.as_deref().unwrap_or("").starts_with("guest:") {
+                                div { class: "guest-badge-preview", "Guest" }
                             }
                             {
                                 let status_client = client.clone();

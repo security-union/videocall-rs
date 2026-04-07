@@ -113,6 +113,10 @@ pub fn router() -> Router<AppState> {
             "/api/v1/meetings/{meeting_id}/end",
             post(meetings::end_meeting_handler),
         )
+        .route(
+            "/api/v1/meetings/{meeting_id}/guest-info",
+            get(meetings::get_meeting_guest_info),
+        )
         // Participant actions
         .route(
             "/api/v1/meetings/{meeting_id}/join",
@@ -129,6 +133,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}/status",
             get(participants::get_my_status),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/guest-status",
+            get(participants::get_guest_status),
         )
         .route(
             "/api/v1/meetings/{meeting_id}/display-name",

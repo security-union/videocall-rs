@@ -103,6 +103,46 @@ fn extract_session_token(parts: &Parts, cookie_name: &str) -> Option<String> {
     None
 }
 
+/// Extract a bearer token from `Authorization: Bearer <token>`.
+fn extract_bearer_token(parts: &Parts) -> Option<String> {
+    parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Extractor for a guest waiting in the lobby. Authenticates via the
+/// `Authorization: Bearer <observer_token>` header (a signed observer JWT).
+#[derive(Debug)]
+pub struct GuestObserver {
+    pub user_id: String,
+    pub meeting_id: String,
+    pub display_name: String,
+}
+
+impl FromRequestParts<AppState> for GuestObserver {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_bearer_token(parts)
+            .ok_or_else(|| AppError::unauthorized_msg("missing Authorization: Bearer header"))?;
+
+        let claims = token::decode_observer_token(&state.jwt_secret, &token)?;
+
+        Ok(GuestObserver {
+            user_id: claims.sub,
+            meeting_id: claims.room,
+            display_name: claims.display_name,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

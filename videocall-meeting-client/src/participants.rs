@@ -79,6 +79,23 @@ impl MeetingApiClient {
         parse_api_response(response).await
     }
 
+    /// Check a guest participant's current status in a meeting.
+    ///
+    /// Calls `GET /api/v1/meetings/{meeting_id}/guest-status`.
+    ///
+    /// The client must be configured with `AuthMode::Bearer(observer_token)`
+    /// to pass the `GuestObserver` extractor on the server.
+    ///
+    /// When `status` is `"admitted"`, the response includes a `room_token`.
+    pub async fn get_guest_status(
+        &self,
+        meeting_id: &str,
+    ) -> Result<ParticipantStatusResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/guest-status");
+        let response = self.get(&path).send().await?;
+        parse_api_response(response).await
+    }
+
     /// Fetch a fresh room access token for the given meeting.
     ///
     /// Convenience wrapper around [`get_status`](Self::get_status) that

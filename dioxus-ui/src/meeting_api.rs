@@ -4,6 +4,8 @@
 
 use crate::constants::meeting_api_client;
 pub use videocall_meeting_client::ApiError as JoinError;
+pub use videocall_meeting_types::responses::CreateMeetingResponse;
+pub use videocall_meeting_types::responses::MeetingGuestInfoResponse;
 pub use videocall_meeting_types::responses::MeetingInfoResponse as MeetingInfo;
 pub use videocall_meeting_types::responses::ParticipantStatusResponse as JoinMeetingResponse;
 
@@ -33,6 +35,21 @@ pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinE
     client()?.get_status(meeting_id).await
 }
 
+/// Check status for a guest participant using their observer JWT as a Bearer
+/// token. Calls `GET /api/v1/meetings/{meeting_id}/guest-status`.
+pub async fn check_guest_status(
+    meeting_id: &str,
+    observer_token: &str,
+) -> Result<JoinMeetingResponse, JoinError> {
+    let base_url = crate::constants::meeting_api_base_url().map_err(JoinError::Config)?;
+    videocall_meeting_client::MeetingApiClient::new(
+        &base_url,
+        videocall_meeting_client::AuthMode::Bearer(observer_token.to_string()),
+    )
+    .get_guest_status(meeting_id)
+    .await
+}
+
 pub async fn refresh_room_token(meeting_id: &str) -> Result<String, JoinError> {
     client()?.refresh_room_token(meeting_id).await
 }
@@ -54,6 +71,12 @@ pub async fn update_meeting(
 pub async fn end_meeting(meeting_id: &str) -> Result<MeetingInfo, JoinError> {
     log::info!("Ending meeting via API: {meeting_id}");
     client()?.end_meeting(meeting_id).await
+}
+
+pub async fn get_meeting_guest_info(
+    meeting_id: &str,
+) -> Result<MeetingGuestInfoResponse, JoinError> {
+    client()?.get_meeting_guest_info(meeting_id).await
 }
 
 pub async fn delete_meeting(meeting_id: &str) -> Result<(), JoinError> {
@@ -85,4 +108,35 @@ pub async fn update_display_name(
     client()?
         .update_display_name(meeting_id, display_name)
         .await
+}
+
+pub async fn create_meeting(
+    meeting_id: Option<&str>,
+    allow_guests: bool,
+) -> Result<CreateMeetingResponse, JoinError> {
+    let req = videocall_meeting_types::requests::CreateMeetingRequest {
+        meeting_id: meeting_id.map(|s| s.to_string()),
+        attendees: vec![],
+        password: None,
+        waiting_room_enabled: Some(true),
+        admitted_can_admit: Some(false),
+        allow_guests: Some(allow_guests),
+    };
+    client()?.create_meeting(&req).await
+}
+
+pub async fn join_meeting_as_guest(
+    meeting_id: &str,
+    display_name: &str,
+) -> Result<JoinMeetingResponse, JoinError> {
+    log::info!("Joining meeting as guest via API: {meeting_id} (display_name: {display_name})");
+    let result = client()?
+        .join_meeting_as_guest(meeting_id, display_name)
+        .await?;
+    log::info!(
+        "Guest join response: status={}, is_host={}",
+        result.status,
+        result.is_host
+    );
+    Ok(result)
 }

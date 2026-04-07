@@ -97,6 +97,33 @@ pub fn decode_session_token(secret: &str, token: &str) -> Result<SessionTokenCla
     })
 }
 
+/// Decode and validate an observer JWT (a `RoomAccessTokenClaims` with `observer: true`).
+/// Returns the claims on success; returns an `AppError::unauthorized_msg` on failure.
+pub fn decode_observer_token(
+    secret: &str,
+    token: &str,
+) -> Result<RoomAccessTokenClaims, AppError> {
+    let mut validation = Validation::default();
+    validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
+
+    let claims = decode::<RoomAccessTokenClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map(|data| data.claims)
+    .map_err(|e| {
+        tracing::warn!("Observer JWT validation failed: {e}");
+        AppError::unauthorized_msg("invalid or expired observer token")
+    })?;
+
+    if !claims.observer {
+        return Err(AppError::unauthorized_msg("token is not an observer token"));
+    }
+
+    Ok(claims)
+}
+
 // ---------------------------------------------------------------------------
 // Room access token
 // ---------------------------------------------------------------------------

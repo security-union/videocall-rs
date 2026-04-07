@@ -24,7 +24,7 @@ use videocall_meeting_types::{
     requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
     responses::{
         APIResponse, CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
-        MeetingInfoResponse, MeetingSummary,
+        MeetingGuestInfoResponse, MeetingInfoResponse, MeetingSummary,
     },
 };
 
@@ -368,6 +368,23 @@ pub async fn update_meeting(
         started_at: row.started_at.timestamp_millis(),
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
+        allow_guests: row.allow_guests,
+    })))
+}
+
+/// GET /api/v1/meetings/{meeting_id}/guest-info
+///
+/// Public (no authentication required). Returns whether guests are allowed
+/// to join this meeting. Used by the frontend to decide whether to redirect
+/// an unauthenticated user to the guest join page.
+pub async fn get_meeting_guest_info(
+    State(state): State<AppState>,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<APIResponse<MeetingGuestInfoResponse>>, AppError> {
+    let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+    Ok(Json(APIResponse::ok(MeetingGuestInfoResponse {
         allow_guests: row.allow_guests,
     })))
 }

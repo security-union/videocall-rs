@@ -201,6 +201,12 @@ pub struct DeleteMeetingResponse {
     pub message: String,
 }
 
+/// Response payload for `GET /api/v1/meetings/{meeting_id}/guest-info` (public, no auth).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MeetingGuestInfoResponse {
+    pub allow_guests: bool,
+}
+
 /// Response payload for `GET /profile`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProfileResponse {

@@ -2751,6 +2751,13 @@ select {
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.transport-preference-note {
+  margin: 8px 0 0;
+  font-size: 0.75rem;
+  color: var(--text-secondary, rgba(255, 255, 255, 0.5));
+  font-style: italic;
+}
+
 .settings-modal {
   width: min(920px, 92vw);
   max-width: min(920px, 92vw);

@@ -1,7 +1,7 @@
 apiVersion: v2
-name: metrics-api-us-east
+name: metrics-api-ascend
 version: 0.1.0
-description: Metrics API service for us-east region
+description: Metrics API server for Ascend region
 
 dependencies:
   - name: metrics-api

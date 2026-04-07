@@ -110,6 +110,9 @@ pub struct ChatServer {
     /// Maps `instance_id` → `SessionId` for the current active session of each
     /// client instance. Used to find and evict stale sessions on reconnection.
     instance_index: HashMap<String, SessionId>,
+    /// Reverse map: `SessionId` → `instance_id`. Enables O(1) cleanup of
+    /// `instance_index` when a session disconnects, instead of an O(n) retain scan.
+    session_instance: HashMap<SessionId, String>,
 }
 
 impl ChatServer {
@@ -124,6 +127,7 @@ impl ChatServer {
             pending_departures: HashMap::new(),
             suppress_join_broadcast: std::collections::HashSet::new(),
             instance_index: HashMap::new(),
+            session_instance: HashMap::new(),
         }
     }
 
@@ -140,10 +144,15 @@ impl ChatServer {
             task.abort();
         }
 
-        // Clean up instance_index: remove any entry that still points to this
-        // session. If the entry was already replaced by a newer session (eviction),
-        // this is a no-op.
-        self.instance_index.retain(|_, sid| *sid != *session_id);
+        // Clean up instance_index via reverse map: O(1) instead of O(n) retain.
+        // If the entry was already replaced by a newer session (eviction), the
+        // reverse map was already updated, so this is a no-op.
+        if let Some(iid) = self.session_instance.remove(session_id) {
+            // Only remove from instance_index if it still points to this session.
+            if self.instance_index.get(&iid) == Some(session_id) {
+                self.instance_index.remove(&iid);
+            }
+        }
 
         // Remove from room_members tracking
         if let Some(room_id) = room {
@@ -299,6 +308,7 @@ impl ChatServer {
         }
 
         self.instance_index.remove(instance_id);
+        self.session_instance.remove(&prev_sid);
 
         true
     }
@@ -534,12 +544,7 @@ impl Handler<ActivateConnection> for ChatServer {
         // (the winner of RTT election) publishes. Testing connections that
         // lose the election never trigger a NATS eviction message.
         if was_testing {
-            if let Some(iid) = self
-                .instance_index
-                .iter()
-                .find(|(_, &sid)| sid == session)
-                .map(|(iid, _)| iid.clone())
-            {
+            if let Some(iid) = self.session_instance.get(&session).cloned() {
                 // Look up room and user_id from room_members.
                 let mut room_user: Option<(String, String)> = None;
                 for (room_id, members) in &self.room_members {
@@ -724,7 +729,11 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                         self.room_members.remove(&room);
                     }
                 }
-                self.instance_index.retain(|_, sid| *sid != session);
+                if let Some(iid) = self.session_instance.remove(&session) {
+                    if self.instance_index.get(&iid).copied() == Some(session) {
+                        self.instance_index.remove(&iid);
+                    }
+                }
                 return;
             }
 
@@ -855,8 +864,9 @@ impl Handler<JoinRoom> for ChatServer {
         if let Some(ref iid) = instance_id {
             evicted_old_session = self.evict_stale_session(iid, &room, &user_id, session, ctx);
 
-            // Register/update this instance_id → session mapping
+            // Register/update this instance_id → session mapping (both directions).
             self.instance_index.insert(iid.clone(), session);
+            self.session_instance.insert(session, iid.clone());
 
             // Cross-server eviction broadcast is deferred to ActivateConnection.
             // During RTT election, multiple connections (WS + WT) fire JoinRoom,

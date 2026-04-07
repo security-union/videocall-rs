@@ -314,10 +314,8 @@ fn emit_packet(bytes: Vec<u8>, message_type: MessageType, callback: Callback<Pac
 }
 
 fn append_uint8_array_to_vec(rust_vec: &mut Vec<u8>, js_array: &Uint8Array) {
-    // Convert the Uint8Array into a Vec<u8>
-    let mut temp_vec = vec![0; js_array.length() as usize];
-    js_array.copy_to(&mut temp_vec);
-
-    // Append it to the existing Rust Vec<u8>
-    rust_vec.append(&mut temp_vec);
+    let start = rust_vec.len();
+    let len = js_array.length() as usize;
+    rust_vec.resize(start + len, 0);
+    js_array.copy_to(&mut rust_vec[start..]);
 }

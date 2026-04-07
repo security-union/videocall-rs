@@ -297,17 +297,20 @@ pub fn meeting_api_base_url() -> Result<String, String> {
 
 pub fn meeting_api_client() -> Result<videocall_meeting_client::MeetingApiClient, String> {
     let base_url = meeting_api_base_url()?;
-    // Bearer token priority:
-    //   1. access_token — the OAuth access token intended for resource servers.
-    //      Sent as-is; the meeting-api validates it via JWKS.
-    //   2. id_token — fallback for tabs where only the id_token was stored
-    //      (e.g. sessions from before the access_token was introduced).
-    //   3. Cookie mode — for deployments that do not use an external OAuth
-    //      provider (the server still accepts legacy HMAC session JWTs).
-    let auth_mode = crate::auth::get_stored_access_token()
-        .or_else(crate::auth::get_stored_id_token)
-        .map(videocall_meeting_client::AuthMode::Bearer)
-        .unwrap_or(videocall_meeting_client::AuthMode::Cookie);
+    // PKCE flow: check sessionStorage for Bearer tokens (access_token preferred,
+    //   id_token as fallback for older sessions). The meeting-api validates
+    //   these via JWKS.
+    // All other flows (server-side OAuth with HttpOnly session cookie, or
+    //   non-OAuth deployments with HMAC session JWT cookie): use Cookie mode
+    //   so that fetch includes `credentials: 'include'`.
+    let auth_mode = if is_pkce_flow() {
+        crate::auth::get_stored_access_token()
+            .or_else(crate::auth::get_stored_id_token)
+            .map(videocall_meeting_client::AuthMode::Bearer)
+            .unwrap_or(videocall_meeting_client::AuthMode::Cookie)
+    } else {
+        videocall_meeting_client::AuthMode::Cookie
+    };
     Ok(videocall_meeting_client::MeetingApiClient::new(
         &base_url, auth_mode,
     ))

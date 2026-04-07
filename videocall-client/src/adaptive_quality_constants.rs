@@ -75,6 +75,16 @@ pub struct VideoQualityTier {
 /// Video quality tiers, ordered from highest (index 0) to lowest.
 pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
     VideoQualityTier {
+        label: "full_hd",
+        max_width: 1920,
+        max_height: 1080,
+        target_fps: 30,
+        ideal_bitrate_kbps: 2500,
+        min_bitrate_kbps: 1500,
+        max_bitrate_kbps: 4000,
+        keyframe_interval_frames: 150, // ~5s at 30fps
+    },
+    VideoQualityTier {
         label: "high",
         max_width: 1280,
         max_height: 720,
@@ -118,23 +128,17 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at the lowest tier ("minimal", 240p/10fps/150kbps) ensures the
-/// system only ever upgrades from the initial state. This eliminates the
-/// visible dimension-change oscillation that occurred when starting at
-/// "medium": the PID controller allocates ~300 kbps during warmup, but
-/// medium expects ~600 kbps, so bitrate_ratio drops below the degrade
-/// threshold and triggers a step-down. Starting at minimal means the first
-/// tier transition the user sees is a quality *improvement*, not a jarring
-/// resolution drop.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 3; // "minimal"
+/// Starting at "high" (720p/30fps) — a middle ground that looks good on
+/// most connections. The PID controller steps up to 1080p if bandwidth
+/// allows, or steps down to 480p/360p if constrained.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 1; // "high"
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at the lowest tier ("low", 480p/5fps/250kbps) to
-/// match the camera strategy: only upgrade, never visibly downgrade. The
-/// PID controller will quickly ramp up resolution once it measures
-/// sufficient bandwidth, so text readability recovers within seconds.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 2; // "low"
+/// Screen share starts at "medium" (720p/10fps) — readable content from
+/// the first frame with room to step up to 1080p or down to 480p based
+/// on network conditions.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
@@ -304,12 +308,22 @@ pub const CAMERA_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 pub const SCREEN_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 
 /// Max time to wait for a keyframe before requesting one (milliseconds).
-/// After a sequence gap, if no keyframe arrives within this window, send PLI.
+/// After packet loss is detected, if no keyframe arrives within this window, send PLI.
 pub const KEYFRAME_REQUEST_TIMEOUT_MS: u64 = 1000;
 
 /// Minimum interval between keyframe requests to the same sender (milliseconds).
-/// Prevents flooding the sender with PLI requests.
-pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
+/// Also used as the initial exponential backoff interval. Subsequent requests
+/// double this interval up to `KEYFRAME_REQUEST_MAX_BACKOFF_MS`.
+pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 1000;
+
+/// Maximum backoff interval between keyframe requests (milliseconds).
+/// The backoff doubles from `KEYFRAME_REQUEST_MIN_INTERVAL_MS` and caps here.
+pub const KEYFRAME_REQUEST_MAX_BACKOFF_MS: u64 = 8000;
+
+/// Maximum number of unanswered keyframe requests before giving up.
+/// After this many requests with no keyframe received, stop sending PLIs
+/// and wait for a natural keyframe from the sender.
+pub const KEYFRAME_REQUEST_MAX_UNANSWERED: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Reconnection
@@ -768,7 +782,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "minimal", "default tier should be 'minimal'");
+        assert_eq!(tier.label, "high", "default tier should be 'high'");
     }
 
     #[test]

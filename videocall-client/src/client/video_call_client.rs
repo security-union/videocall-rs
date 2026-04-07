@@ -51,6 +51,19 @@ use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
 
+/// Generate a random instance ID for correlating reconnections.
+/// Uses Math.random() which is sufficient for collision avoidance.
+fn generate_instance_id() -> String {
+    let rand = || (js_sys::Math::random() * 0xFFFF_FFFF_u32 as f64) as u32;
+    format!(
+        "{:08x}-{:08x}-{:08x}-{:08x}",
+        rand(),
+        rand(),
+        rand(),
+        rand()
+    )
+}
+
 /// Configuration options for creating a [`VideoCallClient`].
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
@@ -460,6 +473,7 @@ impl VideoCallClient {
                 })
             },
             election_period_ms,
+            instance_id: generate_instance_id(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;

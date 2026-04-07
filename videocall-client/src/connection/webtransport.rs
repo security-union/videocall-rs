@@ -113,10 +113,10 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             WebTransportTask::send_datagram(self.transport.clone(), bytes);
         } else {
             // Packet exceeds datagram size limit (e.g., a keyframe).
-            // Fall back to a reliable unidirectional stream to avoid
-            // implementing application-layer fragmentation.
+            // Fall back to a per-packet unidirectional stream so the server's
+            // `read_to_end` can receive it as a complete frame.
             debug!(
-                "Packet size {} exceeds datagram MTU {}, falling back to stream",
+                "Packet size {} exceeds datagram MTU {}, falling back to unistream",
                 bytes.len(),
                 DATAGRAM_MAX_SIZE
             );
@@ -125,6 +125,21 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
     }
 }
 
+/// Reads from a unidirectional QUIC stream, handling two framing modes:
+///
+/// 1. **Legacy per-packet streams**: The sender opens a stream, writes one
+///    packet, and closes the stream.  `done` becomes truthy after the first
+///    (or only) read and any buffered data is emitted as a single packet.
+///
+/// 2. **Persistent length-prefixed streams** (server -> client): The server
+///    keeps the stream open and prefixes every packet with a 4-byte big-endian
+///    length header.  The reader accumulates chunks and extracts complete
+///    `[length][payload]` frames as they arrive, emitting each immediately.
+///
+/// The two modes are distinguished at runtime: if we can extract at least one
+/// complete length-prefixed frame from the buffer we stay in framed mode;
+/// otherwise, when `done` is signalled we fall back to emitting the raw buffer
+/// (legacy mode).
 fn handle_unidirectional_stream(
     stream: WebTransportReceiveStream,
     on_inbound_media: Callback<PacketWrapper>,
@@ -134,7 +149,7 @@ fn handle_unidirectional_stream(
         return;
     }
     let incoming_unistreams: ReadableStreamDefaultReader = stream.get_reader().unchecked_into();
-    let callback = Callback::from(move |d| {
+    let callback = Callback::from(move |d: Vec<u8>| {
         emit_packet(
             d,
             MessageType::UnidirectionalStream,
@@ -142,46 +157,77 @@ fn handle_unidirectional_stream(
         )
     });
     wasm_bindgen_futures::spawn_local(async move {
-        let mut buffer: Vec<u8> = vec![];
+        // Buffer for accumulating partial reads across QUIC chunk boundaries.
+        // For per-packet (legacy) streams this typically holds a single chunk.
+        // For persistent streams it may span multiple length-prefixed frames.
+        let mut pending: Vec<u8> = Vec::new();
+
         loop {
             let read_result = JsFuture::from(incoming_unistreams.read()).await;
             match read_result {
                 Err(e) => {
-                    let reason = WebTransportCloseInfo::default();
-                    reason.set_reason(format!("Failed to read incoming unistream {e:?}").as_str());
+                    warn!("Unistream read error: {:?}", e);
                     break;
                 }
                 Ok(result) => {
-                    let done = match Reflect::get(&result, &JsString::from("done")) {
-                        Ok(val) => val.unchecked_into::<Boolean>(),
-                        Err(e) => {
-                            warn!("Failed to read 'done' from unistream result: {:?}", e);
-                            break;
-                        }
-                    };
+                    let done = Reflect::get(&result, &JsString::from("done"))
+                        .map(|v| v.unchecked_into::<Boolean>().is_truthy())
+                        .unwrap_or(true);
 
-                    let value = match Reflect::get(&result, &JsString::from("value")) {
-                        Ok(val) => val,
-                        Err(e) => {
-                            warn!("Failed to read 'value' from unistream result: {:?}", e);
-                            break;
-                        }
-                    };
-                    if !value.is_undefined() {
-                        let value: Uint8Array = value.unchecked_into();
-                        append_uint8_array_to_vec(&mut buffer, &value);
-                        if buffer.len() > MAX_INBOUND_STREAM_SIZE {
-                            error!(
-                                "Inbound unistream exceeded {} bytes (got {}), dropping",
-                                MAX_INBOUND_STREAM_SIZE,
-                                buffer.len()
-                            );
-                            break;
+                    if let Ok(value) = Reflect::get(&result, &JsString::from("value")) {
+                        if !value.is_undefined() {
+                            let chunk: Uint8Array = value.unchecked_into();
+                            append_uint8_array_to_vec(&mut pending, &chunk);
                         }
                     }
 
-                    if done.is_truthy() {
-                        callback.emit(buffer);
+                    // Try to extract complete length-prefixed frames:
+                    //   [4-byte big-endian length][payload of that length]
+                    while pending.len() >= 4 {
+                        let len =
+                            u32::from_be_bytes([pending[0], pending[1], pending[2], pending[3]])
+                                as usize;
+
+                        if len == 0 || len > MAX_INBOUND_STREAM_SIZE {
+                            // Corrupt or oversized frame -- not a framed stream.
+                            // This can happen on a legacy per-packet stream whose
+                            // first 4 bytes happen to decode to a bad length.
+                            // We will emit the raw buffer when `done` fires.
+                            error!(
+                                "Frame length {} invalid (max {}), treating as non-framed stream",
+                                len, MAX_INBOUND_STREAM_SIZE
+                            );
+                            break;
+                        }
+
+                        if pending.len() < 4 + len {
+                            break; // need more data from the next read
+                        }
+
+                        // Extract the complete packet payload, advance the buffer.
+                        let packet_data = pending[4..4 + len].to_vec();
+                        pending = pending[4 + len..].to_vec();
+                        callback.emit(packet_data);
+                    }
+
+                    if done {
+                        // Stream finished. Any remaining data in `pending` is
+                        // from a legacy per-packet stream (single packet, no
+                        // length prefix) -- emit it as-is.
+                        if !pending.is_empty() {
+                            callback.emit(std::mem::take(&mut pending));
+                        }
+                        break;
+                    }
+
+                    // Guard against unbounded buffer growth on a persistent
+                    // stream that stops yielding valid frames.
+                    if pending.len() > MAX_INBOUND_STREAM_SIZE {
+                        error!(
+                            "Inbound unistream buffer exceeded {} bytes (got {}), dropping stream",
+                            MAX_INBOUND_STREAM_SIZE,
+                            pending.len()
+                        );
                         break;
                     }
                 }

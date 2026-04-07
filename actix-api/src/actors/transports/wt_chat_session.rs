@@ -118,6 +118,7 @@ impl WtChatSession {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
+        instance_id: Option<String>,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -128,6 +129,7 @@ impl WtChatSession {
             tracker_sender,
             session_manager,
             observer,
+            instance_id,
         );
 
         WtChatSession {

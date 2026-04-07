@@ -194,6 +194,9 @@ pub struct SessionLogic {
     /// When true, this session is observer-only: it can receive messages
     /// but cannot publish media to the room.
     pub observer: bool,
+    /// Stable client instance identifier (UUID). Survives reconnects within
+    /// the same tab/meeting join. Used by the server to correlate reconnections.
+    pub instance_id: Option<String>,
     /// Tracks outbound packet drops per sender to generate CONGESTION feedback.
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
@@ -212,6 +215,7 @@ impl SessionLogic {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
+        instance_id: Option<String>,
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
@@ -229,6 +233,7 @@ impl SessionLogic {
             tracker_sender,
             session_manager,
             observer,
+            instance_id,
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
         }
@@ -283,6 +288,7 @@ impl SessionLogic {
             user_id: self.user_id.clone(),
             display_name: self.display_name.clone(),
             observer: self.observer,
+            instance_id: self.instance_id.clone(),
         }
     }
 

@@ -85,13 +85,33 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         keyframe_interval_frames: 150, // ~5s at 30fps
     },
     VideoQualityTier {
-        label: "high",
+        label: "hd_plus",
+        max_width: 1600,
+        max_height: 900,
+        target_fps: 30,
+        ideal_bitrate_kbps: 2000,
+        min_bitrate_kbps: 1200,
+        max_bitrate_kbps: 3000,
+        keyframe_interval_frames: 150, // ~5s at 30fps
+    },
+    VideoQualityTier {
+        label: "hd",
         max_width: 1280,
         max_height: 720,
         target_fps: 30,
         ideal_bitrate_kbps: 1500,
         min_bitrate_kbps: 800,
         max_bitrate_kbps: 2500,
+        keyframe_interval_frames: 150, // ~5s at 30fps
+    },
+    VideoQualityTier {
+        label: "standard",
+        max_width: 960,
+        max_height: 540,
+        target_fps: 30,
+        ideal_bitrate_kbps: 900,
+        min_bitrate_kbps: 500,
+        max_bitrate_kbps: 1500,
         keyframe_interval_frames: 150, // ~5s at 30fps
     },
     VideoQualityTier {
@@ -108,10 +128,20 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         label: "low",
         max_width: 640,
         max_height: 360,
+        target_fps: 20,
+        ideal_bitrate_kbps: 400,
+        min_bitrate_kbps: 200,
+        max_bitrate_kbps: 600,
+        keyframe_interval_frames: 100, // ~5s at 20fps
+    },
+    VideoQualityTier {
+        label: "very_low",
+        max_width: 480,
+        max_height: 270,
         target_fps: 15,
-        ideal_bitrate_kbps: 300,
-        min_bitrate_kbps: 150,
-        max_bitrate_kbps: 500,
+        ideal_bitrate_kbps: 250,
+        min_bitrate_kbps: 100,
+        max_bitrate_kbps: 400,
         keyframe_interval_frames: 75, // ~5s at 15fps
     },
     VideoQualityTier {
@@ -133,7 +163,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 /// the 5s warmup period when tier transitions are suppressed. The PID
 /// controller steps up to 720p/1080p if bandwidth permits, or steps
 /// down to 360p/240p if constrained.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 2; // "medium"
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///

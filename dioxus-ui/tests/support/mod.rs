@@ -221,6 +221,85 @@ pub fn restore_fetch() {
 }
 
 // ---------------------------------------------------------------------------
+// Polling helpers (for async-dependent DOM assertions)
+// ---------------------------------------------------------------------------
+
+/// Poll for a CSS selector to appear in the mount element, with a timeout.
+/// Returns the element if found, or panics with a descriptive message.
+pub async fn wait_for_selector(
+    mount: &web_sys::Element,
+    selector: &str,
+    timeout_ms: u32,
+) -> web_sys::Element {
+    let start = js_sys::Date::now();
+    loop {
+        if let Some(el) = mount.query_selector(selector).unwrap() {
+            return el;
+        }
+        let elapsed = js_sys::Date::now() - start;
+        if elapsed > timeout_ms as f64 {
+            let html = mount.inner_html();
+            panic!(
+                "Timed out after {timeout_ms}ms waiting for selector '{selector}'. Mount HTML:\n{html}"
+            );
+        }
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            gloo_utils::window()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 50)
+                .unwrap();
+        });
+        JsFuture::from(promise).await.unwrap();
+    }
+}
+
+/// Poll for a CSS selector to NOT be present, with a timeout.
+/// Returns if absent, panics if still present after timeout.
+pub async fn wait_for_no_selector(mount: &web_sys::Element, selector: &str, timeout_ms: u32) {
+    let start = js_sys::Date::now();
+    loop {
+        if mount.query_selector(selector).unwrap().is_none() {
+            return;
+        }
+        let elapsed = js_sys::Date::now() - start;
+        if elapsed > timeout_ms as f64 {
+            let html = mount.inner_html();
+            panic!(
+                "Timed out after {timeout_ms}ms waiting for selector '{selector}' to disappear. Mount HTML:\n{html}"
+            );
+        }
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            gloo_utils::window()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 50)
+                .unwrap();
+        });
+        JsFuture::from(promise).await.unwrap();
+    }
+}
+
+/// Poll until the mount's text_content contains a substring, with a timeout.
+pub async fn wait_for_text(mount: &web_sys::Element, substring: &str, timeout_ms: u32) {
+    let start = js_sys::Date::now();
+    loop {
+        let text = mount.text_content().unwrap_or_default();
+        if text.contains(substring) {
+            return;
+        }
+        let elapsed = js_sys::Date::now() - start;
+        if elapsed > timeout_ms as f64 {
+            panic!(
+                "Timed out after {timeout_ms}ms waiting for text containing '{substring}'. Got:\n{text}"
+            );
+        }
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            gloo_utils::window()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 50)
+                .unwrap();
+        });
+        JsFuture::from(promise).await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Real Chrome fake-device enumeration
 // ---------------------------------------------------------------------------
 

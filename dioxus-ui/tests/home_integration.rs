@@ -14,7 +14,7 @@ mod support;
 
 use support::{
     cleanup, create_mount_point, inject_app_config, mock_fetch_401, mock_fetch_meetings_empty,
-    remove_app_config, render_into, restore_fetch, yield_now,
+    remove_app_config, render_into, restore_fetch, wait_for_selector, wait_for_text, yield_now,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
@@ -77,10 +77,13 @@ fn home_wrapper_direct() -> Element {
 async fn home_page_renders_with_oauth_disabled() {
     ensure_root_url();
     inject_app_config();
+    mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
-    yield_now().await;
+
+    // Poll until the Home component has rendered its heading (async fetch must resolve first).
+    wait_for_text(&mount, "Start or Join a Meeting", 5000).await;
 
     // No error banner — config loaded and browser checks passed.
     assert!(
@@ -116,6 +119,7 @@ async fn home_page_renders_with_oauth_disabled() {
     );
 
     cleanup(&mount);
+    restore_fetch();
     remove_app_config();
 }
 
@@ -128,25 +132,8 @@ async fn home_shows_login_when_unauthenticated() {
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
 
-    // Allow the mock fetch to resolve and Dioxus to re-render.
-    yield_now().await;
-    // Extra yield for async fetch resolution
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        gloo_utils::window()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100)
-            .unwrap();
-    });
-    wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
-    yield_now().await;
-
-    // The meetings section should show the sign-in prompt instead of an error.
-    assert!(
-        mount
-            .query_selector(".meetings-auth-prompt")
-            .unwrap()
-            .is_some(),
-        "Sign-in prompt should be visible when API returns 401"
-    );
+    // Poll until the 401 response triggers the sign-in prompt.
+    wait_for_selector(&mount, ".meetings-auth-prompt", 5000).await;
 
     let text = mount.text_content().unwrap_or_default();
     assert!(
@@ -177,15 +164,8 @@ async fn home_hides_login_when_authenticated() {
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
 
-    // Allow the mock fetch to resolve and Dioxus to re-render.
-    yield_now().await;
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        gloo_utils::window()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100)
-            .unwrap();
-    });
-    wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
-    yield_now().await;
+    // Poll until the empty-meetings text appears (async fetch must resolve first).
+    wait_for_text(&mount, "No meetings yet", 5000).await;
 
     // The sign-in prompt should NOT be visible.
     assert!(
@@ -194,13 +174,6 @@ async fn home_hides_login_when_authenticated() {
             .unwrap()
             .is_none(),
         "Sign-in prompt should NOT be visible when API returns 200"
-    );
-
-    // Should show the empty meetings state instead.
-    let text = mount.text_content().unwrap_or_default();
-    assert!(
-        text.contains("No meetings yet"),
-        "Empty meetings message should be shown when authenticated"
     );
 
     cleanup(&mount);

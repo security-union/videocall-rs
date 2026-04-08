@@ -162,17 +162,6 @@ fn extract_session_token(parts: &Parts, cookie_name: &str) -> Option<String> {
     extract_bearer_token(parts)
 }
 
-/// Extract a bearer token from `Authorization: Bearer <token>`.
-fn extract_bearer_token(parts: &Parts) -> Option<String> {
-    parts
-        .headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-}
-
 /// Extractor for a guest waiting in the lobby. Authenticates via the
 /// `Authorization: Bearer <observer_token>` header (a signed observer JWT).
 #[derive(Debug)]

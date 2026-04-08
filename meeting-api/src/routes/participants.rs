@@ -24,12 +24,13 @@ use videocall_meeting_types::{
 };
 
 use crate::auth::AuthUser;
+use crate::auth::GuestObserver;
+use crate::db::meetings::MeetingRow;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::nats_events;
 use crate::state::AppState;
 use crate::token::{generate_observer_token, generate_room_token};
-use crate::auth::GuestObserver;
 
 /// POST /api/v1/meetings/{meeting_id}/join
 ///
@@ -82,73 +83,99 @@ pub async fn join_meeting(
         let mut resp = row.into_participant_status(Some(token));
         resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
         resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+        resp.allow_guests = Some(meeting.allow_guests);
         resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
     } else {
-        // Attendee: must wait for admission if meeting is active.
-        let current_state = meeting.state.as_deref().unwrap_or("idle");
-        if current_state != "active" {
-            // Meeting exists but isn't active yet. Return a "waiting_for_meeting"
-            // status with an observer token so the client can receive a push
-            // notification when the host activates the meeting.
-            let dn = display_name.unwrap_or(&user_id);
-            let observer = generate_observer_token(&state.jwt_secret, &user_id, &meeting_id, dn)?;
-            let resp = ParticipantStatusResponse {
-                user_id: user_id.clone(),
-                display_name: display_name.map(String::from),
-                status: "waiting_for_meeting".to_string(),
-                is_host: false,
-                joined_at: Utc::now().timestamp(),
-                admitted_at: None,
-                room_token: None,
-                observer_token: Some(observer),
-                waiting_room_enabled: Some(meeting.waiting_room_enabled),
-                admitted_can_admit: Some(meeting.admitted_can_admit),
-                host_display_name: meeting.host_display_name,
-                host_user_id: meeting.creator_id,
-            };
-            return Ok(Json(APIResponse::ok(resp)));
-        }
-
-        // Atomically check waiting_room_enabled and insert participant in one
-        // transaction, using FOR UPDATE to serialize against concurrent toggles.
-        let (auto_admitted, row, waiting_room_enabled) =
-            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name).await?;
-
-        let token = if auto_admitted {
-            Some(generate_room_token(
-                &state.jwt_secret,
-                state.token_ttl_secs,
-                &user_id,
-                &meeting_id,
-                false,
-                display_name.unwrap_or(&user_id),
-            )?)
-        } else {
-            None
-        };
-
-        let mut resp = row.into_participant_status(token);
-        // When the participant is placed in the waiting room (not auto-admitted),
-        // include an observer token so they can receive push notifications.
-        if !auto_admitted {
-            let dn = display_name.unwrap_or(&user_id);
-            resp.observer_token = Some(generate_observer_token(
-                &state.jwt_secret,
-                &user_id,
-                &meeting_id,
-                dn,
-            )?);
-            // Notify the host that the waiting room list has changed.
-            nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id).await;
-        }
-        resp.waiting_room_enabled = Some(waiting_room_enabled);
-        resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-        resp.host_display_name = meeting.host_display_name;
-        resp.host_user_id = meeting.creator_id;
-        Ok(Json(APIResponse::ok(resp)))
+        join_as_attendee(
+            &state,
+            meeting,
+            &user_id,
+            &meeting_id,
+            display_name,
+            &user_id,
+        )
+        .await
     }
+}
+
+/// Shared attendee join logic used by both [`join_meeting`] (non-host path)
+/// and [`join_meeting_as_guest`].
+///
+/// Handles the "waiting_for_meeting" early-return when the meeting is not yet
+/// active, the waiting-room / auto-admit flow, and observer-token generation.
+async fn join_as_attendee(
+    state: &AppState,
+    meeting: MeetingRow,
+    user_id: &str,
+    meeting_id: &str,
+    display_name: Option<&str>,
+    fallback_display_name: &str,
+) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let current_state = meeting.state.as_deref().unwrap_or("idle");
+    if current_state != "active" {
+        // Meeting exists but isn't active yet. Return a "waiting_for_meeting"
+        // status with an observer token so the client can receive a push
+        // notification when the host activates the meeting.
+        let dn = display_name.unwrap_or(fallback_display_name);
+        let observer = generate_observer_token(&state.jwt_secret, user_id, meeting_id, dn)?;
+        let resp = ParticipantStatusResponse {
+            user_id: user_id.to_string(),
+            display_name: display_name.map(String::from),
+            status: "waiting_for_meeting".to_string(),
+            is_host: false,
+            joined_at: Utc::now().timestamp(),
+            admitted_at: None,
+            room_token: None,
+            observer_token: Some(observer),
+            waiting_room_enabled: Some(meeting.waiting_room_enabled),
+            admitted_can_admit: Some(meeting.admitted_can_admit),
+            host_display_name: meeting.host_display_name,
+            host_user_id: meeting.creator_id,
+            allow_guests: Some(meeting.allow_guests),
+        };
+        return Ok(Json(APIResponse::ok(resp)));
+    }
+
+    // Atomically check waiting_room_enabled and insert participant in one
+    // transaction, using FOR UPDATE to serialize against concurrent toggles.
+    let (auto_admitted, row, waiting_room_enabled) =
+        db_participants::join_attendee(&state.db, meeting.id, user_id, display_name).await?;
+
+    let token = if auto_admitted {
+        Some(generate_room_token(
+            &state.jwt_secret,
+            state.token_ttl_secs,
+            user_id,
+            meeting_id,
+            false,
+            display_name.unwrap_or(fallback_display_name),
+        )?)
+    } else {
+        None
+    };
+
+    let mut resp = row.into_participant_status(token);
+    // When the participant is placed in the waiting room (not auto-admitted),
+    // include an observer token so they can receive push notifications.
+    if !auto_admitted {
+        let dn = display_name.unwrap_or(fallback_display_name);
+        resp.observer_token = Some(generate_observer_token(
+            &state.jwt_secret,
+            user_id,
+            meeting_id,
+            dn,
+        )?);
+        // Notify the host that the waiting room list has changed.
+        nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
+    }
+    resp.waiting_room_enabled = Some(waiting_room_enabled);
+    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+    resp.allow_guests = Some(meeting.allow_guests);
+    resp.host_display_name = meeting.host_display_name;
+    resp.host_user_id = meeting.creator_id;
+    Ok(Json(APIResponse::ok(resp)))
 }
 
 /// POST /api/v1/meetings/{meeting_id}/join_guest
@@ -159,7 +186,7 @@ pub async fn join_meeting_as_guest(
     Path(meeting_id): Path<String>,
     body: Json<JoinMeetingRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let display_name = body.display_name.as_deref().unwrap_or("Guest");
+    let display_name = body.display_name.as_deref();
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -176,43 +203,15 @@ pub async fn join_meeting_as_guest(
         (uuid::Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64
     );
 
-    // Atomically check waiting_room_enabled and insert participant in one
-    // transaction, using FOR UPDATE to serialize against concurrent toggles.
-    let (auto_admitted, row, waiting_room_enabled) =
-        db_participants::join_attendee(&state.db, meeting.id, &guest_user_id, Some(display_name))
-            .await?;
-
-    let token = if auto_admitted {
-        Some(generate_room_token(
-            &state.jwt_secret,
-            state.token_ttl_secs,
-            &guest_user_id,
-            &meeting_id,
-            false,
-            display_name,
-        )?)
-    } else {
-        None
-    };
-
-    let mut resp = row.into_participant_status(token);
-    // When the participant is placed in the waiting room (not auto-admitted),
-    // include an observer token so they can receive push notifications.
-    if !auto_admitted {
-        resp.observer_token = Some(generate_observer_token(
-            &state.jwt_secret,
-            &guest_user_id,
-            &meeting_id,
-            display_name,
-        )?);
-        // Notify the host that the waiting room list has changed.
-        nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id).await;
-    }
-    resp.waiting_room_enabled = Some(waiting_room_enabled);
-    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-    resp.host_display_name = meeting.host_display_name;
-    resp.host_user_id = meeting.creator_id;
-    Ok(Json(APIResponse::ok(resp)))
+    join_as_attendee(
+        &state,
+        meeting,
+        &guest_user_id,
+        &meeting_id,
+        display_name,
+        "Guest",
+    )
+    .await
 }
 
 /// GET /api/v1/meetings/{meeting_id}/status
@@ -252,6 +251,7 @@ pub async fn get_my_status(
     let mut resp = row.into_participant_status(token);
     resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
     resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+    resp.allow_guests = Some(meeting.allow_guests);
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -295,6 +295,7 @@ pub async fn get_guest_status(
     let mut resp = row.into_participant_status(token);
     resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
     resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+    resp.allow_guests = Some(meeting.allow_guests);
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))

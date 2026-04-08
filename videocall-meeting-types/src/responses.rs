@@ -179,6 +179,9 @@ pub struct ParticipantStatusResponse {
     /// Meeting-level: the host's user_id (i.e. `creator_id`). Present in join/status responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_user_id: Option<String>,
+    /// Meeting-level: whether guests (unauthenticated users) are allowed to join.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_guests: Option<bool>,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}/waiting`.

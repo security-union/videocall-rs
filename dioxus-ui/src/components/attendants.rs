@@ -1212,8 +1212,6 @@ pub fn AttendantsComponent(
                                                 wasm_bindgen_futures::spawn_local(async move {
                                                     match crate::meeting_api::update_meeting(&meeting_id, wr, aca, Some(new_val)).await {
                                                         Ok(updated) => {
-                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
-                                                            admitted_can_admit_toggle.set(updated.admitted_can_admit);
                                                             allow_guests_toggle.set(updated.allow_guests);
                                                             saving.set(false);
                                                         }

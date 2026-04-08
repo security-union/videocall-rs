@@ -317,6 +317,7 @@ impl ParticipantRow {
             admitted_can_admit: None,
             host_display_name: None,
             host_user_id: None,
+            allow_guests: None,
         }
     }
 }

@@ -158,7 +158,7 @@ pub async fn soft_delete(
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit
+                  waiting_room_enabled, admitted_can_admit, allow_guests
         "#,
     )
     .bind(room_id)

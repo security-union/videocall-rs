@@ -46,6 +46,7 @@ pub enum MeetingStatus {
         room_token: String,
         waiting_room_enabled: bool,
         admitted_can_admit: bool,
+        allow_guests: bool,
     },
     Rejected,
     Error(String),
@@ -101,7 +102,6 @@ pub fn MeetingPage(id: String) -> Element {
                                 // encoding the current meeting URL as `returnTo` so the
                                 // server bounces the user back here after sign-in.
                                 // This skips the intermediate /login SPA page entirely.
-
                                 redirect_to_login();
                             }
                         }
@@ -236,6 +236,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     let determined_host_uid = response.host_user_id.clone();
                                     let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                                     let aca = response.admitted_can_admit.unwrap_or(false);
+                                    let ag = response.allow_guests.unwrap_or(false);
                                     host_display_name.set(determined_host.clone());
                                     host_user_id.set(determined_host_uid.clone());
                                     match response.status.as_str() {
@@ -248,6 +249,7 @@ pub fn MeetingPage(id: String) -> Element {
                                                     room_token: token,
                                                     waiting_room_enabled: wr_enabled,
                                                     admitted_can_admit: aca,
+                                                    allow_guests: ag,
                                                 });
                                             } else {
                                                 meeting_status.set(MeetingStatus::Error(
@@ -372,6 +374,7 @@ pub fn MeetingPage(id: String) -> Element {
                         });
                         let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                         let aca = response.admitted_can_admit.unwrap_or(false);
+                        let ag = response.allow_guests.unwrap_or(false);
                         host_display_name.set(determined_host.clone());
                         host_user_id.set(determined_host_uid.clone());
                         match response.status.as_str() {
@@ -385,6 +388,7 @@ pub fn MeetingPage(id: String) -> Element {
                                         room_token: token,
                                         waiting_room_enabled: wr_enabled,
                                         admitted_can_admit: aca,
+                                        allow_guests: ag,
                                     });
                                 } else {
                                     meeting_status.set(MeetingStatus::Error(
@@ -457,6 +461,7 @@ pub fn MeetingPage(id: String) -> Element {
             let determined_host_uid = status.host_user_id.clone();
             let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
             let aca = status.admitted_can_admit.unwrap_or(false);
+            let ag = status.allow_guests.unwrap_or(false);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
             host_user_id.set(determined_host_uid.clone());
@@ -468,6 +473,7 @@ pub fn MeetingPage(id: String) -> Element {
                 room_token: token,
                 waiting_room_enabled: wr_enabled,
                 admitted_can_admit: aca,
+                allow_guests: ag,
             });
         }
     };
@@ -513,7 +519,7 @@ pub fn MeetingPage(id: String) -> Element {
     rsx! {
         match (&maybe_username, &current_meeting_status) {
             // User is admitted - show the meeting
-            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled, admitted_can_admit }) => rsx! {
+            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled, admitted_can_admit, allow_guests }) => rsx! {
                 AttendantsComponent {
                     display_name: username.clone(),
                     id: id.clone(),
@@ -530,6 +536,7 @@ pub fn MeetingPage(id: String) -> Element {
                     room_token: room_token.clone(),
                     waiting_room_enabled: *waiting_room_enabled,
                     admitted_can_admit: *admitted_can_admit,
+                    allow_guests: *allow_guests,
                 }
             },
 

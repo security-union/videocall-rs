@@ -99,10 +99,7 @@ pub fn decode_session_token(secret: &str, token: &str) -> Result<SessionTokenCla
 
 /// Decode and validate an observer JWT (a `RoomAccessTokenClaims` with `observer: true`).
 /// Returns the claims on success; returns an `AppError::unauthorized_msg` on failure.
-pub fn decode_observer_token(
-    secret: &str,
-    token: &str,
-) -> Result<RoomAccessTokenClaims, AppError> {
+pub fn decode_observer_token(secret: &str, token: &str) -> Result<RoomAccessTokenClaims, AppError> {
     let mut validation = Validation::default();
     validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
 

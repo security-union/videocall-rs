@@ -109,7 +109,7 @@ jobs:
           set -e  # Exit on error
           PR_NUM=${{ inputs.pr_number }}
           MAX_SLOTS=${{ vars.PR_PREVIEW_MAX_SLOTS }}
-          MAX_SLOTS=${MAX_SLOTS:-3}  # Default to 3 if not set
+          MAX_SLOTS=${MAX_SLOTS:-5}  # Default to 5 if not set
 
           echo "Maximum preview slots configured: ${MAX_SLOTS}"
           echo "Looking for existing deployment of PR #${PR_NUM}..."
@@ -407,10 +407,10 @@ jobs:
             namespace: ${NAMESPACE}
           spec:
             hard:
-              requests.cpu: "500m"
-              requests.memory: "1Gi"
-              limits.cpu: "1000m"
-              limits.memory: "2Gi"
+              requests.cpu: "300m"
+              requests.memory: "512Mi"
+              limits.cpu: "800m"
+              limits.memory: "1Gi"
               pods: "12"
           EOF
 

@@ -46,6 +46,10 @@ impl AppError {
         )
     }
 
+    pub fn invalid_input(detail: &str) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, APIError::invalid_input(detail))
+    }
+
     pub fn invalid_meeting_id(detail: &str) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,

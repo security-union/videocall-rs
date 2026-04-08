@@ -377,16 +377,19 @@ pub async fn update_meeting(
 /// Public (no authentication required). Returns whether guests are allowed
 /// to join this meeting. Used by the frontend to decide whether to redirect
 /// an unauthenticated user to the guest join page.
+///
+/// NOTE: intentionally returns `{ allow_guests: false }` for both missing and
+/// guest-disabled meetings rather than a 404, to prevent meeting enumeration
+/// by unauthenticated callers.
 pub async fn get_meeting_guest_info(
     State(state): State<AppState>,
     Path(meeting_id): Path<String>,
-) -> Result<Json<APIResponse<MeetingGuestInfoResponse>>, AppError> {
-    let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
-        .await?
-        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
-    Ok(Json(APIResponse::ok(MeetingGuestInfoResponse {
-        allow_guests: row.allow_guests,
-    })))
+) -> Json<APIResponse<MeetingGuestInfoResponse>> {
+    let allow_guests = match db_meetings::get_by_room_id(&state.db, &meeting_id).await {
+        Ok(Some(row)) => row.allow_guests,
+        _ => false,
+    };
+    Json(APIResponse::ok(MeetingGuestInfoResponse { allow_guests }))
 }
 
 #[cfg(test)]

@@ -31,6 +31,7 @@ use crate::error::AppError;
 use crate::nats_events;
 use crate::state::AppState;
 use crate::token::{generate_observer_token, generate_room_token};
+use videocall_types::validation::validate_display_name;
 
 /// POST /api/v1/meetings/{meeting_id}/join
 ///
@@ -186,7 +187,12 @@ pub async fn join_meeting_as_guest(
     Path(meeting_id): Path<String>,
     body: Json<JoinMeetingRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let display_name = body.display_name.as_deref();
+    let display_name = body
+        .display_name
+        .as_deref()
+        .map(|n| validate_display_name(n).map_err(|e| AppError::invalid_input(&e)))
+        .transpose()?;
+    let display_name = display_name.as_deref();
 
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
@@ -264,9 +270,21 @@ pub async fn get_my_status(
 /// When `status == "admitted"` the response includes a fresh `room_token`.
 pub async fn get_guest_status(
     State(state): State<AppState>,
-    GuestObserver { user_id, .. }: GuestObserver,
+    GuestObserver {
+        user_id,
+        meeting_id: token_meeting_id,
+        ..
+    }: GuestObserver,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    // Reject cross-meeting token reuse: the observer token must have been
+    // issued for exactly this meeting, not a different one.
+    if token_meeting_id != meeting_id {
+        return Err(AppError::unauthorized_msg(
+            "observer token is not valid for this meeting",
+        ));
+    }
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;

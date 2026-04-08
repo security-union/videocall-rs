@@ -521,7 +521,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     {
                         let guest_link = window()
                             .and_then(|w| w.location().origin().ok())
-                            .map(|origin| format!("{origin}/meeting/{meeting_id_guest_link}"))
+                            .map(|origin| format!("{origin}/meeting/{meeting_id_guest_link}/guest"))
                             .unwrap_or_default();
                         rsx! {
                             span {

@@ -19,7 +19,6 @@ use context::{
     DisplayNameCtx, TransportPreferenceCtx,
 };
 use dioxus::prelude::*;
-use matomo_logger::{MatomoConfig, MatomoLogger};
 
 fn main() {
     console_error_panic_hook::set_once();
@@ -34,13 +33,7 @@ fn main() {
     // Must run after set_dir!() and before the component tree mounts.
     migrate_legacy_storage();
 
-    let _ = MatomoLogger::init(MatomoConfig {
-        base_url: Some("https://matomo.videocall.rs/".into()),
-        site_id: Some(1),
-        console_level: log::LevelFilter::Info,
-        matomo_level: log::LevelFilter::Warn,
-        ..Default::default()
-    });
+    console_log::init_with_level(log::Level::Info).expect("Failed to initialize logger");
 
     dioxus::launch(App);
 }

@@ -77,11 +77,5 @@ publish = true
 changelog_update = true
 git_release_enable = true
 
-[[package]]
-name = "matomo-logger"
-publish = true
-changelog_update = true
-git_release_enable = true
-
 [changelog]
 protect_breaking_commits = true

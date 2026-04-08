@@ -4612,19 +4612,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
-name = "matomo-logger"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "log",
- "once_cell",
- "serde",
- "serde_json",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4959,7 +4946,6 @@ dependencies = [
  "hound",
  "js-sys",
  "log",
- "matomo-logger",
  "once_cell",
  "opus",
  "rand 0.9.2",
@@ -8572,7 +8558,6 @@ dependencies = [
  "gloo-utils 0.1.7",
  "js-sys",
  "log",
- "matomo-logger",
  "neteq",
  "reqwest 0.12.26",
  "serde",

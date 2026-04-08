@@ -22,6 +22,7 @@ SSH keys should be created on Ubuntu.
 |-----------|-------|
 | Alena | `alena` |
 | Anhelina | `anhelina` |
+| Ilya | `ilya` |
 | Palina | `palina` |
 
 ```bash

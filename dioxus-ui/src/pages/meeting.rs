@@ -11,7 +11,9 @@
  * at your option.
  */
 
-use crate::auth::{check_session, get_user_profile, logout, redirect_to_login, UserProfile};
+use crate::auth::{
+    check_session, get_user_profile, logout, redirect_to_guest, redirect_to_login, UserProfile,
+};
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
@@ -92,18 +94,15 @@ pub fn MeetingPage(id: String) -> Element {
                                 .map(|info| info.allow_guests)
                                 .unwrap_or(false);
                             log::info!("authenticated check");
-                            if let Some(win) = window() {
-                                if allow_guests {
-                                    let guest_url =
-                                        format!("/meeting/{}/guest", id_for_auth);
-                                    let _ = win.location().set_href(&guest_url);
-                                } else {
-                                    // Redirect straight to the backend OAuth login endpoint,
-                                    // encoding the current meeting URL as `returnTo` so the
-                                    // server bounces the user back here after sign-in.
-                                    // This skips the intermediate /login SPA page entirely.
-                                    redirect_to_login();
-                                }
+                            if allow_guests {
+                                redirect_to_guest(&id_for_auth);
+                            } else {
+                                // Redirect straight to the backend OAuth login endpoint,
+                                // encoding the current meeting URL as `returnTo` so the
+                                // server bounces the user back here after sign-in.
+                                // This skips the intermediate /login SPA page entirely.
+
+                                redirect_to_login();
                             }
                         }
                     }
@@ -282,14 +281,10 @@ pub fn MeetingPage(id: String) -> Element {
                                         .await
                                         .map(|info| info.allow_guests)
                                         .unwrap_or(false);
-                                    if let Some(win) = window() {
-                                        if allow_guests {
-                                            let guest_url =
-                                                format!("/meeting/{}/guest", meeting_id);
-                                            let _ = win.location().set_href(&guest_url);
-                                        } else {
-                                            let _ = win.location().set_href("/login");
-                                        }
+                                    if allow_guests {
+                                        redirect_to_guest(&meeting_id);
+                                    } else {
+                                        redirect_to_login();
                                     }
                                 }
                                 Err(e) => {
@@ -439,13 +434,10 @@ pub fn MeetingPage(id: String) -> Element {
                             .await
                             .map(|info| info.allow_guests)
                             .unwrap_or(false);
-                        if let Some(win) = window() {
-                            if allow_guests {
-                                let guest_url = format!("/meeting/{}/guest", meeting_id);
-                                let _ = win.location().set_href(&guest_url);
-                            } else {
-                                let _ = win.location().set_href("/login");
-                            }
+                        if allow_guests {
+                            redirect_to_guest(&meeting_id);
+                        } else {
+                            redirect_to_login();
                         }
                     }
                     Err(e) => {

@@ -27,8 +27,8 @@ use futures::future::AbortHandle;
 use futures::future::Abortable;
 use gloo_timers::callback::Timeout;
 use videocall_client::audio_constants::{MIC_HOLD_DURATION_MS, UI_AUDIO_LEVEL_DELTA};
-use wasm_bindgen::JsCast;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
+use wasm_bindgen::JsCast;
 
 #[component]
 pub fn PeerTile(

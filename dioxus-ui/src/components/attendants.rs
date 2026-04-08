@@ -1023,9 +1023,7 @@ pub fn AttendantsComponent(
     let display_peers: Vec<String> = all_peers
         .into_iter()
         .filter(|session_id| {
-            let peer_uid = client
-                .get_peer_user_id(session_id)
-                .unwrap_or_default();
+            let peer_uid = client.get_peer_user_id(session_id).unwrap_or_default();
             // Exclude peers that match the local user ID, or have no user ID
             // (phantom sessions before identity is resolved).
             !peer_uid.is_empty() && peer_uid != local_user_id

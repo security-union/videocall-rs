@@ -459,6 +459,16 @@ pub fn redirect_to_login() {
     }
 }
 
+/// Redirect the browser to the guest entry point for a meeting.
+///
+/// Called when an unauthenticated user tries to join a meeting that allows guests.
+pub fn redirect_to_guest(meeting_id: &str) {
+    let url = format!("/meeting/{meeting_id}/guest");
+    if let Err(e) = window().location().set_href(&url) {
+        log::error!("Failed to navigate to guest URL: {e:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logout
 // ---------------------------------------------------------------------------

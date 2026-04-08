@@ -32,8 +32,7 @@ pub fn WaitingRoom(
     user_id: String,
     display_name: String,
     observer_token: String,
-    #[props(default = false)]
-    is_guest: bool,
+    #[props(default = false)] is_guest: bool,
     on_admitted: EventHandler<ParticipantStatus>,
     on_rejected: EventHandler<()>,
     on_cancel: EventHandler<()>,

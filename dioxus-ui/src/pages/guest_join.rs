@@ -7,7 +7,7 @@
 use crate::components::attendants::AttendantsComponent;
 use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::components::waiting_room::WaitingRoom;
-use crate::constants::{e2ee_enabled, webtransport_enabled};
+use crate::constants::e2ee_enabled;
 use crate::context::{
     save_display_name_to_storage, validate_display_name, DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
 };
@@ -182,7 +182,6 @@ pub fn GuestJoinPage(id: String) -> Element {
                 AttendantsComponent {
                     display_name: display_name_for_render.clone(),
                     id: id.clone(),
-                    webtransport_enabled: webtransport_enabled().unwrap_or(false),
                     e2ee_enabled: e2ee_enabled().unwrap_or(false),
                     user_id: current_user_id(),
                     host_display_name: host_display_name.clone(),

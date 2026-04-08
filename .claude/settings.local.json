@@ -54,7 +54,14 @@
       "Bash(cargo clippy:*)",
       "Bash(openssl x509:*)",
       "Bash(docker exec:*)",
-      "WebFetch(domain:streams.spec.whatwg.org)"
+      "WebFetch(domain:streams.spec.whatwg.org)",
+      "WebFetch(domain:grafana.videocall.fnxlabs.com)",
+      "Bash(diffstat)",
+      "Bash(wc:*)",
+      "Bash(helm dependency:*)",
+      "Bash(helm template:*)",
+      "Bash(tar xzf:*)",
+      "Bash(python3 -c ':*)"
     ]
   }
 }

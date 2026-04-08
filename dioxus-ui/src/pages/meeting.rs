@@ -94,7 +94,6 @@ pub fn MeetingPage(id: String) -> Element {
                                 .await
                                 .map(|info| info.allow_guests)
                                 .unwrap_or(false);
-                            log::info!("authenticated check");
                             if allow_guests {
                                 redirect_to_guest(&id_for_auth);
                             } else {

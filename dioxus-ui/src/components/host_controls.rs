@@ -244,7 +244,6 @@ pub fn HostControls(
                                         if let Some(name) = display_name.clone() {
                                             if !name.trim().is_empty() {
                                                 div { class: "participant-name", "{name}" }
-                                                div { class: "participant-email", "{uid_for_view}" }
                                             } else {
                                                 div { class: "participant-name", "{uid_for_view}" }
                                             }

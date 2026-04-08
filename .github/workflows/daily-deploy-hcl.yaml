@@ -240,9 +240,8 @@ jobs:
             --set image.tag=${TAG} \
             --set imagePullSecrets[0].name=harbor-pull-secret \
             --set fullnameOverride=videocall-webtransport \
-            --set service.type=NodePort \
+            --set service.type=LoadBalancer \
             --set service.port=4433 \
-            --set service.nodePort=52311 \
             --set service.healthPort=444 \
             --set "command[0]=webtransport_server" \
             --set tlsSecret=webtransport-tls \
@@ -277,7 +276,7 @@ jobs:
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
-          echo "✅ WebTransport server deployed (NodePort 52311)"
+          echo "✅ WebTransport server deployed (LoadBalancer)"
 
       - name: Deploy WebSocket Server
         run: |
@@ -474,7 +473,7 @@ jobs:
           echo "  - Dioxus UI:     https://app.videocall.fnxlabs.com"
           echo "  - API:           https://api.videocall.fnxlabs.com"
           echo "  - WebSocket:     wss://websocket.videocall.fnxlabs.com"
-          echo "  - WebTransport:  https://webtransport.videocall.fnxlabs.com (NodePort 52311)"
+          echo "  - WebTransport:  https://webtransport.videocall.fnxlabs.com"
           echo ""
           echo "Namespace: ${NAMESPACE}"
           echo ""

@@ -15,7 +15,6 @@ members = [
     "neteq",
     "videocall-diagnostics",
     "videocall-transport",
-    "matomo-logger",
     "vcprobe"
 ]
 

@@ -36,7 +36,6 @@ declare -a CHARTS=(
     "global/singapore/webtransport"
     # Additional services deployed to US East cluster for consolidation
     "global/us-east/engineering-vlog"
-    "global/us-east/matomo"
     "global/us-east/videocall-ui"
     "global/us-east/videocall-website"
     # Monitoring infrastructure
@@ -59,7 +58,6 @@ declare -a CERTIFICATE_FILES=(
     "global/us-east/webtransport/certificate.yaml"
     # Additional certificates for consolidated services
     "global/us-east/engineering-vlog/certificate.yaml"
-    "global/us-east/matomo/certificate.yaml"
     "global/us-east/videocall-ui/certificate.yaml"
     "global/us-east/videocall-website/certificate.yaml"
     "global/us-east/grafana/certificate.yaml"
@@ -189,7 +187,7 @@ get_context_for_chart() {
             echo "${SINGAPORE_CONTEXT}"
             ;;
         # Additional services deployed to US East for consolidation
-        "global/us-east/engineering-vlog"|"global/us-east/matomo"|"global/us-east/videocall-ui"|"global/us-east/videocall-website"|"global/us-east/prometheus"|"global/us-east/grafana"|"global/us-east/metrics-api")
+        "global/us-east/engineering-vlog"|"global/us-east/videocall-ui"|"global/us-east/videocall-website"|"global/us-east/prometheus"|"global/us-east/grafana"|"global/us-east/metrics-api")
             echo "${US_EAST_CONTEXT}"
             ;;
         *)
@@ -221,9 +219,6 @@ get_release_name_for_chart() {
         # Additional services deployed to US East for consolidation
         "global/us-east/engineering-vlog")
             echo "engineering-vlog-us-east"
-            ;;
-        "global/us-east/matomo")
-            echo "matomo-us-east"
             ;;
         "global/us-east/videocall-ui")
             echo "videocall-ui-us-east"
@@ -365,7 +360,7 @@ Options:
     --singapore-only         Deploy only to Singapore region (shortcut for --region singapore)
     --services SERVICES      Deploy only specific services (comma-separated)
                             Available: websocket, webtransport, ingress-nginx, engineering-vlog,
-                            matomo, videocall-ui, videocall-website,
+                            videocall-ui, videocall-website,
                             prometheus, grafana, metrics-api
     -h, --help              Show this help message
 
@@ -375,7 +370,7 @@ This script will:
 3. Update helm dependencies for selected charts
 4. Deploy SSL certificates for selected endpoints
 5. Deploy WebSocket and WebTransport services to selected regions
-6. Deploy consolidated services to US East (website, engineering blog, matomo, videocall-ui, videocall-website)
+6. Deploy consolidated services to US East (website, engineering blog, videocall-ui, videocall-website)
 7. Verify deployments and check certificate status
 
 Contexts used:
@@ -486,14 +481,6 @@ update_dependencies() {
     # Add required helm repositories first
     local repos_added=false
     for chart in "${charts[@]}"; do
-        if [[ "${chart}" == "global/us-east/matomo" ]] && [[ "${DRY_RUN}" == "false" ]]; then
-            if ! helm repo list | grep -q bitnami; then
-                log_info "Adding bitnami helm repository for ${chart}"
-                helm repo add bitnami https://charts.bitnami.com/bitnami
-                repos_added=true
-            fi
-        fi
-        
         if [[ "${chart}" == "global/us-east/grafana" ]] && [[ "${DRY_RUN}" == "false" ]]; then
             if ! helm repo list | grep -q grafana; then
                 log_info "Adding grafana helm repository for ${chart}"
@@ -813,7 +800,6 @@ verify_deployments() {
             # Check deployments for new services
             local website_deployment=$(kubectl get deployment website-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local blog_deployment=$(kubectl get deployment engineering-vlog-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-            local matomo_deployment=$(kubectl get deployment matomo-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local ui_deployment=$(kubectl get deployment videocall-ui-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local videocall_website_deployment=$(kubectl get deployment videocall-website-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local prometheus_deployment=$(kubectl get deployment prometheus-us-east-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
@@ -821,7 +807,6 @@ verify_deployments() {
             
             log_info "    Website: ${website_deployment} replicas ready"
             log_info "    Engineering Blog: ${blog_deployment} replicas ready"
-            log_info "    Matomo: ${matomo_deployment} replicas ready"
             log_info "    Videocall UI: ${ui_deployment} replicas ready"
             log_info "    Videocall Website: ${videocall_website_deployment} replicas ready"
             log_info "    Prometheus: ${prometheus_deployment} replicas ready"
@@ -830,7 +815,6 @@ verify_deployments() {
             # Check ingresses for new services
             local website_ingress=$(kubectl get ingress website-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local blog_ingress=$(kubectl get ingress engineering-vlog-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
-            local matomo_ingress=$(kubectl get ingress matomo-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local ui_ingress=$(kubectl get ingress videocall-ui-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local videocall_website_ingress=$(kubectl get ingress videocall-website-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local grafana_ingress=$(kubectl get ingress grafana-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
@@ -839,7 +823,6 @@ verify_deployments() {
             log_info "  INGRESS IP ADDRESSES:"
             log_info "    Website: ${website_ingress}"
             log_info "    Engineering Blog: ${blog_ingress}"
-            log_info "    Matomo: ${matomo_ingress}"
             log_info "    Videocall UI: ${ui_ingress}"
             log_info "    Videocall Website: ${videocall_website_ingress}"
             log_info "    Grafana: ${grafana_ingress}"

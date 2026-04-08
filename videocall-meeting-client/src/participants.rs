@@ -47,7 +47,7 @@ impl MeetingApiClient {
 
     /// Join a meeting as a guest (unauthenticated).
     ///
-    /// Calls `POST /api/v1/meetings/{meeting_id}/join_guest`.
+    /// Calls `POST /api/v1/meetings/{meeting_id}/join-guest`.
     ///
     /// The meeting must have `allow_guests` enabled. `display_name` is required.
     /// Guests are never hosts and cannot auto-create meetings.
@@ -56,7 +56,7 @@ impl MeetingApiClient {
         meeting_id: &str,
         display_name: &str,
     ) -> Result<ParticipantStatusResponse, ApiError> {
-        let path = format!("/api/v1/meetings/{meeting_id}/join_guest");
+        let path = format!("/api/v1/meetings/{meeting_id}/join-guest");
         let body = JoinMeetingRequest {
             display_name: Some(display_name.to_string()),
         };

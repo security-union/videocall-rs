@@ -225,7 +225,6 @@ pub fn MeetingPage(id: String) -> Element {
 
                             match join_meeting(&meeting_id, Some(&display_name)).await {
                                 Ok(response) => {
-                                    log::info!("join was Ok");
                                     let effective_user_id = if response.user_id.is_empty() {
                                         get_or_create_local_user_id()
                                     } else {
@@ -290,7 +289,6 @@ pub fn MeetingPage(id: String) -> Element {
                                     }
                                 }
                                 Err(e) => {
-                                    log::info!("undefined error");
                                     meeting_status.set(MeetingStatus::Error(e.to_string()));
                                 }
                             }
@@ -347,7 +345,6 @@ pub fn MeetingPage(id: String) -> Element {
             wasm_bindgen_futures::spawn_local(async move {
                 match join_meeting(&meeting_id, Some(&display_name)).await {
                     Ok(response) => {
-                        log::info!("join was ok 2");
                         // Use the API-provided user_id when available;
                         // fall back to a locally-generated stable UUID
                         // so non-OAuth users still get a persistent identity.
@@ -445,7 +442,6 @@ pub fn MeetingPage(id: String) -> Element {
                         }
                     }
                     Err(e) => {
-                        log::info!("undefined error 2");
                         observer_token_signal.set(None);
                         meeting_status.set(MeetingStatus::Error(e.to_string()));
                     }

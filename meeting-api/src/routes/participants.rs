@@ -179,7 +179,7 @@ async fn join_as_attendee(
     Ok(Json(APIResponse::ok(resp)))
 }
 
-/// POST /api/v1/meetings/{meeting_id}/join_guest
+/// POST /api/v1/meetings/{meeting_id}/join-guest
 ///
 /// Allows a guest user (non-authenticated) to join a meeting if guests are allowed.
 pub async fn join_meeting_as_guest(
@@ -204,10 +204,7 @@ pub async fn join_meeting_as_guest(
 
     // Guests are treated as attendees but without a user_id. Use a special
     // "guest:{uuid}" format for the participant record and tokens.
-    let guest_user_id = format!(
-        "guest:{}",
-        (uuid::Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64
-    );
+    let guest_user_id = format!("guest:{}", uuid::Uuid::new_v4());
 
     join_as_attendee(
         &state,
@@ -266,7 +263,7 @@ pub async fn get_my_status(
 /// GET /api/v1/meetings/{meeting_id}/guest-status
 ///
 /// Polling endpoint for guests (unauthenticated users who joined via
-/// `join_guest`). Authenticates via an observer JWT Bearer token.
+/// `join-guest`). Authenticates via an observer JWT Bearer token.
 /// When `status == "admitted"` the response includes a fresh `room_token`.
 pub async fn get_guest_status(
     State(state): State<AppState>,

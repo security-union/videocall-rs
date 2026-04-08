@@ -766,6 +766,8 @@ pub fn AttendantsComponent(
                     log::debug!("DIOXUS-UI: peer_display_name_version bumped");
                 },
             )),
+            // Full call participant: decode and play all inbound media.
+            decode_media: true,
         };
 
         let client = VideoCallClient::new(opts);

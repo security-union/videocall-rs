@@ -55,17 +55,13 @@
       "Bash(openssl x509:*)",
       "Bash(docker exec:*)",
       "WebFetch(domain:streams.spec.whatwg.org)",
-      "Bash(GH_HOST=github01.hclpnp.com gh pr diff 262 --repo labs-projects/videocall)",
-      "Bash(diffstat)",
-      "Read(//tmp/**)",
-      "Bash(python3 -c \"import yaml; yaml.safe_load\\(open\\('/home/jboyd/work/vc-worktrees/hcl-main/.github/workflows/pr-deploy-reusable-hcl.yaml'\\)\\)\")",
       "WebFetch(domain:grafana.videocall.fnxlabs.com)",
-      "Bash(helm dependency:*)",
-      "Bash(tar xzf:*)",
-      "Bash(helm template:*)",
-      "Bash(python3 -c ':*)",
+      "Bash(diffstat)",
       "Bash(wc:*)",
-      "WebFetch(domain:github01.hclpnp.com)"
+      "Bash(helm dependency:*)",
+      "Bash(helm template:*)",
+      "Bash(tar xzf:*)",
+      "Bash(python3 -c ':*)"
     ]
   }
 }

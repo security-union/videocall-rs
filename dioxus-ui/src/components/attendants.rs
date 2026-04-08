@@ -37,7 +37,8 @@ use crate::constants::{
 };
 use crate::context::{
     resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
-    MeetingTime, PeerMediaState, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -469,6 +470,10 @@ pub fn AttendantsComponent(
     // on_peer_removed callback inside use_hook below.
     let mut peer_status_map: PeerStatusMap = use_signal(HashMap::new);
 
+    // Create the shared signal history map early so on_peer_removed can clean
+    // up departed peers' histories. Provided as context alongside PeerStatusMap.
+    let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
+
     // Read transport preference from context BEFORE use_hook (hooks must not
     // be called inside the hook closure).
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
@@ -587,6 +592,10 @@ pub fn AttendantsComponent(
                 // `Fn` (Signal is Copy; only the local is mutated each call).
                 let mut map = peer_status_map;
                 map.write().remove(&peer_id);
+                // Also remove the departed peer's signal history so the shared
+                // map does not grow unboundedly over long meetings.
+                let mut hist_map = peer_signal_history_map;
+                hist_map.write().remove(&peer_id);
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
@@ -903,6 +912,11 @@ pub fn AttendantsComponent(
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
     use_context_provider(|| peer_status_map);
+
+    // Provide the shared signal history map so PeerTile components can look up
+    // (or create) their history entry. This survives PeerTile remounts caused
+    // by layout switches (grid -> split when screen sharing starts).
+    use_context_provider(|| peer_signal_history_map);
 
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task

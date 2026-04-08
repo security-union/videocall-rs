@@ -5,6 +5,9 @@
 //! This module centralises shared state that needs to be accessed across
 //! the component tree through Dioxus context providers.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use dioxus::prelude::*;
 use dioxus_sdk_storage::{LocalStorage, StorageBacking};
 use videocall_client::VideoCallClient;
@@ -46,6 +49,22 @@ pub struct PeerMediaState {
 /// `Signal<PeerMediaState>`, so a state change for peer A does not cause
 /// peer B's tile to re-render.
 pub type PeerStatusMap = Signal<std::collections::HashMap<String, Signal<PeerMediaState>>>;
+
+/// Shared map of per-peer signal histories, provided as a Dioxus context so
+/// histories survive `PeerTile` component remounts (e.g., grid -> split layout
+/// when a peer starts screen sharing).
+///
+/// Values are `Rc<RefCell<…>>` rather than `Signal<…>` because Dioxus Signals
+/// are owned by the component scope that creates them.  When a `PeerTile` is
+/// destroyed (e.g. layout switch) its Signals are dropped, but the map outlives
+/// that scope.  `Rc<RefCell<…>>` is scope-independent and lives as long as the
+/// map holds a reference.
+pub type PeerSignalHistoryMap = Signal<
+    std::collections::HashMap<
+        String,
+        Rc<RefCell<crate::components::signal_quality::PeerSignalHistory>>,
+    >,
+>;
 
 /// Holds meeting host information shared via context.
 #[derive(Clone, PartialEq, Default)]

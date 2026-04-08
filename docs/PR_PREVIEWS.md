@@ -13,6 +13,8 @@ Google OAuth requires pre-registered exact callback URLs — wildcards and per-P
 | 1 | `pr1.sandbox.videocall.rs` | `pr1-api.sandbox.videocall.rs` |
 | 2 | `pr2.sandbox.videocall.rs` | `pr2-api.sandbox.videocall.rs` |
 | 3 | `pr3.sandbox.videocall.rs` | `pr3-api.sandbox.videocall.rs` |
+| 4 | `pr4.sandbox.videocall.rs` | `pr4-api.sandbox.videocall.rs` |
+| 5 | `pr5.sandbox.videocall.rs` | `pr5-api.sandbox.videocall.rs` |
 
 The number of active slots is controlled by the `PR_PREVIEW_MAX_SLOTS` repository variable. **Adding slots requires registering the new callback URLs in the Google OAuth console** (`https://prN-api.sandbox.videocall.rs/login/callback`) before they will work.
 
@@ -97,7 +99,7 @@ bash scripts/digitalocean-prod-setup-preview-infra.sh
 
 The script creates the PR namespace, creates a database in the running postgres instance in the preview-infra namespace, and copies OAuth credentials from the `default` namespace.
 
-When adding new slots beyond the current maximum (we started at only 3 slots):
+When adding new slots beyond the current maximum (currently 5 slots):
 1. Update `PR_PREVIEW_MAX_SLOTS` in repository variables.
 2. Register `https://prN-api.sandbox.videocall.rs/login/callback` in the Google OAuth console for each new slot.
 

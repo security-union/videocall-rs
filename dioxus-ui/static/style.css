@@ -626,48 +626,65 @@ select {
 }
 
 /* ============================================================
+   Tile top-right icon row (flex container)
+   ============================================================ */
+
+.tile-top-icons {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: center;
+  gap: 8px;
+  z-index: 3;
+}
+
+/* ============================================================
    Pin & crop icons
    ============================================================ */
 
-.pin-icon {
-  visibility: hidden;
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  font-size: 2em;
-  opacity: 0.6;
-  background-color: black;
-  border-radius: 50%;
-  padding: 10px;
-  text-align: center;
-  line-height: 1;
-  cursor: pointer;
-  z-index: 2;
-}
-
-.grid-item:hover .pin-icon {
-  visibility: visible;
-}
-
+.pin-icon,
 .crop-icon {
   visibility: hidden;
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  font-size: 2em;
-  opacity: 0.6;
-  background-color: black;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(0, 0, 0, 0.6);
   border-radius: 50%;
-  padding: 10px;
-  text-align: center;
-  line-height: 1;
+  border: none;
+  padding: 0;
   cursor: pointer;
-  z-index: 2;
+  transition: background-color 0.15s ease;
+  font: inherit;
+  -webkit-appearance: none;
+  appearance: none;
 }
 
-.grid-item:hover .crop-icon {
+.pin-icon svg,
+.crop-icon svg {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.pin-icon:hover,
+.crop-icon:hover {
+  background-color: rgba(0, 0, 0, 0.8);
+}
+
+.pin-icon:focus-visible,
+.crop-icon:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+.grid-item:hover .pin-icon,
+.grid-item:hover .crop-icon,
+.split-peer-tile:hover .pin-icon,
+.split-peer-tile:hover .crop-icon {
   visibility: visible;
 }
 
@@ -676,16 +693,12 @@ select {
    ============================================================ */
 
 .audio-indicator {
-  position: absolute;
-  top: 8px;
-  right: 8px;
   background-color: rgba(0, 0, 0, 0.6);
   border-radius: 50%;
   padding: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 2;
 }
 
 .audio-indicator svg {
@@ -1804,7 +1817,7 @@ select {
   top: 1rem;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 100;
+  z-index: 9000;
   background: rgba(30, 30, 30, 0.95);
   border-radius: 12px;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
@@ -2821,4 +2834,215 @@ select {
     min-height: 88px;
     padding: 14px;
   }
+}
+
+/* ============================================================
+   Signal quality indicator
+   ============================================================ */
+
+.signal-indicator {
+  background-color: rgba(0, 0, 0, 0.6);
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border: none;
+  padding: 0;
+  font: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color 0.2s ease;
+}
+.signal-indicator:hover {
+  background-color: rgba(0, 0, 0, 0.8);
+}
+.signal-indicator:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+.signal-indicator svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* Signal quality popup -- inline overlay positioned within each tile */
+.signal-quality-popup {
+  position: absolute;
+  top: 44px;           /* 8px top padding + 32px icon row + 4px gap */
+  right: 0;
+  width: min(420px, calc(100% - 8px));
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  background: rgba(26, 26, 46, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  padding: 16px;
+  z-index: 20;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Allow the popup to overflow tile boundaries on small tiles */
+.grid-item.signal-popup-open,
+.split-peer-tile.signal-popup-open {
+  overflow: visible;
+}
+.signal-quality-popup .popup-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.signal-quality-popup .popup-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.signal-quality-popup .popup-close {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  font-size: 14px;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: background-color 0.15s ease, color 0.15s ease;
+  padding: 0;
+}
+.signal-quality-popup .popup-close:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+.signal-chart-wrapper {
+  display: flex;
+  align-items: flex-start;
+  position: relative;
+}
+.signal-chart-y-axis {
+  flex-shrink: 0;
+}
+.signal-chart-y-axis-right {
+  flex-shrink: 0;
+}
+.signal-chart-scroll {
+  position: relative;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 1;
+  min-width: 0;
+  scrollbar-width: auto;
+  scrollbar-color: rgba(255, 255, 255, 0.35) rgba(255, 255, 255, 0.08);
+}
+/* Custom webkit scrollbar: always visible when content overflows.
+   Defining ::-webkit-scrollbar forces classic (non-overlay) scrollbar
+   behavior, so the scrollbar stays permanently visible instead of
+   fading out after inactivity (macOS default). When content fits,
+   overflow-x:auto hides the scrollbar entirely. */
+.signal-chart-scroll::-webkit-scrollbar {
+  height: 10px;
+}
+.signal-chart-scroll::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 5px;
+}
+.signal-chart-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.35);
+  border-radius: 5px;
+}
+.signal-chart-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.5);
+}
+.signal-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: #aaa;
+}
+.signal-chart-legend .legend-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.signal-chart-legend .legend-item input[type="checkbox"] {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: #888;
+}
+.signal-chart-legend span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.signal-chart-legend .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.legend-help-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: none;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 9px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  margin-left: 2px;
+  line-height: 1;
+  vertical-align: middle;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+.legend-help-btn:hover {
+  border-color: rgba(255, 255, 255, 0.6);
+  color: #fff;
+}
+.legend-help-text {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  font-size: 6px;
+  line-height: 1.3;
+  color: #999;
+}
+.legend-help-text strong {
+  color: #ccc;
+  font-size: 6px;
+}
+.legend-help-text p {
+  margin: 3px 0;
+}
+.signal-chart-tooltip {
+  position: fixed;
+  background: rgba(0, 0, 0, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  padding: 4px 7px;
+  font-size: 8px;
+  line-height: 1.5;
+  color: #ddd;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 2147483647;
 }

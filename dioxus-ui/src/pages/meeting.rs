@@ -11,6 +11,7 @@
  * at your option.
  */
 
+use crate::auth::{check_session, get_user_profile, logout, redirect_to_login, UserProfile};
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
@@ -24,10 +25,6 @@ use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMe
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
-use web_sys::window;
-
-use crate::auth::{check_session, get_user_profile, logout, UserProfile};
-use crate::routing::Route;
 
 /// Meeting participant status from the API
 #[derive(Clone, PartialEq, Debug)]
@@ -57,7 +54,6 @@ pub fn MeetingPage(id: String) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
     let mut auth_checked = use_signal(|| false);
-    let navigator = use_navigator();
     let mut user_profile = use_signal(|| None::<UserProfile>);
     let mut meeting_status = use_signal(|| MeetingStatus::NotJoined);
     let mut host_display_name = use_signal(|| None::<String>);
@@ -102,7 +98,11 @@ pub fn MeetingPage(id: String) -> Element {
                                         format!("/meeting/{}/guest", id_for_auth);
                                     let _ = win.location().set_href(&guest_url);
                                 } else {
-                                    let _ = win.location().set_href("/login");
+                                    // Redirect straight to the backend OAuth login endpoint,
+                                    // encoding the current meeting URL as `returnTo` so the
+                                    // server bounces the user back here after sign-in.
+                                    // This skips the intermediate /login SPA page entirely.
+                                    redirect_to_login();
                                 }
                             }
                         }
@@ -182,6 +182,7 @@ pub fn MeetingPage(id: String) -> Element {
 
             let opts = VideoCallClientOptions {
                 user_id: user_id_for_client,
+                display_name: display_name.clone(),
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,
@@ -318,13 +319,15 @@ pub fn MeetingPage(id: String) -> Element {
         });
     }
 
-    // Logout handler
+    // Logout handler: navigate the browser to the meeting-api /logout endpoint
+    // so the server can clear the session cookie and redirect to the OIDC
+    // provider's end_session_endpoint when configured.  The navigator.push()
+    // call that was here previously is no longer needed — the browser will
+    // unload the page as soon as the navigation starts.
     let on_logout = move |_| {
-        let navigator = navigator;
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = logout().await;
-            navigator.push(Route::Login {});
-        });
+        if let Err(e) = logout() {
+            log::error!("Logout navigation failed: {e}");
+        }
     };
 
     // Early return for auth check

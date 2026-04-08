@@ -9,6 +9,7 @@ use crate::pages::guest_join::GuestJoinPage;
 use crate::pages::home::Home;
 use crate::pages::meeting::MeetingPage;
 use crate::pages::meeting_settings::MeetingSettingsPage;
+use crate::pages::oauth_callback::OAuthCallback;
 
 #[derive(Clone, Routable, PartialEq, Debug)]
 pub enum Route {
@@ -16,6 +17,8 @@ pub enum Route {
     Home {},
     #[route("/login")]
     Login {},
+    #[route("/auth/callback?:..query_params")]
+    OAuthCallback { query_params: String },
     #[route("/meeting/:id/settings")]
     MeetingSettings { id: String },
     #[route("/meeting/:id/guest")]
@@ -34,7 +37,9 @@ pub enum Route {
 /// Wrapper component for MeetingSettings route.
 #[component]
 fn MeetingSettings(id: String) -> Element {
-    rsx! { MeetingSettingsPage { id } }
+    rsx! {
+        MeetingSettingsPage { id }
+    }
 }
 
 /// Wrapper component for GuestJoin route.
@@ -46,7 +51,9 @@ fn GuestJoin(id: String) -> Element {
 /// Wrapper component for Meeting2 route that passes only `id` to MeetingPage.
 #[component]
 fn MeetingPage2(id: String, webtransport_enabled: String) -> Element {
-    rsx! { MeetingPage { id: id } }
+    rsx! {
+        MeetingPage { id }
+    }
 }
 
 /// Simple 404 page component.

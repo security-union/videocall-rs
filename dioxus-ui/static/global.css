@@ -494,7 +494,7 @@ body {
   transform: translateX(-50%);
   display: flex;
   gap: 1.2rem; /* add breathing room between control buttons */
-  z-index: 100;
+  z-index: 9000;
   padding: 0.6rem 1.25rem;
   background: rgba(28, 28, 30, 0.85);
   backdrop-filter: blur(14px);
@@ -1034,39 +1034,10 @@ body {
   font-size: 0.8125rem;
 }
 
-/* Pin Icon Fixes - High Specificity Override */
-.grid-item .canvas-container .pin-icon {
-  position: absolute !important;
-  top: 8px !important;
-  right: 48px !important; /* 8px edge + 32px mic + 8px gap */
-  left: auto !important;
-  transform: none !important;
-  opacity: 0.6 !important;
-  background-color: rgba(0, 0, 0, 0.6) !important; /* match mic */
-  border-radius: 50% !important;
-  padding: 6px !important; /* match mic */
-  text-align: center !important;
-  line-height: 1 !important;
-  cursor: pointer !important;
-  z-index: 10 !important;
-  transition: opacity 0.2s ease !important;
-  border: none !important;
-  visibility: hidden !important; /* default hidden on desktop; shown on hover via media query below */
-}
-
-/* Style for the pin icon SVG */
-.grid-item .canvas-container .pin-icon svg {
-  width: 20px !important;
-  height: 20px !important;
-  display: block !important;
-}
-
+/* Pin & Crop Icon Fixes - High Specificity Override
+   Icons are now flex children of .tile-top-icons — no absolute positioning. */
+.grid-item .canvas-container .pin-icon,
 .grid-item .canvas-container .crop-icon {
-  position: absolute !important;
-  top: 8px !important;
-  right: 88px !important; /* 8px edge + mic + pin + 8px gaps */
-  left: auto !important;
-  transform: none !important;
   opacity: 0.6 !important;
   background-color: rgba(0, 0, 0, 0.6) !important;
   border-radius: 50% !important;
@@ -1074,35 +1045,32 @@ body {
   text-align: center !important;
   line-height: 1 !important;
   cursor: pointer !important;
-  z-index: 10 !important;
   transition: opacity 0.2s ease !important;
   border: none !important;
   visibility: hidden !important;
 }
 
+.grid-item .canvas-container .pin-icon svg,
 .grid-item .canvas-container .crop-icon svg {
   width: 20px !important;
   height: 20px !important;
   display: block !important;
 }
 
-/* Hide pin icon by default on desktop, show on hover */
+/* Hide pin/crop by default on desktop, show on hover */
 @media (min-width: 768px) {
-  .grid-item .canvas-container .pin-icon { opacity: 0 !important; }
-  .grid-item .canvas-container:hover .pin-icon {
-    visibility: visible !important;
-    opacity: 0.6 !important;
-  }
+  .grid-item .canvas-container .pin-icon,
   .grid-item .canvas-container .crop-icon { opacity: 0 !important; }
+  .grid-item .canvas-container:hover .pin-icon,
   .grid-item .canvas-container:hover .crop-icon {
     visibility: visible !important;
     opacity: 0.6 !important;
   }
 }
 
-/* Hide pin icon on mobile – tap tile to pin instead */
+/* Hide pin/crop on mobile -- tap tile to pin instead */
 @media (max-width: 767px) {
-  .grid-item .canvas-container .pin-icon { display: none !important; }
+  .grid-item .canvas-container .pin-icon,
   .grid-item .canvas-container .crop-icon { display: none !important; }
 }
 

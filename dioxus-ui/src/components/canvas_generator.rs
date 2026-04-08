@@ -21,6 +21,8 @@ use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
+use crate::components::icons::signal_bars::SignalBarsIcon;
+use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
 use crate::constants::users_allowed_to_stream;
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
@@ -170,6 +172,7 @@ pub struct AudioLevels {
 /// the video tile will occupy the full grid area. The `audio_levels.raw` parameter (0.0–1.0) drives
 /// a glow whose intensity scales with voice volume.
 /// If `host_user_id` matches the peer's authenticated user_id, a crown icon is displayed next to the name.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_for_peer(
     client: &VideoCallClient,
     key: &String,
@@ -178,9 +181,14 @@ pub fn generate_for_peer(
     host_user_id: Option<&str>,
     mode: TileMode,
     my_peer_id: Option<&str>,
+    signal_info: SignalInfo,
+    mut show_signal_popup: Signal<bool>,
 ) -> Element {
     let audio_level = audio_levels.raw;
     let mic_audio_level = audio_levels.mic;
+    let signal_level = signal_info.level;
+    let signal_history = signal_info.history;
+    let meeting_start_ms = signal_info.meeting_start_ms;
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
     let peer_display_name = client
         .get_peer_display_name(key)
@@ -278,9 +286,14 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
+        let split_peer_class = if show_signal_popup() {
+            "split-peer-tile signal-popup-open"
+        } else {
+            "split-peer-tile"
+        };
         return rsx! {
             div {
-                class: "split-peer-tile",
+                class: "{split_peer_class}",
                 id: "{peer_video_div_id}",
                 div {
                     class: "{grid_class}",
@@ -311,14 +324,42 @@ pub fn generate_for_peer(
                         }
                     }
                     div {
-                        class: "{vo_audio_class}",
-                        style: "{vo_mic_style}",
-                        MicIcon { muted: !is_audio_enabled_for_peer }
+                        class: "tile-top-icons",
+                        // Mic icon (rightmost via row-reverse, always visible)
+                        div {
+                            class: "{vo_audio_class}",
+                            style: "{vo_mic_style}",
+                            MicIcon { muted: !is_audio_enabled_for_peer }
+                        }
+                        // Signal icon (always visible, clickable)
+                        button {
+                            class: "signal-indicator",
+                            "aria-label": "Show signal quality",
+                            onclick: move |_| show_signal_popup.toggle(),
+                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                        }
+                        // Crop (visible on hover only)
+                        button {
+                            onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
+                            class: "crop-icon",
+                            CropIcon {}
+                        }
                     }
-                    button {
-                        onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
-                        class: "crop-icon",
-                        CropIcon {}
+                    if show_signal_popup() {
+                        {
+                            let h = signal_history.clone();
+                            let popup_peer_id = key.clone();
+                            let popup_peer_name = peer_display_name.clone();
+                            rsx! {
+                                SignalQualityPopup {
+                                    peer_id: popup_peer_id,
+                                    peer_name: popup_peer_name,
+                                    history: h,
+                                    meeting_start_ms,
+                                    on_close: move |_| show_signal_popup.set(false),
+                                }
+                            }
+                        }
                     }
                     div {
                         style: "{vo_tile_style}",
@@ -347,9 +388,14 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
+        let full_bleed_grid_class = if show_signal_popup() {
+            "grid-item full-bleed signal-popup-open"
+        } else {
+            "grid-item full-bleed"
+        };
         return rsx! {
             div {
-                class: "grid-item full-bleed",
+                class: "{full_bleed_grid_class}",
                 id: "{peer_video_div_id}",
                 div {
                     class: "{full_bleed_class}",
@@ -383,19 +429,47 @@ pub fn generate_for_peer(
                         }
                     }
                     div {
-                        class: "{audio_speaking_class}",
-                        style: "{mic_inline_style}",
-                        MicIcon { muted: !is_audio_enabled_for_peer }
+                        class: "tile-top-icons",
+                        // Mic icon (rightmost via row-reverse, always visible)
+                        div {
+                            class: "{audio_speaking_class}",
+                            style: "{mic_inline_style}",
+                            MicIcon { muted: !is_audio_enabled_for_peer }
+                        }
+                        // Signal icon (always visible, clickable)
+                        button {
+                            class: "signal-indicator",
+                            "aria-label": "Show signal quality",
+                            onclick: move |_| show_signal_popup.toggle(),
+                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                        }
+                        // Pin and Crop (visible on hover only)
+                        button {
+                            onclick: move |_| toggle_pinned_div(&div_id_pin),
+                            class: "pin-icon",
+                            PushPinIcon {}
+                        }
+                        button {
+                            onclick: move |_| toggle_canvas_crop(&canvas_id_crop),
+                            class: "crop-icon",
+                            CropIcon {}
+                        }
                     }
-                    button {
-                        onclick: move |_| toggle_canvas_crop(&canvas_id_crop),
-                        class: "crop-icon",
-                        CropIcon {}
-                    }
-                    button {
-                        onclick: move |_| toggle_pinned_div(&div_id_pin),
-                        class: "pin-icon",
-                        PushPinIcon {}
+                    if show_signal_popup() {
+                        {
+                            let h = signal_history.clone();
+                            let popup_peer_id = key.clone();
+                            let popup_peer_name = peer_display_name.clone();
+                            rsx! {
+                                SignalQualityPopup {
+                                    peer_id: popup_peer_id,
+                                    peer_name: popup_peer_name,
+                                    history: h,
+                                    meeting_start_ms,
+                                    on_close: move |_| show_signal_popup.set(false),
+                                }
+                            }
+                        }
                     }
                     // Glow overlay renders ON TOP of video content so the
                     // inset box-shadow is not hidden behind the canvas element.
@@ -481,9 +555,14 @@ pub fn generate_for_peer(
             };
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
+            let grid_item_class = if show_signal_popup() {
+                "grid-item signal-popup-open"
+            } else {
+                "grid-item"
+            };
             rsx! {
                 div {
-                    class: "grid-item",
+                    class: "{grid_item_class}",
                     id: "{peer_video_div_id}",
                     // One canvas for the User Video
                     div {
@@ -514,19 +593,47 @@ pub fn generate_for_peer(
                             }
                         }
                         div {
-                            class: "{audio_speaking_class}",
-                            style: "{grid_mic_style}",
-                            MicIcon { muted: !is_audio_enabled_for_peer }
+                            class: "tile-top-icons",
+                            // Mic icon (rightmost via row-reverse, always visible)
+                            div {
+                                class: "{audio_speaking_class}",
+                                style: "{grid_mic_style}",
+                                MicIcon { muted: !is_audio_enabled_for_peer }
+                            }
+                            // Signal icon (always visible, clickable)
+                            button {
+                                class: "signal-indicator",
+                                "aria-label": "Show signal quality",
+                                onclick: move |_| show_signal_popup.toggle(),
+                                SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                            }
+                            // Pin and Crop (visible on hover only)
+                            button {
+                                onclick: move |_| toggle_pinned_div(&pv_div_pin),
+                                class: "pin-icon",
+                                PushPinIcon {}
+                            }
+                            button {
+                                onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
+                                class: "crop-icon",
+                                CropIcon {}
+                            }
                         }
-                        button {
-                            onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
-                            class: "crop-icon",
-                            CropIcon {}
-                        }
-                        button {
-                            onclick: move |_| toggle_pinned_div(&pv_div_pin),
-                            class: "pin-icon",
-                            PushPinIcon {}
+                        if show_signal_popup() {
+                            {
+                                let h = signal_history.clone();
+                                let popup_peer_id = key.clone();
+                                let popup_peer_name = peer_display_name.clone();
+                                rsx! {
+                                    SignalQualityPopup {
+                                        peer_id: popup_peer_id,
+                                        peer_name: popup_peer_name,
+                                        history: h,
+                                        meeting_start_ms,
+                                        on_close: move |_| show_signal_popup.set(false),
+                                    }
+                                }
+                            }
                         }
                         // Glow overlay renders ON TOP of video content
                         div {

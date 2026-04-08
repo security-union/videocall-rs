@@ -1014,7 +1014,21 @@ pub fn AttendantsComponent(
     let _ = toast_version(); // subscribe to trigger re-renders when toasts change
     let _ = screen_share_version(); // subscribe to trigger re-renders when screen-share state changes
     let _ = peer_display_name_version();
-    let display_peers = client.sorted_peer_keys();
+    let all_peers = client.sorted_peer_keys();
+    // Filter out the local user's own session to prevent a phantom peer tile
+    // from appearing briefly before SESSION_ASSIGNED resolves.
+    let local_user_id = user_id.as_deref().unwrap_or("");
+    let display_peers: Vec<String> = all_peers
+        .into_iter()
+        .filter(|session_id| {
+            let peer_uid = client
+                .get_peer_user_id(session_id)
+                .unwrap_or_default();
+            // Exclude peers that match the local user ID, or have no user ID
+            // (phantom sessions before identity is resolved).
+            !peer_uid.is_empty() && peer_uid != local_user_id
+        })
+        .collect();
     let peers_for_display: Vec<String> = display_peers
         .iter()
         .map(|session_id| {

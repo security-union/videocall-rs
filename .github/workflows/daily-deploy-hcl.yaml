@@ -337,6 +337,7 @@ jobs:
             --set metricsApi.imagePullSecrets[0].name=harbor-pull-secret \
             --set serverStats.image.repository=${REGISTRY}/videocall-media-server \
             --set serverStats.image.tag=${TAG} \
+            --set serverStats.imagePullSecrets[0].name=harbor-pull-secret \
             --wait --timeout 5m
 
           echo "✅ Metrics API deployed"

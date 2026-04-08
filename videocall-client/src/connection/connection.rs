@@ -244,6 +244,11 @@ impl Connection {
     pub fn set_session_id(&self, session_id: u64) {
         *self.session_id.borrow_mut() = Some(session_id);
     }
+
+    /// Get send queue depth (bufferedAmount for WebSocket, not available for WebTransport)
+    pub fn get_send_queue_depth(&self) -> Option<u64> {
+        self.task.get_send_queue_depth()
+    }
 }
 
 impl Drop for Connection {
@@ -258,7 +263,7 @@ fn build_heartbeat_packet(
     video_enabled: &AtomicBool,
     audio_enabled: &AtomicBool,
     screen_enabled: &AtomicBool,
-    is_speaking: &AtomicBool,
+    _is_speaking: &AtomicBool,
     aes: &Aes128State,
     session_id: &RefCell<Option<u64>>,
 ) -> Option<PacketWrapper> {
@@ -266,7 +271,7 @@ fn build_heartbeat_packet(
         video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
         audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
         screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
-        is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
+        // is_speaking not in proto currently
         ..Default::default()
     };
 

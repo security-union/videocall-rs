@@ -34,6 +34,7 @@ use sec_api::{
     },
     db::{get_pool, PostgresPool},
     lobby::{ws_connect, ws_connect_authenticated},
+    metrics::metrics_responder,
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
@@ -323,6 +324,7 @@ async fn main() -> std::io::Result<()> {
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
                 }))
+                .route("/metrics", web::get().to(metrics_responder))
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
@@ -349,6 +351,7 @@ async fn main() -> std::io::Result<()> {
                     after_login_url: after_login_url.clone(),
                 }))
                 .wrap(cors)
+                .route("/metrics", web::get().to(metrics_responder))
                 .service(handle_google_oauth_callback)
                 .service(login)
                 .service(check_session)
@@ -368,6 +371,7 @@ async fn main() -> std::io::Result<()> {
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
                 }))
+                .route("/metrics", web::get().to(metrics_responder))
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)

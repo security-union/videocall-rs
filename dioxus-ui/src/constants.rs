@@ -86,6 +86,12 @@ pub struct RuntimeConfig {
     #[serde(rename = "oauthPrompt")]
     #[serde(default)]
     pub oauth_prompt: Option<String>,
+    /// OAuth flow mode: `"pkce"` for client-side PKCE, any other value
+    /// (including absent/empty) for server-side OAuth where the backend
+    /// exchanges the authorization code using the client secret.
+    #[serde(rename = "oauthFlow")]
+    #[serde(default)]
+    pub oauth_flow: Option<String>,
     #[serde(rename = "serverElectionPeriodMs")]
     pub server_election_period_ms: u64,
     #[serde(rename = "audioBitrateKbps")]
@@ -264,6 +270,23 @@ pub fn oauth_prompt() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// OAuth flow mode, read from `window.__APP_CONFIG.oauthFlow`.
+/// Returns `Some("pkce")` for client-side PKCE flow.
+/// Any other value (including `None` / empty) means server-side flow.
+pub fn oauth_flow() -> Option<String> {
+    app_config()
+        .ok()
+        .and_then(|c| c.oauth_flow)
+        .filter(|s| !s.is_empty())
+}
+
+/// Returns `true` when OAuth is enabled AND the flow is explicitly set to
+/// `"pkce"`.  All code paths that decide between client-side PKCE and
+/// server-side OAuth should use this single predicate.
+pub fn is_pkce_flow() -> bool {
+    oauth_enabled().unwrap_or(false) && oauth_flow().as_deref() == Some("pkce")
+}
+
 pub fn meeting_api_base_url() -> Result<String, String> {
     app_config().map(|c| {
         c.meeting_api_base_url
@@ -274,17 +297,20 @@ pub fn meeting_api_base_url() -> Result<String, String> {
 
 pub fn meeting_api_client() -> Result<videocall_meeting_client::MeetingApiClient, String> {
     let base_url = meeting_api_base_url()?;
-    // Bearer token priority:
-    //   1. access_token — the OAuth access token intended for resource servers.
-    //      Sent as-is; the meeting-api validates it via JWKS.
-    //   2. id_token — fallback for tabs where only the id_token was stored
-    //      (e.g. sessions from before the access_token was introduced).
-    //   3. Cookie mode — for deployments that do not use an external OAuth
-    //      provider (the server still accepts legacy HMAC session JWTs).
-    let auth_mode = crate::auth::get_stored_access_token()
-        .or_else(crate::auth::get_stored_id_token)
-        .map(videocall_meeting_client::AuthMode::Bearer)
-        .unwrap_or(videocall_meeting_client::AuthMode::Cookie);
+    // PKCE flow: check sessionStorage for Bearer tokens (access_token preferred,
+    //   id_token as fallback for older sessions). The meeting-api validates
+    //   these via JWKS.
+    // All other flows (server-side OAuth with HttpOnly session cookie, or
+    //   non-OAuth deployments with HMAC session JWT cookie): use Cookie mode
+    //   so that fetch includes `credentials: 'include'`.
+    let auth_mode = if is_pkce_flow() {
+        crate::auth::get_stored_access_token()
+            .or_else(crate::auth::get_stored_id_token)
+            .map(videocall_meeting_client::AuthMode::Bearer)
+            .unwrap_or(videocall_meeting_client::AuthMode::Cookie)
+    } else {
+        videocall_meeting_client::AuthMode::Cookie
+    };
     Ok(videocall_meeting_client::MeetingApiClient::new(
         &base_url, auth_mode,
     ))

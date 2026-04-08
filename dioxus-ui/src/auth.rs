@@ -49,8 +49,8 @@
 //! (RP-initiated logout via `end_session_endpoint` when configured).
 
 use crate::constants::{
-    login_url, logout_url, meeting_api_client, oauth_auth_url, oauth_client_id, oauth_enabled,
-    oauth_prompt, oauth_redirect_url, oauth_scopes,
+    login_url, logout_url, meeting_api_client, oauth_auth_url, oauth_client_id, oauth_prompt,
+    oauth_redirect_url, oauth_scopes,
 };
 use crate::pkce::{self};
 use anyhow::anyhow;
@@ -202,7 +202,7 @@ pub fn clear_user_profile() {
 /// nor the id_token is stored, the server will always return 401 — skip the
 /// network round-trip and fail immediately.
 pub async fn check_session() -> anyhow::Result<()> {
-    if oauth_enabled().unwrap_or(false)
+    if crate::constants::is_pkce_flow()
         && get_stored_access_token().is_none()
         && get_stored_id_token().is_none()
     {
@@ -232,11 +232,11 @@ pub async fn get_user_profile() -> anyhow::Result<UserProfile> {
     // Guard: only serve the cache when at least one token is present.  Tokens
     // and the profile cache are cleared together on logout; if both are absent
     // the user has signed out and the cached profile is stale.
-    if oauth_enabled().unwrap_or(false) {
-        if get_stored_access_token().is_some() || get_stored_id_token().is_some() {
-            if let Some(profile) = get_stored_user_profile() {
-                return Ok(profile);
-            }
+    if crate::constants::is_pkce_flow()
+        && (get_stored_access_token().is_some() || get_stored_id_token().is_some())
+    {
+        if let Some(profile) = get_stored_user_profile() {
+            return Ok(profile);
         }
         // Token present but no cached profile — fall through to the API call.
     }
@@ -413,15 +413,14 @@ pub fn do_login() {
     // Determine `return_to` synchronously before the async task runs.
     let return_to = resolve_return_to_for_do_login();
 
-    if oauth_enabled().unwrap_or(false) {
-        // New flow: generate PKCE and redirect directly to the provider.
+    if crate::constants::is_pkce_flow() {
+        // Client-side PKCE: generate challenge and redirect directly to the provider.
         wasm_bindgen_futures::spawn_local(async move {
             start_oauth_flow(return_to).await;
         });
     } else {
-        // OAuth is not configured — navigate to the backend /login endpoint as
-        // a fallback (the backend will return an error, but this path should
-        // never be reached in a correctly configured deployment).
+        // Server-side OAuth (or OAuth disabled): redirect to the backend /login
+        // endpoint which exchanges the authorization code using the client secret.
         let url = match build_legacy_login_url(return_to.as_deref()) {
             Ok(u) => u,
             Err(e) => {
@@ -444,7 +443,7 @@ pub fn do_login() {
 pub fn redirect_to_login() {
     let return_to = window().location().href().ok().filter(|s| !s.is_empty());
 
-    if oauth_enabled().unwrap_or(false) {
+    if crate::constants::is_pkce_flow() {
         wasm_bindgen_futures::spawn_local(async move {
             start_oauth_flow(return_to).await;
         });

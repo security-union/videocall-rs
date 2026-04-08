@@ -23,7 +23,7 @@ use dioxus::prelude::*;
 
 use crate::components::google_sign_in_button::GoogleSignInButton;
 use crate::components::okta_sign_in_button::OktaSignInButton;
-use crate::constants::{oauth_enabled, oauth_provider};
+use crate::constants::{is_pkce_flow, oauth_provider};
 
 /// Start the OAuth / PKCE login flow.
 ///
@@ -58,12 +58,12 @@ pub fn ProviderButton(onclick: EventHandler<MouseEvent>) -> Element {
 #[component]
 pub fn Login() -> Element {
     use_effect(move || {
-        if oauth_enabled().unwrap_or(false) {
+        if is_pkce_flow() {
             do_login();
         }
     });
 
-    if oauth_enabled().unwrap_or(false) {
+    if is_pkce_flow() {
         rsx! {
             div { class: "login-container",
                 div { class: "login-card",

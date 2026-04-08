@@ -51,6 +51,30 @@ use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
 
+/// Generate a cryptographically random instance ID for correlating reconnections.
+/// Uses `crypto.getRandomValues()` for unpredictability since the instance_id
+/// is used for session eviction (a predictable ID could allow targeted eviction).
+fn generate_instance_id() -> String {
+    let mut buf = [0u8; 16];
+    if let Some(crypto) = web_sys::window().and_then(|w| w.crypto().ok()) {
+        let _ = crypto.get_random_values_with_u8_array(&mut buf);
+    } else {
+        // Fallback for environments without window.crypto (e.g., workers).
+        let rand = || (js_sys::Math::random() * 0xFFFF_FFFF_u32 as f64) as u32;
+        buf[0..4].copy_from_slice(&rand().to_be_bytes());
+        buf[4..8].copy_from_slice(&rand().to_be_bytes());
+        buf[8..12].copy_from_slice(&rand().to_be_bytes());
+        buf[12..16].copy_from_slice(&rand().to_be_bytes());
+    }
+    format!(
+        "{:08x}-{:08x}-{:08x}-{:08x}",
+        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+        u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
+    )
+}
+
 /// Configuration options for creating a [`VideoCallClient`].
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
@@ -66,6 +90,7 @@ pub struct VideoCallClientOptions {
     pub get_peer_video_canvas_id: Callback<String, String>,
     pub get_peer_screen_canvas_id: Callback<String, String>,
     pub user_id: String,
+    pub display_name: String,
     pub meeting_id: String,
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
@@ -140,7 +165,7 @@ struct InnerOptions {
 #[derive(Debug)]
 struct Inner {
     options: InnerOptions,
-    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
+    connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     connection_state: ConnectionState,
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
@@ -175,7 +200,7 @@ struct Inner {
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
-    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
+    connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
 }
@@ -240,6 +265,7 @@ impl VideoCallClient {
             );
 
             reporter.set_meeting_id(options.meeting_id.clone());
+            reporter.set_display_name(options.display_name.clone());
 
             if let Some(interval) = options.health_reporting_interval_ms {
                 reporter.set_health_interval(interval);
@@ -250,7 +276,7 @@ impl VideoCallClient {
             None
         };
 
-        let connection_controller: Rc<RefCell<Option<ConnectionController>>> =
+        let connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>> =
             Rc::new(RefCell::new(None));
 
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
@@ -442,7 +468,16 @@ impl VideoCallClient {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         match inner.try_borrow_mut() {
                             Ok(mut inner) => {
-                                inner.peer_decode_manager.run_peer_monitor();
+                                let removed = inner.peer_decode_manager.run_peer_monitor();
+                                if !removed.is_empty() {
+                                    if let Some(hr) = &inner.health_reporter {
+                                        if let Ok(reporter) = hr.try_borrow() {
+                                            for peer_id in &removed {
+                                                reporter.remove_peer(peer_id);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(_) => {
                                 // Transient borrow conflict — another callback
@@ -460,11 +495,23 @@ impl VideoCallClient {
                 })
             },
             election_period_ms,
+            instance_id: generate_instance_id(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
 
-        *self.connection_controller.try_borrow_mut()? = Some(connection_controller);
+        // Store the controller as an Rc so we can share it with the health reporter
+        let controller_rc = Rc::new(connection_controller);
+        *self.connection_controller.try_borrow_mut()? = Some(controller_rc.clone());
+
+        // Pass the connection controller to the health reporter for communication metrics
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(hrb) = hr.try_borrow() {
+                    hrb.set_connection_controller(controller_rc);
+                }
+            }
+        }
 
         info!("ConnectionManager created with RTT testing and 1Hz diagnostics reporting");
         Ok(())
@@ -1222,6 +1269,14 @@ impl Inner {
                         }
                     }
                 }
+
+                // Update health reporter with the server-assigned session_id so that
+                // HealthPacket.session_id matches PacketWrapper.session_id for room traffic.
+                if let Some(hr) = &self.health_reporter {
+                    if let Ok(mut reporter) = hr.try_borrow_mut() {
+                        reporter.set_session_id(response.session_id.to_string());
+                    }
+                }
             }
             Ok(PacketType::MEETING) => match MeetingPacket::parse_from_bytes(&response.data) {
                 Ok(meeting_packet) => {
@@ -1300,6 +1355,19 @@ impl Inner {
                             if meeting_packet.session_id != 0 {
                                 self.peer_decode_manager
                                     .delete_peer(meeting_packet.session_id);
+                                // Also remove from health reporter — delete_peer
+                                // cleans connected_peers and fps_trackers, but
+                                // peer_health_data is maintained separately by
+                                // the health reporter and must be cleaned
+                                // explicitly. Without this, departed peers
+                                // persist in the health packet's peer_stats,
+                                // inflating the peer count indefinitely.
+                                if let Some(hr) = &self.health_reporter {
+                                    if let Ok(reporter) = hr.try_borrow() {
+                                        reporter
+                                            .remove_peer(&meeting_packet.session_id.to_string());
+                                    }
+                                }
                             }
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();

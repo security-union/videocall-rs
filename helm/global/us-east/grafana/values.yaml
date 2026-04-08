@@ -7,11 +7,11 @@ grafana:
   # Minimal resources for cost optimization
   resources:
     limits:
-      cpu: 50m
-      memory: 128Mi
+      cpu: 100m
+      memory: 256Mi
     requests:
-      cpu: 50m
-      memory: 64Mi
+      cpu: 25m
+      memory: 128Mi
   
   # Single replica
   replicas: 1
@@ -90,6 +90,8 @@ grafana:
     default:
       videocall-health:
         file: dashboards/videocall-health.json
+      meeting-investigation:
+        file: dashboards/meeting-investigation.json
       server-connections-analytics:
         file: dashboards/server-connections-analytics.json
       # Standard K8s monitoring dashboards (downloaded from grafana.com at startup)

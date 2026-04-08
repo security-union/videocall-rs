@@ -69,6 +69,11 @@ rustlemania-webtransport:
       service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
       external-dns.alpha.kubernetes.io/hostname: "webtransport-singapore.webtransport.video"
 
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "444"
+    prometheus.io/path: "/metrics"
+
   autoscaling:
     enabled: false
     minReplicas: 1

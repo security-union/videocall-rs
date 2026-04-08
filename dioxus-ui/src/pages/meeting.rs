@@ -163,6 +163,7 @@ pub fn MeetingPage(id: String) -> Element {
 
             let opts = VideoCallClientOptions {
                 user_id: user_id_for_client,
+                display_name: display_name.clone(),
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,

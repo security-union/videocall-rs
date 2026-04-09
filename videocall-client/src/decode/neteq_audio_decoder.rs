@@ -405,6 +405,22 @@ impl NetEqAudioPeerDecoder {
                 ],
             });
         }
+
+        // Expand rate: ratio of concealed vs real audio (Q14 format).
+        // Broadcast as a parsed metric so consumers can match directly
+        // without re-parsing the full stats JSON.
+        if let Some(er) = network.get("expand_rate").and_then(|v| v.as_f64()) {
+            let _ = global_sender().try_broadcast(DiagEvent {
+                subsystem: "neteq",
+                stream_id: Some(format!("current_user->{peer_id}")),
+                ts_ms: now_ms(),
+                metrics: vec![
+                    metric!("expand_rate", er),
+                    metric!("reporting_peer", "current_user"),
+                    metric!("target_peer", peer_id.to_string()),
+                ],
+            });
+        }
     }
 
     /// Create message handler for NetEq worker

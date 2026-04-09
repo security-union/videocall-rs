@@ -4,15 +4,26 @@ metadata:
   name: client-{{ include "metrics-api.fullname" . }}
   labels:
     {{- include "metrics-api.labels" . | nindent 4 }}
+    app.kubernetes.io/component: client-metrics
 spec:
   replicas: {{ .Values.metricsApi.replicas }}
   selector:
     matchLabels:
       {{- include "metrics-api.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: client-metrics
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.metricsApi.service.targetPort }}"
+        prometheus.io/path: "/metrics"
+        prometheus.io/scrape-interval: "15s"
+        {{- with .Values.metricsApi.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       labels:
         {{- include "metrics-api.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: client-metrics
     spec:
       {{- with .Values.metricsApi.imagePullSecrets }}
       imagePullSecrets:

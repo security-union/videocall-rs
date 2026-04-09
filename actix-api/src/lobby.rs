@@ -49,6 +49,10 @@ lazy_static::lazy_static! {
 pub struct LobbyTokenQuery {
     /// JWT room access token. Identity and room are extracted from the claims.
     pub token: String,
+    /// Stable client instance identifier (UUID). Survives reconnects within
+    /// the same tab/meeting join. The server uses it to correlate reconnections
+    /// and silently evict stale sessions.
+    pub instance_id: Option<String>,
 }
 
 /// Query parameters for the deprecated path-based lobby endpoint.
@@ -115,6 +119,7 @@ pub async fn ws_connect_authenticated(
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();
     let session_manager = state.session_manager.clone();
+    let instance_id = query.into_inner().instance_id;
     let actor = WsChatSession::new(
         chat,
         room,
@@ -124,6 +129,7 @@ pub async fn ws_connect_authenticated(
         tracker_sender,
         session_manager,
         observer,
+        instance_id,
     );
     let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
@@ -177,6 +183,7 @@ pub async fn ws_connect(
         tracker_sender,
         session_manager,
         false, // deprecated path-based endpoint: never observer
+        None,  // no instance_id for deprecated endpoint
     );
     let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)

@@ -39,6 +39,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use videocall_codecs::decoder::WasmDecoder;
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, FrameType, VideoFrame as CodecVideoFrame};
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::media_packet::VideoCodec;
 use wasm_bindgen::prelude::Closure;
@@ -66,6 +67,9 @@ struct CanvasRenderer {
     context: CanvasRenderingContext2d,
     last_width: u32,
     last_height: u32,
+    /// Peer context for diagnostics. Set via [`VideoPeerDecoder::set_stream_context`].
+    from_peer: Option<String>,
+    to_peer: Option<String>,
 }
 
 ///
@@ -127,6 +131,8 @@ impl VideoPeerDecoder {
                 context,
                 last_width: 0,
                 last_height: 0,
+                from_peer: None,
+                to_peer: None,
             });
         }
 
@@ -150,23 +156,55 @@ impl VideoPeerDecoder {
     }
 
     /// Set or update the canvas element for rendering. Can be called multiple times.
+    /// Preserves existing peer context (from_peer / to_peer) if already set.
     pub fn set_canvas(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
         let context = canvas
             .get_context("2d")?
             .ok_or_else(|| JsValue::from_str("Failed to get 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
 
-        *self.canvas_renderer.borrow_mut() = Some(CanvasRenderer {
+        let mut guard = self.canvas_renderer.borrow_mut();
+        // Preserve existing peer context when the canvas is swapped.
+        let (from_peer, to_peer) = guard
+            .as_ref()
+            .map(|r| (r.from_peer.clone(), r.to_peer.clone()))
+            .unwrap_or_default();
+        *guard = Some(CanvasRenderer {
             canvas,
             context,
             last_width: 0,
             last_height: 0,
+            from_peer,
+            to_peer,
         });
         Ok(())
     }
 
-    /// Provide original peer IDs to the underlying decoder so worker can tag diagnostics
+    /// Provide original peer IDs to the underlying decoder so worker can tag diagnostics.
+    /// Also stores the peer context in the canvas renderer so resolution changes can
+    /// be broadcast with the correct peer_id.
     pub fn set_stream_context(&self, from_peer: String, to_peer: String) {
+        // Store peer context in the canvas renderer for resolution broadcasts.
+        if let Some(renderer) = self.canvas_renderer.borrow_mut().as_mut() {
+            renderer.from_peer = Some(from_peer.clone());
+            renderer.to_peer = Some(to_peer.clone());
+            // If the canvas already has dimensions (frames arrived before
+            // set_stream_context was called), broadcast the resolution now.
+            if renderer.last_width > 0 && renderer.last_height > 0 {
+                let evt = DiagEvent {
+                    subsystem: "video_resolution",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics: vec![
+                        metric!("resolution_width", renderer.last_width as u64),
+                        metric!("resolution_height", renderer.last_height as u64),
+                        metric!("from_peer", from_peer.clone()),
+                        metric!("to_peer", to_peer.clone()),
+                    ],
+                };
+                let _ = global_sender().try_broadcast(evt);
+            }
+        }
         self.decoder.set_stream_context(from_peer, to_peer);
     }
 
@@ -188,6 +226,22 @@ impl VideoPeerDecoder {
                 renderer.last_width = width;
                 renderer.last_height = height;
                 log::debug!("Resized canvas to {width}x{height}");
+
+                // Broadcast resolution change so the UI can display it in tooltips.
+                if let Some(to_peer) = &renderer.to_peer {
+                    let evt = DiagEvent {
+                        subsystem: "video_resolution",
+                        stream_id: None,
+                        ts_ms: now_ms(),
+                        metrics: vec![
+                            metric!("resolution_width", width as u64),
+                            metric!("resolution_height", height as u64),
+                            metric!("from_peer", renderer.from_peer.clone().unwrap_or_default()),
+                            metric!("to_peer", to_peer.clone()),
+                        ],
+                    };
+                    let _ = global_sender().try_broadcast(evt);
+                }
             }
 
             // Clear and draw frame
@@ -371,6 +425,7 @@ impl PeerDecode for StandardAudioPeerDecoder {
                 );
                 if let Err(e) = self.decoder.decode(packet.clone()) {
                     log::error!("Error decoding audio packet: {e:?}");
+                    // Phase 1: This error will be caught and counted as a frame drop in peer_decode_manager
                     return Err(anyhow::anyhow!("Failed to decode audio packet"));
                 }
                 self.decoded = true;

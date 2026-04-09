@@ -23,6 +23,7 @@ use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use tracing::{error, info};
 
 use sec_api::actors::chat_server::ChatServer;
+use sec_api::metrics::metrics_responder;
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
 use sec_api::version;
@@ -102,6 +103,7 @@ async fn main() {
         let server = HttpServer::new(|| {
             App::new()
                 .route("/healthz", web::get().to(health_responder))
+                .route("/metrics", web::get().to(metrics_responder))
                 .route("/version", web::get().to(version::webtransport_version))
         });
 

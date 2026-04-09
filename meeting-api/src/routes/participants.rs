@@ -89,23 +89,38 @@ pub async fn join_meeting(
         let current_state = meeting.state.as_deref().unwrap_or("idle");
         if current_state != "active" {
             if !meeting.waiting_room_enabled {
-                // No waiting room: auto-activate the meeting and immediately admit
-                // the first non-host joiner so they can wait inside the call.
+                // No waiting room: auto-activate the meeting and admit
+                // a non-host joiner so they can wait inside the call.
                 db_meetings::activate(&state.db, meeting.id).await?;
                 nats_events::publish_meeting_activated(state.nats.as_ref(), &meeting_id).await;
-                let (_auto_admitted, row, _wr_enabled) =
+                let (auto_admitted, row, wr_enabled) =
                     db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name)
                         .await?;
-                let token = generate_room_token(
-                    &state.jwt_secret,
-                    state.token_ttl_secs,
-                    &user_id,
-                    &meeting_id,
-                    false,
-                    display_name.unwrap_or(&user_id),
-                )?;
-                let mut resp = row.into_participant_status(Some(token));
-                resp.waiting_room_enabled = Some(false);
+                let token = if auto_admitted {
+                    Some(generate_room_token(
+                        &state.jwt_secret,
+                        state.token_ttl_secs,
+                        &user_id,
+                        &meeting_id,
+                        false,
+                        display_name.unwrap_or(&user_id),
+                    )?)
+                } else {
+                    None
+                };
+                let mut resp = row.into_participant_status(token);
+                if !auto_admitted {
+                    let dn = display_name.unwrap_or(&user_id);
+                    resp.observer_token = Some(generate_observer_token(
+                        &state.jwt_secret,
+                        &user_id,
+                        &meeting_id,
+                        dn,
+                    )?);
+                    nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id)
+                        .await;
+                }
+                resp.waiting_room_enabled = Some(wr_enabled);
                 resp.admitted_can_admit = Some(meeting.admitted_can_admit);
                 resp.host_display_name = meeting.host_display_name;
                 resp.host_user_id = meeting.creator_id;

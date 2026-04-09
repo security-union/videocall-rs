@@ -659,9 +659,14 @@ impl HealthReporter {
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
 
-                // Calculate loss % from windowed rates (resets every ~1 second)
-                if packets_per_sec > 0.0 {
-                    ps.audio_packet_loss_pct = (expand_per_sec / packets_per_sec) * 100.0;
+                // Calculate loss % from windowed rates (resets every ~1 second).
+                // Gate on >= 2.0 pps (matches quality-score gate): below that the
+                // speaker is likely in DTX silence and the ratio is unreliable.
+                // Clamp to 0–100: packet loss cannot exceed 100% by definition,
+                // and unsynchronised window rollovers can momentarily inflate it.
+                if packets_per_sec >= 2.0 {
+                    ps.audio_packet_loss_pct =
+                        ((expand_per_sec / packets_per_sec) * 100.0).clamp(0.0, 100.0);
                 }
 
                 if let Some(network) = neteq.get("network") {

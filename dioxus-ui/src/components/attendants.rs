@@ -1015,19 +1015,13 @@ pub fn AttendantsComponent(
     let _ = screen_share_version(); // subscribe to trigger re-renders when screen-share state changes
     let _ = peer_display_name_version();
     let all_peers = client.sorted_peer_keys();
-    // Filter out the local user's own session to prevent a phantom peer tile
-    // from appearing briefly before SESSION_ASSIGNED resolves.
-    let local_user_id = user_id.as_deref().unwrap_or("");
+    // Filter out the local user's own session to prevent a phantom peer tile.
+    // Compare by session_id (unique per connection), not user_id (shared when
+    // the same account joins from multiple browsers/tabs).
+    let own_session = client.get_own_session_id().unwrap_or_default();
     let display_peers: Vec<String> = all_peers
         .into_iter()
-        .filter(|session_id| {
-            let peer_uid = client
-                .get_peer_user_id(session_id)
-                .unwrap_or_default();
-            // Exclude peers that match the local user ID, or have no user ID
-            // (phantom sessions before identity is resolved).
-            !peer_uid.is_empty() && peer_uid != local_user_id
-        })
+        .filter(|session_id| *session_id != own_session)
         .collect();
     let peers_for_display: Vec<String> = display_peers
         .iter()

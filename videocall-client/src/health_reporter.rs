@@ -106,9 +106,12 @@ pub struct HealthReporter {
     active_server_rtt_ms: Rc<RefCell<Option<f64>>>,
     connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     /// Adaptive video tier index from CameraEncoder (0=best, 7=minimal).
-    adaptive_video_tier: Rc<AtomicU32>,
+    /// Wrapped in RefCell so `set_adaptive_tier_sources` (called after
+    /// `start_health_reporting`) can swap the inner Rc and the spawned loop
+    /// picks up the new atomic on its next tick.
+    adaptive_video_tier: Rc<RefCell<Rc<AtomicU32>>>,
     /// Adaptive audio tier index from CameraEncoder (0=high, 3=emergency).
-    adaptive_audio_tier: Rc<AtomicU32>,
+    adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
 }
 
 impl HealthReporter {
@@ -128,8 +131,8 @@ impl HealthReporter {
             active_server_type: Rc::new(RefCell::new(None)),
             active_server_rtt_ms: Rc::new(RefCell::new(None)),
             connection_controller: Rc::new(RefCell::new(None)),
-            adaptive_video_tier: Rc::new(AtomicU32::new(0)),
-            adaptive_audio_tier: Rc::new(AtomicU32::new(0)),
+            adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
         }
     }
 
@@ -186,8 +189,8 @@ impl HealthReporter {
         video_tier: Rc<AtomicU32>,
         audio_tier: Rc<AtomicU32>,
     ) {
-        self.adaptive_video_tier = video_tier;
-        self.adaptive_audio_tier = audio_tier;
+        *self.adaptive_video_tier.borrow_mut() = video_tier;
+        *self.adaptive_audio_tier.borrow_mut() = audio_tier;
     }
 
     /// Start subscribing to real diagnostics events via videocall_diagnostics
@@ -520,8 +523,8 @@ impl HealthReporter {
                             send_queue_bytes,
                             packets_received_per_sec,
                             packets_sent_per_sec,
-                            adaptive_video_tier.load(Ordering::Relaxed),
-                            adaptive_audio_tier.load(Ordering::Relaxed),
+                            adaptive_video_tier.borrow().load(Ordering::Relaxed),
+                            adaptive_audio_tier.borrow().load(Ordering::Relaxed),
                             videocall_transport::webtransport::datagram_drop_count(),
                             keyframe_requests_sent_count(),
                         );

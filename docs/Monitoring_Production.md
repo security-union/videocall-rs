@@ -46,7 +46,7 @@ export NS=videocall
 helm upgrade --install prometheus ./helm/global/us-east/prometheus -n $NS
 
 # 2. Grafana (auto-provisions all dashboards from JSON files)
-helm upgrade --install grafana ./helm/global/us-east/grafana -n $NS
+helm upgrade --install grafana ./helm/grafana/ -f helm/global/us-east/grafana/values.yaml -n $NS
 
 # 3. Metrics API (NATS → Prometheus bridge for client health packets)
 helm upgrade --install metrics-api ./helm/global/us-east/metrics-api -n $NS
@@ -85,7 +85,7 @@ kubectl exec -n $NS deploy/nats-box -- wget -qO- http://rustlemania-websocket:80
 | **Client Monitoring** | `videocall-health` | 30 | Detailed per-peer client metrics. |
 | **Server Connections** | `dc5539f9-...` | 4 | Basic server connection analytics. |
 
-Dashboards are provisioned from JSON files in `helm/global/us-east/grafana/dashboards/`. To update a dashboard: edit in Grafana UI → export JSON → save to the dashboards directory → commit.
+Dashboards are provisioned from JSON files in `helm/grafana/dashboards/`. To update a dashboard: edit in Grafana UI → export JSON → save to the dashboards directory → commit.
 
 ### Template variables
 - **Meeting Investigation**: `$meeting` — filter by meeting_id
@@ -170,7 +170,7 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 | Chart | Path | Purpose |
 |---|---|---|
 | Prometheus | `helm/global/us-east/prometheus/` | Server config, scrape jobs, alerts |
-| Grafana | `helm/global/us-east/grafana/` | Dashboards, datasource, provisioning |
+| Grafana | `helm/grafana/` (base) + `helm/global/us-east/grafana/` (env values) | Dashboards, datasource, provisioning |
 | Metrics API | `helm/global/us-east/metrics-api/` | NATS→Prometheus bridge (client + server) |
 | WS relay | `helm/rustlemania-websocket/` + `helm/global/us-east/websocket/` | WebSocket relay server |
 | WT relay | `helm/rustlemania-webtransport/` + `helm/global/us-east/webtransport/` | WebTransport relay server |

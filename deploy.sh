@@ -6,7 +6,7 @@
 #   --restart              Restart core deployments to pull latest images
 #   --services SERVICES    Deploy only specific services (comma-separated)
 #                         Available services: websocket, webtransport, ingress-nginx,
-#                         engineering-vlog, matomo, videocall-ui,
+#                         engineering-vlog, videocall-ui,
 #                         videocall-website, prometheus, grafana, metrics-api, meeting-api
 #   (other)               Pass through to deploy-global-infrastructure.sh
 #

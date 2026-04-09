@@ -746,11 +746,11 @@ fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> 
 #[derive(Debug)]
 pub struct PeerDecodeManager {
     connected_peers: HashMapWithOrderedKeys<u64, Peer>,
-    /// Cache of user_id -> display_name, populated from PARTICIPANT_JOINED events.
+    /// Cache of session_id -> display_name, populated from PARTICIPANT_JOINED events.
     /// This persists independently of the peer list so that when `ensure_peer()`
     /// creates a peer later (after the first media packet arrives), the display
     /// name is immediately available and does not fall back to user_id/email.
-    display_name_cache: HashMap<String, String>,
+    display_name_cache: HashMap<u64, String>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -1023,7 +1023,7 @@ impl PeerDecodeManager {
         )?;
         // Apply cached display name if PARTICIPANT_JOINED arrived before
         // the first media packet created this peer entry.
-        if let Some(cached_name) = self.display_name_cache.get(user_id) {
+        if let Some(cached_name) = self.display_name_cache.get(&session_id) {
             debug!(
                 "Applying cached display_name '{}' for peer {} (user_id={})",
                 cached_name, session_id, user_id
@@ -1039,6 +1039,7 @@ impl PeerDecodeManager {
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
+            self.display_name_cache.remove(&session_id);
             self.on_peer_removed.emit(peer.sid_str);
         }
     }
@@ -1108,26 +1109,37 @@ impl PeerDecodeManager {
         Ok(())
     }
 
-    /// Set the display name for a peer identified by user_id (email).
+    /// Set the display name for a peer identified by session_id.
     /// This is called when a PARTICIPANT_JOINED event provides the display name.
     ///
     /// The display name is stored in both the per-peer entry (if the peer
-    /// already exists) AND a persistent cache keyed by user_id. This way,
+    /// already exists) AND a persistent cache keyed by session_id. This way,
     /// if the PARTICIPANT_JOINED event arrives before the first media packet
     /// creates the peer entry via `ensure_peer()`, the display name is
     /// still available when the peer is created later.
-    pub fn set_peer_display_name_by_user_id(&mut self, user_id: &str, display_name: String) {
+    pub fn set_peer_display_name(&mut self, session_id: u64, display_name: String) {
         // Always persist in the cache so that future `add_peer()` calls
         // can pick it up even if no peer entry exists yet.
         self.display_name_cache
-            .insert(user_id.to_string(), display_name.clone());
+            .insert(session_id, display_name.clone());
 
-        // Also update any existing peer entries with this user_id.
+        // Also update the existing peer entry if it exists.
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            peer.display_name = Some(display_name);
+        }
+    }
+
+    /// Update display name for all peers with the given user_id.
+    /// Used for PARTICIPANT_DISPLAY_NAME_CHANGED events where the server
+    /// does not include session_id — a rename applies to all sessions
+    /// belonging to that user.
+    pub fn set_peer_display_name_by_user_id(&mut self, user_id: &str, display_name: String) {
         let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
         for key in keys {
             if let Some(peer) = self.connected_peers.get_mut(&key) {
                 if peer.user_id == user_id {
                     peer.display_name = Some(display_name.clone());
+                    self.display_name_cache.insert(key, display_name.clone());
                 }
             }
         }

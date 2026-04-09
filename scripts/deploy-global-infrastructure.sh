@@ -196,6 +196,20 @@ get_context_for_chart() {
     esac
 }
 
+# For charts that have been refactored to a shared base chart with per-env
+# values, return the base chart directory.  All other charts are self-contained
+# and the chart source is the same as the CHARTS entry.
+get_chart_source_for_chart() {
+    case "$1" in
+        "global/us-east/grafana")
+            echo "${HELM_DIR}/grafana"
+            ;;
+        *)
+            echo "${HELM_DIR}/${1}"
+            ;;
+    esac
+}
+
 get_release_name_for_chart() {
     case "$1" in
         "global/us-east/websocket")
@@ -414,10 +428,14 @@ validate_prerequisites() {
     # Check helm charts exist for selected region
     local charts=($(get_charts_for_region "${DEPLOY_REGION}" "${SERVICES_FILTER}"))
     for chart in "${charts[@]}"; do
-        local chart_path="${HELM_DIR}/${chart}"
-        
-        if [[ ! -f "${chart_path}/Chart.yaml" ]]; then
-            error_exit "Chart not found: ${chart_path}/Chart.yaml"
+        local chart_source="$(get_chart_source_for_chart "${chart}")"
+        local values_file="${HELM_DIR}/${chart}/values.yaml"
+
+        if [[ ! -f "${chart_source}/Chart.yaml" ]]; then
+            error_exit "Chart not found: ${chart_source}/Chart.yaml"
+        fi
+        if [[ ! -f "${values_file}" ]]; then
+            error_exit "Values file not found: ${values_file}"
         fi
         log_info "✓ Chart '${chart}' exists"
     done
@@ -506,13 +524,13 @@ update_dependencies() {
     
     # Update chart dependencies
     for chart in "${charts[@]}"; do
-        local chart_path="${HELM_DIR}/${chart}"
+        local chart_source="$(get_chart_source_for_chart "${chart}")"
         log_info "Updating dependencies for ${chart}"
-        
+
         if [[ "${DRY_RUN}" == "true" ]]; then
-            log_info "[DRY RUN] Would run: helm dependency update in ${chart_path}"
+            log_info "[DRY RUN] Would run: helm dependency update in ${chart_source}"
         else
-            if ! (cd "${chart_path}" && helm dependency update); then
+            if ! (cd "${chart_source}" && helm dependency update); then
                 error_exit "Failed to update dependencies for ${chart}"
             fi
             log_success "Dependencies updated for ${chart}"
@@ -523,30 +541,31 @@ update_dependencies() {
 # Deploy a single chart
 deploy_chart() {
     local chart="$1"
-    local chart_path="${HELM_DIR}/${chart}"
+    local chart_source="$(get_chart_source_for_chart "${chart}")"
+    local values_file="${HELM_DIR}/${chart}/values.yaml"
     local context="$(get_context_for_chart "${chart}")"
     local release_name="$(get_release_name_for_chart "${chart}")"
-    
+
     log_info "Deploying ${chart} to context ${context} as release ${release_name}"
-    
+
     if [[ "${DRY_RUN}" == "true" ]]; then
         log_info "[DRY RUN] Would run:"
         log_info "  kubectl config use-context ${context}"
-        log_info "  helm upgrade --install ${release_name} . -f values.yaml"
+        log_info "  helm upgrade --install ${release_name} ${chart_source} -f ${values_file}"
         return 0
     fi
-    
+
     # Switch context
     if ! kubectl config use-context "${context}" >/dev/null 2>&1; then
         error_exit "Failed to switch to context ${context}"
     fi
     log_info "Switched to context: ${context}"
-    
-    # Standard local chart deployment for all regional charts
-    if ! (cd "${chart_path}" && helm upgrade --install "${release_name}" . -f values.yaml --timeout 300s --force); then
+
+    # Deploy chart with its values file
+    if ! helm upgrade --install "${release_name}" "${chart_source}" -f "${values_file}" --timeout 300s --force; then
         error_exit "Failed to deploy ${chart}"
     fi
-    
+
     log_success "Successfully deployed ${chart}"
 }
 

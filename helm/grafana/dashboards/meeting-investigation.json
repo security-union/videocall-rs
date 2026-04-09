@@ -1505,12 +1505,17 @@
       "targets": [
         {
           "expr": "rate(videocall_datagram_drops_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
-          "legendFormat": "{{display_name}}",
+          "legendFormat": "WT {{display_name}}",
+          "refId": ""
+        },
+        {
+          "expr": "rate(videocall_websocket_drops_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
+          "legendFormat": "WS {{display_name}}",
           "refId": ""
         }
       ],
-      "title": "Datagram Drops/sec",
-      "description": "Rate of WebTransport datagram drops (writable stream locked). Indicates transport backpressure.",
+      "title": "Transport Drops/sec",
+      "description": "Rate of transport-layer packet drops due to backpressure. WT = WebTransport (writable locked), WS = WebSocket (buffer full).",
       "type": "timeseries"
     },
     {

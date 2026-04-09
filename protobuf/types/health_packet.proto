@@ -99,5 +99,6 @@ message HealthPacket {
   optional uint32 adaptive_audio_tier = 21; // Current audio encoding tier index (0=high, 3=emergency)
   optional uint64 datagram_drops_total = 22; // Cumulative datagrams dropped (writable locked)
   optional uint64 keyframe_requests_sent_total = 23; // Cumulative keyframe requests sent (PLI)
+  optional uint64 websocket_drops_total = 24; // Cumulative WebSocket packets dropped (backpressure)
 }
 

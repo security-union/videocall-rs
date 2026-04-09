@@ -53,6 +53,7 @@ use sec_api::metrics::{
     NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
     PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
     VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
+    WEBSOCKET_DROPS_TOTAL,
 };
 
 async fn metrics_handler(
@@ -179,6 +180,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = ADAPTIVE_VIDEO_TIER.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_AUDIO_TIER.remove_label_values(&reporter_labels);
     let _ = DATAGRAM_DROPS_TOTAL.remove_label_values(&reporter_labels);
+    let _ = WEBSOCKET_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
 
     // Remove active server metrics for this session
@@ -525,6 +527,11 @@ fn process_health_packet_to_metrics_pb(
         }
         if let Some(drops) = health_packet.datagram_drops_total {
             DATAGRAM_DROPS_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(drops as f64);
+        }
+        if let Some(drops) = health_packet.websocket_drops_total {
+            WEBSOCKET_DROPS_TOTAL
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
         }

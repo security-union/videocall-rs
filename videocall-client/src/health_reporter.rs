@@ -526,6 +526,7 @@ impl HealthReporter {
                             adaptive_video_tier.borrow().load(Ordering::Relaxed),
                             adaptive_audio_tier.borrow().load(Ordering::Relaxed),
                             videocall_transport::webtransport::datagram_drop_count(),
+                            videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
                         );
 
@@ -561,6 +562,7 @@ impl HealthReporter {
         adaptive_video_tier: u32,
         adaptive_audio_tier: u32,
         datagram_drops_total: u64,
+        websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
@@ -602,6 +604,7 @@ impl HealthReporter {
         pb.adaptive_video_tier = Some(adaptive_video_tier);
         pb.adaptive_audio_tier = Some(adaptive_audio_tier);
         pb.datagram_drops_total = Some(datagram_drops_total);
+        pb.websocket_drops_total = Some(websocket_drops_total);
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
         // Tab visibility and throttling

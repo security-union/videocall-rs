@@ -395,6 +395,14 @@ lazy_static! {
     )
     .expect("Failed to create datagram_drops_total metric");
 
+    /// Cumulative WebSocket packets dropped (backpressure)
+    pub static ref WEBSOCKET_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_websocket_drops_total",
+        "Cumulative WebSocket packets dropped due to send buffer backpressure",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create websocket_drops_total metric");
+
     /// Cumulative keyframe requests sent (PLI)
     pub static ref KEYFRAME_REQUESTS_SENT_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_keyframe_requests_sent_total",

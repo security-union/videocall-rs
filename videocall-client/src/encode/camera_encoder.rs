@@ -105,6 +105,11 @@ pub struct CameraEncoder {
     /// Shared audio tier FEC flag. Written by the camera encoder's quality
     /// manager alongside `shared_audio_tier_bitrate`.
     shared_audio_tier_fec: Rc<AtomicBool>,
+    /// Current video quality tier index (0=full_hd/best, 7=minimal).
+    /// Updated whenever the adaptive quality manager changes tiers.
+    shared_video_tier_index: Rc<AtomicU32>,
+    /// Current audio quality tier index (0=high, 3=emergency).
+    shared_audio_tier_index: Rc<AtomicU32>,
 }
 
 impl CameraEncoder {
@@ -146,6 +151,8 @@ impl CameraEncoder {
                 default_audio_tier.bitrate_kbps * 1000,
             )),
             shared_audio_tier_fec: Rc::new(AtomicBool::new(default_audio_tier.enable_fec)),
+            shared_video_tier_index: Rc::new(AtomicU32::new(0)),
+            shared_audio_tier_index: Rc::new(AtomicU32::new(0)),
         }
     }
 
@@ -163,6 +170,8 @@ impl CameraEncoder {
         let congestion_flag = self.congestion_step_down.clone();
         let shared_audio_bitrate = self.shared_audio_tier_bitrate.clone();
         let shared_audio_fec = self.shared_audio_tier_fec.clone();
+        let shared_video_tier_idx = self.shared_video_tier_index.clone();
+        let shared_audio_tier_idx = self.shared_audio_tier_index.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -205,6 +214,8 @@ impl CameraEncoder {
                     tier_max_width.store(tier.max_width, Ordering::Relaxed);
                     tier_max_height.store(tier.max_height, Ordering::Relaxed);
                     tier_keyframe_interval.store(tier.keyframe_interval_frames, Ordering::Relaxed);
+                    shared_video_tier_idx
+                        .store(encoder_control.video_tier_index() as u32, Ordering::Relaxed);
                     log::info!(
                         "CameraEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
                         tier.label,
@@ -220,6 +231,8 @@ impl CameraEncoder {
                     let audio_tier = encoder_control.current_audio_tier();
                     shared_audio_bitrate.store(audio_tier.bitrate_kbps * 1000, Ordering::Relaxed);
                     shared_audio_fec.store(audio_tier.enable_fec, Ordering::Relaxed);
+                    shared_audio_tier_idx
+                        .store(encoder_control.audio_tier_index() as u32, Ordering::Relaxed);
                     log::info!(
                         "CameraEncoder: audio tier updated to '{}' ({}kbps, fec={})",
                         audio_tier.label,
@@ -250,6 +263,16 @@ impl CameraEncoder {
     /// RED-style redundancy in audio packets.
     pub fn shared_audio_tier_fec(&self) -> Rc<AtomicBool> {
         self.shared_audio_tier_fec.clone()
+    }
+
+    /// Returns the current video quality tier index (0 = best, 7 = minimal).
+    pub fn shared_video_tier_index(&self) -> Rc<AtomicU32> {
+        self.shared_video_tier_index.clone()
+    }
+
+    /// Returns the current audio quality tier index (0 = high, 3 = emergency).
+    pub fn shared_audio_tier_index(&self) -> Rc<AtomicU32> {
+        self.shared_audio_tier_index.clone()
     }
 
     /// Returns a shared reference to the force-keyframe flag.

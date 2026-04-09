@@ -178,6 +178,12 @@ pub fn Host(
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
 
+        // Wire adaptive quality tier indices to health reporter for metrics
+        client.set_adaptive_tier_sources(
+            camera.shared_video_tier_index(),
+            camera.shared_audio_tier_index(),
+        );
+
         // Wire up encoder controls. The microphone encoder no longer needs
         // its own diagnostics channel — it reads audio tier settings from
         // the camera encoder's shared atomics.

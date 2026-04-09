@@ -369,6 +369,40 @@ lazy_static! {
     )
     .expect("Failed to create client_tab_throttled metric");
 
+    // ===== RECEIVER-SIDE QUALITY METRICS =====
+
+    /// Adaptive video encoding tier (0=full_hd/best, 7=minimal)
+    pub static ref ADAPTIVE_VIDEO_TIER: GaugeVec = register_gauge_vec!(
+        "videocall_adaptive_video_tier",
+        "Adaptive video encoding tier index (0=best, 7=minimal)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create adaptive_video_tier metric");
+
+    /// Adaptive audio encoding tier (0=high, 3=emergency)
+    pub static ref ADAPTIVE_AUDIO_TIER: GaugeVec = register_gauge_vec!(
+        "videocall_adaptive_audio_tier",
+        "Adaptive audio encoding tier index (0=high, 3=emergency)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create adaptive_audio_tier metric");
+
+    /// Cumulative datagram drops (writable stream locked)
+    pub static ref DATAGRAM_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_datagram_drops_total",
+        "Cumulative datagrams dropped due to locked writable stream",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create datagram_drops_total metric");
+
+    /// Cumulative keyframe requests sent (PLI)
+    pub static ref KEYFRAME_REQUESTS_SENT_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_keyframe_requests_sent_total",
+        "Cumulative keyframe requests (PLI) sent by this client",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create keyframe_requests_sent_total metric");
+
     // ===== RELAY SERVER-SIDE METRICS (in-process on relay binaries) =====
     //
     // CARDINALITY NOTE: These metrics use `room` (meeting_id) as a label.

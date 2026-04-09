@@ -18,8 +18,7 @@ if ! docker build -t "$IMAGE_URL" \
     --build-arg BUILD_TIMESTAMP="$BUILD_TIMESTAMP" \
     -f Dockerfile.meeting-api .; then
     echo "Failed to build meeting-api"
-    exit 1
+else
+    docker push "$IMAGE_URL"
+    echo "New image uploaded to ${IMAGE_URL}"
 fi
-
-docker push "$IMAGE_URL"
-echo "Pushed ${IMAGE_URL}"

@@ -88,26 +88,51 @@ pub async fn join_meeting(
         // Attendee: must wait for admission if meeting is active.
         let current_state = meeting.state.as_deref().unwrap_or("idle");
         if current_state != "active" {
-            // Meeting exists but isn't active yet. Return a "waiting_for_meeting"
-            // status with an observer token so the client can receive a push
-            // notification when the host activates the meeting.
-            let dn = display_name.unwrap_or(&user_id);
-            let observer = generate_observer_token(&state.jwt_secret, &user_id, &meeting_id, dn)?;
-            let resp = ParticipantStatusResponse {
-                user_id: user_id.clone(),
-                display_name: display_name.map(String::from),
-                status: "waiting_for_meeting".to_string(),
-                is_host: false,
-                joined_at: Utc::now().timestamp(),
-                admitted_at: None,
-                room_token: None,
-                observer_token: Some(observer),
-                waiting_room_enabled: Some(meeting.waiting_room_enabled),
-                admitted_can_admit: Some(meeting.admitted_can_admit),
-                host_display_name: meeting.host_display_name,
-                host_user_id: meeting.creator_id,
-            };
-            return Ok(Json(APIResponse::ok(resp)));
+            if !meeting.waiting_room_enabled {
+                // No waiting room: auto-activate the meeting and immediately admit
+                // the first non-host joiner so they can wait inside the call.
+                db_meetings::activate(&state.db, meeting.id).await?;
+                nats_events::publish_meeting_activated(state.nats.as_ref(), &meeting_id).await;
+                let (_auto_admitted, row, _wr_enabled) =
+                    db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name)
+                        .await?;
+                let token = generate_room_token(
+                    &state.jwt_secret,
+                    state.token_ttl_secs,
+                    &user_id,
+                    &meeting_id,
+                    false,
+                    display_name.unwrap_or(&user_id),
+                )?;
+                let mut resp = row.into_participant_status(Some(token));
+                resp.waiting_room_enabled = Some(false);
+                resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+                resp.host_display_name = meeting.host_display_name;
+                resp.host_user_id = meeting.creator_id;
+                return Ok(Json(APIResponse::ok(resp)));
+            } else {
+                // Meeting exists but isn't active yet. Return a "waiting_for_meeting"
+                // status with an observer token so the client can receive a push
+                // notification when the host activates the meeting.
+                let dn = display_name.unwrap_or(&user_id);
+                let observer =
+                    generate_observer_token(&state.jwt_secret, &user_id, &meeting_id, dn)?;
+                let resp = ParticipantStatusResponse {
+                    user_id: user_id.clone(),
+                    display_name: display_name.map(String::from),
+                    status: "waiting_for_meeting".to_string(),
+                    is_host: false,
+                    joined_at: Utc::now().timestamp(),
+                    admitted_at: None,
+                    room_token: None,
+                    observer_token: Some(observer),
+                    waiting_room_enabled: Some(meeting.waiting_room_enabled),
+                    admitted_can_admit: Some(meeting.admitted_can_admit),
+                    host_display_name: meeting.host_display_name,
+                    host_user_id: meeting.creator_id,
+                };
+                return Ok(Json(APIResponse::ok(resp)));
+            }
         }
 
         // Atomically check waiting_room_enabled and insert participant in one

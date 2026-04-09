@@ -290,6 +290,9 @@ pub struct OperationStatistics {
     pub next_packet_available: bool,
 }
 
+/// Number of `Operation` enum variants (Normal through Undefined).
+const OPERATION_VARIANT_COUNT: usize = 12;
+
 /// Statistics calculator and tracker
 #[derive(Debug)]
 pub struct StatisticsCalculator {
@@ -304,7 +307,7 @@ pub struct StatisticsCalculator {
     /// Total expanded samples for rate calculations
     total_expanded_samples: u64,
     /// Operation counters for rolling window tracking
-    operation_counts: [u32; 12], // One for each Operation variant
+    operation_counts: [u32; OPERATION_VARIANT_COUNT],
     /// Last time operation rates were calculated
     last_operation_update: Instant,
     /// Window duration for operation rate calculation (1 second)
@@ -330,7 +333,7 @@ impl StatisticsCalculator {
             _last_update: now,
             total_output_samples: 0,
             total_expanded_samples: 0,
-            operation_counts: [0; 12],
+            operation_counts: [0; OPERATION_VARIANT_COUNT],
             last_operation_update: now,
             operation_window_duration: Duration::from_secs(1),
         }
@@ -467,6 +470,7 @@ impl StatisticsCalculator {
             self.network_stats
                 .operation_counters
                 .preemptive_expand_per_sec = self.operation_counts[7] as f32 / elapsed_secs;
+            // Index 8 (TimeStretchBuffer) intentionally omitted — no output field.
             self.network_stats.operation_counters.comfort_noise_per_sec =
                 self.operation_counts[9] as f32 / elapsed_secs;
             self.network_stats.operation_counters.dtmf_per_sec =

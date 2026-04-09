@@ -1,45 +1,38 @@
-name: PR Preview Cleanup (HCL)
+name: PR Preview Cleanup on Close
 
 on:
-  pull_request:
+  pull_request_target:
     types: [closed]
 
 permissions:
   contents: read
+  packages: write
   issues: write
-  pull-requests: write
 
 concurrency:
-  group: pr-cleanup-${{ github.event.pull_request.number }}-hcl
+  group: pr-cleanup-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 defaults:
   run:
     shell: bash --noprofile --norc -euo pipefail {0}
 
-env:
-  KUBECONFIG: /home/jenkins/.kube/k3s-config
-
 jobs:
   cleanup:
     name: Cleanup preview environment
-    runs-on: [self-hosted, linux, docker]
+    runs-on: ubuntu-latest
     outputs:
       slot_existed: ${{ steps.find-slot.outputs.exists }}
       slot: ${{ steps.find-slot.outputs.slot }}
     steps:
-      - name: Setup PATH
-        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+      - name: Configure kubectl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
-      - name: Validate kubectl and kubeconfig access
+      - name: Setup kubectl context
         run: |
-          test -f "${KUBECONFIG}"
-          test -r "${KUBECONFIG}"
-          kubectl config current-context
-          CLUSTER_INFO=$(kubectl cluster-info)
-          echo "${CLUSTER_INFO}"
-          # Strip ANSI color codes before grep (kubectl outputs colors even when not a TTY)
-          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
+          doctl kubernetes cluster kubeconfig save videocall-us-east
 
       - name: Find deployment slot
         id: find-slot
@@ -82,7 +75,7 @@ jobs:
 
           echo "Dropping database: ${DB_NAME} (slot ${SLOT})"
 
-          # Get postgres password from secret in preview-infra namespace
+          # Get postgres password from secret
           # || true: prevents -e from exiting if the secret doesn't exist
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra \
             -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || true)
@@ -97,16 +90,6 @@ jobs:
             echo "✅ Database dropped for slot ${SLOT}"
           fi
 
-      - name: Delete Harbor images (optional)
-        if: steps.find-slot.outputs.exists == 'true'
-        continue-on-error: true
-        run: |
-          # Note: Image retention handled by Harbor retention policy
-          # Configured to delete pr-* tagged images older than 14 days
-          # Policy runs automatically via Harbor's scheduled task system
-          # To verify: https://hclcr.io/harbor/projects/hcllabs → Policy → Retention
-          echo "⚠️  Images retained - Harbor retention policy will purge after 14 days"
-
       - name: Summary
         if: steps.find-slot.outputs.exists == 'true'
         run: |
@@ -117,7 +100,6 @@ jobs:
           echo "Removed:"
           echo "  - Namespace preview-slot-${SLOT}"
           echo "  - Database preview_slot_${SLOT}"
-          echo "  - Harbor images tagged pr-${PR_NUM} (will be purged after 14 days)"
           echo ""
           echo "📊 Slot ${SLOT} is now available for other PRs"
 
@@ -125,7 +107,7 @@ jobs:
     name: Comment on cleanup success
     needs: cleanup
     if: always() && needs.cleanup.result == 'success' && needs.cleanup.outputs.slot_existed == 'true'
-    runs-on: [self-hosted, linux, docker]
+    runs-on: ubuntu-latest
     steps:
       - name: Post cleanup success comment
         uses: actions/github-script@v7
@@ -144,29 +126,28 @@ jobs:
             **Resources removed:**
             - Namespace \`preview-slot-${slot}\` (includes all pods and services)
             - Database \`preview_slot_${slot}\`
-            - Harbor images tagged \`pr-${prNumber}\` (will be purged after 14 days via retention policy)
+            - Images tagged \`pr-${prNumber}\` (purged automatically after 7 days)
 
             📊 **Slot ${slot} is now available** for other PRs.`
-            });
+            })
 
   comment-failure:
     name: Comment on cleanup failure
     needs: cleanup
     if: always() && needs.cleanup.result == 'failure'
-    runs-on: [self-hosted, linux, docker]
+    runs-on: ubuntu-latest
     steps:
-      - name: Post cleanup failure comment
+      - name: Comment on cleanup failure
         uses: actions/github-script@v7
         with:
           script: |
-            const prNumber = context.payload.pull_request.number;
-            const repo = context.repo.owner + '/' + context.repo.repo;
-            const runId = context.runId;
             github.rest.issues.createComment({
-              issue_number: prNumber,
+              issue_number: ${{ github.event.pull_request.number }},
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: `❌ **PR cleanup failed**
 
-            Automatic preview cleanup encountered an error. Check the [workflow logs](https://github01.hclpnp.com/${repo}/actions/runs/${runId}) for details.`
-            });
+            Automatic preview cleanup encountered an error when PR #${{ github.event.pull_request.number }} was closed.
+
+            Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            })

@@ -1,0 +1,40 @@
+name: Build and Package videocall-cli DEB
+
+on:
+  pull_request:
+    paths:
+      - 'videocall-cli/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
+
+jobs:
+  build_and_package:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake
+
+
+    - name: Build and Create DEB Package
+      run: |
+        cargo install cargo-deb
+        cd videocall-cli
+        cargo deb
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: videocall-cli.deb
+        path: videocall-cli/target/debian/*.deb
+        retention-days: 90

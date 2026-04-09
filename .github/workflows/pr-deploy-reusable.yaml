@@ -1,4 +1,4 @@
-name: Deploy PR Preview (Reusable) (HCL)
+name: Deploy PR Preview (Reusable)
 
 on:
   workflow_call:
@@ -16,57 +16,36 @@ on:
         required: false
         type: string
     secrets:
-      HARBOR_USERNAME:
+      DIGITALOCEAN_ACCESS_TOKEN:
         required: true
-      HARBOR_PASSWORD:
-        required: true
-
-permissions:
-  actions: read
-  contents: read
-  issues: write
-  pull-requests: write
 
 defaults:
   run:
     shell: bash --noprofile --norc -euo pipefail {0}
 
-env:
-  KUBECONFIG: /home/jenkins/.kube/k3s-config
-
 jobs:
   deploy:
     name: Deploy preview environment
-    runs-on: [self-hosted, linux, docker]
+    runs-on: ubuntu-latest
     steps:
-      - name: Setup PATH
-        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
-
-      - name: Validate kubectl and kubeconfig access
-        run: |
-          test -f "${KUBECONFIG}"
-          test -r "${KUBECONFIG}"
-          kubectl config current-context
-          CLUSTER_INFO=$(kubectl cluster-info)
-          echo "${CLUSTER_INFO}"
-          # Strip ANSI color codes before grep (kubectl outputs colors even when not a TTY)
-          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_sha }}
 
+      - name: Configure kubectl for DigitalOcean
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Setup kubectl context
+        run: |
+          doctl kubernetes cluster kubeconfig save videocall-us-east
+
       - name: Add NATS Helm repo
         run: |
           helm repo add nats https://nats-io.github.io/k8s/helm/charts/
           helm repo update
-
-      - name: List Nodes and Namespaces (debug)
-        run: |
-          kubectl get nodes
-          kubectl get namespaces
-          kubectl config current-context
 
       - name: Check for running undeploy workflows
         id: check-undeploy
@@ -77,15 +56,15 @@ jobs:
             const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              workflow_id: 'pr-undeploy-hcl.yaml',
+              workflow_id: 'pr-undeploy.yaml',
               status: 'in_progress',
               per_page: 10
             });
 
-            const hasRunning = runs.total_count > 0;
-            console.log(`Found ${runs.total_count} undeploy workflow(s) in progress`);
-            core.setOutput('has_running_undeploys', hasRunning ? 'true' : 'false');
-            core.setOutput('undeploy_count', runs.total_count);
+            const count = runs.workflow_runs.length;
+            console.log(`Found ${count} undeploy workflow(s) in progress (total_count=${runs.total_count})`);
+            core.setOutput('has_running_undeploys', count > 0 ? 'true' : 'false');
+            core.setOutput('undeploy_count', count);
 
       - name: Assign deployment slot
         id: assign-slot
@@ -155,8 +134,8 @@ jobs:
             echo "slot_info<<EOF" >> $GITHUB_OUTPUT
             kubectl get namespaces -l app=preview \
               -o custom-columns=SLOT:.metadata.labels.slot,PR:.metadata.labels.pr,AGE:.metadata.creationTimestamp \
-              --no-headers | while read slot pr age; do
-              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.preview.videocall.fnxlabs.com ([undeploy](https://github01.hclpnp.com/${{ github.repository }}/pull/${pr}#issuecomment-new))"
+              --no-headers | while read -r slot pr age; do
+              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.sandbox.videocall.rs ([undeploy](https://github.com/${{ github.repository }}/pull/${pr}#issuecomment-new))" >> $GITHUB_OUTPUT
             done
             echo "EOF" >> $GITHUB_OUTPUT
           else
@@ -206,72 +185,57 @@ jobs:
         if: steps.assign-slot.outputs.slot_assigned == 'false'
         run: exit 1
 
-      - name: Login to Harbor
-        env:
-          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
-          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
-        run: |
-          echo "Attempting Harbor login as user: $HARBOR_USERNAME"
-          if echo "$HARBOR_PASSWORD" | docker login hclcr.io -u "$HARBOR_USERNAME" --password-stdin; then
-            echo "✅ Harbor login successful"
-          else
-            echo "❌ Harbor login failed"
-            exit 1
-          fi
-
-      - name: Verify Harbor images exist
+      - name: Verify GHCR images exist
         id: verify-images
         env:
-          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
-          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+          PR_TAG="pr-${PR_NUM}"
+          OWNER="${{ github.repository_owner }}"
 
-          echo "Checking if Harbor images exist for pr-${PR_NUM}..."
-          echo "Registry: ${REGISTRY}"
+          echo "Checking if GHCR images exist for ${PR_TAG} (parallel)..."
 
-          # Harbor API endpoint (assumes hclcr.io Harbor instance)
-          HARBOR_API="https://hclcr.io/api/v2.0"
-          PROJECT="hcllabs"
-          TAG="pr-${PR_NUM}"
-
-          REPOS=(
+          PACKAGES=(
             "videocall-media-server"
             "videocall-meeting-api"
-            "videocall-web-ui"
             "videocall-dioxus-ui"
           )
 
-          MISSING_IMAGES=()
+          rm -f /tmp/missing_images_${PR_NUM}
 
-          for REPO in "${REPOS[@]}"; do
-            IMAGE="${REGISTRY}/${REPO}:${TAG}"
-            echo "Checking ${IMAGE}..."
-
-            # Use Harbor API to check if artifact exists
-            # URL encode the repository name (replace / with %2F)
-            ENCODED_REPO=$(echo "${REPO}" | sed 's/\//%2F/g')
-            API_URL="${HARBOR_API}/projects/${PROJECT}/repositories/${ENCODED_REPO}/artifacts/${TAG}"
-
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" "${API_URL}")
-
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "  ✅ Found"
+          check_image() {
+            local PKG=$1
+            local TAG=$2
+            echo "Checking ghcr.io/${OWNER}/${PKG}:${TAG}..."
+            # Use the GitHub Packages API via gh cli — avoids GHCR registry auth entirely
+            local COUNT
+            COUNT=$(gh api \
+              "/users/${OWNER}/packages/container/${PKG}/versions?per_page=100" \
+              --jq "[.[] | select(.metadata.container.tags[]? == \"${TAG}\")] | length" \
+              2>/dev/null || echo "0")
+            if [ "${COUNT:-0}" -gt 0 ] 2>/dev/null; then
+              echo "  ✅ Found ghcr.io/${OWNER}/${PKG}:${TAG}"
             else
-              echo "  ❌ Not found (HTTP ${HTTP_CODE})"
-              MISSING_IMAGES+=("${IMAGE}")
+              echo "  ❌ Not found ghcr.io/${OWNER}/${PKG}:${TAG}"
+              echo "ghcr.io/${OWNER}/${PKG}:${TAG}" >> /tmp/missing_images_${PR_NUM}
             fi
-          done
+          }
 
-          if [ ${#MISSING_IMAGES[@]} -gt 0 ]; then
+          # Check all three images in parallel
+          for PKG in "${PACKAGES[@]}"; do
+            check_image "${PKG}" "${PR_TAG}" &
+          done
+          wait
+
+          if [ -f /tmp/missing_images_${PR_NUM} ]; then
             echo "images_missing=true" >> $GITHUB_OUTPUT
             echo "missing_list<<EOF" >> $GITHUB_OUTPUT
-            for IMG in "${MISSING_IMAGES[@]}"; do
+            while IFS= read -r IMG; do
               echo "- **${IMG}**" >> $GITHUB_OUTPUT
-            done
+            done < /tmp/missing_images_${PR_NUM}
             echo "EOF" >> $GITHUB_OUTPUT
+            rm -f /tmp/missing_images_${PR_NUM}
           else
             echo "images_missing=false" >> $GITHUB_OUTPUT
             echo "✅ All images found"
@@ -335,23 +299,11 @@ jobs:
           NAMESPACE="preview-slot-${SLOT}"
 
           echo "Copying wildcard TLS secret to slot ${SLOT} namespace..."
-          kubectl get secret preview-wildcard-tls -n preview-infra -o json \
+          kubectl get secret sandbox-wildcard-tls -n default -o json \
             | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.selfLink, .metadata.managedFields) | .metadata.namespace = "'${NAMESPACE}'"' \
             | kubectl apply -f -
 
           echo "✅ TLS secret copied"
-
-      - name: Copy Harbor registry pull secret to preview namespace
-        run: |
-          SLOT=${{ steps.assign-slot.outputs.SLOT }}
-          NAMESPACE="preview-slot-${SLOT}"
-
-          echo "Copying Harbor pull secret to slot ${SLOT} namespace..."
-          kubectl get secret harbor-pull-secret -n preview-infra -o json \
-            | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.selfLink, .metadata.managedFields) | .metadata.namespace = "'${NAMESPACE}'"' \
-            | kubectl apply -f -
-
-          echo "✅ Harbor pull secret copied"
 
       - name: Create JWT secret for preview
         run: |
@@ -365,8 +317,8 @@ jobs:
           else
             echo "Creating new JWT secret for slot ${SLOT}..."
 
-            # Generate a unique JWT secret for this preview slot (256-bit entropy)
-            JWT_SECRET=$(openssl rand -hex 32)
+            # Generate a unique JWT secret for this preview slot
+            JWT_SECRET="preview-slot-${SLOT}-jwt-$(openssl rand -hex 16)"
 
             kubectl create secret generic jwt-secret \
               --from-literal=secret="${JWT_SECRET}" \
@@ -458,16 +410,13 @@ jobs:
           PR_NUM=${{ inputs.pr_number }}
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
 
           echo "Deploying WebSocket server to slot ${SLOT}..."
 
           helm upgrade --install preview-${PR_NUM}-ws helm/rustlemania-websocket/ \
             --namespace ${NAMESPACE} \
-            --set image.repository=${REGISTRY}/videocall-media-server \
+            --set image.repository=ghcr.io/${{ github.repository_owner }}/videocall-media-server \
             --set image.tag=pr-${PR_NUM} \
-            --set imagePullSecrets[0].name=harbor-pull-secret \
             --set fullnameOverride=websocket-pr-${PR_NUM} \
             --set "env[0].name=NATS_URL" \
             --set "env[0].value=nats://nats-pr-${PR_NUM}.${NAMESPACE}.svc.cluster.local:4222" \
@@ -486,13 +435,13 @@ jobs:
             --set-string "env[6].value=5" \
             --set "env[7].name=TOKIO_WORKER_THREADS" \
             --set-string "env[7].value=1" \
-            --set "ingress.hosts[0].host=pr${SLOT}-ws.preview.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].host=pr${SLOT}-ws.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=websocket-pr-${PR_NUM}" \
             --set "ingress.hosts[0].paths[0].service.port.number=8080" \
-            --set "ingress.tls[0].secretName=preview-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr${SLOT}-ws.preview.videocall.fnxlabs.com" \
+            --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}-ws.sandbox.videocall.rs" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
@@ -506,8 +455,6 @@ jobs:
           PR_NUM=${{ inputs.pr_number }}
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
 
           # Get postgres password
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra -o jsonpath='{.data.password}' | base64 -d)
@@ -535,9 +482,8 @@ jobs:
 
           helm upgrade --install preview-${PR_NUM}-api helm/meeting-api/ \
             --namespace ${NAMESPACE} \
-            --set image.repository=${REGISTRY}/videocall-meeting-api \
+            --set image.repository=ghcr.io/${{ github.repository_owner }}/videocall-meeting-api \
             --set image.tag=pr-${PR_NUM} \
-            --set imagePullSecrets[0].name=harbor-pull-secret \
             --set fullnameOverride=api-pr-${PR_NUM} \
             --set "env[0].name=DATABASE_URL" \
             --set "env[0].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.preview-infra.svc.cluster.local:5432/preview_slot_${SLOT}?sslmode=disable" \
@@ -545,9 +491,9 @@ jobs:
             --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[1].valueFrom.secretKeyRef.key=secret" \
             --set "env[2].name=CORS_ALLOWED_ORIGIN" \
-            --set "env[2].value=https://pr${SLOT}.preview.videocall.fnxlabs.com\,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "env[2].value=https://pr${SLOT}.sandbox.videocall.rs" \
             --set "env[3].name=COOKIE_DOMAIN" \
-            --set "env[3].value=.preview.videocall.fnxlabs.com" \
+            --set "env[3].value=.sandbox.videocall.rs" \
             --set "env[4].name=OAUTH_ISSUER" \
             --set "env[4].value=https://accounts.google.com" \
             --set "env[5].name=OAUTH_CLIENT_ID" \
@@ -555,96 +501,50 @@ jobs:
             --set "env[6].name=OAUTH_SECRET" \
             --set "env[6].value=${OAUTH_CLIENT_SECRET}" \
             --set "env[7].name=OAUTH_REDIRECT_URL" \
-            --set "env[7].value=https://pr${SLOT}-api.preview.videocall.fnxlabs.com/login/callback" \
+            --set "env[7].value=https://pr${SLOT}-api.sandbox.videocall.rs/login/callback" \
             --set "env[8].name=AFTER_LOGIN_URL" \
-            --set "env[8].value=https://pr${SLOT}.preview.videocall.fnxlabs.com" \
+            --set "env[8].value=https://pr${SLOT}.sandbox.videocall.rs" \
             --set "env[9].name=OAUTH_SCOPES" \
             --set "env[9].value=openid email profile" \
-            --set "env[10].name=ALLOWED_REDIRECT_URLS" \
-            --set "env[10].value=https://pr${SLOT}.preview.videocall.fnxlabs.com\,https://pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
-            --set "env[11].name=LISTEN_ADDR" \
-            --set "env[11].value=0.0.0.0:8081" \
-            --set "env[12].name=RUST_LOG" \
-            --set "env[12].value=info" \
-            --set "env[13].name=COOKIE_NAME" \
-            --set "env[13].value=pr${SLOT}-session" \
+            --set "env[10].name=LISTEN_ADDR" \
+            --set "env[10].value=0.0.0.0:8081" \
+            --set "env[11].name=RUST_LOG" \
+            --set "env[11].value=info" \
+            --set "env[12].name=COOKIE_NAME" \
+            --set "env[12].value=pr${SLOT}-session" \
+            --set "env[13].name=ALLOWED_REDIRECT_URLS" \
+            --set "env[13].value=https://pr${SLOT}.sandbox.videocall.rs" \
             --set "env[14].name=SERVICE_VERSION_URLS" \
-            --set "env[14].value=http://websocket-pr-${PR_NUM}:8080/version\,http://dx-pr-${PR_NUM}:80/version.json\,http://ui-pr-${PR_NUM}:80/version.json" \
-            --set "ingress.hosts[0].host=pr${SLOT}-api.preview.videocall.fnxlabs.com" \
+            --set "env[14].value=http://websocket-pr-${PR_NUM}:8080/version\,http://ui-pr-${PR_NUM}:80/version.json" \
+            --set "ingress.hosts[0].host=pr${SLOT}-api.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=api-pr-${PR_NUM}" \
             --set "ingress.hosts[0].paths[0].service.port.number=8081" \
-            --set "ingress.tls[0].secretName=preview-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr${SLOT}-api.preview.videocall.fnxlabs.com" \
+            --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}-api.sandbox.videocall.rs" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
           echo "✅ Meeting API deployed to slot ${SLOT} with OAuth"
 
-      - name: Deploy UI
-        run: |
-          PR_NUM=${{ inputs.pr_number }}
-          SLOT=${{ steps.assign-slot.outputs.SLOT }}
-          NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
-
-          echo "Deploying UI to slot ${SLOT} with OAuth enabled..."
-
-          helm upgrade --install preview-${PR_NUM}-ui helm/rustlemania-ui/ \
-            --namespace ${NAMESPACE} \
-            --set image.repository=${REGISTRY}/videocall-web-ui \
-            --set image.tag=pr-${PR_NUM} \
-            --set imagePullSecrets[0].name=harbor-pull-secret \
-            --set fullnameOverride=ui-pr-${PR_NUM} \
-            --set ingress.redirect=false \
-            --set "runtimeConfig.apiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
-            --set "runtimeConfig.meetingApiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
-            --set "runtimeConfig.wsUrl=wss://pr${SLOT}-ws.preview.videocall.fnxlabs.com" \
-            --set "runtimeConfig.webTransportHost=" \
-            --set-string "runtimeConfig.webTransportEnabled=false" \
-            --set-string "runtimeConfig.oauthEnabled=true" \
-            --set-string "runtimeConfig.e2eeEnabled=false" \
-            --set-string "runtimeConfig.firefoxEnabled=false" \
-            --set "runtimeConfig.usersAllowedToStream=" \
-            --set "runtimeConfig.serverElectionPeriodMs=2000" \
-            --set "runtimeConfig.audioBitrateKbps=65" \
-            --set "runtimeConfig.videoBitrateKbps=1000" \
-            --set "runtimeConfig.screenBitrateKbps=1000" \
-            --set "ingress.hosts[0].host=pr${SLOT}.preview.videocall.fnxlabs.com" \
-            --set "ingress.hosts[0].paths[0].path=/" \
-            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
-            --set "ingress.hosts[0].paths[0].service.name=ui-pr-${PR_NUM}" \
-            --set "ingress.hosts[0].paths[0].service.port.number=80" \
-            --set "ingress.tls[0].secretName=preview-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr${SLOT}.preview.videocall.fnxlabs.com" \
-            --set "ingress.annotations.cert-manager\.io/issuer=null" \
-            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
-            --wait --timeout 5m
-
-          echo "✅ UI deployed to slot ${SLOT} with OAuth"
-
       - name: Deploy Dioxus UI
         run: |
           PR_NUM=${{ inputs.pr_number }}
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
-          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
 
           echo "Deploying Dioxus UI to slot ${SLOT}..."
 
-          helm upgrade --install preview-${PR_NUM}-dx helm/videocall-ui/ \
+          helm upgrade --install preview-${PR_NUM}-ui helm/videocall-ui/ \
             --namespace ${NAMESPACE} \
-            --set image.repository=${REGISTRY}/videocall-dioxus-ui \
+            --set image.repository=ghcr.io/${{ github.repository_owner }}/videocall-dioxus-ui \
             --set image.tag=pr-${PR_NUM} \
-            --set "imagePullSecrets[0].name=harbor-pull-secret" \
-            --set fullnameOverride=dx-pr-${PR_NUM} \
-            --set "runtimeConfig.apiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
-            --set "runtimeConfig.meetingApiBaseUrl=https://pr${SLOT}-api.preview.videocall.fnxlabs.com" \
-            --set "runtimeConfig.wsUrl=wss://pr${SLOT}-ws.preview.videocall.fnxlabs.com" \
+            --set fullnameOverride=ui-pr-${PR_NUM} \
+            --set "runtimeConfig.apiBaseUrl=https://pr${SLOT}-api.sandbox.videocall.rs" \
+            --set "runtimeConfig.meetingApiBaseUrl=https://pr${SLOT}-api.sandbox.videocall.rs" \
+            --set "runtimeConfig.wsUrl=wss://pr${SLOT}-ws.sandbox.videocall.rs" \
             --set "runtimeConfig.webTransportHost=" \
             --set-string "runtimeConfig.webTransportEnabled=false" \
             --set-string "runtimeConfig.oauthEnabled=true" \
@@ -656,29 +556,26 @@ jobs:
             --set "runtimeConfig.audioBitrateKbps=65" \
             --set "runtimeConfig.videoBitrateKbps=1000" \
             --set "runtimeConfig.screenBitrateKbps=1000" \
-            --set "ingress.hosts[0].host=pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "ingress.hosts[0].host=pr${SLOT}.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
-            --set "ingress.tls[0].secretName=preview-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr${SLOT}-dx.preview.videocall.fnxlabs.com" \
+            --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}.sandbox.videocall.rs" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
           echo "✅ Dioxus UI deployed to slot ${SLOT}"
 
-      - name: Verify rollout status
+      - name: Wait for all pods to be ready
         run: |
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          PR_NUM=${{ inputs.pr_number }}
 
-          echo "Verifying rollout status for slot ${SLOT}..."
-          kubectl rollout status deployment/websocket-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
-          kubectl rollout status deployment/api-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
-          kubectl rollout status deployment/ui-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
-          kubectl rollout status deployment/dx-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
-          echo "✅ All deployments rolled out in slot ${SLOT}"
+          echo "Waiting for all pods to be ready in slot ${SLOT}..."
+          kubectl wait --for=condition=ready pod --all -n ${NAMESPACE} --timeout=180s
+
+          echo "✅ All pods ready in slot ${SLOT}"
 
       - name: Get deployment status
         id: deployment-status
@@ -715,10 +612,9 @@ jobs:
               body: `✅ **Preview ${deploymentType} to slot ${slot}** ${slotStatus}
 
             🌐 **Preview URLs:**
-            - **Yew UI:** https://pr${slot}.preview.videocall.fnxlabs.com
-            - **Dioxus UI:** https://pr${slot}-dx.preview.videocall.fnxlabs.com
-            - **API:** https://pr${slot}-api.preview.videocall.fnxlabs.com
-            - **WebSocket:** wss://pr${slot}-ws.preview.videocall.fnxlabs.com
+            - **Dioxus UI:** https://pr${slot}.sandbox.videocall.rs
+            - **API:** https://pr${slot}-api.sandbox.videocall.rs
+            - **WebSocket:** wss://pr${slot}-ws.sandbox.videocall.rs
 
             🔐 **Configuration:**
             - **Authentication:** Google OAuth enabled (login required)
@@ -731,17 +627,23 @@ jobs:
 
             **Redeploy:** Push new commits, then comment \`/build-and-deploy\` to update.
 
-            [View deployment logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            [View deployment logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             });
 
   cleanup-on-failure:
     name: Cleanup on deployment failure
     needs: deploy
     if: always() && needs.deploy.result == 'failure'
-    runs-on: [self-hosted, linux, docker]
+    runs-on: ubuntu-latest
     steps:
-      - name: Setup PATH
-        run: echo "/home/jenkins/bin" >> $GITHUB_PATH
+      - name: Configure kubectl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Setup kubectl context
+        run: |
+          doctl kubernetes cluster kubeconfig save videocall-us-east
 
       - name: Cleanup failed deployment
         run: |
@@ -787,5 +689,5 @@ jobs:
               repo: context.repo.repo,
               body: `❌ **Deployment failed**
 
-            Check the [workflow logs](https://github01.hclpnp.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
             });

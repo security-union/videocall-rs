@@ -137,8 +137,9 @@ pub async fn join_meeting(
 
         // Atomically check waiting_room_enabled and insert participant in one
         // transaction, using FOR UPDATE to serialize against concurrent toggles.
-        let (auto_admitted, row, waiting_room_enabled) =
-            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name).await?;
+        let (auto_admitted, row, wr_enabled) =
+            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name)
+            .await?;
 
         let token = if auto_admitted {
             Some(generate_room_token(
@@ -167,7 +168,7 @@ pub async fn join_meeting(
             // Notify the host that the waiting room list has changed.
             nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id).await;
         }
-        resp.waiting_room_enabled = Some(waiting_room_enabled);
+        resp.waiting_room_enabled = Some(wr_enabled);
         resp.admitted_can_admit = Some(meeting.admitted_can_admit);
         resp.host_display_name = meeting.host_display_name;
         resp.host_user_id = meeting.creator_id;

@@ -329,6 +329,123 @@ pub fn confirm_transport_change(new_value: &str, current: TransportPreference, s
 }
 
 // ---------------------------------------------------------------------------
+// Transport preference
+// ---------------------------------------------------------------------------
+
+/// User-facing transport protocol preference.
+///
+/// Stored in `localStorage` under `vc_transport_preference` and read at
+/// connection time to override the server-provided WebTransport flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TransportPreference {
+    /// Honour the server-side `webTransportEnabled` flag (default behaviour).
+    #[default]
+    Auto,
+    /// Force WebTransport — WebSocket URLs are cleared.
+    WebTransportOnly,
+    /// Force WebSocket — WebTransport is disabled.
+    WebSocketOnly,
+}
+
+impl std::fmt::Display for TransportPreference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            TransportPreference::Auto => "auto",
+            TransportPreference::WebTransportOnly => "webtransport",
+            TransportPreference::WebSocketOnly => "websocket",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for TransportPreference {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(TransportPreference::Auto),
+            "webtransport" => Ok(TransportPreference::WebTransportOnly),
+            "websocket" => Ok(TransportPreference::WebSocketOnly),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Context wrapper for the transport preference signal.
+#[derive(Clone, Copy)]
+pub struct TransportPreferenceCtx(pub Signal<TransportPreference>);
+
+const TRANSPORT_PREF_KEY: &str = "vc_transport_preference";
+
+/// Load the persisted transport preference from `localStorage`.
+pub fn load_transport_preference() -> TransportPreference {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(TRANSPORT_PREF_KEY).ok().flatten())
+        .and_then(|val| val.parse::<TransportPreference>().ok())
+        .unwrap_or_default()
+}
+
+/// Persist the transport preference to `localStorage`.
+pub fn save_transport_preference(pref: TransportPreference) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(TRANSPORT_PREF_KEY, &pref.to_string());
+    }
+}
+
+/// Resolve effective transport configuration from the user's preference and
+/// the server-provided WebTransport flag.
+///
+/// Returns `(enable_webtransport, websocket_urls, webtransport_urls)`.
+pub fn resolve_transport_config(
+    pref: TransportPreference,
+    server_wt_enabled: bool,
+    ws_urls: Vec<String>,
+    wt_urls: Vec<String>,
+) -> (bool, Vec<String>, Vec<String>) {
+    match pref {
+        TransportPreference::Auto => (server_wt_enabled, ws_urls, wt_urls),
+        TransportPreference::WebTransportOnly => (true, vec![], wt_urls),
+        TransportPreference::WebSocketOnly => (false, ws_urls, vec![]),
+    }
+}
+
+/// Handle a transport preference change from a `<select>` element.
+///
+/// Shows a confirmation dialog. If the user confirms, saves the preference and
+/// reloads the page. If cancelled, resets the `<select>` element back to the
+/// current value so the dropdown doesn't show a stale selection.
+pub fn confirm_transport_change(new_value: &str, current: TransportPreference, select_id: &str) {
+    use wasm_bindgen::JsCast;
+
+    let pref = new_value.parse::<TransportPreference>().unwrap_or_default();
+    if pref == current {
+        return;
+    }
+    let confirmed = web_sys::window()
+        .and_then(|w| {
+            w.confirm_with_message(
+                "Changing the transport protocol will reload the page \
+                 and disconnect the current call. Continue?",
+            )
+            .ok()
+        })
+        .unwrap_or(false);
+    if confirmed {
+        save_transport_preference(pref);
+        if let Some(w) = web_sys::window() {
+            let _ = w.location().reload();
+        }
+    } else if let Some(select) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(select_id))
+        .and_then(|el| el.dyn_into::<web_sys::HtmlSelectElement>().ok())
+    {
+        select.set_value(&current.to_string());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Validation helpers (re-exported from shared crate)
 // ---------------------------------------------------------------------------
 

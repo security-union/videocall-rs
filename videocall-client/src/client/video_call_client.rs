@@ -653,6 +653,14 @@ impl VideoCallClient {
         }
     }
 
+    /// Get the local session ID assigned by the server, if available.
+    pub fn get_own_session_id(&self) -> Option<String> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.own_session_id.map(|sid| sid.to_string()),
+            Err(_) => None,
+        }
+    }
+
     pub fn get_peer_user_id(&self, session_id: &str) -> Option<String> {
         let sid: u64 = session_id.parse().ok()?;
         match self.inner.try_borrow() {

@@ -52,7 +52,9 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
-use crate::adaptive_quality_constants::{BITRATE_CHANGE_THRESHOLD, SCREEN_QUALITY_TIERS};
+use crate::adaptive_quality_constants::{
+    BITRATE_CHANGE_THRESHOLD, ENCODER_PLI_COOLDOWN_MS, SCREEN_QUALITY_TIERS,
+};
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
 
@@ -533,6 +535,7 @@ impl ScreenEncoder {
                 .unchecked_into::<ReadableStreamDefaultReader>();
 
             let mut screen_frame_counter: u32 = 0;
+            let mut last_pli_keyframe_time: f64 = 0.0;
             let mut current_encoder_width = width as u32;
             let mut current_encoder_height = height as u32;
 
@@ -672,17 +675,33 @@ impl ScreenEncoder {
                         let opts = VideoEncoderEncodeOptions::new();
                         // Check if a keyframe was requested via PLI.
                         let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
+                        let now = window()
+                            .performance()
+                            .expect("Performance API not available")
+                            .now();
+                        let pli_cooldown_ok =
+                            (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
+                        let force_pli = pli_requested && pli_cooldown_ok;
+                        if force_pli {
+                            last_pli_keyframe_time = now;
+                        }
                         // Use tier-controlled keyframe interval.
                         // Using `%` instead of `.is_multiple_of()` for compatibility
                         // with Rust toolchains older than 1.87.
                         #[allow(clippy::manual_is_multiple_of)]
                         let is_periodic_keyframe = local_keyframe_interval > 0
                             && screen_frame_counter % local_keyframe_interval == 0;
-                        opts.set_key_frame(is_periodic_keyframe || pli_requested);
-                        if pli_requested {
+                        opts.set_key_frame(is_periodic_keyframe || force_pli);
+                        if force_pli {
                             log::info!(
                                 "ScreenEncoder: forcing keyframe at frame {} (PLI)",
                                 screen_frame_counter
+                            );
+                        } else if pli_requested {
+                            log::info!(
+                                "ScreenEncoder: PLI keyframe suppressed at frame {} (cooldown: {:.0}ms since last)",
+                                screen_frame_counter,
+                                now - last_pli_keyframe_time,
                             );
                         }
 

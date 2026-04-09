@@ -364,6 +364,18 @@ pub const KEYFRAME_REQUEST_MAX_UNANSWERED: u32 = 5;
 /// balances recovery against bandwidth cost.
 pub const KEYFRAME_REQUEST_SLOW_RETRY_MS: u64 = 15000;
 
+/// Time (milliseconds) with no packet loss before fully resetting PLI backoff
+/// state. Prevents stale congestion history from penalizing genuinely new loss
+/// events, while keeping backoff elevated during recovery windows where the
+/// network is still fragile.
+pub const KEYFRAME_BACKOFF_DECAY_MS: u64 = 30_000;
+
+/// Minimum interval (milliseconds) between PLI-forced keyframes at the
+/// encoder. Prevents the encoder from being dominated by back-to-back PLI
+/// keyframes during a request storm. Periodic (tier-controlled) keyframes
+/// are NOT subject to this cooldown.
+pub const ENCODER_PLI_COOLDOWN_MS: f64 = 2000.0;
+
 // ---------------------------------------------------------------------------
 // Reconnection
 // ---------------------------------------------------------------------------

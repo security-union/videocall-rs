@@ -20,6 +20,8 @@ message MeetingPacket {
     PARTICIPANT_REJECTED = 7;
     // Waiting room list changed
     WAITING_ROOM_UPDATED = 8;
+    // Participant updated their display name
+    PARTICIPANT_DISPLAY_NAME_CHANGED = 9;
   }
 
   MeetingEventType event_type = 1;

@@ -75,13 +75,43 @@ pub struct VideoQualityTier {
 /// Video quality tiers, ordered from highest (index 0) to lowest.
 pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
     VideoQualityTier {
-        label: "high",
+        label: "full_hd",
+        max_width: 1920,
+        max_height: 1080,
+        target_fps: 30,
+        ideal_bitrate_kbps: 2500,
+        min_bitrate_kbps: 1500,
+        max_bitrate_kbps: 2500,
+        keyframe_interval_frames: 150, // ~5s at 30fps
+    },
+    VideoQualityTier {
+        label: "hd_plus",
+        max_width: 1600,
+        max_height: 900,
+        target_fps: 30,
+        ideal_bitrate_kbps: 2000,
+        min_bitrate_kbps: 1200,
+        max_bitrate_kbps: 2500,
+        keyframe_interval_frames: 150, // ~5s at 30fps
+    },
+    VideoQualityTier {
+        label: "hd",
         max_width: 1280,
         max_height: 720,
         target_fps: 30,
         ideal_bitrate_kbps: 1500,
         min_bitrate_kbps: 800,
-        max_bitrate_kbps: 2500,
+        max_bitrate_kbps: 2000,
+        keyframe_interval_frames: 150, // ~5s at 30fps
+    },
+    VideoQualityTier {
+        label: "standard",
+        max_width: 960,
+        max_height: 540,
+        target_fps: 30,
+        ideal_bitrate_kbps: 900,
+        min_bitrate_kbps: 500,
+        max_bitrate_kbps: 1500,
         keyframe_interval_frames: 150, // ~5s at 30fps
     },
     VideoQualityTier {
@@ -98,10 +128,20 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         label: "low",
         max_width: 640,
         max_height: 360,
+        target_fps: 20,
+        ideal_bitrate_kbps: 400,
+        min_bitrate_kbps: 200,
+        max_bitrate_kbps: 600,
+        keyframe_interval_frames: 100, // ~5s at 20fps
+    },
+    VideoQualityTier {
+        label: "very_low",
+        max_width: 480,
+        max_height: 270,
         target_fps: 15,
-        ideal_bitrate_kbps: 300,
-        min_bitrate_kbps: 150,
-        max_bitrate_kbps: 500,
+        ideal_bitrate_kbps: 250,
+        min_bitrate_kbps: 100,
+        max_bitrate_kbps: 400,
         keyframe_interval_frames: 75, // ~5s at 15fps
     },
     VideoQualityTier {
@@ -118,15 +158,12 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at the lowest tier ("minimal", 240p/10fps/150kbps) ensures the
-/// system only ever upgrades from the initial state. This eliminates the
-/// visible dimension-change oscillation that occurred when starting at
-/// "medium": the PID controller allocates ~300 kbps during warmup, but
-/// medium expects ~600 kbps, so bitrate_ratio drops below the degrade
-/// threshold and triggers a step-down. Starting at minimal means the first
-/// tier transition the user sees is a quality *improvement*, not a jarring
-/// resolution drop.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 3; // "minimal"
+/// Starting at "medium" (480p/25fps/600kbps) keeps initial bandwidth
+/// under 1 Mbps, avoiding buffer bloat on constrained connections during
+/// the 5s warmup period when tier transitions are suppressed. The PID
+/// controller steps up to 720p/1080p if bandwidth permits, or steps
+/// down to 360p/240p if constrained.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 
 /// Label of the video quality tier to use as camera ceiling during screen sharing.
 ///
@@ -148,11 +185,10 @@ pub fn screen_share_camera_ceiling_index() -> usize {
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at the lowest tier ("low", 480p/5fps/250kbps) to
-/// match the camera strategy: only upgrade, never visibly downgrade. The
-/// PID controller will quickly ramp up resolution once it measures
-/// sufficient bandwidth, so text readability recovers within seconds.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 2; // "low"
+/// Screen share starts at "medium" (720p/10fps) — readable content from
+/// the first frame with room to step up to 1080p or down to 480p based
+/// on network conditions.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
@@ -322,12 +358,41 @@ pub const CAMERA_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 pub const SCREEN_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 
 /// Max time to wait for a keyframe before requesting one (milliseconds).
-/// After a sequence gap, if no keyframe arrives within this window, send PLI.
+/// After packet loss is detected, if no keyframe arrives within this window, send PLI.
 pub const KEYFRAME_REQUEST_TIMEOUT_MS: u64 = 1000;
 
 /// Minimum interval between keyframe requests to the same sender (milliseconds).
-/// Prevents flooding the sender with PLI requests.
-pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
+/// Also used as the initial exponential backoff interval. Subsequent requests
+/// double this interval up to `KEYFRAME_REQUEST_MAX_BACKOFF_MS`.
+pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 1000;
+
+/// Maximum backoff interval between keyframe requests (milliseconds).
+/// The backoff doubles from `KEYFRAME_REQUEST_MIN_INTERVAL_MS` and caps here.
+pub const KEYFRAME_REQUEST_MAX_BACKOFF_MS: u64 = 8000;
+
+/// Maximum number of unanswered keyframe requests before giving up.
+/// After this many requests with no keyframe received, switch from
+/// exponential backoff to slow periodic retry.
+pub const KEYFRAME_REQUEST_MAX_UNANSWERED: u32 = 5;
+
+/// Slow periodic retry interval (milliseconds) after the initial backoff
+/// is exhausted. On lossy networks, keyframes (5-10x larger than delta
+/// frames) have a higher drop probability, so giving up permanently
+/// would leave the user with frozen video. A slow retry every 15 seconds
+/// balances recovery against bandwidth cost.
+pub const KEYFRAME_REQUEST_SLOW_RETRY_MS: u64 = 15000;
+
+/// Time (milliseconds) with no packet loss before fully resetting PLI backoff
+/// state. Prevents stale congestion history from penalizing genuinely new loss
+/// events, while keeping backoff elevated during recovery windows where the
+/// network is still fragile.
+pub const KEYFRAME_BACKOFF_DECAY_MS: u64 = 30_000;
+
+/// Minimum interval (milliseconds) between PLI-forced keyframes at the
+/// encoder. Prevents the encoder from being dominated by back-to-back PLI
+/// keyframes during a request storm. Periodic (tier-controlled) keyframes
+/// are NOT subject to this cooldown.
+pub const ENCODER_PLI_COOLDOWN_MS: f64 = 2000.0;
 
 // ---------------------------------------------------------------------------
 // Reconnection
@@ -802,7 +867,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "minimal", "default tier should be 'minimal'");
+        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
     }
 
     #[test]

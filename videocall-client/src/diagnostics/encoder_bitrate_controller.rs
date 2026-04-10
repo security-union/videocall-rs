@@ -247,10 +247,11 @@ impl EncoderBitrateController {
 
     /// Create a new bitrate controller for screen share.
     ///
-    /// Uses `SCREEN_QUALITY_TIERS` starting at the highest tier (1080p) via
-    /// [`AdaptiveQualityManager::new_for_screen`]. The initial
-    /// `ideal_bitrate_kbps` is synced from the starting tier so the PID
-    /// controller does not make an unnecessary correction on the first update.
+    /// Uses `SCREEN_QUALITY_TIERS` starting at `DEFAULT_SCREEN_TIER_INDEX`
+    /// (medium/720p) via [`AdaptiveQualityManager::new_for_screen`]. The
+    /// initial `ideal_bitrate_kbps` is synced from the starting tier so the
+    /// PID controller does not make an unnecessary correction on the first
+    /// update.
     pub fn new_for_screen(
         target_fps: Rc<AtomicU32>,
         video_tiers: &'static [VideoQualityTier],
@@ -260,18 +261,7 @@ impl EncoderBitrateController {
         Self::build(tier_ideal, target_fps, quality_manager)
     }
 
-    /// Create a new bitrate controller using a custom video tier array
-    /// (e.g., `SCREEN_QUALITY_TIERS` for screen share).
-    pub fn new_with_tiers(
-        ideal_bitrate_kbps: u32,
-        target_fps: Rc<AtomicU32>,
-        video_tiers: &'static [VideoQualityTier],
-    ) -> Self {
-        let quality_manager = AdaptiveQualityManager::new(video_tiers);
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
-    }
-
-    /// Internal constructor shared by `new`, `new_with_tiers`, and `new_for_screen`.
+    /// Internal constructor shared by `new` and `new_for_screen`.
     fn build(
         ideal_bitrate_kbps: u32,
         target_fps: Rc<AtomicU32>,
@@ -1269,9 +1259,9 @@ mod tests {
         let target_fps = Rc::new(AtomicU32::new(15));
         let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
 
-        // Should start at the highest screen tier (index 0, "high")
+        // Should start at DEFAULT_SCREEN_TIER_INDEX (index 1, "medium")
         assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
-        assert_eq!(controller.current_video_tier().label, "high");
+        assert_eq!(controller.current_video_tier().label, "medium");
 
         // The ideal_bitrate_kbps should be synced with the starting tier
         let expected_bitrate = SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].ideal_bitrate_kbps;

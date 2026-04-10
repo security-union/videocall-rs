@@ -122,6 +122,29 @@ pub async fn publish_waiting_room_updated(nats: Option<&async_nats::Client>, roo
     tracing::debug!("Published WAITING_ROOM_UPDATED for room {room_id}");
 }
 
+/// Publish `PARTICIPANT_DISPLAY_NAME_CHANGED` when a participant updates their display name.
+pub async fn publish_participant_display_name_changed(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+    new_display_name: &str,
+) {
+    let Some(nats) = nats else { return };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        display_name: new_display_name.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    publish(nats, room_system_subject(room_id), bytes).await;
+    tracing::debug!(
+        "Published PARTICIPANT_DISPLAY_NAME_CHANGED for {target_user_id} in room {room_id}: {}",
+        new_display_name
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

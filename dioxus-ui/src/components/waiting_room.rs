@@ -14,6 +14,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::constants::{actix_websocket_base, webtransport_enabled, webtransport_host_base};
+use crate::context::{resolve_transport_config, TransportPreferenceCtx};
 use crate::meeting_api::{check_status, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
@@ -35,6 +36,7 @@ pub fn WaitingRoom(
     on_rejected: EventHandler<()>,
     on_cancel: EventHandler<()>,
 ) -> Element {
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut error = use_signal(|| None::<String>);
 
     // Track whether the observer WebSocket is currently connected.
@@ -71,6 +73,16 @@ pub fn WaitingRoom(
                 .map(&lobby_url)
                 .collect();
 
+            // Apply user's transport preference
+            let server_wt_enabled = webtransport_enabled().unwrap_or(false);
+            let (effective_wt_enabled, websocket_urls, webtransport_urls) =
+                resolve_transport_config(
+                    (transport_pref_ctx.0)(),
+                    server_wt_enabled,
+                    websocket_urls,
+                    webtransport_urls,
+                );
+
             let meeting_id_for_fetch = meeting_id.clone();
             let meeting_id_for_post_connect = meeting_id.clone();
             let obs_conn_on_connect = observer_connected.clone();
@@ -78,11 +90,12 @@ pub fn WaitingRoom(
 
             let opts = VideoCallClientOptions {
                 user_id: user_id.clone(),
+                display_name: String::new(),
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,
                 enable_e2ee: false,
-                enable_webtransport: webtransport_enabled().unwrap_or(false),
+                enable_webtransport: effective_wt_enabled,
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting room)");
                     obs_conn_on_connect.set(true);
@@ -171,6 +184,7 @@ pub fn WaitingRoom(
                 vad_threshold: None,
                 on_peer_left: None,
                 on_peer_joined: None,
+                on_display_name_changed: None,
             };
 
             let mut client = VideoCallClient::new(opts);

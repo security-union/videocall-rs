@@ -1,0 +1,119 @@
+metricsApi:
+  image:
+    repository: securityunion/videocall-media-server
+    pullPolicy: Always
+    tag: latest
+
+  imagePullSecrets: []
+  podAnnotations: {}
+
+  resources:
+    limits:
+      cpu: 50m
+      memory: 128Mi
+    requests:
+      cpu: 25m
+      memory: 64Mi
+
+  replicas: 1
+
+  service:
+    type: ClusterIP
+    port: 9091
+    targetPort: 9091
+
+  env:
+    METRICS_PORT: "9091"
+    NATS_URL: "nats://nats:4222"
+    REGION: "default"
+    SERVICE_TYPE: "metrics"
+    RUST_LOG: "warn,async_nats=warn"
+    TOKIO_WORKER_THREADS: "1"
+
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 9091
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 9091
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+serverStats:
+  image:
+    repository: securityunion/videocall-media-server
+    pullPolicy: Always
+    tag: latest
+
+  imagePullSecrets: []
+  podAnnotations: {}
+
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+  replicas: 1
+
+  service:
+    type: ClusterIP
+    port: 9092
+    targetPort: 9092
+
+  env:
+    METRICS_PORT: "9092"
+    NATS_URL: "nats://nats:4222"
+    REGION: "default"
+    SERVICE_TYPE: "server-stats"
+    RUST_LOG: "debug,async_nats=info"
+    TOKIO_WORKER_THREADS: "1"
+
+  command: ["/usr/bin/metrics_server_snapshot"]
+
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 9092
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 9092
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000

@@ -1,0 +1,18 @@
+nats:
+  fullnameOverride: nats-ascend
+  nats:
+    auth:
+      enabled: false
+    cluster:
+      enabled: false
+    jetstream:
+      enabled: false
+    natsbox:
+      enabled: true
+    resources:
+      limits:
+        cpu: 400m
+        memory: 600Mi
+      requests:
+        cpu: 400m
+        memory: 600Mi

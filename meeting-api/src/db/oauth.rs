@@ -66,7 +66,12 @@ pub async fn fetch_oauth_request(
     .await
 }
 
-/// Upsert a user after successful OAuth login.
+/// Upsert a user after successful OAuth token exchange.
+///
+/// On **insert** (new user): persists the provider display name in `name`.
+///
+/// On **conflict** (returning user): refreshes the provider `name`, tokens,
+/// and `last_login`.
 pub async fn upsert_user(
     pool: &PgPool,
     email: &str,
@@ -76,16 +81,52 @@ pub async fn upsert_user(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO users (email, name, access_token, refresh_token, created_at, last_login)
+        INSERT INTO users (email, name, access_token, refresh_token,
+                           created_at, last_login)
         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT (email)
-        DO UPDATE SET access_token = $3, refresh_token = $4, name = $2, last_login = CURRENT_TIMESTAMP
+        ON CONFLICT (email) DO UPDATE
+            SET access_token         = $3,
+                refresh_token        = $4,
+                name                 = $2,
+                last_login           = CURRENT_TIMESTAMP
         "#,
     )
     .bind(email)
     .bind(name)
     .bind(access_token)
     .bind(refresh_token)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Upsert a user from an id_token identity without provider access/refresh
+/// tokens.  Used by `POST /api/v1/user/register` when the browser performs
+/// the token exchange directly with the provider (PKCE public-client flow)
+/// and the provider tokens are held only in the browser.
+///
+/// Behaviour:
+/// - **Insert** (new user): creates the row with the provider display name in
+///   `name`; `access_token` and `refresh_token` are left NULL.
+/// - **Conflict** (returning user): updates `name` and `last_login` only.
+///   `access_token`, and `refresh_token` are not overwritten so any tokens
+///    stored by the full [`upsert_user`] path are preserved.
+pub async fn register_user_from_token(
+    pool: &PgPool,
+    user_id: &str,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO users (email, name, created_at, last_login)
+        VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT (email) DO UPDATE
+            SET name       = $2,
+                last_login = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(user_id)
+    .bind(name)
     .execute(pool)
     .await?;
     Ok(())

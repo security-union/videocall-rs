@@ -12,7 +12,8 @@ use wasm_bindgen_test::*;
 
 use dioxus_ui::context::{
     clear_display_name_from_storage, email_to_display_name, load_display_name_from_storage,
-    save_display_name_to_storage, validate_display_name, DISPLAY_NAME_MAX_LEN,
+    load_transport_preference, resolve_transport_config, save_display_name_to_storage,
+    save_transport_preference, validate_display_name, TransportPreference, DISPLAY_NAME_MAX_LEN,
 };
 use videocall_types::validation::normalize_spaces;
 
@@ -242,4 +243,328 @@ fn profile_name_preserves_casing_when_not_email() {
     let profile_name = "McDowell";
     let validated = validate_display_name(profile_name).unwrap();
     assert_eq!(validated, "McDowell");
+}
+
+// ---------------------------------------------------------------------------
+// TransportPreference — Display trait
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn transport_preference_display_auto() {
+    assert_eq!(TransportPreference::Auto.to_string(), "auto");
+}
+
+#[wasm_bindgen_test]
+fn transport_preference_display_webtransport_only() {
+    assert_eq!(
+        TransportPreference::WebTransportOnly.to_string(),
+        "webtransport"
+    );
+}
+
+#[wasm_bindgen_test]
+fn transport_preference_display_websocket_only() {
+    assert_eq!(TransportPreference::WebSocketOnly.to_string(), "websocket");
+}
+
+// ---------------------------------------------------------------------------
+// TransportPreference — FromStr trait
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn transport_preference_parse_auto() {
+    assert_eq!(
+        "auto".parse::<TransportPreference>().unwrap(),
+        TransportPreference::Auto
+    );
+}
+
+#[wasm_bindgen_test]
+fn transport_preference_parse_webtransport() {
+    assert_eq!(
+        "webtransport".parse::<TransportPreference>().unwrap(),
+        TransportPreference::WebTransportOnly
+    );
+}
+
+#[wasm_bindgen_test]
+fn transport_preference_parse_websocket() {
+    assert_eq!(
+        "websocket".parse::<TransportPreference>().unwrap(),
+        TransportPreference::WebSocketOnly
+    );
+}
+
+#[wasm_bindgen_test]
+fn transport_preference_parse_invalid_returns_err() {
+    assert!("".parse::<TransportPreference>().is_err());
+    assert!("Auto".parse::<TransportPreference>().is_err());
+    assert!("WEBTRANSPORT".parse::<TransportPreference>().is_err());
+    assert!("WebSocket".parse::<TransportPreference>().is_err());
+    assert!("quic".parse::<TransportPreference>().is_err());
+    assert!("tcp".parse::<TransportPreference>().is_err());
+    assert!("something_random".parse::<TransportPreference>().is_err());
+}
+
+// ---------------------------------------------------------------------------
+// TransportPreference — Default trait
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn transport_preference_default_is_auto() {
+    assert_eq!(TransportPreference::default(), TransportPreference::Auto);
+}
+
+// ---------------------------------------------------------------------------
+// TransportPreference — Display/FromStr round-trip
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn transport_preference_display_fromstr_roundtrip() {
+    // Every variant should survive a Display -> FromStr round-trip.
+    let variants = [
+        TransportPreference::Auto,
+        TransportPreference::WebTransportOnly,
+        TransportPreference::WebSocketOnly,
+    ];
+    for variant in &variants {
+        let s = variant.to_string();
+        let parsed: TransportPreference = s.parse().unwrap_or_else(|_| {
+            panic!(
+                "TransportPreference::from_str({:?}) should succeed for variant {:?}",
+                s, variant
+            )
+        });
+        assert_eq!(
+            *variant, parsed,
+            "Round-trip failed for variant {:?} (serialized as {:?})",
+            variant, s
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// resolve_transport_config — Auto mode
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn resolve_auto_with_server_wt_enabled_passes_through() {
+    let ws = vec!["ws://a:8080".to_string(), "ws://b:8080".to_string()];
+    let wt = vec!["https://a:4433".to_string(), "https://b:4433".to_string()];
+    let (enable_wt, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::Auto, true, ws.clone(), wt.clone());
+    assert!(
+        enable_wt,
+        "Auto + server WT enabled => enable_webtransport = true"
+    );
+    assert_eq!(ws_out, ws, "Auto should pass WS URLs through unchanged");
+    assert_eq!(wt_out, wt, "Auto should pass WT URLs through unchanged");
+}
+
+#[wasm_bindgen_test]
+fn resolve_auto_with_server_wt_disabled_passes_through() {
+    let ws = vec!["ws://a:8080".to_string()];
+    let wt = vec!["https://a:4433".to_string()];
+    let (enable_wt, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::Auto, false, ws.clone(), wt.clone());
+    assert!(
+        !enable_wt,
+        "Auto + server WT disabled => enable_webtransport = false"
+    );
+    assert_eq!(ws_out, ws, "Auto should pass WS URLs through unchanged");
+    assert_eq!(wt_out, wt, "Auto should pass WT URLs through unchanged");
+}
+
+#[wasm_bindgen_test]
+fn resolve_auto_with_empty_urls_passes_through_empties() {
+    let (enable_wt, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::Auto, true, vec![], vec![]);
+    assert!(enable_wt);
+    assert!(ws_out.is_empty(), "Auto should pass empty WS list through");
+    assert!(wt_out.is_empty(), "Auto should pass empty WT list through");
+}
+
+// ---------------------------------------------------------------------------
+// resolve_transport_config — WebTransportOnly mode
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn resolve_webtransport_only_clears_ws_urls_and_enables_wt() {
+    let ws = vec!["ws://a:8080".to_string(), "ws://b:8080".to_string()];
+    let wt = vec!["https://a:4433".to_string()];
+    let (enable_wt, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::WebTransportOnly, true, ws, wt.clone());
+    assert!(
+        enable_wt,
+        "WebTransportOnly should force enable_webtransport = true"
+    );
+    assert!(
+        ws_out.is_empty(),
+        "WebTransportOnly should clear all WS URLs"
+    );
+    assert_eq!(wt_out, wt, "WebTransportOnly should keep WT URLs unchanged");
+}
+
+#[wasm_bindgen_test]
+fn resolve_webtransport_only_overrides_server_wt_disabled() {
+    // Even when the server says WT is disabled, WebTransportOnly forces it on.
+    let ws = vec!["ws://a:8080".to_string()];
+    let wt = vec!["https://a:4433".to_string()];
+    let (enable_wt, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::WebTransportOnly, false, ws, wt.clone());
+    assert!(
+        enable_wt,
+        "WebTransportOnly should override server_wt_enabled=false and force true"
+    );
+    assert!(
+        ws_out.is_empty(),
+        "WebTransportOnly should clear WS URLs even when server says WT disabled"
+    );
+    assert_eq!(wt_out, wt);
+}
+
+#[wasm_bindgen_test]
+fn resolve_webtransport_only_with_empty_urls() {
+    let (enable_wt, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::WebTransportOnly, false, vec![], vec![]);
+    assert!(
+        enable_wt,
+        "WebTransportOnly should enable WT even with empty URL lists"
+    );
+    assert!(ws_out.is_empty());
+    assert!(wt_out.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// resolve_transport_config — WebSocketOnly mode
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn resolve_websocket_only_clears_wt_urls_and_disables_wt() {
+    let ws = vec!["ws://a:8080".to_string()];
+    let wt = vec!["https://a:4433".to_string(), "https://b:4433".to_string()];
+    let (enable_wt, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::WebSocketOnly, false, ws.clone(), wt);
+    assert!(
+        !enable_wt,
+        "WebSocketOnly should force enable_webtransport = false"
+    );
+    assert_eq!(ws_out, ws, "WebSocketOnly should keep WS URLs unchanged");
+    assert!(wt_out.is_empty(), "WebSocketOnly should clear all WT URLs");
+}
+
+#[wasm_bindgen_test]
+fn resolve_websocket_only_overrides_server_wt_enabled() {
+    // Even when the server says WT is enabled, WebSocketOnly forces it off.
+    let ws = vec!["ws://a:8080".to_string()];
+    let wt = vec!["https://a:4433".to_string()];
+    let (enable_wt, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::WebSocketOnly, true, ws.clone(), wt);
+    assert!(
+        !enable_wt,
+        "WebSocketOnly should override server_wt_enabled=true and force false"
+    );
+    assert_eq!(
+        ws_out, ws,
+        "WebSocketOnly should keep WS URLs even when server says WT enabled"
+    );
+    assert!(
+        wt_out.is_empty(),
+        "WebSocketOnly should clear WT URLs even when server says WT enabled"
+    );
+}
+
+#[wasm_bindgen_test]
+fn resolve_websocket_only_with_empty_urls() {
+    let (enable_wt, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::WebSocketOnly, true, vec![], vec![]);
+    assert!(
+        !enable_wt,
+        "WebSocketOnly should disable WT even with empty URL lists"
+    );
+    assert!(ws_out.is_empty());
+    assert!(wt_out.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// resolve_transport_config — multiple URLs preserved correctly
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn resolve_auto_preserves_order_of_multiple_urls() {
+    let ws = vec![
+        "ws://first:8080".to_string(),
+        "ws://second:8080".to_string(),
+        "ws://third:8080".to_string(),
+    ];
+    let wt = vec![
+        "https://first:4433".to_string(),
+        "https://second:4433".to_string(),
+    ];
+    let (_, ws_out, wt_out) =
+        resolve_transport_config(TransportPreference::Auto, true, ws.clone(), wt.clone());
+    assert_eq!(ws_out, ws, "URL order must be preserved");
+    assert_eq!(wt_out, wt, "URL order must be preserved");
+}
+
+// ---------------------------------------------------------------------------
+// Transport preference localStorage round-trip
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+fn transport_preference_storage_round_trip() {
+    // Clear any previous value
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item("vc_transport_preference");
+    }
+
+    // Default (nothing stored) should return Auto
+    assert_eq!(
+        load_transport_preference(),
+        TransportPreference::Auto,
+        "With nothing stored, load_transport_preference should return Auto"
+    );
+
+    // Save WebTransportOnly and reload
+    save_transport_preference(TransportPreference::WebTransportOnly);
+    assert_eq!(
+        load_transport_preference(),
+        TransportPreference::WebTransportOnly,
+    );
+
+    // Save WebSocketOnly and reload
+    save_transport_preference(TransportPreference::WebSocketOnly);
+    assert_eq!(
+        load_transport_preference(),
+        TransportPreference::WebSocketOnly,
+    );
+
+    // Save Auto explicitly and reload
+    save_transport_preference(TransportPreference::Auto);
+    assert_eq!(load_transport_preference(), TransportPreference::Auto);
+
+    // Cleanup
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item("vc_transport_preference");
+    }
+}
+
+#[wasm_bindgen_test]
+fn transport_preference_storage_invalid_value_returns_auto() {
+    // If localStorage contains an invalid string, load_transport_preference
+    // should fall back to Auto (the default).
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item("vc_transport_preference", "invalid_value");
+    }
+
+    assert_eq!(
+        load_transport_preference(),
+        TransportPreference::Auto,
+        "Invalid stored value should fall back to Auto"
+    );
+
+    // Cleanup
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item("vc_transport_preference");
+    }
 }

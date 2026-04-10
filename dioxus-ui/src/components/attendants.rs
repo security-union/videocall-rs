@@ -25,6 +25,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::PeerList,
     peer_tile::PeerTile,
+    update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
         CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
         PeerListButton, ScreenShareButton,
@@ -34,7 +35,11 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::{LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerStatusMap};
+use crate::context::{
+    resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
+    MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
+    TransportPreferenceCtx,
+};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
@@ -198,6 +203,7 @@ fn schedule_reconnect(
     current_display_name: Signal<String>,
     mut connection_error: Signal<Option<String>>,
     mut meeting_ended_message: Signal<Option<String>>,
+    transport_pref_signal: Signal<TransportPreference>,
     attempt: u32,
 ) {
     let delay_ms = match reconnect_delay_ms(attempt) {
@@ -224,6 +230,15 @@ fn schedule_reconnect(
                     log::info!("Room token refreshed, reconnecting with new token");
                     let latest_display_name = current_display_name();
                     let (ws, wt) = build_lobby_urls(&new_token, &latest_display_name, &meeting_id);
+
+                    // Apply the user's transport preference so the reconnection
+                    // honours the same protocol selection as the initial connection.
+                    let pref = transport_pref_signal();
+                    let server_wt_enabled =
+                        crate::constants::webtransport_enabled().unwrap_or(false);
+                    let (_enable_wt, ws, wt) =
+                        resolve_transport_config(pref, server_wt_enabled, ws, wt);
+
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
                         if let Err(e) = client.connect() {
@@ -243,6 +258,7 @@ fn schedule_reconnect(
                         current_display_name,
                         connection_error,
                         meeting_ended_message,
+                        transport_pref_signal,
                         attempt + 1,
                     );
                 }
@@ -376,7 +392,6 @@ pub fn AttendantsComponent(
     #[props(default)] id: String,
     #[props(default)] display_name: String,
     e2ee_enabled: bool,
-    webtransport_enabled: bool,
     #[props(default)] user_name: Option<String>,
     #[props(default)] user_id: Option<String>,
     #[props(default)] on_logout: Option<EventHandler<()>>,
@@ -386,6 +401,7 @@ pub fn AttendantsComponent(
     #[props(default)] is_owner: bool,
     #[props(default)] room_token: String,
     #[props(default = true)] waiting_room_enabled: bool,
+    #[props(default)] admitted_can_admit: bool,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -401,7 +417,10 @@ pub fn AttendantsComponent(
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
+    let mut display_name_modal_open = use_signal(|| false);
     let current_display_name = use_signal(|| display_name.clone());
+    let display_name_ctx = use_context::<DisplayNameCtx>();
+    let display_name_ctx_signal = display_name_ctx.0;
     let mut meeting_joined = use_signal(|| false);
     let mut show_copy_toast = use_signal(|| false);
     let mut meeting_start_time_server = use_signal(|| None::<f64>);
@@ -423,12 +442,15 @@ pub fn AttendantsComponent(
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
+    let peer_display_name_version = use_signal(|| 0u32);
+
     // Container dimensions — updated on every window resize so compute_grid
     // reacts to viewport changes without any JS ResizeObserver boilerplate.
     let mut container_w = use_signal(|| {
@@ -447,6 +469,15 @@ pub fn AttendantsComponent(
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
     let mut peer_status_map: PeerStatusMap = use_signal(HashMap::new);
+
+    // Create the shared signal history map early so on_peer_removed can clean
+    // up departed peers' histories. Provided as context alongside PeerStatusMap.
+    let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
+
+    // Read transport preference from context BEFORE use_hook (hooks must not
+    // be called inside the hook closure).
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let transport_pref = (transport_pref_ctx.0)();
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -469,6 +500,15 @@ pub fn AttendantsComponent(
         let (websocket_urls, webtransport_urls) =
             build_lobby_urls(&token, &initial_display_name, &id);
 
+        // Apply user's transport preference
+        let server_wt_enabled = crate::constants::webtransport_enabled().unwrap_or(false);
+        let (effective_wt_enabled, websocket_urls, webtransport_urls) = resolve_transport_config(
+            transport_pref,
+            server_wt_enabled,
+            websocket_urls,
+            webtransport_urls,
+        );
+
         log::info!(
             "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
             initial_display_name,
@@ -478,15 +518,18 @@ pub fn AttendantsComponent(
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
 
+        let user_id_for_display_name_changed = user_id.clone();
+
         let opts = VideoCallClientOptions {
             user_id: user_id
                 .clone()
                 .unwrap_or_else(|| initial_display_name.clone()),
+            display_name: initial_display_name.clone(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
             enable_e2ee: e2ee_enabled,
-            enable_webtransport: webtransport_enabled,
+            enable_webtransport: effective_wt_enabled,
             on_connected: VcCallback::from(move |_| {
                 log::info!("DIOXUS-UI: Connection established");
                 let mut connection_error = connection_error;
@@ -517,6 +560,7 @@ pub fn AttendantsComponent(
                             current_display_name,
                             connection_error,
                             meeting_ended_message,
+                            transport_pref_ctx.0,
                             0,
                         );
                     }
@@ -548,6 +592,10 @@ pub fn AttendantsComponent(
                 // `Fn` (Signal is Copy; only the local is mutated each call).
                 let mut map = peer_status_map;
                 map.write().remove(&peer_id);
+                // Also remove the departed peer's signal history so the shared
+                // map does not grow unboundedly over long meetings.
+                let mut hist_map = peer_signal_history_map;
+                hist_map.write().remove(&peer_id);
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
@@ -592,39 +640,9 @@ pub fn AttendantsComponent(
                 v.set(v() + 1);
             })),
             on_peer_left: {
-                let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
                     move |(display_name, user_id): (String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
-
-                        // Suppress toast if the client is reconnecting — the server
-                        // replays the full member list on each connect, so leave
-                        // events during reconnection are not genuine departures.
-                        let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
-                            if client.is_reconnecting() {
-                                log::debug!(
-                                    "Suppressing leave toast for {} (reconnecting)",
-                                    user_id
-                                );
-                                true
-                            } else if !client.has_peer_with_user_id(&user_id) {
-                                // Peer is not in the tracked list (already removed
-                                // by a previous event) — no toast needed.
-                                log::debug!(
-                                    "Suppressing leave toast for {} (not in peer list)",
-                                    user_id
-                                );
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if suppress_toast {
-                            return;
-                        }
 
                         let mut toast_counter = toast_counter;
                         let mut peer_toasts = peer_toasts;
@@ -670,11 +688,6 @@ pub fn AttendantsComponent(
                     move |(display_name, user_id): (String, String)| {
                         log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
 
-                        // Suppress toast if the client is reconnecting — the server
-                        // replays the full member list as PARTICIPANT_JOINED events
-                        // on each connect, so these are not genuine new arrivals.
-                        // Also suppress if this participant is already tracked in the
-                        // peer list (they reconnected, not newly joined).
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
                             if client.is_reconnecting() {
                                 log::debug!(
@@ -698,7 +711,6 @@ pub fn AttendantsComponent(
                         let mut toast_counter = toast_counter;
                         let mut peer_toasts = peer_toasts;
                         let mut toast_version = toast_version;
-                        // Remove any pending "left" toast for this user (waiting room admission).
                         let mut current = peer_toasts.peek().clone();
                         current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
 
@@ -712,7 +724,6 @@ pub fn AttendantsComponent(
                                 let v = *toast_version.peek();
                                 toast_version.set(v + 1);
                             }
-                            // Schedule toast removal after 8 seconds.
                             Timeout::new(8_000, move || {
                                 let updated: Vec<_> = peer_toasts
                                     .peek()
@@ -731,8 +742,6 @@ pub fn AttendantsComponent(
                             peer_toasts.set(current);
                         }
 
-                        // Always force tile re-render so display names appear,
-                        // even when the toast is suppressed.
                         {
                             let mut v = peer_list_version;
                             v.set(v() + 1);
@@ -740,6 +749,33 @@ pub fn AttendantsComponent(
                     },
                 ))
             },
+            on_display_name_changed: Some(VcCallback::from(
+                move |(changed_user_id, new_display_name): (String, String)| {
+                    log::info!(
+                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\"",
+                        changed_user_id,
+                        new_display_name,
+                    );
+
+                    if user_id_for_display_name_changed.as_deref() == Some(changed_user_id.as_str())
+                    {
+                        log::info!(
+                            "DIOXUS-UI: Local user display name confirmed by server: {}",
+                            new_display_name
+                        );
+                        save_display_name_to_storage(&new_display_name);
+                        let mut current_display_name = current_display_name;
+                        current_display_name.set(new_display_name.clone());
+                        let mut dn_ctx = display_name_ctx_signal;
+                        dn_ctx.set(Some(new_display_name.clone()));
+                        log::debug!("DIOXUS-UI: current_display_name signal updated");
+                    }
+
+                    let mut v = peer_display_name_version;
+                    v.set(v() + 1);
+                    log::debug!("DIOXUS-UI: peer_display_name_version bumped");
+                },
+            )),
         };
 
         let client = VideoCallClient::new(opts);
@@ -877,6 +913,11 @@ pub fn AttendantsComponent(
     // The signal was created earlier so on_peer_removed can capture it.
     use_context_provider(|| peer_status_map);
 
+    // Provide the shared signal history map so PeerTile components can look up
+    // (or create) their history entry. This survives PeerTile remounts caused
+    // by layout switches (grid -> split when screen sharing starts).
+    use_context_provider(|| peer_signal_history_map);
+
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
     // dispatches peer_status events into a shared HashMap.
@@ -972,7 +1013,16 @@ pub fn AttendantsComponent(
     let _ = peer_list_version(); // subscribe to trigger re-renders when peers change
     let _ = toast_version(); // subscribe to trigger re-renders when toasts change
     let _ = screen_share_version(); // subscribe to trigger re-renders when screen-share state changes
-    let display_peers = client.sorted_peer_keys();
+    let _ = peer_display_name_version();
+    let all_peers = client.sorted_peer_keys();
+    // Filter out the local user's own session to prevent a phantom peer tile.
+    // Compare by session_id (unique per connection), not user_id (shared when
+    // the same account joins from multiple browsers/tabs).
+    let own_session = client.get_own_session_id().unwrap_or_default();
+    let display_peers: Vec<String> = all_peers
+        .into_iter()
+        .filter(|session_id| *session_id != own_session)
+        .collect();
     let peers_for_display: Vec<String> = display_peers
         .iter()
         .map(|session_id| {
@@ -1000,7 +1050,11 @@ pub fn AttendantsComponent(
         // Add new sharers to the end (most recent = last)
         for pid in &display_peers {
             if client.is_screen_share_enabled_for_peer(pid) && !stack.contains(pid) {
-                stack.push(pid.clone());
+                // Skip self — local screen share is shown in the host preview
+                let peer_user_id = client.get_peer_user_id(pid).unwrap_or_else(|| pid.clone());
+                if user_id.as_deref() != Some(peer_user_id.as_str()) {
+                    stack.push(pid.clone());
+                }
             }
         }
         stack.last().cloned()
@@ -1035,13 +1089,10 @@ pub fn AttendantsComponent(
     let effective_user_id = user_id.as_deref().unwrap_or(&latest_display_name);
     let can_stream =
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
-
     // --- Pre-join screen ---
     if !meeting_joined() {
         return rsx! {
-            div {
-                id: "main-container",
-                class: "meeting-page",
+            div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
                 div {
                     id: "join-meeting-container",
@@ -1057,6 +1108,7 @@ pub fn AttendantsComponent(
                     if is_owner {
                         {
                             let meeting_id_for_toggle = id.clone();
+                            let aca_opacity = if waiting_room_toggle() { "1" } else { "0.5" };
                             rsx! {
                                 div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
                                     span { style: "font-size: 0.9rem;", "Waiting Room" }
@@ -1071,12 +1123,18 @@ pub fn AttendantsComponent(
                                                 }
                                                 toggle_error.set(None);
                                                 waiting_room_toggle.set(new_val);
+                                                // When disabling waiting room, also disable admitted_can_admit
+                                                if !new_val {
+                                                    admitted_can_admit_toggle.set(false);
+                                                }
                                                 saving.set(true);
                                                 let meeting_id = meeting_id.clone();
-                                                                wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val).await {
+                                                let aca = if new_val { Some(admitted_can_admit_toggle()) } else { Some(false) };
+                                                wasm_bindgen_futures::spawn_local(async move {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val, aca).await {
                                                         Ok(updated) => {
                                                             waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                            admitted_can_admit_toggle.set(updated.admitted_can_admit);
                                                             saving.set(false);
                                                         }
                                                         Err(e) => {
@@ -1091,10 +1149,43 @@ pub fn AttendantsComponent(
                                         },
                                     }
                                 }
-                                if let Some(err) = toggle_error() {
-                                    p { class: "toggle-error",
-                                        "{err}"
+                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white; opacity: {aca_opacity};",
+                                    span { style: "font-size: 0.9rem;", "Admitted can admit" }
+                                    crate::components::toggle_switch::ToggleSwitch {
+                                        enabled: admitted_can_admit_toggle(),
+                                        disabled: saving() || !waiting_room_toggle(),
+                                        on_toggle: {
+                                            let meeting_id = meeting_id_for_toggle.clone();
+                                            move |new_val: bool| {
+                                                if saving() || !waiting_room_toggle() {
+                                                    return;
+                                                }
+                                                toggle_error.set(None);
+                                                admitted_can_admit_toggle.set(new_val);
+                                                saving.set(true);
+                                                let meeting_id = meeting_id.clone();
+                                                let wr = waiting_room_toggle();
+                                                wasm_bindgen_futures::spawn_local(async move {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, wr, Some(new_val)).await {
+                                                        Ok(updated) => {
+                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                            admitted_can_admit_toggle.set(updated.admitted_can_admit);
+                                                            saving.set(false);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("Failed to update admitted_can_admit setting: {e}");
+                                                            admitted_can_admit_toggle.set(!new_val);
+                                                            saving.set(false);
+                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        },
                                     }
+                                }
+                                if let Some(err) = toggle_error() {
+                                    p { class: "toggle-error", "{err}" }
                                 }
                                 p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-bottom: 1.5rem; margin-top: -0.75rem;",
                                     if waiting_room_toggle() {
@@ -1111,17 +1202,21 @@ pub fn AttendantsComponent(
                         onclick: move |_| {
                             mda.borrow().request();
                         },
-                        if is_owner { "Start Meeting" } else { "Join Meeting" }
+                        if is_owner {
+                            "Start Meeting"
+                        } else {
+                            "Join Meeting"
+                        }
                     }
                     if show_device_warning() {
                         div { class: "modal-overlay",
                             div { class: "modal-window",
                                 h3 { "Device access problem" }
                                 if let Some(err) = mic_error.read().as_ref() {
-                                    { render_single_device_error("Microphone", err) }
+                                    {render_single_device_error("Microphone", err)}
                                 }
                                 if let Some(err) = video_error.read().as_ref() {
-                                    { render_single_device_error("Camera", err) }
+                                    {render_single_device_error("Camera", err)}
                                 }
                                 {
                                     let mut client = client.clone();
@@ -1161,19 +1256,24 @@ pub fn AttendantsComponent(
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
-            div {
-                id: "main-container",
-                class: "meeting-page",
+            div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
                 if !peer_toasts().is_empty() {
-                    div {
-                        class: "peer-toasts",
-                        for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
+                    div { class: "peer-toasts",
+                        for (id , display_name , _ , is_joined) in peer_toasts().iter().cloned() {
                             {
-                                let variant_class = if is_joined { "peer-toast toast-joined" } else { "peer-toast toast-left" };
-                                let action_text = if is_joined { "joined the meeting" } else { "left the meeting" };
+                                let variant_class = if is_joined {
+                                    "peer-toast toast-joined"
+                                } else {
+                                    "peer-toast toast-left"
+                                };
+                                let action_text = if is_joined {
+                                    "joined the meeting"
+                                } else {
+                                    "left the meeting"
+                                };
                                 rsx! {
                                     div { key: "{id}", class: "{variant_class}",
                                         span { class: "toast-icon",
@@ -1189,8 +1289,18 @@ pub fn AttendantsComponent(
                                                     stroke_linejoin: "round",
                                                     path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
                                                     circle { cx: "9", cy: "7", r: "4" }
-                                                    line { x1: "19", y1: "8", x2: "19", y2: "14" }
-                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
+                                                    line {
+                                                        x1: "19",
+                                                        y1: "8",
+                                                        x2: "19",
+                                                        y2: "14",
+                                                    }
+                                                    line {
+                                                        x1: "22",
+                                                        y1: "11",
+                                                        x2: "16",
+                                                        y2: "11",
+                                                    }
                                                 }
                                             } else {
                                                 svg {
@@ -1204,7 +1314,12 @@ pub fn AttendantsComponent(
                                                     stroke_linejoin: "round",
                                                     path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
                                                     circle { cx: "9", cy: "7", r: "4" }
-                                                    line { x1: "22", y1: "11", x2: "16", y2: "11" }
+                                                    line {
+                                                        x1: "22",
+                                                        y1: "11",
+                                                        x2: "16",
+                                                        y2: "11",
+                                                    }
                                                 }
                                             }
                                         }
@@ -1220,14 +1335,12 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                div {
-                    id: "grid-container",
-                    style: "{container_style}",
+                div { id: "grid-container", style: "{container_style}",
+
                     if has_screen_share {
                         // ---- Split layout: active screen share (left 2/3) + peer videos (right 1/3) ----
                         // Left panel — ONLY the most recent (active) screen sharer
-                        div {
-                            style: "flex: 2; min-width: 0; height: 100%; display: flex; flex-direction: column; \
+                        div { style: "flex: 2; min-width: 0; height: 100%; display: flex; flex-direction: column; \
                                     align-items: center; justify-content: center; overflow: hidden;",
                             if let Some(ref active_peer) = active_screen_sharer {
                                 PeerTile {
@@ -1236,34 +1349,36 @@ pub fn AttendantsComponent(
                                     full_bleed: true,
                                     host_user_id: host_user_id.clone(),
                                     render_mode: TileMode::ScreenOnly,
+                                    my_peer_id: user_id.clone(),
                                 }
                             }
                         }
                         // Right panel — all peer video tiles stacked vertically
-                        div {
-                            style: "flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;",
-                            for peer_id in display_peers.iter().take(CANVAS_LIMIT) {
+                        div { style: "flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;",
+                            for (i , peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
                                 PeerTile {
-                                    key: "tile-{peer_id}",
+                                    key: "vid-{i}-{peer_id}",
                                     peer_id: peer_id.clone(),
                                     full_bleed: false,
                                     host_user_id: host_user_id.clone(),
                                     render_mode: TileMode::VideoOnly,
+                                    my_peer_id: user_id.clone(),
                                 }
                             }
                         }
                     } else {
                         // ---- Normal grid layout ----
-                        for peer_id in display_peers.iter().take(CANVAS_LIMIT) {
+                        for (i , peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
                             {
                                 let full_bleed = display_peers.len() == 1
                                     && !client.is_screen_share_enabled_for_peer(peer_id);
                                 rsx! {
                                     PeerTile {
-                                        key: "tile-{peer_id}",
+                                        key: "tile-{i}-{peer_id}",
                                         peer_id: peer_id.clone(),
-                                        full_bleed: full_bleed,
+                                        full_bleed,
                                         host_user_id: host_user_id.clone(),
+                                        my_peer_id: user_id.clone(),
                                     }
                                 }
                             }
@@ -1271,59 +1386,70 @@ pub fn AttendantsComponent(
 
                         // Invitation overlay when no peers
                         if num_display_peers == 0 {
-                        div {
-                            id: "invite-overlay",
-                            class: "card-apple",
-                            style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
-                            h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                            p { style: "font-size: 0.9rem; opacity: 0.8;", "Share this meeting link with others you want in the meeting" }
-                            div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
-                                input {
-                                    id: "meeting-link-input",
-                                    value: "{meeting_link}",
-                                    readonly: true,
-                                    class: "input-apple",
-                                    style: "flex:1; overflow:hidden; text-overflow: ellipsis;",
+                            div {
+                                id: "invite-overlay",
+                                class: "card-apple",
+                                style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
+                                h4 { style: "margin-top:0;", "Your meeting is ready!" }
+                                p { style: "font-size: 0.9rem; opacity: 0.8;",
+                                    "Share this meeting link with others you want in the meeting"
                                 }
-                                button {
-                                    class: if show_copy_toast() { "btn-apple btn-primary btn-sm copy-button btn-pop-animate" } else { "btn-apple btn-primary btn-sm copy-button" },
-                                    style: "margin-left: 0.5rem;",
-                                    onclick: {
-                                        let meeting_link = meeting_link.clone();
-                                        move |_| {
-                                            if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) {
-                                                let _ = clipboard.write_text(&meeting_link);
-                                                show_copy_toast.set(true);
-                                                Timeout::new(1640, move || {
-                                                    show_copy_toast.set(false);
-                                                }).forget();
+                                div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
+                                    input {
+                                        id: "meeting-link-input",
+                                        value: "{meeting_link}",
+                                        readonly: true,
+                                        class: "input-apple",
+                                        style: "flex:1; overflow:hidden; text-overflow: ellipsis;",
+                                    }
+                                    button {
+                                        class: if show_copy_toast() { "btn-apple btn-primary btn-sm copy-button btn-pop-animate" } else { "btn-apple btn-primary btn-sm copy-button" },
+                                        style: "margin-left: 0.5rem;",
+                                        onclick: {
+                                            let meeting_link = meeting_link.clone();
+                                            move |_| {
+                                                if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard())
+                                                {
+                                                    let _ = clipboard.write_text(&meeting_link);
+                                                    show_copy_toast.set(true);
+                                                    Timeout::new(
+                                                            1640,
+                                                            move || {
+                                                                show_copy_toast.set(false);
+                                                            },
+                                                        )
+                                                        .forget();
+                                                }
                                             }
-                                        }
-                                    },
-                                    "Copy"
-                                    if show_copy_toast() {
-                                        div { class: "sparkles", "aria-hidden": "true",
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
-                                            span { class: "sparkle" }
+                                        },
+                                        "Copy"
+                                        if show_copy_toast() {
+                                            div {
+                                                class: "sparkles",
+                                                "aria-hidden": "true",
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                                span { class: "sparkle" }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            p { style: "font-size: 0.8rem; opacity: 0.7;", "People who use this meeting link must get your permission before they can join." }
-                            div {
-                                class: if show_copy_toast() { "copy-toast copy-toast--visible" } else { "copy-toast" },
-                                role: "alert",
-                                "aria-live": "assertive",
-                                "Link copied to clipboard"
+                                p { style: "font-size: 0.8rem; opacity: 0.7;",
+                                    "People who use this meeting link must get your permission before they can join."
+                                }
+                                div {
+                                    class: if show_copy_toast() { "copy-toast copy-toast--visible" } else { "copy-toast" },
+                                    role: "alert",
+                                    "aria-live": "assertive",
+                                    "Link copied to clipboard"
+                                }
                             }
                         }
-                    }
                     } // end of else (normal grid layout)
 
                     // Controls nav
@@ -1562,22 +1688,47 @@ pub fn AttendantsComponent(
                             },
                             host_display_name: host_display_name.clone(),
                             host_user_id: host_user_id.clone(),
+                            local_user_display_name: current_display_name(),
+                            on_edit_self_name: {move |_| {
+                                display_name_modal_open.set(true);
+                            }},
                         }
                     }
                 }
 
-                // Waiting room controls (host only)
-                if is_owner {
+                // Waiting room controls (host or admitted participants when allowed)
+                if is_owner || admitted_can_admit {
                     HostControls {
                         meeting_id: id.clone(),
                         is_admitted: true,
-                        waiting_room_version: waiting_room_version,
+                        waiting_room_version,
                     }
+                }
+
+                UpdateDisplayNameModal {
+                    visible: display_name_modal_open(),
+                    current_display_name: current_display_name(),
+                    meeting_id: id.clone(),
+                    on_close: move |_| {
+                        display_name_modal_open.set(false);
+                    },
+                    on_success: move |new_name: String| {
+                        // Update local UI immediately — do NOT wait for server broadcast.
+                        // The server will broadcast PARTICIPANT_DISPLAY_NAME_CHANGED moments later,
+                        // which will be handled by on_display_name_changed callback and will
+                        // confirm the same value. This ensures no perceived lag for the user.
+                        log::info!("RENAME: on_success called with new_name: {}", new_name);
+                        let mut current_name = current_display_name;
+                        current_name.set(new_name.clone());
+                        let mut dn_ctx = display_name_ctx_signal;
+                        dn_ctx.set(Some(new_name.clone()));
+                        display_name_modal_open.set(false);
+                    },
                 }
 
                 // Meeting ended overlay
                 if let Some(message) = meeting_ended_message() {
-                    MeetingEndedOverlay { message: message }
+                    MeetingEndedOverlay { message }
                 }
 
                 // Diagnostics sidebar

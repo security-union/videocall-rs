@@ -18,7 +18,7 @@
 
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
-    canvas_generator::TileMode,
+    canvas_generator::{speak_style, TileMode},
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
@@ -439,6 +439,7 @@ pub fn AttendantsComponent(
     let connecting = use_signal(|| false);
     let local_speaking = use_signal(|| false);
     let local_audio_level = use_signal(|| 0.0f32);
+    let mut pinned_peer_id: Signal<Option<String>> = use_signal(|| None);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
@@ -1252,6 +1253,19 @@ pub fn AttendantsComponent(
 
     info!("Rendering meeting view with {} peers", display_peers.len());
 
+    // Host self-view speaking glow
+    let host_audio = local_audio_level();
+    let host_is_speaking = local_speaking();
+    let host_class = if host_is_speaking {
+        "host speaking-tile"
+    } else {
+        "host"
+    };
+    let host_style = speak_style(host_audio, host_is_speaking);
+
+    // Pinned peer glow: read current pinned value for PeerTile props
+    let current_pinned = pinned_peer_id();
+
     rsx! {
         div {
             // Provide MeetingTime context
@@ -1350,6 +1364,19 @@ pub fn AttendantsComponent(
                                     host_user_id: host_user_id.clone(),
                                     render_mode: TileMode::ScreenOnly,
                                     my_peer_id: user_id.clone(),
+                                    pinned_peer_id: current_pinned.clone(),
+                                    on_toggle_pin: {
+                                        let client = client.clone();
+                                        move |pid: String| {
+                                            let normalized = client.get_peer_user_id(&pid).unwrap_or_else(|| pid.clone());
+                                            let cur = pinned_peer_id();
+                                            if cur.as_deref() == Some(normalized.as_str()) {
+                                                pinned_peer_id.set(None);
+                                            } else {
+                                                pinned_peer_id.set(Some(normalized));
+                                            }
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -1363,6 +1390,19 @@ pub fn AttendantsComponent(
                                     host_user_id: host_user_id.clone(),
                                     render_mode: TileMode::VideoOnly,
                                     my_peer_id: user_id.clone(),
+                                    pinned_peer_id: current_pinned.clone(),
+                                    on_toggle_pin: {
+                                        let client = client.clone();
+                                        move |pid: String| {
+                                            let normalized = client.get_peer_user_id(&pid).unwrap_or_else(|| pid.clone());
+                                            let cur = pinned_peer_id();
+                                            if cur.as_deref() == Some(normalized.as_str()) {
+                                                pinned_peer_id.set(None);
+                                            } else {
+                                                pinned_peer_id.set(Some(normalized));
+                                            }
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -1379,6 +1419,19 @@ pub fn AttendantsComponent(
                                         full_bleed,
                                         host_user_id: host_user_id.clone(),
                                         my_peer_id: user_id.clone(),
+                                        pinned_peer_id: current_pinned.clone(),
+                                        on_toggle_pin: {
+                                            let client = client.clone();
+                                            move |pid: String| {
+                                                let normalized = client.get_peer_user_id(&pid).unwrap_or_else(|| pid.clone());
+                                                let cur = pinned_peer_id();
+                                                if cur.as_deref() == Some(normalized.as_str()) {
+                                                    pinned_peer_id.set(None);
+                                                } else {
+                                                    pinned_peer_id.set(Some(normalized));
+                                                }
+                                            }
+                                        },
                                     }
                                 }
                             }
@@ -1454,7 +1507,9 @@ pub fn AttendantsComponent(
 
                     // Controls nav
                     if can_stream {
-                        nav { class: "host",
+                        nav { id: "host-controls-nav",
+                            class: "{host_class}",
+                            style: "{host_style}",
                             div { class: "controls",
                                 nav { class: "video-controls-container",
                                     {

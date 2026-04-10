@@ -2,6 +2,25 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
+/**
+ * Speaking-glow E2E tests.
+ *
+ * The speaking glow is rendered as:
+ * - `.speaking-tile` CSS class on the outer tile div (peer: `.grid-item`,
+ *    host self-view: `#host-controls-nav`)
+ * - Inline `box-shadow` + `transition` via `speak_style()` on the same element
+ *
+ * Since Playwright uses `--use-fake-device-for-media-stream`, no real audio is
+ * produced, so all participants remain in the "silent" state.  Tests verify
+ * the **silent baseline** (no glow, correct transition, no speaking class) and
+ * structural correctness of the elements that would receive glow.
+ *
+ * Screen-share glow suppression cannot be fully automated because
+ * `getDisplayMedia()` opens a system picker that Playwright cannot drive.
+ * Pinned-peer suppression requires a speaking peer to observe the glow
+ * difference.  Both are documented inline with best-effort structural checks.
+ */
+
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 
 const BROWSER_ARGS = [
@@ -117,203 +136,391 @@ async function admitGuestIfNeeded(
   }
 }
 
+/**
+ * Set up a two-user meeting (host + guest) and return both pages
+ * along with browser handles for cleanup.
+ */
+async function setupTwoUserMeeting(
+  uiURL: string,
+  meetingId: string,
+  hostName: string,
+  guestName: string,
+) {
+  const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+  const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+  const hostCtx = await createAuthenticatedContext(
+    browser1,
+    `${hostName.toLowerCase()}@videocall.rs`,
+    hostName,
+    uiURL,
+  );
+  const guestCtx = await createAuthenticatedContext(
+    browser2,
+    `${guestName.toLowerCase()}@videocall.rs`,
+    guestName,
+    uiURL,
+  );
+
+  const hostPage = await hostCtx.newPage();
+  const guestPage = await guestCtx.newPage();
+
+  await navigateToMeeting(hostPage, meetingId, hostName);
+  const hostResult = await joinMeetingFromPage(hostPage);
+  expect(hostResult).toBe("in-meeting");
+
+  await navigateToMeeting(guestPage, meetingId, guestName);
+  const guestResult = await joinMeetingFromPage(guestPage);
+  await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+  // Wait for peer tile to appear on the host side
+  const peerTile = hostPage.locator("#grid-container .grid-item");
+  await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
+
+  return { hostPage, guestPage, browser1, browser2 };
+}
+
 test.describe("Speaker highlight glow on video tiles", () => {
   test.beforeAll(async () => {
     await waitForServices();
   });
 
-  test("video tile has transparent border and no glow when silent", async ({ baseURL }) => {
+  // ──────────────────────────────────────────────────────────────────────
+  // 1. Glow on outer tile only — silent state
+  // ──────────────────────────────────────────────────────────────────────
+  test("peer tile outer div has box-shadow:none and no speaking-tile class when silent", async ({
+    baseURL,
+  }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_glow_peer_${Date.now()}`;
 
-    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
-    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const { hostPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "GlowHost",
+      "GlowGuest",
+    );
 
     try {
-      const hostCtx = await createAuthenticatedContext(
-        browser1,
-        "host-glow@videocall.rs",
-        "GlowHost",
-        uiURL,
-      );
-      const guestCtx = await createAuthenticatedContext(
-        browser2,
-        "guest-glow@videocall.rs",
-        "GlowGuest",
-        uiURL,
-      );
+      // The outer tile div is a .grid-item inside #grid-container.
+      // When silent it must NOT have .speaking-tile class and its inline
+      // style must contain "box-shadow: none".
+      const outerTile = hostPage.locator("#grid-container .grid-item").first();
+      await expect(outerTile).toBeVisible({ timeout: 10_000 });
 
-      const hostPage = await hostCtx.newPage();
-      const guestPage = await guestCtx.newPage();
+      const tileClass = await outerTile.getAttribute("class");
+      expect(tileClass).toBeTruthy();
+      expect(tileClass).not.toContain("speaking-tile");
 
-      // Host starts the meeting
-      await navigateToMeeting(hostPage, meetingId, "GlowHost");
-      const hostResult = await joinMeetingFromPage(hostPage);
-      expect(hostResult).toBe("in-meeting");
-
-      // Guest joins the meeting
-      await navigateToMeeting(guestPage, meetingId, "GlowGuest");
-      const guestResult = await joinMeetingFromPage(guestPage);
-      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
-
-      // Wait for peer tile to appear on the host side
-      const peerTile = hostPage.locator("#grid-container .canvas-container");
-      await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
-
-      // The glow inline style lives on the child .glow-overlay div.
-      const glowOverlay = peerTile.first().locator(".glow-overlay");
-      await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
-
-      // When silent: border-color is transparent, box-shadow is none.
-      const style = await glowOverlay.getAttribute("style");
-      expect(style).toBeTruthy();
-      expect(style).toContain("border: 1.5px solid transparent");
-      expect(style).toContain("box-shadow: none");
+      const tileStyle = await outerTile.getAttribute("style");
+      expect(tileStyle).toBeTruthy();
+      expect(tileStyle).toContain("box-shadow: none");
     } finally {
       await browser1.close();
       await browser2.close();
     }
   });
 
-  test("video tile has transition property in inline style", async ({ baseURL }) => {
+  // ──────────────────────────────────────────────────────────────────────
+  // 2. Transition property present for smooth glow animation
+  // ──────────────────────────────────────────────────────────────────────
+  test("peer tile has transition property in inline style for glow animation", async ({
+    baseURL,
+  }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_glow_trans_${Date.now()}`;
 
-    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
-    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const { hostPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "TransHost",
+      "TransGuest",
+    );
 
     try {
-      const hostCtx = await createAuthenticatedContext(
-        browser1,
-        "host-trans@videocall.rs",
-        "TransHost",
-        uiURL,
-      );
-      const guestCtx = await createAuthenticatedContext(
-        browser2,
-        "guest-trans@videocall.rs",
-        "TransGuest",
-        uiURL,
-      );
+      const outerTile = hostPage.locator("#grid-container .grid-item").first();
+      await expect(outerTile).toBeVisible({ timeout: 10_000 });
 
-      const hostPage = await hostCtx.newPage();
-      const guestPage = await guestCtx.newPage();
-
-      // Host starts the meeting
-      await navigateToMeeting(hostPage, meetingId, "TransHost");
-      const hostResult = await joinMeetingFromPage(hostPage);
-      expect(hostResult).toBe("in-meeting");
-
-      // Guest joins the meeting
-      await navigateToMeeting(guestPage, meetingId, "TransGuest");
-      const guestResult = await joinMeetingFromPage(guestPage);
-      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
-
-      // Wait for peer tile to appear
-      const peerTile = hostPage.locator("#grid-container .canvas-container");
-      await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
-
-      // The glow inline style lives on the child .glow-overlay div.
-      const glowOverlay = peerTile.first().locator(".glow-overlay");
-      await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
-
-      // The inline style should contain a transition property for the
-      // smooth fade-in/fade-out of the glow border.
-      const style = await glowOverlay.getAttribute("style");
+      const style = await outerTile.getAttribute("style");
       expect(style).toBeTruthy();
+      // speak_style() always emits transition: for both silent and active states
       expect(style).toContain("transition:");
+      expect(style).toContain("box-shadow");
     } finally {
       await browser1.close();
       await browser2.close();
     }
   });
 
-  test("host tile has transparent border when silent", async ({ baseURL }) => {
+  // ──────────────────────────────────────────────────────────────────────
+  // 3. Host controls nav (#host-controls-nav) — silent state
+  // ──────────────────────────────────────────────────────────────────────
+  test("host-controls-nav has class 'host' without speaking-tile when silent", async ({
+    baseURL,
+  }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
-    const meetingId = `e2e_glow_host_${Date.now()}`;
+    const meetingId = `e2e_glow_hostnav_${Date.now()}`;
 
     const browser = await chromium.launch({ args: BROWSER_ARGS });
 
     try {
       const ctx = await createAuthenticatedContext(
         browser,
-        "host-self@videocall.rs",
-        "SelfHost",
+        "host-nav@videocall.rs",
+        "HostNav",
         uiURL,
       );
-
       const page = await ctx.newPage();
 
-      // Navigate to a meeting and join
-      await navigateToMeeting(page, meetingId, "SelfHost");
+      await navigateToMeeting(page, meetingId, "HostNav");
       const result = await joinMeetingFromPage(page);
       expect(result).toBe("in-meeting");
 
-      // Wait for ANY visible .glow-overlay on the page. With fake devices
-      // in E2E, video may be off so the glow-overlay can render outside
-      // .host-video-wrapper.
-      const glowOverlay = page.locator(".glow-overlay").first();
-      await expect(glowOverlay).toBeVisible({ timeout: 15_000 });
+      const hostNav = page.locator("#host-controls-nav");
+      await expect(hostNav).toBeVisible({ timeout: 15_000 });
 
-      // The host's own tile should also have silent-state inline styles.
-      const style = await glowOverlay.getAttribute("style");
-      expect(style).toBeTruthy();
-      expect(style).toContain("border: 1.5px solid transparent");
+      // Class should be "host" (no "speaking-tile")
+      const navClass = await hostNav.getAttribute("class");
+      expect(navClass).toBeTruthy();
+      expect(navClass).toContain("host");
+      expect(navClass).not.toContain("speaking-tile");
     } finally {
       await browser.close();
     }
   });
 
+  test("host-controls-nav inline style has box-shadow:none when silent", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_glow_hostbox_${Date.now()}`;
+
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "host-box@videocall.rs",
+        "HostBox",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+
+      await navigateToMeeting(page, meetingId, "HostBox");
+      const result = await joinMeetingFromPage(page);
+      expect(result).toBe("in-meeting");
+
+      const hostNav = page.locator("#host-controls-nav");
+      await expect(hostNav).toBeVisible({ timeout: 15_000 });
+
+      const style = await hostNav.getAttribute("style");
+      expect(style).toBeTruthy();
+      expect(style).toContain("box-shadow: none");
+      expect(style).toContain("transition:");
+    } finally {
+      await browser.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 4. Screen-share tiles — no glow
+  //
+  // LIMITATION: Cannot be fully automated. getDisplayMedia() opens a
+  // system-level picker that Playwright cannot drive. However, the code
+  // path is verified here structurally:
+  //   - In the grid layout, screen-share tiles are rendered inside a
+  //     separate `.grid-item` div WITHOUT speaking-tile or box-shadow.
+  //   - In the split layout (TileMode::ScreenOnly), the screen share
+  //     renders inside a `.split-screen-tile` div with NO glow props.
+  //   - The Rust source (`canvas_generator.rs` line 216) sets
+  //     `is_suppressed = true` when `is_screen_share_enabled_for_peer`
+  //     is true, which forces `visible_audio_level = 0` and removes the
+  //     `.speaking-tile` class.
+  //
+  // The test below verifies that in a normal (no-screen-share) meeting
+  // the grid-item tiles do NOT have screen-share glow artifacts or stale
+  // split-screen-tile elements.
+  // ──────────────────────────────────────────────────────────────────────
+  test("grid-item tiles in a normal meeting have no stale screen-share glow artifacts", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_glow_ss_${Date.now()}`;
+
+    const { hostPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSHost",
+      "SSGuest",
+    );
+
+    try {
+      // No .split-screen-tile should exist when nobody is screen-sharing
+      const splitScreenTile = hostPage.locator(".split-screen-tile");
+      await expect(splitScreenTile).toHaveCount(0);
+
+      // The peer tile should have box-shadow: none (no glow) and no
+      // speaking-tile class — confirming normal silent rendering without
+      // screen-share-related artifacts.
+      const outerTile = hostPage.locator("#grid-container .grid-item").first();
+      await expect(outerTile).toBeVisible({ timeout: 10_000 });
+
+      const style = await outerTile.getAttribute("style");
+      expect(style).toContain("box-shadow: none");
+
+      const cls = await outerTile.getAttribute("class");
+      expect(cls).not.toContain("speaking-tile");
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 5. Pinned suppression (structural verification)
+  //
+  // LIMITATION: Full pinned-glow suppression testing requires a speaking
+  // peer (to see glow suppressed on non-pinned peers). Since fake devices
+  // produce no audio, we cannot trigger the speaking state. Instead we
+  // verify:
+  //   a. Pin button is present on peer tiles
+  //   b. Clicking it does not introduce spurious glow on silent tiles
+  //   c. The glow-related inline styles remain in the "silent" state
+  //
+  // The suppression logic itself (`is_speaking_suppressed()`) is tested
+  // at the unit level in Rust.
+  // ──────────────────────────────────────────────────────────────────────
+  test("pin button is present on peer tiles and toggling preserves silent glow state", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_glow_pin_${Date.now()}`;
+
+    const { hostPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "PinHost",
+      "PinGuest",
+    );
+
+    try {
+      const outerTile = hostPage.locator("#grid-container .grid-item").first();
+      await expect(outerTile).toBeVisible({ timeout: 10_000 });
+
+      // Hover to reveal the pin icon (visible on hover via CSS)
+      await outerTile.hover();
+      await hostPage.waitForTimeout(500);
+
+      const pinButton = outerTile.locator(".pin-icon");
+      // Pin icon should be in the DOM
+      const pinCount = await pinButton.count();
+      expect(pinCount).toBeGreaterThan(0);
+
+      // Click pin to toggle pinned state
+      await pinButton.first().click({ force: true });
+      await hostPage.waitForTimeout(500);
+
+      // After pinning: the tile should still have box-shadow: none (silent)
+      const styleAfterPin = await outerTile.getAttribute("style");
+      expect(styleAfterPin).toContain("box-shadow: none");
+
+      // And no speaking-tile class
+      const classAfterPin = await outerTile.getAttribute("class");
+      expect(classAfterPin).not.toContain("speaking-tile");
+
+      // Unpin by clicking again
+      await outerTile.hover();
+      await hostPage.waitForTimeout(300);
+      await pinButton.first().click({ force: true });
+      await hostPage.waitForTimeout(500);
+
+      // Still silent after unpin
+      const styleAfterUnpin = await outerTile.getAttribute("style");
+      expect(styleAfterUnpin).toContain("box-shadow: none");
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 6. Mic icon audio-indicator — no speaking class when silent
+  // ──────────────────────────────────────────────────────────────────────
   test("mic icon does not have speaking class when silent", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_glow_mic_${Date.now()}`;
 
-    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
-    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const { hostPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "MicHost",
+      "MicGuest",
+    );
 
     try {
-      const hostCtx = await createAuthenticatedContext(
-        browser1,
-        "host-mic@videocall.rs",
-        "MicHost",
-        uiURL,
-      );
-      const guestCtx = await createAuthenticatedContext(
-        browser2,
-        "guest-mic@videocall.rs",
-        "MicGuest",
-        uiURL,
-      );
-
-      const hostPage = await hostCtx.newPage();
-      const guestPage = await guestCtx.newPage();
-
-      // Host starts the meeting
-      await navigateToMeeting(hostPage, meetingId, "MicHost");
-      const hostResult = await joinMeetingFromPage(hostPage);
-      expect(hostResult).toBe("in-meeting");
-
-      // Guest joins the meeting
-      await navigateToMeeting(guestPage, meetingId, "MicGuest");
-      const guestResult = await joinMeetingFromPage(guestPage);
-      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
-
-      // Wait for peer tile to appear
-      const peerTile = hostPage.locator("#grid-container .canvas-container");
-      await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
-
-      // The audio indicator on the peer tile should NOT have the
-      // "speaking" class when the participant is silent.
-      const audioIndicator = hostPage.locator(".audio-indicator").first();
+      // The audio-indicator div on peer tiles should NOT have "speaking" class
+      const audioIndicator = hostPage.locator("#grid-container .audio-indicator").first();
       await expect(audioIndicator).toBeVisible({ timeout: 10_000 });
       await expect(audioIndicator).not.toHaveClass(/speaking/);
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 7. Host controls nav structural pattern — class + inline style
+  //
+  // Verifies #host-controls-nav carries both a CSS class and an inline
+  // style from speak_style(), so that when speaking IS triggered the glow
+  // will render correctly via the `.speaking-tile` CSS rule + box-shadow.
+  // ──────────────────────────────────────────────────────────────────────
+  test("host-controls-nav has both class and inline style from speak_style", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_glow_hostpat_${Date.now()}`;
+
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "host-pattern@videocall.rs",
+        "HostPattern",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+
+      await navigateToMeeting(page, meetingId, "HostPattern");
+      const result = await joinMeetingFromPage(page);
+      expect(result).toBe("in-meeting");
+
+      const hostNav = page.locator("#host-controls-nav");
+      await expect(hostNav).toBeVisible({ timeout: 15_000 });
+
+      // Verify the element has BOTH class and style attributes set:
+      //   class = "host" (silent) or "host speaking-tile" (speaking)
+      //   style = output of speak_style() — always includes transition + box-shadow
+      const cls = await hostNav.getAttribute("class");
+      expect(cls).toMatch(/\bhost\b/);
+
+      const style = await hostNav.getAttribute("style");
+      expect(style).toBeTruthy();
+      // speak_style() always emits these two properties
+      expect(style).toContain("transition:");
+      expect(style).toContain("box-shadow");
+
+      // Specifically for silent state: ease-out transition for fade-out
+      expect(style).toContain("ease-out");
+    } finally {
+      await browser.close();
     }
   });
 });

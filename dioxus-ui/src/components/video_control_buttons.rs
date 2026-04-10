@@ -318,6 +318,75 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
 }
 
 // =============================================================================
+// Mock Peers Button (debug / layout testing)
+// =============================================================================
+
+#[component]
+pub fn MockPeersButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
+    let class = if open {
+        "video-control-button active"
+    } else {
+        "video-control-button"
+    };
+
+    rsx! {
+        button { class, onclick: move |evt| onclick.call(evt),
+            svg {
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" }
+                circle { cx: "9", cy: "7", r: "4" }
+                line { x1: "19", y1: "8", x2: "19", y2: "14" }
+                line { x1: "22", y1: "11", x2: "16", y2: "11" }
+            }
+            span { class: "tooltip", "Mock Peers" }
+        }
+    }
+}
+
+// =============================================================================
+// Density Mode Button (layout density selector)
+// =============================================================================
+
+#[component]
+pub fn DensityModeButton(
+    label: String,
+    open: bool,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    let class = if open {
+        "video-control-button active"
+    } else {
+        "video-control-button"
+    };
+
+    rsx! {
+        button {
+            class,
+            title: "Layout density: {label}",
+            onclick: move |evt| onclick.call(evt),
+            svg {
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                width: "24",
+                height: "24",
+                fill: "currentColor",
+                rect { x: "3", y: "3", width: "8", height: "8", rx: "1" }
+                rect { x: "13", y: "3", width: "8", height: "8", rx: "1" }
+                rect { x: "3", y: "13", width: "8", height: "8", rx: "1" }
+                rect { x: "13", y: "13", width: "8", height: "8", rx: "1" }
+            }
+            span { class: "tooltip", "Layout: {label}" }
+        }
+    }
+}
+
+// =============================================================================
 // Hang Up Button
 // =============================================================================
 

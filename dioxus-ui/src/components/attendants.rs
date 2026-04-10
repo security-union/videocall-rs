@@ -27,13 +27,14 @@ use crate::components::{
     peer_tile::PeerTile,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
-        CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
-        PeerListButton, ScreenShareButton,
+        CameraButton, DensityModeButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
+        MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
     },
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
-    server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
+    mock_peers_enabled, server_election_period_ms, users_allowed_to_stream,
+    webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{
     resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
@@ -317,75 +318,105 @@ fn schedule_reconnect_no_jwt(
     .forget();
 }
 
-fn compute_grid(n: usize, container_w: f64, container_h: f64) -> (usize, usize) {
-    const PADDING: f64 = 16.0 * 2.0;
-    const GAP: f64 = 10.0;
-
+/// Google Meet–style layout: перебираем все варианты колонок, для каждого
+/// считаем максимальный размер 16:9 тайла, выбираем вариант с наибольшей
+/// площадью.  Возвращает `(cols, rows, tile_width)`.
+fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     if n == 0 {
-        return (1, 1);
+        return (1, 1, w);
     }
-    if n == 1 {
-        return (1, 1);
-    }
-    if n == 2 {
-        if container_w >= container_h {
-            return (2, 1);
-        } else {
-            return (1, 2);
-        }
-    }
-    if n == 3 || n == 4 {
-        return (2, 2);
-    }
-
-    let avail_w = (container_w - PADDING).max(1.0);
-    let avail_h = (container_h - PADDING).max(1.0);
-
-    const MAX_ASPECT: f64 = 2.0;
-
-    let mut best_cols = 1usize;
-    let mut best_rows = n;
-    let mut best_area = 0.0f64;
+    let mut best_cols = 1_usize;
+    let mut best_rows = 1_usize;
+    let mut best_area = 0.0_f64;
+    let mut best_tw = 0.0_f64;
+    let ar: f64 = 16.0 / 9.0;
 
     for cols in 1..=n {
-        let rows = n.div_ceil(cols);
-        let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
-        let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
-        if tile_w <= 0.0 || tile_h <= 0.0 {
-            continue;
+        let rows = (n + cols - 1) / cols; // ceil(n / cols)
+
+        let avail_w = (w - (cols as f64 - 1.0) * gap).max(0.0);
+        let avail_h = (h - (rows as f64 - 1.0) * gap).max(0.0);
+
+        let mut tw = avail_w / cols as f64;
+        let mut th = tw / ar;
+
+        if th * rows as f64 > avail_h {
+            th = avail_h / rows as f64;
+            tw = th * ar;
         }
-        let aspect = tile_w / tile_h;
-        if !(1.0 / MAX_ASPECT..=MAX_ASPECT).contains(&aspect) {
-            continue;
-        }
-        let area = tile_w * tile_h;
+
+        let area = tw * th;
         if area > best_area {
             best_area = area;
             best_cols = cols;
             best_rows = rows;
+            best_tw = tw;
         }
     }
 
-    if best_area == 0.0 {
-        let mut best_delta = f64::MAX;
-        for cols in 1..=n {
-            let rows = n.div_ceil(cols);
-            let tile_w = (avail_w - GAP * (cols as f64 - 1.0)) / cols as f64;
-            let tile_h = (avail_h - GAP * (rows as f64 - 1.0)) / rows as f64;
-            if tile_w <= 0.0 || tile_h <= 0.0 {
-                continue;
-            }
-            let delta = (tile_w / tile_h - 1.0).abs();
-            if delta < best_delta {
-                best_delta = delta;
-                best_cols = cols;
-                best_rows = rows;
-            }
-        }
-    }
-
-    (best_cols, best_rows)
+    (best_cols, best_rows, best_tw)
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DensityMode {
+    Auto,
+    Standard,
+    Dense,
+    Maximum,
+}
+
+impl DensityMode {
+    /// Minimum tile width (px) for this mode, adjusted for viewport.
+    /// This is the ONLY knob that differentiates modes — no participant caps.
+    /// The system fits as many tiles as possible while keeping each tile at
+    /// least this wide.  Values are tuned so that **all four modes produce
+    /// visibly different tile counts** for a typical 20-participant call on
+    /// both desktop (~1366 px) and mobile (~375 px).
+    fn min_tile_width(self, viewport_w: f64) -> f64 {
+        if viewport_w < 568.0 {
+            // Mobile: 1-col vs 2-col is the main differentiator.
+            match self {
+                DensityMode::Standard => 250.0, // 1 col, ~4 tiles
+                DensityMode::Auto => 170.0,     // 1 col, ~6 tiles
+                DensityMode::Dense => 140.0,    // 2 cols, ~16 tiles
+                DensityMode::Maximum => 90.0,   // 3 cols, ~20 tiles
+            }
+        } else {
+            // Desktop: 3-col / 4-col / 5-col+ transitions.
+            match self {
+                DensityMode::Standard => 340.0, // 3 cols, ~9 tiles
+                DensityMode::Auto => 280.0,     // 4 cols, ~12 tiles
+                DensityMode::Dense => 260.0,    // 4 cols, ~16 tiles
+                DensityMode::Maximum => 120.0,  // 5+ cols, all tiles
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DensityMode::Auto => "Auto",
+            DensityMode::Standard => "Standard",
+            DensityMode::Dense => "Dense",
+            DensityMode::Maximum => "Maximum",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            DensityMode::Auto => "Optimal",
+            DensityMode::Standard => "Fewer, larger",
+            DensityMode::Dense => "More, smaller",
+            DensityMode::Maximum => "As many as fit",
+        }
+    }
+}
+
+const DENSITY_MODES: [DensityMode; 4] = [
+    DensityMode::Auto,
+    DensityMode::Standard,
+    DensityMode::Dense,
+    DensityMode::Maximum,
+];
 
 #[component]
 pub fn AttendantsComponent(
@@ -413,7 +444,29 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    let mut mock_peers_open = use_signal(|| false);
     let encoder_settings = use_signal(|| None::<String>);
+    let mut debug_peer_count = use_signal(|| 0u32);
+    // Per-peer speech priority: session_id → last-spoke timestamp (ms).
+    // Peers that spoke recently sort higher in the grid.
+    let mut peer_speech_priority: Signal<HashMap<String, f64>> = use_signal(HashMap::new);
+    let mut density_mode: Signal<DensityMode> = use_signal(|| DensityMode::Auto);
+    let mut density_open = use_signal(|| false);
+    // Viewport size signal — updated on window resize so layout recomputes.
+    let mut viewport_version = use_signal(|| 0u32);
+    {
+        let _ = viewport_version();
+    }
+    use_effect(move || {
+        let win = window();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            viewport_version.with_mut(|v| *v = v.wrapping_add(1));
+        });
+        let _ = win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        // Keep the closure alive for the component's lifetime.
+        // Intentionally leak — cleaned up when the page unloads.
+        cb.forget();
+    });
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
@@ -450,21 +503,6 @@ pub fn AttendantsComponent(
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
     let peer_display_name_version = use_signal(|| 0u32);
-
-    // Container dimensions — updated on every window resize so compute_grid
-    // reacts to viewport changes without any JS ResizeObserver boilerplate.
-    let mut container_w = use_signal(|| {
-        web_sys::window()
-            .and_then(|w| w.inner_width().ok())
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1280.0)
-    });
-    let mut container_h = use_signal(|| {
-        web_sys::window()
-            .and_then(|w| w.inner_height().ok())
-            .and_then(|v| v.as_f64())
-            .unwrap_or(720.0)
-    });
 
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
@@ -596,6 +634,8 @@ pub fn AttendantsComponent(
                 // map does not grow unboundedly over long meetings.
                 let mut hist_map = peer_signal_history_map;
                 hist_map.write().remove(&peer_id);
+                let mut speech_map = peer_speech_priority;
+                speech_map.write().remove(&peer_id);
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
@@ -926,6 +966,18 @@ pub fn AttendantsComponent(
         let task = spawn(async move {
             let mut rx = videocall_diagnostics::subscribe();
             while let Ok(evt) = rx.recv().await {
+                if evt.subsystem == "peer_speaking" {
+                    // Track speech activity for priority sorting.
+                    if let Some(peer_id) = parse_speaking_peer(&evt) {
+                        peer_speech_priority
+                            .write()
+                            .insert(peer_id, js_sys::Date::now());
+                        let mut v = peer_list_version;
+                        let next = *v.peek() + 1;
+                        v.set(next);
+                    }
+                    continue;
+                }
                 if evt.subsystem != "peer_status" {
                     continue;
                 }
@@ -961,34 +1013,6 @@ pub fn AttendantsComponent(
         if let Some(task) = diagnostics_task.peek().as_ref() {
             task.cancel();
         }
-    });
-
-    // Window resize listener — updates container_w / container_h so
-    // compute_grid() reacts to viewport changes on every re-render.
-    use_effect(move || {
-        use wasm_bindgen::prelude::*;
-        use wasm_bindgen::JsCast;
-
-        let closure = Closure::wrap(Box::new(move || {
-            if let Some(win) = web_sys::window() {
-                if let Ok(w) = win.inner_width() {
-                    if let Some(w) = w.as_f64() {
-                        container_w.set(w);
-                    }
-                }
-                if let Ok(h) = win.inner_height() {
-                    if let Some(h) = h.as_f64() {
-                        container_h.set(h);
-                    }
-                }
-            }
-        }) as Box<dyn FnMut()>);
-
-        if let Some(win) = web_sys::window() {
-            let _ =
-                win.add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref());
-        }
-        closure.forget();
     });
 
     // Check for config errors
@@ -1029,6 +1053,17 @@ pub fn AttendantsComponent(
             !peer_uid.is_empty() && peer_uid != local_user_id
         })
         .collect();
+    // Sort by speech priority: peers who spoke recently appear first.
+    // Peers who never spoke (ts=0) keep their original join order (stable sort).
+    let mut display_peers = display_peers;
+    {
+        let speech_map = peer_speech_priority.read();
+        display_peers.sort_by(|a, b| {
+            let ts_a = speech_map.get(a).copied().unwrap_or(0.0);
+            let ts_b = speech_map.get(b).copied().unwrap_or(0.0);
+            ts_b.partial_cmp(&ts_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
     let peers_for_display: Vec<String> = display_peers
         .iter()
         .map(|session_id| {
@@ -1038,12 +1073,62 @@ pub fn AttendantsComponent(
         })
         .collect();
     let num_display_peers = display_peers.len();
-    let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
+    let mock_count = debug_peer_count() as usize;
+    let total_tiles = (num_display_peers + mock_count).min(CANVAS_LIMIT);
 
-    // Compute grid dimensions from current viewport size.
-    let cw = container_w();
-    let ch = container_h();
-    let (cols, rows) = compute_grid(num_display_peers.min(CANVAS_LIMIT), cw, ch);
+    // --- Viewport dimensions (needed for min-tile-size check & grid style) ---
+    let vw = window()
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1024.0);
+    let vh = window()
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(768.0);
+    let (gap, pad_top, pad_right, pad_bottom, pad_left) = if vw < 568.0 {
+        (8.0, 8.0, 8.0, 72.0, 8.0)
+    } else {
+        (16.0, 20.0, 20.0, 84.0, 20.0)
+    };
+    let avail_w = (vw - pad_left - pad_right).max(0.0);
+    let avail_h = (vh - pad_top - pad_bottom).max(0.0);
+
+    // --- Determine visible tile count ---
+    // Each density mode defines only a min_tile_width.  We try to fit all
+    // participants, counting down until the tile size meets the threshold.
+    let mode = density_mode();
+    let min_tw = mode.min_tile_width(vw);
+    let effective_visible = {
+        let mut t = total_tiles;
+        while t > 1 {
+            let (_c, _r, tw) = compute_layout(t, avail_w, avail_h, gap);
+            if tw >= min_tw {
+                break;
+            }
+            t -= 1;
+        }
+        t
+    };
+
+    // Show density selector only when modes would produce different results.
+    // If even Standard (most restrictive) can show all tiles, hide it.
+    let show_density_selector = {
+        let std_min = DensityMode::Standard.min_tile_width(vw);
+        let (_c, _r, tw) = compute_layout(total_tiles, avail_w, avail_h, gap);
+        tw < std_min // Standard can't fit everyone → modes matter
+    };
+
+    let (visible_tile_count, overflow_count) = if total_tiles > effective_visible {
+        let visible = effective_visible.saturating_sub(1).max(1);
+        (visible, total_tiles - visible)
+    } else {
+        (total_tiles, 0)
+    };
+    // Split visible slots between real peers and mock peers.
+    let visible_real = num_display_peers.min(visible_tile_count);
+    let visible_mock = visible_tile_count.saturating_sub(visible_real);
 
     // --- Screen share stack: tracks the order of peer screen shares (LIFO) ---
     let mut screen_share_stack: Signal<Vec<String>> = use_signal(Vec::new);
@@ -1070,18 +1155,16 @@ pub fn AttendantsComponent(
     let container_style = if has_screen_share {
         // 2/3 screen-share panel on the left, 1/3 peer panel on the right
         "position: absolute; inset: 0; width: 100%; height: 100%; \
-         display: flex; flex-direction: row; gap: 10px; padding: 16px; \
+         display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
+         padding: 16px 16px 80px 16px; \
          align-items: center; box-sizing: border-box;"
             .to_string()
     } else {
+        // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
+        let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
+        let (cols, rows, _tw) = compute_layout(tile_count, avail_w, avail_h, gap);
         format!(
-            "position: absolute; inset: 0; width: 100%; height: 100%; \
-             --num-peers: {}; \
-             grid-template-columns: repeat({}, 1fr); \
-             grid-template-rows: repeat({}, 1fr);",
-            num_peers_for_styling.max(1),
-            cols,
-            rows,
+            "grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr);"
         )
     };
 
@@ -1361,7 +1444,7 @@ pub fn AttendantsComponent(
                         }
                         // Right panel — all peer video tiles stacked vertically
                         div { style: "flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;",
-                            for (i , peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
+                            for (i , peer_id) in display_peers.iter().take(visible_real).enumerate() {
                                 PeerTile {
                                     key: "vid-{i}-{peer_id}",
                                     peer_id: peer_id.clone(),
@@ -1371,12 +1454,22 @@ pub fn AttendantsComponent(
                                     my_peer_id: user_id.clone(),
                                 }
                             }
+                            for i in 0..visible_mock {
+                                PeerTile {
+                                    key: "mock-split-{i}",
+                                    peer_id: format!("mock-{i}"),
+                                    full_bleed: false,
+                                    host_user_id: host_user_id.clone(),
+                                    render_mode: TileMode::VideoOnly,
+                                    my_peer_id: user_id.clone(),
+                                }
+                            }
                         }
                     } else {
                         // ---- Normal grid layout ----
-                        for (i , peer_id) in display_peers.iter().take(CANVAS_LIMIT).enumerate() {
+                        for (i , peer_id) in display_peers.iter().take(visible_real).enumerate() {
                             {
-                                let full_bleed = display_peers.len() == 1
+                                let full_bleed = visible_tile_count == 1
                                     && !client.is_screen_share_enabled_for_peer(peer_id);
                                 rsx! {
                                     PeerTile {
@@ -1390,8 +1483,26 @@ pub fn AttendantsComponent(
                             }
                         }
 
+                        for i in 0..visible_mock {
+                            PeerTile {
+                                key: "mock-tile-{i}",
+                                peer_id: format!("mock-{i}"),
+                                full_bleed: false,
+                                host_user_id: host_user_id.clone(),
+                                my_peer_id: user_id.clone(),
+                            }
+                        }
+
+                        if overflow_count > 0 {
+                            div {
+                                class: "grid-overflow-badge",
+                                "+{overflow_count}"
+                                span { "more in meeting" }
+                            }
+                        }
+
                         // Invitation overlay when no peers
-                        if num_display_peers == 0 {
+                        if num_display_peers == 0 && visible_mock == 0 {
                             div {
                                 id: "invite-overlay",
                                 class: "card-apple",
@@ -1544,6 +1655,23 @@ pub fn AttendantsComponent(
                                                 diagnostics_open.set(false);
                                             }
                                         },
+                                    }
+                                    if show_density_selector && !has_screen_share {
+                                        DensityModeButton {
+                                            label: density_mode().label().to_string(),
+                                            open: density_open(),
+                                            onclick: move |_| {
+                                                density_open.set(!density_open());
+                                            },
+                                        }
+                                    }
+                                    if mock_peers_enabled() {
+                                        MockPeersButton {
+                                            open: mock_peers_open(),
+                                            onclick: move |_| {
+                                                mock_peers_open.set(!mock_peers_open());
+                                            },
+                                        }
                                     }
                                     DiagnosticsButton {
                                         open: diagnostics_open(),
@@ -1748,6 +1876,70 @@ pub fn AttendantsComponent(
                         encoder_settings: encoder_settings(),
                     }
                 }
+
+                // Mock peers popover (only shown when env-gated)
+                if mock_peers_enabled() && mock_peers_open() {
+                    div { class: "mock-peers-popover",
+                        div { class: "mock-peers-popover-header",
+                            span { "Mock Peers" }
+                            button {
+                                class: "mock-peers-popover-close",
+                                onclick: move |_| mock_peers_open.set(false),
+                                "\u{2715}"
+                            }
+                        }
+                        div { class: "mock-peers-popover-body",
+                            label { r#for: "mock-count-input", "Count (0\u{2013}100)" }
+                            div { class: "mock-peers-count-row",
+                                button {
+                                    class: "mock-peers-step",
+                                    onclick: move |_| {
+                                        let c = debug_peer_count().saturating_sub(1);
+                                        debug_peer_count.set(c);
+                                    },
+                                    "\u{2212}"
+                                }
+                                input {
+                                    id: "mock-count-input",
+                                    r#type: "number",
+                                    min: "0",
+                                    max: "100",
+                                    value: "{debug_peer_count()}",
+                                    oninput: move |e| {
+                                        let n = e.value().parse::<u32>().unwrap_or(0).min(100);
+                                        debug_peer_count.set(n);
+                                    },
+                                }
+                                button {
+                                    class: "mock-peers-step",
+                                    onclick: move |_| {
+                                        let c = (debug_peer_count() + 1).min(100);
+                                        debug_peer_count.set(c);
+                                    },
+                                    "+"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Density mode popover
+                if show_density_selector && !has_screen_share && density_open() {
+                    div { class: "density-popover",
+                        for mode in DENSITY_MODES {
+                            div {
+                                key: "{mode.label()}",
+                                class: if density_mode() == mode { "density-option active" } else { "density-option" },
+                                onclick: move |_| {
+                                    density_mode.set(mode);
+                                    density_open.set(false);
+                                },
+                                span { class: "density-option-label", "{mode.label()}" }
+                                span { class: "density-option-range", "{mode.description()}" }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1782,6 +1974,32 @@ fn parse_peer_status_event(
             },
         )
     })
+}
+
+/// Parse a `peer_speaking` diagnostics event. Returns `Some(peer_id)` when
+/// the event indicates the peer is actively speaking (audio_level > 0 or
+/// speaking flag set).
+fn parse_speaking_peer(evt: &videocall_diagnostics::DiagEvent) -> Option<String> {
+    use videocall_diagnostics::MetricValue;
+
+    let mut to_peer: Option<String> = None;
+    let mut audio_lvl: Option<f64> = None;
+    let mut speaking: Option<bool> = None;
+    for m in &evt.metrics {
+        match (m.name, &m.value) {
+            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+            ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v),
+            ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+            _ => {}
+        }
+    }
+    let is_speaking = audio_lvl.map(|l| l > 0.0).unwrap_or(false)
+        || speaking.unwrap_or(false);
+    if is_speaking {
+        to_peer
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

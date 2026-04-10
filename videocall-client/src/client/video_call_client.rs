@@ -1332,14 +1332,16 @@ impl Inner {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()
                             };
 
-                            self.peer_decode_manager.set_peer_display_name_by_user_id(
-                                &target_str,
-                                display_name.clone(),
-                            );
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager.set_peer_display_name(
+                                    meeting_packet.session_id,
+                                    display_name.clone(),
+                                );
+                            }
 
                             // NOTE: Do NOT emit on_display_name_changed here.
                             // PARTICIPANT_JOINED carries the initial display name for bookkeeping
-                            // (set_peer_display_name_by_user_id above), but it is NOT a name-change
+                            // (set_peer_display_name above), but it is NOT a name-change
                             // event.  Emitting the callback here would confuse the UI into treating
                             // every peer join as a display-name mutation — and would spuriously
                             // update the local user's own name signal on reconnect.
@@ -1456,10 +1458,21 @@ impl Inner {
                                 target_str, new_display_name, self.options.user_id
                             );
 
-                            self.peer_decode_manager.set_peer_display_name_by_user_id(
-                                &target_str,
-                                new_display_name.clone(),
-                            );
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager.set_peer_display_name(
+                                    meeting_packet.session_id,
+                                    new_display_name.clone(),
+                                );
+                            } else {
+                                // Server does not populate session_id for display
+                                // name changes — fall back to updating all sessions
+                                // belonging to this user_id. A rename logically
+                                // applies to every session of the same account.
+                                self.peer_decode_manager.set_peer_display_name_by_user_id(
+                                    &target_str,
+                                    new_display_name.clone(),
+                                );
+                            }
 
                             if let Some(cb) = &self.options.on_display_name_changed {
                                 debug!(

@@ -150,11 +150,8 @@ impl ScreenEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderBitrateController::new_with_tiers(
-                current_bitrate.load(Ordering::Relaxed),
-                current_fps.clone(),
-                SCREEN_QUALITY_TIERS,
-            );
+            let mut encoder_control =
+                EncoderBitrateController::new_for_screen(current_fps.clone(), SCREEN_QUALITY_TIERS);
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {

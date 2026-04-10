@@ -105,6 +105,10 @@ pub struct CameraEncoder {
     /// Shared audio tier FEC flag. Written by the camera encoder's quality
     /// manager alongside `shared_audio_tier_bitrate`.
     shared_audio_tier_fec: Rc<AtomicBool>,
+    /// Shared flag indicating whether screen share is active. Written by the
+    /// `ScreenEncoder`, read by this camera encoder's diagnostics loop to
+    /// coordinate bandwidth (drop camera tier and set ceiling when active).
+    screen_sharing_active: Rc<AtomicBool>,
     /// Current video quality tier index (0=full_hd/best, 7=minimal).
     /// Updated whenever the adaptive quality manager changes tiers.
     shared_video_tier_index: Rc<AtomicU32>,
@@ -151,6 +155,7 @@ impl CameraEncoder {
                 default_audio_tier.bitrate_kbps * 1000,
             )),
             shared_audio_tier_fec: Rc::new(AtomicBool::new(default_audio_tier.enable_fec)),
+            screen_sharing_active: Rc::new(AtomicBool::new(false)),
             shared_video_tier_index: Rc::new(AtomicU32::new(0)),
             shared_audio_tier_index: Rc::new(AtomicU32::new(0)),
         }
@@ -170,6 +175,7 @@ impl CameraEncoder {
         let congestion_flag = self.congestion_step_down.clone();
         let shared_audio_bitrate = self.shared_audio_tier_bitrate.clone();
         let shared_audio_fec = self.shared_audio_tier_fec.clone();
+        let screen_sharing_active = self.screen_sharing_active.clone();
         let shared_video_tier_idx = self.shared_video_tier_index.clone();
         let shared_audio_tier_idx = self.shared_audio_tier_index.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -177,7 +183,20 @@ impl CameraEncoder {
                 current_bitrate.load(Ordering::Relaxed),
                 current_fps.clone(),
             );
+            let mut prev_screen_active = false;
             while let Some(event) = diagnostics_receiver.next().await {
+                // Check for screen sharing state transitions and coordinate
+                // camera quality to avoid bandwidth contention.
+                let screen_active = screen_sharing_active.load(Ordering::Acquire);
+                if screen_active != prev_screen_active {
+                    prev_screen_active = screen_active;
+                    encoder_control.notify_screen_sharing(screen_active);
+                    log::info!(
+                        "CameraEncoder: screen sharing {} — camera tier coordination applied",
+                        if screen_active { "ACTIVE" } else { "INACTIVE" },
+                    );
+                }
+
                 // Check for server congestion step-down request before
                 // processing the diagnostics packet so the forced step-down
                 // takes effect immediately.
@@ -263,6 +282,14 @@ impl CameraEncoder {
     /// RED-style redundancy in audio packets.
     pub fn shared_audio_tier_fec(&self) -> Rc<AtomicBool> {
         self.shared_audio_tier_fec.clone()
+    }
+
+    /// Returns the shared screen-sharing-active flag.
+    ///
+    /// The `ScreenEncoder` writes this flag when screen capture starts/stops.
+    /// The camera encoder's diagnostics loop reads it to coordinate bandwidth.
+    pub fn screen_sharing_flag(&self) -> Rc<AtomicBool> {
+        self.screen_sharing_active.clone()
     }
 
     /// Returns the current video quality tier index (0 = best, 7 = minimal).

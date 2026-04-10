@@ -106,6 +106,10 @@ pub struct ScreenEncoder {
     /// original capture track is stopped; stopping a cloned track (e.g. from
     /// `MediaStream::clone()`) does **not** affect the indicator.
     active_video_track: Rc<RefCell<Option<MediaStreamTrack>>>,
+    /// Shared flag for cross-stream bandwidth coordination. Set to `true` when
+    /// screen capture starts, `false` when it stops. The `CameraEncoder` reads
+    /// this to drop its quality tier and prevent bandwidth contention.
+    screen_sharing_active: Option<Rc<AtomicBool>>,
 }
 
 impl ScreenEncoder {
@@ -137,7 +141,16 @@ impl ScreenEncoder {
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
             active_video_track: Rc::new(RefCell::new(None)),
+            screen_sharing_active: None,
         }
+    }
+
+    /// Set the shared screen-sharing-active flag for cross-stream coordination.
+    ///
+    /// This flag is read by the `CameraEncoder` to drop its quality tier when
+    /// screen share is active, preventing bandwidth contention.
+    pub fn set_screen_sharing_flag(&mut self, flag: Rc<AtomicBool>) {
+        self.screen_sharing_active = Some(flag);
     }
 
     pub fn set_encoder_control(
@@ -249,6 +262,11 @@ impl ScreenEncoder {
     /// It sets the encoder flags, notifies the client at the protocol level,
     /// and synchronously stops all media tracks.
     pub fn stop(&mut self) {
+        // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
+        if let Some(ref flag) = self.screen_sharing_active {
+            flag.store(false, Ordering::Release);
+        }
+
         // Signal the encoding loop to exit
         self.state.stop();
 
@@ -321,6 +339,7 @@ impl ScreenEncoder {
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
         let active_video_track = self.active_video_track.clone();
+        let screen_sharing_active = self.screen_sharing_active.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -369,9 +388,21 @@ impl ScreenEncoder {
 
             log::info!("Screen to share: {screen_to_share:?}");
 
+            // Signal camera encoder ASAP after capture is confirmed so it begins
+            // stepping down during encoder setup, not after encoding starts.
+            if let Some(ref flag) = screen_sharing_active {
+                flag.store(true, Ordering::Release);
+            } else {
+                log::warn!(
+                    "ScreenEncoder: screen_sharing_active flag not wired — \
+                     camera bandwidth coordination will not engage. \
+                     Ensure host.rs calls screen.set_screen_sharing_flag(camera.screen_sharing_flag())"
+                );
+            }
+
             screen_stream.borrow_mut().replace(screen_to_share.clone());
 
-            // Helper to clean up stream on error - stops all tracks and emits Failed event
+            // Helper to clean up stream on error - stops all tracks, clears flags, emits Failed event
             let cleanup_on_error = |screen_to_share: &MediaStream,
                                     enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
                                     on_state_change: &Option<Callback<ScreenShareEvent>>,
@@ -386,6 +417,10 @@ impl ScreenEncoder {
                 }
                 // Reset enabled flag
                 enabled.store(false, Ordering::Release);
+                // Clear screen-sharing flag so camera drops its ceiling
+                if let Some(ref flag) = screen_sharing_active {
+                    flag.store(false, Ordering::Release);
+                }
                 // Emit Failed event
                 if let Some(ref callback) = on_state_change {
                     callback.emit(ScreenShareEvent::Failed(error_msg));
@@ -479,9 +514,15 @@ impl ScreenEncoder {
             let _onended_handler = {
                 let enabled_clone = enabled.clone();
                 let on_state_change_clone = on_state_change.clone();
+                let screen_sharing_flag_clone = screen_sharing_active.clone();
                 let handler = Closure::wrap(Box::new(move || {
                     log::info!("Screen share track ended (user stopped sharing)");
                     enabled_clone.store(false, Ordering::Release);
+                    // Clear the flag immediately so the camera encoder can begin recovery
+                    // without waiting for the async encoding loop to wind down.
+                    if let Some(ref flag) = screen_sharing_flag_clone {
+                        flag.store(false, Ordering::Release);
+                    }
                     client_for_onended.set_screen_enabled(false);
                     if let Some(ref callback) = on_state_change_clone {
                         callback.emit(ScreenShareEvent::Stopped);
@@ -728,6 +769,11 @@ impl ScreenEncoder {
                         track.stop();
                     }
                 }
+            }
+
+            // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
+            if let Some(ref flag) = screen_sharing_active {
+                flag.store(false, Ordering::Release);
             }
 
             // Emit Stopped event if we haven't already (onended handler might have already fired)

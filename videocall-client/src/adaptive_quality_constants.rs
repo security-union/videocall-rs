@@ -165,6 +165,24 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 /// down to 360p/240p if constrained.
 pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 
+/// Label of the video quality tier to use as camera ceiling during screen sharing.
+///
+/// When screen share starts, the camera is forced to this tier and capped here
+/// to avoid bandwidth contention on the shared connection. Resolved by label
+/// (not index) so the ceiling is correct regardless of how many tiers exist.
+const SCREEN_SHARE_CAMERA_CEILING_LABEL: &str = "low";
+
+/// Resolve the camera tier ceiling index for screen sharing.
+///
+/// Looks up `SCREEN_SHARE_CAMERA_CEILING_LABEL` in `VIDEO_QUALITY_TIERS`.
+/// Falls back to second-lowest tier if the label isn't found.
+pub fn screen_share_camera_ceiling_index() -> usize {
+    VIDEO_QUALITY_TIERS
+        .iter()
+        .position(|t| t.label == SCREEN_SHARE_CAMERA_CEILING_LABEL)
+        .unwrap_or_else(|| VIDEO_QUALITY_TIERS.len().saturating_sub(2))
+}
+
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
 /// Screen share starts at "medium" (720p/10fps) — readable content from
@@ -651,6 +669,22 @@ mod tests {
             "DEFAULT_VIDEO_TIER_INDEX ({}) out of bounds (len={})",
             DEFAULT_VIDEO_TIER_INDEX,
             VIDEO_QUALITY_TIERS.len(),
+        );
+    }
+
+    #[test]
+    fn test_screen_share_camera_ceiling_resolves_to_low() {
+        let idx = screen_share_camera_ceiling_index();
+        assert!(
+            idx < VIDEO_QUALITY_TIERS.len(),
+            "screen_share_camera_ceiling_index ({}) out of bounds (len={})",
+            idx,
+            VIDEO_QUALITY_TIERS.len(),
+        );
+        assert_eq!(
+            VIDEO_QUALITY_TIERS[idx].label, "low",
+            "ceiling should resolve to 'low' tier, got '{}' at index {}",
+            VIDEO_QUALITY_TIERS[idx].label, idx,
         );
     }
 

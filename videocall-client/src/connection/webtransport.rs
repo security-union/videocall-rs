@@ -40,7 +40,6 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::ReadableStreamDefaultReader;
 use web_sys::WebTransportBidirectionalStream;
-use web_sys::WebTransportCloseInfo;
 use web_sys::WebTransportReceiveStream;
 
 /// Maximum size for an inbound stream buffer (4 MB), matching the server's MAX_FRAME_SIZE.
@@ -260,9 +259,9 @@ fn handle_bidirectional_stream(
             let read_result = JsFuture::from(readable.read()).await;
 
             match read_result {
-                Err(e) => {
-                    let reason = WebTransportCloseInfo::default();
-                    reason.set_reason(format!("Failed to read incoming bidistream {e:?}").as_str());
+                Err(_) => {
+                    // Expected when the transport is closed (Drop or network
+                    // failure).
                     break;
                 }
                 Ok(result) => {

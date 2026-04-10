@@ -1273,7 +1273,11 @@ impl Inner {
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {
                         if let Err(e) = controller.set_own_session_id(response.session_id) {
-                            warn!("Failed to set own_session_id in ConnectionManager: {e}");
+                            // Expected during election: complete_connection_election()
+                            // already set own_session_id before emitting the synthetic
+                            // SESSION_ASSIGNED packet, so the ConnectionManager RefCell
+                            // is still borrowed.
+                            debug!("ConnectionManager already has session_id (borrow conflict during election): {e}");
                         }
                     }
                 }

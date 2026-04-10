@@ -1270,4 +1270,132 @@ mod tests {
             "Initial ideal_bitrate_kbps should match the starting tier's ideal_bitrate_kbps"
         );
     }
+
+    // =====================================================================
+    // Screen sharing coordination (notify_screen_sharing)
+    // =====================================================================
+
+    #[wasm_bindgen_test]
+    fn test_notify_screen_sharing_active_forces_ceiling() {
+        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(1500, target_fps);
+
+        // Camera starts at DEFAULT_VIDEO_TIER_INDEX (the lowest/minimal tier).
+        let initial_index = controller.video_tier_index();
+        let ceiling = screen_share_camera_ceiling_index();
+
+        // Screen share activates — camera should jump to ceiling tier
+        controller.notify_screen_sharing(true);
+
+        assert_eq!(
+            controller.video_tier_index(),
+            ceiling,
+            "Camera should be forced to ceiling tier '{}' (index {}), was at index {}",
+            controller.current_video_tier().label,
+            controller.video_tier_index(),
+            initial_index,
+        );
+        assert_eq!(
+            controller.current_video_tier().label,
+            "low",
+            "Ceiling tier should be 'low'"
+        );
+        // ideal_bitrate should be synced with the new tier
+        assert_eq!(
+            controller.ideal_bitrate_kbps,
+            controller.current_video_tier().ideal_bitrate_kbps,
+            "ideal_bitrate_kbps should match the ceiling tier"
+        );
+        // tier_changed should be set so the encoding loop picks it up
+        assert!(
+            controller.take_tier_changed(),
+            "tier_changed should be true after screen share activation"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_notify_screen_sharing_deactivate_removes_ceiling() {
+        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(1500, target_fps);
+
+        let ceiling = screen_share_camera_ceiling_index();
+
+        // Activate then deactivate
+        controller.notify_screen_sharing(true);
+        assert_eq!(controller.video_tier_index(), ceiling);
+        controller.take_tier_changed(); // consume
+
+        controller.notify_screen_sharing(false);
+
+        // Tier doesn't change on deactivation — only the ceiling is removed.
+        // The camera stays at its current tier and recovers naturally via the
+        // PID step-up mechanism.
+        assert_eq!(
+            controller.video_tier_index(),
+            ceiling,
+            "Tier should not jump on deactivation, stays at current position"
+        );
+        assert!(
+            !controller.take_tier_changed(),
+            "tier_changed should NOT be set on deactivation (tier didn't move)"
+        );
+
+        // Feed good conditions — the camera should eventually step up past the
+        // old ceiling, proving the ceiling was actually removed.
+        let base = 10000.0;
+        for i in 0..15 {
+            let t = base + (i as f64 * 1100.0);
+            let packet = create_test_packet("s", "peer1", 29.0, 1400);
+            controller.process_diagnostics_packet_with_time(packet, t);
+        }
+        assert!(
+            controller.video_tier_index() < ceiling,
+            "Camera should step up past old ceiling after removal, \
+             got index {} (ceiling was {})",
+            controller.video_tier_index(),
+            ceiling,
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_notify_screen_sharing_double_activation_is_idempotent() {
+        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(1500, target_fps);
+
+        let ceiling = screen_share_camera_ceiling_index();
+
+        // First activation
+        controller.notify_screen_sharing(true);
+        assert_eq!(controller.video_tier_index(), ceiling);
+        let tier_after_first = controller.current_video_tier().label;
+        let bitrate_after_first = controller.ideal_bitrate_kbps;
+        controller.take_tier_changed(); // consume
+
+        // Second activation — should be a no-op (already at ceiling)
+        controller.notify_screen_sharing(true);
+        assert_eq!(
+            controller.video_tier_index(),
+            ceiling,
+            "Double activation should not change tier"
+        );
+        assert_eq!(
+            controller.current_video_tier().label,
+            tier_after_first,
+            "Tier label should be unchanged"
+        );
+        assert_eq!(
+            controller.ideal_bitrate_kbps, bitrate_after_first,
+            "Bitrate should be unchanged"
+        );
+        assert!(
+            !controller.take_tier_changed(),
+            "tier_changed should NOT be set on redundant activation"
+        );
+    }
 }

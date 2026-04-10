@@ -128,6 +128,16 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 /// resolution drop.
 pub const DEFAULT_VIDEO_TIER_INDEX: usize = 3; // "minimal"
 
+/// Camera tier ceiling (maximum quality) when screen share is active.
+///
+/// Index 2 = "low" (640x360, 15fps, 300kbps ideal). When screen share starts,
+/// the camera is forced to this tier and capped here to avoid bandwidth
+/// contention on the shared TCP connection. The screen encoder ramps up
+/// independently via its own PID controller; this ceiling ensures the camera
+/// doesn't compete for headroom. Camera can still step DOWN further if
+/// conditions worsen, but cannot step UP past this ceiling.
+pub const SCREEN_SHARE_CAMERA_CEILING_INDEX: usize = 2; // "low"
+
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
 /// Screen share starts at the lowest tier ("low", 480p/5fps/250kbps) to
@@ -585,6 +595,16 @@ mod tests {
             DEFAULT_VIDEO_TIER_INDEX < VIDEO_QUALITY_TIERS.len(),
             "DEFAULT_VIDEO_TIER_INDEX ({}) out of bounds (len={})",
             DEFAULT_VIDEO_TIER_INDEX,
+            VIDEO_QUALITY_TIERS.len(),
+        );
+    }
+
+    #[test]
+    fn test_screen_share_camera_ceiling_index_in_bounds() {
+        assert!(
+            SCREEN_SHARE_CAMERA_CEILING_INDEX < VIDEO_QUALITY_TIERS.len(),
+            "SCREEN_SHARE_CAMERA_CEILING_INDEX ({}) out of bounds (len={})",
+            SCREEN_SHARE_CAMERA_CEILING_INDEX,
             VIDEO_QUALITY_TIERS.len(),
         );
     }

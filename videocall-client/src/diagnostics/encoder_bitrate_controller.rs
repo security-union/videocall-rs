@@ -25,7 +25,7 @@ use js_sys::Date;
 use crate::adaptive_quality_constants::{
     AudioQualityTier, VideoQualityTier, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
     PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
-    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
+    PID_OUTPUT_MIN, SCREEN_SHARE_CAMERA_CEILING_INDEX, VIDEO_QUALITY_TIERS,
 };
 use crate::diagnostics::adaptive_quality_manager::AdaptiveQualityManager;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -524,6 +524,29 @@ impl EncoderBitrateController {
             self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
         }
         changed
+    }
+
+    /// Notify this controller that screen sharing state changed.
+    ///
+    /// When screen share becomes active, the camera is forced to a conservative
+    /// tier and capped there to prevent bandwidth contention. When screen share
+    /// stops, the cap is removed and the camera recovers naturally.
+    pub fn notify_screen_sharing(&mut self, active: bool) {
+        if active {
+            let now = Date::now();
+            let changed = self
+                .quality_manager
+                .force_video_step_to(SCREEN_SHARE_CAMERA_CEILING_INDEX, now);
+            self.quality_manager
+                .set_quality_ceiling(Some(SCREEN_SHARE_CAMERA_CEILING_INDEX));
+            if changed {
+                let new_tier = self.quality_manager.current_video_tier();
+                self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+                self.tier_changed = true;
+            }
+        } else {
+            self.quality_manager.set_quality_ceiling(None);
+        }
     }
 }
 

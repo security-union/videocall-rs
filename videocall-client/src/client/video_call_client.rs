@@ -34,7 +34,7 @@ use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -789,6 +789,19 @@ impl VideoCallClient {
     /// `EncoderBitrateController`.
     pub fn congestion_step_down_flag(&self) -> Arc<AtomicBool> {
         self.inner.borrow().congestion_step_down_requested.clone()
+    }
+
+    /// Bind adaptive quality tier sources from a `CameraEncoder` to the
+    /// health reporter. Call this after creating the camera encoder so the
+    /// health reporter includes the current encoding tiers in each packet.
+    pub fn set_adaptive_tier_sources(&self, video_tier: Rc<AtomicU32>, audio_tier: Rc<AtomicU32>) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(mut reporter) = hr.try_borrow_mut() {
+                    reporter.set_adaptive_tier_sources(video_tier, audio_tier);
+                }
+            }
+        }
     }
 
     pub(crate) fn aes(&self) -> Rc<Aes128State> {

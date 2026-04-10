@@ -43,15 +43,17 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
 use sec_api::metrics::{
-    ACTIVE_SESSIONS_TOTAL, AUDIO_PACKET_LOSS_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE,
-    CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_MEMORY_TOTAL_BYTES,
-    CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
-    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, HEALTH_REPORTS_TOTAL,
-    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
-    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
+    ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_VIDEO_TIER, AUDIO_PACKET_LOSS_PCT,
+    AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
+    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC,
+    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE,
+    DATAGRAM_DROPS_TOTAL, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
+    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
+    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
+    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
+    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
+    WEBSOCKET_DROPS_TOTAL,
 };
 
 async fn metrics_handler(
@@ -164,7 +166,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         &session_info.display_name,
     ]);
 
-    // Remove send queue, packet rates, tab throttled metrics
+    // Remove send queue, packet rates, tab throttled, and receiver-side metrics
     let reporter_labels = [
         &session_info.meeting_id as &str,
         &session_info.session_id,
@@ -175,6 +177,11 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = CLIENT_PACKETS_RECEIVED_PER_SEC.remove_label_values(&reporter_labels);
     let _ = CLIENT_PACKETS_SENT_PER_SEC.remove_label_values(&reporter_labels);
     let _ = CLIENT_TAB_THROTTLED.remove_label_values(&reporter_labels);
+    let _ = ADAPTIVE_VIDEO_TIER.remove_label_values(&reporter_labels);
+    let _ = ADAPTIVE_AUDIO_TIER.remove_label_values(&reporter_labels);
+    let _ = DATAGRAM_DROPS_TOTAL.remove_label_values(&reporter_labels);
+    let _ = WEBSOCKET_DROPS_TOTAL.remove_label_values(&reporter_labels);
+    let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
 
     // Remove active server metrics for this session
     for (server_url, server_type) in &session_info.active_servers {
@@ -506,6 +513,33 @@ fn process_health_packet_to_metrics_pb(
             } else {
                 0.0
             });
+
+        // Receiver-side quality metrics
+        if let Some(tier) = health_packet.adaptive_video_tier {
+            ADAPTIVE_VIDEO_TIER
+                .with_label_values(&reporter_labels)
+                .set(tier as f64);
+        }
+        if let Some(tier) = health_packet.adaptive_audio_tier {
+            ADAPTIVE_AUDIO_TIER
+                .with_label_values(&reporter_labels)
+                .set(tier as f64);
+        }
+        if let Some(drops) = health_packet.datagram_drops_total {
+            DATAGRAM_DROPS_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(drops as f64);
+        }
+        if let Some(drops) = health_packet.websocket_drops_total {
+            WEBSOCKET_DROPS_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(drops as f64);
+        }
+        if let Some(kf_reqs) = health_packet.keyframe_requests_sent_total {
+            KEYFRAME_REQUESTS_SENT_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(kf_reqs as f64);
+        }
 
         // Process peer health data
         if !health_packet.peer_stats.is_empty() {

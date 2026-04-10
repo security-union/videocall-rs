@@ -31,6 +31,7 @@ use log::debug;
 use protobuf::Message;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Display, sync::Arc};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -40,6 +41,14 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
+
+/// Cumulative count of keyframe requests (PLI) sent by this client.
+static KEYFRAME_REQUESTS_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of keyframe requests sent since process start.
+pub fn keyframe_requests_sent_count() -> u64 {
+    KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed)
+}
 
 #[derive(Debug)]
 pub enum PeerDecodeError {
@@ -997,6 +1006,7 @@ impl PeerDecodeManager {
             ..Default::default()
         };
 
+        KEYFRAME_REQUESTS_SENT.fetch_add(1, Ordering::Relaxed);
         log::info!(
             "Sending KEYFRAME_REQUEST to {} for {:?}",
             peer_user_id,

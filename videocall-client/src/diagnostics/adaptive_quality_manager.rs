@@ -101,7 +101,7 @@ impl AdaptiveQualityManager {
 
     /// Create a new manager for screen share.
     ///
-    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` (low/480p) to match the
+    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` (medium/720p) to match the
     /// camera strategy of only upgrading, never visibly downgrading. The
     /// PID controller will quickly ramp up resolution once it measures
     /// sufficient bandwidth.
@@ -397,8 +397,8 @@ mod tests {
             mgr.current_video_tier().label,
             SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].label
         );
-        // Screen share starts at "low" (480p) to avoid downgrade oscillation
-        assert_eq!(mgr.current_video_tier().label, "low");
+        // Screen share starts at "medium" (720p) to avoid downgrade oscillation
+        assert_eq!(mgr.current_video_tier().label, "medium");
     }
 
     #[wasm_bindgen_test]

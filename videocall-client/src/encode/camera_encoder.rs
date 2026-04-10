@@ -56,7 +56,7 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
+    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, ENCODER_PLI_COOLDOWN_MS, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
@@ -608,6 +608,7 @@ impl CameraEncoder {
 
             // Start encoding video and audio.
             let mut video_frame_counter: u32 = 0;
+            let mut last_pli_keyframe_time: f64 = 0.0;
 
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
@@ -743,6 +744,16 @@ impl CameraEncoder {
                         // Check if a keyframe was requested via PLI (Picture Loss Indication).
                         // The flag is cleared after producing the keyframe.
                         let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
+                        let now = window()
+                            .performance()
+                            .expect("Performance API not available")
+                            .now();
+                        let pli_cooldown_ok =
+                            (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
+                        let force_pli = pli_requested && pli_cooldown_ok;
+                        if force_pli {
+                            last_pli_keyframe_time = now;
+                        }
                         // Use tier-controlled keyframe interval instead of the
                         // static constant, allowing adaptive quality to adjust it.
                         // Using `%` instead of `.is_multiple_of()` for compatibility
@@ -751,11 +762,17 @@ impl CameraEncoder {
                         let is_periodic_keyframe = local_keyframe_interval > 0
                             && video_frame_counter % local_keyframe_interval == 0;
                         video_encoder_encode_options
-                            .set_key_frame(is_periodic_keyframe || pli_requested);
-                        if pli_requested {
+                            .set_key_frame(is_periodic_keyframe || force_pli);
+                        if force_pli {
                             log::info!(
                                 "CameraEncoder: forcing keyframe at frame {} (PLI)",
                                 video_frame_counter
+                            );
+                        } else if pli_requested {
+                            log::info!(
+                                "CameraEncoder: PLI keyframe suppressed at frame {} (cooldown: {:.0}ms since last)",
+                                video_frame_counter,
+                                now - last_pli_keyframe_time,
                             );
                         }
                         if let Err(e) = video_encoder

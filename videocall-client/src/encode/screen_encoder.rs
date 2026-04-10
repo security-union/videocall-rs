@@ -388,9 +388,21 @@ impl ScreenEncoder {
 
             log::info!("Screen to share: {screen_to_share:?}");
 
+            // Signal camera encoder ASAP after capture is confirmed so it begins
+            // stepping down during encoder setup, not after encoding starts.
+            if let Some(ref flag) = screen_sharing_active {
+                flag.store(true, Ordering::Release);
+            } else {
+                log::warn!(
+                    "ScreenEncoder: screen_sharing_active flag not wired — \
+                     camera bandwidth coordination will not engage. \
+                     Ensure host.rs calls screen.set_screen_sharing_flag(camera.screen_sharing_flag())"
+                );
+            }
+
             screen_stream.borrow_mut().replace(screen_to_share.clone());
 
-            // Helper to clean up stream on error - stops all tracks and emits Failed event
+            // Helper to clean up stream on error - stops all tracks, clears flags, emits Failed event
             let cleanup_on_error = |screen_to_share: &MediaStream,
                                     enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
                                     on_state_change: &Option<Callback<ScreenShareEvent>>,
@@ -405,6 +417,10 @@ impl ScreenEncoder {
                 }
                 // Reset enabled flag
                 enabled.store(false, Ordering::Release);
+                // Clear screen-sharing flag so camera drops its ceiling
+                if let Some(ref flag) = screen_sharing_active {
+                    flag.store(false, Ordering::Release);
+                }
                 // Emit Failed event
                 if let Some(ref callback) = on_state_change {
                     callback.emit(ScreenShareEvent::Failed(error_msg));
@@ -549,10 +565,6 @@ impl ScreenEncoder {
             client_for_state.set_screen_enabled(true);
             if let Some(ref callback) = on_state_change {
                 callback.emit(ScreenShareEvent::Started(screen_to_share.clone()));
-            }
-            // Signal the camera encoder to drop quality and set a ceiling.
-            if let Some(ref flag) = screen_sharing_active {
-                flag.store(true, Ordering::Release);
             }
 
             let screen_reader = screen_processor

@@ -380,9 +380,14 @@ impl AdaptiveQualityManager {
     /// Pass `None` to remove the ceiling (e.g., when screen share stops).
     pub fn set_quality_ceiling(&mut self, ceiling: Option<usize>) {
         self.quality_ceiling_index = ceiling;
-        // Reset recovery timer so the ceiling takes effect immediately
-        // rather than allowing a pending step-up to fire.
-        self.recover_start_ms = None;
+        if ceiling.is_some() {
+            // Reset recovery timer so the ceiling takes effect immediately
+            // rather than allowing a pending step-up to fire.
+            self.recover_start_ms = None;
+        }
+        // When clearing (None), intentionally preserve recover_start_ms so
+        // the camera can begin stepping up without re-waiting the full
+        // STEP_UP_STABILIZATION_WINDOW_MS.
     }
 
     /// Force the video tier to a specific index, bypassing the one-step-at-a-time
@@ -406,6 +411,7 @@ impl AdaptiveQualityManager {
             return false;
         }
 
+        // Higher index = worse quality = "DOWN"; lower index = better quality = "UP"
         let direction = if clamped > self.video_tier_index {
             "DOWN"
         } else {
@@ -428,7 +434,9 @@ impl AdaptiveQualityManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adaptive_quality_constants::{SCREEN_QUALITY_TIERS, VIDEO_QUALITY_TIERS};
+    use crate::adaptive_quality_constants::{
+        screen_share_camera_ceiling_index, SCREEN_QUALITY_TIERS, VIDEO_QUALITY_TIERS,
+    };
     use wasm_bindgen_test::*;
 
     /// Create a manager with `created_at_ms` and `last_transition_time_ms` set
@@ -747,7 +755,8 @@ mod tests {
         mgr.video_tier_index = 2;
         mgr.set_quality_ceiling(Some(2));
 
-        // Good conditions — blocked by ceiling
+        // Good conditions — blocked by ceiling. These updates also accumulate
+        // recovery time in recover_start_ms.
         let base = 10000.0;
         for i in 0..=6 {
             let t = base + (i as f64 * 1000.0);
@@ -755,19 +764,46 @@ mod tests {
         }
         assert_eq!(mgr.video_tier_index(), 2, "Should be blocked by ceiling");
 
-        // Remove ceiling
+        // Remove ceiling. The recovery timer accumulated above is preserved
+        // (not reset), so the camera doesn't have to re-wait the full
+        // stabilization window.
         mgr.set_quality_ceiling(None);
-        mgr.last_transition_time_ms = 0.0; // Reset min-interval guard
 
-        // Now step-up should work
-        let base2 = 30000.0;
-        for i in 0..=6 {
+        // Continue with good conditions — recovery should happen within the
+        // natural MIN_TIER_TRANSITION_INTERVAL_MS + stabilization window,
+        // without artificially resetting last_transition_time_ms.
+        let base2 = base + 20000.0; // well past min-interval from any ceiling-phase transition
+        for i in 0..=8 {
             let t = base2 + (i as f64 * 1000.0);
             mgr.update(29.0, 30.0, 1400.0, 1500.0, t);
         }
         assert!(
             mgr.video_tier_index() < 2,
-            "Step-up should work after ceiling removal"
+            "Step-up should work after ceiling removal without artificial guard reset"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_audio_stays_high_at_ceiling_tier() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        // Force camera to "low" ceiling (same as screen share coordination)
+        let ceiling = screen_share_camera_ceiling_index();
+        mgr.force_video_step_to(ceiling, 0.0);
+        mgr.set_quality_ceiling(Some(ceiling));
+
+        // Sustain moderate conditions — camera at ceiling, not at minimal
+        let base = 10000.0;
+        for i in 0..=10 {
+            let t = base + (i as f64 * 1000.0);
+            mgr.update(20.0, 30.0, 350.0, 400.0, t);
+        }
+        assert_eq!(
+            mgr.audio_tier_index(),
+            0,
+            "Audio should stay at 'high' (index 0) while camera is at ceiling tier '{}', \
+             not at lowest video tier. Got audio tier index {}",
+            VIDEO_QUALITY_TIERS[ceiling].label,
+            mgr.audio_tier_index(),
         );
     }
 

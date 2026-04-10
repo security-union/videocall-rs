@@ -93,5 +93,12 @@ message HealthPacket {
   // Included in every health packet so observers (vcprobe, metrics_server)
   // can learn display names without depending on one-shot PARTICIPANT_JOINED events.
   optional string display_name = 19;
+
+  // Receiver-side metrics: adaptive quality and transport health
+  optional uint32 adaptive_video_tier = 20; // Current video encoding tier index (0=best, 7=minimal)
+  optional uint32 adaptive_audio_tier = 21; // Current audio encoding tier index (0=high, 3=emergency)
+  optional uint64 datagram_drops_total = 22; // Cumulative datagrams dropped (writable locked)
+  optional uint64 keyframe_requests_sent_total = 23; // Cumulative keyframe requests sent (PLI)
+  optional uint64 websocket_drops_total = 24; // Cumulative WebSocket packets dropped (backpressure)
 }
 

@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, Error};
 use futures::channel::oneshot::channel;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, rc::Rc};
 use thiserror::Error as ThisError;
 use videocall_types::Callback;
@@ -18,6 +19,14 @@ use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
     WebTransportDatagramDuplexStream, WebTransportReceiveStream, WritableStream,
 };
+
+/// Cumulative count of datagrams dropped because the writable stream was locked.
+static DATAGRAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of datagrams dropped since process start.
+pub fn datagram_drop_count() -> u64 {
+    DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
+}
 
 /// Represents formatting errors.
 #[derive(Debug, ThisError)]
@@ -339,6 +348,7 @@ impl WebTransportTask {
             let stream = transport.datagrams();
             let writable: WritableStream = stream.writable();
             if writable.locked() {
+                DATAGRAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
                 log!("datagram dropped (stream busy)");
                 return;
             }

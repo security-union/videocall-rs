@@ -17,12 +17,14 @@
  */
 
 use crate::connection::ConnectionController;
+use crate::decode::peer_decode_manager::keyframe_requests_sent_count;
 use log::{debug, warn};
 use protobuf::Message;
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU32, Ordering};
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
@@ -103,6 +105,13 @@ pub struct HealthReporter {
     active_server_type: Rc<RefCell<Option<String>>>,
     active_server_rtt_ms: Rc<RefCell<Option<f64>>>,
     connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
+    /// Adaptive video tier index from CameraEncoder (0=best, 7=minimal).
+    /// Wrapped in RefCell so `set_adaptive_tier_sources` (called after
+    /// `start_health_reporting`) can swap the inner Rc and the spawned loop
+    /// picks up the new atomic on its next tick.
+    adaptive_video_tier: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Adaptive audio tier index from CameraEncoder (0=high, 3=emergency).
+    adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
 }
 
 impl HealthReporter {
@@ -122,6 +131,8 @@ impl HealthReporter {
             active_server_type: Rc::new(RefCell::new(None)),
             active_server_rtt_ms: Rc::new(RefCell::new(None)),
             connection_controller: Rc::new(RefCell::new(None)),
+            adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
         }
     }
 
@@ -169,6 +180,17 @@ impl HealthReporter {
     /// Set the connection controller reference for communication metrics
     pub fn set_connection_controller(&self, connection_controller: Rc<ConnectionController>) {
         *self.connection_controller.borrow_mut() = Some(connection_controller);
+    }
+
+    /// Bind the adaptive quality tier atomics from a CameraEncoder so the
+    /// health reporter can include the current encoding tiers in each packet.
+    pub fn set_adaptive_tier_sources(
+        &mut self,
+        video_tier: Rc<AtomicU32>,
+        audio_tier: Rc<AtomicU32>,
+    ) {
+        *self.adaptive_video_tier.borrow_mut() = video_tier;
+        *self.adaptive_audio_tier.borrow_mut() = audio_tier;
     }
 
     /// Start subscribing to real diagnostics events via videocall_diagnostics
@@ -433,6 +455,8 @@ impl HealthReporter {
         let active_server_type = Rc::downgrade(&self.active_server_type);
         let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
         let connection_controller = Rc::downgrade(&self.connection_controller);
+        let adaptive_video_tier = self.adaptive_video_tier.clone();
+        let adaptive_audio_tier = self.adaptive_audio_tier.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -499,6 +523,11 @@ impl HealthReporter {
                             send_queue_bytes,
                             packets_received_per_sec,
                             packets_sent_per_sec,
+                            adaptive_video_tier.borrow().load(Ordering::Relaxed),
+                            adaptive_audio_tier.borrow().load(Ordering::Relaxed),
+                            videocall_transport::webtransport::datagram_drop_count(),
+                            videocall_transport::websocket::websocket_drop_count(),
+                            keyframe_requests_sent_count(),
                         );
 
                         if let Some(packet) = health_packet {
@@ -530,6 +559,11 @@ impl HealthReporter {
         send_queue_bytes: Option<u64>,
         packets_received_per_sec: Option<f64>,
         packets_sent_per_sec: Option<f64>,
+        adaptive_video_tier: u32,
+        adaptive_audio_tier: u32,
+        datagram_drops_total: u64,
+        websocket_drops_total: u64,
+        keyframe_requests_sent_total: u64,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -565,6 +599,13 @@ impl HealthReporter {
         pb.send_queue_bytes = send_queue_bytes;
         pb.packets_received_per_sec = packets_received_per_sec;
         pb.packets_sent_per_sec = packets_sent_per_sec;
+
+        // Receiver-side metrics: adaptive quality and transport health
+        pb.adaptive_video_tier = Some(adaptive_video_tier);
+        pb.adaptive_audio_tier = Some(adaptive_audio_tier);
+        pb.datagram_drops_total = Some(datagram_drops_total);
+        pb.websocket_drops_total = Some(websocket_drops_total);
+        pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
         // Tab visibility and throttling
         #[cfg(target_arch = "wasm32")]

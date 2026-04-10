@@ -35,7 +35,7 @@
 
 //! Web worker decoder that handles both frame data and control messages using a JitterBuffer.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
 use videocall_codecs::jitter_buffer::JitterBuffer;
@@ -53,6 +53,15 @@ struct WebDecoder {
     decoder: RefCell<Option<VideoDecoder>>,
     current_codec: RefCell<Option<FrameCodec>>,
     self_scope: DedicatedWorkerGlobalScope,
+    /// Set to `true` immediately after a fresh `VideoDecoder` is created and configured.
+    /// A freshly-configured WebCodecs `VideoDecoder` requires its first chunk to be a
+    /// keyframe — feeding a delta will throw `DataError: A key frame is required after
+    /// configure() or flush()`. This flag lets `decode()` drop stray delta frames that
+    /// race in after a `reset_pipeline()` (which destroys the decoder synchronously but
+    /// schedules the jitter-buffer reset asynchronously via `setTimeout(0)`), preventing
+    /// a reconfigure loop until the next real keyframe arrives. Cleared only after a
+    /// keyframe has been successfully handed off to the decoder.
+    just_reinitialized: Cell<bool>,
 }
 
 // Safety: These are safe because we're in a single-threaded web worker context
@@ -65,6 +74,7 @@ impl WebDecoder {
             decoder: RefCell::new(None),
             current_codec: RefCell::new(None),
             self_scope,
+            just_reinitialized: Cell::new(false),
         }
     }
 
@@ -146,6 +156,14 @@ impl WebDecoder {
         console::log_1(
             &format!("[WORKER] WebCodecs decoder initialized with codec: {codec:?}").into(),
         );
+
+        // Mark the decoder as freshly (re)initialized. `decode()` will refuse to feed
+        // delta frames in this state and will clear the flag once the first keyframe
+        // has been successfully handed off to the decoder. This is the race guard for
+        // the `reset_pipeline()` path where the jitter buffer reset is deferred via
+        // `setTimeout(0)`.
+        self.just_reinitialized.set(true);
+
         Ok(())
     }
 
@@ -210,6 +228,31 @@ impl Decodable for WebDecoder {
             return;
         }
 
+        // Race guard: if `initialize_decoder()` just created a brand-new `VideoDecoder`
+        // (e.g. after `reset_pipeline()` tore down the previous one, or at startup),
+        // the WebCodecs spec requires the first chunk we feed it to be a keyframe. A
+        // delta arriving here would trigger `DataError: A key frame is required after
+        // configure() or flush()` and loop us into another reset. Drop deltas silently
+        // until we successfully hand off a keyframe below. Note that `initialize_decoder()`
+        // above may have just set this flag on this very call path — that is intentional;
+        // the current frame is the first candidate to satisfy the keyframe requirement.
+        // The flag is NOT cleared here — only after `decoder.decode(&chunk)` returns `Ok`,
+        // so a failed chunk construction or a failed enqueue doesn't leave the decoder
+        // in a "needs keyframe" state with the guard disarmed.
+        if self.just_reinitialized.get()
+            && matches!(
+                frame.frame.frame_type,
+                videocall_codecs::frame::FrameType::DeltaFrame
+            )
+        {
+            log::debug!(
+                "[WORKER] Dropping delta frame {} (codec {:?}) after decoder reinit; waiting for keyframe",
+                frame.sequence_number(),
+                frame.frame.codec
+            );
+            return;
+        }
+
         let decoder_ref = self.decoder.borrow();
         if let Some(decoder) = decoder_ref.as_ref() {
             // Only decode when the VideoDecoder is in the Configured state.
@@ -236,19 +279,40 @@ impl Decodable for WebDecoder {
 
             match EncodedVideoChunk::new(&init) {
                 Ok(chunk) => {
-                    if let Err(e) = decoder.decode(&chunk) {
-                        console::error_1(&format!("[WORKER] Decoder error: {e:?}").into());
+                    match decoder.decode(&chunk) {
+                        Ok(()) => {
+                            // Successful hand-off. If this was the keyframe we were waiting
+                            // for after a fresh (re)init, disarm the race guard now that the
+                            // WebCodecs decoder has accepted its required first keyframe.
+                            if matches!(
+                                frame.frame.frame_type,
+                                videocall_codecs::frame::FrameType::KeyFrame
+                            ) && self.just_reinitialized.get()
+                            {
+                                self.just_reinitialized.set(false);
+                            }
+                        }
+                        Err(e) => {
+                            console::error_1(&format!("[WORKER] Decoder error: {e:?}").into());
 
-                        // Release the immutable borrow so we can safely mutate within
-                        // `reset_pipeline()`.
-                        drop(decoder_ref);
+                            // Release the immutable borrow so we can safely mutate within
+                            // `reset_pipeline()`.
+                            drop(decoder_ref);
 
-                        // Completely reset decoder + jitter buffer in a single abstraction.
-                        self.reset_pipeline();
+                            // Completely reset decoder + jitter buffer in a single abstraction.
+                            self.reset_pipeline();
+                        }
                     }
                 }
                 Err(e) => {
                     console::error_1(&format!("[WORKER] Failed to create chunk: {e:?}").into());
+                    // The decoder was left untouched, but if we were waiting for a keyframe
+                    // and this was it, we must NOT leave the guard disarmed — reset the whole
+                    // pipeline so the next frame goes through a fresh init + keyframe sequence.
+                    if self.just_reinitialized.get() {
+                        drop(decoder_ref);
+                        self.reset_pipeline();
+                    }
                 }
             }
         }

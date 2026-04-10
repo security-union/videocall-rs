@@ -128,15 +128,23 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 /// resolution drop.
 pub const DEFAULT_VIDEO_TIER_INDEX: usize = 3; // "minimal"
 
-/// Camera tier ceiling (maximum quality) when screen share is active.
+/// Label of the video quality tier to use as camera ceiling during screen sharing.
 ///
-/// Index 2 = "low" (640x360, 15fps, 300kbps ideal). When screen share starts,
-/// the camera is forced to this tier and capped here to avoid bandwidth
-/// contention on the shared TCP connection. The screen encoder ramps up
-/// independently via its own PID controller; this ceiling ensures the camera
-/// doesn't compete for headroom. Camera can still step DOWN further if
-/// conditions worsen, but cannot step UP past this ceiling.
-pub const SCREEN_SHARE_CAMERA_CEILING_INDEX: usize = 2; // "low"
+/// When screen share starts, the camera is forced to this tier and capped here
+/// to avoid bandwidth contention on the shared connection. Resolved by label
+/// (not index) so the ceiling is correct regardless of how many tiers exist.
+const SCREEN_SHARE_CAMERA_CEILING_LABEL: &str = "low";
+
+/// Resolve the camera tier ceiling index for screen sharing.
+///
+/// Looks up `SCREEN_SHARE_CAMERA_CEILING_LABEL` in `VIDEO_QUALITY_TIERS`.
+/// Falls back to second-lowest tier if the label isn't found.
+pub fn screen_share_camera_ceiling_index() -> usize {
+    VIDEO_QUALITY_TIERS
+        .iter()
+        .position(|t| t.label == SCREEN_SHARE_CAMERA_CEILING_LABEL)
+        .unwrap_or_else(|| VIDEO_QUALITY_TIERS.len().saturating_sub(2))
+}
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
@@ -600,12 +608,18 @@ mod tests {
     }
 
     #[test]
-    fn test_screen_share_camera_ceiling_index_in_bounds() {
+    fn test_screen_share_camera_ceiling_resolves_to_low() {
+        let idx = screen_share_camera_ceiling_index();
         assert!(
-            SCREEN_SHARE_CAMERA_CEILING_INDEX < VIDEO_QUALITY_TIERS.len(),
-            "SCREEN_SHARE_CAMERA_CEILING_INDEX ({}) out of bounds (len={})",
-            SCREEN_SHARE_CAMERA_CEILING_INDEX,
+            idx < VIDEO_QUALITY_TIERS.len(),
+            "screen_share_camera_ceiling_index ({}) out of bounds (len={})",
+            idx,
             VIDEO_QUALITY_TIERS.len(),
+        );
+        assert_eq!(
+            VIDEO_QUALITY_TIERS[idx].label, "low",
+            "ceiling should resolve to 'low' tier, got '{}' at index {}",
+            VIDEO_QUALITY_TIERS[idx].label, idx,
         );
     }
 

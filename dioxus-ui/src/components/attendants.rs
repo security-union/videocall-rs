@@ -318,9 +318,9 @@ fn schedule_reconnect_no_jwt(
     .forget();
 }
 
-/// Google Meet–style layout: перебираем все варианты колонок, для каждого
-/// считаем максимальный размер 16:9 тайла, выбираем вариант с наибольшей
-/// площадью.  Возвращает `(cols, rows, tile_width)`.
+/// Google Meet–style layout: try every column count, compute the maximum
+/// 16:9 tile size for each, and pick the variant with the largest tile area.
+/// Returns `(cols, rows, tile_width)`.
 fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     if n == 0 {
         return (1, 1, w);
@@ -457,14 +457,14 @@ pub fn AttendantsComponent(
     {
         let _ = viewport_version();
     }
-    use_effect(move || {
+    use_hook(move || {
         let win = window();
         let cb = Closure::<dyn FnMut()>::new(move || {
             viewport_version.with_mut(|v| *v = v.wrapping_add(1));
         });
         let _ = win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
         // Keep the closure alive for the component's lifetime.
-        // Intentionally leak — cleaned up when the page unloads.
+        // Runs once (use_hook), so no accumulation on re-renders.
         cb.forget();
     });
     let mut device_settings_open = use_signal(|| false);
@@ -968,13 +968,26 @@ pub fn AttendantsComponent(
             while let Ok(evt) = rx.recv().await {
                 if evt.subsystem == "peer_speaking" {
                     // Track speech activity for priority sorting.
+                    // Only update the map (and trigger a re-sort) when the
+                    // speaker is new or their last timestamp is >5 s stale.
+                    // This prevents grid thrashing when multiple people talk
+                    // at the same time — tiles stay stable instead of
+                    // constantly swapping positions.
                     if let Some(peer_id) = parse_speaking_peer(&evt) {
-                        peer_speech_priority
-                            .write()
-                            .insert(peer_id, js_sys::Date::now());
-                        let mut v = peer_list_version;
-                        let next = *v.peek() + 1;
-                        v.set(next);
+                        let now = js_sys::Date::now();
+                        let should_update = {
+                            let map = peer_speech_priority.read();
+                            match map.get(&peer_id) {
+                                None => true,
+                                Some(&prev) => now - prev > 5_000.0,
+                            }
+                        };
+                        if should_update {
+                            peer_speech_priority.write().insert(peer_id, now);
+                            let mut v = peer_list_version;
+                            let next = *v.peek() + 1;
+                            v.set(next);
+                        }
                     }
                     continue;
                 }
@@ -1074,7 +1087,10 @@ pub fn AttendantsComponent(
         .collect();
     let num_display_peers = display_peers.len();
     let mock_count = debug_peer_count() as usize;
-    let total_tiles = (num_display_peers + mock_count).min(CANVAS_LIMIT);
+    // CANVAS_LIMIT caps real peers (each drives a canvas + diagnostics task).
+    // Mock peers are layout-only placeholders and don't carry that cost.
+    let capped_real = num_display_peers.min(CANVAS_LIMIT);
+    let total_tiles = capped_real + mock_count;
 
     // --- Viewport dimensions (needed for min-tile-size check & grid style) ---
     let vw = window()
@@ -1162,9 +1178,11 @@ pub fn AttendantsComponent(
     } else {
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
         let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
-        let (cols, rows, _tw) = compute_layout(tile_count, avail_w, avail_h, gap);
+        let (cols, rows, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
+        let th = tw / (16.0 / 9.0);
         format!(
-            "grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr);"
+            "grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr); \
+             --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
         )
     };
 

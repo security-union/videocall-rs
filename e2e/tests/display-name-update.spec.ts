@@ -144,6 +144,28 @@ async function updateDisplayNameViaApi(
   }
 }
 
+/**
+ * Call the meeting API's PUT /display-name endpoint and return the raw Response
+ * without throwing on non-2xx status. Useful for testing error paths.
+ */
+async function updateDisplayNameRaw(
+  email: string,
+  name: string,
+  meetingId: string,
+  newDisplayName: string,
+): Promise<Response> {
+  const token = generateSessionToken(email, name);
+  const url = `${API_URL}/api/v1/meetings/${meetingId}/display-name`;
+  return fetch(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: `${COOKIE_NAME}=${token}`,
+    },
+    body: JSON.stringify({ display_name: newDisplayName }),
+  });
+}
+
 test.describe("Display name live update", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -429,6 +451,171 @@ test.describe("Display name live update", () => {
       const usernameInput = guestPage.locator("#username");
       await expect(usernameInput).toBeVisible({ timeout: 10_000 });
       await expect(usernameInput).toHaveValue("NewPersisted", { timeout: 5_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * Backend rejects invalid display names with HTTP 400.
+   * Characters like '@' are disallowed by validate_display_name.
+   */
+  test("invalid display name is rejected by backend with 400", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_invalid_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-inv@videocall.rs",
+        "InvalidHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-inv@videocall.rs",
+        "ValidGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host joins
+      await navigateToMeeting(hostPage, meetingId, "InvalidHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins
+      await navigateToMeeting(guestPage, meetingId, "ValidGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer discovery
+      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // ---- Attempt to set an invalid display name (contains '@') ----
+      const res = await updateDisplayNameRaw(
+        "guest-inv@videocall.rs",
+        "ValidGuest",
+        meetingId,
+        "bad@name",
+      );
+      expect(res.status).toBe(400);
+
+      // ---- Verify the old name is still shown on the host (unchanged) ----
+      const originalNameOnHost = hostPage.locator(".floating-name", {
+        hasText: "ValidGuest",
+      });
+      await expect(originalNameOnHost.first()).toBeVisible({ timeout: 10_000 });
+
+      // No name tile should contain the invalid name
+      await expect(hostPage.locator(".floating-name", { hasText: "bad@name" })).toHaveCount(0);
+
+      // Both still in meeting
+      await expect(hostPage.locator("#grid-container")).toBeVisible();
+      await expect(guestPage.locator("#grid-container")).toBeVisible();
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * After a successful rename, re-opening the rename modal should show the
+   * latest display name (not the stale original). This validates that the
+   * `current_display_name` prop is updated before the modal re-renders.
+   */
+  test("rename modal reopens with latest display name, not stale input", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_modal_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-modal@videocall.rs",
+        "ModalHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-modal@videocall.rs",
+        "FirstName",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host joins
+      await navigateToMeeting(hostPage, meetingId, "ModalHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins
+      await navigateToMeeting(guestPage, meetingId, "FirstName");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer discovery
+      await expect(guestPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // ---- Open the rename modal via the edit button in peer list ----
+      const editButton = guestPage.getByLabel("Edit display name");
+      await expect(editButton.first()).toBeVisible({ timeout: 10_000 });
+      await editButton.first().click();
+
+      // Modal should appear with the current name pre-filled
+      const modalInput = guestPage.locator(".card-apple input.input-apple");
+      await expect(modalInput).toBeVisible({ timeout: 5_000 });
+      await expect(modalInput).toHaveValue("FirstName", { timeout: 5_000 });
+
+      // ---- Submit a new name via the modal ----
+      await modalInput.fill("SecondName");
+      await guestPage.locator(".card-apple button[type='submit']").click();
+
+      // Wait for success confirmation and modal to close
+      await expect(guestPage.locator(".card-apple")).not.toBeVisible({ timeout: 15_000 });
+
+      // Verify the guest sees the new name on their own tile
+      const guestSelfName = guestPage.locator(".floating-name", {
+        hasText: "SecondName",
+      });
+      await expect(guestSelfName.first()).toBeVisible({ timeout: 15_000 });
+
+      // ---- Re-open the modal — it should show "SecondName", not "FirstName" ----
+      await editButton.first().click();
+      await expect(modalInput).toBeVisible({ timeout: 5_000 });
+      await expect(modalInput).toHaveValue("SecondName", { timeout: 5_000 });
+
+      // Close the modal without saving
+      await guestPage.locator(".card-apple button[type='button']").click();
+      await expect(guestPage.locator(".card-apple")).not.toBeVisible({ timeout: 5_000 });
+
+      // Both still in meeting
+      await expect(hostPage.locator("#grid-container")).toBeVisible();
+      await expect(guestPage.locator("#grid-container")).toBeVisible();
     } finally {
       await browser1.close();
       await browser2.close();

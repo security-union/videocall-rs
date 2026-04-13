@@ -37,9 +37,8 @@ use crate::constants::{
     webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{
-    resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
-    MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
-    TransportPreferenceCtx,
+    resolve_transport_config, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
+    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -747,7 +746,6 @@ pub fn AttendantsComponent(
                             "DIOXUS-UI: Local user display name confirmed by server: {}",
                             new_display_name
                         );
-                        save_display_name_to_storage(&new_display_name);
                         let mut current_display_name = current_display_name;
                         current_display_name.set(new_display_name.clone());
                         let mut dn_ctx = display_name_ctx_signal;
@@ -1864,25 +1862,26 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                UpdateDisplayNameModal {
-                    visible: display_name_modal_open(),
-                    current_display_name: current_display_name(),
-                    meeting_id: id.clone(),
-                    on_close: move |_| {
-                        display_name_modal_open.set(false);
-                    },
-                    on_success: move |new_name: String| {
-                        // Update local UI immediately — do NOT wait for server broadcast.
-                        // The server will broadcast PARTICIPANT_DISPLAY_NAME_CHANGED moments later,
-                        // which will be handled by on_display_name_changed callback and will
-                        // confirm the same value. This ensures no perceived lag for the user.
-                        log::info!("RENAME: on_success called with new_name: {}", new_name);
-                        let mut current_name = current_display_name;
-                        current_name.set(new_name.clone());
-                        let mut dn_ctx = display_name_ctx_signal;
-                        dn_ctx.set(Some(new_name.clone()));
-                        display_name_modal_open.set(false);
-                    },
+                if display_name_modal_open() {
+                    UpdateDisplayNameModal {
+                        current_display_name: current_display_name(),
+                        meeting_id: id.clone(),
+                        on_close: move |_| {
+                            display_name_modal_open.set(false);
+                        },
+                        on_success: move |new_name: String| {
+                            // Update local UI immediately — do NOT wait for server broadcast.
+                            // The server will broadcast PARTICIPANT_DISPLAY_NAME_CHANGED moments later,
+                            // which will be handled by on_display_name_changed callback and will
+                            // confirm the same value. This ensures no perceived lag for the user.
+                            log::info!("RENAME: on_success called with new_name: {}", new_name);
+                            let mut current_name = current_display_name;
+                            current_name.set(new_name.clone());
+                            let mut dn_ctx = display_name_ctx_signal;
+                            dn_ctx.set(Some(new_name.clone()));
+                            display_name_modal_open.set(false);
+                        },
+                    }
                 }
 
                 // Meeting ended overlay

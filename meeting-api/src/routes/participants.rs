@@ -23,6 +23,8 @@ use videocall_meeting_types::{
     responses::{APIResponse, ParticipantStatusResponse},
 };
 
+use videocall_types::validation::validate_display_name;
+
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
@@ -41,7 +43,12 @@ pub async fn join_meeting(
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let display_name = body.as_ref().and_then(|b| b.display_name.as_deref());
+    let display_name = body
+        .as_ref()
+        .and_then(|b| b.display_name.as_deref())
+        .map(|raw| validate_display_name(raw).map_err(|e| AppError::invalid_display_name(&e)))
+        .transpose()?;
+    let display_name = display_name.as_deref();
 
     let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
         Some(m) => m,
@@ -234,6 +241,10 @@ pub async fn update_display_name(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
+    // Validate the display name
+    let validated_name = validate_display_name(&body.display_name)
+        .map_err(|e| AppError::invalid_display_name(&e))?;
+
     // Validate the participant exists and is in the meeting
     db_participants::get_status(&state.db, meeting.id, &user_id)
         .await?
@@ -241,7 +252,7 @@ pub async fn update_display_name(
 
     // Update the display name in the database
     let updated_row =
-        db_participants::update_display_name(&state.db, meeting.id, &user_id, &body.display_name)
+        db_participants::update_display_name(&state.db, meeting.id, &user_id, &validated_name)
             .await?
             .ok_or_else(AppError::not_in_meeting)?;
 
@@ -250,7 +261,7 @@ pub async fn update_display_name(
         state.nats.as_ref(),
         &meeting_id,
         &user_id,
-        &body.display_name,
+        &validated_name,
     )
     .await;
 

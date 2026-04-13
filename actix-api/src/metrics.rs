@@ -411,6 +411,82 @@ lazy_static! {
     )
     .expect("Failed to create keyframe_requests_sent_total metric");
 
+    // ===== ENCODER & SCREEN SHARE METRICS (sender-side, P0/P1) =====
+
+    /// Encoder fps_ratio (received/target) driving tier decisions
+    pub static ref ENCODER_FPS_RATIO: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_fps_ratio",
+        "Ratio of received FPS to target FPS driving adaptive quality decisions",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create encoder_fps_ratio metric");
+
+    /// Worst peer FPS observed by encoder
+    pub static ref ENCODER_WORST_PEER_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_worst_peer_fps",
+        "FPS from the worst-performing receiver driving encoder decisions",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create encoder_worst_peer_fps metric");
+
+    /// Screen share quality tier (0=high, 1=medium, 2=low)
+    pub static ref ADAPTIVE_SCREEN_TIER: GaugeVec = register_gauge_vec!(
+        "videocall_adaptive_screen_tier",
+        "Screen share adaptive quality tier index (0=high, 2=low)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create adaptive_screen_tier metric");
+
+    /// Screen sharing active indicator
+    pub static ref SCREEN_SHARING_ACTIVE: GaugeVec = register_gauge_vec!(
+        "videocall_screen_sharing_active",
+        "Whether screen sharing is active (1=active, 0=inactive)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create screen_sharing_active metric");
+
+    /// Encoder output FPS
+    pub static ref ENCODER_OUTPUT_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_output_fps",
+        "Actual frames per second produced by the camera encoder",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create encoder_output_fps metric");
+
+    /// Encoder target bitrate (PID controller output)
+    pub static ref ENCODER_TARGET_BITRATE_KBPS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_target_bitrate_kbps",
+        "PID controller computed target bitrate in kbps",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create encoder_target_bitrate_kbps metric");
+
+    /// Encoder bitrate ratio
+    pub static ref ENCODER_BITRATE_RATIO: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_bitrate_ratio",
+        "Ratio of current bitrate to ideal bitrate for tier selection",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create encoder_bitrate_ratio metric");
+
+    // ===== PER-PEER QUALITY METRICS (new/transition) =====
+
+    /// Audio concealment percentage (renamed from audio_packet_loss_pct)
+    pub static ref AUDIO_CONCEALMENT_PCT: GaugeVec = register_gauge_vec!(
+        "videocall_audio_concealment_pct",
+        "Audio concealment percentage from NetEQ expand events (0.0-100.0)",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create audio_concealment_pct metric");
+
+    /// Cumulative decoder errors per peer
+    pub static ref DECODER_ERRORS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_decoder_errors_total",
+        "Cumulative decoder error count per peer pair",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create decoder_errors_total metric");
+
     // ===== RELAY SERVER-SIDE METRICS (in-process on relay binaries) =====
     //
     // CARDINALITY NOTE: These metrics use `room` (meeting_id) as a label.

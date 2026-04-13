@@ -95,6 +95,7 @@ struct FpsTracker {
     current_bitrate: f64,       // Current bitrate in kbits/sec
     decode_errors_count: u32,   // Windowed counter (resets every 1s)
     decode_errors_per_sec: f64, // Decode errors per second
+    total_decode_errors: u64,   // Cumulative decode error counter (never resets)
 }
 
 impl FpsTracker {
@@ -112,6 +113,7 @@ impl FpsTracker {
             current_bitrate: 0.0,
             decode_errors_count: 0,
             decode_errors_per_sec: 0.0,
+            total_decode_errors: 0,
         }
     }
 
@@ -149,6 +151,7 @@ impl FpsTracker {
 
     fn track_decode_error(&mut self) {
         self.decode_errors_count += 1;
+        self.total_decode_errors += 1;
     }
 
     // Check if no frames have been received for a while and reset FPS if needed
@@ -501,6 +504,7 @@ impl DiagnosticWorker {
                             metric!("fps_received", fps),
                             metric!("bitrate_kbps", bitrate),
                             metric!("decode_errors_per_sec", decode_errors),
+                            metric!("decode_errors_total", tracker.total_decode_errors),
                             metric!("media_type", format!("{:?}", media_type)),
                             metric!("from_peer", self.userid.clone()),
                             metric!("to_peer", peer_id.clone()),

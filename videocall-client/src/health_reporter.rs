@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
@@ -52,6 +52,8 @@ pub struct PeerHealthData {
     pub last_audio_update_ms: u64,
     /// Timestamp of last video stats update (ms since epoch). 0 = never received.
     pub last_video_update_ms: u64,
+    /// Cumulative decode error count across the session lifetime.
+    pub decode_errors_total: u64,
 }
 
 impl PeerHealthData {
@@ -65,6 +67,7 @@ impl PeerHealthData {
             last_update_ms: 0,
             last_audio_update_ms: 0,
             last_video_update_ms: 0,
+            decode_errors_total: 0,
         }
     }
 
@@ -112,6 +115,20 @@ pub struct HealthReporter {
     adaptive_video_tier: Rc<RefCell<Rc<AtomicU32>>>,
     /// Adaptive audio tier index from CameraEncoder (0=high, 3=emergency).
     adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder fps_ratio (f32 bits in AtomicU32). Wrapped in RefCell for late binding.
+    encoder_fps_ratio: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder worst peer FPS (f32 bits in AtomicU32).
+    encoder_worst_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder bitrate_ratio (f32 bits in AtomicU32).
+    encoder_bitrate_ratio: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder PID target bitrate kbps (f32 bits in AtomicU32).
+    encoder_target_bitrate_kbps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Screen share quality tier index.
+    adaptive_screen_tier: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Screen sharing active flag.
+    screen_sharing_active: Rc<RefCell<Rc<AtomicBool>>>,
+    /// Encoder output FPS (camera).
+    encoder_output_fps: Rc<RefCell<Rc<AtomicU32>>>,
 }
 
 impl HealthReporter {
@@ -133,6 +150,13 @@ impl HealthReporter {
             connection_controller: Rc::new(RefCell::new(None)),
             adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_fps_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_worst_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_bitrate_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
+            encoder_output_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
         }
     }
 
@@ -191,6 +215,28 @@ impl HealthReporter {
     ) {
         *self.adaptive_video_tier.borrow_mut() = video_tier;
         *self.adaptive_audio_tier.borrow_mut() = audio_tier;
+    }
+
+    /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder so the
+    /// health reporter can include encoder decision inputs in each health packet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_encoder_metric_sources(
+        &mut self,
+        fps_ratio: Rc<AtomicU32>,
+        worst_peer_fps: Rc<AtomicU32>,
+        bitrate_ratio: Rc<AtomicU32>,
+        target_bitrate_kbps: Rc<AtomicU32>,
+        screen_tier: Rc<AtomicU32>,
+        screen_active: Rc<AtomicBool>,
+        output_fps: Rc<AtomicU32>,
+    ) {
+        *self.encoder_fps_ratio.borrow_mut() = fps_ratio;
+        *self.encoder_worst_peer_fps.borrow_mut() = worst_peer_fps;
+        *self.encoder_bitrate_ratio.borrow_mut() = bitrate_ratio;
+        *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
+        *self.adaptive_screen_tier.borrow_mut() = screen_tier;
+        *self.screen_sharing_active.borrow_mut() = screen_active;
+        *self.encoder_output_fps.borrow_mut() = output_fps;
     }
 
     /// Start subscribing to real diagnostics events via videocall_diagnostics
@@ -416,6 +462,11 @@ impl HealthReporter {
                                 video_stats["decode_errors_per_sec"] = json!(error_rate);
                             }
                         }
+                        "decode_errors_total" => {
+                            if let MetricValue::U64(total) = &metric.value {
+                                peer_data.decode_errors_total = *total;
+                            }
+                        }
                         "bitrate_kbps" => match &metric.value {
                             MetricValue::U64(bitrate) => {
                                 video_stats["bitrate_kbps"] = json!(bitrate);
@@ -457,6 +508,13 @@ impl HealthReporter {
         let connection_controller = Rc::downgrade(&self.connection_controller);
         let adaptive_video_tier = self.adaptive_video_tier.clone();
         let adaptive_audio_tier = self.adaptive_audio_tier.clone();
+        let encoder_fps_ratio = self.encoder_fps_ratio.clone();
+        let encoder_worst_peer_fps = self.encoder_worst_peer_fps.clone();
+        let encoder_bitrate_ratio = self.encoder_bitrate_ratio.clone();
+        let encoder_target_bitrate_kbps = self.encoder_target_bitrate_kbps.clone();
+        let adaptive_screen_tier = self.adaptive_screen_tier.clone();
+        let screen_sharing_active = self.screen_sharing_active.clone();
+        let encoder_output_fps = self.encoder_output_fps.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -509,6 +567,24 @@ impl HealthReporter {
                                 (None, None, None)
                             };
 
+                        // Read encoder decision inputs from shared atomics (f32 bits → f64).
+                        let fps_ratio_val =
+                            f32::from_bits(encoder_fps_ratio.borrow().load(Ordering::Relaxed))
+                                as f64;
+                        let worst_peer_fps_val =
+                            f32::from_bits(encoder_worst_peer_fps.borrow().load(Ordering::Relaxed))
+                                as f64;
+                        let bitrate_ratio_val =
+                            f32::from_bits(encoder_bitrate_ratio.borrow().load(Ordering::Relaxed))
+                                as f64;
+                        let target_bitrate_kbps_val = f32::from_bits(
+                            encoder_target_bitrate_kbps.borrow().load(Ordering::Relaxed),
+                        ) as f64;
+                        let screen_tier_val = adaptive_screen_tier.borrow().load(Ordering::Relaxed);
+                        let screen_active_val =
+                            screen_sharing_active.borrow().load(Ordering::Relaxed);
+                        let output_fps_val = encoder_output_fps.borrow().load(Ordering::Relaxed);
+
                         let health_packet = Self::create_health_packet(
                             &session_id_val,
                             &meeting_id,
@@ -528,6 +604,13 @@ impl HealthReporter {
                             videocall_transport::webtransport::datagram_drop_count(),
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
+                            fps_ratio_val,
+                            worst_peer_fps_val,
+                            bitrate_ratio_val,
+                            target_bitrate_kbps_val,
+                            screen_tier_val,
+                            screen_active_val,
+                            output_fps_val,
                         );
 
                         if let Some(packet) = health_packet {
@@ -564,6 +647,13 @@ impl HealthReporter {
         datagram_drops_total: u64,
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
+        encoder_fps_ratio: f64,
+        encoder_worst_peer_fps: f64,
+        encoder_bitrate_ratio: f64,
+        encoder_target_bitrate_kbps: f64,
+        adaptive_screen_tier: u32,
+        screen_sharing_active: bool,
+        encoder_output_fps: u32,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -606,6 +696,27 @@ impl HealthReporter {
         pb.datagram_drops_total = Some(datagram_drops_total);
         pb.websocket_drops_total = Some(websocket_drops_total);
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
+
+        // Encoder decision inputs (P0)
+        if encoder_fps_ratio.is_finite() && encoder_fps_ratio > 0.0 {
+            pb.encoder_fps_ratio = Some(encoder_fps_ratio);
+        }
+        if encoder_worst_peer_fps.is_finite() {
+            pb.encoder_worst_peer_fps = Some(encoder_worst_peer_fps);
+        }
+        pb.adaptive_screen_tier = Some(adaptive_screen_tier);
+        pb.screen_sharing_active = Some(screen_sharing_active);
+
+        // Encoder outputs (P1)
+        if encoder_output_fps > 0 {
+            pb.encoder_output_fps = Some(encoder_output_fps);
+        }
+        if encoder_target_bitrate_kbps.is_finite() && encoder_target_bitrate_kbps > 0.0 {
+            pb.encoder_target_bitrate_kbps = Some(encoder_target_bitrate_kbps);
+        }
+        if encoder_bitrate_ratio.is_finite() && encoder_bitrate_ratio > 0.0 {
+            pb.encoder_bitrate_ratio = Some(encoder_bitrate_ratio);
+        }
 
         // Tab visibility and throttling
         #[cfg(target_arch = "wasm32")]
@@ -782,6 +893,11 @@ impl HealthReporter {
                 {
                     ps.frames_dropped_per_sec = error_rate;
                 }
+            }
+
+            // Cumulative decode error count (only set if > 0 to avoid noise)
+            if health_data.decode_errors_total > 0 {
+                ps.decoder_errors_total = Some(health_data.decode_errors_total);
             }
 
             // ── Quality scores ─────────────────────────────────────────────

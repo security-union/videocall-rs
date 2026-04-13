@@ -804,6 +804,35 @@ impl VideoCallClient {
         }
     }
 
+    /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_encoder_metric_sources(
+        &self,
+        fps_ratio: Rc<AtomicU32>,
+        worst_peer_fps: Rc<AtomicU32>,
+        bitrate_ratio: Rc<AtomicU32>,
+        target_bitrate_kbps: Rc<AtomicU32>,
+        screen_tier: Rc<AtomicU32>,
+        screen_active: Rc<AtomicBool>,
+        output_fps: Rc<AtomicU32>,
+    ) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(mut reporter) = hr.try_borrow_mut() {
+                    reporter.set_encoder_metric_sources(
+                        fps_ratio,
+                        worst_peer_fps,
+                        bitrate_ratio,
+                        target_bitrate_kbps,
+                        screen_tier,
+                        screen_active,
+                        output_fps,
+                    );
+                }
+            }
+        }
+    }
+
     pub(crate) fn aes(&self) -> Rc<Aes128State> {
         self.aes.clone()
     }

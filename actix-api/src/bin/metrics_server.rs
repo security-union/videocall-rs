@@ -43,17 +43,19 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
 use sec_api::metrics::{
-    ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_VIDEO_TIER, AUDIO_PACKET_LOSS_PCT,
-    AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
-    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC,
-    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE,
-    DATAGRAM_DROPS_TOTAL, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
-    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
-    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
-    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
-    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
-    WEBSOCKET_DROPS_TOTAL,
+    ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
+    AUDIO_CONCEALMENT_PCT, AUDIO_PACKET_LOSS_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE,
+    CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_MEMORY_TOTAL_BYTES,
+    CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
+    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, DATAGRAM_DROPS_TOTAL,
+    DECODER_ERRORS_TOTAL, ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS,
+    ENCODER_TARGET_BITRATE_KBPS, ENCODER_WORST_PEER_FPS, HEALTH_REPORTS_TOTAL,
+    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
+    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
+    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    SCREEN_SHARING_ACTIVE, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, VIDEO_BITRATE_KBPS, VIDEO_FPS,
+    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS_TOTAL,
 };
 
 async fn metrics_handler(
@@ -182,6 +184,13 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = DATAGRAM_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
+    let _ = ENCODER_FPS_RATIO.remove_label_values(&reporter_labels);
+    let _ = ENCODER_WORST_PEER_FPS.remove_label_values(&reporter_labels);
+    let _ = ADAPTIVE_SCREEN_TIER.remove_label_values(&reporter_labels);
+    let _ = SCREEN_SHARING_ACTIVE.remove_label_values(&reporter_labels);
+    let _ = ENCODER_OUTPUT_FPS.remove_label_values(&reporter_labels);
+    let _ = ENCODER_TARGET_BITRATE_KBPS.remove_label_values(&reporter_labels);
+    let _ = ENCODER_BITRATE_RATIO.remove_label_values(&reporter_labels);
 
     // Remove active server metrics for this session
     for (server_url, server_type) in &session_info.active_servers {
@@ -266,6 +275,8 @@ fn remove_per_peer_metrics(
     let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
+    let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
+    let _ = DECODER_ERRORS_TOTAL.remove_label_values(&labels);
 }
 
 fn process_health_packet_to_metrics_pb(
@@ -541,6 +552,45 @@ fn process_health_packet_to_metrics_pb(
                 .set(kf_reqs as f64);
         }
 
+        // Encoder decision inputs (P0)
+        if let Some(ratio) = health_packet.encoder_fps_ratio {
+            ENCODER_FPS_RATIO
+                .with_label_values(&reporter_labels)
+                .set(ratio);
+        }
+        if let Some(fps) = health_packet.encoder_worst_peer_fps {
+            ENCODER_WORST_PEER_FPS
+                .with_label_values(&reporter_labels)
+                .set(fps);
+        }
+        if let Some(tier) = health_packet.adaptive_screen_tier {
+            ADAPTIVE_SCREEN_TIER
+                .with_label_values(&reporter_labels)
+                .set(tier as f64);
+        }
+        if let Some(active) = health_packet.screen_sharing_active {
+            SCREEN_SHARING_ACTIVE
+                .with_label_values(&reporter_labels)
+                .set(if active { 1.0 } else { 0.0 });
+        }
+
+        // Encoder outputs (P1)
+        if let Some(fps) = health_packet.encoder_output_fps {
+            ENCODER_OUTPUT_FPS
+                .with_label_values(&reporter_labels)
+                .set(fps as f64);
+        }
+        if let Some(kbps) = health_packet.encoder_target_bitrate_kbps {
+            ENCODER_TARGET_BITRATE_KBPS
+                .with_label_values(&reporter_labels)
+                .set(kbps);
+        }
+        if let Some(ratio) = health_packet.encoder_bitrate_ratio {
+            ENCODER_BITRATE_RATIO
+                .with_label_values(&reporter_labels)
+                .set(ratio);
+        }
+
         // Process peer health data
         if !health_packet.peer_stats.is_empty() {
             // Snapshot display_name_map once (avoids locking per peer in the loop)
@@ -672,9 +722,22 @@ fn process_health_packet_to_metrics_pb(
                         .set(peer_data.frames_dropped_per_sec);
                 }
 
+                if let Some(total) = peer_data.decoder_errors_total {
+                    DECODER_ERRORS_TOTAL
+                        .with_label_values(&peer_labels)
+                        .set(total as f64);
+                }
+
                 // Audio packet loss
                 if peer_data.audio_packet_loss_pct > 0.0 {
                     AUDIO_PACKET_LOSS_PCT
+                        .with_label_values(&peer_labels)
+                        .set(peer_data.audio_packet_loss_pct);
+                }
+
+                // Audio concealment (new name, emitting alongside old for backward compat)
+                if peer_data.audio_packet_loss_pct > 0.0 {
+                    AUDIO_CONCEALMENT_PCT
                         .with_label_values(&peer_labels)
                         .set(peer_data.audio_packet_loss_pct);
                 }

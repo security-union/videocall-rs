@@ -189,6 +189,17 @@ pub fn Host(
             camera.shared_audio_tier_index(),
         );
 
+        // Wire encoder decision inputs + screen tier to health reporter for metrics
+        client.set_encoder_metric_sources(
+            camera.shared_encoder_fps_ratio(),
+            camera.shared_encoder_worst_peer_fps(),
+            camera.shared_encoder_bitrate_ratio(),
+            camera.shared_encoder_target_bitrate_kbps(),
+            screen.shared_screen_tier_index(),
+            camera.screen_sharing_flag(),
+            camera.shared_encoder_output_fps(),
+        );
+
         // Wire up encoder controls. The microphone encoder no longer needs
         // its own diagnostics channel — it reads audio tier settings from
         // the camera encoder's shared atomics.

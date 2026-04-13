@@ -130,7 +130,7 @@ pub struct VideoCallClientOptions {
     /// that audio from participants already in the call cannot be decoded and
     /// played back while the local user is not yet admitted.
     ///
-    /// Defaults to `true`; all existing call clients should keep it `true`.
+    /// Should be `true` for call participants; set to `false` only for observer/lobby clients.
     pub decode_media: bool,
 }
 
@@ -1113,6 +1113,10 @@ impl Inner {
             };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
+                // Observer/lobby clients must not receive encryption keys (defense-in-depth).
+                if !self.options.decode_media {
+                    return;
+                }
                 if !self.options.enable_e2ee {
                     return;
                 }
@@ -1141,6 +1145,10 @@ impl Inner {
                 }
             }
             Ok(PacketType::RSA_PUB_KEY) => {
+                // Observer/lobby clients must not receive encryption keys (defense-in-depth).
+                if !self.options.decode_media {
+                    return;
+                }
                 if !self.options.enable_e2ee {
                     return;
                 }

@@ -746,6 +746,7 @@ impl Handler<JoinRoom> for ChatServer {
                             session_recipient.clone(),
                             room_clone.clone(),
                             session_clone,
+                            observer,
                         )(msg)
                         {
                             error!("Error handling message: {}", e);
@@ -785,6 +786,7 @@ fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
     session: SessionId,
+    observer: bool,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
         if msg.subject == format!("room.{room}.{session}").replace(' ', "_").into() {
@@ -798,6 +800,43 @@ fn handle_msg(
                 return Ok(());
             }
         }
+
+        // Observer sessions (waiting room) must not receive media streams or
+        // encryption keys. The client-side `decode_media: false` check is
+        // bypassable (WASM patching, raw WebSocket capture, custom client),
+        // so the server enforces this as the authoritative filter.
+        //
+        // Fail-closed: if the payload cannot be parsed, drop it rather than
+        // risk forwarding an unknown/media packet to the observer.
+        if observer {
+            match PacketWrapper::parse_from_bytes(&msg.payload) {
+                Ok(pw) => {
+                    let pt = pw.packet_type;
+                    if pt == PacketType::MEDIA.into()
+                        || pt == PacketType::AES_KEY.into()
+                        || pt == PacketType::RSA_PUB_KEY.into()
+                    {
+                        trace!(
+                            "Dropping packet_type {:?} for observer session {} in room {}",
+                            pt,
+                            session,
+                            room
+                        );
+                        return Ok(());
+                    }
+                }
+                Err(_) => {
+                    trace!(
+                        "Dropping unparseable packet for observer session {} in room {} \
+                         (fail-closed)",
+                        session,
+                        room
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         let message = Message {
             msg: msg.payload.to_vec(),
             session,
@@ -2156,5 +2195,229 @@ mod tests {
                 .copied()
                 .unwrap_or(ConnectionState::Testing))
         }
+    }
+
+    // ==========================================================================
+    // Unit tests for `handle_msg` observer filtering
+    // ==========================================================================
+    //
+    // These tests exercise the closure returned by `handle_msg` in isolation.
+    // They do NOT require a NATS connection or `#[serial]` — they only need an
+    // actix runtime to start the RecordingSession actor.
+
+    /// Actor that records how many `Message`s it receives.
+    struct RecordingSession {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Actor for RecordingSession {
+        type Context = actix::Context<Self>;
+    }
+
+    impl Handler<Message> for RecordingSession {
+        type Result = ();
+        fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Build a minimal `async_nats::Message` with the given subject and payload.
+    fn make_nats_message(subject: &str, payload: Vec<u8>) -> async_nats::Message {
+        async_nats::Message {
+            subject: subject.into(),
+            payload: payload.into(),
+            reply: None,
+            headers: None,
+            status: None,
+            description: None,
+            length: 0,
+        }
+    }
+
+    /// Serialize a `PacketWrapper` with the given `PacketType`.
+    fn make_packet_bytes(packet_type: PacketType) -> Vec<u8> {
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = packet_type.into();
+        pw.user_id = b"test-user".to_vec();
+        pw.write_to_bytes()
+            .expect("PacketWrapper serialization should succeed")
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_observer_drops_media_packet() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "room1".to_string(),
+            9001,
+            true, // observer
+        );
+
+        let nats_msg = make_nats_message(
+            "room.room1.other_session",
+            make_packet_bytes(PacketType::MEDIA),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Observer must NOT receive MEDIA packets"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_observer_drops_aes_key_packet() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "room2".to_string(),
+            9002,
+            true, // observer
+        );
+
+        let nats_msg = make_nats_message(
+            "room.room2.other_session",
+            make_packet_bytes(PacketType::AES_KEY),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Observer must NOT receive AES_KEY packets"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_observer_drops_rsa_pub_key_packet() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "room3".to_string(),
+            9003,
+            true, // observer
+        );
+
+        let nats_msg = make_nats_message(
+            "room.room3.other_session",
+            make_packet_bytes(PacketType::RSA_PUB_KEY),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Observer must NOT receive RSA_PUB_KEY packets"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_observer_allows_meeting_packet() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "room4".to_string(),
+            9004,
+            true, // observer
+        );
+
+        let nats_msg = make_nats_message(
+            "room.room4.other_session",
+            make_packet_bytes(PacketType::MEETING),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "Observer MUST receive MEETING packets"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_observer_drops_unparseable_packet() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "room5".to_string(),
+            9005,
+            true, // observer
+        );
+
+        // Send garbage bytes that cannot be parsed as a PacketWrapper.
+        let nats_msg = make_nats_message(
+            "room.room5.other_session",
+            vec![0xFF, 0xFE, 0xFD, 0x00, 0x01],
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Observer must NOT receive unparseable packets (fail-closed)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_non_observer_forwards_media_packet() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "room6".to_string(),
+            9006,
+            false, // NOT an observer
+        );
+
+        let nats_msg = make_nats_message(
+            "room.room6.other_session",
+            make_packet_bytes(PacketType::MEDIA),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "Non-observer MUST receive MEDIA packets"
+        );
     }
 }

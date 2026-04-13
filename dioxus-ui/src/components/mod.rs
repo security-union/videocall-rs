@@ -4,6 +4,7 @@ pub mod attendants;
 pub mod browser_compatibility;
 pub mod call_timer;
 pub mod config_error;
+mod density;
 pub mod device_selector;
 pub mod device_settings_modal;
 pub mod diagnostics;

@@ -192,6 +192,7 @@ h3 {
   display: grid;
   grid-template-columns: repeat(4, 1fr); /* fallback; Rust overrides */
   grid-template-rows: repeat(3, 1fr);    /* fallback; Rust overrides */
+  /* Desktop gap/padding — keep in sync with attendants.rs (vw >= 568.0 branch) */
   gap: 16px;
   padding: 20px 20px 84px 20px;
   box-sizing: border-box;
@@ -244,9 +245,10 @@ h3 {
 
 /* ============================================================
    Mobile: narrower gap/padding
+   Keep breakpoint + values in sync with attendants.rs (vw < 568.0)
    ============================================================ */
 
-@media (max-width: 37.5em) {
+@media (max-width: 568px) {
   #grid-container {
     gap: 8px;
     padding: 8px 8px 72px 8px;

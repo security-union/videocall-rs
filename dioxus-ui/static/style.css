@@ -225,7 +225,7 @@ h3 {
   /* Border for visual separation */
   border: 2px solid rgba(100, 100, 100, 0.30);
   border-radius: 12px;
-  transition: border-color 0.3s ease-out, box-shadow 0.6s ease-out;
+  /* Speaking glow transition is driven by inline style from Rust speak_style(). */
 }
 
 /* --- data-peers rules removed: layout is now fully computed in Rust
@@ -374,7 +374,7 @@ canvas {
   max-width: 240px;
   border: 2px solid rgba(100, 100, 100, 0.30);
   border-radius: 12px;
-  transition: border-color 0.3s ease-out, box-shadow 0.6s ease-out;
+  /* Speaking glow transition is driven by inline style from Rust speak_style(). */
   z-index: 10;
   background-color: #1c1c1c;
   display: flex;
@@ -2270,8 +2270,9 @@ select {
   justify-content: center;
   overflow: hidden;
   background-color: #2d2d2d;
-  border: 2px solid rgb(68, 68, 68);
-  border-radius: 10px;
+  border: 2px solid rgba(100, 100, 100, 0.30);
+  border-radius: 12px;
+  /* Speaking glow transition is driven by inline style from Rust speak_style(). */
 }
 
 .split-peer-tile .canvas-container {

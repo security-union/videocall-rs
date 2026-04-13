@@ -936,4 +936,24 @@ mod tests {
     fn tile_mode_default_is_full() {
         assert_eq!(TileMode::default(), TileMode::Full);
     }
+
+    // -- is_speaking_suppressed -----------------------------------------------
+
+    /// No peer is pinned → glow is never suppressed.
+    #[test]
+    fn suppressed_no_pin_returns_false() {
+        assert!(!is_speaking_suppressed(false, None));
+    }
+
+    /// The pinned peer itself → glow is NOT suppressed.
+    #[test]
+    fn suppressed_pinned_peer_returns_false() {
+        assert!(!is_speaking_suppressed(true, Some("alice")));
+    }
+
+    /// A non-pinned peer while another peer is pinned → glow IS suppressed.
+    #[test]
+    fn suppressed_non_pinned_while_pin_active_returns_true() {
+        assert!(is_speaking_suppressed(false, Some("alice")));
+    }
 }

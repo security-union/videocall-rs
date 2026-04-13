@@ -42,6 +42,7 @@ use crate::context::{
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::error;
@@ -447,6 +448,7 @@ pub fn AttendantsComponent(
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
+    let mut host_el = use_signal(|| Option::<web_sys::Element>::None);
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
@@ -992,6 +994,25 @@ pub fn AttendantsComponent(
         closure.forget();
     });
 
+    // Host self-view speaking glow — update DOM directly to avoid re-rendering
+    // the entire meeting view on every audio-level tick.
+    // Note: host glow is intentionally not suppressed by pin state so the local
+    // user always has visible speaking feedback on their own self-view.
+    use_effect(move || {
+        let audio_level = local_audio_level();
+        let speaking = local_speaking();
+        let class = if speaking {
+            "host speaking-tile"
+        } else {
+            "host"
+        };
+        let style = speak_style(audio_level, speaking);
+        if let Some(el) = host_el() {
+            let _ = el.set_attribute("class", class);
+            let _ = el.set_attribute("style", &style);
+        }
+    });
+
     // Check for config errors
     use_effect(move || {
         if let Err(e) = crate::constants::app_config() {
@@ -1253,18 +1274,24 @@ pub fn AttendantsComponent(
 
     info!("Rendering meeting view with {} peers", display_peers.len());
 
-    // Host self-view speaking glow
-    let host_audio = local_audio_level();
-    let host_is_speaking = local_speaking();
-    let host_class = if host_is_speaking {
-        "host speaking-tile"
-    } else {
-        "host"
-    };
-    let host_style = speak_style(host_audio, host_is_speaking);
-
     // Pinned peer glow: read current pinned value for PeerTile props
     let current_pinned = pinned_peer_id();
+
+    let toggle_pin = {
+        let client = client.clone();
+        move |pid: String| {
+            // pid is already a user_id from canvas_generator.rs.
+            // Keep normalization defensive in case a session_id is passed in the future.
+            let normalized = client.get_peer_user_id(&pid).unwrap_or_else(|| pid.clone());
+
+            let cur = pinned_peer_id();
+            if cur.as_deref() == Some(normalized.as_str()) {
+                pinned_peer_id.set(None);
+            } else {
+                pinned_peer_id.set(Some(normalized));
+            }
+        }
+    };
 
     rsx! {
         div {
@@ -1365,18 +1392,7 @@ pub fn AttendantsComponent(
                                     render_mode: TileMode::ScreenOnly,
                                     my_peer_id: user_id.clone(),
                                     pinned_peer_id: current_pinned.clone(),
-                                    on_toggle_pin: {
-                                        let client = client.clone();
-                                        move |pid: String| {
-                                            let normalized = client.get_peer_user_id(&pid).unwrap_or_else(|| pid.clone());
-                                            let cur = pinned_peer_id();
-                                            if cur.as_deref() == Some(normalized.as_str()) {
-                                                pinned_peer_id.set(None);
-                                            } else {
-                                                pinned_peer_id.set(Some(normalized));
-                                            }
-                                        }
-                                    },
+                                    on_toggle_pin: toggle_pin.clone(),
                                 }
                             }
                         }
@@ -1391,18 +1407,7 @@ pub fn AttendantsComponent(
                                     render_mode: TileMode::VideoOnly,
                                     my_peer_id: user_id.clone(),
                                     pinned_peer_id: current_pinned.clone(),
-                                    on_toggle_pin: {
-                                        let client = client.clone();
-                                        move |pid: String| {
-                                            let normalized = client.get_peer_user_id(&pid).unwrap_or_else(|| pid.clone());
-                                            let cur = pinned_peer_id();
-                                            if cur.as_deref() == Some(normalized.as_str()) {
-                                                pinned_peer_id.set(None);
-                                            } else {
-                                                pinned_peer_id.set(Some(normalized));
-                                            }
-                                        }
-                                    },
+                                    on_toggle_pin: toggle_pin.clone(),
                                 }
                             }
                         }
@@ -1420,18 +1425,7 @@ pub fn AttendantsComponent(
                                         host_user_id: host_user_id.clone(),
                                         my_peer_id: user_id.clone(),
                                         pinned_peer_id: current_pinned.clone(),
-                                        on_toggle_pin: {
-                                            let client = client.clone();
-                                            move |pid: String| {
-                                                let normalized = client.get_peer_user_id(&pid).unwrap_or_else(|| pid.clone());
-                                                let cur = pinned_peer_id();
-                                                if cur.as_deref() == Some(normalized.as_str()) {
-                                                    pinned_peer_id.set(None);
-                                                } else {
-                                                    pinned_peer_id.set(Some(normalized));
-                                                }
-                                            }
-                                        },
+                                        on_toggle_pin: toggle_pin.clone(),
                                     }
                                 }
                             }
@@ -1508,8 +1502,13 @@ pub fn AttendantsComponent(
                     // Controls nav
                     if can_stream {
                         nav { id: "host-controls-nav",
-                            class: "{host_class}",
-                            style: "{host_style}",
+                            class: "host",
+                            style: "{speak_style(0.0, false)}",
+                            onmounted: move |evt| {
+                                if let Some(elem) = evt.try_as_web_event() {
+                                    host_el.set(Some(elem));
+                                }
+                            },
                             div { class: "controls",
                                 nav { class: "video-controls-container",
                                     {

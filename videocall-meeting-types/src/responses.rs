@@ -154,6 +154,9 @@ pub struct ParticipantStatusResponse {
     pub display_name: Option<String>,
     pub status: String,
     pub is_host: bool,
+    /// Whether this participant joined as an unauthenticated guest.
+    #[serde(default)]
+    pub is_guest: bool,
     /// Unix timestamp in seconds when the participant joined/entered the waiting room.
     pub joined_at: i64,
     /// Unix timestamp in seconds when the participant was admitted, or `null`.

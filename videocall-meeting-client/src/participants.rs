@@ -124,6 +124,18 @@ impl MeetingApiClient {
         parse_api_response(response).await
     }
 
+    /// Leave a meeting as an unauthenticated guest.
+    ///
+    /// Calls `POST /api/v1/meetings/{meeting_id}/leave-guest`.
+    pub async fn leave_meeting_as_guest(
+        &self,
+        meeting_id: &str,
+    ) -> Result<ParticipantStatusResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/leave-guest");
+        let response = self.post(&path).send().await?;
+        parse_api_response(response).await
+    }
+
     /// Update your display name during an active meeting.
     ///
     /// Calls `PUT /api/v1/meetings/{meeting_id}/display-name`.

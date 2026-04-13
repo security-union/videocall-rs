@@ -19,7 +19,7 @@ use axum::{
 };
 use chrono::Utc;
 use videocall_meeting_types::{
-    requests::{JoinMeetingRequest, UpdateDisplayNameRequest},
+    requests::{GuestJoinRequest, JoinMeetingRequest, UpdateDisplayNameRequest},
     responses::{APIResponse, ParticipantStatusResponse},
 };
 
@@ -79,6 +79,7 @@ pub async fn join_meeting(
             &meeting_id,
             true,
             display_name.unwrap_or(&user_id),
+            false,
         )?;
 
         let mut resp = row.into_participant_status(Some(token));
@@ -96,6 +97,7 @@ pub async fn join_meeting(
             &meeting_id,
             display_name,
             &user_id,
+            false,
         )
         .await
     }
@@ -113,15 +115,15 @@ async fn join_as_attendee(
     meeting_id: &str,
     display_name: Option<&str>,
     fallback_display_name: &str,
+    is_guest: bool,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let current_state = meeting.state.as_deref().unwrap_or("idle");
     if current_state != "active" {
-        // Meeting exists but isn't active yet. Return a "waiting_for_meeting"
-        // status with an observer token so the client can receive a push
-        // notification when the host activates the meeting.
         let dn = display_name.unwrap_or(fallback_display_name);
-        let observer = generate_observer_token(&state.jwt_secret, user_id, meeting_id, dn)?;
+        let observer =
+            generate_observer_token(&state.jwt_secret, user_id, meeting_id, dn, is_guest)?;
         let resp = ParticipantStatusResponse {
+            is_guest,
             user_id: user_id.to_string(),
             display_name: display_name.map(String::from),
             status: "waiting_for_meeting".to_string(),
@@ -142,7 +144,8 @@ async fn join_as_attendee(
     // Atomically check waiting_room_enabled and insert participant in one
     // transaction, using FOR UPDATE to serialize against concurrent toggles.
     let (auto_admitted, row, waiting_room_enabled) =
-        db_participants::join_attendee(&state.db, meeting.id, user_id, display_name).await?;
+        db_participants::join_attendee(&state.db, meeting.id, user_id, display_name, is_guest)
+            .await?;
 
     let token = if auto_admitted {
         Some(generate_room_token(
@@ -152,6 +155,7 @@ async fn join_as_attendee(
             meeting_id,
             false,
             display_name.unwrap_or(fallback_display_name),
+            is_guest,
         )?)
     } else {
         None
@@ -167,6 +171,7 @@ async fn join_as_attendee(
             user_id,
             meeting_id,
             dn,
+            is_guest,
         )?);
         // Notify the host that the waiting room list has changed.
         nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
@@ -185,22 +190,16 @@ async fn join_as_attendee(
 pub async fn join_meeting_as_guest(
     State(state): State<AppState>,
     Path(meeting_id): Path<String>,
-    body: Json<JoinMeetingRequest>,
+    body: Json<GuestJoinRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let display_name = body
-        .display_name
-        .as_deref()
-        .map(|n| validate_display_name(n).map_err(|e| AppError::invalid_input(&e)))
-        .transpose()?;
-    let display_name = display_name.as_deref();
+    let display_name =
+        validate_display_name(&body.display_name).map_err(|e| AppError::invalid_input(&e))?;
+    let display_name = display_name.as_str();
 
-    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
-        .await?
-        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
-
-    if !meeting.allow_guests {
-        return Err(AppError::guests_not_allowed(&meeting_id));
-    }
+    let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
+        Some(m) if m.allow_guests => m,
+        _ => return Err(AppError::guests_not_allowed()),
+    };
 
     // Guests are treated as attendees but without a user_id. Use a special
     // "guest:{uuid}" format for the participant record and tokens.
@@ -211,8 +210,9 @@ pub async fn join_meeting_as_guest(
         meeting,
         &guest_user_id,
         &meeting_id,
-        display_name,
+        Some(display_name),
         "Guest",
+        true,
     )
     .await
 }
@@ -246,6 +246,7 @@ pub async fn get_my_status(
             &meeting_id,
             row.is_host,
             row.display_name.as_deref().unwrap_or(&user_id),
+            false,
         )?)
     } else {
         None
@@ -302,6 +303,7 @@ pub async fn get_guest_status(
             &meeting_id,
             false,
             row.display_name.as_deref().unwrap_or(&user_id),
+            true,
         )?)
     } else {
         None
@@ -340,6 +342,40 @@ pub async fn leave_meeting(
             db_meetings::end_meeting(&state.db, meeting.id).await?;
         }
     }
+
+    Ok(Json(APIResponse::ok(row.into_participant_status(None))))
+}
+
+/// POST /api/v1/meetings/{meeting_id}/leave-guest
+///
+/// Allows a guest participant to cleanly leave and remove their row from the
+/// waiting room.
+pub async fn leave_meeting_as_guest(
+    State(state): State<AppState>,
+    GuestObserver {
+        user_id,
+        meeting_id: token_meeting_id,
+        ..
+    }: GuestObserver,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    if token_meeting_id != meeting_id {
+        return Err(AppError::unauthorized_msg(
+            "observer token is not valid for this meeting",
+        ));
+    }
+
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    let row = match db_participants::leave(&state.db, meeting.id, &user_id).await? {
+        Some(r) => r,
+        None => return Err(AppError::not_in_meeting()),
+    };
+
+    // Notify the host that the waiting room list changed.
+    nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id).await;
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }

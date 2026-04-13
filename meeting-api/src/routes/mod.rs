@@ -148,6 +148,10 @@ pub fn router() -> Router<AppState> {
             post(participants::leave_meeting),
         )
         .route(
+            "/api/v1/meetings/{meeting_id}/leave-guest",
+            post(participants::leave_meeting_as_guest),
+        )
+        .route(
             "/api/v1/meetings/{meeting_id}/status",
             get(participants::get_my_status),
         )

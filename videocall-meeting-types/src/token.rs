@@ -52,6 +52,10 @@ pub struct RoomAccessTokenClaims {
     /// Whether this participant is the meeting host.
     pub is_host: bool,
 
+    /// Whether this participant joined as an unauthenticated guest.
+    #[serde(default)]
+    pub is_guest: bool,
+
     /// Participant's chosen display name for this meeting.
     pub display_name: String,
 

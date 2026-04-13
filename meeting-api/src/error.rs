@@ -108,11 +108,8 @@ impl AppError {
         )
     }
 
-    pub fn guests_not_allowed(meeting_id: &str) -> Self {
-        Self::new(
-            StatusCode::FORBIDDEN,
-            APIError::guests_not_allowed(meeting_id),
-        )
+    pub fn guests_not_allowed() -> Self {
+        Self::new(StatusCode::FORBIDDEN, APIError::guests_not_allowed())
     }
 }
 

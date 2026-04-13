@@ -140,3 +140,26 @@ pub async fn join_meeting_as_guest(
     );
     Ok(result)
 }
+
+/// Leave a meeting as a guest, authenticated via the observer JWT that was
+/// issued at join time. Calls `POST /api/v1/meetings/{meeting_id}/leave-guest`.
+pub async fn leave_meeting_as_guest(
+    meeting_id: &str,
+    observer_token: &str,
+) -> Result<(), JoinError> {
+    log::info!("Guest leaving meeting via API: {meeting_id}");
+    match make_guest_client(observer_token)?
+        .leave_meeting_as_guest(meeting_id)
+        .await
+    {
+        Ok(_) => {
+            log::info!("Guest successfully left meeting {meeting_id}");
+            Ok(())
+        }
+        Err(JoinError::NotFound(_)) => {
+            log::warn!("Guest row not found for meeting {meeting_id} when trying to leave");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}

@@ -325,8 +325,9 @@ pub fn GuestJoinPage(id: String) -> Element {
         let meeting_id = id.clone();
         move |_| {
             let meeting_id = meeting_id.clone();
+            let token = observer_token_signal().unwrap_or_default();
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = crate::meeting_api::leave_meeting(&meeting_id).await;
+                let _ = crate::meeting_api::leave_meeting_as_guest(&meeting_id, &token).await;
                 if let Some(w) = web_sys::window() {
                     let _ = w.location().set_href("/");
                 }
@@ -351,6 +352,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                     host_user_id: host_user_id.clone(),
                     auto_join: should_auto_join,
                     is_owner: false,
+                    is_guest: true,
                     room_token: room_token.clone(),
                     waiting_room_enabled: *waiting_room_enabled,
                     admitted_can_admit: *admitted_can_admit,
@@ -496,7 +498,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                                             }
                                             div {
                                                 class: "input-apple",
-                                                style: "opacity: 0.7; cursor: default; user-select: all;",
+                                                style: "opacity: 0.7; cursor: default; user-select: all; display: flex; align-items: center;",
                                                 "{id}"
                                             }
                                         }

@@ -142,10 +142,10 @@ impl APIError {
         }
     }
 
-    pub fn guests_not_allowed(meeting_id: &str) -> Self {
+    pub fn guests_not_allowed() -> Self {
         Self {
             code: "GUESTS_NOT_ALLOWED".to_string(),
-            message: format!("Meeting '{meeting_id}' does not allow guest attendees"),
+            message: "Unable to join this meeting as a guest.".to_string(),
             engineering_error: None,
         }
     }

@@ -25,6 +25,7 @@ pub struct ParticipantRow {
     pub user_id: String,
     pub status: String,
     pub is_host: bool,
+    pub is_guest: bool,
     pub is_required: bool,
     pub joined_at: DateTime<Utc>,
     pub admitted_at: Option<DateTime<Utc>>,
@@ -35,7 +36,7 @@ pub struct ParticipantRow {
 }
 
 const PARTICIPANT_COLUMNS: &str = r#"
-    id, meeting_id, user_id, status, is_host, is_required,
+    id, meeting_id, user_id, status, is_host, is_guest, is_required,
     joined_at, admitted_at, left_at, created_at, updated_at, display_name
 "#;
 
@@ -48,8 +49,8 @@ pub async fn upsert_host(
 ) -> Result<ParticipantRow, sqlx::Error> {
     let query = format!(
         r#"
-        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
-        VALUES ($1, $2, 'admitted', TRUE, $3, NOW())
+        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, admitted_at)
+        VALUES ($1, $2, 'admitted', TRUE, FALSE, $3, NOW())
         ON CONFLICT (meeting_id, user_id)
         DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(), left_at = NULL,
                       display_name = COALESCE($3, meeting_participants.display_name)
@@ -77,6 +78,7 @@ pub async fn join_attendee(
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
+    is_guest: bool,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
@@ -90,8 +92,8 @@ pub async fn join_attendee(
     let row = if waiting_room_enabled {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name)
-            VALUES ($1, $2, 'waiting', FALSE, $3)
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name)
+            VALUES ($1, $2, 'waiting', FALSE, $4, $3)
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'waiting', left_at = NULL,
                           display_name = COALESCE($3, meeting_participants.display_name)
@@ -102,13 +104,14 @@ pub async fn join_attendee(
             .bind(meeting_id)
             .bind(user_id)
             .bind(display_name)
+            .bind(is_guest)
             .fetch_one(&mut *tx)
             .await?
     } else {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
-            VALUES ($1, $2, 'admitted', FALSE, $3, NOW())
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, admitted_at)
+            VALUES ($1, $2, 'admitted', FALSE, $4, $3, NOW())
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
                           display_name = COALESCE($3, meeting_participants.display_name)
@@ -119,6 +122,7 @@ pub async fn join_attendee(
             .bind(meeting_id)
             .bind(user_id)
             .bind(display_name)
+            .bind(is_guest)
             .fetch_one(&mut *tx)
             .await?
     };
@@ -305,6 +309,7 @@ impl ParticipantRow {
         room_token: Option<String>,
     ) -> videocall_meeting_types::responses::ParticipantStatusResponse {
         videocall_meeting_types::responses::ParticipantStatusResponse {
+            is_guest: self.is_guest,
             user_id: self.user_id,
             display_name: self.display_name,
             status: self.status,

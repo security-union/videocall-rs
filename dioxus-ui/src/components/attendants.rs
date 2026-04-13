@@ -399,6 +399,7 @@ pub fn AttendantsComponent(
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] auto_join: bool,
     #[props(default)] is_owner: bool,
+    #[props(default)] is_guest: bool,
     #[props(default)] room_token: String,
     #[props(default = true)] waiting_room_enabled: bool,
     #[props(default)] admitted_can_admit: bool,
@@ -1600,6 +1601,8 @@ pub fn AttendantsComponent(
                                     {
                                         let hangup_client = client.clone();
                                         let hangup_id = id.clone();
+                                        let hangup_is_guest = is_guest;
+                                        let hangup_room_token = room_token.clone();
                                         rsx! {
                                             HangUpButton {
                                                 onclick: move |_| {
@@ -1618,8 +1621,11 @@ pub fn AttendantsComponent(
                                                     meeting_start_time_server.set(None);
 
                                                     let meeting_id = hangup_id.clone();
+                                                    let room_token = hangup_room_token.clone();
                                                     wasm_bindgen_futures::spawn_local(async move {
-                                                        if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
+                                                        if hangup_is_guest {
+                                                            let _ = crate::meeting_api::leave_meeting_as_guest(&meeting_id, &room_token).await;
+                                                        } else if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
                                                             log::error!("Error leaving meeting: {e}");
                                                         }
                                                         let _ = window().location().set_href("/");
@@ -1691,7 +1697,7 @@ pub fn AttendantsComponent(
                                     reload_devices_counter: reload_devices_counter(),
                                 }
                             }
-                            if user_id.as_deref().unwrap_or("").starts_with("guest:") {
+                            if is_guest {
                                 div { class: "guest-badge-preview", "Guest" }
                             }
                             {

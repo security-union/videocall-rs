@@ -181,7 +181,7 @@ impl FromRequestParts<AppState> for GuestObserver {
         let token = extract_bearer_token(parts)
             .ok_or_else(|| AppError::unauthorized_msg("missing Authorization: Bearer header"))?;
 
-        let claims = token::decode_observer_token(&state.jwt_secret, &token)?;
+        let claims = token::decode_guest_token(&state.jwt_secret, &token)?;
 
         Ok(GuestObserver {
             user_id: claims.sub,

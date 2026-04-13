@@ -73,6 +73,13 @@ pub struct JoinMeetingRequest {
     pub display_name: Option<String>,
 }
 
+/// Request body for `POST /api/v1/meetings/{meeting_id}/join-guest`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GuestJoinRequest {
+    /// Display name shown in the meeting UI. Must be provided by the caller.
+    pub display_name: String,
+}
+
 /// Request body for `PUT /api/v1/meetings/{meeting_id}/display-name`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UpdateDisplayNameRequest {

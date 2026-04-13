@@ -523,4 +523,83 @@ test.describe("Speaker highlight glow on video tiles", () => {
       await browser.close();
     }
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 8. Pinned peer leaves → pin state resets
+  //
+  // Regression test: when a pinned peer disconnects, the UI must:
+  //   a. Remove the grid-item-pinned class from the DOM
+  //   b. Keep the host's own glow infrastructure functional so speaking
+  //      glow can still trigger for any remaining/future peers
+  //
+  // The underlying fix clears pinned_peer_id to None when the pinned
+  // peer is no longer in the display_peers list, which in turn stops
+  // is_speaking_suppressed() from suppressing glow for everyone.
+  // ──────────────────────────────────────────────────────────────────────
+  test("pinned peer leaving resets pin state and preserves glow infrastructure", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pinleave_${Date.now()}`;
+
+    const { hostPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "PinLeaveHost",
+      "PinLeaveGuest",
+    );
+
+    try {
+      // ---- Step 1: Pin the guest's tile on the host side ----
+      const outerTile = hostPage.locator("#grid-container .grid-item").first();
+      await expect(outerTile).toBeVisible({ timeout: 10_000 });
+
+      // Hover to reveal the pin icon
+      await outerTile.hover();
+      await hostPage.waitForTimeout(500);
+
+      const pinButton = outerTile.locator(".pin-icon");
+      await expect(pinButton.first()).toBeVisible({ timeout: 5_000 });
+      await pinButton.first().click({ force: true });
+      await hostPage.waitForTimeout(1000);
+
+      // Verify the tile is pinned (has grid-item-pinned class)
+      const pinnedTiles = hostPage.locator(".grid-item-pinned");
+      await expect(pinnedTiles).toHaveCount(1, { timeout: 5_000 });
+
+      // ---- Step 2: Guest leaves by closing their browser ----
+      await browser2.close();
+
+      // ---- Step 3: Wait for the peer tile to disappear ----
+      // The host should detect the peer disconnect and remove the tile.
+      await expect(hostPage.locator("#grid-container .grid-item")).toHaveCount(0, {
+        timeout: 30_000,
+      });
+
+      // ---- Step 4: Verify pin state is fully cleared ----
+      // No element in the DOM should retain the grid-item-pinned class.
+      const stalePinned = hostPage.locator(".grid-item-pinned");
+      await expect(stalePinned).toHaveCount(0);
+
+      // ---- Step 5: Host's own glow infrastructure still functional ----
+      // #host-controls-nav should still have proper speak_style() output
+      // (transition + box-shadow) so that glow can activate if a new peer
+      // joins and speaks.
+      const hostNav = hostPage.locator("#host-controls-nav");
+      await expect(hostNav).toBeVisible({ timeout: 10_000 });
+
+      const navStyle = await hostNav.getAttribute("style");
+      expect(navStyle).toBeTruthy();
+      expect(navStyle).toContain("box-shadow");
+      expect(navStyle).toContain("transition:");
+
+      const navClass = await hostNav.getAttribute("class");
+      expect(navClass).toContain("host");
+      expect(navClass).not.toContain("speaking-tile");
+    } finally {
+      // browser2 already closed above; close browser1
+      await browser1.close();
+    }
+  });
 });

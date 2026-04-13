@@ -1001,14 +1001,14 @@ pub fn AttendantsComponent(
     use_effect(move || {
         let audio_level = local_audio_level();
         let speaking = local_speaking();
-        let class = if speaking {
-            "host speaking-tile"
-        } else {
-            "host"
-        };
         let style = speak_style(audio_level, speaking);
         if let Some(el) = host_el() {
-            let _ = el.set_attribute("class", class);
+            let cl = el.class_list();
+            if speaking {
+                let _ = cl.add_1("speaking-tile");
+            } else {
+                let _ = cl.remove_1("speaking-tile");
+            }
             let _ = el.set_attribute("style", &style);
         }
     });
@@ -1273,6 +1273,20 @@ pub fn AttendantsComponent(
     });
 
     info!("Rendering meeting view with {} peers", display_peers.len());
+
+    // Clear stale pin: if the pinned peer left the meeting, reset to None so
+    // that is_speaking_suppressed() no longer suppresses glow for everyone.
+    {
+        let current_pinned = pinned_peer_id();
+        if let Some(ref pid) = current_pinned {
+            let still_exists = display_peers
+                .iter()
+                .any(|peer_id| client.get_peer_user_id(peer_id).as_deref() == Some(pid));
+            if !still_exists {
+                pinned_peer_id.set(None);
+            }
+        }
+    }
 
     // Pinned peer glow: read current pinned value for PeerTile props
     let current_pinned = pinned_peer_id();

@@ -56,6 +56,7 @@ use crate::adaptive_quality_constants::{
     BITRATE_CHANGE_THRESHOLD, ENCODER_PLI_COOLDOWN_MS, SCREEN_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
+use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 
 /// Events emitted by [ScreenEncoder] to notify about screen share state changes.
@@ -112,6 +113,8 @@ pub struct ScreenEncoder {
     screen_sharing_active: Option<Rc<AtomicBool>>,
     /// Current screen share quality tier index (0=high, 1=medium, 2=low).
     shared_screen_tier_index: Rc<AtomicU32>,
+    /// Tier transition events buffer, drained by health reporter.
+    shared_tier_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
 }
 
 impl ScreenEncoder {
@@ -146,6 +149,7 @@ impl ScreenEncoder {
             screen_sharing_active: None,
             // Default to tier 1 (medium) matching DEFAULT_SCREEN_TIER_INDEX.
             shared_screen_tier_index: Rc::new(AtomicU32::new(1)),
+            shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -162,6 +166,11 @@ impl ScreenEncoder {
         self.shared_screen_tier_index.clone()
     }
 
+    /// Returns the shared tier transitions buffer for health reporting.
+    pub fn shared_tier_transitions(&self) -> Rc<RefCell<Vec<TierTransitionRecord>>> {
+        self.shared_tier_transitions.clone()
+    }
+
     pub fn set_encoder_control(
         &mut self,
         mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
@@ -174,6 +183,7 @@ impl ScreenEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let shared_screen_tier_idx = self.shared_screen_tier_index.clone();
+        let shared_tier_transitions = self.shared_tier_transitions.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control =
                 EncoderBitrateController::new_for_screen(current_fps.clone(), SCREEN_QUALITY_TIERS);
@@ -213,6 +223,15 @@ impl ScreenEncoder {
                         tier.target_fps,
                         tier.keyframe_interval_frames,
                     );
+                }
+
+                // Drain tier transitions, overriding stream to "screen".
+                let mut transitions = encoder_control.drain_tier_transitions();
+                for t in &mut transitions {
+                    t.stream = "screen";
+                }
+                if !transitions.is_empty() {
+                    shared_tier_transitions.borrow_mut().extend(transitions);
                 }
             }
         });

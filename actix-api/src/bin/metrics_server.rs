@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use actix_web::{web, App, HttpResponse, HttpServer, Result};
 use async_nats::{Client, Message};
 use futures::StreamExt;
@@ -54,7 +56,8 @@ use sec_api::metrics::{
     NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
     NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
     PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    SCREEN_SHARING_ACTIVE, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, VIDEO_BITRATE_KBPS, VIDEO_FPS,
+    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
+    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
     VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS_TOTAL,
 };
 
@@ -256,7 +259,7 @@ fn remove_per_peer_metrics(
         peer_display_name,
     ];
 
-    // Per-peer metrics (18 kept, 7 low-value ones removed for cardinality reduction)
+    // Per-peer metrics (22 kept, 7 low-value ones removed for cardinality reduction)
     let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
     let _ = PEER_CAN_SEE.remove_label_values(&labels);
     let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
@@ -277,6 +280,8 @@ fn remove_per_peer_metrics(
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
     let _ = DECODER_ERRORS_TOTAL.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_FPS.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_BITRATE_KBPS.remove_label_values(&labels);
 }
 
 fn process_health_packet_to_metrics_pb(
@@ -591,6 +596,23 @@ fn process_health_packet_to_metrics_pb(
                 .set(ratio);
         }
 
+        // Tier transition events (P2): increment counter for each transition
+        for t in &health_packet.tier_transitions {
+            TIER_TRANSITIONS_TOTAL
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    &reporter_display_name,
+                    &t.direction,
+                    &t.stream,
+                    &t.from_tier,
+                    &t.to_tier,
+                    &t.trigger,
+                ])
+                .inc();
+        }
+
         // Process peer health data
         if !health_packet.peer_stats.is_empty() {
             // Snapshot display_name_map once (avoids locking per peer in the loop)
@@ -715,6 +737,20 @@ fn process_health_packet_to_metrics_pb(
                     }
                 }
 
+                // Screen video metrics (separate from camera)
+                if let Some(screen_stats) = peer_data.screen_video_stats.as_ref() {
+                    if screen_stats.fps_received != 0.0 {
+                        SCREEN_VIDEO_FPS
+                            .with_label_values(&peer_labels)
+                            .set(screen_stats.fps_received);
+                    }
+                    if screen_stats.bitrate_kbps != 0 {
+                        SCREEN_VIDEO_BITRATE_KBPS
+                            .with_label_values(&peer_labels)
+                            .set(screen_stats.bitrate_kbps as f64);
+                    }
+                }
+
                 // Decode errors
                 if peer_data.frames_dropped_per_sec > 0.0 {
                     VIDEO_FRAMES_DROPPED
@@ -736,11 +772,10 @@ fn process_health_packet_to_metrics_pb(
                 }
 
                 // Audio concealment (new name, emitting alongside old for backward compat)
-                if peer_data.audio_packet_loss_pct > 0.0 {
-                    AUDIO_CONCEALMENT_PCT
-                        .with_label_values(&peer_labels)
-                        .set(peer_data.audio_packet_loss_pct);
-                }
+                // Always set — allows gauge to recover to 0.0 when concealment clears
+                AUDIO_CONCEALMENT_PCT
+                    .with_label_values(&peer_labels)
+                    .set(peer_data.audio_packet_loss_pct);
 
                 // Quality scores
                 if let Some(score) = peer_data.audio_quality_score {

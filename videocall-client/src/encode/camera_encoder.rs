@@ -23,6 +23,7 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
@@ -59,6 +60,7 @@ use crate::adaptive_quality_constants::{
     AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, ENCODER_PLI_COOLDOWN_MS, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
+use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 
 use futures::channel::mpsc::UnboundedReceiver;
@@ -122,6 +124,8 @@ pub struct CameraEncoder {
     shared_encoder_bitrate_ratio: Rc<AtomicU32>,
     /// PID target bitrate kbps from the encoder control loop (f32 bits in AtomicU32).
     shared_encoder_target_bitrate_kbps: Rc<AtomicU32>,
+    /// Tier transition events buffer, drained by health reporter each health packet.
+    shared_tier_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
 }
 
 impl CameraEncoder {
@@ -170,6 +174,7 @@ impl CameraEncoder {
             shared_encoder_worst_peer_fps: Rc::new(AtomicU32::new(0)),
             shared_encoder_bitrate_ratio: Rc::new(AtomicU32::new(0)),
             shared_encoder_target_bitrate_kbps: Rc::new(AtomicU32::new(0)),
+            shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -194,6 +199,7 @@ impl CameraEncoder {
         let shared_encoder_worst_peer_fps = self.shared_encoder_worst_peer_fps.clone();
         let shared_encoder_bitrate_ratio = self.shared_encoder_bitrate_ratio.clone();
         let shared_encoder_target_bitrate_kbps = self.shared_encoder_target_bitrate_kbps.clone();
+        let shared_tier_transitions = self.shared_tier_transitions.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -242,6 +248,12 @@ impl CameraEncoder {
                     (encoder_control.last_target_bitrate_kbps() as f32).to_bits(),
                     Ordering::Relaxed,
                 );
+
+                // Drain tier transitions into shared buffer for health reporting.
+                let transitions = encoder_control.drain_tier_transitions();
+                if !transitions.is_empty() {
+                    shared_tier_transitions.borrow_mut().extend(transitions);
+                }
 
                 if let Some(bitrate) = output_wasted {
                     if enabled.load(Ordering::Acquire) {
@@ -360,6 +372,11 @@ impl CameraEncoder {
     /// Returns the encoder target bitrate kbps atomic (f32 bits).
     pub fn shared_encoder_target_bitrate_kbps(&self) -> Rc<AtomicU32> {
         self.shared_encoder_target_bitrate_kbps.clone()
+    }
+
+    /// Returns the shared tier transitions buffer for health reporting.
+    pub fn shared_tier_transitions(&self) -> Rc<RefCell<Vec<TierTransitionRecord>>> {
+        self.shared_tier_transitions.clone()
     }
 
     /// Returns a shared reference to the force-keyframe flag.

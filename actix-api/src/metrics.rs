@@ -487,6 +487,43 @@ lazy_static! {
     )
     .expect("Failed to create decoder_errors_total metric");
 
+    // ===== SCREEN SHARE PER-PEER METRICS =====
+
+    /// Screen share FPS observed by receiver
+    pub static ref SCREEN_VIDEO_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_fps",
+        "Screen share frames per second observed by the receiver",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create screen_video_fps metric");
+
+    /// Screen share bitrate observed by receiver (kbps)
+    pub static ref SCREEN_VIDEO_BITRATE_KBPS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_bitrate_kbps",
+        "Screen share bitrate observed by the receiver in kbps",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create screen_video_bitrate_kbps metric");
+
+    // ===== TIER TRANSITION COUNTER =====
+    //
+    // CARDINALITY NOTE: 9-label CounterVec. The from_tier/to_tier labels create
+    // one series per unique tier transition pair per session. Hysteresis timers
+    // (3s min interval) limit practical growth to ~10-20 combos per session.
+    // At scale targets (15 meetings × 20 users) expect ~4,500 series.
+    // CounterVec series are NOT cleaned up on session disconnect (counters are
+    // cumulative); they expire via Prometheus metric_relabel_configs TTL.
+    // If cardinality grows beyond expectations, drop from_tier/to_tier labels.
+
+    /// Cumulative tier transition events
+    pub static ref TIER_TRANSITIONS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_tier_transition_total",
+        "Cumulative tier transitions by direction, stream, and trigger",
+        &["meeting_id", "session_id", "peer_id", "display_name",
+          "direction", "stream", "from_tier", "to_tier", "trigger"]
+    )
+    .expect("Failed to create tier_transition_total metric");
+
     // ===== RELAY SERVER-SIDE METRICS (in-process on relay binaries) =====
     //
     // CARDINALITY NOTE: These metrics use `room` (meeting_id) as a label.

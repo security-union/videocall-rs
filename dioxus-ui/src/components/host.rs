@@ -198,6 +198,8 @@ pub fn Host(
             screen.shared_screen_tier_index(),
             camera.screen_sharing_flag(),
             camera.shared_encoder_output_fps(),
+            camera.shared_tier_transitions(),
+            screen.shared_tier_transitions(),
         );
 
         // Wire up encoder controls. The microphone encoder no longer needs

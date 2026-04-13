@@ -39,6 +39,16 @@ use crate::adaptive_quality_constants::{
     VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO,
 };
 
+/// Record of a single tier transition event, captured for health reporting.
+#[derive(Debug, Clone)]
+pub struct TierTransitionRecord {
+    pub direction: &'static str, // "up" or "down"
+    pub stream: &'static str, // "video", "audio"  (caller overrides to "screen" for screen share)
+    pub from_tier: String,    // tier label
+    pub to_tier: String,      // tier label
+    pub trigger: &'static str, // "fps", "bitrate", "congestion", "coordination"
+}
+
 /// Adaptive quality manager that automatically selects video and audio tiers
 /// based on network conditions. It enforces hysteresis to prevent oscillation
 /// between tiers.
@@ -79,6 +89,9 @@ pub struct AdaptiveQualityManager {
     /// camera's quality manager is capped to prevent bandwidth contention.
     /// `None` means no ceiling (default).
     quality_ceiling_index: Option<usize>,
+
+    /// Buffer of tier transition events since last drain.
+    transition_buffer: Vec<TierTransitionRecord>,
 }
 
 impl AdaptiveQualityManager {
@@ -103,6 +116,7 @@ impl AdaptiveQualityManager {
             audio_recover_start_ms: None,
             created_at_ms: now,
             quality_ceiling_index: None,
+            transition_buffer: Vec::new(),
         }
     }
 
@@ -125,6 +139,7 @@ impl AdaptiveQualityManager {
             audio_recover_start_ms: None,
             created_at_ms: now,
             quality_ceiling_index: None,
+            transition_buffer: Vec::new(),
         }
     }
 
@@ -197,13 +212,28 @@ impl AdaptiveQualityManager {
             let degrade_duration = now_ms - degrade_start;
 
             if degrade_duration >= STEP_DOWN_REACTION_TIME_MS as f64 && can_transition {
+                let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
                 self.video_tier_index += 1;
                 self.last_transition_time_ms = now_ms;
                 self.degrade_start_ms = None;
                 self.recover_start_ms = None;
+                let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+                // Primary trigger: fps drives degradation more than bitrate
+                let trigger = if fps_ratio < VIDEO_TIER_DEGRADE_FPS_RATIO {
+                    "fps"
+                } else {
+                    "bitrate"
+                };
+                self.transition_buffer.push(TierTransitionRecord {
+                    direction: "down",
+                    stream: "video",
+                    from_tier,
+                    to_tier: to_tier.clone(),
+                    trigger,
+                });
                 log::info!(
                     "AdaptiveQuality: video stepped DOWN to tier '{}' (index {}), fps_ratio={:.2}, bitrate_ratio={:.2}",
-                    self.video_tiers[self.video_tier_index].label,
+                    to_tier,
                     self.video_tier_index,
                     fps_ratio,
                     bitrate_ratio,
@@ -227,13 +257,22 @@ impl AdaptiveQualityManager {
             let recover_duration = now_ms - recover_start;
 
             if recover_duration >= STEP_UP_STABILIZATION_WINDOW_MS as f64 && can_transition {
+                let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
                 self.video_tier_index -= 1;
                 self.last_transition_time_ms = now_ms;
                 self.recover_start_ms = None;
                 self.degrade_start_ms = None;
+                let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+                self.transition_buffer.push(TierTransitionRecord {
+                    direction: "up",
+                    stream: "video",
+                    from_tier,
+                    to_tier: to_tier.clone(),
+                    trigger: "fps",
+                });
                 log::info!(
                     "AdaptiveQuality: video stepped UP to tier '{}' (index {}), fps_ratio={:.2}, bitrate_ratio={:.2}",
-                    self.video_tiers[self.video_tier_index].label,
+                    to_tier,
                     self.video_tier_index,
                     fps_ratio,
                     bitrate_ratio,
@@ -265,13 +304,22 @@ impl AdaptiveQualityManager {
             let degrade_duration = now_ms - degrade_start;
 
             if degrade_duration >= STEP_DOWN_REACTION_TIME_MS as f64 && can_transition {
+                let from_tier = AUDIO_QUALITY_TIERS[self.audio_tier_index].label.to_string();
                 self.audio_tier_index += 1;
                 self.last_transition_time_ms = now_ms;
                 self.audio_degrade_start_ms = None;
                 self.audio_recover_start_ms = None;
+                let to_tier = AUDIO_QUALITY_TIERS[self.audio_tier_index].label.to_string();
+                self.transition_buffer.push(TierTransitionRecord {
+                    direction: "down",
+                    stream: "audio",
+                    from_tier,
+                    to_tier: to_tier.clone(),
+                    trigger: "fps",
+                });
                 log::info!(
                     "AdaptiveQuality: audio stepped DOWN to tier '{}' (index {}), fps_ratio={:.2}",
-                    AUDIO_QUALITY_TIERS[self.audio_tier_index].label,
+                    to_tier,
                     self.audio_tier_index,
                     fps_ratio,
                 );
@@ -289,13 +337,22 @@ impl AdaptiveQualityManager {
             let recover_duration = now_ms - recover_start;
 
             if recover_duration >= STEP_UP_STABILIZATION_WINDOW_MS as f64 && can_transition {
+                let from_tier = AUDIO_QUALITY_TIERS[self.audio_tier_index].label.to_string();
                 self.audio_tier_index -= 1;
                 self.last_transition_time_ms = now_ms;
                 self.audio_recover_start_ms = None;
                 self.audio_degrade_start_ms = None;
+                let to_tier = AUDIO_QUALITY_TIERS[self.audio_tier_index].label.to_string();
+                self.transition_buffer.push(TierTransitionRecord {
+                    direction: "up",
+                    stream: "audio",
+                    from_tier,
+                    to_tier: to_tier.clone(),
+                    trigger: "fps",
+                });
                 log::info!(
                     "AdaptiveQuality: audio stepped UP to tier '{}' (index {}), fps_ratio={:.2}",
-                    AUDIO_QUALITY_TIERS[self.audio_tier_index].label,
+                    to_tier,
                     self.audio_tier_index,
                     fps_ratio,
                 );
@@ -358,13 +415,22 @@ impl AdaptiveQualityManager {
             return false;
         }
 
+        let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
         self.video_tier_index += 1;
         self.last_transition_time_ms = now_ms;
         self.degrade_start_ms = None;
         self.recover_start_ms = None;
+        let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+        self.transition_buffer.push(TierTransitionRecord {
+            direction: "down",
+            stream: "video",
+            from_tier,
+            to_tier: to_tier.clone(),
+            trigger: "congestion",
+        });
         log::warn!(
             "AdaptiveQuality: CONGESTION forced video step-down to tier '{}' (index {})",
-            self.video_tiers[self.video_tier_index].label,
+            to_tier,
             self.video_tier_index,
         );
         true
@@ -412,22 +478,36 @@ impl AdaptiveQualityManager {
         }
 
         // Higher index = worse quality = "DOWN"; lower index = better quality = "UP"
+        let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
         let direction = if clamped > self.video_tier_index {
-            "DOWN"
+            "down"
         } else {
-            "UP"
+            "up"
         };
         self.video_tier_index = clamped;
         self.last_transition_time_ms = now_ms;
         self.degrade_start_ms = None;
         self.recover_start_ms = None;
+        let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+        self.transition_buffer.push(TierTransitionRecord {
+            direction,
+            stream: "video",
+            from_tier,
+            to_tier: to_tier.clone(),
+            trigger: "coordination",
+        });
         log::info!(
             "AdaptiveQuality: forced video step {} to tier '{}' (index {}) for cross-stream coordination",
-            direction,
-            self.video_tiers[self.video_tier_index].label,
+            direction.to_uppercase(),
+            to_tier,
             self.video_tier_index,
         );
         true
+    }
+
+    /// Drain and return all tier transition records since the last drain.
+    pub fn drain_transitions(&mut self) -> Vec<TierTransitionRecord> {
+        std::mem::take(&mut self.transition_buffer)
     }
 }
 

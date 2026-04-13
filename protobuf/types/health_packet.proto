@@ -63,6 +63,9 @@ message PeerStats {
 
   // P1: Cumulative decoder error count (codec failures: keyframe miss, parse error, decoder reset)
   optional uint64 decoder_errors_total = 13;
+
+  // Screen share video stats (separate from camera video_stats field 6)
+  VideoStats screen_video_stats = 14;
 }
 
 message HealthPacket {
@@ -114,5 +117,22 @@ message HealthPacket {
   optional uint32 encoder_output_fps = 29;         // Actual frames/sec the camera encoder is producing
   optional double encoder_target_bitrate_kbps = 30; // PID controller computed target bitrate in kbps
   optional double encoder_bitrate_ratio = 31;      // Ratio of current bitrate to ideal bitrate for tier
+
+  // P2: Tier transition events since last health packet
+  repeated TierTransition tier_transitions = 32;
+
+  // Reserved for future join-time network probe (P2, deferred)
+  optional double join_bandwidth_kbps = 33;
+  optional double join_rtt_ms = 34;
+  optional double join_jitter_ms = 35;
+  optional double join_packet_loss_pct = 36;
+}
+
+message TierTransition {
+  string direction = 1;    // "up" or "down"
+  string stream = 2;       // "video", "audio", "screen"
+  string from_tier = 3;    // tier label e.g. "hd_1080p", "medium_480p"
+  string to_tier = 4;      // tier label
+  string trigger = 5;      // "fps", "bitrate", "congestion", "coordination"
 }
 

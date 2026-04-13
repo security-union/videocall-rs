@@ -27,7 +27,7 @@ use crate::adaptive_quality_constants::{
     PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
     PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
-use crate::diagnostics::adaptive_quality_manager::AdaptiveQualityManager;
+use crate::diagnostics::adaptive_quality_manager::{AdaptiveQualityManager, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -573,6 +573,11 @@ impl EncoderBitrateController {
         } else {
             self.quality_manager.set_quality_ceiling(None);
         }
+    }
+
+    /// Drain tier transition records from the quality manager.
+    pub fn drain_tier_transitions(&mut self) -> Vec<TierTransitionRecord> {
+        self.quality_manager.drain_transitions()
     }
 }
 

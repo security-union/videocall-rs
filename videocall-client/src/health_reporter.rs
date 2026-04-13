@@ -18,6 +18,7 @@
 
 use crate::connection::ConnectionController;
 use crate::decode::peer_decode_manager::keyframe_requests_sent_count;
+use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use log::{debug, warn};
 use protobuf::Message;
 use serde_json::{json, Value};
@@ -29,7 +30,7 @@ use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
-    PeerStats as PbPeerStats, VideoStats as PbVideoStats,
+    PeerStats as PbPeerStats, TierTransition as PbTierTransition, VideoStats as PbVideoStats,
 };
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -42,7 +43,10 @@ use web_time::{SystemTime, UNIX_EPOCH};
 pub struct PeerHealthData {
     pub peer_id: String,
     pub last_neteq_stats: Option<Value>,
-    pub last_video_stats: Option<Value>,
+    /// Camera video stats (media_type=VIDEO).
+    pub last_camera_stats: Option<Value>,
+    /// Screen share video stats (media_type=SCREEN).
+    pub last_screen_stats: Option<Value>,
     /// Sender's self-reported audio state (from peer heartbeat metadata).
     pub audio_enabled: bool,
     /// Sender's self-reported video state (from peer heartbeat metadata).
@@ -50,8 +54,10 @@ pub struct PeerHealthData {
     pub last_update_ms: u64,
     /// Timestamp of last audio stats update (ms since epoch). 0 = never received.
     pub last_audio_update_ms: u64,
-    /// Timestamp of last video stats update (ms since epoch). 0 = never received.
-    pub last_video_update_ms: u64,
+    /// Timestamp of last camera video stats update (ms since epoch). 0 = never received.
+    pub last_camera_update_ms: u64,
+    /// Timestamp of last screen share stats update (ms since epoch). 0 = never received.
+    pub last_screen_update_ms: u64,
     /// Cumulative decode error count across the session lifetime.
     pub decode_errors_total: u64,
 }
@@ -61,12 +67,14 @@ impl PeerHealthData {
         Self {
             peer_id,
             last_neteq_stats: None,
-            last_video_stats: None,
+            last_camera_stats: None,
+            last_screen_stats: None,
             audio_enabled: false,
             video_enabled: false,
             last_update_ms: 0,
             last_audio_update_ms: 0,
-            last_video_update_ms: 0,
+            last_camera_update_ms: 0,
+            last_screen_update_ms: 0,
             decode_errors_total: 0,
         }
     }
@@ -81,16 +89,29 @@ impl PeerHealthData {
         self.last_audio_update_ms = now_ms;
     }
 
-    pub fn update_video_stats(&mut self, video_stats: Value) {
-        self.last_video_stats = Some(video_stats);
+    pub fn update_camera_stats(&mut self, video_stats: Value) {
+        self.last_camera_stats = Some(video_stats);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         self.last_update_ms = now_ms;
-        self.last_video_update_ms = now_ms;
+        self.last_camera_update_ms = now_ms;
+    }
+
+    pub fn update_screen_stats(&mut self, video_stats: Value) {
+        self.last_screen_stats = Some(video_stats);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_update_ms = now_ms;
+        self.last_screen_update_ms = now_ms;
     }
 }
+
+/// Shared buffer of tier transition records from camera and screen encoders.
+type TierTransitionBuffers = Rc<RefCell<Vec<Rc<RefCell<Vec<TierTransitionRecord>>>>>>;
 
 /// Health reporter that collects diagnostics and sends health packets
 #[derive(Debug)]
@@ -129,6 +150,8 @@ pub struct HealthReporter {
     screen_sharing_active: Rc<RefCell<Rc<AtomicBool>>>,
     /// Encoder output FPS (camera).
     encoder_output_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Shared tier transition buffers (camera + screen, drained each health packet).
+    tier_transitions: TierTransitionBuffers,
 }
 
 impl HealthReporter {
@@ -157,6 +180,7 @@ impl HealthReporter {
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
             encoder_output_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            tier_transitions: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -229,6 +253,8 @@ impl HealthReporter {
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
         output_fps: Rc<AtomicU32>,
+        camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
     ) {
         *self.encoder_fps_ratio.borrow_mut() = fps_ratio;
         *self.encoder_worst_peer_fps.borrow_mut() = worst_peer_fps;
@@ -237,6 +263,7 @@ impl HealthReporter {
         *self.adaptive_screen_tier.borrow_mut() = screen_tier;
         *self.screen_sharing_active.borrow_mut() = screen_active;
         *self.encoder_output_fps.borrow_mut() = output_fps;
+        *self.tier_transitions.borrow_mut() = vec![camera_transitions, screen_transitions];
     }
 
     /// Start subscribing to real diagnostics events via videocall_diagnostics
@@ -428,8 +455,19 @@ impl HealthReporter {
                     .entry(target_peer.to_string())
                     .or_insert_with(|| PeerHealthData::new(target_peer.to_string()));
 
-                // Extract video stats from metrics
-                let mut video_stats = match &peer_data.last_video_stats {
+                // Determine if this is camera or screen based on media_type metric.
+                let is_screen = event.metrics.iter().any(|m| {
+                    m.name == "media_type"
+                        && matches!(&m.value, MetricValue::Text(s) if s == "SCREEN")
+                });
+
+                // Pick the right stats bucket (camera or screen).
+                let existing = if is_screen {
+                    &peer_data.last_screen_stats
+                } else {
+                    &peer_data.last_camera_stats
+                };
+                let mut video_stats = match existing {
                     Some(Value::Object(map)) => Value::Object(map.clone()),
                     _ => json!({}),
                 };
@@ -480,8 +518,13 @@ impl HealthReporter {
                     }
                 }
 
-                peer_data.update_video_stats(video_stats);
-                debug!("Updated video health for peer: {target_peer}");
+                if is_screen {
+                    peer_data.update_screen_stats(video_stats);
+                    debug!("Updated screen health for peer: {target_peer}");
+                } else {
+                    peer_data.update_camera_stats(video_stats);
+                    debug!("Updated camera health for peer: {target_peer}");
+                }
             }
         }
     }
@@ -515,6 +558,7 @@ impl HealthReporter {
         let adaptive_screen_tier = self.adaptive_screen_tier.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
         let encoder_output_fps = self.encoder_output_fps.clone();
+        let tier_transitions = self.tier_transitions.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -585,6 +629,16 @@ impl HealthReporter {
                             screen_sharing_active.borrow().load(Ordering::Relaxed);
                         let output_fps_val = encoder_output_fps.borrow().load(Ordering::Relaxed);
 
+                        // Drain tier transitions from all encoder buffers.
+                        let mut drained_transitions = Vec::new();
+                        if let Ok(buffers) = tier_transitions.try_borrow() {
+                            for buf in buffers.iter() {
+                                if let Ok(mut t) = buf.try_borrow_mut() {
+                                    drained_transitions.append(&mut *t);
+                                }
+                            }
+                        }
+
                         let health_packet = Self::create_health_packet(
                             &session_id_val,
                             &meeting_id,
@@ -611,6 +665,7 @@ impl HealthReporter {
                             screen_tier_val,
                             screen_active_val,
                             output_fps_val,
+                            drained_transitions,
                         );
 
                         if let Some(packet) = health_packet {
@@ -654,6 +709,7 @@ impl HealthReporter {
         adaptive_screen_tier: u32,
         screen_sharing_active: bool,
         encoder_output_fps: u32,
+        tier_transitions: Vec<TierTransitionRecord>,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -698,7 +754,7 @@ impl HealthReporter {
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
         // Encoder decision inputs (P0)
-        if encoder_fps_ratio.is_finite() && encoder_fps_ratio > 0.0 {
+        if encoder_fps_ratio.is_finite() {
             pb.encoder_fps_ratio = Some(encoder_fps_ratio);
         }
         if encoder_worst_peer_fps.is_finite() {
@@ -708,14 +764,28 @@ impl HealthReporter {
         pb.screen_sharing_active = Some(screen_sharing_active);
 
         // Encoder outputs (P1)
+        // encoder_output_fps uses > 0 (not is_finite) because 0 means the encoder
+        // hasn't started yet, which isn't diagnostic. The other encoder metrics
+        // allow 0.0 through because a zero ratio/bitrate IS the diagnostic signal.
         if encoder_output_fps > 0 {
             pb.encoder_output_fps = Some(encoder_output_fps);
         }
-        if encoder_target_bitrate_kbps.is_finite() && encoder_target_bitrate_kbps > 0.0 {
+        if encoder_target_bitrate_kbps.is_finite() {
             pb.encoder_target_bitrate_kbps = Some(encoder_target_bitrate_kbps);
         }
-        if encoder_bitrate_ratio.is_finite() && encoder_bitrate_ratio > 0.0 {
+        if encoder_bitrate_ratio.is_finite() {
             pb.encoder_bitrate_ratio = Some(encoder_bitrate_ratio);
+        }
+
+        // Tier transition events (P2)
+        for t in &tier_transitions {
+            let mut pb_t = PbTierTransition::new();
+            pb_t.direction = t.direction.to_string();
+            pb_t.stream = t.stream.to_string();
+            pb_t.from_tier = t.from_tier.clone();
+            pb_t.to_tier = t.to_tier.clone();
+            pb_t.trigger = t.trigger.to_string();
+            pb.tier_transitions.push(pb_t);
         }
 
         // Tab visibility and throttling
@@ -765,8 +835,11 @@ impl HealthReporter {
             // emitting DiagEvents when no frames arrive, so timestamps stop advancing).
             let audio_fresh = health_data.last_audio_update_ms > 0
                 && now_ms.saturating_sub(health_data.last_audio_update_ms) < STATS_STALE_MS;
-            let video_fresh = health_data.last_video_update_ms > 0
-                && now_ms.saturating_sub(health_data.last_video_update_ms) < STATS_STALE_MS;
+            let camera_fresh = health_data.last_camera_update_ms > 0
+                && now_ms.saturating_sub(health_data.last_camera_update_ms) < STATS_STALE_MS;
+            let video_fresh = camera_fresh
+                || (health_data.last_screen_update_ms > 0
+                    && now_ms.saturating_sub(health_data.last_screen_update_ms) < STATS_STALE_MS);
 
             let mut ps = PbPeerStats::new();
             // can_listen/can_see: receiver-observed. True only while stream is fresh.
@@ -870,8 +943,8 @@ impl HealthReporter {
                 ps.neteq_stats = ::protobuf::MessageField::some(ns);
             }
 
-            // Video mapping
-            if let Some(video) = &health_data.last_video_stats {
+            // Camera video mapping (backward compat: goes into existing video_stats field)
+            if let Some(video) = &health_data.last_camera_stats {
                 let mut vs = PbVideoStats::new();
                 if let Some(v) = video.get("fps_received").and_then(|v| v.as_f64()) {
                     vs.fps_received = v;
@@ -887,12 +960,30 @@ impl HealthReporter {
                 }
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 
-                // Extract decode_errors_per_sec (windowed rate) from video stats
+                // Extract decode_errors_per_sec (windowed rate) from camera video stats
                 if let Some(error_rate) =
                     video.get("decode_errors_per_sec").and_then(|v| v.as_f64())
                 {
                     ps.frames_dropped_per_sec = error_rate;
                 }
+            }
+
+            // Screen share video mapping (new field, separate from camera)
+            if let Some(screen) = &health_data.last_screen_stats {
+                let mut svs = PbVideoStats::new();
+                if let Some(v) = screen.get("fps_received").and_then(|v| v.as_f64()) {
+                    svs.fps_received = v;
+                }
+                if let Some(v) = screen.get("frames_buffered").and_then(|v| v.as_f64()) {
+                    svs.frames_buffered = v;
+                }
+                if let Some(v) = screen.get("frames_decoded").and_then(|v| v.as_u64()) {
+                    svs.frames_decoded = v;
+                }
+                if let Some(v) = screen.get("bitrate_kbps").and_then(|v| v.as_u64()) {
+                    svs.bitrate_kbps = v;
+                }
+                ps.screen_video_stats = ::protobuf::MessageField::some(svs);
             }
 
             // Cumulative decode error count (only set if > 0 to avoid noise)

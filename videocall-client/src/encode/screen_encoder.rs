@@ -53,7 +53,8 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
 use crate::adaptive_quality_constants::{
-    BITRATE_CHANGE_THRESHOLD, ENCODER_PLI_COOLDOWN_MS, SCREEN_QUALITY_TIERS,
+    BITRATE_CHANGE_THRESHOLD, DEFAULT_SCREEN_TIER_INDEX, ENCODER_PLI_COOLDOWN_MS,
+    SCREEN_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -147,8 +148,7 @@ impl ScreenEncoder {
             force_keyframe: Arc::new(AtomicBool::new(false)),
             active_video_track: Rc::new(RefCell::new(None)),
             screen_sharing_active: None,
-            // Default to tier 1 (medium) matching DEFAULT_SCREEN_TIER_INDEX.
-            shared_screen_tier_index: Rc::new(AtomicU32::new(1)),
+            shared_screen_tier_index: Rc::new(AtomicU32::new(DEFAULT_SCREEN_TIER_INDEX as u32)),
             shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
         }
     }

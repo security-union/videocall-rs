@@ -121,11 +121,9 @@ message HealthPacket {
   // P2: Tier transition events since last health packet
   repeated TierTransition tier_transitions = 32;
 
-  // Reserved for future join-time network probe (P2, deferred)
-  optional double join_bandwidth_kbps = 33;
-  optional double join_rtt_ms = 34;
-  optional double join_jitter_ms = 35;
-  optional double join_packet_loss_pct = 36;
+  // Field numbers 33-36 reserved for future join-time network probe.
+  reserved 33, 34, 35, 36;
+  reserved "join_bandwidth_kbps", "join_rtt_ms", "join_jitter_ms", "join_packet_loss_pct";
 }
 
 message TierTransition {

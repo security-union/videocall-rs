@@ -738,17 +738,15 @@ fn process_health_packet_to_metrics_pb(
                 }
 
                 // Screen video metrics (separate from camera)
+                // Always set when present -- allows gauges to recover to 0.0
+                // when screen share stops or quality collapses.
                 if let Some(screen_stats) = peer_data.screen_video_stats.as_ref() {
-                    if screen_stats.fps_received != 0.0 {
-                        SCREEN_VIDEO_FPS
-                            .with_label_values(&peer_labels)
-                            .set(screen_stats.fps_received);
-                    }
-                    if screen_stats.bitrate_kbps != 0 {
-                        SCREEN_VIDEO_BITRATE_KBPS
-                            .with_label_values(&peer_labels)
-                            .set(screen_stats.bitrate_kbps as f64);
-                    }
+                    SCREEN_VIDEO_FPS
+                        .with_label_values(&peer_labels)
+                        .set(screen_stats.fps_received);
+                    SCREEN_VIDEO_BITRATE_KBPS
+                        .with_label_values(&peer_labels)
+                        .set(screen_stats.bitrate_kbps as f64);
                 }
 
                 // Decode errors

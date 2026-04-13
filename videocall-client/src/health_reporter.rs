@@ -173,9 +173,11 @@ impl HealthReporter {
             connection_controller: Rc::new(RefCell::new(None)),
             adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            encoder_fps_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_fps_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(f32::NAN.to_bits())))),
             encoder_worst_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            encoder_bitrate_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_bitrate_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(
+                f32::NAN.to_bits(),
+            )))),
             encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),

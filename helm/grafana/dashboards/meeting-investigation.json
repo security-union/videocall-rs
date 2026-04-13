@@ -2537,7 +2537,7 @@
           },
           "targets": [
             {
-              "expr": "rate(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
+              "expr": "deriv(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
               "legendFormat": "{{reporter_name}} \u2192 {{peer_name}}",
               "refId": "A"
             }

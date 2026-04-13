@@ -1,4 +1,0 @@
-[toolchain]
-channel = "1.85"
-
-targets = [ "wasm32-unknown-unknown" ]

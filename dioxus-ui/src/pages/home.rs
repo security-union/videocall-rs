@@ -69,16 +69,6 @@ pub fn Home() -> Element {
     let mut create_error = use_signal(|| None::<String>);
     let mut creating = use_signal(|| false);
 
-    // Set Matomo user ID early if available
-    use_effect({
-        let uid = existing_username.clone();
-        move || {
-            if !uid.is_empty() {
-                matomo_logger::set_user_id(&uid);
-            }
-        }
-    });
-
     // Fetch user profile when OAuth is enabled.
     //
     // Because the display name field starts empty for OAuth deployments (see
@@ -101,7 +91,6 @@ pub fn Home() -> Element {
                             // Session confirmed — restore the previously saved name.
                             username_value.set(stored_name.clone());
                             display_name_ctx.0.set(Some(stored_name.clone()));
-                            matomo_logger::set_user_id(&stored_name);
                         } else {
                             // No saved name yet — derive one from the provider profile.
                             let display_name = if profile.name.contains('@') {
@@ -113,7 +102,6 @@ pub fn Home() -> Element {
                                 save_display_name_to_storage(&valid_name);
                                 display_name_ctx.0.set(Some(valid_name.clone()));
                                 username_value.set(valid_name.clone());
-                                matomo_logger::set_user_id(&valid_name);
                             }
                         }
                         user_profile.set(Some(profile));
@@ -247,7 +235,6 @@ pub fn Home() -> Element {
                                     username_value.set(valid_name.clone());
                                     save_display_name_to_storage(&valid_name);
                                     (display_name_ctx.0).set(Some(valid_name.clone()));
-                                    matomo_logger::set_user_id(&valid_name);
 
                                     spawn(async move {
                                         gloo_timers::future::TimeoutFuture::new(0).await;
@@ -363,7 +350,6 @@ pub fn Home() -> Element {
                                                 username_value.set(valid_name.clone());
                                                 save_display_name_to_storage(&valid_name);
                                                 (display_name_ctx.0).set(Some(valid_name.clone()));
-                                                matomo_logger::set_user_id(&valid_name);
                                                 creating.set(true);
 
                                                 spawn(async move {

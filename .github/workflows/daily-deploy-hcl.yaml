@@ -240,9 +240,8 @@ jobs:
             --set image.tag=${TAG} \
             --set imagePullSecrets[0].name=harbor-pull-secret \
             --set fullnameOverride=videocall-webtransport \
-            --set service.type=NodePort \
+            --set service.type=LoadBalancer \
             --set service.port=4433 \
-            --set service.nodePort=52311 \
             --set service.healthPort=444 \
             --set "command[0]=webtransport_server" \
             --set tlsSecret=webtransport-tls \
@@ -266,6 +265,7 @@ jobs:
             --set-string "env[7].value=1" \
             --set "env[8].name=TOKIO_BLOCKING_THREADS" \
             --set-string "env[8].value=2" \
+            --set ingress.enabled=true \
             --set "ingress.hosts[0].host=webtransport.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -277,7 +277,7 @@ jobs:
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
-          echo "✅ WebTransport server deployed (NodePort 52311)"
+          echo "✅ WebTransport server deployed (LoadBalancer)"
 
       - name: Deploy WebSocket Server
         run: |
@@ -308,6 +308,7 @@ jobs:
             --set "env[5].value=websocket" \
             --set "env[6].name=SERVER_STATS_INTERVAL_SECS" \
             --set-string "env[6].value=5" \
+            --set ingress.enabled=true \
             --set "ingress.hosts[0].host=websocket.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -338,6 +339,7 @@ jobs:
             --set metricsApi.imagePullSecrets[0].name=harbor-pull-secret \
             --set serverStats.image.repository=${REGISTRY}/videocall-media-server \
             --set serverStats.image.tag=${TAG} \
+            --set serverStats.imagePullSecrets[0].name=harbor-pull-secret \
             --wait --timeout 5m
 
           echo "✅ Metrics API deployed"
@@ -394,6 +396,7 @@ jobs:
             --set "env[13].value=videocall-session" \
             --set "env[14].name=SERVICE_VERSION_URLS" \
             --set "env[14].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
+            --set ingress.enabled=true \
             --set "ingress.hosts[0].host=api.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -435,6 +438,7 @@ jobs:
             --set "runtimeConfig.audioBitrateKbps=65" \
             --set "runtimeConfig.videoBitrateKbps=1000" \
             --set "runtimeConfig.screenBitrateKbps=1000" \
+            --set ingress.enabled=true \
             --set "ingress.hosts[0].host=app.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -474,7 +478,7 @@ jobs:
           echo "  - Dioxus UI:     https://app.videocall.fnxlabs.com"
           echo "  - API:           https://api.videocall.fnxlabs.com"
           echo "  - WebSocket:     wss://websocket.videocall.fnxlabs.com"
-          echo "  - WebTransport:  https://webtransport.videocall.fnxlabs.com (NodePort 52311)"
+          echo "  - WebTransport:  https://webtransport.videocall.fnxlabs.com"
           echo ""
           echo "Namespace: ${NAMESPACE}"
           echo ""

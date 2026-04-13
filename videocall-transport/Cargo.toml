@@ -44,7 +44,6 @@ features = [
     "WebSocket",
     "WebTransport",
     "WebTransportBidirectionalStream",
-    "WebTransportCloseInfo",
     "WebTransportDatagramDuplexStream",
     "WebTransportReceiveStream",
     "WritableStream",

@@ -87,13 +87,29 @@ jobs:
             core.setOutput('has_running_undeploys', hasRunning ? 'true' : 'false');
             core.setOutput('undeploy_count', runs.total_count);
 
+      - name: Verify PR is still open
+        id: check-pr-state
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ inputs.pr_number }},
+            });
+            console.log(`PR #${{ inputs.pr_number }} state: ${pr.state}`);
+            if (pr.state !== 'open') {
+              core.setFailed(`PR #${{ inputs.pr_number }} is ${pr.state} — aborting deploy to avoid orphaned preview environment`);
+            }
+
       - name: Assign deployment slot
         id: assign-slot
         run: |
           set -e  # Exit on error
           PR_NUM=${{ inputs.pr_number }}
           MAX_SLOTS=${{ vars.PR_PREVIEW_MAX_SLOTS }}
-          MAX_SLOTS=${MAX_SLOTS:-3}  # Default to 3 if not set
+          MAX_SLOTS=${MAX_SLOTS:-5}  # Default to 5 if not set
 
           echo "Maximum preview slots configured: ${MAX_SLOTS}"
           echo "Looking for existing deployment of PR #${PR_NUM}..."
@@ -152,12 +168,16 @@ jobs:
             echo "max_slots=${MAX_SLOTS}" >> $GITHUB_OUTPUT
 
             # Get slot occupancy for error message
+            # NOTE: pipe into `while read` runs in a subshell — the echo
+            # inside would write to the subshell's stdout, not GITHUB_OUTPUT.
+            # Use a temp variable to avoid the subshell problem.
             echo "slot_info<<EOF" >> $GITHUB_OUTPUT
-            kubectl get namespaces -l app=preview \
+            SLOT_LINES=$(kubectl get namespaces -l app=preview \
               -o custom-columns=SLOT:.metadata.labels.slot,PR:.metadata.labels.pr,AGE:.metadata.creationTimestamp \
-              --no-headers | while read slot pr age; do
-              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.preview.videocall.fnxlabs.com ([undeploy](https://github01.hclpnp.com/${{ github.repository }}/pull/${pr}#issuecomment-new))"
-            done
+              --no-headers)
+            while read slot pr age; do
+              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.preview.videocall.fnxlabs.com ([undeploy](https://github01.hclpnp.com/${{ github.repository }}/pull/${pr}#issuecomment-new))" >> $GITHUB_OUTPUT
+            done <<< "$SLOT_LINES"
             echo "EOF" >> $GITHUB_OUTPUT
           else
             echo "SLOT=$AVAILABLE_SLOT" >> $GITHUB_OUTPUT
@@ -387,10 +407,10 @@ jobs:
             namespace: ${NAMESPACE}
           spec:
             hard:
-              requests.cpu: "500m"
-              requests.memory: "1Gi"
-              limits.cpu: "1000m"
-              limits.memory: "2Gi"
+              requests.cpu: "300m"
+              requests.memory: "512Mi"
+              limits.cpu: "800m"
+              limits.memory: "1Gi"
               pods: "12"
           EOF
 
@@ -464,6 +484,7 @@ jobs:
 
           helm upgrade --install preview-${PR_NUM}-ws helm/rustlemania-websocket/ \
             --namespace ${NAMESPACE} \
+            --set ingress.enabled=true \
             --set image.repository=${REGISTRY}/videocall-media-server \
             --set image.tag=pr-${PR_NUM} \
             --set imagePullSecrets[0].name=harbor-pull-secret \
@@ -534,6 +555,7 @@ jobs:
 
           helm upgrade --install preview-${PR_NUM}-api helm/meeting-api/ \
             --namespace ${NAMESPACE} \
+            --set ingress.enabled=true \
             --set image.repository=${REGISTRY}/videocall-meeting-api \
             --set image.tag=pr-${PR_NUM} \
             --set imagePullSecrets[0].name=harbor-pull-secret \

@@ -28,7 +28,6 @@ dioxus-ui
   |- videocall-diagnostics   (performance diagnostics)
   |- neteq                   (audio jitter buffer, web worker)
   |- videocall-codecs        (video decoder, web worker)
-  |- matomo-logger           (analytics)
 ```
 
 `videocall-client` is the core client library. The dioxus-ui uses it **without** the `yew-compat` feature, meaning callbacks use `Rc<dyn Fn(T)>` closures.

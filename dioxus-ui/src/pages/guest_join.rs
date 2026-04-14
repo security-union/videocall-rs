@@ -200,6 +200,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                 on_peer_left: None,
                 on_peer_joined: None,
                 on_display_name_changed: None,
+                decode_media: false,
             };
 
             let mut client = VideoCallClient::new(opts);

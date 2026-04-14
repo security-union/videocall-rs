@@ -19,8 +19,7 @@
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::constants::*;
 use crate::context::{
-    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    LocalAudioLevelCtx, TransportPreferenceCtx, VideoCallClientCtx,
+    TransportPreferenceCtx, VideoCallClientCtx,
 };
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;

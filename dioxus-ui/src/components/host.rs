@@ -16,17 +16,14 @@
  * conditions.
  */
 
-use crate::components::{
-    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
-};
+use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::constants::*;
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    LocalAudioLevelCtx, TransportPreferenceCtx, VideoCallClientCtx,
+    TransportPreferenceCtx, VideoCallClientCtx,
 };
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
-use dioxus::web::WebEventExt;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
@@ -78,9 +75,7 @@ pub fn Host(
     reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
-    let audio_level = use_context::<LocalAudioLevelCtx>().0;
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
-    let mut glow_el = use_signal(|| None::<web_sys::Element>);
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -540,17 +535,6 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
-    // Update glow overlay style directly on the DOM element — no component
-    // re-render needed.  The effect subscribes to both `audio_level` (fires on
-    // every mic callback) and `glow_el` (fires when video toggles and a new
-    // overlay element mounts).
-    use_effect(move || {
-        let level = audio_level();
-        if let Some(el) = glow_el() {
-            let _ = el.set_attribute("style", &speak_style(level));
-        }
-    });
-
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
         // The camera encoder attaches srcObject via JS; if Dioxus recreates
@@ -565,17 +549,6 @@ pub fn Host(
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
-            // Glow overlay renders ON TOP of the video element
-            if video_enabled {
-                div {
-                    class: "glow-overlay",
-                    onmounted: move |evt| {
-                        if let Some(elem) = evt.try_as_web_event() {
-                            glow_el.set(Some(elem));
-                        }
-                    },
-                }
-            }
         }
         // Always-mounted screen share preview — toggled via style so the element
         // exists in the DOM before attach_screen_preview() runs.
@@ -591,22 +564,13 @@ pub fn Host(
         }
         if !video_enabled {
             div {
-                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent; width:100%; aspect-ratio:16/9;",
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; width:100%; aspect-ratio:16/9;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
                         line { x1: "1", y1: "1", x2: "23", y2: "23" }
                     }
                     span { class: "placeholder-text", "Camera Off" }
-                }
-                // Glow overlay renders ON TOP of content
-                div {
-                    class: "glow-overlay",
-                    onmounted: move |evt| {
-                        if let Some(elem) = evt.try_as_web_event() {
-                            glow_el.set(Some(elem));
-                        }
-                    },
                 }
             }
         }

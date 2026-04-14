@@ -223,11 +223,9 @@ h3 {
   background-color: #2d2d2d; /* Slightly different background for items */
 
   /* Border for visual separation */
-  border-width: 2px;
-  border-style: solid;
-  border-color: rgb(68, 68, 68);
-  border-image: initial;
-  border-radius: 10px;
+  border: 2px solid rgba(100, 100, 100, 0.30);
+  border-radius: 12px;
+  /* Speaking glow transition is driven by inline style from Rust speak_style(). */
 }
 
 /* --- data-peers rules removed: layout is now fully computed in Rust
@@ -356,18 +354,6 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1.5px solid transparent;
-  box-shadow: none;
-}
-
-/* Transparent overlay that sits on top of the video canvas so the speaking
-   glow (border + inset box-shadow) is not hidden behind the video element. */
-.glow-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 20;
-  pointer-events: none;
-  border-radius: inherit;
 }
 
 canvas {
@@ -386,8 +372,9 @@ canvas {
   right: clamp(1rem, 2vw, 1.5rem);
   width: clamp(10rem, 18vw, 15rem);
   max-width: 240px;
-  border: 2px solid #444;
-  border-radius: 8px;
+  border: 2px solid rgba(100, 100, 100, 0.30);
+  border-radius: 12px;
+  /* Speaking glow transition is driven by inline style from Rust speak_style(). */
   z-index: 10;
   background-color: #1c1c1c;
   display: flex;
@@ -2283,8 +2270,9 @@ select {
   justify-content: center;
   overflow: hidden;
   background-color: #2d2d2d;
-  border: 2px solid rgb(68, 68, 68);
-  border-radius: 10px;
+  border: 2px solid rgba(100, 100, 100, 0.30);
+  border-radius: 12px;
+  /* Speaking glow transition is driven by inline style from Rust speak_style(). */
 }
 
 .split-peer-tile .canvas-container {
@@ -2445,20 +2433,21 @@ select {
 .peer_item_mic svg { width: 100%; height: 100%; }
 
 .peer_item_mic.speaking {
-  color: #00ff41;
-  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  color: #5bcf9f;
+  filter: drop-shadow(0 0 6px rgba(91, 207, 159, 0.8));
 }
-.peer_item_mic.speaking svg { stroke: #00ff41; }
+.peer_item_mic.speaking svg { stroke: #5bcf9f; }
 
 .host-video-wrapper { border-radius: 0; overflow: hidden; border: none; box-shadow: none; aspect-ratio: 16 / 9; flex-shrink: 0; }
 
-/* Glow transitions are now fully controlled by inline styles from Rust.
-   No .speaking-tile class needed — speak_style() always returns explicit values. */
+.speaking-tile {
+  border-color: #5bcf9f;
+}
 
 .audio-indicator {
   transition: color 0.4s ease, filter 0.4s ease;
 }
-.audio-indicator.speaking svg { stroke: #00ff41; }
+.audio-indicator.speaking svg { stroke: #5bcf9f; }
 
 /* ── Participant join/leave toast notifications ─────────────────────── */
 

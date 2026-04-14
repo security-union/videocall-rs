@@ -18,7 +18,7 @@ pub fn SignalBarsIcon(
         "#555"
     } else {
         match level {
-            5 => "#00ff41",
+            5 => "#5bcf9f",
             4 => "#4CAF50",
             3 => "#FFC107",
             2 => "#FF8C00",

@@ -354,11 +354,7 @@ pub fn MockPeersButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element
 // =============================================================================
 
 #[component]
-pub fn DensityModeButton(
-    label: String,
-    open: bool,
-    onclick: EventHandler<MouseEvent>,
-) -> Element {
+pub fn DensityModeButton(label: String, open: bool, onclick: EventHandler<MouseEvent>) -> Element {
     let class = if open {
         "video-control-button active"
     } else {

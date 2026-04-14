@@ -197,7 +197,7 @@ pub fn generate_for_peer(
     // Compare authenticated user_id (from JWT/DB) instead of user-chosen display name
     // to prevent spoofing the host crown icon.
     let is_host = host_user_id.map(|h| h == peer_user_id).unwrap_or(false);
-    let is_guest = peer_user_id.starts_with("guest:");
+    let is_guest = peer_user_id.starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX);
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.contains(&peer_user_id) {
         return rsx! {};

@@ -496,6 +496,20 @@ pub fn redirect_to_guest(meeting_id: &str) {
     }
 }
 
+/// When the user is not authenticated, check if the meeting allows guests
+/// and redirect accordingly.
+pub async fn handle_not_authenticated(meeting_id: &str) {
+    let allow_guests = crate::meeting_api::get_meeting_guest_info(meeting_id)
+        .await
+        .map(|info| info.allow_guests)
+        .unwrap_or(false);
+    if allow_guests {
+        redirect_to_guest(meeting_id);
+    } else {
+        redirect_to_login();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logout
 // ---------------------------------------------------------------------------

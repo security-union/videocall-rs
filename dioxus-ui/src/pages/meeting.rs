@@ -11,9 +11,7 @@
  * at your option.
  */
 
-use crate::auth::{
-    check_session, get_user_profile, logout, redirect_to_guest, redirect_to_login, UserProfile,
-};
+use crate::auth::{check_session, get_user_profile, handle_not_authenticated, logout, UserProfile};
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
@@ -23,7 +21,7 @@ use crate::context::{
     get_or_create_local_user_id, load_display_name_from_storage, resolve_transport_config,
     save_display_name_to_storage, validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
 };
-use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
+use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -88,21 +86,7 @@ pub fn MeetingPage(id: String) -> Element {
                     match check_session().await {
                         Ok(_) => auth_checked.set(true),
                         Err(_) => {
-                            // Check whether the meeting allows guests before deciding
-                            // where to send the unauthenticated user.
-                            let allow_guests = get_meeting_guest_info(&id_for_auth)
-                                .await
-                                .map(|info| info.allow_guests)
-                                .unwrap_or(false);
-                            if allow_guests {
-                                redirect_to_guest(&id_for_auth);
-                            } else {
-                                // Redirect straight to the backend OAuth login endpoint,
-                                // encoding the current meeting URL as `returnTo` so the
-                                // server bounces the user back here after sign-in.
-                                // This skips the intermediate /login SPA page entirely.
-                                redirect_to_login();
-                            }
+                            handle_not_authenticated(&id_for_auth).await;
                         }
                     }
                 });
@@ -276,16 +260,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     }
                                 }
                                 Err(JoinError::NotAuthenticated) => {
-                                    log::info!("Join::NotAuthenticated error");
-                                    let allow_guests = get_meeting_guest_info(&meeting_id)
-                                        .await
-                                        .map(|info| info.allow_guests)
-                                        .unwrap_or(false);
-                                    if allow_guests {
-                                        redirect_to_guest(&meeting_id);
-                                    } else {
-                                        redirect_to_login();
-                                    }
+                                    handle_not_authenticated(&meeting_id).await;
                                 }
                                 Err(e) => {
                                     meeting_status.set(MeetingStatus::Error(e.to_string()));
@@ -428,17 +403,8 @@ pub fn MeetingPage(id: String) -> Element {
                         });
                     }
                     Err(JoinError::NotAuthenticated) => {
-                        log::info!("Not authenticated error and processing");
                         observer_token_signal.set(None);
-                        let allow_guests = get_meeting_guest_info(&meeting_id)
-                            .await
-                            .map(|info| info.allow_guests)
-                            .unwrap_or(false);
-                        if allow_guests {
-                            redirect_to_guest(&meeting_id);
-                        } else {
-                            redirect_to_login();
-                        }
+                        handle_not_authenticated(&meeting_id).await;
                     }
                     Err(e) => {
                         observer_token_signal.set(None);

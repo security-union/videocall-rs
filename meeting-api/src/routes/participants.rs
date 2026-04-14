@@ -207,15 +207,19 @@ pub async fn join_meeting_as_guest(
     // reuse it.
     let guest_user_id = match body.guest_session_id.as_deref() {
         Some(id)
-            if id.starts_with("guest:")
+            if id.starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX)
                 && id
-                    .strip_prefix("guest:")
+                    .strip_prefix(videocall_meeting_types::GUEST_USER_ID_PREFIX)
                     .and_then(|s| uuid::Uuid::parse_str(s).ok())
                     .is_some() =>
         {
             id.to_string()
         }
-        _ => format!("guest:{}", uuid::Uuid::new_v4()),
+        _ => format!(
+            "{}{}",
+            videocall_meeting_types::GUEST_USER_ID_PREFIX,
+            uuid::Uuid::new_v4()
+        ),
     };
 
     join_as_attendee(

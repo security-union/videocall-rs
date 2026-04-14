@@ -77,3 +77,10 @@ impl RoomAccessTokenClaims {
     /// The expected issuer value for tokens produced by the Meeting Backend.
     pub const ISSUER: &'static str = "videocall-meeting-backend";
 }
+
+/// Prefix used for guest participant user IDs: `"guest:{uuid}"`.
+///
+/// Guest `sub` claims in [`RoomAccessTokenClaims`] always start with this
+/// prefix, so any code that receives a user ID can distinguish guests from
+/// authenticated users without inspecting the `is_guest` flag.
+pub const GUEST_USER_ID_PREFIX: &str = "guest:";

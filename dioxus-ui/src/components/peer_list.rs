@@ -201,7 +201,7 @@ pub fn PeerList(
                     div { class: "peer-list",
                         ul {
                             // show self as the first item with actual username
-                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_self: true, is_guest: current_user_id_val.starts_with("guest:"), muted: self_muted, speaking: self_speaking, on_edit_name: on_edit_self_name } }
+                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_self: true, is_guest: current_user_id_val.starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX), muted: self_muted, speaking: self_speaking, on_edit_name: on_edit_self_name } }
 
                             for peer in filtered_peers.iter() {
                                 {
@@ -230,7 +230,7 @@ pub fn PeerList(
                                                 name: peer_display_name,
                                                 tooltip: peer.clone(),
                                                 is_host: is_peer_host,
-                                                is_guest: peer.starts_with("guest:"),
+                                                is_guest: peer.starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX),
                                                 muted: muted,
                                                 speaking: speaking,
                                             }

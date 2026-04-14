@@ -16,17 +16,14 @@
  * conditions.
  */
 
-use crate::components::{
-    canvas_generator::speak_style, device_settings_modal::DeviceSettingsModal,
-};
+use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::constants::*;
 use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    LocalAudioLevelCtx, VideoCallClientCtx,
+    TransportPreferenceCtx, VideoCallClientCtx,
 };
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
-use dioxus::web::WebEventExt;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
@@ -78,8 +75,7 @@ pub fn Host(
     reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
-    let audio_level = use_context::<LocalAudioLevelCtx>().0;
-    let mut glow_el = use_signal(|| None::<web_sys::Element>);
+    let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -176,6 +172,30 @@ pub fn Host(
         camera.set_congestion_step_down_flag(client.congestion_step_down_flag());
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
+
+        // Wire up cross-stream bandwidth coordination: the screen encoder sets
+        // this flag when capture starts/stops; the camera encoder reads it to
+        // drop quality and set a ceiling, preventing bandwidth contention.
+        screen.set_screen_sharing_flag(camera.screen_sharing_flag());
+
+        // Wire adaptive quality tier indices to health reporter for metrics
+        client.set_adaptive_tier_sources(
+            camera.shared_video_tier_index(),
+            camera.shared_audio_tier_index(),
+        );
+
+        // Wire encoder decision inputs + screen tier to health reporter for metrics
+        client.set_encoder_metric_sources(
+            camera.shared_encoder_fps_ratio(),
+            camera.shared_encoder_worst_peer_fps(),
+            camera.shared_encoder_bitrate_ratio(),
+            camera.shared_encoder_target_bitrate_kbps(),
+            screen.shared_screen_tier_index(),
+            camera.screen_sharing_flag(),
+            camera.shared_encoder_output_fps(),
+            camera.shared_tier_transitions(),
+            screen.shared_tier_transitions(),
+        );
 
         // Wire up encoder controls. The microphone encoder no longer needs
         // its own diagnostics channel — it reads audio tier settings from
@@ -505,11 +525,6 @@ pub fn Host(
         })
     };
 
-    // Change name state
-    let mut show_change_name = use_signal(|| false);
-    let mut pending_name = use_signal(String::new);
-    let mut change_name_error = use_signal(|| None::<String>);
-
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -519,17 +534,6 @@ pub fn Host(
     let selected_camera_id = s.media_devices.video_inputs.selected();
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
-
-    // Update glow overlay style directly on the DOM element — no component
-    // re-render needed.  The effect subscribes to both `audio_level` (fires on
-    // every mic callback) and `glow_el` (fires when video toggles and a new
-    // overlay element mounts).
-    use_effect(move || {
-        let level = audio_level();
-        if let Some(el) = glow_el() {
-            let _ = el.set_attribute("style", &speak_style(level));
-        }
-    });
 
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
@@ -545,30 +549,6 @@ pub fn Host(
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
-            button {
-                class: "change-name-fab",
-                title: "Change name",
-                onclick: move |_| {
-                    pending_name.set(load_display_name_from_storage().unwrap_or_default());
-                    show_change_name.set(true);
-                    change_name_error.set(None);
-                },
-                svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    path { d: "M12 20h9" }
-                    path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
-                }
-            }
-            // Glow overlay renders ON TOP of the video element
-            if video_enabled {
-                div {
-                    class: "glow-overlay",
-                    onmounted: move |evt| {
-                        if let Some(elem) = evt.try_as_web_event() {
-                            glow_el.set(Some(elem));
-                        }
-                    },
-                }
-            }
         }
         // Always-mounted screen share preview — toggled via style so the element
         // exists in the DOM before attach_screen_preview() runs.
@@ -584,35 +564,13 @@ pub fn Host(
         }
         if !video_enabled {
             div {
-                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; border: 1.5px solid transparent; width:100%; aspect-ratio:16/9;",
+                style: "padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; width:100%; aspect-ratio:16/9;",
                 div { class: "placeholder-content",
                     svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                         path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
                         line { x1: "1", y1: "1", x2: "23", y2: "23" }
                     }
                     span { class: "placeholder-text", "Camera Off" }
-                }
-                button {
-                    class: "change-name-fab",
-                    title: "Change name",
-                    onclick: move |_| {
-                        pending_name.set(load_display_name_from_storage().unwrap_or_default());
-                        show_change_name.set(true);
-                        change_name_error.set(None);
-                    },
-                    svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                        path { d: "M12 20h9" }
-                        path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
-                    }
-                }
-                // Glow overlay renders ON TOP of content
-                div {
-                    class: "glow-overlay",
-                    onmounted: move |evt| {
-                        if let Some(elem) = evt.try_as_web_event() {
-                            glow_el.set(Some(elem));
-                        }
-                    },
                 }
             }
         }
@@ -645,78 +603,8 @@ pub fn Host(
                     on_camera_select: move |d: DeviceInfo| on_cam(d),
                     on_speaker_select: move |d: DeviceInfo| on_spk(d),
                     visible: device_settings_open,
-                    on_close: move |_| on_device_settings_toggle.call(())
-                }
-            }
-        }
-
-        // Change Name Modal
-        if show_change_name() {
-            div {
-                class: "glass-backdrop",
-                onkeydown: move |e: Event<KeyboardData>| {
-                    let key = e.key();
-                    if key == Key::Escape {
-                        show_change_name.set(false);
-                        change_name_error.set(None);
-                    } else if key == Key::Enter {
-                        let new_name = pending_name().trim().to_string();
-                        match validate_display_name(&new_name) {
-                            Ok(valid_name) => {
-                                save_display_name_to_storage(&valid_name);
-                                if let Some(win) = web_sys::window() {
-                                    let _ = win.location().reload();
-                                }
-                            }
-                            Err(message) => {
-                                change_name_error.set(Some(message));
-                            }
-                        }
-                    }
-                },
-                div { class: "card-apple", style: "width: 380px;",
-                    h3 { style: "margin-top:0;", "Change your name" }
-                    p { style: "color:#AEAEB2; margin-top:0.25rem;", "This name will be visible to others in the meeting." }
-                    input {
-                        class: "input-apple",
-                        value: "{pending_name}",
-                        oninput: move |e: Event<FormData>| {
-                            pending_name.set(e.value());
-                        },
-                        placeholder: "Enter new name",
-                        autofocus: true,
-                    }
-                    if let Some(err) = change_name_error() {
-                        p { style: "color:#FF453A; margin-top:6px; font-size:12px;", "{err}" }
-                    }
-                    div { style: "display:flex; gap:8px; justify-content:flex-end; margin-top:12px;",
-                        button {
-                            class: "btn-apple btn-secondary btn-sm",
-                            onclick: move |_| {
-                                show_change_name.set(false);
-                                change_name_error.set(None);
-                            },
-                            "Cancel"
-                        }
-                        button {
-                            class: "btn-apple btn-primary btn-sm",
-                            onclick: move |_| {
-                                let new_name = pending_name().trim().to_string();
-                                match validate_display_name(&new_name) {
-                                    Ok(valid_name) => {
-                                        save_display_name_to_storage(&valid_name);
-                                        if let Some(win) = web_sys::window() {
-                                            let _ = win.location().reload();
-                                        }
-                                    }
-                                    Err(message) => {
-                                        change_name_error.set(Some(message));
-                                    }
-                                }
-                            },
-                            "Save"
-                        }
-                    }
+                    on_close: move |_| on_device_settings_toggle.call(()),
+                    transport_preference: (transport_pref_ctx.0)(),
                 }
             }
         }

@@ -59,6 +59,17 @@ impl AppState {
             .and_then(|o| o.jwks_url.as_ref())
             .map(|url| JwksCache::new(url.clone()));
 
+        if jwks_cache.is_some() {
+            tracing::warn!(
+                "JWKS token validation is active. Audience ('aud') validation is DISABLED \
+                 for per-request Bearer tokens: any JWT signed by the configured provider \
+                 is accepted regardless of its intended audience. This is safe when the \
+                 provider is used exclusively for this service. If the same provider issues \
+                 tokens for other services, consider adding OAUTH_RESOURCE_SERVER_AUDIENCE \
+                 support to restrict accepted tokens to this resource server."
+            );
+        }
+
         Self {
             db,
             jwt_secret: config.jwt_secret.clone(),

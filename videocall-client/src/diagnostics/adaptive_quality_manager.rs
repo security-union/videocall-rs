@@ -39,6 +39,16 @@ use crate::adaptive_quality_constants::{
     VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO,
 };
 
+/// Record of a single tier transition event, captured for health reporting.
+#[derive(Debug, Clone)]
+pub struct TierTransitionRecord {
+    pub direction: &'static str, // "up" or "down"
+    pub stream: &'static str, // "video", "audio"  (caller overrides to "screen" for screen share)
+    pub from_tier: String,    // tier label
+    pub to_tier: String,      // tier label
+    pub trigger: &'static str, // "fps", "bitrate", "congestion", "coordination"
+}
+
 /// Adaptive quality manager that automatically selects video and audio tiers
 /// based on network conditions. It enforces hysteresis to prevent oscillation
 /// between tiers.
@@ -73,6 +83,15 @@ pub struct AdaptiveQualityManager {
     /// grace period during which no tier transitions occur, preventing
     /// false step-downs from zero-FPS readings at encoder startup.
     created_at_ms: f64,
+
+    /// Quality ceiling: step-up cannot go below (better quality than) this index.
+    /// Used for cross-stream coordination — when screen share is active, the
+    /// camera's quality manager is capped to prevent bandwidth contention.
+    /// `None` means no ceiling (default).
+    quality_ceiling_index: Option<usize>,
+
+    /// Buffer of tier transition events since last drain.
+    transition_buffer: Vec<TierTransitionRecord>,
 }
 
 impl AdaptiveQualityManager {
@@ -96,12 +115,14 @@ impl AdaptiveQualityManager {
             audio_degrade_start_ms: None,
             audio_recover_start_ms: None,
             created_at_ms: now,
+            quality_ceiling_index: None,
+            transition_buffer: Vec::new(),
         }
     }
 
     /// Create a new manager for screen share.
     ///
-    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` (low/480p) to match the
+    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` (medium/720p) to match the
     /// camera strategy of only upgrading, never visibly downgrading. The
     /// PID controller will quickly ramp up resolution once it measures
     /// sufficient bandwidth.
@@ -117,6 +138,8 @@ impl AdaptiveQualityManager {
             audio_degrade_start_ms: None,
             audio_recover_start_ms: None,
             created_at_ms: now,
+            quality_ceiling_index: None,
+            transition_buffer: Vec::new(),
         }
     }
 
@@ -189,13 +212,28 @@ impl AdaptiveQualityManager {
             let degrade_duration = now_ms - degrade_start;
 
             if degrade_duration >= STEP_DOWN_REACTION_TIME_MS as f64 && can_transition {
+                let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
                 self.video_tier_index += 1;
                 self.last_transition_time_ms = now_ms;
                 self.degrade_start_ms = None;
                 self.recover_start_ms = None;
+                let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+                // Primary trigger: fps drives degradation more than bitrate
+                let trigger = if fps_ratio < VIDEO_TIER_DEGRADE_FPS_RATIO {
+                    "fps"
+                } else {
+                    "bitrate"
+                };
+                self.transition_buffer.push(TierTransitionRecord {
+                    direction: "down",
+                    stream: "video",
+                    from_tier,
+                    to_tier: to_tier.clone(),
+                    trigger,
+                });
                 log::info!(
                     "AdaptiveQuality: video stepped DOWN to tier '{}' (index {}), fps_ratio={:.2}, bitrate_ratio={:.2}",
-                    self.video_tiers[self.video_tier_index].label,
+                    to_tier,
                     self.video_tier_index,
                     fps_ratio,
                     bitrate_ratio,
@@ -211,18 +249,30 @@ impl AdaptiveQualityManager {
         let should_recover = fps_ratio > VIDEO_TIER_RECOVER_FPS_RATIO
             && bitrate_ratio > VIDEO_TIER_RECOVER_BITRATE_RATIO;
 
-        if should_recover && self.video_tier_index > 0 {
+        // Respect the quality ceiling set by cross-stream coordination.
+        let min_allowed_index = self.quality_ceiling_index.unwrap_or(0);
+
+        if should_recover && self.video_tier_index > min_allowed_index {
             let recover_start = *self.recover_start_ms.get_or_insert(now_ms);
             let recover_duration = now_ms - recover_start;
 
             if recover_duration >= STEP_UP_STABILIZATION_WINDOW_MS as f64 && can_transition {
+                let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
                 self.video_tier_index -= 1;
                 self.last_transition_time_ms = now_ms;
                 self.recover_start_ms = None;
                 self.degrade_start_ms = None;
+                let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+                self.transition_buffer.push(TierTransitionRecord {
+                    direction: "up",
+                    stream: "video",
+                    from_tier,
+                    to_tier: to_tier.clone(),
+                    trigger: "fps",
+                });
                 log::info!(
                     "AdaptiveQuality: video stepped UP to tier '{}' (index {}), fps_ratio={:.2}, bitrate_ratio={:.2}",
-                    self.video_tiers[self.video_tier_index].label,
+                    to_tier,
                     self.video_tier_index,
                     fps_ratio,
                     bitrate_ratio,
@@ -254,13 +304,22 @@ impl AdaptiveQualityManager {
             let degrade_duration = now_ms - degrade_start;
 
             if degrade_duration >= STEP_DOWN_REACTION_TIME_MS as f64 && can_transition {
+                let from_tier = AUDIO_QUALITY_TIERS[self.audio_tier_index].label.to_string();
                 self.audio_tier_index += 1;
                 self.last_transition_time_ms = now_ms;
                 self.audio_degrade_start_ms = None;
                 self.audio_recover_start_ms = None;
+                let to_tier = AUDIO_QUALITY_TIERS[self.audio_tier_index].label.to_string();
+                self.transition_buffer.push(TierTransitionRecord {
+                    direction: "down",
+                    stream: "audio",
+                    from_tier,
+                    to_tier: to_tier.clone(),
+                    trigger: "fps",
+                });
                 log::info!(
                     "AdaptiveQuality: audio stepped DOWN to tier '{}' (index {}), fps_ratio={:.2}",
-                    AUDIO_QUALITY_TIERS[self.audio_tier_index].label,
+                    to_tier,
                     self.audio_tier_index,
                     fps_ratio,
                 );
@@ -278,13 +337,22 @@ impl AdaptiveQualityManager {
             let recover_duration = now_ms - recover_start;
 
             if recover_duration >= STEP_UP_STABILIZATION_WINDOW_MS as f64 && can_transition {
+                let from_tier = AUDIO_QUALITY_TIERS[self.audio_tier_index].label.to_string();
                 self.audio_tier_index -= 1;
                 self.last_transition_time_ms = now_ms;
                 self.audio_recover_start_ms = None;
                 self.audio_degrade_start_ms = None;
+                let to_tier = AUDIO_QUALITY_TIERS[self.audio_tier_index].label.to_string();
+                self.transition_buffer.push(TierTransitionRecord {
+                    direction: "up",
+                    stream: "audio",
+                    from_tier,
+                    to_tier: to_tier.clone(),
+                    trigger: "fps",
+                });
                 log::info!(
                     "AdaptiveQuality: audio stepped UP to tier '{}' (index {}), fps_ratio={:.2}",
-                    AUDIO_QUALITY_TIERS[self.audio_tier_index].label,
+                    to_tier,
                     self.audio_tier_index,
                     fps_ratio,
                 );
@@ -347,23 +415,108 @@ impl AdaptiveQualityManager {
             return false;
         }
 
+        let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
         self.video_tier_index += 1;
         self.last_transition_time_ms = now_ms;
         self.degrade_start_ms = None;
         self.recover_start_ms = None;
+        let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+        self.transition_buffer.push(TierTransitionRecord {
+            direction: "down",
+            stream: "video",
+            from_tier,
+            to_tier: to_tier.clone(),
+            trigger: "congestion",
+        });
         log::warn!(
             "AdaptiveQuality: CONGESTION forced video step-down to tier '{}' (index {})",
-            self.video_tiers[self.video_tier_index].label,
+            to_tier,
             self.video_tier_index,
         );
         true
+    }
+
+    /// Set a quality ceiling that prevents step-up from going below (better
+    /// quality than) the given index.
+    ///
+    /// Used for cross-stream bandwidth coordination: when screen share is
+    /// active, the camera's quality manager is capped so the combined
+    /// bandwidth stays within safe limits.
+    ///
+    /// Pass `None` to remove the ceiling (e.g., when screen share stops).
+    pub fn set_quality_ceiling(&mut self, ceiling: Option<usize>) {
+        self.quality_ceiling_index = ceiling;
+        if ceiling.is_some() {
+            // Reset recovery timer so the ceiling takes effect immediately
+            // rather than allowing a pending step-up to fire.
+            self.recover_start_ms = None;
+        }
+        // When clearing (None), intentionally preserve recover_start_ms so
+        // the camera can begin stepping up without re-waiting the full
+        // STEP_UP_STABILIZATION_WINDOW_MS.
+    }
+
+    /// Force the video tier to a specific index, bypassing the one-step-at-a-time
+    /// limit and the minimum transition interval.
+    ///
+    /// This is a coordination signal (e.g., screen share started/stopped), not a
+    /// congestion reaction. It allows jumping multiple tiers in a single call and
+    /// intentionally bypasses the warmup guard — coordination must take effect
+    /// immediately regardless of encoder startup state.
+    ///
+    /// Note: if the current tier is already *below* the target (worse quality),
+    /// this will step UP to the target. This is intentional for screen share
+    /// coordination — it normalizes the camera to the ceiling tier.
+    ///
+    /// Returns `true` if the tier actually changed.
+    pub fn force_video_step_to(&mut self, target: usize, now_ms: f64) -> bool {
+        let max_index = self.video_tiers.len().saturating_sub(1);
+        let clamped = target.min(max_index);
+
+        if clamped == self.video_tier_index {
+            return false;
+        }
+
+        // Higher index = worse quality = "DOWN"; lower index = better quality = "UP"
+        let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
+        let direction = if clamped > self.video_tier_index {
+            "down"
+        } else {
+            "up"
+        };
+        self.video_tier_index = clamped;
+        self.last_transition_time_ms = now_ms;
+        self.degrade_start_ms = None;
+        self.recover_start_ms = None;
+        let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+        self.transition_buffer.push(TierTransitionRecord {
+            direction,
+            stream: "video",
+            from_tier,
+            to_tier: to_tier.clone(),
+            trigger: "coordination",
+        });
+        log::info!(
+            "AdaptiveQuality: forced video step {} to tier '{}' (index {}) for cross-stream coordination",
+            direction.to_uppercase(),
+            to_tier,
+            self.video_tier_index,
+        );
+        true
+    }
+
+    /// Drain and return all tier transition records since the last drain.
+    pub fn drain_transitions(&mut self) -> Vec<TierTransitionRecord> {
+        std::mem::take(&mut self.transition_buffer)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adaptive_quality_constants::{SCREEN_QUALITY_TIERS, VIDEO_QUALITY_TIERS};
+    use crate::adaptive_quality_constants::{
+        screen_share_camera_ceiling_index, SCREEN_QUALITY_TIERS, VIDEO_QUALITY_TIERS,
+    };
     use wasm_bindgen_test::*;
 
     /// Create a manager with `created_at_ms` and `last_transition_time_ms` set
@@ -397,8 +550,8 @@ mod tests {
             mgr.current_video_tier().label,
             SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].label
         );
-        // Screen share starts at "low" (480p) to avoid downgrade oscillation
-        assert_eq!(mgr.current_video_tier().label, "low");
+        // Screen share starts at "medium" (720p) to avoid downgrade oscillation
+        assert_eq!(mgr.current_video_tier().label, "medium");
     }
 
     #[wasm_bindgen_test]
@@ -627,5 +780,139 @@ mod tests {
         let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
         let changed = mgr.update(0.0, 0.0, 0.0, 0.0, 10000.0);
         assert!(!changed);
+    }
+
+    // =====================================================================
+    // Quality ceiling tests (cross-stream coordination)
+    // =====================================================================
+
+    #[wasm_bindgen_test]
+    fn test_quality_ceiling_blocks_step_up() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        // Start at index 2 ("low")
+        mgr.video_tier_index = 2;
+        // Set ceiling at index 2 — can't go above "low"
+        mgr.set_quality_ceiling(Some(2));
+
+        // Good conditions that would normally trigger step-up
+        let base = 10000.0;
+        // Sustain recovery for STEP_UP_STABILIZATION_WINDOW_MS
+        for i in 0..=6 {
+            let t = base + (i as f64 * 1000.0);
+            mgr.update(29.0, 30.0, 1400.0, 1500.0, t);
+        }
+        assert_eq!(
+            mgr.video_tier_index(),
+            2,
+            "Step-up should be blocked by quality ceiling"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_quality_ceiling_allows_step_down() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        // Start at index 1 ("medium")
+        mgr.video_tier_index = 1;
+        // Set ceiling at index 1 — ceiling only blocks step-up, not step-down
+        mgr.set_quality_ceiling(Some(1));
+
+        // Bad conditions to trigger step-down
+        let base = 10000.0;
+        // Sustain degradation for STEP_DOWN_REACTION_TIME_MS
+        for i in 0..=3 {
+            let t = base + (i as f64 * 1000.0);
+            mgr.update(5.0, 30.0, 100.0, 600.0, t);
+        }
+        assert!(
+            mgr.video_tier_index() > 1,
+            "Step-down should not be blocked by quality ceiling"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_quality_ceiling_removal_allows_step_up() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 2;
+        mgr.set_quality_ceiling(Some(2));
+
+        // Good conditions — blocked by ceiling. These updates also accumulate
+        // recovery time in recover_start_ms.
+        let base = 10000.0;
+        for i in 0..=6 {
+            let t = base + (i as f64 * 1000.0);
+            mgr.update(29.0, 30.0, 1400.0, 1500.0, t);
+        }
+        assert_eq!(mgr.video_tier_index(), 2, "Should be blocked by ceiling");
+
+        // Remove ceiling. The recovery timer accumulated above is preserved
+        // (not reset), so the camera doesn't have to re-wait the full
+        // stabilization window.
+        mgr.set_quality_ceiling(None);
+
+        // Continue with good conditions — recovery should happen within the
+        // natural MIN_TIER_TRANSITION_INTERVAL_MS + stabilization window,
+        // without artificially resetting last_transition_time_ms.
+        let base2 = base + 20000.0; // well past min-interval from any ceiling-phase transition
+        for i in 0..=8 {
+            let t = base2 + (i as f64 * 1000.0);
+            mgr.update(29.0, 30.0, 1400.0, 1500.0, t);
+        }
+        assert!(
+            mgr.video_tier_index() < 2,
+            "Step-up should work after ceiling removal without artificial guard reset"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_audio_stays_high_at_ceiling_tier() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        // Force camera to "low" ceiling (same as screen share coordination)
+        let ceiling = screen_share_camera_ceiling_index();
+        mgr.force_video_step_to(ceiling, 0.0);
+        mgr.set_quality_ceiling(Some(ceiling));
+
+        // Sustain moderate conditions — camera at ceiling, not at minimal
+        let base = 10000.0;
+        for i in 0..=10 {
+            let t = base + (i as f64 * 1000.0);
+            mgr.update(20.0, 30.0, 350.0, 400.0, t);
+        }
+        assert_eq!(
+            mgr.audio_tier_index(),
+            0,
+            "Audio should stay at 'high' (index 0) while camera is at ceiling tier '{}', \
+             not at lowest video tier. Got audio tier index {}",
+            VIDEO_QUALITY_TIERS[ceiling].label,
+            mgr.audio_tier_index(),
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_force_video_step_to() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 0;
+
+        // Force to index 2
+        let changed = mgr.force_video_step_to(2, 10000.0);
+        assert!(changed);
+        assert_eq!(mgr.video_tier_index(), 2);
+
+        // Force to same index — no change
+        let changed = mgr.force_video_step_to(2, 10001.0);
+        assert!(!changed);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_force_video_step_to_clamps() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        // Force to index far beyond array bounds
+        let changed = mgr.force_video_step_to(999, 10000.0);
+        assert!(changed);
+        let max_index = VIDEO_QUALITY_TIERS.len() - 1;
+        assert_eq!(
+            mgr.video_tier_index(),
+            max_index,
+            "Should clamp to last valid index"
+        );
     }
 }

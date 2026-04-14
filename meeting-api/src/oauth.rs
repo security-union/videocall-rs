@@ -31,9 +31,14 @@ const JWKS_REFRESH_INTERVAL_SECS: u64 = 300;
 // ID token claims
 // ---------------------------------------------------------------------------
 
-/// Claims extracted from an OIDC ID token JWT.
+/// Claims extracted from an OIDC ID token JWT, or from a JWT access token
+/// when the provider issues structured access tokens.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IdTokenClaims {
+    /// Subject identifier — the provider's canonical, stable user ID.
+    /// Always present in both id_tokens and JWT access tokens.
+    #[serde(default)]
+    pub sub: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]
@@ -59,16 +64,26 @@ pub struct IdTokenClaims {
 }
 
 impl IdTokenClaims {
-    /// Return a display name, coalescing `name`, `given_name + family_name`, or email.
+    /// Return a display name, coalescing `name`, `given_name + family_name`,
+    /// `email`, or `sub` (in that priority order).
+    ///
+    /// Access tokens often omit `email` and human-readable name fields; `sub`
+    /// is the final fallback so callers always receive a non-empty identifier.
     pub fn display_name(&self) -> String {
         if !self.name.is_empty() {
             return self.name.clone();
         }
         match (&self.given_name, &self.family_name) {
-            (Some(g), Some(f)) if !g.is_empty() => format!("{g} {f}"),
-            (Some(g), _) if !g.is_empty() => g.clone(),
-            _ => self.email.clone().unwrap_or_default(),
+            (Some(g), Some(f)) if !g.is_empty() => return format!("{g} {f}"),
+            (Some(g), _) if !g.is_empty() => return g.clone(),
+            _ => {}
         }
+        if let Some(e) = &self.email {
+            if !e.is_empty() {
+                return e.clone();
+            }
+        }
+        self.sub.clone().unwrap_or_default()
     }
 }
 
@@ -85,6 +100,10 @@ pub struct OidcEndpoints {
     pub jwks_uri: Option<String>,
     #[serde(default)]
     pub userinfo_endpoint: Option<String>,
+    /// End-session endpoint used for both RP-initiated logout and front-channel
+    /// logout flows (OIDC RP-Initiated Logout 1.0 / Front-Channel Logout 1.0).
+    #[serde(default)]
+    pub end_session_endpoint: Option<String>,
 }
 
 /// Fetch OIDC discovery document from `{issuer}/.well-known/openid-configuration`.
@@ -281,14 +300,26 @@ fn jwk_algorithm(jwk: &JwkEntry) -> Algorithm {
 // JWT verification
 // ---------------------------------------------------------------------------
 
-/// Verify an ID token's signature and standard claims, returning the decoded claims.
+/// Verify a JWT Bearer token's signature and standard claims, returning the
+/// decoded claims.
 ///
-/// Validates: signature (via JWKS), `exp`, `aud` == `client_id`,
-/// optionally `iss` == `issuer`, optionally `nonce` == `expected_nonce`.
+/// Validates: **signature** (via JWKS), **`exp`**, optionally **`aud`** (when
+/// `expected_audience` is `Some`), optionally **`iss`**, optionally **`nonce`**.
+///
+/// ## Audience validation
+///
+/// Pass `Some(client_id)` when verifying an id_token at exchange time — the
+/// provider must have set `aud` to the OAuth client ID.
+///
+/// Pass `None` when validating per-request Bearer tokens in the `AuthUser`
+/// extractor.  Access tokens carry the resource-server URL (or another value)
+/// in `aud`, not the `client_id`, so strict `aud` checking would reject them.
+/// Signature + issuer + expiry is still validated; only the audience check is
+/// skipped.
 pub async fn verify_and_decode_id_token(
     jwks: &JwksCache,
     id_token: &str,
-    client_id: &str,
+    expected_audience: Option<&str>,
     issuer: Option<&str>,
     expected_nonce: Option<&str>,
 ) -> Result<IdTokenClaims, AppError> {
@@ -303,7 +334,20 @@ pub async fn verify_and_decode_id_token(
     let (alg, key) = jwks.get_key(kid).await?;
 
     let mut validation = Validation::new(alg);
-    validation.set_audience(&[client_id]);
+    if let Some(aud) = expected_audience {
+        validation.set_audience(&[aud]);
+    } else {
+        // No expected audience provided → skip aud validation entirely.
+        //
+        // jsonwebtoken 9 rejects tokens that carry an `aud` claim when
+        // `validate_aud = true` but no expected audience is configured
+        // (RFC 7519 §4.1.3: "If the principal processing the claim does not
+        // identify itself with a value in the 'aud' claim when this claim is
+        // present, then the JWT MUST be rejected").  Access tokens arrive with
+        // a resource-server audience that differs from `client_id`, so we must
+        // disable the check rather than simply omitting `set_audience`.
+        validation.validate_aud = false;
+    }
     if let Some(iss) = issuer {
         validation.set_issuer(&[iss]);
     }
@@ -435,7 +479,7 @@ pub async fn exchange_code_for_claims(
         .ok_or_else(|| AppError::internal("OAuth response missing id_token"))?;
 
     let claims = if let Some(jwks) = jwks {
-        verify_and_decode_id_token(jwks, id_token, client_id, issuer, expected_nonce).await?
+        verify_and_decode_id_token(jwks, id_token, Some(client_id), issuer, expected_nonce).await?
     } else {
         tracing::warn!(
             "JWKS not configured — ID token signature, issuer, audience, and nonce are NOT verified. \
@@ -556,6 +600,7 @@ mod tests {
 
     fn base_claims() -> IdTokenClaims {
         IdTokenClaims {
+            sub: Some("user@example.com".to_string()),
             email: Some("user@example.com".to_string()),
             name: "Test User".to_string(),
             email_verified: Some(true),
@@ -584,7 +629,7 @@ mod tests {
         let result = verify_and_decode_id_token(
             &jwks,
             &token,
-            "my-client-id",
+            Some("my-client-id"),
             Some("https://accounts.google.com"),
             Some("test-nonce-123"),
         )
@@ -611,7 +656,7 @@ mod tests {
         let result = verify_and_decode_id_token(
             &jwks,
             &token,
-            "my-client-id",
+            Some("my-client-id"),
             Some("https://accounts.google.com"),
             Some("test-nonce-123"),
         )
@@ -630,7 +675,7 @@ mod tests {
         let result = verify_and_decode_id_token(
             &jwks,
             &token,
-            "my-client-id",
+            Some("my-client-id"),
             Some("https://wrong-issuer.com"),
             Some("test-nonce-123"),
         )
@@ -651,7 +696,7 @@ mod tests {
         let result = verify_and_decode_id_token(
             &jwks,
             &token,
-            "my-client-id",
+            Some("my-client-id"),
             Some("https://accounts.google.com"),
             Some("test-nonce-123"),
         )
@@ -670,7 +715,7 @@ mod tests {
         let result = verify_and_decode_id_token(
             &jwks,
             &token,
-            "my-client-id",
+            Some("my-client-id"),
             Some("https://accounts.google.com"),
             Some("wrong-nonce"),
         )
@@ -690,7 +735,7 @@ mod tests {
         let result = verify_and_decode_id_token(
             &jwks,
             &token,
-            "my-client-id",
+            Some("my-client-id"),
             Some("https://accounts.google.com"),
             Some("test-nonce-123"),
         )
@@ -712,7 +757,7 @@ mod tests {
         let result = verify_and_decode_id_token(
             &jwks,
             &token,
-            "wrong-client-id",
+            Some("wrong-client-id"),
             Some("https://accounts.google.com"),
             Some("test-nonce-123"),
         )
@@ -729,9 +774,14 @@ mod tests {
         let token = sign_token(&enc, &kid, &claims);
 
         // Pass None for issuer — should skip issuer check.
-        let result =
-            verify_and_decode_id_token(&jwks, &token, "my-client-id", None, Some("test-nonce-123"))
-                .await;
+        let result = verify_and_decode_id_token(
+            &jwks,
+            &token,
+            Some("my-client-id"),
+            None,
+            Some("test-nonce-123"),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -750,7 +800,7 @@ mod tests {
         let result = verify_and_decode_id_token(
             &jwks,
             &token,
-            "my-client-id",
+            Some("my-client-id"),
             Some("https://accounts.google.com"),
             None,
         )
@@ -773,7 +823,7 @@ mod tests {
         let result = verify_and_decode_id_token(
             &jwks,
             &token,
-            "my-client-id",
+            Some("my-client-id"),
             Some("https://accounts.google.com"),
             Some("test-nonce-123"),
         )
@@ -820,8 +870,22 @@ mod tests {
     }
 
     #[test]
-    fn display_name_empty_when_no_email() {
+    fn display_name_falls_back_to_sub_when_no_email() {
         let c = IdTokenClaims {
+            sub: Some("sub-opaque-user-id".to_string()),
+            email: None,
+            name: String::new(),
+            given_name: None,
+            family_name: None,
+            ..base_claims()
+        };
+        assert_eq!(c.display_name(), "sub-opaque-user-id");
+    }
+
+    #[test]
+    fn display_name_empty_when_no_email_no_sub() {
+        let c = IdTokenClaims {
+            sub: None,
             email: None,
             name: String::new(),
             given_name: None,

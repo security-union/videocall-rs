@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: videocall-dashboards
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  meeting-investigation.json: |-
+    {{ .Files.Get "dashboards/meeting-investigation.json" | nindent 4 }}
+  server-connections-analytics.json: |-
+    {{ .Files.Get "dashboards/server-connections-analytics.json" | nindent 4 }}
+  videocall-health.json: |-
+    {{ .Files.Get "dashboards/videocall-health.json" | nindent 4 }}

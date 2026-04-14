@@ -373,7 +373,6 @@ graph TD
     C --> J[videocall-ui]
     C --> K[rustlemania-websocket]
     C --> L[rustlemania-webtransport]
-    C --> M[matomo]
 ```
 
 ### Primary Helm Charts
@@ -390,7 +389,6 @@ graph TD
    - **rustlemania-webtransport**: Deploys the WebTransport server
    - **videocall-ui**: Deploys the Dioxus-based frontend application
    - **videocall-website**: Deploys the marketing website
-   - **matomo**: Deploys analytics tools for usage tracking
 
 ### Deployment Configuration
 
@@ -401,30 +399,6 @@ Each component is configured through values files that specify:
 - Connection parameters for inter-service communication
 - Security settings and credentials
 - Persistence configuration
-
-Example from the `matomo` chart values:
-
-```yaml
-# Matomo deployment configuration
-replicaCount: 1
-
-mariadb:
-  enabled: true
-  auth:
-    database: matomo
-    username: matomo
-
-service:
-  type: NodePort
-  port: 80
-
-ingress:
-  enabled: true
-  hostname: matomo.videocall.rs
-  annotations:
-    kubernetes.io/ingress.class: nginx
-    cert-manager.io/issuer: letsencrypt-prod
-```
 
 ### Deployment Workflow
 

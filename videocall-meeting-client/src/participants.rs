@@ -13,7 +13,10 @@
 
 //! Participant action endpoints: join, leave, status, refresh token.
 
-use videocall_meeting_types::{requests::JoinMeetingRequest, responses::ParticipantStatusResponse};
+use videocall_meeting_types::{
+    requests::{JoinMeetingRequest, UpdateDisplayNameRequest},
+    responses::ParticipantStatusResponse,
+};
 
 use crate::error::ApiError;
 use crate::{parse_api_response, MeetingApiClient};
@@ -82,6 +85,24 @@ impl MeetingApiClient {
     ) -> Result<ParticipantStatusResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/leave");
         let response = self.post(&path).send().await?;
+        parse_api_response(response).await
+    }
+
+    /// Update your display name during an active meeting.
+    ///
+    /// Calls `PUT /api/v1/meetings/{meeting_id}/display-name`.
+    ///
+    /// The display name change is broadcast to all connected participants.
+    pub async fn update_display_name(
+        &self,
+        meeting_id: &str,
+        display_name: &str,
+    ) -> Result<ParticipantStatusResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/display-name");
+        let body = UpdateDisplayNameRequest {
+            display_name: display_name.to_string(),
+        };
+        let response = self.put(&path).json(&body).send().await?;
         parse_api_response(response).await
     }
 

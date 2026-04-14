@@ -40,7 +40,9 @@ runtimeConfig:
   wsUrl: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
   webTransportHost: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"
   oauthEnabled: "false"
-  oauthProvider: ""
+  oauthProvider: ""              # "google", "okta", or ""
+  oauthFlow: ""                  # "pkce" for client-side PKCE, "" for server-side OAuth
+  oauthPrompt: ""                # "login", "consent", "select_account", or "" to omit
   e2eeEnabled: "false"
   webTransportEnabled: "true"
   firefoxEnabled: "false"

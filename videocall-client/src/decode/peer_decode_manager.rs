@@ -20,7 +20,7 @@ use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
-    KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
+    KEYFRAME_BACKOFF_DECAY_MS, KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
     KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_SLOW_RETRY_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
 };
 use crate::audio::shared_audio_context::SharedAudioContext;
@@ -31,6 +31,7 @@ use log::debug;
 use protobuf::Message;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Display, sync::Arc};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -40,6 +41,14 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
+
+/// Cumulative count of keyframe requests (PLI) sent by this client.
+static KEYFRAME_REQUESTS_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of keyframe requests sent since process start.
+pub fn keyframe_requests_sent_count() -> u64 {
+    KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed)
+}
 
 #[derive(Debug)]
 pub enum PeerDecodeError {
@@ -183,10 +192,16 @@ impl SequenceTracker {
     /// persistent loss without flooding the sender.
     fn should_request_keyframe(&mut self, now: u64) -> bool {
         if self.lost_count == 0 {
-            // No loss -- reset all request state.
+            // No current loss -- clear detection timestamp but preserve
+            // backoff escalation. Only fully reset after sustained stability
+            // (KEYFRAME_BACKOFF_DECAY_MS with no PLI activity), so that
+            // repeated PLI→keyframe→loss cycles don't restart the backoff
+            // from scratch every time. See issue #832.
             self.loss_detected_at_ms = None;
-            self.unanswered_requests = 0;
-            self.current_backoff_ms = KEYFRAME_REQUEST_MIN_INTERVAL_MS;
+            if now.saturating_sub(self.last_keyframe_request_ms) >= KEYFRAME_BACKOFF_DECAY_MS {
+                self.unanswered_requests = 0;
+                self.current_backoff_ms = KEYFRAME_REQUEST_MIN_INTERVAL_MS;
+            }
             return false;
         }
 
@@ -225,12 +240,28 @@ impl SequenceTracker {
         true
     }
 
-    /// Called when a keyframe is received -- resets loss/request state.
+    /// Called when a keyframe is received -- clears loss state with graduated
+    /// backoff recovery.
+    ///
+    /// We clear `lost_count` and `loss_detected_at_ms` because the keyframe
+    /// provides a fresh decode point. However, we intentionally preserve most
+    /// of the backoff escalation (`current_backoff_ms`) and only decrement
+    /// `unanswered_requests` by 1.
+    ///
+    /// **Why**: In a PLI storm, each keyframe (5-10x larger than a delta frame)
+    /// causes a bandwidth spike that triggers new packet loss, sending another
+    /// PLI. If we fully reset backoff here, the cycle restarts at 1s forever
+    /// and never reaches slow-retry. By retaining escalation history, the
+    /// interval between PLIs naturally grows (1s → 2s → 4s → 8s), giving the
+    /// network time to recover. See issue #832.
+    ///
+    /// Full backoff reset happens only after sustained stability (30s with no
+    /// loss), via the time-gated path in `should_request_keyframe()`.
     fn on_keyframe(&mut self) {
         self.lost_count = 0;
         self.loss_detected_at_ms = None;
-        self.unanswered_requests = 0;
-        self.current_backoff_ms = KEYFRAME_REQUEST_MIN_INTERVAL_MS;
+        self.unanswered_requests = self.unanswered_requests.saturating_sub(1);
+        // current_backoff_ms is intentionally NOT reset -- see doc comment.
     }
 }
 
@@ -746,11 +777,11 @@ fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> 
 #[derive(Debug)]
 pub struct PeerDecodeManager {
     connected_peers: HashMapWithOrderedKeys<u64, Peer>,
-    /// Cache of user_id -> display_name, populated from PARTICIPANT_JOINED events.
+    /// Cache of session_id -> display_name, populated from PARTICIPANT_JOINED events.
     /// This persists independently of the peer list so that when `ensure_peer()`
     /// creates a peer later (after the first media packet arrives), the display
     /// name is immediately available and does not fall back to user_id/email.
-    display_name_cache: HashMap<String, String>,
+    display_name_cache: HashMap<u64, String>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -997,6 +1028,7 @@ impl PeerDecodeManager {
             ..Default::default()
         };
 
+        KEYFRAME_REQUESTS_SENT.fetch_add(1, Ordering::Relaxed);
         log::info!(
             "Sending KEYFRAME_REQUEST to {} for {:?}",
             peer_user_id,
@@ -1023,7 +1055,7 @@ impl PeerDecodeManager {
         )?;
         // Apply cached display name if PARTICIPANT_JOINED arrived before
         // the first media packet created this peer entry.
-        if let Some(cached_name) = self.display_name_cache.get(user_id) {
+        if let Some(cached_name) = self.display_name_cache.get(&session_id) {
             debug!(
                 "Applying cached display_name '{}' for peer {} (user_id={})",
                 cached_name, session_id, user_id
@@ -1039,6 +1071,7 @@ impl PeerDecodeManager {
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
+            self.display_name_cache.remove(&session_id);
             self.on_peer_removed.emit(peer.sid_str);
         }
     }
@@ -1108,26 +1141,37 @@ impl PeerDecodeManager {
         Ok(())
     }
 
-    /// Set the display name for a peer identified by user_id (email).
+    /// Set the display name for a peer identified by session_id.
     /// This is called when a PARTICIPANT_JOINED event provides the display name.
     ///
     /// The display name is stored in both the per-peer entry (if the peer
-    /// already exists) AND a persistent cache keyed by user_id. This way,
+    /// already exists) AND a persistent cache keyed by session_id. This way,
     /// if the PARTICIPANT_JOINED event arrives before the first media packet
     /// creates the peer entry via `ensure_peer()`, the display name is
     /// still available when the peer is created later.
-    pub fn set_peer_display_name_by_user_id(&mut self, user_id: &str, display_name: String) {
+    pub fn set_peer_display_name(&mut self, session_id: u64, display_name: String) {
         // Always persist in the cache so that future `add_peer()` calls
         // can pick it up even if no peer entry exists yet.
         self.display_name_cache
-            .insert(user_id.to_string(), display_name.clone());
+            .insert(session_id, display_name.clone());
 
-        // Also update any existing peer entries with this user_id.
+        // Also update the existing peer entry if it exists.
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            peer.display_name = Some(display_name);
+        }
+    }
+
+    /// Update display name for all peers with the given user_id.
+    /// Used for PARTICIPANT_DISPLAY_NAME_CHANGED events where the server
+    /// does not include session_id — a rename applies to all sessions
+    /// belonging to that user.
+    pub fn set_peer_display_name_by_user_id(&mut self, user_id: &str, display_name: String) {
         let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
         for key in keys {
             if let Some(peer) = self.connected_peers.get_mut(&key) {
                 if peer.user_id == user_id {
                     peer.display_name = Some(display_name.clone());
+                    self.display_name_cache.insert(key, display_name.clone());
                 }
             }
         }
@@ -2818,9 +2862,12 @@ mod tests {
         );
     }
 
-    /// A keyframe resets the backoff and unanswered count.
+    /// A keyframe clears loss state but preserves backoff escalation
+    /// (graduated recovery — see #832). Only `lost_count` and
+    /// `loss_detected_at_ms` are fully cleared; `unanswered_requests`
+    /// is decremented by 1, and `current_backoff_ms` is retained.
     #[wasm_bindgen_test]
-    fn keyframe_resets_backoff_state() {
+    fn keyframe_graduated_backoff_recovery() {
         let mut tracker = SequenceTracker::new();
         tracker.lost_count = 5;
         tracker.loss_detected_at_ms = Some(0);
@@ -2832,8 +2879,8 @@ mod tests {
 
         assert_eq!(tracker.lost_count, 0);
         assert!(tracker.loss_detected_at_ms.is_none());
-        assert_eq!(tracker.unanswered_requests, 0);
-        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MIN_INTERVAL_MS);
+        assert_eq!(tracker.unanswered_requests, 2); // 3 - 1 = 2 (graduated)
+        assert_eq!(tracker.current_backoff_ms, 4000); // preserved, not reset
     }
 
     /// Verify that out-of-order packets across a realistic WebTransport
@@ -2906,11 +2953,114 @@ mod tests {
         tracker.on_keyframe();
         assert_eq!(tracker.lost_count, 0);
 
-        // Next check should return false and reset state.
+        // Next check with a timestamp well past the 30s decay window should
+        // return false and fully reset backoff state.
         let result = tracker.should_request_keyframe(99999);
         assert!(!result);
         assert!(tracker.loss_detected_at_ms.is_none());
         assert_eq!(tracker.unanswered_requests, 0);
         assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MIN_INTERVAL_MS);
+    }
+
+    /// Verify that repeated PLI→keyframe cycles escalate the backoff interval
+    /// instead of resetting it, breaking the death spiral described in #832.
+    #[wasm_bindgen_test]
+    fn graduated_backoff_across_pli_cycles() {
+        let mut tracker = SequenceTracker::new();
+
+        // Simulate 4 PLI→keyframe cycles. Each cycle:
+        //   1. Inject loss (lost_count > 0)
+        //   2. Advance past timeout + backoff → should_request_keyframe fires PLI
+        //   3. Keyframe arrives → on_keyframe() clears loss but preserves backoff
+
+        // Cycle 1: initial state, backoff = 1000ms
+        tracker.lost_count = 3;
+        tracker.loss_detected_at_ms = Some(1000);
+        tracker.last_keyframe_request_ms = 0;
+        // At t=2100 (1000ms timeout + 1100ms > 1000ms backoff)
+        assert!(tracker.should_request_keyframe(2100));
+        assert_eq!(tracker.unanswered_requests, 1);
+        assert_eq!(tracker.current_backoff_ms, 2000); // doubled from 1000
+                                                      // Keyframe arrives
+        tracker.on_keyframe();
+        assert_eq!(tracker.lost_count, 0);
+        assert_eq!(tracker.unanswered_requests, 0); // 1 - 1 = 0
+        assert_eq!(tracker.current_backoff_ms, 2000); // NOT reset to 1000
+
+        // Cycle 2: new loss, backoff starts at 2000ms (retained)
+        tracker.lost_count = 2;
+        tracker.loss_detected_at_ms = Some(3000);
+        // At t=6200 (3000 + 1000 timeout = 4000, then need 2000ms backoff from last PLI at 2100)
+        // elapsed_since_last_req = 6200 - 2100 = 4100 >= 2000 → fires
+        assert!(tracker.should_request_keyframe(6200));
+        assert_eq!(tracker.unanswered_requests, 1);
+        assert_eq!(tracker.current_backoff_ms, 4000); // doubled from 2000
+        tracker.on_keyframe();
+        assert_eq!(tracker.unanswered_requests, 0);
+        assert_eq!(tracker.current_backoff_ms, 4000); // preserved
+
+        // Cycle 3: backoff now at 4000ms
+        tracker.lost_count = 2;
+        tracker.loss_detected_at_ms = Some(7000);
+        // Need elapsed_since_last_req >= 4000. Last req at 6200. 6200+4000=10200
+        assert!(tracker.should_request_keyframe(10300));
+        assert_eq!(tracker.unanswered_requests, 1);
+        assert_eq!(tracker.current_backoff_ms, 8000); // doubled from 4000
+        tracker.on_keyframe();
+        assert_eq!(tracker.current_backoff_ms, 8000); // preserved at cap
+
+        // Cycle 4: capped at 8000ms
+        tracker.lost_count = 1;
+        tracker.loss_detected_at_ms = Some(11000);
+        // Last req at 10300, need 8000ms: 10300+8000=18300
+        assert!(tracker.should_request_keyframe(18400));
+        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MAX_BACKOFF_MS); // stays capped
+        tracker.on_keyframe();
+        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MAX_BACKOFF_MS);
+    }
+
+    /// After 30 seconds of stability (no loss), the backoff state should fully
+    /// reset so that future loss events aren't penalized by stale history.
+    #[wasm_bindgen_test]
+    fn backoff_full_reset_after_stability() {
+        let mut tracker = SequenceTracker::new();
+
+        // Simulate escalated state after a PLI storm.
+        tracker.lost_count = 0; // no current loss
+        tracker.unanswered_requests = 3;
+        tracker.current_backoff_ms = 8000;
+        tracker.last_keyframe_request_ms = 10_000;
+
+        // 20s later — not yet past the 30s decay window.
+        let result = tracker.should_request_keyframe(30_000);
+        assert!(!result);
+        // Backoff state should be PRESERVED (only 20s of stability).
+        assert_eq!(tracker.unanswered_requests, 3);
+        assert_eq!(tracker.current_backoff_ms, 8000);
+
+        // 31s after last PLI — past the 30s decay window.
+        let result = tracker.should_request_keyframe(41_000);
+        assert!(!result);
+        // NOW fully reset.
+        assert_eq!(tracker.unanswered_requests, 0);
+        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MIN_INTERVAL_MS);
+    }
+
+    /// A fresh tracker receiving its first keyframe should have no backoff
+    /// penalty — the saturating_sub in on_keyframe() must not underflow.
+    #[wasm_bindgen_test]
+    fn late_joiner_no_penalty() {
+        let mut tracker = SequenceTracker::new();
+        assert_eq!(tracker.unanswered_requests, 0);
+        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MIN_INTERVAL_MS);
+
+        // First keyframe arrives.
+        tracker.on_keyframe();
+
+        // Should still be at initial state — no penalty.
+        assert_eq!(tracker.unanswered_requests, 0); // saturating_sub(0, 1) = 0
+        assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MIN_INTERVAL_MS);
+        assert_eq!(tracker.lost_count, 0);
+        assert!(tracker.loss_detected_at_ms.is_none());
     }
 }

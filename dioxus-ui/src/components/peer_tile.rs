@@ -27,8 +27,8 @@ use futures::future::AbortHandle;
 use futures::future::Abortable;
 use gloo_timers::callback::Timeout;
 use videocall_client::audio_constants::{MIC_HOLD_DURATION_MS, UI_AUDIO_LEVEL_DELTA};
-use wasm_bindgen::JsCast;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
+use wasm_bindgen::JsCast;
 
 #[component]
 pub fn PeerTile(
@@ -37,6 +37,8 @@ pub fn PeerTile(
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] render_mode: TileMode,
     #[props(default)] my_peer_id: Option<String>,
+    #[props(default)] pinned_peer_id: Option<String>,
+    on_toggle_pin: EventHandler<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -218,6 +220,8 @@ pub fn PeerTile(
             },
         },
         show_signal_popup,
+        pinned_peer_id.as_deref(),
+        on_toggle_pin,
     )
 }
 

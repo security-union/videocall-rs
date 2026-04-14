@@ -122,7 +122,10 @@ pub fn app_config() -> Result<RuntimeConfig, String> {
         .map_err(|e| format!("Failed to parse __APP_CONFIG: {e:?}"))
 }
 
-pub const CANVAS_LIMIT: usize = 100;
+/// Maximum number of **real** peer tiles rendered with full PeerTile treatment
+/// (canvas, diagnostics subscription, signal history). Mock peers are
+/// layout-only and bypass this limit.
+pub const CANVAS_LIMIT: usize = 30;
 
 pub fn audio_bitrate_kbps() -> Result<u32, String> {
     app_config().map(|c| c.audio_bitrate_kbps)

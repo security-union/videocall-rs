@@ -290,6 +290,9 @@ pub struct OperationStatistics {
     pub next_packet_available: bool,
 }
 
+/// Number of `Operation` enum variants (Normal through Undefined).
+const OPERATION_VARIANT_COUNT: usize = 12;
+
 /// Statistics calculator and tracker
 #[derive(Debug)]
 pub struct StatisticsCalculator {
@@ -304,7 +307,7 @@ pub struct StatisticsCalculator {
     /// Total expanded samples for rate calculations
     total_expanded_samples: u64,
     /// Operation counters for rolling window tracking
-    operation_counts: [u32; 9], // One for each Operation variant
+    operation_counts: [u32; OPERATION_VARIANT_COUNT],
     /// Last time operation rates were calculated
     last_operation_update: Instant,
     /// Window duration for operation rate calculation (1 second)
@@ -330,7 +333,7 @@ impl StatisticsCalculator {
             _last_update: now,
             total_output_samples: 0,
             total_expanded_samples: 0,
-            operation_counts: [0; 9],
+            operation_counts: [0; OPERATION_VARIANT_COUNT],
             last_operation_update: now,
             operation_window_duration: Duration::from_secs(1),
         }
@@ -445,26 +448,35 @@ impl StatisticsCalculator {
         let elapsed_secs = elapsed.as_secs_f32();
 
         if elapsed_secs > 0.0 {
+            // Indices match the Operation enum mapping in record_decode_operation():
+            //   0=Normal, 1=Merge, 2=Expand, 3=ExpandStart, 4=ExpandEnd,
+            //   5=Accelerate, 6=FastAccelerate, 7=PreemptiveExpand,
+            //   8=TimeStretchBuffer, 9=ComfortNoise, 10=Dtmf, 11=Undefined
             self.network_stats.operation_counters.normal_per_sec =
                 self.operation_counts[0] as f32 / elapsed_secs;
             self.network_stats.operation_counters.merge_per_sec =
                 self.operation_counts[1] as f32 / elapsed_secs;
+            // Fold ExpandStart (3) and ExpandEnd (4) into expand_per_sec —
+            // they are sub-phases of the same concealment operation.
             self.network_stats.operation_counters.expand_per_sec =
-                self.operation_counts[2] as f32 / elapsed_secs;
+                (self.operation_counts[2] + self.operation_counts[3] + self.operation_counts[4])
+                    as f32
+                    / elapsed_secs;
             self.network_stats.operation_counters.accelerate_per_sec =
-                self.operation_counts[3] as f32 / elapsed_secs;
+                self.operation_counts[5] as f32 / elapsed_secs;
             self.network_stats
                 .operation_counters
-                .fast_accelerate_per_sec = self.operation_counts[4] as f32 / elapsed_secs;
+                .fast_accelerate_per_sec = self.operation_counts[6] as f32 / elapsed_secs;
             self.network_stats
                 .operation_counters
-                .preemptive_expand_per_sec = self.operation_counts[5] as f32 / elapsed_secs;
+                .preemptive_expand_per_sec = self.operation_counts[7] as f32 / elapsed_secs;
+            // Index 8 (TimeStretchBuffer) intentionally omitted — no output field.
             self.network_stats.operation_counters.comfort_noise_per_sec =
-                self.operation_counts[6] as f32 / elapsed_secs;
+                self.operation_counts[9] as f32 / elapsed_secs;
             self.network_stats.operation_counters.dtmf_per_sec =
-                self.operation_counts[7] as f32 / elapsed_secs;
+                self.operation_counts[10] as f32 / elapsed_secs;
             self.network_stats.operation_counters.undefined_per_sec =
-                self.operation_counts[8] as f32 / elapsed_secs;
+                self.operation_counts[11] as f32 / elapsed_secs;
 
             // Reset counters for next window
             self.operation_counts.fill(0);

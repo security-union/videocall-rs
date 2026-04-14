@@ -15,6 +15,7 @@
  * license, shall be dual licensed as above, without any additional terms or
  * conditions.
  */
+#![recursion_limit = "256"]
 
 pub mod actors;
 pub mod auth;

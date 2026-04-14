@@ -23,11 +23,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use js_sys::Date;
 
 use crate::adaptive_quality_constants::{
-    AudioQualityTier, VideoQualityTier, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
-    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
-    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
+    screen_share_camera_ceiling_index, AudioQualityTier, VideoQualityTier,
+    PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
+    PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
-use crate::diagnostics::adaptive_quality_manager::AdaptiveQualityManager;
+use crate::diagnostics::adaptive_quality_manager::{AdaptiveQualityManager, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -236,6 +236,14 @@ pub struct EncoderBitrateController {
     /// Set to `true` after any tier transition, cleared by the caller via
     /// [`Self::take_tier_changed`].
     tier_changed: bool,
+    /// Last computed fps_ratio for external observation.
+    last_fps_ratio: f64,
+    /// Last worst-peer FPS for external observation.
+    last_worst_peer_fps: f64,
+    /// Last computed bitrate_ratio for external observation.
+    last_bitrate_ratio: f64,
+    /// Last PID target bitrate for external observation.
+    last_target_bitrate_kbps: f64,
 }
 
 impl EncoderBitrateController {
@@ -247,10 +255,11 @@ impl EncoderBitrateController {
 
     /// Create a new bitrate controller for screen share.
     ///
-    /// Uses `SCREEN_QUALITY_TIERS` starting at the highest tier (1080p) via
-    /// [`AdaptiveQualityManager::new_for_screen`]. The initial
-    /// `ideal_bitrate_kbps` is synced from the starting tier so the PID
-    /// controller does not make an unnecessary correction on the first update.
+    /// Uses `SCREEN_QUALITY_TIERS` starting at `DEFAULT_SCREEN_TIER_INDEX`
+    /// (medium/720p) via [`AdaptiveQualityManager::new_for_screen`]. The
+    /// initial `ideal_bitrate_kbps` is synced from the starting tier so the
+    /// PID controller does not make an unnecessary correction on the first
+    /// update.
     pub fn new_for_screen(
         target_fps: Rc<AtomicU32>,
         video_tiers: &'static [VideoQualityTier],
@@ -260,18 +269,7 @@ impl EncoderBitrateController {
         Self::build(tier_ideal, target_fps, quality_manager)
     }
 
-    /// Create a new bitrate controller using a custom video tier array
-    /// (e.g., `SCREEN_QUALITY_TIERS` for screen share).
-    pub fn new_with_tiers(
-        ideal_bitrate_kbps: u32,
-        target_fps: Rc<AtomicU32>,
-        video_tiers: &'static [VideoQualityTier],
-    ) -> Self {
-        let quality_manager = AdaptiveQualityManager::new(video_tiers);
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
-    }
-
-    /// Internal constructor shared by `new`, `new_with_tiers`, and `new_for_screen`.
+    /// Internal constructor shared by `new` and `new_for_screen`.
     fn build(
         ideal_bitrate_kbps: u32,
         target_fps: Rc<AtomicU32>,
@@ -308,6 +306,10 @@ impl EncoderBitrateController {
             correction_throttle_ms: PID_CORRECTION_THROTTLE_MS,
             quality_manager,
             tier_changed: false,
+            last_fps_ratio: 0.0,
+            last_worst_peer_fps: 0.0,
+            last_bitrate_ratio: 0.0,
+            last_target_bitrate_kbps: 0.0,
         }
     }
 
@@ -355,6 +357,7 @@ impl EncoderBitrateController {
             Some((_, fps)) => fps,
             None => return None,
         };
+        self.last_worst_peer_fps = worst_fps;
 
         let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
         let fps_received = worst_fps.min(target_fps);
@@ -466,6 +469,11 @@ impl EncoderBitrateController {
         let tier_max = tier.max_bitrate_kbps as f64;
         let tier_clamped = final_bitrate.clamp(tier_min, tier_max);
 
+        // Store encoder decision inputs for external observation (health reporting).
+        self.last_fps_ratio = fps_received / target_fps;
+        self.last_bitrate_ratio = tier_clamped / ideal_for_tier;
+        self.last_target_bitrate_kbps = tier_clamped;
+
         self.last_correction_time = now;
         Some(tier_clamped)
     }
@@ -511,6 +519,26 @@ impl EncoderBitrateController {
         self.quality_manager.audio_tier_index()
     }
 
+    /// Last computed fps_ratio (received / target) for health reporting.
+    pub fn last_fps_ratio(&self) -> f64 {
+        self.last_fps_ratio
+    }
+
+    /// Last worst-peer FPS for health reporting.
+    pub fn last_worst_peer_fps(&self) -> f64 {
+        self.last_worst_peer_fps
+    }
+
+    /// Last computed bitrate_ratio (tier_clamped / ideal_for_tier) for health reporting.
+    pub fn last_bitrate_ratio(&self) -> f64 {
+        self.last_bitrate_ratio
+    }
+
+    /// Last PID target bitrate (kbps) for health reporting.
+    pub fn last_target_bitrate_kbps(&self) -> f64 {
+        self.last_target_bitrate_kbps
+    }
+
     /// Force an immediate video quality step-down due to server congestion.
     ///
     /// Delegates to [`AdaptiveQualityManager::force_video_step_down`].
@@ -524,6 +552,32 @@ impl EncoderBitrateController {
             self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
         }
         changed
+    }
+
+    /// Notify this controller that screen sharing state changed.
+    ///
+    /// When screen share becomes active, the camera is forced to a conservative
+    /// tier and capped there to prevent bandwidth contention. When screen share
+    /// stops, the cap is removed and the camera recovers naturally.
+    pub fn notify_screen_sharing(&mut self, active: bool) {
+        if active {
+            let ceiling = screen_share_camera_ceiling_index();
+            let now = Date::now();
+            let changed = self.quality_manager.force_video_step_to(ceiling, now);
+            self.quality_manager.set_quality_ceiling(Some(ceiling));
+            if changed {
+                let new_tier = self.quality_manager.current_video_tier();
+                self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+                self.tier_changed = true;
+            }
+        } else {
+            self.quality_manager.set_quality_ceiling(None);
+        }
+    }
+
+    /// Drain tier transition records from the quality manager.
+    pub fn drain_tier_transitions(&mut self) -> Vec<TierTransitionRecord> {
+        self.quality_manager.drain_transitions()
     }
 }
 
@@ -1248,15 +1302,143 @@ mod tests {
         let target_fps = Rc::new(AtomicU32::new(15));
         let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
 
-        // Should start at the highest screen tier (index 0, "high")
+        // Should start at DEFAULT_SCREEN_TIER_INDEX (index 1, "medium")
         assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
-        assert_eq!(controller.current_video_tier().label, "high");
+        assert_eq!(controller.current_video_tier().label, "medium");
 
         // The ideal_bitrate_kbps should be synced with the starting tier
         let expected_bitrate = SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].ideal_bitrate_kbps;
         assert_eq!(
             controller.ideal_bitrate_kbps, expected_bitrate,
             "Initial ideal_bitrate_kbps should match the starting tier's ideal_bitrate_kbps"
+        );
+    }
+
+    // =====================================================================
+    // Screen sharing coordination (notify_screen_sharing)
+    // =====================================================================
+
+    #[wasm_bindgen_test]
+    fn test_notify_screen_sharing_active_forces_ceiling() {
+        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(1500, target_fps);
+
+        // Camera starts at DEFAULT_VIDEO_TIER_INDEX (the lowest/minimal tier).
+        let initial_index = controller.video_tier_index();
+        let ceiling = screen_share_camera_ceiling_index();
+
+        // Screen share activates — camera should jump to ceiling tier
+        controller.notify_screen_sharing(true);
+
+        assert_eq!(
+            controller.video_tier_index(),
+            ceiling,
+            "Camera should be forced to ceiling tier '{}' (index {}), was at index {}",
+            controller.current_video_tier().label,
+            controller.video_tier_index(),
+            initial_index,
+        );
+        assert_eq!(
+            controller.current_video_tier().label,
+            "low",
+            "Ceiling tier should be 'low'"
+        );
+        // ideal_bitrate should be synced with the new tier
+        assert_eq!(
+            controller.ideal_bitrate_kbps,
+            controller.current_video_tier().ideal_bitrate_kbps,
+            "ideal_bitrate_kbps should match the ceiling tier"
+        );
+        // tier_changed should be set so the encoding loop picks it up
+        assert!(
+            controller.take_tier_changed(),
+            "tier_changed should be true after screen share activation"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_notify_screen_sharing_deactivate_removes_ceiling() {
+        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(1500, target_fps);
+
+        let ceiling = screen_share_camera_ceiling_index();
+
+        // Activate then deactivate
+        controller.notify_screen_sharing(true);
+        assert_eq!(controller.video_tier_index(), ceiling);
+        controller.take_tier_changed(); // consume
+
+        controller.notify_screen_sharing(false);
+
+        // Tier doesn't change on deactivation — only the ceiling is removed.
+        // The camera stays at its current tier and recovers naturally via the
+        // PID step-up mechanism.
+        assert_eq!(
+            controller.video_tier_index(),
+            ceiling,
+            "Tier should not jump on deactivation, stays at current position"
+        );
+        assert!(
+            !controller.take_tier_changed(),
+            "tier_changed should NOT be set on deactivation (tier didn't move)"
+        );
+
+        // Feed good conditions — the camera should eventually step up past the
+        // old ceiling, proving the ceiling was actually removed.
+        let base = 10000.0;
+        for i in 0..15 {
+            let t = base + (i as f64 * 1100.0);
+            let packet = create_test_packet("s", "peer1", 29.0, 1400);
+            controller.process_diagnostics_packet_with_time(packet, t);
+        }
+        assert!(
+            controller.video_tier_index() < ceiling,
+            "Camera should step up past old ceiling after removal, \
+             got index {} (ceiling was {})",
+            controller.video_tier_index(),
+            ceiling,
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_notify_screen_sharing_double_activation_is_idempotent() {
+        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(1500, target_fps);
+
+        let ceiling = screen_share_camera_ceiling_index();
+
+        // First activation
+        controller.notify_screen_sharing(true);
+        assert_eq!(controller.video_tier_index(), ceiling);
+        let tier_after_first = controller.current_video_tier().label;
+        let bitrate_after_first = controller.ideal_bitrate_kbps;
+        controller.take_tier_changed(); // consume
+
+        // Second activation — should be a no-op (already at ceiling)
+        controller.notify_screen_sharing(true);
+        assert_eq!(
+            controller.video_tier_index(),
+            ceiling,
+            "Double activation should not change tier"
+        );
+        assert_eq!(
+            controller.current_video_tier().label,
+            tier_after_first,
+            "Tier label should be unchanged"
+        );
+        assert_eq!(
+            controller.ideal_bitrate_kbps, bitrate_after_first,
+            "Bitrate should be unchanged"
+        );
+        assert!(
+            !controller.take_tier_changed(),
+            "tier_changed should NOT be set on redundant activation"
         );
     }
 }

@@ -60,6 +60,12 @@ message PeerStats {
   optional double audio_quality_score = 10; // Audio quality; absent when no audio flowing
   optional double video_quality_score = 11; // Video quality; absent when video disabled
   optional double call_quality_score  = 12; // min(audio, video) — primary alerting metric
+
+  // P1: Cumulative decoder error count (codec failures: keyframe miss, parse error, decoder reset)
+  optional uint64 decoder_errors_total = 13;
+
+  // Screen share video stats (separate from camera video_stats field 6)
+  VideoStats screen_video_stats = 14;
 }
 
 message HealthPacket {
@@ -93,5 +99,38 @@ message HealthPacket {
   // Included in every health packet so observers (vcprobe, metrics_server)
   // can learn display names without depending on one-shot PARTICIPANT_JOINED events.
   optional string display_name = 19;
+
+  // Receiver-side metrics: adaptive quality and transport health
+  optional uint32 adaptive_video_tier = 20; // Current video encoding tier index (0=best, 7=minimal)
+  optional uint32 adaptive_audio_tier = 21; // Current audio encoding tier index (0=high, 3=emergency)
+  optional uint64 datagram_drops_total = 22; // Cumulative datagrams dropped (writable locked)
+  optional uint64 keyframe_requests_sent_total = 23; // Cumulative keyframe requests sent (PLI)
+  optional uint64 websocket_drops_total = 24; // Cumulative WebSocket packets dropped (backpressure)
+
+  // Encoder decision inputs (P0: exposes the adaptive quality controller's reasoning)
+  optional double encoder_fps_ratio = 25;          // Ratio of received FPS to target FPS driving tier decisions
+  optional double encoder_worst_peer_fps = 26;     // FPS from the worst-performing receiver
+  optional uint32 adaptive_screen_tier = 27;       // Screen share quality tier index (0=high, 1=medium, 2=low)
+  optional bool screen_sharing_active = 28;        // Whether screen share is currently active
+
+  // Encoder outputs (P1: completes the encoder decision chain)
+  optional uint32 encoder_output_fps = 29;         // Actual frames/sec the camera encoder is producing
+  optional double encoder_target_bitrate_kbps = 30; // PID controller computed target bitrate in kbps
+  optional double encoder_bitrate_ratio = 31;      // Ratio of current bitrate to ideal bitrate for tier
+
+  // P2: Tier transition events since last health packet
+  repeated TierTransition tier_transitions = 32;
+
+  // Field numbers 33-36 reserved for future join-time network probe.
+  reserved 33, 34, 35, 36;
+  reserved "join_bandwidth_kbps", "join_rtt_ms", "join_jitter_ms", "join_packet_loss_pct";
+}
+
+message TierTransition {
+  string direction = 1;    // "up" or "down"
+  string stream = 2;       // "video", "audio", "screen"
+  string from_tier = 3;    // tier label e.g. "hd_1080p", "medium_480p"
+  string to_tier = 4;      // tier label
+  string trigger = 5;      // "fps", "bitrate", "congestion", "coordination"
 }
 

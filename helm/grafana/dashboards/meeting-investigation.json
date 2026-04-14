@@ -2180,6 +2180,373 @@
       ],
       "title": "Health Reports Ingestion Rate",
       "type": "timeseries"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 71
+      },
+      "id": 42,
+      "title": "Adaptive Quality Debugging",
+      "type": "row",
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "max": 7,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 3
+                  },
+                  {
+                    "color": "red",
+                    "value": 5
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 72
+          },
+          "id": 43,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "videocall_adaptive_video_tier{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} video",
+              "refId": "A"
+            },
+            {
+              "expr": "videocall_adaptive_audio_tier{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} audio",
+              "refId": "B"
+            },
+            {
+              "expr": "videocall_adaptive_screen_tier{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} screen",
+              "refId": "C"
+            }
+          ],
+          "title": "Adaptive Quality Tiers",
+          "description": "Quality tier per sender (0=best HD, higher=more degraded). Correlate tier changes with FPS ratio and bitrate ratio below to identify the trigger.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "max": 2,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.5
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.85
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Degrade threshold (FPS)"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "dash": [10, 10],
+                      "fill": "dash"
+                    }
+                  },
+                  {
+                    "id": "custom.fillOpacity",
+                    "value": 0
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "red",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Degrade threshold (bitrate)"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "dash": [10, 10],
+                      "fill": "dash"
+                    }
+                  },
+                  {
+                    "id": "custom.fillOpacity",
+                    "value": 0
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "orange",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 72
+          },
+          "id": 44,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "videocall_encoder_fps_ratio{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} fps_ratio",
+              "refId": "A"
+            },
+            {
+              "expr": "videocall_encoder_bitrate_ratio{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} bitrate_ratio",
+              "refId": "B"
+            },
+            {
+              "expr": "vector(0.85)",
+              "legendFormat": "Degrade threshold (FPS)",
+              "refId": "C"
+            },
+            {
+              "expr": "vector(0.5)",
+              "legendFormat": "Degrade threshold (bitrate)",
+              "refId": "D"
+            }
+          ],
+          "title": "Encoder Decision Inputs",
+          "description": "FPS ratio = worst_peer_fps / encoder_output_fps. Bitrate ratio = actual / target. When fps_ratio drops below 0.85 or bitrate_ratio below 0.5, the adaptive system degrades quality.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "fps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 80
+          },
+          "id": 45,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "videocall_encoder_worst_peer_fps{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} worst_peer",
+              "refId": "A"
+            },
+            {
+              "expr": "videocall_encoder_output_fps{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} output",
+              "refId": "B"
+            }
+          ],
+          "title": "Worst Peer FPS (Encoder Input)",
+          "description": "The FPS the worst-performing receiver reports vs what the encoder actually produces. A 0 FPS worst_peer drives the adaptive system to degrade for ALL receivers.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 80
+          },
+          "id": 46,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "deriv(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
+              "legendFormat": "{{reporter_name}} \u2192 {{peer_name}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Decoder Errors (per receiver)",
+          "description": "Rate of WebCodecs decoder errors per receiver pair. Correlate with tier changes and worst_peer_fps to find the receiver dragging down quality for everyone.",
+          "type": "timeseries"
+        }
+      ]
     }
   ],
   "refresh": "5s",

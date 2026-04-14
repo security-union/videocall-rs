@@ -27,7 +27,7 @@ use crate::adaptive_quality_constants::{
     PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
     PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
-use crate::diagnostics::adaptive_quality_manager::AdaptiveQualityManager;
+use crate::diagnostics::adaptive_quality_manager::{AdaptiveQualityManager, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -236,6 +236,14 @@ pub struct EncoderBitrateController {
     /// Set to `true` after any tier transition, cleared by the caller via
     /// [`Self::take_tier_changed`].
     tier_changed: bool,
+    /// Last computed fps_ratio for external observation.
+    last_fps_ratio: f64,
+    /// Last worst-peer FPS for external observation.
+    last_worst_peer_fps: f64,
+    /// Last computed bitrate_ratio for external observation.
+    last_bitrate_ratio: f64,
+    /// Last PID target bitrate for external observation.
+    last_target_bitrate_kbps: f64,
 }
 
 impl EncoderBitrateController {
@@ -298,6 +306,10 @@ impl EncoderBitrateController {
             correction_throttle_ms: PID_CORRECTION_THROTTLE_MS,
             quality_manager,
             tier_changed: false,
+            last_fps_ratio: 0.0,
+            last_worst_peer_fps: 0.0,
+            last_bitrate_ratio: 0.0,
+            last_target_bitrate_kbps: 0.0,
         }
     }
 
@@ -345,6 +357,7 @@ impl EncoderBitrateController {
             Some((_, fps)) => fps,
             None => return None,
         };
+        self.last_worst_peer_fps = worst_fps;
 
         let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
         let fps_received = worst_fps.min(target_fps);
@@ -456,6 +469,11 @@ impl EncoderBitrateController {
         let tier_max = tier.max_bitrate_kbps as f64;
         let tier_clamped = final_bitrate.clamp(tier_min, tier_max);
 
+        // Store encoder decision inputs for external observation (health reporting).
+        self.last_fps_ratio = fps_received / target_fps;
+        self.last_bitrate_ratio = tier_clamped / ideal_for_tier;
+        self.last_target_bitrate_kbps = tier_clamped;
+
         self.last_correction_time = now;
         Some(tier_clamped)
     }
@@ -501,6 +519,26 @@ impl EncoderBitrateController {
         self.quality_manager.audio_tier_index()
     }
 
+    /// Last computed fps_ratio (received / target) for health reporting.
+    pub fn last_fps_ratio(&self) -> f64 {
+        self.last_fps_ratio
+    }
+
+    /// Last worst-peer FPS for health reporting.
+    pub fn last_worst_peer_fps(&self) -> f64 {
+        self.last_worst_peer_fps
+    }
+
+    /// Last computed bitrate_ratio (tier_clamped / ideal_for_tier) for health reporting.
+    pub fn last_bitrate_ratio(&self) -> f64 {
+        self.last_bitrate_ratio
+    }
+
+    /// Last PID target bitrate (kbps) for health reporting.
+    pub fn last_target_bitrate_kbps(&self) -> f64 {
+        self.last_target_bitrate_kbps
+    }
+
     /// Force an immediate video quality step-down due to server congestion.
     ///
     /// Delegates to [`AdaptiveQualityManager::force_video_step_down`].
@@ -535,6 +573,11 @@ impl EncoderBitrateController {
         } else {
             self.quality_manager.set_quality_ceiling(None);
         }
+    }
+
+    /// Drain tier transition records from the quality manager.
+    pub fn drain_tier_transitions(&mut self) -> Vec<TierTransitionRecord> {
+        self.quality_manager.drain_transitions()
     }
 }
 

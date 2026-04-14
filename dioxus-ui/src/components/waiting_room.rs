@@ -226,6 +226,10 @@ pub fn WaitingRoom(
                 on_peer_left: None,
                 on_peer_joined: None,
                 on_display_name_changed: None,
+                // Observer-only client: never decode or play back media.
+                // Participants in the waiting room must not hear audio from
+                // the active call.
+                decode_media: false,
             };
 
             let mut client = VideoCallClient::new(opts);

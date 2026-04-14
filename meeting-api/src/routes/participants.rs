@@ -203,7 +203,20 @@ pub async fn join_meeting_as_guest(
 
     // Guests are treated as attendees but without a user_id. Use a special
     // "guest:{uuid}" format for the participant record and tokens.
-    let guest_user_id = format!("guest:{}", uuid::Uuid::new_v4());
+    // If the client provided a stable guest_session_id from a previous join,
+    // reuse it.
+    let guest_user_id = match body.guest_session_id.as_deref() {
+        Some(id)
+            if id.starts_with("guest:")
+                && id
+                    .strip_prefix("guest:")
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    .is_some() =>
+        {
+            id.to_string()
+        }
+        _ => format!("guest:{}", uuid::Uuid::new_v4()),
+    };
 
     join_as_attendee(
         &state,

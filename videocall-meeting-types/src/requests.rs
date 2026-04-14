@@ -78,6 +78,9 @@ pub struct JoinMeetingRequest {
 pub struct GuestJoinRequest {
     /// Display name shown in the meeting UI. Must be provided by the caller.
     pub display_name: String,
+    /// Optional stable guest identifier persisted in the client's sessionStorage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_session_id: Option<String>,
 }
 
 /// Request body for `PUT /api/v1/meetings/{meeting_id}/display-name`.

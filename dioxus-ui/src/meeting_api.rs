@@ -50,6 +50,16 @@ pub async fn check_guest_status(
     .await
 }
 
+fn make_guest_client(
+    token: &str,
+) -> Result<videocall_meeting_client::MeetingApiClient, JoinError> {
+    let base_url = crate::constants::meeting_api_base_url().map_err(JoinError::Config)?;
+    Ok(videocall_meeting_client::MeetingApiClient::new(
+        &base_url,
+        videocall_meeting_client::AuthMode::Bearer(token.to_string()),
+    ))
+}
+
 pub async fn refresh_room_token(meeting_id: &str) -> Result<String, JoinError> {
     client()?.refresh_room_token(meeting_id).await
 }
@@ -130,13 +140,21 @@ pub async fn join_meeting_as_guest(
     display_name: &str,
 ) -> Result<JoinMeetingResponse, JoinError> {
     log::info!("Joining meeting as guest via API: {meeting_id} (display_name: {display_name})");
-    let result = client()?
-        .join_meeting_as_guest(meeting_id, display_name)
-        .await?;
+    let stored_id = crate::auth::get_guest_session_id();
+    let base_url = crate::constants::meeting_api_base_url().map_err(JoinError::Config)?;
+    let result = videocall_meeting_client::MeetingApiClient::new(
+        &base_url,
+        videocall_meeting_client::AuthMode::Cookie,
+    )
+    .join_meeting_as_guest(meeting_id, display_name, stored_id.as_deref())
+    .await?;
+   
+   crate::auth::store_guest_session_id(&result.user_id);
     log::info!(
-        "Guest join response: status={}, is_host={}",
+        "Guest join response: status={}, is_host={}, user_id={}",
         result.status,
-        result.is_host
+        result.is_host,
+        result.user_id,
     );
     Ok(result)
 }

@@ -87,6 +87,27 @@ const PROFILE_USER_ID_KEY: &str = "vc_profile_user_id";
 /// validated id_token payload.
 const PROFILE_DISPLAY_NAME_KEY: &str = "vc_profile_display_name";
 
+/// Session-storage key for the stable guest participant ID (`guest:<uuid>`)
+/// that is reused across re-joins within the same browser tab.
+const GUEST_SESSION_ID_KEY: &str = "vc_guest_session_id";
+
+/// Read the stable guest session ID for the current tab, if any.
+pub fn get_guest_session_id() -> Option<String> {
+    SessionStorage::get::<Option<String>>(&GUEST_SESSION_ID_KEY.to_string()).flatten()
+}
+
+/// Persist the guest session ID so re-joins reuse the same participant row.
+pub fn store_guest_session_id(id: &str) {
+    SessionStorage::set(GUEST_SESSION_ID_KEY.to_string(), &Some(id.to_string()));
+}
+
+/// Clear the guest session ID.
+pub fn clear_guest_session_id() {
+    if let Ok(Some(storage)) = window().session_storage() {
+        let _ = storage.remove_item(GUEST_SESSION_ID_KEY);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Token storage
 // ---------------------------------------------------------------------------
@@ -202,6 +223,12 @@ pub fn clear_user_profile() {
 /// nor the id_token is stored, the server will always return 401 — skip the
 /// network round-trip and fail immediately.
 pub async fn check_session() -> anyhow::Result<()> {
+    // Fast-path: skip the network call when a guest session ID is present,
+    // meaning this tab is (or was) a guest — no OAuth session cookie exists.
+    if get_guest_session_id().is_some() {
+        clear_guest_session_id();
+        return Err(anyhow!("guest session; no OAuth session cookie"));
+    }
     if crate::constants::is_pkce_flow()
         && get_stored_access_token().is_none()
         && get_stored_id_token().is_none()

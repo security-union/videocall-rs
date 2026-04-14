@@ -318,6 +318,7 @@ pub fn GuestJoinPage(id: String) -> Element {
 
     let on_rejected = move |_| {
         observer_token_signal.set(None);
+        crate::auth::clear_guest_session_id();
         guest_status.set(GuestStatus::Rejected);
     };
 

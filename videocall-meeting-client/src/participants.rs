@@ -14,7 +14,7 @@
 //! Participant action endpoints: join, leave, status, refresh token.
 
 use videocall_meeting_types::{
-    requests::{JoinMeetingRequest, UpdateDisplayNameRequest},
+    requests::{GuestJoinRequest, JoinMeetingRequest, UpdateDisplayNameRequest},
     responses::ParticipantStatusResponse,
 };
 
@@ -55,10 +55,12 @@ impl MeetingApiClient {
         &self,
         meeting_id: &str,
         display_name: &str,
+        guest_session_id: Option<&str>,
     ) -> Result<ParticipantStatusResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/join-guest");
-        let body = JoinMeetingRequest {
-            display_name: Some(display_name.to_string()),
+        let body = GuestJoinRequest {
+            display_name: display_name.to_string(),
+            guest_session_id: guest_session_id.map(|s| s.to_string()),
         };
         let response = self.post(&path).json(&body).send().await?;
         parse_api_response(response).await

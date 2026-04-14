@@ -50,7 +50,6 @@ meeting-api:
           name: google-oauth-credentials
           key: client-secret
           optional: true
-    # Discovery will auto-populate auth/token/jwks URLs based on OAUTH_ISSUER
     - name: OAUTH_ISSUER
       value: "https://accounts.google.com"
     - name: OAUTH_REDIRECT_URL
@@ -62,7 +61,7 @@ meeting-api:
     - name: ALLOWED_REDIRECT_URLS
       value: "https://app.videocall.rs"
     - name: SERVICE_VERSION_URLS
-      value: "http://websocket-us-east:8080/version,http://webtransport-us-east:444/version,http://videocall-ui-us-east:80/version.json"
+      value: "http://websocket-us-east:8080/version,http://webtransport-us-east-lb:444/version,http://videocall-ui-us-east:80/version.json"
 
   resources:
     limits:
@@ -97,7 +96,6 @@ meeting-api:
         hosts:
           - api.videocall.rs
 
-  # Node selector for US East region
   nodeSelector:
     topology.kubernetes.io/region: "nyc1"
 

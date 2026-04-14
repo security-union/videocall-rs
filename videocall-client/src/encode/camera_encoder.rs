@@ -56,7 +56,7 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
+    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, ENCODER_PLI_COOLDOWN_MS, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
@@ -105,6 +105,15 @@ pub struct CameraEncoder {
     /// Shared audio tier FEC flag. Written by the camera encoder's quality
     /// manager alongside `shared_audio_tier_bitrate`.
     shared_audio_tier_fec: Rc<AtomicBool>,
+    /// Shared flag indicating whether screen share is active. Written by the
+    /// `ScreenEncoder`, read by this camera encoder's diagnostics loop to
+    /// coordinate bandwidth (drop camera tier and set ceiling when active).
+    screen_sharing_active: Rc<AtomicBool>,
+    /// Current video quality tier index (0=full_hd/best, 7=minimal).
+    /// Updated whenever the adaptive quality manager changes tiers.
+    shared_video_tier_index: Rc<AtomicU32>,
+    /// Current audio quality tier index (0=high, 3=emergency).
+    shared_audio_tier_index: Rc<AtomicU32>,
 }
 
 impl CameraEncoder {
@@ -146,6 +155,9 @@ impl CameraEncoder {
                 default_audio_tier.bitrate_kbps * 1000,
             )),
             shared_audio_tier_fec: Rc::new(AtomicBool::new(default_audio_tier.enable_fec)),
+            screen_sharing_active: Rc::new(AtomicBool::new(false)),
+            shared_video_tier_index: Rc::new(AtomicU32::new(0)),
+            shared_audio_tier_index: Rc::new(AtomicU32::new(0)),
         }
     }
 
@@ -163,12 +175,28 @@ impl CameraEncoder {
         let congestion_flag = self.congestion_step_down.clone();
         let shared_audio_bitrate = self.shared_audio_tier_bitrate.clone();
         let shared_audio_fec = self.shared_audio_tier_fec.clone();
+        let screen_sharing_active = self.screen_sharing_active.clone();
+        let shared_video_tier_idx = self.shared_video_tier_index.clone();
+        let shared_audio_tier_idx = self.shared_audio_tier_index.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
                 current_fps.clone(),
             );
+            let mut prev_screen_active = false;
             while let Some(event) = diagnostics_receiver.next().await {
+                // Check for screen sharing state transitions and coordinate
+                // camera quality to avoid bandwidth contention.
+                let screen_active = screen_sharing_active.load(Ordering::Acquire);
+                if screen_active != prev_screen_active {
+                    prev_screen_active = screen_active;
+                    encoder_control.notify_screen_sharing(screen_active);
+                    log::info!(
+                        "CameraEncoder: screen sharing {} — camera tier coordination applied",
+                        if screen_active { "ACTIVE" } else { "INACTIVE" },
+                    );
+                }
+
                 // Check for server congestion step-down request before
                 // processing the diagnostics packet so the forced step-down
                 // takes effect immediately.
@@ -205,6 +233,8 @@ impl CameraEncoder {
                     tier_max_width.store(tier.max_width, Ordering::Relaxed);
                     tier_max_height.store(tier.max_height, Ordering::Relaxed);
                     tier_keyframe_interval.store(tier.keyframe_interval_frames, Ordering::Relaxed);
+                    shared_video_tier_idx
+                        .store(encoder_control.video_tier_index() as u32, Ordering::Relaxed);
                     log::info!(
                         "CameraEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
                         tier.label,
@@ -220,6 +250,8 @@ impl CameraEncoder {
                     let audio_tier = encoder_control.current_audio_tier();
                     shared_audio_bitrate.store(audio_tier.bitrate_kbps * 1000, Ordering::Relaxed);
                     shared_audio_fec.store(audio_tier.enable_fec, Ordering::Relaxed);
+                    shared_audio_tier_idx
+                        .store(encoder_control.audio_tier_index() as u32, Ordering::Relaxed);
                     log::info!(
                         "CameraEncoder: audio tier updated to '{}' ({}kbps, fec={})",
                         audio_tier.label,
@@ -250,6 +282,24 @@ impl CameraEncoder {
     /// RED-style redundancy in audio packets.
     pub fn shared_audio_tier_fec(&self) -> Rc<AtomicBool> {
         self.shared_audio_tier_fec.clone()
+    }
+
+    /// Returns the shared screen-sharing-active flag.
+    ///
+    /// The `ScreenEncoder` writes this flag when screen capture starts/stops.
+    /// The camera encoder's diagnostics loop reads it to coordinate bandwidth.
+    pub fn screen_sharing_flag(&self) -> Rc<AtomicBool> {
+        self.screen_sharing_active.clone()
+    }
+
+    /// Returns the current video quality tier index (0 = best, 7 = minimal).
+    pub fn shared_video_tier_index(&self) -> Rc<AtomicU32> {
+        self.shared_video_tier_index.clone()
+    }
+
+    /// Returns the current audio quality tier index (0 = high, 3 = emergency).
+    pub fn shared_audio_tier_index(&self) -> Rc<AtomicU32> {
+        self.shared_audio_tier_index.clone()
     }
 
     /// Returns a shared reference to the force-keyframe flag.
@@ -585,6 +635,7 @@ impl CameraEncoder {
 
             // Start encoding video and audio.
             let mut video_frame_counter: u32 = 0;
+            let mut last_pli_keyframe_time: f64 = 0.0;
 
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
@@ -720,6 +771,16 @@ impl CameraEncoder {
                         // Check if a keyframe was requested via PLI (Picture Loss Indication).
                         // The flag is cleared after producing the keyframe.
                         let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
+                        let now = window()
+                            .performance()
+                            .expect("Performance API not available")
+                            .now();
+                        let pli_cooldown_ok =
+                            (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
+                        let force_pli = pli_requested && pli_cooldown_ok;
+                        if force_pli {
+                            last_pli_keyframe_time = now;
+                        }
                         // Use tier-controlled keyframe interval instead of the
                         // static constant, allowing adaptive quality to adjust it.
                         // Using `%` instead of `.is_multiple_of()` for compatibility
@@ -728,11 +789,17 @@ impl CameraEncoder {
                         let is_periodic_keyframe = local_keyframe_interval > 0
                             && video_frame_counter % local_keyframe_interval == 0;
                         video_encoder_encode_options
-                            .set_key_frame(is_periodic_keyframe || pli_requested);
-                        if pli_requested {
+                            .set_key_frame(is_periodic_keyframe || force_pli);
+                        if force_pli {
                             log::info!(
                                 "CameraEncoder: forcing keyframe at frame {} (PLI)",
                                 video_frame_counter
+                            );
+                        } else if pli_requested {
+                            log::info!(
+                                "CameraEncoder: PLI keyframe suppressed at frame {} (cooldown: {:.0}ms since last)",
+                                video_frame_counter,
+                                now - last_pli_keyframe_time,
                             );
                         }
                         if let Err(e) = video_encoder

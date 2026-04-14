@@ -1,0 +1,122 @@
+# Grafana values for HCL K3s cluster (videocall.fnxlabs.com)
+grafana:
+  image:
+    tag: "10.0.0"
+
+  resources:
+    limits:
+      cpu: 100m
+      memory: 256Mi
+    requests:
+      cpu: 25m
+      memory: 128Mi
+
+  replicas: 1
+
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClassName: "local-path"
+
+  adminUser: admin
+  adminPassword: password
+
+  service:
+    type: ClusterIP
+    port: 80
+
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/issuer: "letsencrypt-prod"
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+      nginx.ingress.kubernetes.io/proxy-busy-buffers-size: "16k"
+    hosts:
+      - grafana.videocall.fnxlabs.com
+    tls:
+      - secretName: grafana-tls
+        hosts:
+          - grafana.videocall.fnxlabs.com
+
+  grafana.ini:
+    server:
+      domain: grafana.videocall.fnxlabs.com
+      root_url: https://grafana.videocall.fnxlabs.com
+    security:
+      admin_user: admin
+      admin_password: password
+    users:
+      allow_sign_up: false
+    auth.anonymous:
+      enabled: false
+
+  # Dashboard providers
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: "Videocall"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+        - name: kubernetes
+          orgId: 1
+          folder: "Kubernetes"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/kubernetes
+
+  # Datasources
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://prometheus-server:80
+          access: proxy
+          isDefault: true
+          jsonData:
+            timeInterval: "15s"
+
+  # Custom videocall dashboards — loaded from base chart ConfigMap
+  dashboardsConfigMaps:
+    default: "videocall-dashboards"
+
+  # Community K8s dashboards — downloaded from grafana.com by init container
+  dashboards:
+    kubernetes:
+      node-exporter-full:
+        gnetId: 1860
+        revision: 37
+        datasource: Prometheus
+      kubernetes-cluster:
+        gnetId: 315
+        revision: 3
+        datasource: Prometheus
+      kubernetes-deployments:
+        gnetId: 8588
+        revision: 1
+        datasource: Prometheus
+      kubernetes-pod-resources:
+        gnetId: 6417
+        revision: 1
+        datasource: Prometheus
+
+  securityContext:
+    runAsUser: 472
+    runAsGroup: 472
+    fsGroup: 472
+
+  podSecurityContext:
+    runAsUser: 472
+    runAsGroup: 472
+    fsGroup: 472

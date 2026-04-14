@@ -34,7 +34,7 @@ use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -51,6 +51,30 @@ use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
 
+/// Generate a cryptographically random instance ID for correlating reconnections.
+/// Uses `crypto.getRandomValues()` for unpredictability since the instance_id
+/// is used for session eviction (a predictable ID could allow targeted eviction).
+fn generate_instance_id() -> String {
+    let mut buf = [0u8; 16];
+    if let Some(crypto) = web_sys::window().and_then(|w| w.crypto().ok()) {
+        let _ = crypto.get_random_values_with_u8_array(&mut buf);
+    } else {
+        // Fallback for environments without window.crypto (e.g., workers).
+        let rand = || (js_sys::Math::random() * 0xFFFF_FFFF_u32 as f64) as u32;
+        buf[0..4].copy_from_slice(&rand().to_be_bytes());
+        buf[4..8].copy_from_slice(&rand().to_be_bytes());
+        buf[8..12].copy_from_slice(&rand().to_be_bytes());
+        buf[12..16].copy_from_slice(&rand().to_be_bytes());
+    }
+    format!(
+        "{:08x}-{:08x}-{:08x}-{:08x}",
+        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+        u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
+    )
+}
+
 /// Configuration options for creating a [`VideoCallClient`].
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
@@ -66,6 +90,7 @@ pub struct VideoCallClientOptions {
     pub get_peer_video_canvas_id: Callback<String, String>,
     pub get_peer_screen_canvas_id: Callback<String, String>,
     pub user_id: String,
+    pub display_name: String,
     pub meeting_id: String,
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
@@ -154,7 +179,7 @@ struct InnerOptions {
 #[derive(Debug)]
 struct Inner {
     options: InnerOptions,
-    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
+    connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     connection_state: ConnectionState,
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
@@ -189,7 +214,7 @@ struct Inner {
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
-    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
+    connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
 }
@@ -254,6 +279,7 @@ impl VideoCallClient {
             );
 
             reporter.set_meeting_id(options.meeting_id.clone());
+            reporter.set_display_name(options.display_name.clone());
 
             if let Some(interval) = options.health_reporting_interval_ms {
                 reporter.set_health_interval(interval);
@@ -264,7 +290,7 @@ impl VideoCallClient {
             None
         };
 
-        let connection_controller: Rc<RefCell<Option<ConnectionController>>> =
+        let connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>> =
             Rc::new(RefCell::new(None));
 
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
@@ -457,7 +483,16 @@ impl VideoCallClient {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         match inner.try_borrow_mut() {
                             Ok(mut inner) => {
-                                inner.peer_decode_manager.run_peer_monitor();
+                                let removed = inner.peer_decode_manager.run_peer_monitor();
+                                if !removed.is_empty() {
+                                    if let Some(hr) = &inner.health_reporter {
+                                        if let Ok(reporter) = hr.try_borrow() {
+                                            for peer_id in &removed {
+                                                reporter.remove_peer(peer_id);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(_) => {
                                 // Transient borrow conflict — another callback
@@ -475,11 +510,23 @@ impl VideoCallClient {
                 })
             },
             election_period_ms,
+            instance_id: generate_instance_id(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
 
-        *self.connection_controller.try_borrow_mut()? = Some(connection_controller);
+        // Store the controller as an Rc so we can share it with the health reporter
+        let controller_rc = Rc::new(connection_controller);
+        *self.connection_controller.try_borrow_mut()? = Some(controller_rc.clone());
+
+        // Pass the connection controller to the health reporter for communication metrics
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(hrb) = hr.try_borrow() {
+                    hrb.set_connection_controller(controller_rc);
+                }
+            }
+        }
 
         info!("ConnectionManager created with RTT testing and 1Hz diagnostics reporting");
         Ok(())
@@ -621,6 +668,14 @@ impl VideoCallClient {
         }
     }
 
+    /// Get the local session ID assigned by the server, if available.
+    pub fn get_own_session_id(&self) -> Option<String> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.own_session_id.map(|sid| sid.to_string()),
+            Err(_) => None,
+        }
+    }
+
     pub fn get_peer_user_id(&self, session_id: &str) -> Option<String> {
         let sid: u64 = session_id.parse().ok()?;
         match self.inner.try_borrow() {
@@ -749,6 +804,19 @@ impl VideoCallClient {
     /// `EncoderBitrateController`.
     pub fn congestion_step_down_flag(&self) -> Arc<AtomicBool> {
         self.inner.borrow().congestion_step_down_requested.clone()
+    }
+
+    /// Bind adaptive quality tier sources from a `CameraEncoder` to the
+    /// health reporter. Call this after creating the camera encoder so the
+    /// health reporter includes the current encoding tiers in each packet.
+    pub fn set_adaptive_tier_sources(&self, video_tier: Rc<AtomicU32>, audio_tier: Rc<AtomicU32>) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(mut reporter) = hr.try_borrow_mut() {
+                    reporter.set_adaptive_tier_sources(video_tier, audio_tier);
+                }
+            }
+        }
     }
 
     pub(crate) fn aes(&self) -> Rc<Aes128State> {
@@ -1254,8 +1322,20 @@ impl Inner {
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {
                         if let Err(e) = controller.set_own_session_id(response.session_id) {
-                            warn!("Failed to set own_session_id in ConnectionManager: {e}");
+                            // Expected during election: complete_connection_election()
+                            // already set own_session_id before emitting the synthetic
+                            // SESSION_ASSIGNED packet, so the ConnectionManager RefCell
+                            // is still borrowed.
+                            debug!("ConnectionManager already has session_id (borrow conflict during election): {e}");
                         }
+                    }
+                }
+
+                // Update health reporter with the server-assigned session_id so that
+                // HealthPacket.session_id matches PacketWrapper.session_id for room traffic.
+                if let Some(hr) = &self.health_reporter {
+                    if let Ok(mut reporter) = hr.try_borrow_mut() {
+                        reporter.set_session_id(response.session_id.to_string());
                     }
                 }
             }
@@ -1305,14 +1385,16 @@ impl Inner {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()
                             };
 
-                            self.peer_decode_manager.set_peer_display_name_by_user_id(
-                                &target_str,
-                                display_name.clone(),
-                            );
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager.set_peer_display_name(
+                                    meeting_packet.session_id,
+                                    display_name.clone(),
+                                );
+                            }
 
                             // NOTE: Do NOT emit on_display_name_changed here.
                             // PARTICIPANT_JOINED carries the initial display name for bookkeeping
-                            // (set_peer_display_name_by_user_id above), but it is NOT a name-change
+                            // (set_peer_display_name above), but it is NOT a name-change
                             // event.  Emitting the callback here would confuse the UI into treating
                             // every peer join as a display-name mutation — and would spuriously
                             // update the local user's own name signal on reconnect.
@@ -1336,6 +1418,19 @@ impl Inner {
                             if meeting_packet.session_id != 0 {
                                 self.peer_decode_manager
                                     .delete_peer(meeting_packet.session_id);
+                                // Also remove from health reporter — delete_peer
+                                // cleans connected_peers and fps_trackers, but
+                                // peer_health_data is maintained separately by
+                                // the health reporter and must be cleaned
+                                // explicitly. Without this, departed peers
+                                // persist in the health packet's peer_stats,
+                                // inflating the peer count indefinitely.
+                                if let Some(hr) = &self.health_reporter {
+                                    if let Ok(reporter) = hr.try_borrow() {
+                                        reporter
+                                            .remove_peer(&meeting_packet.session_id.to_string());
+                                    }
+                                }
                             }
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
@@ -1416,10 +1511,21 @@ impl Inner {
                                 target_str, new_display_name, self.options.user_id
                             );
 
-                            self.peer_decode_manager.set_peer_display_name_by_user_id(
-                                &target_str,
-                                new_display_name.clone(),
-                            );
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager.set_peer_display_name(
+                                    meeting_packet.session_id,
+                                    new_display_name.clone(),
+                                );
+                            } else {
+                                // Server does not populate session_id for display
+                                // name changes — fall back to updating all sessions
+                                // belonging to this user_id. A rename logically
+                                // applies to every session of the same account.
+                                self.peer_decode_manager.set_peer_display_name_by_user_id(
+                                    &target_str,
+                                    new_display_name.clone(),
+                                );
+                            }
 
                             if let Some(cb) = &self.options.on_display_name_changed {
                                 debug!(

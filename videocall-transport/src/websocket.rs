@@ -7,6 +7,7 @@
 use anyhow::Error;
 use log::warn;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error as ThisError;
 use videocall_types::Callback;
 
@@ -15,6 +16,14 @@ use videocall_types::Callback;
 /// are silently dropped to prevent unbounded memory growth on slow networks.
 /// 1 MB matches the congestion-drop behavior used on the WebTransport path.
 const MAX_BUFFERED_AMOUNT: u32 = 1_048_576;
+
+/// Cumulative count of packets dropped because the WebSocket send buffer exceeded the threshold.
+static WEBSOCKET_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of WebSocket packets dropped due to backpressure since process start.
+pub fn websocket_drop_count() -> u64 {
+    WEBSOCKET_DROP_COUNT.load(Ordering::Relaxed)
+}
 
 use gloo::events::EventListener;
 use js_sys::Uint8Array;
@@ -268,6 +277,11 @@ impl WebSocketTask {
         self.ws.buffered_amount()
     }
 
+    /// Get the amount of data in bytes queued to be transmitted (bufferedAmount)
+    pub fn get_buffered_amount(&self) -> Option<u64> {
+        Some(self.ws.buffered_amount() as u64)
+    }
+
     /// Sends data to a WebSocket connection.
     pub fn send(&mut self, data: String) {
         if !self.is_active() {
@@ -298,6 +312,7 @@ impl WebSocketTask {
         }
         let buffered = self.ws.buffered_amount();
         if buffered > MAX_BUFFERED_AMOUNT {
+            WEBSOCKET_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
             warn!(
                 "WebSocket backpressure: dropping {} byte packet (buffered: {} bytes, threshold: {} bytes)",
                 data.len(),

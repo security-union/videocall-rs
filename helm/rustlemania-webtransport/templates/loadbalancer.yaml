@@ -19,7 +19,13 @@ spec:
       port: {{ .Values.service.healthPort }}
       targetPort: {{ .Values.service.healthPort }}
       name: wt-api-health
+      {{- if .Values.service.healthNodePort }}
+      nodePort: {{ .Values.service.healthNodePort }}
+      {{- end }}
     - protocol: UDP
       port: {{ .Values.service.port }}
       targetPort: {{ .Values.service.port }}
       name: wt-api
+      {{- if .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}

@@ -52,7 +52,9 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
-use crate::adaptive_quality_constants::{BITRATE_CHANGE_THRESHOLD, SCREEN_QUALITY_TIERS};
+use crate::adaptive_quality_constants::{
+    BITRATE_CHANGE_THRESHOLD, ENCODER_PLI_COOLDOWN_MS, SCREEN_QUALITY_TIERS,
+};
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
 
@@ -104,6 +106,10 @@ pub struct ScreenEncoder {
     /// original capture track is stopped; stopping a cloned track (e.g. from
     /// `MediaStream::clone()`) does **not** affect the indicator.
     active_video_track: Rc<RefCell<Option<MediaStreamTrack>>>,
+    /// Shared flag for cross-stream bandwidth coordination. Set to `true` when
+    /// screen capture starts, `false` when it stops. The `CameraEncoder` reads
+    /// this to drop its quality tier and prevent bandwidth contention.
+    screen_sharing_active: Option<Rc<AtomicBool>>,
 }
 
 impl ScreenEncoder {
@@ -135,7 +141,16 @@ impl ScreenEncoder {
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
             active_video_track: Rc::new(RefCell::new(None)),
+            screen_sharing_active: None,
         }
+    }
+
+    /// Set the shared screen-sharing-active flag for cross-stream coordination.
+    ///
+    /// This flag is read by the `CameraEncoder` to drop its quality tier when
+    /// screen share is active, preventing bandwidth contention.
+    pub fn set_screen_sharing_flag(&mut self, flag: Rc<AtomicBool>) {
+        self.screen_sharing_active = Some(flag);
     }
 
     pub fn set_encoder_control(
@@ -150,11 +165,8 @@ impl ScreenEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderBitrateController::new_with_tiers(
-                current_bitrate.load(Ordering::Relaxed),
-                current_fps.clone(),
-                SCREEN_QUALITY_TIERS,
-            );
+            let mut encoder_control =
+                EncoderBitrateController::new_for_screen(current_fps.clone(), SCREEN_QUALITY_TIERS);
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
@@ -250,6 +262,11 @@ impl ScreenEncoder {
     /// It sets the encoder flags, notifies the client at the protocol level,
     /// and synchronously stops all media tracks.
     pub fn stop(&mut self) {
+        // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
+        if let Some(ref flag) = self.screen_sharing_active {
+            flag.store(false, Ordering::Release);
+        }
+
         // Signal the encoding loop to exit
         self.state.stop();
 
@@ -322,6 +339,7 @@ impl ScreenEncoder {
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
         let active_video_track = self.active_video_track.clone();
+        let screen_sharing_active = self.screen_sharing_active.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -370,9 +388,21 @@ impl ScreenEncoder {
 
             log::info!("Screen to share: {screen_to_share:?}");
 
+            // Signal camera encoder ASAP after capture is confirmed so it begins
+            // stepping down during encoder setup, not after encoding starts.
+            if let Some(ref flag) = screen_sharing_active {
+                flag.store(true, Ordering::Release);
+            } else {
+                log::warn!(
+                    "ScreenEncoder: screen_sharing_active flag not wired — \
+                     camera bandwidth coordination will not engage. \
+                     Ensure host.rs calls screen.set_screen_sharing_flag(camera.screen_sharing_flag())"
+                );
+            }
+
             screen_stream.borrow_mut().replace(screen_to_share.clone());
 
-            // Helper to clean up stream on error - stops all tracks and emits Failed event
+            // Helper to clean up stream on error - stops all tracks, clears flags, emits Failed event
             let cleanup_on_error = |screen_to_share: &MediaStream,
                                     enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
                                     on_state_change: &Option<Callback<ScreenShareEvent>>,
@@ -387,6 +417,10 @@ impl ScreenEncoder {
                 }
                 // Reset enabled flag
                 enabled.store(false, Ordering::Release);
+                // Clear screen-sharing flag so camera drops its ceiling
+                if let Some(ref flag) = screen_sharing_active {
+                    flag.store(false, Ordering::Release);
+                }
                 // Emit Failed event
                 if let Some(ref callback) = on_state_change {
                     callback.emit(ScreenShareEvent::Failed(error_msg));
@@ -480,9 +514,15 @@ impl ScreenEncoder {
             let _onended_handler = {
                 let enabled_clone = enabled.clone();
                 let on_state_change_clone = on_state_change.clone();
+                let screen_sharing_flag_clone = screen_sharing_active.clone();
                 let handler = Closure::wrap(Box::new(move || {
                     log::info!("Screen share track ended (user stopped sharing)");
                     enabled_clone.store(false, Ordering::Release);
+                    // Clear the flag immediately so the camera encoder can begin recovery
+                    // without waiting for the async encoding loop to wind down.
+                    if let Some(ref flag) = screen_sharing_flag_clone {
+                        flag.store(false, Ordering::Release);
+                    }
                     client_for_onended.set_screen_enabled(false);
                     if let Some(ref callback) = on_state_change_clone {
                         callback.emit(ScreenShareEvent::Stopped);
@@ -533,6 +573,7 @@ impl ScreenEncoder {
                 .unchecked_into::<ReadableStreamDefaultReader>();
 
             let mut screen_frame_counter: u32 = 0;
+            let mut last_pli_keyframe_time: f64 = 0.0;
             let mut current_encoder_width = width as u32;
             let mut current_encoder_height = height as u32;
 
@@ -672,17 +713,33 @@ impl ScreenEncoder {
                         let opts = VideoEncoderEncodeOptions::new();
                         // Check if a keyframe was requested via PLI.
                         let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
+                        let now = window()
+                            .performance()
+                            .expect("Performance API not available")
+                            .now();
+                        let pli_cooldown_ok =
+                            (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
+                        let force_pli = pli_requested && pli_cooldown_ok;
+                        if force_pli {
+                            last_pli_keyframe_time = now;
+                        }
                         // Use tier-controlled keyframe interval.
                         // Using `%` instead of `.is_multiple_of()` for compatibility
                         // with Rust toolchains older than 1.87.
                         #[allow(clippy::manual_is_multiple_of)]
                         let is_periodic_keyframe = local_keyframe_interval > 0
                             && screen_frame_counter % local_keyframe_interval == 0;
-                        opts.set_key_frame(is_periodic_keyframe || pli_requested);
-                        if pli_requested {
+                        opts.set_key_frame(is_periodic_keyframe || force_pli);
+                        if force_pli {
                             log::info!(
                                 "ScreenEncoder: forcing keyframe at frame {} (PLI)",
                                 screen_frame_counter
+                            );
+                        } else if pli_requested {
+                            log::info!(
+                                "ScreenEncoder: PLI keyframe suppressed at frame {} (cooldown: {:.0}ms since last)",
+                                screen_frame_counter,
+                                now - last_pli_keyframe_time,
                             );
                         }
 
@@ -712,6 +769,11 @@ impl ScreenEncoder {
                         track.stop();
                     }
                 }
+            }
+
+            // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
+            if let Some(ref flag) = screen_sharing_active {
+                flag.store(false, Ordering::Release);
             }
 
             // Emit Stopped event if we haven't already (onended handler might have already fired)

@@ -20,8 +20,6 @@
 // a Dedicated Web Worker or AudioWorklet.
 
 use crate::{codec::UnifiedOpusDecoder, AudioPacket, NetEq, NetEqConfig, RtpHeader};
-#[cfg(feature = "matomo-logger")]
-use matomo_logger::worker as matomo_worker;
 use serde_wasm_bindgen;
 use wasm_bindgen::prelude::*;
 
@@ -131,21 +129,7 @@ impl WebNetEq {
     }
 }
 
+/// Initialization hook for WebAssembly workers. Currently a no-op; retained
+/// for API compatibility with existing worker bootstrap scripts.
 #[wasm_bindgen(js_name = initNetEq)]
-pub fn init_net_eq() {
-    // Initialize worker-side logger bridge: forward WARN+ to main thread (Matomo)
-    // Keep console at INFO for local visibility inside the workers
-    #[cfg(all(feature = "matomo-logger", target_arch = "wasm32"))]
-    {
-        use log::LevelFilter;
-
-        if let Err(_e) = matomo_worker::init_with_bridge(LevelFilter::Info, LevelFilter::Debug, {
-            // The bridge expects the object as 'arguments[0]'
-            js_sys::Function::new_no_args("self.postMessage(arguments[0]);")
-        }) {
-            use web_sys::console;
-
-            console::error_1(&"[neteq-worker] Failed to initialize matomo worker bridge".into());
-        }
-    }
-}
+pub fn init_net_eq() {}

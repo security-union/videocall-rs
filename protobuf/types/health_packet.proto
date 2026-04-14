@@ -24,6 +24,10 @@ message NetEqStats {
   NetEqNetwork network = 3;
   // Number of audio packets received per second (rolling 1s window)
   double packets_per_sec = 4;
+  // Delay manager target delay — the algorithm's estimate of how much buffering is
+  // needed to absorb observed network jitter. This IS the network jitter metric;
+  // < 30ms = excellent, < 75ms = acceptable, >= 75ms = degraded.
+  double target_delay_ms = 5;
 }
 
 message VideoStats {
@@ -45,6 +49,17 @@ message PeerStats {
   // Structured stats
   NetEqStats neteq_stats = 5;
   VideoStats video_stats = 6;
+
+  // Phase 1 metrics: Quality indicators (FIXED: use windowed rates)
+  double frames_dropped_per_sec = 7; // Decode errors per second (codec failures: keyframe miss, parse error, decoder reset). NOT CPU-pressure drops.
+  double audio_packet_loss_pct = 8; // Audio packet loss percentage (0.0-100.0)
+  optional double avg_decode_latency_ms = 9; // Average decode latency in ms
+
+  // Computed quality scores (0-100). Absent when the stream is inactive.
+  // 100 = perfect, 0 = completely broken.
+  optional double audio_quality_score = 10; // Audio quality; absent when no audio flowing
+  optional double video_quality_score = 11; // Video quality; absent when video disabled
+  optional double call_quality_score  = 12; // min(audio, video) — primary alerting metric
 }
 
 message HealthPacket {
@@ -64,5 +79,26 @@ message HealthPacket {
   string active_server_url = 8;
   string active_server_type = 9; // "webtransport" | "websocket"
   double active_server_rtt_ms = 10;
+
+  // Phase 1 metrics: Browser state and resource usage
+  bool is_tab_visible = 11; // Tab visibility state (true = visible/active)
+  optional uint64 memory_used_bytes = 12; // JS heap memory used (Chrome only)
+  optional uint64 memory_total_bytes = 13; // JS heap memory limit (Chrome only)
+  optional double avg_encode_latency_ms = 14; // Average encode latency in ms
+  bool is_tab_throttled = 15; // Browser tab throttling state
+  optional uint64 send_queue_bytes = 16; // Bytes queued in send buffer
+  optional double packets_received_per_sec = 17; // Inbound packet rate
+  optional double packets_sent_per_sec = 18; // Outbound packet rate
+  // Display name as entered by the user in the UI (e.g. "Jay at work").
+  // Included in every health packet so observers (vcprobe, metrics_server)
+  // can learn display names without depending on one-shot PARTICIPANT_JOINED events.
+  optional string display_name = 19;
+
+  // Receiver-side metrics: adaptive quality and transport health
+  optional uint32 adaptive_video_tier = 20; // Current video encoding tier index (0=best, 7=minimal)
+  optional uint32 adaptive_audio_tier = 21; // Current audio encoding tier index (0=high, 3=emergency)
+  optional uint64 datagram_drops_total = 22; // Cumulative datagrams dropped (writable locked)
+  optional uint64 keyframe_requests_sent_total = 23; // Cumulative keyframe requests sent (PLI)
+  optional uint64 websocket_drops_total = 24; // Cumulative WebSocket packets dropped (backpressure)
 }
 

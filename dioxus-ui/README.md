@@ -28,7 +28,6 @@ dioxus-ui
   |- videocall-diagnostics   (performance diagnostics)
   |- neteq                   (audio jitter buffer, web worker)
   |- videocall-codecs        (video decoder, web worker)
-  |- matomo-logger           (analytics)
 ```
 
 `videocall-client` is the core client library. The dioxus-ui uses it **without** the `yew-compat` feature, meaning callbacks use `Rc<dyn Fn(T)>` closures.
@@ -120,6 +119,7 @@ The app reads `window.__APP_CONFIG` (injected by `scripts/config.js`) at startup
 ```javascript
 window.__APP_CONFIG = Object.freeze({
     apiBaseUrl: "https://api.example.com",
+    meetingApiBaseUrl: "https://api.example.com",  // optional, defaults to apiBaseUrl
     wsUrl: "wss://api.example.com",
     webTransportHost: "https://wt.example.com:4433",
     oauthEnabled: "false",
@@ -128,6 +128,14 @@ window.__APP_CONFIG = Object.freeze({
     firefoxEnabled: "false",
     usersAllowedToStream: "",
     oauthProvider: "",           // "google", "okta", or ""
+    oauthFlow: "",               // "pkce" for client-side PKCE, "" for server-side OAuth
+    oauthAuthUrl: "",            // provider authorization endpoint (falls back to /api/v1/oauth/provider-config)
+    oauthClientId: "",           // public client ID (required for PKCE flow)
+    oauthRedirectUrl: "",        // callback URL (PKCE default: {origin}/auth/callback)
+    oauthScopes: "openid email profile",
+    oauthTokenUrl: "",           // provider token endpoint (falls back to OIDC discovery)
+    oauthIssuer: "",             // OIDC issuer URL for discovery
+    oauthPrompt: "",             // "login", "consent", "select_account", or "" to omit
     serverElectionPeriodMs: 2000,
     audioBitrateKbps: 65,
     videoBitrateKbps: 100,
@@ -135,6 +143,11 @@ window.__APP_CONFIG = Object.freeze({
     vadThreshold: 0.02,         // Voice activity detection sensitivity (0.01=high, 0.05=low)
 });
 ```
+
+**OAuth flow modes:**
+
+- **Server-side** (default, `oauthFlow: ""`): The UI redirects to the backend `/login` endpoint. The server exchanges the authorization code with the provider using the `client_secret`. This is required for providers like Google that do not support public-client PKCE.
+- **PKCE** (`oauthFlow: "pkce"`): The UI performs the full OIDC authorization code flow with PKCE directly in the browser. No `client_secret` is needed. The callback lands on `/auth/callback` in the UI, which exchanges the code with the provider's token endpoint. Use this for providers that support public clients (e.g. Okta SPA apps, Azure AD with PKCE).
 
 ## Development
 

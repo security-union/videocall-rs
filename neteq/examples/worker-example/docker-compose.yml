@@ -30,7 +30,7 @@ services:
 
         COPY --from=project_root . .
 
-        RUN cargo build --target wasm32-unknown-unknown --features web,matomo-logger --bin neteq_wasm --no-default-features --release
+        RUN cargo build --target wasm32-unknown-unknown --features web --bin neteq_wasm --no-default-features --release
         RUN wasm-bindgen ./target/wasm32-unknown-unknown/release/neteq_wasm.wasm --out-dir "/tmp/wasm" --target web
 
         # Put everything together

@@ -21,6 +21,7 @@ use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
+use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::HealthReporter;
 use anyhow::{anyhow, Result};
@@ -813,6 +814,39 @@ impl VideoCallClient {
             if let Some(hr) = &inner.health_reporter {
                 if let Ok(mut reporter) = hr.try_borrow_mut() {
                     reporter.set_adaptive_tier_sources(video_tier, audio_tier);
+                }
+            }
+        }
+    }
+
+    /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_encoder_metric_sources(
+        &self,
+        fps_ratio: Rc<AtomicU32>,
+        worst_peer_fps: Rc<AtomicU32>,
+        bitrate_ratio: Rc<AtomicU32>,
+        target_bitrate_kbps: Rc<AtomicU32>,
+        screen_tier: Rc<AtomicU32>,
+        screen_active: Rc<AtomicBool>,
+        output_fps: Rc<AtomicU32>,
+        camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+    ) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(mut reporter) = hr.try_borrow_mut() {
+                    reporter.set_encoder_metric_sources(
+                        fps_ratio,
+                        worst_peer_fps,
+                        bitrate_ratio,
+                        target_bitrate_kbps,
+                        screen_tier,
+                        screen_active,
+                        output_fps,
+                        camera_transitions,
+                        screen_transitions,
+                    );
                 }
             }
         }

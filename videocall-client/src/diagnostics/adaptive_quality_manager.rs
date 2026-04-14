@@ -1093,7 +1093,7 @@ mod tests {
         mgr.video_tier_index = 1;
         let base = 10000.0;
 
-        // Recovery conditions: fps_ratio=0.93 > 0.85, bitrate_ratio=0.90 > 0.75
+        // Recovery conditions: fps_ratio=0.93 > 0.70, bitrate_ratio=0.90 > 0.75
         let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, base, 5);
         assert!(!changed, "Should not step up immediately");
 
@@ -1173,10 +1173,10 @@ mod tests {
 
         let base = 10000.0;
 
-        // fps_ratio = 0.7 > AUDIO_TIER_RECOVER_FPS_RATIO (0.60) but < VIDEO_TIER_RECOVER_FPS_RATIO (0.85)
+        // fps_ratio = 0.65 > AUDIO_TIER_RECOVER_FPS_RATIO (0.60) but < VIDEO_TIER_RECOVER_FPS_RATIO (0.70)
         // Audio should recover, video should not.
-        let _ = mgr.update(7.0, 10.0, 150.0, 150.0, base, 5);
-        let changed = mgr.update(7.0, 10.0, 150.0, 150.0, base + 5100.0, 5);
+        let _ = mgr.update(6.5, 10.0, 150.0, 150.0, base, 5);
+        let changed = mgr.update(6.5, 10.0, 150.0, 150.0, base + 5100.0, 5);
         assert!(changed);
         assert_eq!(mgr.audio_tier_index(), 1); // Audio stepped up
         assert_eq!(mgr.video_tier_index, max_video); // Video unchanged

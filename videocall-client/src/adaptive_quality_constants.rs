@@ -297,7 +297,14 @@ pub const VIDEO_TIER_DEGRADE_FPS_RATIO: f64 = 0.50;
 /// the standard 0.50 threshold) trades call quality for sender CPU.
 pub const VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT: f64 = 0.30;
 /// FPS ratio above which we step UP one video tier (must be sustained).
-pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.85;
+///
+/// Lowered from 0.85 to 0.70 for recovery parity with audio (0.60).
+/// At 0.85, video stayed stuck at minimal while audio recovered to high —
+/// the 0.35 gap between degrade (0.50) and recover (0.85) was too wide.
+/// At 0.70 the hysteresis gap is 0.20 (degrade 0.50, recover 0.70),
+/// which still prevents oscillation while allowing video to recover
+/// within a similar window as audio.
+pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.70;
 
 /// Bitrate ratio (actual/ideal) below which we step DOWN one video tier.
 pub const VIDEO_TIER_DEGRADE_BITRATE_RATIO: f64 = 0.40;

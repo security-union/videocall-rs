@@ -144,6 +144,18 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when a remote participant joins the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_JOINED meeting event.
     pub on_peer_joined: Option<Callback<(String, String)>>,
+
+    /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
+    /// silently discarded and no peer decoder workers are created.  Only
+    /// meeting-control packets (MEETING, SESSION_ASSIGNED) are still processed.
+    ///
+    /// Set to `false` for observer clients that only need push notifications
+    /// (e.g. the waiting room or "waiting for meeting to start" screen) so
+    /// that audio from participants already in the call cannot be decoded and
+    /// played back while the local user is not yet admitted.
+    ///
+    /// Should be `true` for call participants; set to `false` only for observer/lobby clients.
+    pub decode_media: bool,
 }
 
 #[derive(Debug)]
@@ -160,6 +172,7 @@ struct InnerOptions {
     on_peer_left: Option<Callback<(String, String)>>,
     on_peer_joined: Option<Callback<(String, String)>>,
     on_display_name_changed: Option<Callback<(String, String)>>,
+    decode_media: bool,
 }
 
 #[derive(Debug)]
@@ -299,6 +312,7 @@ impl VideoCallClient {
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
+                    decode_media: options.decode_media,
                 },
                 connection_controller: connection_controller.clone(),
                 connection_state: ConnectionState::Failed {
@@ -1150,9 +1164,14 @@ impl Inner {
             response.session_id
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
-        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
+        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0).
+        // Also skip creating peers when media decoding is disabled (observer mode): there
+        // is no point spinning up decoder workers for packets that will be dropped anyway.
         let peer_status =
-            if response.user_id == SYSTEM_USER_ID.as_bytes() || response.session_id == 0 {
+            if response.user_id == SYSTEM_USER_ID.as_bytes()
+                || response.session_id == 0
+                || !self.options.decode_media
+            {
                 PeerStatus::NoChange
             } else {
                 let peer_user_id = String::from_utf8_lossy(&response.user_id);
@@ -1161,6 +1180,10 @@ impl Inner {
             };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
+                // Observer/lobby clients must not receive encryption keys (defense-in-depth).
+                if !self.options.decode_media {
+                    return;
+                }
                 if !self.options.enable_e2ee {
                     return;
                 }
@@ -1189,6 +1212,10 @@ impl Inner {
                 }
             }
             Ok(PacketType::RSA_PUB_KEY) => {
+                // Observer/lobby clients must not receive encryption keys (defense-in-depth).
+                if !self.options.decode_media {
+                    return;
+                }
                 if !self.options.enable_e2ee {
                     return;
                 }
@@ -1230,6 +1257,14 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEDIA) => {
+                // When this client is in observer/lobby mode (decode_media == false),
+                // drop all media packets immediately.  The observer connection is only
+                // used to receive meeting-control push notifications; it must never
+                // decode or play back audio or video from the real call.
+                if !self.options.decode_media {
+                    return;
+                }
+
                 // Check if this is a KEYFRAME_REQUEST targeted at us (the sender).
                 // These arrive as MEDIA packets; we intercept them here before
                 // they reach the peer decode manager which would just skip them.

@@ -272,6 +272,10 @@ pub fn MeetingPage(id: String) -> Element {
                 on_peer_left: None,
                 on_peer_joined: None,
                 on_display_name_changed: None,
+                // Observer-only client: never decode or play back media.
+                // Users waiting for the meeting to start must not hear audio
+                // from the active call.
+                decode_media: false,
             };
 
             let mut client = VideoCallClient::new(opts);

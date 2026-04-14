@@ -181,14 +181,9 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         }
         saving.set(true);
         let meeting_id = meeting_id_toggle.clone();
-        let aca = if new_val {
-            Some(admitted_can_admit_toggle())
-        } else {
-            Some(false)
-        };
-        let current_allow_guests = allow_guests_toggle();
+        let aca = if new_val { None } else { Some(false) };
         spawn(async move {
-            match update_meeting(&meeting_id, new_val, aca, Some(current_allow_guests)).await {
+            match update_meeting(&meeting_id, Some(new_val), aca, None).await {
                 Ok(updated) => {
                     waiting_room_toggle.set(updated.waiting_room_enabled);
                     admitted_can_admit_toggle.set(updated.admitted_can_admit);
@@ -213,10 +208,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         admitted_can_admit_toggle.set(new_val);
         saving.set(true);
         let meeting_id = meeting_id_toggle2.clone();
-        let wr = waiting_room_toggle();
-        let current_allow_guests = allow_guests_toggle();
         spawn(async move {
-            match update_meeting(&meeting_id, wr, Some(new_val), Some(current_allow_guests)).await {
+            match update_meeting(&meeting_id, None, Some(new_val), None).await {
                 Ok(updated) => {
                     waiting_room_toggle.set(updated.waiting_room_enabled);
                     admitted_can_admit_toggle.set(updated.admitted_can_admit);
@@ -240,10 +233,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         allow_guests_toggle.set(new_val);
         saving.set(true);
         let meeting_id = meeting_id_toggle3.clone();
-        let wr = waiting_room_toggle();
-        let aca = admitted_can_admit_toggle();
         spawn(async move {
-            match update_meeting(&meeting_id, wr, Some(aca), Some(new_val)).await {
+            match update_meeting(&meeting_id, None, None, Some(new_val)).await {
                 Ok(updated) => {
                     allow_guests_toggle.set(updated.allow_guests);
                     saving.set(false);

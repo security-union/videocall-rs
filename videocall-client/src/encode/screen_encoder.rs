@@ -53,9 +53,11 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
 use crate::adaptive_quality_constants::{
-    BITRATE_CHANGE_THRESHOLD, ENCODER_PLI_COOLDOWN_MS, SCREEN_QUALITY_TIERS,
+    BITRATE_CHANGE_THRESHOLD, DEFAULT_SCREEN_TIER_INDEX, ENCODER_PLI_COOLDOWN_MS,
+    SCREEN_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
+use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 
 /// Events emitted by [ScreenEncoder] to notify about screen share state changes.
@@ -110,6 +112,10 @@ pub struct ScreenEncoder {
     /// screen capture starts, `false` when it stops. The `CameraEncoder` reads
     /// this to drop its quality tier and prevent bandwidth contention.
     screen_sharing_active: Option<Rc<AtomicBool>>,
+    /// Current screen share quality tier index (0=high, 1=medium, 2=low).
+    shared_screen_tier_index: Rc<AtomicU32>,
+    /// Tier transition events buffer, drained by health reporter.
+    shared_tier_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
 }
 
 impl ScreenEncoder {
@@ -142,6 +148,8 @@ impl ScreenEncoder {
             force_keyframe: Arc::new(AtomicBool::new(false)),
             active_video_track: Rc::new(RefCell::new(None)),
             screen_sharing_active: None,
+            shared_screen_tier_index: Rc::new(AtomicU32::new(DEFAULT_SCREEN_TIER_INDEX as u32)),
+            shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -151,6 +159,16 @@ impl ScreenEncoder {
     /// screen share is active, preventing bandwidth contention.
     pub fn set_screen_sharing_flag(&mut self, flag: Rc<AtomicBool>) {
         self.screen_sharing_active = Some(flag);
+    }
+
+    /// Returns the current screen share quality tier index (0=high, 1=medium, 2=low).
+    pub fn shared_screen_tier_index(&self) -> Rc<AtomicU32> {
+        self.shared_screen_tier_index.clone()
+    }
+
+    /// Returns the shared tier transitions buffer for health reporting.
+    pub fn shared_tier_transitions(&self) -> Rc<RefCell<Vec<TierTransitionRecord>>> {
+        self.shared_tier_transitions.clone()
     }
 
     pub fn set_encoder_control(
@@ -164,6 +182,8 @@ impl ScreenEncoder {
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
+        let shared_screen_tier_idx = self.shared_screen_tier_index.clone();
+        let shared_tier_transitions = self.shared_tier_transitions.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control =
                 EncoderBitrateController::new_for_screen(current_fps.clone(), SCREEN_QUALITY_TIERS);
@@ -193,6 +213,8 @@ impl ScreenEncoder {
                     tier_max_width.store(tier.max_width, Ordering::Relaxed);
                     tier_max_height.store(tier.max_height, Ordering::Relaxed);
                     tier_keyframe_interval.store(tier.keyframe_interval_frames, Ordering::Relaxed);
+                    shared_screen_tier_idx
+                        .store(encoder_control.video_tier_index() as u32, Ordering::Relaxed);
                     log::info!(
                         "ScreenEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
                         tier.label,
@@ -201,6 +223,15 @@ impl ScreenEncoder {
                         tier.target_fps,
                         tier.keyframe_interval_frames,
                     );
+                }
+
+                // Drain tier transitions, overriding stream to "screen".
+                let mut transitions = encoder_control.drain_tier_transitions();
+                for t in &mut transitions {
+                    t.stream = "screen";
+                }
+                if !transitions.is_empty() {
+                    shared_tier_transitions.borrow_mut().extend(transitions);
                 }
             }
         });

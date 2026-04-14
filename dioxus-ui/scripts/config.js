@@ -11,13 +11,14 @@ window.__APP_CONFIG = Object.freeze({
   audioBitrateKbps: 65,
   videoBitrateKbps: 100,
   screenBitrateKbps: 100,
-  oauthProvider: "google",
+  oauthProvider: "",
   vadThreshold: 0.02,
   oauthAuthUrl: "",
-  oauthClientId: "848221358617-b4do9et7tv09rqs4fvjnfo88m85jl18u.apps.googleusercontent.com",
-  oauthRedirectUrl: "http://localhost:8081/login/callback",
+  oauthClientId: "",
+  oauthRedirectUrl: "http://localhost:3001/auth/callback",
   oauthScopes: "openid email profile",
   oauthTokenUrl: "",
-  oauthIssuer: "https://accounts.google.com",
-  oauthPrompt: ""
+  oauthIssuer: "",
+  oauthPrompt: "",
+  oauthFlow: ""
 });

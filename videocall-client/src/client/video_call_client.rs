@@ -147,8 +147,7 @@ pub struct VideoCallClientOptions {
 
     /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
     /// silently discarded and no peer decoder workers are created.  Only
-    /// meeting-control packets (MEETING, SESSION_ASSIGNED, CONNECTION, …) are
-    /// still processed.
+    /// meeting-control packets (MEETING, SESSION_ASSIGNED) are still processed.
     ///
     /// Set to `false` for observer clients that only need push notifications
     /// (e.g. the waiting room or "waiting for meeting to start" screen) so

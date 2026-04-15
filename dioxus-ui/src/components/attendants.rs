@@ -37,8 +37,8 @@ use crate::constants::{
     CANVAS_LIMIT,
 };
 use crate::context::{
-    resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
-    MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
+    resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, MeetingTime,
+    PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
     TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
@@ -333,7 +333,7 @@ fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     let ar: f64 = 16.0 / 9.0;
 
     for cols in 1..=n {
-        let rows = (n + cols - 1) / cols; // ceil(n / cols)
+        let rows = n.div_ceil(cols);
 
         let avail_w = (w - (cols as f64 - 1.0) * gap).max(0.0);
         let avail_h = (h - (rows as f64 - 1.0) * gap).max(0.0);
@@ -893,7 +893,6 @@ pub fn AttendantsComponent(
     use_context_provider(|| client.clone());
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
-    use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
 
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.

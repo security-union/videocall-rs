@@ -23,7 +23,9 @@ use web_sys::{Event, EventInit, HtmlButtonElement, HtmlInputElement};
 use dioxus::prelude::*;
 use dioxus_ui::components::config_error::ConfigError;
 use dioxus_ui::constants::app_config;
-use dioxus_ui::context::{load_display_name_from_storage, DisplayNameCtx};
+use dioxus_ui::context::{
+    load_display_name_from_storage, DisplayNameCtx, TransportPreference, TransportPreferenceCtx,
+};
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
@@ -56,11 +58,22 @@ fn ensure_root_url() {
     );
 }
 
-/// Full app wrapper: provides DisplayNameCtx then renders Router<Route>.
-/// The Router picks the component based on the current URL (pushed to "/").
+/// Full app wrapper: provides DisplayNameCtx + TransportPreferenceCtx then
+/// renders Router<Route>.  The Router picks the component based on the
+/// current URL (pushed to "/").
+///
+/// Both contexts must be provided here to match `main.rs`, because form
+/// submission in the Home route can navigate to /meeting/:id, and
+/// `MeetingPage::use_context::<TransportPreferenceCtx>()` panics when the
+/// context is missing.  Without this provider, the panic corrupts the Dioxus
+/// runtime state and breaks subsequent tests in the same binary.
 fn home_wrapper_direct() -> Element {
     let username_signal = use_signal(|| None::<String>);
     use_context_provider(|| DisplayNameCtx(username_signal));
+
+    let transport_pref = use_signal(TransportPreference::default);
+    use_context_provider(|| TransportPreferenceCtx(transport_pref));
+
     match app_config() {
         Ok(_) => rsx! {
             Router::<dioxus_ui::routing::Route> {}

@@ -19,6 +19,7 @@
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
+    connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
@@ -33,8 +34,8 @@ use crate::components::{
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
-    mock_peers_enabled, server_election_period_ms, users_allowed_to_stream,
-    webtransport_host_base, CANVAS_LIMIT,
+    mock_peers_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
+    CANVAS_LIMIT,
 };
 use crate::context::{
     resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
@@ -1820,6 +1821,7 @@ pub fn AttendantsComponent(
                                     }
                                 }
                             }
+                            ConnectionQualityIndicator {}
                         }
                     }
                 }
@@ -2018,8 +2020,7 @@ fn parse_speaking_peer(evt: &videocall_diagnostics::DiagEvent) -> Option<String>
             _ => {}
         }
     }
-    let is_speaking = audio_lvl.map(|l| l > 0.0).unwrap_or(false)
-        || speaking.unwrap_or(false);
+    let is_speaking = audio_lvl.map(|l| l > 0.0).unwrap_or(false) || speaking.unwrap_or(false);
     if is_speaking {
         to_peer
     } else {

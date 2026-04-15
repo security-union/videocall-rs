@@ -92,14 +92,14 @@ impl VideoEncoderBuilder {
         cfg.rc_target_bitrate = self.bitrate_kbps;
         cfg.rc_min_quantizer = self.min_quantizer;
         cfg.rc_max_quantizer = self.max_quantizer;
-        cfg.g_threads = 2;
+        cfg.g_threads = 1;
         cfg.g_lag_in_frames = 1;
         cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
         cfg.g_pass = vpx_enc_pass::VPX_RC_ONE_PASS;
         cfg.g_profile = self.profile;
         cfg.rc_end_usage = vpx_rc_mode::VPX_VBR;
         cfg.kf_max_dist = 150;
-        cfg.kf_min_dist = 150;
+        cfg.kf_min_dist = 0;
         cfg.kf_mode = vpx_kf_mode::VPX_KF_AUTO;
 
         let ctx = MaybeUninit::zeroed();
@@ -151,6 +151,19 @@ impl VideoEncoder {
     }
 
     pub fn encode(&mut self, pts: i64, data: &[u8]) -> anyhow::Result<Frames<'_>> {
+        self.encode_inner(pts, data, false)
+    }
+
+    pub fn encode_keyframe(&mut self, pts: i64, data: &[u8]) -> anyhow::Result<Frames<'_>> {
+        self.encode_inner(pts, data, true)
+    }
+
+    fn encode_inner(
+        &mut self,
+        pts: i64,
+        data: &[u8],
+        force_keyframe: bool,
+    ) -> anyhow::Result<Frames<'_>> {
         let image = MaybeUninit::zeroed();
         let mut image = unsafe { image.assume_init() };
 
@@ -163,7 +176,11 @@ impl VideoEncoder {
             data.as_ptr() as _,
         ));
 
-        let flags: i64 = 0;
+        let flags: i64 = if force_keyframe {
+            VPX_EFLAG_FORCE_KF as i64
+        } else {
+            0
+        };
 
         vpx!(vpx_codec_encode(
             &mut self.ctx,

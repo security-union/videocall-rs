@@ -469,6 +469,16 @@ pub const REELECTION_RTT_MIN_THRESHOLD_MS: f64 = 50.0;
 /// Number of consecutive degraded RTT samples before triggering re-election.
 pub const REELECTION_CONSECUTIVE_SAMPLES: u32 = 5;
 
+/// Minimum RTT improvement (ms) required for a re-election winner to beat the old active.
+/// Prevents re-election from firing on noise when RTT values are close (hysteresis).
+/// The winner must be at least this many milliseconds better than the old connection.
+pub const REELECTION_MIN_IMPROVEMENT_MS: f64 = 20.0;
+
+/// If the old active RTT exceeds this value (ms), accept any re-election winner
+/// regardless of whether it is better. The connection is so degraded that any
+/// alternative is worth trying.
+pub const REELECTION_CATASTROPHIC_RTT_MS: f64 = 5000.0;
+
 // ---------------------------------------------------------------------------
 // Heartbeat & Polling
 // ---------------------------------------------------------------------------

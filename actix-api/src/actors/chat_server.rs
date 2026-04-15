@@ -42,6 +42,7 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::validation::validate_display_name;
 use videocall_types::SYSTEM_USER_ID;
 
 use super::session_logic::{ConnectionState, SessionId};
@@ -661,10 +662,20 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: UpdateMemberDisplayName, _ctx: &mut Self::Context) -> Self::Result {
+        let validated_name = match validate_display_name(&msg.display_name) {
+            Ok(name) => name,
+            Err(e) => {
+                warn!(
+                    "UpdateMemberDisplayName: rejecting invalid display name from NATS for user {} in room {}: {}",
+                    msg.user_id, msg.room_id, e
+                );
+                return;
+            }
+        };
         if let Some(members) = self.room_members.get_mut(&msg.room_id) {
             for (_sid, uid, dname) in members.iter_mut() {
                 if *uid == msg.user_id {
-                    *dname = msg.display_name.clone();
+                    *dname = validated_name.clone();
                 }
             }
         }
@@ -1067,22 +1078,44 @@ impl Handler<JoinRoom> for ChatServer {
                     while let Some(msg) = sub.next().await {
                         // Detect PARTICIPANT_DISPLAY_NAME_CHANGED and update
                         // in-memory room_members via the actor before forwarding.
-                        if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&msg.payload) {
-                            if wrapper.packet_type == PacketType::MEETING.into() {
-                                if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
-                                    if inner.event_type
-                                        == MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into()
+                        // Only system messages (room.{room}.system) carry display-name
+                        // change events — skip the protobuf parse entirely for the
+                        // high-frequency per-session media subjects.
+                        if msg.subject.ends_with(".system") {
+                            if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&msg.payload) {
+                                if wrapper.packet_type == PacketType::MEETING.into() {
+                                    if let Ok(inner) =
+                                        MeetingPacket::parse_from_bytes(&wrapper.data)
                                     {
-                                        let target = String::from_utf8_lossy(&inner.target_user_id)
-                                            .into_owned();
-                                        let new_name = String::from_utf8_lossy(&inner.display_name)
-                                            .into_owned();
-                                        if !target.is_empty() && !new_name.is_empty() {
-                                            server_addr.do_send(UpdateMemberDisplayName {
-                                                room_id: inner.room_id.clone(),
-                                                user_id: target,
-                                                display_name: new_name,
-                                            });
+                                        if inner.event_type
+                                            == MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED
+                                                .into()
+                                        {
+                                            let target = match String::from_utf8(
+                                                inner.target_user_id.to_vec(),
+                                            ) {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    warn!("UpdateMemberDisplayName: non-UTF-8 target_user_id in NATS packet, dropping");
+                                                    continue;
+                                                }
+                                            };
+                                            let new_name = match String::from_utf8(
+                                                inner.display_name.to_vec(),
+                                            ) {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    warn!("UpdateMemberDisplayName: non-UTF-8 display_name in NATS packet, dropping");
+                                                    continue;
+                                                }
+                                            };
+                                            if !target.is_empty() && !new_name.is_empty() {
+                                                server_addr.do_send(UpdateMemberDisplayName {
+                                                    room_id: inner.room_id.clone(),
+                                                    user_id: target,
+                                                    display_name: new_name,
+                                                });
+                                            }
                                         }
                                     }
                                 }

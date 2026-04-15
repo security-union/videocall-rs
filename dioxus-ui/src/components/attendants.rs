@@ -37,8 +37,9 @@ use crate::constants::{
     webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{
-    resolve_transport_config, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
+    MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -746,6 +747,7 @@ pub fn AttendantsComponent(
                             "DIOXUS-UI: Local user display name confirmed by server: {}",
                             new_display_name
                         );
+                        save_display_name_to_storage(&new_display_name);
                         let mut current_display_name = current_display_name;
                         current_display_name.set(new_display_name.clone());
                         let mut dn_ctx = display_name_ctx_signal;

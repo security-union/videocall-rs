@@ -287,14 +287,6 @@ lazy_static! {
     )
     .expect("Failed to create video_frames_dropped metric");
 
-    /// Audio packet loss percentage (0.0-100.0)
-    pub static ref AUDIO_PACKET_LOSS_PCT: GaugeVec = register_gauge_vec!(
-        "videocall_audio_packet_loss_pct",
-        "Audio packet loss percentage calculated from NetEQ concealment events",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
-    )
-    .expect("Failed to create audio_packet_loss_pct metric");
-
     /// Audio quality score (0-100, absent when no audio flowing)
     pub static ref AUDIO_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_audio_quality_score",
@@ -473,7 +465,7 @@ lazy_static! {
 
     // ===== PER-PEER QUALITY METRICS (new/transition) =====
 
-    /// Audio concealment percentage (renamed from audio_packet_loss_pct)
+    /// Audio concealment percentage from NetEQ expand events (0.0-100.0)
     pub static ref AUDIO_CONCEALMENT_PCT: GaugeVec = register_gauge_vec!(
         "videocall_audio_concealment_pct",
         "Audio concealment percentage from NetEQ expand events (0.0-100.0)",

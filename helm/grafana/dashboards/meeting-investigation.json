@@ -767,12 +767,12 @@
       },
       "targets": [
         {
-          "expr": "videocall_audio_packet_loss_pct{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_audio_concealment_pct{meeting_id=~\"$meeting\"}",
           "legendFormat": "{{reporter_name}} sees {{peer_name}}",
           "refId": ""
         }
       ],
-      "title": "Packet Loss %",
+      "title": "Audio Concealment %",
       "type": "timeseries"
     },
     {

@@ -892,7 +892,7 @@ impl HealthReporter {
                 // Clamp to 0–100: packet loss cannot exceed 100% by definition,
                 // and unsynchronised window rollovers can momentarily inflate it.
                 if packets_per_sec >= 2.0 {
-                    ps.audio_packet_loss_pct =
+                    ps.audio_concealment_pct =
                         ((expand_per_sec / packets_per_sec) * 100.0).clamp(0.0, 100.0);
                 }
 
@@ -1012,7 +1012,7 @@ impl HealthReporter {
                     .and_then(|net| net.operation_counters.as_ref())
                     .map(|oc| oc.expand_per_sec)
                     .unwrap_or(0.0);
-                let loss = ps.audio_packet_loss_pct;
+                let loss = ps.audio_concealment_pct;
 
                 // Penalties sum to 100 max.
                 // Jitter (target_delay_ms) is intentionally excluded: in this stack it

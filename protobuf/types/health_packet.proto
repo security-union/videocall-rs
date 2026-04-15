@@ -52,7 +52,8 @@ message PeerStats {
 
   // Phase 1 metrics: Quality indicators (FIXED: use windowed rates)
   double frames_dropped_per_sec = 7; // Decode errors per second (codec failures: keyframe miss, parse error, decoder reset). NOT CPU-pressure drops.
-  double audio_packet_loss_pct = 8; // Audio packet loss percentage (0.0-100.0)
+  // Renamed from audio_packet_loss_pct in PR #318.
+  double audio_concealment_pct = 8; // Audio concealment percentage from NetEQ expand events (0.0-100.0)
   optional double avg_decode_latency_ms = 9; // Average decode latency in ms
 
   // Computed quality scores (0-100). Absent when the stream is inactive.

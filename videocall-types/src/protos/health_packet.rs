@@ -810,8 +810,8 @@ pub struct PeerStats {
     ///  Phase 1 metrics: Quality indicators (FIXED: use windowed rates)
     // @@protoc_insertion_point(field:health_packet.PeerStats.frames_dropped_per_sec)
     pub frames_dropped_per_sec: f64,
-    // @@protoc_insertion_point(field:health_packet.PeerStats.audio_packet_loss_pct)
-    pub audio_packet_loss_pct: f64,
+    // @@protoc_insertion_point(field:health_packet.PeerStats.audio_concealment_pct)
+    pub audio_concealment_pct: f64,
     // @@protoc_insertion_point(field:health_packet.PeerStats.avg_decode_latency_ms)
     pub avg_decode_latency_ms: ::std::option::Option<f64>,
     ///  Computed quality scores (0-100). Absent when the stream is inactive.
@@ -883,9 +883,9 @@ impl PeerStats {
             |m: &mut PeerStats| { &mut m.frames_dropped_per_sec },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "audio_packet_loss_pct",
-            |m: &PeerStats| { &m.audio_packet_loss_pct },
-            |m: &mut PeerStats| { &mut m.audio_packet_loss_pct },
+            "audio_concealment_pct",
+            |m: &PeerStats| { &m.audio_concealment_pct },
+            |m: &mut PeerStats| { &mut m.audio_concealment_pct },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
             "avg_decode_latency_ms",
@@ -957,7 +957,7 @@ impl ::protobuf::Message for PeerStats {
                     self.frames_dropped_per_sec = is.read_double()?;
                 },
                 65 => {
-                    self.audio_packet_loss_pct = is.read_double()?;
+                    self.audio_concealment_pct = is.read_double()?;
                 },
                 73 => {
                     self.avg_decode_latency_ms = ::std::option::Option::Some(is.read_double()?);
@@ -1012,7 +1012,7 @@ impl ::protobuf::Message for PeerStats {
         if self.frames_dropped_per_sec != 0. {
             my_size += 1 + 8;
         }
-        if self.audio_packet_loss_pct != 0. {
+        if self.audio_concealment_pct != 0. {
             my_size += 1 + 8;
         }
         if let Some(v) = self.avg_decode_latency_ms {
@@ -1061,8 +1061,8 @@ impl ::protobuf::Message for PeerStats {
         if self.frames_dropped_per_sec != 0. {
             os.write_double(7, self.frames_dropped_per_sec)?;
         }
-        if self.audio_packet_loss_pct != 0. {
-            os.write_double(8, self.audio_packet_loss_pct)?;
+        if self.audio_concealment_pct != 0. {
+            os.write_double(8, self.audio_concealment_pct)?;
         }
         if let Some(v) = self.avg_decode_latency_ms {
             os.write_double(9, v)?;
@@ -1106,7 +1106,7 @@ impl ::protobuf::Message for PeerStats {
         self.neteq_stats.clear();
         self.video_stats.clear();
         self.frames_dropped_per_sec = 0.;
-        self.audio_packet_loss_pct = 0.;
+        self.audio_concealment_pct = 0.;
         self.avg_decode_latency_ms = ::std::option::Option::None;
         self.audio_quality_score = ::std::option::Option::None;
         self.video_quality_score = ::std::option::Option::None;
@@ -1125,7 +1125,7 @@ impl ::protobuf::Message for PeerStats {
             neteq_stats: ::protobuf::MessageField::none(),
             video_stats: ::protobuf::MessageField::none(),
             frames_dropped_per_sec: 0.,
-            audio_packet_loss_pct: 0.,
+            audio_concealment_pct: 0.,
             avg_decode_latency_ms: ::std::option::Option::None,
             audio_quality_score: ::std::option::Option::None,
             video_quality_score: ::std::option::Option::None,
@@ -2059,8 +2059,8 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x18\x05\x20\x01(\x0b2\x19.health_packet.NetEqStatsR\nneteqStats\x12:\n\
     \x0bvideo_stats\x18\x06\x20\x01(\x0b2\x19.health_packet.VideoStatsR\nvid\
     eoStats\x123\n\x16frames_dropped_per_sec\x18\x07\x20\x01(\x01R\x13frames\
-    DroppedPerSec\x121\n\x15audio_packet_loss_pct\x18\x08\x20\x01(\x01R\x12a\
-    udioPacketLossPct\x126\n\x15avg_decode_latency_ms\x18\t\x20\x01(\x01H\0R\
+    DroppedPerSec\x122\n\x15audio_concealment_pct\x18\x08\x20\x01(\x01R\x13a\
+    udioConcealmentPct\x126\n\x15avg_decode_latency_ms\x18\t\x20\x01(\x01H\0R\
     \x12avgDecodeLatencyMs\x88\x01\x01\x123\n\x13audio_quality_score\x18\n\
     \x20\x01(\x01H\x01R\x11audioQualityScore\x88\x01\x01\x123\n\x13video_qua\
     lity_score\x18\x0b\x20\x01(\x01H\x02R\x11videoQualityScore\x88\x01\x01\

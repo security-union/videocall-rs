@@ -1013,7 +1013,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "Audio quality 0-100. Penalized by concealment (70%) and packet loss (30%). Absent during DTX silence.",
+      "description": "Audio quality 0-100. Penalized by concealment (70%) and concealment rate (30%). Absent during DTX silence.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1491,19 +1491,19 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "videocall_audio_packet_loss_pct{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "expr": "videocall_audio_concealment_pct{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "instant": false,
           "legendFormat": "{{reporter_name}} sees {{peer_name}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Audio Packet Loss %",
+      "title": "Audio Concealment %",
       "type": "timeseries"
     },
     {
       "datasource": "Prometheus",
-      "description": "Audio RTP packets received/sec. Near 0 = speaker is silent (DTX). Use this to distinguish real packet loss from DTX silence in concealment panels.",
+      "description": "Audio RTP packets received/sec. Near 0 = speaker is silent (DTX). Use this to distinguish real concealment from DTX silence in concealment panels.",
       "fieldConfig": {
         "defaults": {
           "color": {

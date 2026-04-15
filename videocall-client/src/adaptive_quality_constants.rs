@@ -281,6 +281,20 @@ pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
 ///
 /// FPS ratio (received/target) below which we step DOWN one video tier.
 pub const VIDEO_TIER_DEGRADE_FPS_RATIO: f64 = 0.50;
+/// Lenient FPS degradation threshold used when `effective_peer_count < 3`.
+///
+/// With fewer than 3 peers, p75 aggregation degenerates (for 1 peer it's
+/// just that peer's value; for 2 peers it's the minimum). A single
+/// struggling peer has outsized influence, so we use a more permissive
+/// threshold to avoid false degradation in small meetings.
+///
+/// **Sender CPU tradeoff:** the lenient threshold keeps the sender encoding
+/// at a higher tier for longer in 1:1 and 2-person calls. On low-power
+/// devices (old Macs with VP9 software encode, budget Chromebooks) this
+/// means more CPU time spent on the encoder before a step-down occurs.
+/// If CPU-bound senders become a problem, tightening this value (toward
+/// the standard 0.50 threshold) trades call quality for sender CPU.
+pub const VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT: f64 = 0.30;
 /// FPS ratio above which we step UP one video tier (must be sustained).
 pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.85;
 

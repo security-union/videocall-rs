@@ -421,7 +421,9 @@ lazy_static! {
     )
     .expect("Failed to create encoder_fps_ratio metric");
 
-    /// Worst peer FPS observed by encoder
+    /// Peer FPS signal driving encoder decisions.
+    /// NOTE: As of PR-A (#312), this reports p75 aggregated FPS, not worst-peer FPS.
+    /// TODO(PR-G): rename metric to `videocall_encoder_p75_peer_fps`.
     pub static ref ENCODER_WORST_PEER_FPS: GaugeVec = register_gauge_vec!(
         "videocall_encoder_worst_peer_fps",
         "FPS from the worst-performing receiver driving encoder decisions",

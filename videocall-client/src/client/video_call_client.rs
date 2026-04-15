@@ -1201,17 +1201,16 @@ impl Inner {
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0).
         // Also skip creating peers when media decoding is disabled (observer mode): there
         // is no point spinning up decoder workers for packets that will be dropped anyway.
-        let peer_status =
-            if response.user_id == SYSTEM_USER_ID.as_bytes()
-                || response.session_id == 0
-                || !self.options.decode_media
-            {
-                PeerStatus::NoChange
-            } else {
-                let peer_user_id = String::from_utf8_lossy(&response.user_id);
-                self.peer_decode_manager
-                    .ensure_peer(response.session_id, &peer_user_id)
-            };
+        let peer_status = if response.user_id == SYSTEM_USER_ID.as_bytes()
+            || response.session_id == 0
+            || !self.options.decode_media
+        {
+            PeerStatus::NoChange
+        } else {
+            let peer_user_id = String::from_utf8_lossy(&response.user_id);
+            self.peer_decode_manager
+                .ensure_peer(response.session_id, &peer_user_id)
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 // Observer/lobby clients must not receive encryption keys (defense-in-depth).

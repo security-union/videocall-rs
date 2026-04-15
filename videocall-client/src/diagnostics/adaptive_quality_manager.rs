@@ -36,7 +36,8 @@ use crate::adaptive_quality_constants::{
     AUDIO_TIER_RECOVER_FPS_RATIO, DEFAULT_SCREEN_TIER_INDEX, DEFAULT_VIDEO_TIER_INDEX,
     MIN_TIER_TRANSITION_INTERVAL_MS, QUALITY_WARMUP_MS, STEP_DOWN_REACTION_TIME_MS,
     STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_TIER_DEGRADE_BITRATE_RATIO,
-    VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO,
+    VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT,
+    VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO,
 };
 
 /// Record of a single tier transition event, captured for health reporting.
@@ -149,11 +150,12 @@ impl AdaptiveQualityManager {
     /// should apply the new tier settings to the encoder.
     ///
     /// # Arguments
-    /// * `received_fps` - FPS actually received by the worst peer
+    /// * `received_fps` - FPS actually received (p75 aggregate across peers)
     /// * `target_fps` - Target FPS we are aiming for
     /// * `current_bitrate_kbps` - Actual bitrate being used
     /// * `ideal_bitrate_kbps` - Ideal bitrate for the current tier
     /// * `now_ms` - Current timestamp in milliseconds
+    /// * `effective_peer_count` - Number of peers that contributed FPS data
     pub fn update(
         &mut self,
         received_fps: f64,
@@ -161,6 +163,7 @@ impl AdaptiveQualityManager {
         current_bitrate_kbps: f64,
         ideal_bitrate_kbps: f64,
         now_ms: f64,
+        effective_peer_count: usize,
     ) -> bool {
         // Warmup guard: during encoder startup, no frames have been produced yet
         // so fps_ratio reads as 0.0, triggering false step-downs. Suppress all
@@ -184,7 +187,13 @@ impl AdaptiveQualityManager {
         let mut changed = false;
 
         // --- Video tier logic ---
-        changed |= self.update_video_tier(fps_ratio, bitrate_ratio, now_ms, can_transition);
+        changed |= self.update_video_tier(
+            fps_ratio,
+            bitrate_ratio,
+            now_ms,
+            can_transition,
+            effective_peer_count,
+        );
 
         // --- Audio tier logic ---
         changed |= self.update_audio_tier(fps_ratio, now_ms, can_transition);
@@ -199,12 +208,20 @@ impl AdaptiveQualityManager {
         bitrate_ratio: f64,
         now_ms: f64,
         can_transition: bool,
+        effective_peer_count: usize,
     ) -> bool {
         let max_video_index = self.video_tiers.len().saturating_sub(1);
 
         // --- Step DOWN ---
-        let should_degrade = fps_ratio < VIDEO_TIER_DEGRADE_FPS_RATIO
-            || bitrate_ratio < VIDEO_TIER_DEGRADE_BITRATE_RATIO;
+        // With fewer than 3 peers, p75 aggregation degenerates, so use a more
+        // lenient FPS threshold to avoid false degradation from a single outlier.
+        let degrade_fps_threshold = if effective_peer_count < 3 {
+            VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT
+        } else {
+            VIDEO_TIER_DEGRADE_FPS_RATIO
+        };
+        let should_degrade =
+            fps_ratio < degrade_fps_threshold || bitrate_ratio < VIDEO_TIER_DEGRADE_BITRATE_RATIO;
 
         if should_degrade && self.video_tier_index < max_video_index {
             // Start or continue tracking degradation duration.
@@ -219,7 +236,7 @@ impl AdaptiveQualityManager {
                 self.recover_start_ms = None;
                 let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
                 // Primary trigger: fps drives degradation more than bitrate
-                let trigger = if fps_ratio < VIDEO_TIER_DEGRADE_FPS_RATIO {
+                let trigger = if fps_ratio < degrade_fps_threshold {
                     "fps"
                 } else {
                     "bitrate"
@@ -564,22 +581,22 @@ mod tests {
 
         // During warmup (now < created_at + QUALITY_WARMUP_MS), even terrible
         // conditions should not cause a transition.
-        let changed = mgr.update(0.0, 30.0, 0.0, 1500.0, 2000.0);
+        let changed = mgr.update(0.0, 30.0, 0.0, 1500.0, 2000.0, 5);
         assert!(!changed, "Should not transition during warmup");
         assert_eq!(mgr.video_tier_index(), 0);
 
         // Still during warmup (4999ms after creation)
-        let changed = mgr.update(0.0, 30.0, 0.0, 1500.0, 5999.0);
+        let changed = mgr.update(0.0, 30.0, 0.0, 1500.0, 5999.0, 5);
         assert!(!changed, "Should not transition during warmup");
         assert_eq!(mgr.video_tier_index(), 0);
 
         // After warmup (5000ms after creation), transitions should work.
         // First call starts the degrade timer.
-        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, 6000.0);
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, 6000.0, 5);
         assert!(!changed, "Degrade timer just started");
 
         // After reaction time, should step down.
-        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, 7600.0);
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, 7600.0, 5);
         assert!(changed, "Should transition after warmup + reaction time");
         assert_eq!(mgr.video_tier_index(), 1);
     }
@@ -592,7 +609,7 @@ mod tests {
         mgr.video_tier_index = 2; // start at "low" to test step-up
 
         // During warmup, good conditions should not cause a step-up.
-        let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, 3000.0);
+        let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, 3000.0, 5);
         assert!(!changed, "Should not step up during warmup");
         assert_eq!(mgr.video_tier_index(), 2);
     }
@@ -618,7 +635,7 @@ mod tests {
         // Start from a known state for this test
         mgr.video_tier_index = 0;
         // fps_ratio=1.0, bitrate_ratio=1.0 -- perfect conditions
-        let changed = mgr.update(30.0, 30.0, 1500.0, 1500.0, 10000.0);
+        let changed = mgr.update(30.0, 30.0, 1500.0, 1500.0, 10000.0, 5);
         assert!(!changed);
         assert_eq!(mgr.video_tier_index(), 0);
     }
@@ -631,18 +648,18 @@ mod tests {
         let base = 10000.0;
 
         // fps_ratio = 0.3 (below 0.50 threshold)
-        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base);
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base, 5);
         assert!(!changed, "Should not step down immediately");
 
         // Still degraded but not enough time elapsed
-        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 1000.0);
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 1000.0, 5);
         assert!(!changed);
 
         // After STEP_DOWN_REACTION_TIME_MS (1500ms), should step down
-        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 1600.0);
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 1600.0, 5);
         assert!(changed);
         assert_eq!(mgr.video_tier_index(), 1);
-        assert_eq!(mgr.current_video_tier().label, "medium");
+        assert_eq!(mgr.current_video_tier().label, "hd_plus");
     }
 
     #[wasm_bindgen_test]
@@ -653,10 +670,10 @@ mod tests {
         let base = 10000.0;
 
         // Good FPS but bitrate_ratio = 0.3 (below 0.40 threshold)
-        let changed = mgr.update(28.0, 30.0, 450.0, 1500.0, base);
+        let changed = mgr.update(28.0, 30.0, 450.0, 1500.0, base, 5);
         assert!(!changed);
 
-        let changed = mgr.update(28.0, 30.0, 450.0, 1500.0, base + 1600.0);
+        let changed = mgr.update(28.0, 30.0, 450.0, 1500.0, base + 1600.0, 5);
         assert!(changed);
         assert_eq!(mgr.video_tier_index(), 1);
     }
@@ -669,18 +686,18 @@ mod tests {
         let base = 10000.0;
 
         // Recovery conditions: fps_ratio=0.93 > 0.85, bitrate_ratio=0.90 > 0.75
-        let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, base);
+        let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, base, 5);
         assert!(!changed, "Should not step up immediately");
 
         // Not enough time yet (4 seconds < 5000ms)
-        let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, base + 4000.0);
+        let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, base + 4000.0, 5);
         assert!(!changed);
 
         // After STEP_UP_STABILIZATION_WINDOW_MS (5000ms), should step up
-        let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, base + 5100.0);
+        let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, base + 5100.0, 5);
         assert!(changed);
         assert_eq!(mgr.video_tier_index(), 0);
-        assert_eq!(mgr.current_video_tier().label, "high");
+        assert_eq!(mgr.current_video_tier().label, "full_hd");
     }
 
     #[wasm_bindgen_test]
@@ -691,18 +708,18 @@ mod tests {
         let base = 10000.0;
 
         // Step down once
-        let _ = mgr.update(9.0, 30.0, 1500.0, 1500.0, base);
-        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 1600.0);
+        let _ = mgr.update(9.0, 30.0, 1500.0, 1500.0, base, 5);
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 1600.0, 5);
         assert!(changed);
         assert_eq!(mgr.video_tier_index(), 1);
 
         // Try to step down again immediately (still bad conditions)
         // Even though reaction time could be met, MIN_TIER_TRANSITION_INTERVAL_MS blocks it
-        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 2000.0);
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 2000.0, 5);
         assert!(!changed);
 
         // After MIN_TIER_TRANSITION_INTERVAL_MS (3000ms) from last transition + reaction time
-        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 4700.0);
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 4700.0, 5);
         // degrade_start was reset at transition; 4700 - 1600 = 3100 > 3000 (interval ok)
         // but degrade_start was None after transition, so it started fresh at the next
         // degraded update. Let's trace: after step-down at 11600, degrade_start=None.
@@ -721,7 +738,7 @@ mod tests {
 
         // Not at lowest video tier -- audio should NOT degrade even with terrible FPS
         mgr.video_tier_index = 0;
-        let changed = mgr.update(3.0, 30.0, 1500.0, 1500.0, base);
+        let changed = mgr.update(3.0, 30.0, 1500.0, 1500.0, base, 5);
         assert!(!changed || mgr.audio_tier_index() == 0);
 
         // Set video to lowest tier
@@ -730,8 +747,8 @@ mod tests {
         mgr.last_transition_time_ms = 0.0; // allow transitions
 
         // fps_ratio = 0.1 < AUDIO_TIER_DEGRADE_FPS_RATIO (0.30)
-        let _ = mgr.update(1.0, 10.0, 150.0, 150.0, base);
-        let changed = mgr.update(1.0, 10.0, 150.0, 150.0, base + 1600.0);
+        let _ = mgr.update(1.0, 10.0, 150.0, 150.0, base, 5);
+        let changed = mgr.update(1.0, 10.0, 150.0, 150.0, base + 1600.0, 5);
         assert!(changed);
         assert_eq!(mgr.audio_tier_index(), 1);
         assert_eq!(mgr.current_audio_tier().label, "medium");
@@ -750,8 +767,8 @@ mod tests {
 
         // fps_ratio = 0.7 > AUDIO_TIER_RECOVER_FPS_RATIO (0.60) but < VIDEO_TIER_RECOVER_FPS_RATIO (0.85)
         // Audio should recover, video should not.
-        let _ = mgr.update(7.0, 10.0, 150.0, 150.0, base);
-        let changed = mgr.update(7.0, 10.0, 150.0, 150.0, base + 5100.0);
+        let _ = mgr.update(7.0, 10.0, 150.0, 150.0, base, 5);
+        let changed = mgr.update(7.0, 10.0, 150.0, 150.0, base + 5100.0, 5);
         assert!(changed);
         assert_eq!(mgr.audio_tier_index(), 1); // Audio stepped up
         assert_eq!(mgr.video_tier_index, max_video); // Video unchanged
@@ -763,11 +780,11 @@ mod tests {
         let base = 10000.0;
 
         // Start degrading
-        let _ = mgr.update(9.0, 30.0, 1500.0, 1500.0, base);
+        let _ = mgr.update(9.0, 30.0, 1500.0, 1500.0, base, 5);
         assert!(mgr.degrade_start_ms.is_some());
 
         // Conditions improve before reaction time
-        let changed = mgr.update(28.0, 30.0, 1500.0, 1500.0, base + 1000.0);
+        let changed = mgr.update(28.0, 30.0, 1500.0, 1500.0, base + 1000.0, 5);
         assert!(!changed);
         assert!(
             mgr.degrade_start_ms.is_none(),
@@ -778,7 +795,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_zero_target_fps_returns_false() {
         let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
-        let changed = mgr.update(0.0, 0.0, 0.0, 0.0, 10000.0);
+        let changed = mgr.update(0.0, 0.0, 0.0, 0.0, 10000.0, 5);
         assert!(!changed);
     }
 
@@ -799,7 +816,7 @@ mod tests {
         // Sustain recovery for STEP_UP_STABILIZATION_WINDOW_MS
         for i in 0..=6 {
             let t = base + (i as f64 * 1000.0);
-            mgr.update(29.0, 30.0, 1400.0, 1500.0, t);
+            mgr.update(29.0, 30.0, 1400.0, 1500.0, t, 5);
         }
         assert_eq!(
             mgr.video_tier_index(),
@@ -821,7 +838,7 @@ mod tests {
         // Sustain degradation for STEP_DOWN_REACTION_TIME_MS
         for i in 0..=3 {
             let t = base + (i as f64 * 1000.0);
-            mgr.update(5.0, 30.0, 100.0, 600.0, t);
+            mgr.update(5.0, 30.0, 100.0, 600.0, t, 5);
         }
         assert!(
             mgr.video_tier_index() > 1,
@@ -840,7 +857,7 @@ mod tests {
         let base = 10000.0;
         for i in 0..=6 {
             let t = base + (i as f64 * 1000.0);
-            mgr.update(29.0, 30.0, 1400.0, 1500.0, t);
+            mgr.update(29.0, 30.0, 1400.0, 1500.0, t, 5);
         }
         assert_eq!(mgr.video_tier_index(), 2, "Should be blocked by ceiling");
 
@@ -855,7 +872,7 @@ mod tests {
         let base2 = base + 20000.0; // well past min-interval from any ceiling-phase transition
         for i in 0..=8 {
             let t = base2 + (i as f64 * 1000.0);
-            mgr.update(29.0, 30.0, 1400.0, 1500.0, t);
+            mgr.update(29.0, 30.0, 1400.0, 1500.0, t, 5);
         }
         assert!(
             mgr.video_tier_index() < 2,
@@ -875,7 +892,7 @@ mod tests {
         let base = 10000.0;
         for i in 0..=10 {
             let t = base + (i as f64 * 1000.0);
-            mgr.update(20.0, 30.0, 350.0, 400.0, t);
+            mgr.update(20.0, 30.0, 350.0, 400.0, t, 5);
         }
         assert_eq!(
             mgr.audio_tier_index(),
@@ -914,5 +931,119 @@ mod tests {
             max_index,
             "Should clamp to last valid index"
         );
+    }
+
+    // =====================================================================
+    // Lenient threshold tests (effective_peer_count < 3)
+    // =====================================================================
+
+    #[wasm_bindgen_test]
+    fn test_single_peer_uses_lenient_fps_threshold() {
+        // fps_ratio=0.40 is between LENIENT (0.30) and STANDARD (0.50).
+        // With 1 peer (< 3), should NOT degrade on FPS alone.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 0;
+        let base = 10000.0;
+
+        // fps_ratio=0.40, bitrate_ratio=0.90 (good bitrate)
+        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base, 1);
+        assert!(!changed, "Degrade timer should start but not fire yet");
+        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 2000.0, 1);
+        assert!(
+            !changed,
+            "fps_ratio=0.40 with 1 peer should NOT trigger degradation (lenient threshold 0.30)"
+        );
+        assert_eq!(mgr.video_tier_index(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_single_peer_degrades_below_lenient_threshold() {
+        // fps_ratio=0.20 is below LENIENT (0.30). Should degrade even with 1 peer.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 0;
+        let base = 10000.0;
+
+        // fps_ratio=0.20, good bitrate
+        let _ = mgr.update(6.0, 30.0, 1350.0, 1500.0, base, 1);
+        let changed = mgr.update(6.0, 30.0, 1350.0, 1500.0, base + 1600.0, 1);
+        assert!(
+            changed,
+            "fps_ratio=0.20 should degrade even with lenient threshold"
+        );
+        assert_eq!(mgr.video_tier_index(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_two_peers_uses_lenient_fps_threshold() {
+        // 2 peers also uses lenient threshold (< 3).
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 0;
+        let base = 10000.0;
+
+        // fps_ratio=0.40, bitrate_ratio=0.90
+        let _ = mgr.update(12.0, 30.0, 1350.0, 1500.0, base, 2);
+        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 2000.0, 2);
+        assert!(
+            !changed,
+            "fps_ratio=0.40 with 2 peers should NOT trigger degradation (lenient threshold 0.30)"
+        );
+        assert_eq!(mgr.video_tier_index(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_three_peers_uses_standard_fps_threshold() {
+        // 3 peers uses the standard threshold (>= 3).
+        // fps_ratio=0.40 is below STANDARD (0.50). Should degrade.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 0;
+        let base = 10000.0;
+
+        // fps_ratio=0.40, bitrate_ratio=0.90 (good bitrate)
+        let _ = mgr.update(12.0, 30.0, 1350.0, 1500.0, base, 3);
+        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 1600.0, 3);
+        assert!(
+            changed,
+            "fps_ratio=0.40 with 3 peers should degrade using standard threshold (0.50)"
+        );
+        assert_eq!(mgr.video_tier_index(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_peer_count_boundary_no_flapping() {
+        // Verify that a peer joining (2→3) or dropping (3→2) near the threshold
+        // boundary doesn't cause spurious tier transitions. fps_ratio=0.40 is
+        // between LENIENT (0.30) and STANDARD (0.50), so it only triggers
+        // degradation at ≥3 peers.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 0;
+        let base = 10000.0;
+
+        // Phase 1: 2 peers, fps_ratio=0.40 — lenient threshold, no degradation.
+        let _ = mgr.update(12.0, 30.0, 1350.0, 1500.0, base, 2);
+        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 1600.0, 2);
+        assert!(
+            !changed,
+            "Should NOT degrade at 2 peers with fps_ratio=0.40"
+        );
+        assert_eq!(mgr.video_tier_index(), 0);
+
+        // Phase 2: 3rd peer joins — standard threshold, degrade timer starts.
+        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 2000.0, 3);
+        assert!(!changed, "Degrade timer just started after peer join");
+
+        // Phase 3: 3rd peer drops before reaction time elapses — back to lenient.
+        // The degrade timer was running but the condition is no longer met under
+        // the lenient threshold, so it should reset.
+        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 3000.0, 2);
+        assert!(
+            !changed,
+            "Should NOT degrade: back to 2 peers (lenient threshold)"
+        );
+        assert_eq!(mgr.video_tier_index(), 0);
+
+        // Phase 4: Even after enough time, no degradation at 2 peers.
+        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 5000.0, 2);
+        assert!(!changed, "Still no degradation at 2 peers after long wait");
+        assert_eq!(mgr.video_tier_index(), 0);
     }
 }

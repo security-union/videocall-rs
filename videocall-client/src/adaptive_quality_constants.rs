@@ -186,8 +186,9 @@ pub fn screen_share_camera_ceiling_index() -> usize {
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
 /// Screen share starts at "medium" (720p/10fps) — readable content from
-/// the first frame with room to step up to 1080p or down to 480p based
-/// on network conditions.
+/// the first frame with room to step up to 1080p or down to 720p/5fps
+/// based on network conditions. The floor stays at 720p to keep text
+/// readable even at minimum quality.
 pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
 
 // ---------------------------------------------------------------------------
@@ -218,12 +219,12 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
     },
     VideoQualityTier {
         label: "low",
-        max_width: 854,
-        max_height: 480,
+        max_width: 1280,
+        max_height: 720,
         target_fps: 5,
-        ideal_bitrate_kbps: 250,
-        min_bitrate_kbps: 100,
-        max_bitrate_kbps: 400,
+        ideal_bitrate_kbps: 300,
+        min_bitrate_kbps: 150,
+        max_bitrate_kbps: 500,
         keyframe_interval_frames: 25, // ~5s at 5fps
     },
 ];
@@ -326,6 +327,20 @@ pub const MIN_TIER_TRANSITION_INTERVAL_MS: u64 = 3000;
 /// aspect-ratio glitches. This warmup period suppresses all tier transitions
 /// until the encoder has had time to produce stable output.
 pub const QUALITY_WARMUP_MS: f64 = 5000.0;
+
+/// Default warmup duration used by `AdaptiveQualityManager::new()`.
+/// Alias for `QUALITY_WARMUP_MS` — exists so future constructors cannot
+/// silently inherit `0.0` by forgetting to set `warmup_ms`.
+pub const DEFAULT_WARMUP_MS: f64 = QUALITY_WARMUP_MS;
+
+/// Screen share warmup grace period (milliseconds).
+///
+/// Longer than camera warmup (5s) because receivers must initialize
+/// on-demand screen decoders, receive the first screen keyframe, and
+/// start reporting non-zero screen FPS. During this window the screen
+/// encoder's feedback is all zeros, which would trigger aggressive
+/// step-downs without the grace period.
+pub const SCREEN_QUALITY_WARMUP_MS: f64 = 8000.0;
 
 // ---------------------------------------------------------------------------
 // PID Controller Tuning

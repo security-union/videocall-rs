@@ -34,8 +34,8 @@
 use crate::adaptive_quality_constants::{
     AudioQualityTier, VideoQualityTier, AUDIO_QUALITY_TIERS, AUDIO_TIER_DEGRADE_FPS_RATIO,
     AUDIO_TIER_RECOVER_FPS_RATIO, DEFAULT_SCREEN_TIER_INDEX, DEFAULT_VIDEO_TIER_INDEX,
-    MIN_TIER_TRANSITION_INTERVAL_MS, QUALITY_WARMUP_MS, STEP_DOWN_REACTION_TIME_MS,
-    STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_TIER_DEGRADE_BITRATE_RATIO,
+    DEFAULT_WARMUP_MS, MIN_TIER_TRANSITION_INTERVAL_MS, SCREEN_QUALITY_WARMUP_MS,
+    STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_TIER_DEGRADE_BITRATE_RATIO,
     VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT,
     VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO,
 };
@@ -85,6 +85,11 @@ pub struct AdaptiveQualityManager {
     /// false step-downs from zero-FPS readings at encoder startup.
     created_at_ms: f64,
 
+    /// Warmup duration (ms). Camera uses `QUALITY_WARMUP_MS` (5s), screen
+    /// uses `SCREEN_QUALITY_WARMUP_MS` (8s) because receivers need extra
+    /// time to initialize on-demand screen decoders.
+    warmup_ms: f64,
+
     /// Quality ceiling: step-up cannot go below (better quality than) this index.
     /// Used for cross-stream coordination — when screen share is active, the
     /// camera's quality manager is capped to prevent bandwidth contention.
@@ -96,6 +101,33 @@ pub struct AdaptiveQualityManager {
 }
 
 impl AdaptiveQualityManager {
+    /// Internal constructor that centralizes field initialization.
+    ///
+    /// All public constructors delegate here so that adding a new field
+    /// produces a compile error in one place, and `warmup_ms` can never
+    /// silently default to `0.0`.
+    fn new_with_warmup(
+        video_tiers: &'static [VideoQualityTier],
+        warmup_ms: f64,
+        default_tier_index: usize,
+    ) -> Self {
+        let now = js_sys::Date::now();
+        Self {
+            video_tiers,
+            video_tier_index: default_tier_index,
+            audio_tier_index: 0,
+            last_transition_time_ms: now,
+            degrade_start_ms: None,
+            recover_start_ms: None,
+            audio_degrade_start_ms: None,
+            audio_recover_start_ms: None,
+            created_at_ms: now,
+            warmup_ms,
+            quality_ceiling_index: None,
+            transition_buffer: Vec::new(),
+        }
+    }
+
     /// Create a new manager for the given video tier array.
     ///
     /// Starts at `DEFAULT_VIDEO_TIER_INDEX` (minimal/lowest). Starting at the
@@ -105,20 +137,7 @@ impl AdaptiveQualityManager {
     ///
     /// Use `VIDEO_QUALITY_TIERS` for camera, `SCREEN_QUALITY_TIERS` for screen share.
     pub fn new(video_tiers: &'static [VideoQualityTier]) -> Self {
-        let now = js_sys::Date::now();
-        Self {
-            video_tiers,
-            video_tier_index: DEFAULT_VIDEO_TIER_INDEX,
-            audio_tier_index: 0,
-            last_transition_time_ms: now,
-            degrade_start_ms: None,
-            recover_start_ms: None,
-            audio_degrade_start_ms: None,
-            audio_recover_start_ms: None,
-            created_at_ms: now,
-            quality_ceiling_index: None,
-            transition_buffer: Vec::new(),
-        }
+        Self::new_with_warmup(video_tiers, DEFAULT_WARMUP_MS, DEFAULT_VIDEO_TIER_INDEX)
     }
 
     /// Create a new manager for screen share.
@@ -128,20 +147,11 @@ impl AdaptiveQualityManager {
     /// PID controller will quickly ramp up resolution once it measures
     /// sufficient bandwidth.
     pub fn new_for_screen(video_tiers: &'static [VideoQualityTier]) -> Self {
-        let now = js_sys::Date::now();
-        Self {
+        Self::new_with_warmup(
             video_tiers,
-            video_tier_index: DEFAULT_SCREEN_TIER_INDEX,
-            audio_tier_index: 0,
-            last_transition_time_ms: now,
-            degrade_start_ms: None,
-            recover_start_ms: None,
-            audio_degrade_start_ms: None,
-            audio_recover_start_ms: None,
-            created_at_ms: now,
-            quality_ceiling_index: None,
-            transition_buffer: Vec::new(),
-        }
+            SCREEN_QUALITY_WARMUP_MS,
+            DEFAULT_SCREEN_TIER_INDEX,
+        )
     }
 
     /// Process updated network signals and potentially transition tiers.
@@ -168,7 +178,7 @@ impl AdaptiveQualityManager {
         // Warmup guard: during encoder startup, no frames have been produced yet
         // so fps_ratio reads as 0.0, triggering false step-downs. Suppress all
         // tier transitions until the encoder has had time to stabilize.
-        if now_ms - self.created_at_ms < QUALITY_WARMUP_MS {
+        if now_ms - self.created_at_ms < self.warmup_ms {
             return false;
         }
 
@@ -413,7 +423,7 @@ impl AdaptiveQualityManager {
     pub fn force_video_step_down(&mut self, now_ms: f64) -> bool {
         // Warmup guard: same as update() — suppress forced step-downs during
         // encoder startup when zero-FPS readings would be misleading.
-        if now_ms - self.created_at_ms < QUALITY_WARMUP_MS {
+        if now_ms - self.created_at_ms < self.warmup_ms {
             return false;
         }
 
@@ -612,6 +622,40 @@ mod tests {
         let changed = mgr.update(28.0, 30.0, 1350.0, 1500.0, 3000.0, 5);
         assert!(!changed, "Should not step up during warmup");
         assert_eq!(mgr.video_tier_index(), 2);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_screen_warmup_uses_longer_window() {
+        let mut mgr = AdaptiveQualityManager::new_for_screen(SCREEN_QUALITY_TIERS);
+        mgr.created_at_ms = 1000.0;
+        mgr.last_transition_time_ms = 0.0;
+        mgr.video_tier_index = 0; // start at highest screen tier
+
+        // At 6s (past camera 5s warmup but still in screen 8s warmup), should block.
+        let changed = mgr.update(0.0, 15.0, 0.0, 1500.0, 7000.0);
+        assert!(!changed, "Should not transition during 8s screen warmup");
+        assert_eq!(mgr.video_tier_index(), 0);
+
+        // 7999ms elapsed (within 8000ms screen warmup window)
+        let changed = mgr.update(0.0, 15.0, 0.0, 1500.0, 8999.0);
+        assert!(
+            !changed,
+            "Should not transition at 7999ms into screen warmup"
+        );
+        assert_eq!(mgr.video_tier_index(), 0);
+
+        // At 9000ms (warmup expired: 9000 - 1000 = 8000 = SCREEN_QUALITY_WARMUP_MS).
+        // First call starts the degrade timer.
+        let changed = mgr.update(0.0, 15.0, 0.0, 1500.0, 9000.0);
+        assert!(!changed, "Degrade timer just started");
+
+        // After reaction time, should step down.
+        let changed = mgr.update(0.0, 15.0, 0.0, 1500.0, 10600.0);
+        assert!(
+            changed,
+            "Should transition after 8s screen warmup + reaction time"
+        );
+        assert_eq!(mgr.video_tier_index(), 1);
     }
 
     #[wasm_bindgen_test]

@@ -38,10 +38,13 @@ use crate::constants::{
     mock_peers_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
     CANVAS_LIMIT,
 };
+#[cfg(feature = "media-server-jwt-auth")]
+use crate::context::TransportPreference;
 use crate::context::{
-    resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
-    MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
-    TransportPreferenceCtx,
+    load_appearance_settings_from_storage, resolve_transport_config,
+    save_appearance_settings_to_storage, save_display_name_to_storage, AppearanceSettingsCtx,
+    DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap,
+    PeerStatusMap, TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -929,6 +932,25 @@ pub fn AttendantsComponent(
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
     use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
+    let appearance_settings = use_signal(load_appearance_settings_from_storage);
+    use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
+    let appearance_save_timeout: Rc<RefCell<Option<Timeout>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+
+    // Persist local-only appearance preferences for this viewer.
+    use_effect(move || {
+        let settings = appearance_settings();
+        if let Some(timeout) = appearance_save_timeout.borrow_mut().take() {
+            timeout.cancel();
+        }
+
+        let timeout_cell = appearance_save_timeout.clone();
+        let timeout = Timeout::new(300, move || {
+            save_appearance_settings_to_storage(&settings);
+            timeout_cell.borrow_mut().take();
+        });
+        *appearance_save_timeout.borrow_mut() = Some(timeout);
+    });
 
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
@@ -1016,7 +1038,8 @@ pub fn AttendantsComponent(
     use_effect(move || {
         let audio_level = local_audio_level();
         let speaking = local_speaking();
-        let style = speak_style(audio_level, speaking);
+        let appearance = appearance_settings();
+        let style = speak_style(audio_level, speaking, &appearance);
         if let Some(el) = host_el() {
             let cl = el.class_list();
             if speaking {
@@ -1660,7 +1683,7 @@ pub fn AttendantsComponent(
                     if can_stream {
                         nav { id: "host-controls-nav",
                             class: "host",
-                            style: "{speak_style(0.0, false)}",
+                            style: "box-shadow: none; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;",
                             onmounted: move |evt| {
                                 if let Some(elem) = evt.try_as_web_event() {
                                     host_el.set(Some(elem));

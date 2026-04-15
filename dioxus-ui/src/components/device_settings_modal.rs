@@ -6,13 +6,198 @@ use crate::context::{confirm_transport_change, TransportPreference};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
+use wasm_bindgen::JsCast;
 use web_sys::MediaDeviceInfo;
+
+// ── Reusable glass-styled select ──────────────────────────────────
+
+fn focus_element_by_id(id: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+    {
+        let _ = el
+            .dyn_into::<web_sys::HtmlElement>()
+            .map(|h| h.focus());
+    }
+}
+
+fn focus_option_by_position(trigger_id: &str, last: bool) {
+    if let Some(parent) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(trigger_id))
+        .and_then(|el| el.parent_element())
+    {
+        if let Ok(nodes) = parent.query_selector_all(".glass-select-option") {
+            let index = if last {
+                nodes.length().saturating_sub(1)
+            } else {
+                0
+            };
+            if let Some(node) = nodes.item(index) {
+                let _ = node
+                    .dyn_into::<web_sys::HtmlElement>()
+                    .map(|h| h.focus());
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct GlassSelectOption {
+    value: String,
+    label: String,
+}
+
+#[component]
+fn SettingsGlassSelect(
+    id: &'static str,
+    options: Vec<GlassSelectOption>,
+    selected_value: String,
+    on_change: EventHandler<String>,
+    open_dropdown: Signal<Option<&'static str>>,
+) -> Element {
+    let mut open_dropdown = open_dropdown;
+    let is_open = open_dropdown() == Some(id);
+
+    let selected_label = options
+        .iter()
+        .find(|o| o.value == selected_value)
+        .map(|o| o.label.clone())
+        .unwrap_or_else(|| selected_value.clone());
+
+    rsx! {
+        div { class: if is_open { "glass-select open" } else { "glass-select" },
+            button {
+                id,
+                class: if is_open { "glass-select-trigger open" } else { "glass-select-trigger" },
+                r#type: "button",
+                "aria-haspopup": "listbox",
+                "aria-expanded": if is_open { "true" } else { "false" },
+                onclick: move |e: MouseEvent| {
+                    e.stop_propagation();
+                    if is_open {
+                        open_dropdown.set(None);
+                    } else {
+                        open_dropdown.set(Some(id));
+                    }
+                },
+                onkeydown: move |evt: KeyboardEvent| {
+                    match evt.key() {
+                        Key::Escape if is_open => {
+                            evt.stop_propagation();
+                            open_dropdown.set(None);
+                        }
+                        Key::ArrowDown if is_open => {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            focus_option_by_position(id, false);
+                        }
+                        Key::ArrowUp if is_open => {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            focus_option_by_position(id, true);
+                        }
+                        Key::ArrowDown | Key::ArrowUp if !is_open => {
+                            evt.stop_propagation();
+                            open_dropdown.set(Some(id));
+                        }
+                        _ => {}
+                    }
+                },
+                span { class: "glass-select-label", "{selected_label}" }
+                svg {
+                    class: "glass-select-chevron",
+                    view_box: "0 0 12 8",
+                    width: "12",
+                    height: "8",
+                    path {
+                        d: "M1 1.5l5 5 5-5",
+                        stroke: "currentColor",
+                        stroke_width: "1.5",
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                        fill: "none",
+                    }
+                }
+            }
+            if is_open {
+                div {
+                    class: "glass-select-menu",
+                    role: "listbox",
+                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                    for opt in options.iter() {
+                        div {
+                            class: if opt.value == selected_value { "glass-select-option selected" } else { "glass-select-option" },
+                            role: "option",
+                            "aria-selected": if opt.value == selected_value { "true" } else { "false" },
+                            tabindex: "0",
+                            onclick: {
+                                let value = opt.value.clone();
+                                move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    on_change.call(value.clone());
+                                    open_dropdown.set(None);
+                                    focus_element_by_id(id);
+                                }
+                            },
+                            onkeydown: {
+                                let value = opt.value.clone();
+                                move |evt: KeyboardEvent| {
+                                    match evt.key() {
+                                        Key::Enter => {
+                                            evt.stop_propagation();
+                                            evt.prevent_default();
+                                            on_change.call(value.clone());
+                                            open_dropdown.set(None);
+                                            focus_element_by_id(id);
+                                        }
+                                        Key::Escape => {
+                                            evt.stop_propagation();
+                                            open_dropdown.set(None);
+                                            focus_element_by_id(id);
+                                        }
+                                        Key::ArrowDown => {
+                                            evt.stop_propagation();
+                                            evt.prevent_default();
+                                            if let Some(next) = web_sys::window()
+                                                .and_then(|w| w.document())
+                                                .and_then(|d| d.active_element())
+                                                .and_then(|el| el.next_element_sibling())
+                                            {
+                                                let _ = next.dyn_into::<web_sys::HtmlElement>().map(|h| { let _ = h.focus(); });
+                                            }
+                                        }
+                                        Key::ArrowUp => {
+                                            evt.stop_propagation();
+                                            evt.prevent_default();
+                                            if let Some(prev) = web_sys::window()
+                                                .and_then(|w| w.document())
+                                                .and_then(|d| d.active_element())
+                                                .and_then(|el| el.previous_element_sibling())
+                                            {
+                                                let _ = prev.dyn_into::<web_sys::HtmlElement>().map(|h| { let _ = h.focus(); });
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            },
+                            "{opt.label}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsSection {
     Audio,
     Video,
     Network,
+    Appearance,
 }
 
 impl SettingsSection {
@@ -21,6 +206,7 @@ impl SettingsSection {
             SettingsSection::Audio => "Audio",
             SettingsSection::Video => "Video",
             SettingsSection::Network => "Network",
+            SettingsSection::Appearance => "Appearance",
         }
     }
 
@@ -29,6 +215,7 @@ impl SettingsSection {
             SettingsSection::Audio => "settings-tab-audio",
             SettingsSection::Video => "settings-tab-video",
             SettingsSection::Network => "settings-tab-network",
+            SettingsSection::Appearance => "settings-tab-appearance",
         }
     }
 
@@ -37,6 +224,7 @@ impl SettingsSection {
             SettingsSection::Audio => "settings-panel-audio",
             SettingsSection::Video => "settings-panel-video",
             SettingsSection::Network => "settings-panel-network",
+            SettingsSection::Appearance => "settings-panel-appearance",
         }
     }
 
@@ -45,14 +233,16 @@ impl SettingsSection {
             SettingsSection::Audio => "settings-nav-audio",
             SettingsSection::Video => "settings-nav-video",
             SettingsSection::Network => "settings-nav-network",
+            SettingsSection::Appearance => "settings-nav-appearance",
         }
     }
 
-    fn all() -> [SettingsSection; 3] {
+    fn all() -> [SettingsSection; 4] {
         [
             SettingsSection::Audio,
             SettingsSection::Video,
             SettingsSection::Network,
+            SettingsSection::Appearance,
         ]
     }
 
@@ -60,15 +250,17 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => SettingsSection::Video,
             SettingsSection::Video => SettingsSection::Network,
-            SettingsSection::Network => SettingsSection::Audio,
+            SettingsSection::Network => SettingsSection::Appearance,
+            SettingsSection::Appearance => SettingsSection::Audio,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            SettingsSection::Audio => SettingsSection::Network,
+            SettingsSection::Audio => SettingsSection::Appearance,
             SettingsSection::Video => SettingsSection::Audio,
             SettingsSection::Network => SettingsSection::Video,
+            SettingsSection::Appearance => SettingsSection::Network,
         }
     }
 }
@@ -90,6 +282,7 @@ pub fn DeviceSettingsModal(
 ) -> Element {
     let is_ios_safari = is_ios();
     let mut active_section = use_signal(|| SettingsSection::Audio);
+    let mut open_dropdown: Signal<Option<&'static str>> = use_signal(|| None);
 
     if !visible {
         return rsx! {};
@@ -163,12 +356,16 @@ pub fn DeviceSettingsModal(
                             SettingsNavButton {
                                 section,
                                 active: active_section() == section,
-                                onclick: move |_| active_section.set(section),
+                                onclick: move |_| {
+                                    open_dropdown.set(None);
+                                    active_section.set(section);
+                                },
                             }
                         }
                     }
 
                     div { class: "settings-panel",
+                        onclick: move |_| open_dropdown.set(None),
                         match active_section() {
                             SettingsSection::Audio => rsx! {
                                 div {
@@ -184,50 +381,44 @@ pub fn DeviceSettingsModal(
 
                                     div { class: "device-setting-group",
                                         label { r#for: "modal-audio-select", "Microphone" }
-                                        select {
+                                        SettingsGlassSelect {
                                             id: "modal-audio-select",
-                                            class: "device-selector-modal",
-                                            onchange: {
+                                            options: microphones.iter().map(|d| GlassSelectOption {
+                                                value: d.device_id(),
+                                                label: d.label(),
+                                            }).collect::<Vec<_>>(),
+                                            selected_value: selected_microphone_id.clone().unwrap_or_default(),
+                                            on_change: {
                                                 let microphones = microphones.clone();
-                                                move |evt: Event<FormData>| {
-                                                    let device_id = evt.value();
+                                                move |device_id: String| {
                                                     if let Some(info) = find_device_by_id(&microphones, &device_id) {
                                                         on_microphone_select.call(info);
                                                     }
                                                 }
                                             },
-                                            for device in microphones.iter() {
-                                                option {
-                                                    value: device.device_id(),
-                                                    selected: selected_microphone_id.as_deref() == Some(device.device_id().as_str()),
-                                                    "{device.label()}"
-                                                }
-                                            }
+                                            open_dropdown,
                                         }
                                     }
 
                                     if !is_ios_safari {
                                         div { class: "device-setting-group",
                                             label { r#for: "modal-speaker-select", "Speaker" }
-                                            select {
+                                            SettingsGlassSelect {
                                                 id: "modal-speaker-select",
-                                                class: "device-selector-modal",
-                                                onchange: {
+                                                options: speakers.iter().map(|d| GlassSelectOption {
+                                                    value: d.device_id(),
+                                                    label: d.label(),
+                                                }).collect::<Vec<_>>(),
+                                                selected_value: selected_speaker_id.clone().unwrap_or_default(),
+                                                on_change: {
                                                     let speakers = speakers.clone();
-                                                    move |evt: Event<FormData>| {
-                                                        let device_id = evt.value();
+                                                    move |device_id: String| {
                                                         if let Some(info) = find_device_by_id(&speakers, &device_id) {
                                                             on_speaker_select.call(info);
                                                         }
                                                     }
                                                 },
-                                                for device in speakers.iter() {
-                                                    option {
-                                                        value: device.device_id(),
-                                                        selected: selected_speaker_id.as_deref() == Some(device.device_id().as_str()),
-                                                        "{device.label()}"
-                                                    }
-                                                }
+                                                open_dropdown,
                                             }
                                         }
                                     } else {
@@ -254,25 +445,22 @@ pub fn DeviceSettingsModal(
 
                                     div { class: "device-setting-group",
                                         label { r#for: "modal-video-select", "Camera" }
-                                        select {
+                                        SettingsGlassSelect {
                                             id: "modal-video-select",
-                                            class: "device-selector-modal",
-                                            onchange: {
+                                            options: cameras.iter().map(|d| GlassSelectOption {
+                                                value: d.device_id(),
+                                                label: d.label(),
+                                            }).collect::<Vec<_>>(),
+                                            selected_value: selected_camera_id.clone().unwrap_or_default(),
+                                            open_dropdown,
+                                            on_change: {
                                                 let cameras = cameras.clone();
-                                                move |evt: Event<FormData>| {
-                                                    let device_id = evt.value();
+                                                move |device_id: String| {
                                                     if let Some(info) = find_device_by_id(&cameras, &device_id) {
                                                         on_camera_select.call(info);
                                                     }
                                                 }
                                             },
-                                            for device in cameras.iter() {
-                                                option {
-                                                    value: device.device_id(),
-                                                    selected: selected_camera_id.as_deref() == Some(device.device_id().as_str()),
-                                                    "{device.label()}"
-                                                }
-                                            }
                                         }
                                     }
                                 }
@@ -291,37 +479,42 @@ pub fn DeviceSettingsModal(
 
                                     div { class: "device-setting-group",
                                         label { r#for: "modal-transport-select", "Protocol" }
-                                        select {
+                                        SettingsGlassSelect {
                                             id: "modal-transport-select",
-                                            class: "device-selector-modal",
-                                            onchange: move |evt: Event<FormData>| {
+                                            options: vec![
+                                                GlassSelectOption { value: "auto".to_string(), label: "Auto".to_string() },
+                                                GlassSelectOption { value: "webtransport".to_string(), label: "WebTransport".to_string() },
+                                                GlassSelectOption { value: "websocket".to_string(), label: "WebSocket".to_string() },
+                                            ],
+                                            selected_value: match transport_preference {
+                                                TransportPreference::Auto => "auto".to_string(),
+                                                TransportPreference::WebTransportOnly => "webtransport".to_string(),
+                                                TransportPreference::WebSocketOnly => "websocket".to_string(),
+                                            },
+                                            on_change: move |value: String| {
                                                 confirm_transport_change(
-                                                    &evt.value(),
+                                                    &value,
                                                     transport_preference,
                                                     "modal-transport-select",
                                                 );
                                             },
-                                            option {
-                                                value: "auto",
-                                                selected: transport_preference == TransportPreference::Auto,
-                                                "Auto"
-                                            }
-                                            option {
-                                                value: "webtransport",
-                                                selected: transport_preference == TransportPreference::WebTransportOnly,
-                                                "WebTransport"
-                                            }
-                                            option {
-                                                value: "websocket",
-                                                selected: transport_preference == TransportPreference::WebSocketOnly,
-                                                "WebSocket"
-                                            }
+                                            open_dropdown,
                                         }
                                     }
 
                                     p { class: "transport-preference-note",
                                         "Changing protocol will reload the page."
                                     }
+                                }
+                            },
+                            SettingsSection::Appearance => rsx! {
+                                div {
+                                    id: SettingsSection::Appearance.panel_id(),
+                                    class: "settings-section",
+                                    role: "tabpanel",
+                                    "aria-labelledby": SettingsSection::Appearance.tab_id(),
+
+                                    crate::components::appearance_settings_panel::AppearanceSettingsPanel {}
                                 }
                             },
                         }

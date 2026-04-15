@@ -24,7 +24,7 @@ use crate::components::icons::push_pin::PushPinIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
 use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
 use crate::constants::users_allowed_to_stream;
-use crate::context::VideoCallClientCtx;
+use crate::context::{AppearanceSettings, VideoCallClientCtx};
 use dioxus::prelude::*;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
@@ -33,23 +33,37 @@ use wasm_bindgen::JsCast;
 use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry};
 
 /// Compute the inline CSS for the speaking glow on the outer tile container.
-/// Border color is controlled via the `.speaking-tile` CSS class; this
-/// function only emits `box-shadow` and `transition` values.
-pub(crate) fn speak_style(audio_level: f32, speaking_active: bool) -> String {
-    if !speaking_active || audio_level <= 0.0 {
+/// Emits `box-shadow`, `border-color`, and `transition` values driven by the
+/// viewer's local [`AppearanceSettings`].
+pub(crate) fn speak_style(
+    audio_level: f32,
+    speaking_active: bool,
+    settings: &AppearanceSettings,
+) -> String {
+    if !settings.glow_enabled || !speaking_active || audio_level <= 0.0 {
         return "box-shadow: none; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;".to_string();
     }
 
+    let (r, g, b) = settings.glow_color.to_rgb();
+    let brightness = settings.glow_brightness.clamp(0.0, 1.0);
+    let inner_strength = settings.inner_glow_strength.clamp(0.0, 1.0);
+    let brightness_curve = brightness * brightness;
+    let inner_curve = inner_strength * inner_strength;
+
     let i = audio_level.clamp(0.0, 1.0);
+    let outer_blur = 14.0 + i * (14.0 + brightness_curve * 10.0);
+    let outer_spread = 1.0 + i * (2.0 + brightness_curve * 4.0);
+    let outer_alpha = (0.18 + i * 0.32) * brightness_curve;
+    let inner_blur = 10.0 + i * (10.0 + inner_curve * 12.0);
+    let inner_alpha = (0.10 + i * 0.22) * brightness_curve * (0.25 + inner_curve * 0.75);
+    // Border alpha is independent of brightness so the colored border stays
+    // clearly visible even when glow brightness is turned down to zero.
+    let border_alpha = (0.50 + i * 0.42).clamp(0.45, 0.92);
     format!(
-        "box-shadow: 0 0 {:.0}px {:.0}px rgba(91, 207, 159, {:.2}), \
-         inset 0 0 {:.0}px 0 rgba(91, 207, 159, {:.2}); \
+        "box-shadow: 0 0 {outer_blur:.0}px {outer_spread:.0}px rgba({r}, {g}, {b}, {outer_alpha:.2}), \
+         inset 0 0 {inner_blur:.0}px 0 rgba({r}, {g}, {b}, {inner_alpha:.2}); \
+         border-color: rgba({r}, {g}, {b}, {border_alpha:.2}); \
          transition: border-color 0.15s ease-in, box-shadow 0.15s ease-in;",
-        16.0 + i * 15.0,
-        1.5 + i * 3.0,
-        0.24 + i * 0.20,
-        13.0 + i * 13.0,
-        0.14 + i * 0.12,
     )
 }
 
@@ -63,49 +77,61 @@ pub(crate) fn is_speaking_suppressed(is_pinned: bool, pinned_peer_id: Option<&st
 /// Always returns explicit values — no reliance on CSS class for glow reset.
 ///
 /// Two separate signals control different visual properties:
-/// - `mic_audio_level` (held 1s after silence) controls the icon COLOR (mint)
+/// - `mic_audio_level` (held 1s after silence) controls the icon COLOR
 /// - `glow_audio_level` (raw, same as border) controls the drop-shadow GLOW
 ///
-/// This way the icon stays mint briefly after speech stops (via the held signal)
-/// while the drop-shadow glow tracks the border glow exactly.
-fn mic_style(mic_audio_level: f32, glow_audio_level: f32) -> String {
+/// Color and glow intensity are driven by the viewer's local
+/// [`AppearanceSettings`].
+fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceSettings) -> String {
     if mic_audio_level <= 0.0 && glow_audio_level <= 0.0 {
         // Fully silent: fade out both color and filter
         return "color: inherit; filter: none; transition: color 5.0s ease-out, filter 1.5s ease-out;".to_string();
     }
+
+    if !settings.glow_enabled {
+        // Respect the global glow toggle for mic visuals too.
+        return "color: inherit; filter: none; transition: color 5.0s ease-out, filter 1.5s ease-out;".to_string();
+    }
+
+    let (r, g, b) = settings.glow_color.to_rgb();
+    let brightness = settings.glow_brightness.clamp(0.0, 1.0);
+    let brightness_curve = brightness * brightness;
+    let icon_alpha = (0.4 + brightness_curve * 0.6).clamp(0.24, 1.0);
+    let icon_color = format!("rgba({r}, {g}, {b}, {icon_alpha:.2})");
+
     // Unreachable in practice: the mic hold timer guarantees mic_audio_level
     // stays positive at least as long as glow_audio_level. Handle defensively
-    // by showing only the glow without the mint icon color.
+    // by showing only the glow without the icon color.
     if mic_audio_level <= 0.0 && glow_audio_level > 0.0 {
         let clamped = glow_audio_level.clamp(0.0, 1.0);
         let glow_i = clamped.sqrt();
         return format!(
             "color: inherit; \
-             filter: drop-shadow(0 0 {:.0}px rgba(91, 207, 159, {:.2})) \
-                     drop-shadow(0 0 {:.0}px rgba(91, 207, 159, {:.2})); \
+             filter: drop-shadow(0 0 {:.0}px rgba({r}, {g}, {b}, {:.2})) \
+                     drop-shadow(0 0 {:.0}px rgba({r}, {g}, {b}, {:.2})); \
              transition: color 5.0s ease-out, filter 0.15s ease-in;",
             8.0 + glow_i * 16.0,
-            0.7 + glow_i * 0.3,
+            (0.55 + glow_i * 0.45) * brightness_curve,
             3.0 + glow_i * 8.0,
-            0.8 + glow_i * 0.2,
+            (0.60 + glow_i * 0.40) * brightness_curve,
         );
     }
     if mic_audio_level > 0.0 && glow_audio_level <= 0.0 {
-        // Held color (still mint) but raw glow has faded — no drop-shadow
-        return "color: #5bcf9f; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;".to_string();
+        // Held color but raw glow has faded — no drop-shadow
+        return format!("color: {icon_color}; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;");
     }
-    // Both positive: mint color + scaled drop-shadow glow
+    // Both positive: colored icon + scaled drop-shadow glow
     let clamped = glow_audio_level.clamp(0.0, 1.0);
     let glow_i = clamped.sqrt();
     format!(
-        "color: #5bcf9f; \
-         filter: drop-shadow(0 0 {:.0}px rgba(91, 207, 159, {:.2})) \
-                 drop-shadow(0 0 {:.0}px rgba(91, 207, 159, {:.2})); \
+        "color: {icon_color}; \
+         filter: drop-shadow(0 0 {:.0}px rgba({r}, {g}, {b}, {:.2})) \
+                 drop-shadow(0 0 {:.0}px rgba({r}, {g}, {b}, {:.2})); \
          transition: color 0.05s ease-in, filter 0.15s ease-in;",
-        8.0 + glow_i * 16.0, // primary drop-shadow blur: 8–24px
-        0.7 + glow_i * 0.3,  // primary drop-shadow alpha: 0.7–1.0
-        3.0 + glow_i * 8.0,  // secondary (tight) glow blur: 3–11px
-        0.8 + glow_i * 0.2,  // secondary glow alpha: 0.8–1.0
+        8.0 + glow_i * 16.0,
+        (0.55 + glow_i * 0.45) * brightness_curve,
+        3.0 + glow_i * 8.0,
+        (0.60 + glow_i * 0.40) * brightness_curve,
     )
 }
 
@@ -185,6 +211,7 @@ pub fn generate_for_peer(
     mut show_signal_popup: Signal<bool>,
     pinned_peer_id: Option<&str>,
     on_toggle_pin: EventHandler<String>,
+    appearance: &AppearanceSettings,
 ) -> Element {
     let audio_level = audio_levels.raw;
     let mic_audio_level = audio_levels.mic;
@@ -228,8 +255,8 @@ pub fn generate_for_peer(
         "audio-indicator"
     };
 
-    let tile_style = speak_style(visible_audio_level, is_speaking);
-    let mic_inline_style = mic_style(visible_mic_level, visible_audio_level);
+    let tile_style = speak_style(visible_audio_level, is_speaking, appearance);
+    let mic_inline_style = mic_style(visible_mic_level, visible_audio_level, appearance);
 
     // ---- Split-layout: screen-share left panel --------------------------------
     if matches!(mode, TileMode::ScreenOnly) {

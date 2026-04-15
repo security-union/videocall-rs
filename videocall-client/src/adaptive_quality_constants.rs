@@ -310,6 +310,9 @@ pub const AUDIO_TIER_RECOVER_FPS_RATIO: f64 = 0.60;
 
 /// How long conditions must remain "good" before stepping UP (milliseconds).
 /// Prevents rapid oscillation on unstable connections.
+/// Note: during active recovery slowdown (after a yo-yo crash), this window
+/// is multiplied by `RECOVERY_SLOWDOWN_FACTOR` — see the climb-rate limiter
+/// constants below.
 pub const STEP_UP_STABILIZATION_WINDOW_MS: u64 = 5000;
 
 /// How quickly we step DOWN (milliseconds). Degradation is faster than recovery.
@@ -341,6 +344,66 @@ pub const DEFAULT_WARMUP_MS: f64 = QUALITY_WARMUP_MS;
 /// encoder's feedback is all zeros, which would trigger aggressive
 /// step-downs without the grace period.
 pub const SCREEN_QUALITY_WARMUP_MS: f64 = 8000.0;
+
+// ---------------------------------------------------------------------------
+// Climb-Rate Limiter (PR-H)
+// ---------------------------------------------------------------------------
+// Prevents the adaptive quality system from yo-yoing between max and min
+// quality by imposing two complementary mechanisms:
+//
+// 1. **Crash ceiling** (Option A): after a detected yo-yo (two step-downs
+//    within `YOYO_DETECTION_WINDOW_MS`), a temporary ceiling prevents
+//    recovering past the failure tier. The ceiling lifts one tier at a time
+//    after each decay period, with exponential backoff on repeated crashes.
+//
+// 2. **Recovery slowdown** (Option B): after any ceiling-arming event, the
+//    step-up stabilization window is multiplied by `RECOVERY_SLOWDOWN_FACTOR`,
+//    giving each tier genuine soak time before climbing higher. The slowdown
+//    decays linearly back to 1.0 over `RECOVERY_SLOWDOWN_DECAY_MS`.
+
+/// Base decay period (ms) before the crash ceiling lifts by one tier.
+/// After the ceiling is armed, this is how long the system waits before
+/// allowing recovery to attempt the next-higher tier.
+pub const CLIMB_COOLDOWN_BASE_MS: f64 = 120_000.0; // 2 min
+
+/// Maximum ceiling decay period (ms) after repeated crashes.
+/// The decay period doubles on each re-crash via `CLIMB_COOLDOWN_BACKOFF`
+/// but caps here to prevent indefinite quality lockout.
+pub const CLIMB_COOLDOWN_MAX_MS: f64 = 600_000.0; // 10 min
+
+/// Backoff multiplier applied to the ceiling decay period on each re-crash.
+/// Sequence: 2 min → 4 min → 8 min → 10 min (capped).
+pub const CLIMB_COOLDOWN_BACKOFF: f64 = 2.0;
+
+/// Multiplier applied to `STEP_UP_STABILIZATION_WINDOW_MS` after a yo-yo
+/// crash is detected. Gives each tier longer soak time during recovery,
+/// catching degradation at intermediate tiers before climbing higher.
+pub const RECOVERY_SLOWDOWN_FACTOR: f64 = 2.0;
+
+/// Time (ms) for the recovery slowdown factor to decay linearly from
+/// `RECOVERY_SLOWDOWN_FACTOR` back to 1.0 (normal speed).
+/// Aligned with `CLIMB_COOLDOWN_BASE_MS` cadence so the slowdown expires
+/// around the time the ceiling lifts, avoiding wasted lift attempts.
+pub const RECOVERY_SLOWDOWN_DECAY_MS: f64 = 180_000.0; // 3 min
+
+/// Time (ms) of stable operation (no step-downs) after which crash memory
+/// resets: `ceiling_decay_ms` returns to `CLIMB_COOLDOWN_BASE_MS` and the
+/// slowdown clears. Represents "this meeting is fine now."
+pub const CRASH_MEMORY_RESET_MS: f64 = 600_000.0; // 10 min
+
+/// Window (ms) for yo-yo detection (design decision 1b). A crash ceiling
+/// is only armed when a step-down occurs within this window of a prior
+/// step-down, indicating an oscillation pattern rather than a one-shot
+/// degradation from a legitimate capacity change.
+/// Set to 3 minutes — production yo-yo cycles are 30-60s, so this catches
+/// the pattern within one cycle without false positives on single events.
+pub const YOYO_DETECTION_WINDOW_MS: f64 = 180_000.0; // 3 min
+
+/// Grace period (ms) after a successful server re-election during which
+/// step-downs do NOT arm the crash ceiling. Re-elections cause an FPS
+/// collapse during the server swap that looks like a crash to AQ; without
+/// this suppression the ceiling would cap a genuinely-better path.
+pub const REELECTION_CEILING_SUPPRESSION_MS: f64 = 10_000.0; // 10s
 
 // ---------------------------------------------------------------------------
 // PID Controller Tuning
@@ -885,6 +948,50 @@ mod tests {
             "PID output min ({}) must be < max ({})",
             PID_OUTPUT_MIN,
             PID_OUTPUT_MAX,
+        );
+    }
+
+    // =====================================================================
+    // Climb-rate limiter constant validation
+    // =====================================================================
+
+    #[test]
+    fn test_climb_rate_limiter_constants() {
+        assert!(
+            CLIMB_COOLDOWN_BASE_MS > 0.0,
+            "base cooldown must be positive"
+        );
+        assert!(
+            CLIMB_COOLDOWN_MAX_MS >= CLIMB_COOLDOWN_BASE_MS,
+            "max cooldown ({}) must be >= base ({})",
+            CLIMB_COOLDOWN_MAX_MS,
+            CLIMB_COOLDOWN_BASE_MS,
+        );
+        assert!(
+            CLIMB_COOLDOWN_BACKOFF > 1.0,
+            "backoff multiplier must be > 1.0"
+        );
+        assert!(
+            RECOVERY_SLOWDOWN_FACTOR >= 1.0,
+            "slowdown factor must be >= 1.0"
+        );
+        assert!(
+            RECOVERY_SLOWDOWN_DECAY_MS > 0.0,
+            "slowdown decay must be positive"
+        );
+        assert!(
+            CRASH_MEMORY_RESET_MS > CLIMB_COOLDOWN_MAX_MS,
+            "crash memory reset ({}) should be > max cooldown ({}) so ceiling decays before memory resets",
+            CRASH_MEMORY_RESET_MS,
+            CLIMB_COOLDOWN_MAX_MS,
+        );
+        assert!(
+            YOYO_DETECTION_WINDOW_MS > 0.0,
+            "yo-yo window must be positive"
+        );
+        assert!(
+            REELECTION_CEILING_SUPPRESSION_MS > 0.0,
+            "re-election suppression must be positive"
         );
     }
 

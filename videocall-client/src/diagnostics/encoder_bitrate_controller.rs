@@ -625,6 +625,33 @@ impl EncoderBitrateController {
     pub fn drain_tier_transitions(&mut self) -> Vec<TierTransitionRecord> {
         self.quality_manager.drain_transitions()
     }
+
+    /// Notify the quality manager that a server re-election completed.
+    /// Suppresses crash ceiling arming for `REELECTION_CEILING_SUPPRESSION_MS`.
+    ///
+    /// TODO(PR-H integration): Wire this through ConnectionController → CameraEncoder
+    /// so re-election events reach the AQM. Until connected, re-election suppression
+    /// is inactive and the ceiling may arm falsely during server swaps.
+    pub fn notify_reelection_completed(&mut self) {
+        let now = Date::now();
+        self.quality_manager.notify_reelection_completed(now);
+    }
+
+    /// Return the current crash ceiling state, if active.
+    /// `(ceiling_index, tier_label, current_decay_ms)`
+    pub fn crash_ceiling_info(&self) -> Option<(usize, &'static str, f64)> {
+        self.quality_manager.crash_ceiling_info()
+    }
+
+    /// Return step-up blocked counters: `(ceiling, slowdown, screen_share)`.
+    pub fn step_up_blocked_counts(&self) -> (u64, u64, u64) {
+        self.quality_manager.step_up_blocked_counts()
+    }
+
+    /// Drain accumulated dwell time samples: `Vec<(tier_label, dwell_ms)>`.
+    pub fn drain_dwell_samples(&mut self) -> Vec<(&'static str, f64)> {
+        self.quality_manager.drain_dwell_samples()
+    }
 }
 
 #[cfg(test)]

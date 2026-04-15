@@ -1509,6 +1509,7 @@ pub fn AttendantsComponent(
                                     host_user_id: host_user_id.clone(),
                                     render_mode: TileMode::VideoOnly,
                                     my_peer_id: user_id.clone(),
+                                    on_toggle_pin: toggle_pin.clone(),
                                 }
                             }
                         }
@@ -1539,6 +1540,7 @@ pub fn AttendantsComponent(
                                 full_bleed: false,
                                 host_user_id: host_user_id.clone(),
                                 my_peer_id: user_id.clone(),
+                                on_toggle_pin: toggle_pin.clone(),
                             }
                         }
 

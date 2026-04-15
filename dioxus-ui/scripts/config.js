@@ -21,5 +21,6 @@ window.__APP_CONFIG = Object.freeze({
   oauthIssuer: "",
   oauthPrompt: "",
   oauthFlow: "",
+  consoleLogUploadEnabled: "false",
   mockPeersEnabled: "false"
 });

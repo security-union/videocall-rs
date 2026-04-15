@@ -110,7 +110,7 @@ pub async fn upsert_user(
 ///   `name`; `access_token` and `refresh_token` are left NULL.
 /// - **Conflict** (returning user): updates `name` and `last_login` only.
 ///   `access_token`, and `refresh_token` are not overwritten so any tokens
-///    stored by the full [`upsert_user`] path are preserved.
+///   stored by the full [`upsert_user`] path are preserved.
 pub async fn register_user_from_token(
     pool: &PgPool,
     user_id: &str,

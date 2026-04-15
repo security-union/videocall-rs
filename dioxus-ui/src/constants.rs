@@ -102,6 +102,9 @@ pub struct RuntimeConfig {
     pub screen_bitrate_kbps: u32,
     #[serde(rename = "vadThreshold", default = "default_vad_threshold")]
     pub vad_threshold: f32,
+    #[serde(rename = "consoleLogUploadEnabled")]
+    #[serde(default)]
+    pub console_log_upload_enabled: String,
     #[serde(rename = "mockPeersEnabled")]
     #[serde(default)]
     pub mock_peers_enabled: String,
@@ -181,6 +184,9 @@ pub fn e2ee_enabled() -> Result<bool, String> {
 }
 pub fn firefox_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.firefox_enabled.as_str())))
+}
+pub fn console_log_upload_enabled() -> Result<bool, String> {
+    app_config().map(|c| truthy(Some(c.console_log_upload_enabled.as_str())))
 }
 
 pub fn mock_peers_enabled() -> bool {

@@ -25,7 +25,8 @@ window.__APP_CONFIG = Object.freeze({
   oauthScopes: "${OAUTH_SCOPES:-openid email profile}",
   oauthTokenUrl: "${OAUTH_TOKEN_URL:-}",
   oauthIssuer: "${OAUTH_ISSUER:-}",
-  oauthPrompt: "${OAUTH_PROMPT:-}"
+  oauthPrompt: "${OAUTH_PROMPT:-}",
+  mockPeersEnabled: "${MOCK_PEERS_ENABLED:-false}"
 });
 EOF
 

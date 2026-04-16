@@ -737,12 +737,12 @@ fn render_detail(
                     colored_value(cs, cc)
                 },
                 Span::raw("   "),
-                label("Pkt Loss: "),
+                label("Conceal: "),
                 colored_value(
-                    format!("{:.1}%", q.audio_packet_loss_pct),
-                    if q.audio_packet_loss_pct < 1.0 {
+                    format!("{:.1}%", q.audio_concealment_pct),
+                    if q.audio_concealment_pct < 1.0 {
                         Color::Green
-                    } else if q.audio_packet_loss_pct < 5.0 {
+                    } else if q.audio_concealment_pct < 5.0 {
                         Color::Yellow
                     } else {
                         Color::Red
@@ -1072,7 +1072,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Jitter    NetEQ target delay ms. In this stack often settles at a fixed"),
         Line::from("            default (~120ms); Conc/s is the more reliable audio indicator."),
         Line::from("  Buf       Current jitter buffer depth (ms)."),
-        Line::from("  Pkt Loss  Audio packet loss % (expand_per_sec / packets_per_sec proxy)."),
+        Line::from("  Conceal   Audio concealment % (expand_per_sec / packets_per_sec proxy)."),
         Line::from("            Green: <1%  Yellow: 1-5%  Red: >5%"),
         Line::from("  DecErr    Codec decode errors/sec (keyframe miss, parser error, reset)."),
         Line::from("            NOT the same as CPU-pressure frame drops. Usually near 0."),

@@ -13,13 +13,14 @@
 
 //! Axum router configuration for the Meeting Backend API.
 
+pub mod console_logs;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
 pub mod waiting_room;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     routing::{delete, get, patch, post, put},
     Router,
 };
@@ -167,5 +168,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}/reject",
             post(waiting_room::reject_participant),
+        )
+        // Console log uploads
+        .route(
+            "/api/v1/meetings/{meeting_id}/console-logs",
+            post(console_logs::upload_console_logs)
+                .layer(DefaultBodyLimit::max(console_logs::MAX_BODY_SIZE)),
         )
 }

@@ -1,0 +1,16 @@
+{{- if .Values.consoleLogs.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "meeting-api.fullname" . }}-console-logs
+  labels:
+    {{- include "meeting-api.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.consoleLogs.storageSize }}
+{{- end }}

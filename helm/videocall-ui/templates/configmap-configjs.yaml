@@ -7,4 +7,5 @@ metadata:
 data:
   config.js: |-
     {{ $cfg := default dict .Values.runtimeConfig }}
+    {{ $_ := set $cfg "imageTag" (default "unknown" .Values.image.tag) }}
     window.__APP_CONFIG = Object.freeze({{ $cfg | toJson }});

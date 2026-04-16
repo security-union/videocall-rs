@@ -767,12 +767,12 @@
       },
       "targets": [
         {
-          "expr": "videocall_audio_packet_loss_pct{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_audio_concealment_pct{meeting_id=~\"$meeting\"}",
           "legendFormat": "{{reporter_name}} sees {{peer_name}}",
           "refId": ""
         }
       ],
-      "title": "Packet Loss %",
+      "title": "Audio Concealment %",
       "type": "timeseries"
     },
     {
@@ -2304,7 +2304,7 @@
                   },
                   {
                     "color": "red",
-                    "value": 0.85
+                    "value": 0.70
                   }
                 ]
               },
@@ -2314,7 +2314,7 @@
               {
                 "matcher": {
                   "id": "byName",
-                  "options": "Degrade threshold (FPS)"
+                  "options": "Recovery threshold (FPS)"
                 },
                 "properties": [
                   {
@@ -2399,8 +2399,8 @@
               "refId": "B"
             },
             {
-              "expr": "vector(0.85)",
-              "legendFormat": "Degrade threshold (FPS)",
+              "expr": "vector(0.70)",
+              "legendFormat": "Recovery threshold (FPS)",
               "refId": "C"
             },
             {
@@ -2410,7 +2410,7 @@
             }
           ],
           "title": "Encoder Decision Inputs",
-          "description": "FPS ratio = worst_peer_fps / encoder_output_fps. Bitrate ratio = actual / target. When fps_ratio drops below 0.85 or bitrate_ratio below 0.5, the adaptive system degrades quality.",
+          "description": "FPS ratio = worst_peer_fps / encoder_output_fps. Bitrate ratio = actual / target. When fps_ratio drops below 0.50 the system degrades; when it recovers above 0.70 (sustained) the system steps up.",
           "type": "timeseries"
         },
         {

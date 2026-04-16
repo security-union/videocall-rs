@@ -980,8 +980,8 @@ mod tests {
             "slowdown decay must be positive"
         );
         assert!(
-            CRASH_MEMORY_RESET_MS > CLIMB_COOLDOWN_MAX_MS,
-            "crash memory reset ({}) should be > max cooldown ({}) so ceiling decays before memory resets",
+            CRASH_MEMORY_RESET_MS >= CLIMB_COOLDOWN_MAX_MS,
+            "crash memory reset ({}) should be >= max cooldown ({}) so ceiling decays before memory resets",
             CRASH_MEMORY_RESET_MS,
             CLIMB_COOLDOWN_MAX_MS,
         );

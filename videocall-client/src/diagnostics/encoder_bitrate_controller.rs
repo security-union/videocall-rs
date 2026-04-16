@@ -629,9 +629,8 @@ impl EncoderBitrateController {
     /// Notify the quality manager that a server re-election completed.
     /// Suppresses crash ceiling arming for `REELECTION_CEILING_SUPPRESSION_MS`.
     ///
-    /// TODO(PR-H integration): Wire this through ConnectionController → CameraEncoder
-    /// so re-election events reach the AQM. Until connected, re-election suppression
-    /// is inactive and the ceiling may arm falsely during server swaps.
+    /// Wired through: ConnectionManager → shared AtomicBool signal → CameraEncoder
+    /// control loop (checks/clears each tick) → this method.
     pub fn notify_reelection_completed(&mut self) {
         let now = Date::now();
         self.quality_manager.notify_reelection_completed(now);

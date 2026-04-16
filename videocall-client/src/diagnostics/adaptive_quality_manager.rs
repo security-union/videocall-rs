@@ -134,6 +134,11 @@ pub struct AdaptiveQualityManager {
     /// timestamp do not arm the crash ceiling.
     reelection_completed_at_ms: Option<f64>,
 
+    /// Running count of video step-downs since session start. Included in
+    /// climb-limiter log messages to correlate ceiling events with the
+    /// overall degradation history.
+    step_down_count: u32,
+
     // --- Telemetry ---
     /// Counter: step-ups blocked because the crash ceiling prevented recovery.
     step_up_blocked_ceiling: u64,
@@ -189,6 +194,7 @@ impl AdaptiveQualityManager {
             recovered_since_ceiling: false,
             slowdown_activated_at_ms: None,
             reelection_completed_at_ms: None,
+            step_down_count: 0,
             // Telemetry
             step_up_blocked_ceiling: 0,
             step_up_blocked_slowdown: 0,
@@ -207,6 +213,14 @@ impl AdaptiveQualityManager {
     /// has not yet allocated enough bitrate for a higher tier.
     ///
     /// Use `VIDEO_QUALITY_TIERS` for camera, `SCREEN_QUALITY_TIERS` for screen share.
+    ///
+    /// # Lifecycle
+    ///
+    /// Each `CameraEncoder::start()` / `ScreenEncoder::start()` call creates a
+    /// fresh `EncoderBitrateController` (which owns this manager). Climb-rate
+    /// limiter state (`crash_ceiling_index`, `ceiling_decay_ms`,
+    /// `slowdown_activated_at_ms`, counters, etc.) is therefore per-session
+    /// and does not leak across meetings. No explicit `reset()` is needed.
     pub fn new(video_tiers: &'static [VideoQualityTier]) -> Self {
         Self::new_with_warmup(video_tiers, DEFAULT_WARMUP_MS, DEFAULT_VIDEO_TIER_INDEX)
     }
@@ -344,6 +358,7 @@ impl AdaptiveQualityManager {
                 // Climb-rate limiter: evaluate yo-yo detection for ceiling arming.
                 // N.B. must be called before updating last_step_down_ms so it reads
                 // the *previous* step-down timestamp for yo-yo detection.
+                self.step_down_count += 1;
                 self.maybe_arm_ceiling(self.video_tier_index, now_ms);
                 self.last_step_down_ms = Some(now_ms);
                 return true;
@@ -413,9 +428,16 @@ impl AdaptiveQualityManager {
                 // Step-up would have triggered at normal speed but slowdown blocked it.
                 self.step_up_blocked_slowdown += 1;
             }
-        } else {
-            // Track why step-up was blocked when conditions are good.
-            if should_recover && self.video_tier_index <= min_allowed_index {
+        } else if should_recover && self.video_tier_index <= min_allowed_index {
+            // At the ceiling with good conditions — track recovery time so we
+            // can distinguish "would have stepped up this tick" from "conditions
+            // just became good". Only count a blocked event when the stabilization
+            // window is met (i.e., a step-up would have triggered absent the
+            // ceiling). Without this gate, the counter increments every evaluation
+            // tick, inflating telemetry.
+            let recover_start = *self.recover_start_ms.get_or_insert(now_ms);
+            let recover_duration = now_ms - recover_start;
+            if recover_duration >= STEP_UP_STABILIZATION_WINDOW_MS as f64 && can_transition {
                 let crash = self.crash_ceiling_index.unwrap_or(0);
                 let coord = self.quality_ceiling_index.unwrap_or(0);
                 if self.crash_ceiling_index.is_some() && crash >= coord {
@@ -424,6 +446,8 @@ impl AdaptiveQualityManager {
                     self.step_up_blocked_screen_share += 1;
                 }
             }
+        } else {
+            // Conditions not good enough to recover — reset the timer.
             self.recover_start_ms = None;
         }
 
@@ -579,6 +603,7 @@ impl AdaptiveQualityManager {
             self.video_tier_index,
         );
         // Climb-rate limiter: congestion step-downs participate in yo-yo detection.
+        self.step_down_count += 1;
         self.maybe_arm_ceiling(self.video_tier_index, now_ms);
         self.last_step_down_ms = Some(now_ms);
         true
@@ -694,10 +719,11 @@ impl AdaptiveQualityManager {
                     self.crash_ceiling_index = None;
                     log::info!(
                         "ClimbLimiter: crash ceiling REMOVED (was tier '{}' index {}). \
-                         Decay period was {:.0}s.",
+                         Decay period was {:.0}s. step_downs={}",
                         self.video_tiers[old_ceiling].label,
                         old_ceiling,
                         self.ceiling_decay_ms / 1000.0,
+                        self.step_down_count,
                     );
                 } else {
                     let new_ceiling = ceiling - 1;
@@ -705,12 +731,13 @@ impl AdaptiveQualityManager {
                     self.ceiling_expires_at_ms = now_ms + self.ceiling_decay_ms;
                     log::info!(
                         "ClimbLimiter: crash ceiling LIFTED from '{}' (index {}) to '{}' (index {}). \
-                         Next lift in {:.0}s.",
+                         Next lift in {:.0}s. step_downs={}",
                         self.video_tiers[old_ceiling].label,
                         old_ceiling,
                         self.video_tiers[new_ceiling].label,
                         new_ceiling,
                         self.ceiling_decay_ms / 1000.0,
+                        self.step_down_count,
                     );
                 }
             }
@@ -730,10 +757,11 @@ impl AdaptiveQualityManager {
                 if had_ceiling || old_decay > CLIMB_COOLDOWN_BASE_MS {
                     log::info!(
                         "ClimbLimiter: crash memory RESET after {:.0}s stable. \
-                         Decay period reset from {:.0}s to {:.0}s.",
+                         Decay period reset from {:.0}s to {:.0}s. step_downs={}",
                         CRASH_MEMORY_RESET_MS / 1000.0,
                         old_decay / 1000.0,
                         CLIMB_COOLDOWN_BASE_MS / 1000.0,
+                        self.step_down_count,
                     );
                 }
             }
@@ -779,16 +807,25 @@ impl AdaptiveQualityManager {
                 self.slowdown_activated_at_ms = Some(now_ms);
                 log::info!(
                     "ClimbLimiter: crash ceiling ARMED at '{}' (index {}). \
-                     Decay period {:.0}s. Recovery slowdown {:.1}x.",
+                     Decay period {:.0}s. Recovery slowdown {:.1}x. step_downs={}",
                     self.video_tiers[to_index].label,
                     to_index,
                     self.ceiling_decay_ms / 1000.0,
                     RECOVERY_SLOWDOWN_FACTOR,
+                    self.step_down_count,
                 );
             }
             Some(_existing) => {
                 if self.recovered_since_ceiling {
                     // Re-crash after recovery: tighten ceiling and escalate backoff.
+                    //
+                    // Edge case: if the ceiling was at index 2 and recovery only
+                    // went 4 -> 3 (one step up), then a new crash goes 3 -> 4,
+                    // `recovered_since_ceiling` is true so we re-arm at index 4
+                    // (the new `to_index`) with 2x backoff. This is intentional:
+                    // even a partial recovery that crashes again is evidence that
+                    // the network cannot sustain the higher tier, and the looser
+                    // ceiling plus longer backoff is the correct response.
                     self.crash_ceiling_index = Some(to_index);
                     self.ceiling_decay_ms =
                         (self.ceiling_decay_ms * CLIMB_COOLDOWN_BACKOFF).min(CLIMB_COOLDOWN_MAX_MS);
@@ -797,11 +834,12 @@ impl AdaptiveQualityManager {
                     self.slowdown_activated_at_ms = Some(now_ms);
                     log::info!(
                         "ClimbLimiter: crash ceiling RE-ARMED at '{}' (index {}). \
-                         Backoff escalated to {:.0}s. Recovery slowdown {:.1}x.",
+                         Backoff escalated to {:.0}s. Recovery slowdown {:.1}x. step_downs={}",
                         self.video_tiers[to_index].label,
                         to_index,
                         self.ceiling_decay_ms / 1000.0,
                         RECOVERY_SLOWDOWN_FACTOR,
+                        self.step_down_count,
                     );
                 }
                 // else: cascade (rapid step-downs without recovery) — don't
@@ -811,6 +849,10 @@ impl AdaptiveQualityManager {
     }
 
     /// Record dwell time for the current tier and update the entry timestamp.
+    ///
+    /// The dwell sample is labeled with the *outgoing* tier (the tier we are
+    /// about to leave), not the tier we are entering. This method must be
+    /// called *before* `video_tier_index` is mutated.
     fn record_dwell(&mut self, now_ms: f64) {
         let dwell = now_ms - self.tier_entered_at_ms;
         if dwell > 0.0 {
@@ -2001,5 +2043,133 @@ mod tests {
         let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 5000.0, 2);
         assert!(!changed, "Still no degradation at 2 peers after long wait");
         assert_eq!(mgr.video_tier_index(), 0);
+    }
+
+    // =====================================================================
+    // End-to-end climb-rate limiter test via update() API (PR-H review fix #6)
+    // =====================================================================
+
+    /// Walk the public `update()` API through the full climb-rate limiter
+    /// lifecycle: arm -> recover -> re-crash, without manipulating internal
+    /// state directly. This catches wiring regressions that the unit test
+    /// `test_recrash_tightens_and_escalates_backoff` (which mutates fields
+    /// directly) would miss.
+    #[wasm_bindgen_test]
+    fn test_climb_limiter_e2e_arm_recover_recrash() {
+        let mut mgr = new_test_manager_at(VIDEO_QUALITY_TIERS, 2); // start at "hd" (index 2)
+        let peers = 5;
+
+        // === Phase 1: First step-down (index 2 -> 3) ===
+        // Drive bad conditions for STEP_DOWN_REACTION_TIME_MS.
+        let t = 10000.0;
+        mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers); // start degrade timer
+        let t = t + 1600.0; // 1600ms > 1500ms reaction time
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers);
+        assert!(changed, "Phase 1: should step down 2->3");
+        assert_eq!(mgr.video_tier_index(), 3);
+        assert!(
+            mgr.crash_ceiling_info().is_none(),
+            "Phase 1: single step-down should NOT arm ceiling"
+        );
+
+        // === Phase 2: Second step-down (index 3 -> 4) — arms ceiling ===
+        // Wait past MIN_TIER_TRANSITION_INTERVAL_MS (3000ms) then degrade again.
+        let t = t + 3100.0; // past min-interval
+        mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers); // start degrade timer
+        let t = t + 1600.0;
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers);
+        assert!(changed, "Phase 2: should step down 3->4");
+        assert_eq!(mgr.video_tier_index(), 4);
+
+        // Ceiling should now be armed at index 4 (yo-yo: two step-downs within window).
+        let info = mgr.crash_ceiling_info();
+        assert!(
+            info.is_some(),
+            "Phase 2: ceiling should be armed after yo-yo"
+        );
+        let (ceiling_idx, _, initial_decay) = info.unwrap();
+        assert_eq!(
+            ceiling_idx, 4,
+            "Phase 2: ceiling should be at step-down tier"
+        );
+        assert!(
+            (initial_decay - CLIMB_COOLDOWN_BASE_MS).abs() < 1.0,
+            "Phase 2: decay should be base value"
+        );
+
+        // === Phase 3: Recover up to the ceiling (index 4 -> ... -> 4) ===
+        // With ceiling at 4, recovery can only reach index 4 (already there),
+        // but the act of stepping up sets recovered_since_ceiling = true.
+        // We need to be *below* the ceiling to step up to it. Step down once
+        // more so we can recover.
+        let t = t + 3100.0; // past min-interval
+        mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers); // degrade timer
+        let t = t + 1600.0;
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers);
+        assert!(changed, "Phase 3a: should step down 4->5");
+        assert_eq!(mgr.video_tier_index(), 5);
+
+        // Now recover: step up from 5 -> 4 (ceiling is at 4, so 4 is allowed).
+        let t = t + 3100.0; // past min-interval
+        mgr.update(28.0, 30.0, 400.0, 400.0, t, peers); // start recover timer
+        let t = t + 5100.0; // past stabilization window (may be slowed by recovery slowdown)
+                            // Slowdown is active (armed from Phase 2), so effective window ~= 5000 * 2.0 = 10000.
+                            // We may need to wait longer. Use enough time for slowed window.
+        let t = t + 5000.0; // total 10100ms from recover start — past 2.0x slowed window
+        let changed = mgr.update(28.0, 30.0, 400.0, 400.0, t, peers);
+        assert!(
+            changed,
+            "Phase 3b: should step up 5->4 (recovering to ceiling)"
+        );
+        assert_eq!(mgr.video_tier_index(), 4);
+
+        // Verify we can't step past the ceiling.
+        let t = t + 3100.0; // past min-interval
+        mgr.update(28.0, 30.0, 400.0, 400.0, t, peers); // start recover timer
+        let t = t + 10100.0; // long enough even with slowdown
+        let changed = mgr.update(28.0, 30.0, 400.0, 400.0, t, peers);
+        assert!(
+            !changed,
+            "Phase 3c: should NOT step past ceiling at index 4"
+        );
+        assert_eq!(mgr.video_tier_index(), 4);
+
+        // === Phase 4: Re-crash — step down from ceiling (index 4 -> 5) ===
+        // This should tighten the ceiling and escalate the backoff.
+        let t = t + 3100.0;
+        mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers); // degrade timer
+        let t = t + 1600.0;
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers);
+        assert!(changed, "Phase 4a: first step-down of re-crash, 4->5");
+        assert_eq!(mgr.video_tier_index(), 5);
+
+        // Second step-down for yo-yo detection within the re-crash.
+        let t = t + 3100.0;
+        mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers);
+        let t = t + 1600.0;
+        let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers);
+        assert!(changed, "Phase 4b: second step-down of re-crash, 5->6");
+        assert_eq!(mgr.video_tier_index(), 6);
+
+        // Ceiling should have tightened (moved to 6) and backoff escalated (2x).
+        let info = mgr.crash_ceiling_info();
+        assert!(
+            info.is_some(),
+            "Phase 4: ceiling should still be armed after re-crash"
+        );
+        let (ceiling_idx, _, new_decay) = info.unwrap();
+        assert_eq!(
+            ceiling_idx, 6,
+            "Phase 4: ceiling should have tightened to re-crash tier"
+        );
+        let expected_decay =
+            (CLIMB_COOLDOWN_BASE_MS * CLIMB_COOLDOWN_BACKOFF).min(CLIMB_COOLDOWN_MAX_MS);
+        assert!(
+            (new_decay - expected_decay).abs() < 1.0,
+            "Phase 4: backoff should have escalated from {:.0}s to {:.0}s, got {:.0}s",
+            initial_decay / 1000.0,
+            expected_decay / 1000.0,
+            new_decay / 1000.0,
+        );
     }
 }

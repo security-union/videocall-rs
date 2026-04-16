@@ -23,6 +23,7 @@ use gloo::timers::callback::Interval;
 use log::{debug, info, warn};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::AtomicBool;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 #[derive(Debug)]
@@ -274,6 +275,20 @@ impl ConnectionController {
             None
         }
     }
+
+    /// Returns the shared re-election completed signal.
+    ///
+    /// Forwards to [`ConnectionManager::reelection_completed_signal`].
+    pub fn reelection_completed_signal(&self) -> Rc<AtomicBool> {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.reelection_completed_signal()
+        } else {
+            // Fallback: return a standalone AtomicBool. This only happens if
+            // the manager is already borrowed (should not occur during setup).
+            log::warn!("ConnectionController: manager borrowed during reelection_completed_signal — returning disconnected signal");
+            Rc::new(AtomicBool::new(false))
+        }
+    }
 }
 
 impl Drop for ConnectionController {
@@ -337,6 +352,7 @@ mod tests {
             peer_monitor: Callback::from(|_| {}),
             election_period_ms: 1000,
             instance_id: "test-instance-id".to_string(),
+            reelection_completed_signal: Rc::new(AtomicBool::new(false)),
         }
     }
 

@@ -1110,11 +1110,60 @@ impl Handler<JoinRoom> for ChatServer {
                                                 }
                                             };
                                             if !target.is_empty() && !new_name.is_empty() {
+                                                let room_mismatch = !inner.room_id.is_empty()
+                                                    && inner.room_id != room_clone;
+                                                if room_mismatch {
+                                                    warn!(
+                                                        "UpdateMemberDisplayName: protobuf room_id '{}' differs from subscription room '{}', sanitizing before forwarding",
+                                                        inner.room_id, room_clone
+                                                    );
+                                                }
                                                 server_addr.do_send(UpdateMemberDisplayName {
-                                                    room_id: inner.room_id.clone(),
+                                                    room_id: room_clone.clone(),
                                                     user_id: target,
                                                     display_name: new_name,
                                                 });
+                                                if room_mismatch {
+                                                    // Rewrite room_id so clients never see the mismatched value.
+                                                    let mut patched = inner;
+                                                    patched.room_id = room_clone.clone();
+                                                    let forwarded =
+                                                        patched.write_to_bytes().and_then(|ib| {
+                                                            let mut pw = wrapper;
+                                                            pw.data = ib;
+                                                            pw.write_to_bytes()
+                                                        });
+                                                    match forwarded {
+                                                        Ok(sanitized) => {
+                                                            let message = Message {
+                                                                msg: sanitized,
+                                                                session: session_clone,
+                                                            };
+                                                            if let Err(e) =
+                                                                session_recipient.try_send(message)
+                                                            {
+                                                                RELAY_PACKET_DROPS_TOTAL
+                                                                    .with_label_values(&[
+                                                                        &room_clone,
+                                                                        "nats_delivery",
+                                                                        "mailbox_full",
+                                                                    ])
+                                                                    .inc();
+                                                                warn!(
+                                                                    "Dropping sanitized PARTICIPANT_DISPLAY_NAME_CHANGED for session {}: {}",
+                                                                    session_clone, e
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "Failed to re-serialize sanitized PARTICIPANT_DISPLAY_NAME_CHANGED, dropping forward: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                    continue;
+                                                }
                                             }
                                         }
                                     }

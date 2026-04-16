@@ -621,4 +621,98 @@ test.describe("Display name live update", () => {
       await browser2.close();
     }
   });
+
+  /**
+   * Late-joiner scenario: User A joins, renames via API, then User C joins
+   * *after* the rename. User C should see User A's updated display name
+   * immediately — not the original name. This validates that the server
+   * persists the renamed display name and sends it to newly joining
+   * participants via the initial participant list / peer announcement.
+   */
+  test("late joiner sees already-renamed display name", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_latejoin_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      // ---- User A creates and joins the meeting ----
+      const userACtx = await createAuthenticatedContext(
+        browser1,
+        "usera-late@videocall.rs",
+        "OriginalNameA",
+        uiURL,
+      );
+      const userAPage = await userACtx.newPage();
+
+      await navigateToMeeting(userAPage, meetingId, "OriginalNameA");
+      const userAResult = await joinMeetingFromPage(userAPage);
+      expect(userAResult).toBe("in-meeting");
+      await expect(userAPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // ---- User A renames via API while alone in the meeting ----
+      await updateDisplayNameViaApi(
+        "usera-late@videocall.rs",
+        "OriginalNameA",
+        meetingId,
+        "RenamedA",
+      );
+
+      // Wait for User A to see own name update confirmed on their tile
+      const userASelfName = userAPage.locator(".floating-name", {
+        hasText: "RenamedA",
+      });
+      await expect(userASelfName.first()).toBeVisible({ timeout: 15_000 });
+
+      // ---- User C joins AFTER the rename ----
+      const userCCtx = await createAuthenticatedContext(
+        browser2,
+        "userc-late@videocall.rs",
+        "UserC",
+        uiURL,
+      );
+      const userCPage = await userCCtx.newPage();
+
+      await navigateToMeeting(userCPage, meetingId, "UserC");
+      const userCResult = await joinMeetingFromPage(userCPage);
+      await admitGuestIfNeeded(userAPage, userCPage, userCResult);
+
+      // Wait for peer discovery on User C's side
+      await expect(userCPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // ---- User C should see User A's RENAMED display name ----
+      const renamedOnC = userCPage.locator(".floating-name", {
+        hasText: "RenamedA",
+      });
+      await expect(renamedOnC.first()).toBeVisible({ timeout: 15_000 });
+
+      // The original name should NOT appear on User C's view
+      await expect(userCPage.locator(".floating-name", { hasText: "OriginalNameA" })).toHaveCount(
+        0,
+        { timeout: 5_000 },
+      );
+
+      // ---- User A also sees User C ----
+      const userCNameOnA = userAPage.locator(".floating-name", {
+        hasText: "UserC",
+      });
+      await expect(userCNameOnA.first()).toBeVisible({ timeout: 15_000 });
+
+      // Both still in meeting — no disruption
+      await expect(userAPage.locator("#grid-container")).toBeVisible();
+      await expect(userCPage.locator("#grid-container")).toBeVisible();
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
 });

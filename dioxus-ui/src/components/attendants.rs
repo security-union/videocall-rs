@@ -19,6 +19,7 @@
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
+    connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
@@ -31,10 +32,11 @@ use crate::components::{
         MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
     },
 };
+use crate::console_log_collector::{flush_console_logs, set_console_log_context};
 use crate::constants::actix_websocket_base;
 use crate::constants::{
-    mock_peers_enabled, server_election_period_ms, users_allowed_to_stream,
-    webtransport_host_base, CANVAS_LIMIT,
+    mock_peers_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
+    CANVAS_LIMIT,
 };
 use crate::context::{
     resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
@@ -512,15 +514,44 @@ pub fn AttendantsComponent(
             webtransport_urls,
             enable_e2ee: e2ee_enabled,
             enable_webtransport: effective_wt_enabled,
-            on_connected: VcCallback::from(move |_| {
-                log::info!("DIOXUS-UI: Connection established");
-                let mut connection_error = connection_error;
-                let mut call_start_time = call_start_time;
-                let mut session_loaded = session_loaded;
-                connection_error.set(None);
-                call_start_time.set(Some(js_sys::Date::now()));
-                session_loaded.set(true);
-            }),
+            on_connected: {
+                let meeting_id_for_log = id.clone();
+                // Slugify the fallback display name so it passes SAFE_USER_ID_RE
+                // on the server (spaces and other chars would cause a 400).
+                let user_id_for_log = user_id.clone().unwrap_or_else(|| {
+                    initial_display_name
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || c == '.' || c == '@' || c == '-' {
+                                c
+                            } else {
+                                '_'
+                            }
+                        })
+                        .collect()
+                });
+                VcCallback::from(move |_| {
+                    log::info!("DIOXUS-UI: Connection established");
+                    let mut connection_error = connection_error;
+                    let mut call_start_time = call_start_time;
+                    let mut session_loaded = session_loaded;
+                    connection_error.set(None);
+                    call_start_time.set(Some(js_sys::Date::now()));
+                    session_loaded.set(true);
+                    // Activate console log collection if enabled in config.
+                    if crate::constants::console_log_upload_enabled().unwrap_or(false) {
+                        // Raise the WASM log level to Debug so uploaded logs
+                        // capture detailed diagnostic output. We use Debug
+                        // rather than Trace (as ticket #307 mentions) because
+                        // Trace is prohibitively noisy in WASM — every
+                        // wasm-bindgen call and Dioxus re-render generates
+                        // trace spans that would overwhelm the upload buffer.
+                        log::set_max_level(log::LevelFilter::Debug);
+                        let dn = current_display_name();
+                        set_console_log_context(&meeting_id_for_log, &user_id_for_log, &dn);
+                    }
+                })
+            },
             on_connection_lost: {
                 let id = id.clone();
                 let client_cell = client_for_reconnect.clone();
@@ -1478,6 +1509,7 @@ pub fn AttendantsComponent(
                                     host_user_id: host_user_id.clone(),
                                     render_mode: TileMode::VideoOnly,
                                     my_peer_id: user_id.clone(),
+                                    on_toggle_pin: toggle_pin.clone(),
                                 }
                             }
                         }
@@ -1508,6 +1540,7 @@ pub fn AttendantsComponent(
                                 full_bleed: false,
                                 host_user_id: host_user_id.clone(),
                                 my_peer_id: user_id.clone(),
+                                on_toggle_pin: toggle_pin.clone(),
                             }
                         }
 
@@ -1724,6 +1757,14 @@ pub fn AttendantsComponent(
                                             HangUpButton {
                                                 onclick: move |_| {
                                                     log::info!("Hanging up - resetting to initial state");
+                                                    // Flush console logs before disconnecting so the
+                                                    // final chunk reaches the server while the session
+                                                    // is still active.
+                                                    if crate::constants::console_log_upload_enabled()
+                                                        .unwrap_or(false)
+                                                    {
+                                                        flush_console_logs();
+                                                    }
                                                     if hangup_client.is_connected() {
                                                         if let Err(e) = hangup_client.disconnect() {
                                                             log::error!("Error disconnecting: {e}");
@@ -1820,6 +1861,7 @@ pub fn AttendantsComponent(
                                     }
                                 }
                             }
+                            ConnectionQualityIndicator {}
                         }
                     }
                 }
@@ -1864,25 +1906,26 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                UpdateDisplayNameModal {
-                    visible: display_name_modal_open(),
-                    current_display_name: current_display_name(),
-                    meeting_id: id.clone(),
-                    on_close: move |_| {
-                        display_name_modal_open.set(false);
-                    },
-                    on_success: move |new_name: String| {
-                        // Update local UI immediately — do NOT wait for server broadcast.
-                        // The server will broadcast PARTICIPANT_DISPLAY_NAME_CHANGED moments later,
-                        // which will be handled by on_display_name_changed callback and will
-                        // confirm the same value. This ensures no perceived lag for the user.
-                        log::info!("RENAME: on_success called with new_name: {}", new_name);
-                        let mut current_name = current_display_name;
-                        current_name.set(new_name.clone());
-                        let mut dn_ctx = display_name_ctx_signal;
-                        dn_ctx.set(Some(new_name.clone()));
-                        display_name_modal_open.set(false);
-                    },
+                if display_name_modal_open() {
+                    UpdateDisplayNameModal {
+                        current_display_name: current_display_name(),
+                        meeting_id: id.clone(),
+                        on_close: move |_| {
+                            display_name_modal_open.set(false);
+                        },
+                        on_success: move |new_name: String| {
+                            // Update local UI immediately — do NOT wait for server broadcast.
+                            // The server will broadcast PARTICIPANT_DISPLAY_NAME_CHANGED moments later,
+                            // which will be handled by on_display_name_changed callback and will
+                            // confirm the same value. This ensures no perceived lag for the user.
+                            log::info!("RENAME: on_success called with new_name: {}", new_name);
+                            let mut current_name = current_display_name;
+                            current_name.set(new_name.clone());
+                            let mut dn_ctx = display_name_ctx_signal;
+                            dn_ctx.set(Some(new_name.clone()));
+                            display_name_modal_open.set(false);
+                        },
+                    }
                 }
 
                 // Meeting ended overlay
@@ -2018,8 +2061,7 @@ fn parse_speaking_peer(evt: &videocall_diagnostics::DiagEvent) -> Option<String>
             _ => {}
         }
     }
-    let is_speaking = audio_lvl.map(|l| l > 0.0).unwrap_or(false)
-        || speaking.unwrap_or(false);
+    let is_speaking = audio_lvl.map(|l| l > 0.0).unwrap_or(false) || speaking.unwrap_or(false);
     if is_speaking {
         to_peer
     } else {

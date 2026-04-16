@@ -156,7 +156,7 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 | `videocall_video_quality_score` | 0-100, FPS health + decode error penalty |
 | `videocall_neteq_expand_ops_per_sec` | Audio concealment rate (key audio health signal) |
 | `videocall_neteq_target_delay_ms` | Jitter estimate |
-| `videocall_audio_packet_loss_pct` | Packet loss percentage |
+| `videocall_audio_concealment_pct` | Audio concealment percentage |
 
 ### Container resource metrics (via cAdvisor)
 | Metric | Description |

@@ -92,6 +92,11 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+consoleLogs:
+  enabled: false
+  storageSize: 10Gi
+  retentionDays: 30
+
 ingress:
   enabled: true
   className: nginx

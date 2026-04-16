@@ -27,7 +27,7 @@
 | `videocall_video_bitrate_kbps` | Bitrate observed by receiver |
 | `videocall_video_quality_score` | Video quality 0-100 |
 | `videocall_video_frames_dropped` | Frames dropped by receiver |
-| `videocall_audio_packet_loss_pct` | Audio loss from NetEQ concealment |
+| `videocall_audio_concealment_pct` | Audio concealment from NetEQ expand events |
 | `videocall_audio_quality_score` | Audio quality 0-100 |
 | `videocall_call_quality_score` | min(audio, video) quality |
 | `videocall_neteq_target_delay_ms` | Jitter buffer target delay |

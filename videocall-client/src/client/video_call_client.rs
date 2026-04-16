@@ -23,7 +23,7 @@ use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
-use crate::health_reporter::HealthReporter;
+use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
@@ -203,6 +203,9 @@ struct Inner {
     /// The camera encoder's diagnostics loop checks this flag and calls
     /// `force_video_step_down()` on the `EncoderBitrateController`.
     congestion_step_down_requested: Arc<AtomicBool>,
+    /// Signal set by `ConnectionManager` when a re-election completes. The
+    /// camera encoder reads and clears this to suppress crash ceiling arming.
+    reelection_completed_signal: Rc<AtomicBool>,
 }
 
 /// The main client handle for a video call session.
@@ -296,6 +299,7 @@ impl VideoCallClient {
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+        let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
         let client = Self {
             options: options.clone(),
@@ -334,6 +338,7 @@ impl VideoCallClient {
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
+                reelection_completed_signal: reelection_completed_signal.clone(),
             })),
             connection_controller,
             aes,
@@ -511,6 +516,7 @@ impl VideoCallClient {
             },
             election_period_ms,
             instance_id: generate_instance_id(),
+            reelection_completed_signal: self.inner.borrow().reelection_completed_signal.clone(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -806,6 +812,14 @@ impl VideoCallClient {
         self.inner.borrow().congestion_step_down_requested.clone()
     }
 
+    /// Returns a shared reference to the re-election completed signal.
+    ///
+    /// Pass this to `CameraEncoder` so that re-election events reach the
+    /// adaptive quality manager's crash ceiling suppression logic.
+    pub fn reelection_completed_signal(&self) -> Rc<AtomicBool> {
+        self.inner.borrow().reelection_completed_signal.clone()
+    }
+
     /// Bind adaptive quality tier sources from a `CameraEncoder` to the
     /// health reporter. Call this after creating the camera encoder so the
     /// health reporter includes the current encoding tiers in each packet.
@@ -832,6 +846,8 @@ impl VideoCallClient {
         output_fps: Rc<AtomicU32>,
         camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
+        dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
     ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(hr) = &inner.health_reporter {
@@ -846,6 +862,8 @@ impl VideoCallClient {
                         output_fps,
                         camera_transitions,
                         screen_transitions,
+                        climb_limiter_snapshot,
+                        dwell_samples,
                     );
                 }
             }
@@ -1201,17 +1219,16 @@ impl Inner {
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0).
         // Also skip creating peers when media decoding is disabled (observer mode): there
         // is no point spinning up decoder workers for packets that will be dropped anyway.
-        let peer_status =
-            if response.user_id == SYSTEM_USER_ID.as_bytes()
-                || response.session_id == 0
-                || !self.options.decode_media
-            {
-                PeerStatus::NoChange
-            } else {
-                let peer_user_id = String::from_utf8_lossy(&response.user_id);
-                self.peer_decode_manager
-                    .ensure_peer(response.session_id, &peer_user_id)
-            };
+        let peer_status = if response.user_id == SYSTEM_USER_ID.as_bytes()
+            || response.session_id == 0
+            || !self.options.decode_media
+        {
+            PeerStatus::NoChange
+        } else {
+            let peer_user_id = String::from_utf8_lossy(&response.user_id);
+            self.peer_decode_manager
+                .ensure_peer(response.session_id, &peer_user_id)
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 // Observer/lobby clients must not receive encryption keys (defense-in-depth).

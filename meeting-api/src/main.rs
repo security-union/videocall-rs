@@ -98,6 +98,9 @@ async fn main() {
             http::header::AUTHORIZATION,
             http::header::COOKIE,
             http::header::ACCEPT,
+            // Console log upload custom headers
+            http::HeaderName::from_static("x-user-id"),
+            http::HeaderName::from_static("x-session-timestamp"),
         ])
         .allow_credentials(true);
 

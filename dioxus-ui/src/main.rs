@@ -3,6 +3,7 @@
 mod auth;
 #[allow(non_camel_case_types)]
 mod components;
+mod console_log_collector;
 mod constants;
 mod context;
 mod id_token;

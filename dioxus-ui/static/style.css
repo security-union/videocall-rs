@@ -1511,6 +1511,61 @@ select {
 }
 
 /* ============================================================
+   Connection Quality Indicator (self-view RTT warning)
+   ============================================================ */
+
+.connection-quality-indicator {
+  position: absolute;
+  top: 8px;
+  right: 28px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px 3px 4px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 12px;
+  z-index: 5;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+  pointer-events: none;
+}
+
+.connection-quality-indicator.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.connection-quality-indicator.exiting {
+  transition-duration: 0.5s;
+}
+
+.connection-quality-indicator svg {
+  width: 16px;
+  height: 16px;
+}
+
+.connection-quality-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.9);
+  white-space: nowrap;
+  line-height: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .connection-quality-indicator,
+  .connection-quality-indicator.exiting {
+    transition: none;
+  }
+}
+
+@media (max-width: 37.5em) {
+  .connection-quality-label { display: none; }
+  .connection-quality-indicator svg { width: 14px; height: 14px; }
+}
+
+/* ============================================================
    Meetings List Component
    ============================================================ */
 

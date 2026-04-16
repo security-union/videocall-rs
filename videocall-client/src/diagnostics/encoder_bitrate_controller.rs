@@ -95,14 +95,26 @@ impl DiagnosticPacketWindow {
         None
     }
 
-    /// Get the minimum FPS received within the window
-    pub fn min_fps(&self) -> Option<f64> {
+    /// Get the average FPS received within the window.
+    ///
+    /// Uses average instead of minimum so that a single bad 1-second sample
+    /// does not poison the entire 10-second window. Average smooths transient
+    /// spikes while still reflecting sustained problems.
+    ///
+    /// **Reaction latency tradeoff:** averaging over a 10-second window means
+    /// that a sudden FPS collapse only fully registers after ~5–6 seconds
+    /// (half the window must be filled with bad samples before the average
+    /// crosses the degradation threshold). Combined with `STEP_DOWN_REACTION_TIME_MS`
+    /// (1.5s), worst-case time-to-step-down is ~7s. This is intentional: the
+    /// extra latency prevents tier oscillation on networks with short packet-loss
+    /// bursts, at the cost of slower response to genuine sustained degradation.
+    pub fn avg_fps(&self) -> Option<f64> {
         if self.packets.is_empty() {
             return None;
         }
 
-        let mut min_fps = f64::INFINITY;
-        let mut found_fps = false;
+        let mut sum_fps = 0.0;
+        let mut count = 0u32;
 
         for (_, packet) in &self.packets {
             let fps = match packet.media_type.enum_value_or_default() {
@@ -113,13 +125,13 @@ impl DiagnosticPacketWindow {
             };
 
             if let Some(fps) = fps {
-                min_fps = min_fps.min(fps);
-                found_fps = true;
+                sum_fps += fps;
+                count += 1;
             }
         }
 
-        if found_fps {
-            Some(min_fps)
+        if count > 0 {
+            Some(sum_fps / count as f64)
         } else {
             None
         }
@@ -188,25 +200,53 @@ impl DiagnosticPackets {
         });
     }
 
-    /// Get the peer with the lowest FPS
-    pub fn get_worst_fps_peer(&self) -> Option<(String, f64)> {
+    /// Get the p75 FPS across all reporting peers.
+    ///
+    /// Collects each peer's average FPS (within their diagnostic window), sorts
+    /// them, and returns the 75th percentile value together with the number of
+    /// peers that actually contributed FPS data ("effective count"). With 5
+    /// peers, the bottom ~25% (outliers with unusually low FPS) have minimal
+    /// influence on the result, preventing a single bad receiver from tanking
+    /// sender quality.
+    ///
+    /// The effective count may be less than `peer_windows.len()` when some peers
+    /// have no usable FPS data (e.g., they joined but haven't produced video
+    /// metrics yet). Callers should use this effective count — not the raw
+    /// window count — for threshold selection so that the lenient/strict
+    /// boundary stays consistent with the actual data feeding the p75.
+    ///
+    /// **Small-n behavior:** at n=3 the 0.75 quantile collapses to the median
+    /// (index `floor(2 * 0.75)` = 1 out of \[0,1,2\]). For 1–2 peers the method
+    /// falls back to the minimum. The adaptive quality manager compensates by
+    /// using `VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT` (0.30 vs 0.50) when
+    /// `effective_peer_count < 3`, so the two pieces form a balanced pair.
+    pub fn get_p75_fps(&self) -> Option<(f64, usize)> {
         if self.peer_windows.is_empty() {
             return None;
         }
 
-        let mut worst_peer = None;
-        let mut min_fps = f64::INFINITY;
+        let mut fps_values: Vec<f64> = self
+            .peer_windows
+            .values()
+            .filter_map(|window| window.avg_fps())
+            .filter(|v| v.is_finite())
+            .collect();
 
-        for (peer_id, window) in &self.peer_windows {
-            if let Some(fps) = window.min_fps() {
-                if fps < min_fps {
-                    min_fps = fps;
-                    worst_peer = Some((peer_id.clone(), fps));
-                }
-            }
+        if fps_values.is_empty() {
+            return None;
         }
 
-        worst_peer
+        let n = fps_values.len();
+        if n <= 2 {
+            // For 1-2 peers, return the minimum (conservative fallback).
+            // Lenient threshold in update_video_tier() compensates for this conservatism.
+            return fps_values.iter().copied().reduce(f64::min).map(|v| (v, n));
+        }
+
+        // Sort ascending and pick the 75th percentile.
+        fps_values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p75_index = ((n - 1) as f64 * 0.75).floor() as usize;
+        Some((fps_values[p75_index], n))
     }
 
     /// Get all active peer IDs
@@ -239,6 +279,7 @@ pub struct EncoderBitrateController {
     /// Last computed fps_ratio for external observation.
     last_fps_ratio: f64,
     /// Last worst-peer FPS for external observation.
+    /// TODO(PR-G): rename to `last_p75_fps`; update proto field, Prometheus metric, and Grafana panel.
     last_worst_peer_fps: f64,
     /// Last computed bitrate_ratio for external observation.
     last_bitrate_ratio: f64,
@@ -352,11 +393,12 @@ impl EncoderBitrateController {
             return None; // Too soon since last correction, don't emit a new one
         }
 
-        // Get the worst performing peer's FPS
-        let worst_fps = match self.diagnostic_packets.get_worst_fps_peer() {
-            Some((_, fps)) => fps,
-            None => return None,
-        };
+        // Get the p75 FPS across all reporting peers.
+        // Semantically this is now the p75 aggregate, but the field name is kept
+        // as `last_worst_peer_fps` for proto/metric compatibility (rename in PR-G).
+        // effective_peer_count is the number of peers that contributed FPS data,
+        // which may be less than peer_windows.len() (some peers may lack metrics).
+        let (worst_fps, effective_peer_count) = self.diagnostic_packets.get_p75_fps()?;
         self.last_worst_peer_fps = worst_fps;
 
         let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
@@ -446,6 +488,9 @@ impl EncoderBitrateController {
 
         // --- Adaptive quality manager: tier selection ---
         // Feed the same signals to the quality manager for tier transitions.
+        // Use effective_peer_count (peers with FPS data) rather than
+        // peer_windows.len() so the lenient/strict threshold stays consistent
+        // with the actual peers feeding the p75 aggregation.
         let tier = self.quality_manager.current_video_tier();
         let ideal_for_tier = tier.ideal_bitrate_kbps as f64;
         let tier_changed = self.quality_manager.update(
@@ -454,6 +499,7 @@ impl EncoderBitrateController {
             final_bitrate,
             ideal_for_tier,
             now,
+            effective_peer_count,
         );
         if tier_changed {
             self.tier_changed = true;
@@ -578,6 +624,32 @@ impl EncoderBitrateController {
     /// Drain tier transition records from the quality manager.
     pub fn drain_tier_transitions(&mut self) -> Vec<TierTransitionRecord> {
         self.quality_manager.drain_transitions()
+    }
+
+    /// Notify the quality manager that a server re-election completed.
+    /// Suppresses crash ceiling arming for `REELECTION_CEILING_SUPPRESSION_MS`.
+    ///
+    /// Wired through: ConnectionManager → shared AtomicBool signal → CameraEncoder
+    /// control loop (checks/clears each tick) → this method.
+    pub fn notify_reelection_completed(&mut self) {
+        let now = Date::now();
+        self.quality_manager.notify_reelection_completed(now);
+    }
+
+    /// Return the current crash ceiling state, if active.
+    /// `(ceiling_index, tier_label, current_decay_ms)`
+    pub fn crash_ceiling_info(&self) -> Option<(usize, &'static str, f64)> {
+        self.quality_manager.crash_ceiling_info()
+    }
+
+    /// Return step-up blocked counters: `(ceiling, slowdown, screen_share)`.
+    pub fn step_up_blocked_counts(&self) -> (u64, u64, u64) {
+        self.quality_manager.step_up_blocked_counts()
+    }
+
+    /// Drain accumulated dwell time samples: `Vec<(tier_label, dwell_ms)>`.
+    pub fn drain_dwell_samples(&mut self) -> Vec<(&'static str, f64)> {
+        self.quality_manager.drain_dwell_samples()
     }
 }
 
@@ -715,8 +787,9 @@ mod tests {
         assert!(controller.peer_ids().contains(&"peer2".to_string()));
         assert!(controller.peer_ids().contains(&"peer3".to_string()));
 
-        // The controller should adjust bitrate based on the worst peer (peer3)
-        // Process one more packet to check the behavior
+        // With p75 aggregation, a single poor peer (peer3 at 5fps) should NOT
+        // tank the bitrate when 3 out of 4 peers are doing fine.
+        // Peers: [5, 20, 30, 30] -> p75_index = floor(3*0.75) = 2 -> p75 = 30.
         let result4 = controller.process_diagnostics_packet_with_time(
             create_test_packet("test_sender", "test_target", 30.0, 500),
             base_time + 3300.0,
@@ -724,12 +797,12 @@ mod tests {
 
         assert!(result4.is_some(), "Fourth packet should return a bitrate");
 
-        // With one very poor peer, the bitrate should be significantly reduced
+        // With p75 filtering, the single poor peer is treated as an outlier.
+        // The bitrate should remain reasonable (not aggressively reduced).
         if let Some(bitrate) = result4 {
-            // Should be much lower than ideal due to the poor peer
             assert!(
-                bitrate < ideal_bitrate_kbps as f64 * 0.7, // 70% of ideal or less
-                "Expected reduced bitrate due to poor peer, got {bitrate} bps (ideal: {ideal_bitrate_kbps} bps)"
+                bitrate > ideal_bitrate_kbps as f64 * 0.5,
+                "Expected bitrate to remain reasonable with p75 filtering, got {bitrate} kbps (ideal: {ideal_bitrate_kbps} kbps)"
             );
         }
     }
@@ -824,8 +897,8 @@ mod tests {
         assert_eq!(window.len(), 3);
         assert_eq!(window.latest_timestamp(), Some(base_time + 2000.0));
 
-        // Check min FPS (should be 20.0)
-        assert_eq!(window.min_fps(), Some(20.0));
+        // Check avg FPS: (30 + 25 + 20) / 3 = 25.0
+        assert_eq!(window.avg_fps(), Some(25.0));
 
         // Force cleanup with timestamp that should only be outside the window for the first packet
         window.cleanup(base_time + 10500.0);
@@ -838,7 +911,7 @@ mod tests {
 
         // All packets should be removed
         assert_eq!(window.len(), 0);
-        assert_eq!(window.min_fps(), None);
+        assert_eq!(window.avg_fps(), None);
     }
 
     #[wasm_bindgen_test]
@@ -1070,7 +1143,7 @@ mod tests {
             }
         }
         assert!(
-            degraded_bitrate < ideal_bitrate_kbps as f64 * 0.5,
+            degraded_bitrate < ideal_bitrate_kbps as f64 * 0.7,
             "Sustained poor FPS should significantly reduce bitrate, got {degraded_bitrate}"
         );
 
@@ -1147,10 +1220,14 @@ mod tests {
                 bitrate_at_60_target = b;
             }
         }
-        // FPS (15) is far below new target (60) — bitrate should decrease significantly
+        // FPS (15) is far below new target (60) — bitrate should decrease significantly.
+        // The PID drives bitrate toward zero, but tier-clamped output floors at the
+        // current tier's min_bitrate_kbps. Verify we hit that floor.
+        let tier_min = controller.current_video_tier().min_bitrate_kbps as f64;
         assert!(
-            bitrate_at_60_target < ideal_bitrate_kbps as f64 * 0.5,
-            "Bitrate should drop when FPS is far below new target, got {bitrate_at_60_target}"
+            bitrate_at_60_target <= tier_min + 50.0,
+            "Bitrate should drop to near tier minimum when FPS is far below target, \
+             got {bitrate_at_60_target} (tier min: {tier_min})"
         );
     }
 
@@ -1389,7 +1466,12 @@ mod tests {
 
         // Feed good conditions — the camera should eventually step up past the
         // old ceiling, proving the ceiling was actually removed.
-        let base = 10000.0;
+        //
+        // Use Date::now() as the base so timestamps are consistent with the
+        // quality manager's Date::now()-based created_at_ms and
+        // last_transition_time_ms. The +10_000 offset ensures warmup (5s) and
+        // min-transition-interval (3s) are both satisfied from the start.
+        let base = Date::now() + 10_000.0;
         for i in 0..15 {
             let t = base + (i as f64 * 1100.0);
             let packet = create_test_packet("s", "peer1", 29.0, 1400);
@@ -1439,6 +1521,219 @@ mod tests {
         assert!(
             !controller.take_tier_changed(),
             "tier_changed should NOT be set on redundant activation"
+        );
+    }
+
+    // =====================================================================
+    // P75 aggregation and avg_fps tests
+    // =====================================================================
+
+    #[wasm_bindgen_test]
+    fn test_avg_fps_window() {
+        let mut window = DiagnosticPacketWindow::new(10);
+        let base_time = 1000.0;
+
+        // Add packets at 30, 5, 25 fps
+        window.add_packet(base_time, create_test_packet("s", "p", 30.0, 500));
+        window.add_packet(base_time + 1000.0, create_test_packet("s", "p", 5.0, 500));
+        window.add_packet(base_time + 2000.0, create_test_packet("s", "p", 25.0, 500));
+
+        // avg should be (30 + 5 + 25) / 3 = 20.0, not 5.0 (the minimum)
+        let avg = window.avg_fps().unwrap();
+        assert!(
+            (avg - 20.0).abs() < 0.001,
+            "avg_fps should be 20.0, got {avg}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_p75_aggregation_filters_outlier() {
+        // 5 peers: 4 at 28fps, 1 at 0fps. The p75 should be ~28, not 0.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        // Add good peers
+        for i in 0..4 {
+            let target_id = format!("good_peer_{i}");
+            let packet = create_test_packet("sender", &target_id, 28.0, 500);
+            packets.process_packet(packet, base + (i as f64 * 100.0));
+        }
+        // Add bad peer
+        let bad_packet = create_test_packet("sender", "bad_peer", 0.0, 500);
+        packets.process_packet(bad_packet, base + 400.0);
+
+        assert_eq!(packets.peer_count(), 5);
+
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 5);
+        // With 5 values [0, 28, 28, 28, 28] sorted ascending,
+        // p75_index = floor(4 * 0.75) = 3, so p75 = 28.0
+        assert!(
+            (p75 - 28.0).abs() < 0.001,
+            "p75 should be ~28.0 (filtering outlier), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_p75_aggregation_with_widespread_degradation() {
+        // 5 peers: 4 at 5fps, 1 at 28fps. The p75 should be ~5.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        for i in 0..4 {
+            let target_id = format!("slow_peer_{i}");
+            let packet = create_test_packet("sender", &target_id, 5.0, 500);
+            packets.process_packet(packet, base + (i as f64 * 100.0));
+        }
+        let good_packet = create_test_packet("sender", "good_peer", 28.0, 500);
+        packets.process_packet(good_packet, base + 400.0);
+
+        assert_eq!(packets.peer_count(), 5);
+
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 5);
+        // With 5 values [5, 5, 5, 5, 28] sorted ascending,
+        // p75_index = floor(4 * 0.75) = 3, so p75 = 5.0
+        assert!(
+            (p75 - 5.0).abs() < 0.001,
+            "p75 should be ~5.0 (widespread degradation), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_single_peer_p75_returns_that_peer() {
+        // With 1 peer, get_p75_fps should return that peer's avg_fps directly.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        let packet = create_test_packet("sender", "peer1", 12.0, 500);
+        packets.process_packet(packet, base);
+
+        assert_eq!(packets.peer_count(), 1);
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 1);
+        assert!(
+            (p75 - 12.0).abs() < 0.001,
+            "Single peer p75 should be that peer's fps, got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_two_peers_p75_returns_minimum() {
+        // With 2 peers, get_p75_fps should return the minimum of the two.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        let packet1 = create_test_packet("sender", "peer1", 12.0, 500);
+        packets.process_packet(packet1, base);
+        let packet2 = create_test_packet("sender", "peer2", 28.0, 500);
+        packets.process_packet(packet2, base + 100.0);
+
+        assert_eq!(packets.peer_count(), 2);
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 2);
+        assert!(
+            (p75 - 12.0).abs() < 0.001,
+            "Two-peer p75 should be the minimum (12.0), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_three_peers_p75_filters_outlier() {
+        // With 3 peers, p75 kicks in (no longer minimum fallback).
+        // Sorted: [5, 25, 30] -> p75_index = floor(2 * 0.75) = 1 -> value = 25.
+        // The outlier at 5 fps does NOT dominate.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        packets.process_packet(create_test_packet("sender", "peer1", 30.0, 500), base);
+        packets.process_packet(
+            create_test_packet("sender", "peer2", 5.0, 500),
+            base + 100.0,
+        );
+        packets.process_packet(
+            create_test_packet("sender", "peer3", 25.0, 500),
+            base + 200.0,
+        );
+
+        assert_eq!(packets.peer_count(), 3);
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 3);
+        assert!(
+            (p75 - 25.0).abs() < 0.001,
+            "Three-peer p75 should be 25.0 (index 1 of [5,25,30]), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_p75_effective_count_excludes_non_fps_peers() {
+        // 3 registered peers, but one has no usable FPS (media_type=VIDEO,
+        // video_metrics=None — simulates a peer that just joined and hasn't
+        // produced video yet). effective_n should be 2, not 3, so the lenient
+        // threshold applies.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        // Two peers with valid FPS
+        packets.process_packet(create_test_packet("sender", "peer1", 28.0, 500), base);
+        packets.process_packet(
+            create_test_packet("sender", "peer2", 25.0, 500),
+            base + 100.0,
+        );
+
+        // Third peer: media_type=VIDEO but video_metrics=None -> avg_fps()=None
+        let mut no_fps_packet = DiagnosticsPacket::new();
+        no_fps_packet.sender_id = "sender".to_string();
+        no_fps_packet.target_id = "peer_no_fps".to_string();
+        no_fps_packet.media_type = MediaType::VIDEO.into();
+        // Intentionally do NOT set video_metrics — it stays None.
+        packets.process_packet(no_fps_packet, base + 200.0);
+
+        // All 3 peers are registered in the window map
+        assert_eq!(packets.peer_count(), 3);
+
+        // But only 2 contributed FPS data
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(
+            effective_n, 2,
+            "effective_n should be 2 (peer_no_fps has no FPS data), got {effective_n}"
+        );
+        // With 2 peers, p75 degenerates to min([25, 28]) = 25
+        assert!(
+            (p75 - 25.0).abs() < 0.001,
+            "p75 should be 25.0 (min of 2 effective peers), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_pid_converges_near_target_fps() {
+        // Feed p75 = 28 fps (very close to target 30) for ~30 iterations.
+        // The PID should converge near ideal_bitrate (500 kbps) since there
+        // is very little error. This proves the PID is stable with the p75 signal.
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = 500u32;
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
+
+        // Use base_time far in the past so the warmup guard and tier transition
+        // timers in the adaptive quality manager are safely exceeded.
+        let base_time = 1000.0;
+
+        let mut final_bitrate = ideal_bitrate_kbps as f64;
+        for i in 0..30 {
+            let result = controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 28.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+            if let Some(b) = result {
+                final_bitrate = b;
+            }
+        }
+
+        // Final bitrate should be within 10% of ideal (450-550 range).
+        assert!(
+            (450.0..=550.0).contains(&final_bitrate),
+            "PID should converge near ideal_bitrate ({ideal_bitrate_kbps}) with p75=28, \
+             got {final_bitrate}"
         );
     }
 }

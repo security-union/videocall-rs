@@ -1,0 +1,36 @@
+# Bot configuration template
+#
+# Copy this file to config-<name>.yaml and fill in your values:
+#   cp config.yaml.template config-myenv.yaml
+#
+# Generate conversation assets first:
+#   python3 generate-conversation-edge.py
+#
+# Usage:
+#   bot --config config-myenv.yaml --users 5
+
+# Transport: "websocket" or "webtransport"
+transport: "websocket"
+
+# Server URL
+#   WebSocket:     wss://websocket.example.com  (or https:// — auto-converted to wss://)
+#   WebTransport:  https://webtransport.example.com:443
+server_url: "wss://websocket.example.com"
+
+# Meeting ID to join
+meeting_id: "1"
+
+# Path to conversation directory (contains manifest.yaml + lines/*.wav)
+conversation_dir: "conversation"
+
+# Delay between starting each client (ms)
+ramp_up_delay_ms: 500
+
+# JWT secret for authentication (or set JWT_SECRET env var)
+# jwt_secret: "your-base64-secret-here"
+
+# Token TTL in seconds (default: 86400 = 24h)
+# token_ttl_secs: 86400
+
+# Skip TLS certificate verification (WebTransport only)
+# insecure: true

@@ -11,7 +11,10 @@
  * at your option.
  */
 
-use crate::auth::{check_session, get_user_profile, handle_not_authenticated, logout, UserProfile};
+use crate::auth::{
+    check_session, get_user_profile, handle_not_authenticated, logout, redirect_not_authenticated,
+    UserProfile,
+};
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
@@ -21,7 +24,7 @@ use crate::context::{
     get_or_create_local_user_id, load_display_name_from_storage, resolve_transport_config,
     save_display_name_to_storage, validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
 };
-use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
+use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -83,10 +86,15 @@ pub fn MeetingPage(id: String) -> Element {
             if oauth_enabled().unwrap_or(false) {
                 let id_for_auth = id_for_auth.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match check_session().await {
+                    let (session_result, guest_info_result) =
+                        futures::join!(check_session(), get_meeting_guest_info(&id_for_auth),);
+                    match session_result {
                         Ok(_) => auth_checked.set(true),
                         Err(_) => {
-                            handle_not_authenticated(&id_for_auth).await;
+                            let allow_guests = guest_info_result
+                                .map(|info| info.allow_guests)
+                                .unwrap_or(false);
+                            redirect_not_authenticated(&id_for_auth, allow_guests);
                         }
                     }
                 });

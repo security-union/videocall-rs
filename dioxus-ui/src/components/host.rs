@@ -18,9 +18,7 @@
 
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::constants::*;
-use crate::context::{
-    TransportPreferenceCtx, VideoCallClientCtx,
-};
+use crate::context::{TransportPreferenceCtx, VideoCallClientCtx};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use futures::channel::mpsc;

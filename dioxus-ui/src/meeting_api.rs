@@ -41,13 +41,9 @@ pub async fn check_guest_status(
     meeting_id: &str,
     observer_token: &str,
 ) -> Result<JoinMeetingResponse, JoinError> {
-    let base_url = crate::constants::meeting_api_base_url().map_err(JoinError::Config)?;
-    videocall_meeting_client::MeetingApiClient::new(
-        &base_url,
-        videocall_meeting_client::AuthMode::Bearer(observer_token.to_string()),
-    )
-    .get_guest_status(meeting_id)
-    .await
+    make_guest_client(observer_token)?
+        .get_guest_status(meeting_id)
+        .await
 }
 
 /// Fetch the participant's current status using the appropriate auth mode.

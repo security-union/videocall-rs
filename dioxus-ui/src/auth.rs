@@ -503,6 +503,12 @@ pub async fn handle_not_authenticated(meeting_id: &str) {
         .await
         .map(|info| info.allow_guests)
         .unwrap_or(false);
+    redirect_not_authenticated(meeting_id, allow_guests);
+}
+
+/// Redirect based on a pre-fetched `allow_guests` value (no extra network
+/// call). Use this when guest info has already been fetched concurrently.
+pub fn redirect_not_authenticated(meeting_id: &str, allow_guests: bool) {
     if allow_guests {
         redirect_to_guest(meeting_id);
     } else {

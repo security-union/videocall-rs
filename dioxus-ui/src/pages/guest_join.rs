@@ -168,7 +168,6 @@ pub fn GuestJoinPage(id: String) -> Element {
                                             let obs_token =
                                                 response.observer_token.unwrap_or_default();
                                             came_from_waiting_room.set(true);
-                                            observer_token_signal.set(Some(obs_token.clone()));
                                             guest_status.set(GuestStatus::Waiting {
                                                 observer_token: obs_token,
                                             });
@@ -260,7 +259,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                             }
                             "waiting" => {
                                 let obs_token = response.observer_token.unwrap_or_default();
-                                observer_token_signal.set(Some(obs_token.clone()));
+                                observer_token_signal.set(None);
                                 came_from_waiting_room.set(true);
                                 guest_status.set(GuestStatus::Waiting {
                                     observer_token: obs_token,

@@ -61,6 +61,12 @@ pub struct RoomAccessTokenClaims {
     #[serde(default)]
     pub observer: bool,
 
+    /// Whether the meeting ends for all participants when the host leaves.
+    /// Defaults to `true` for backward compatibility with older tokens that
+    /// lack this claim.
+    #[serde(default = "default_true")]
+    pub end_on_host_leave: bool,
+
     /// Expiration timestamp (Unix seconds).
     /// Token is rejected after this time.
     pub exp: i64,
@@ -72,4 +78,8 @@ pub struct RoomAccessTokenClaims {
 impl RoomAccessTokenClaims {
     /// The expected issuer value for tokens produced by the Meeting Backend.
     pub const ISSUER: &'static str = "videocall-meeting-backend";
+}
+
+fn default_true() -> bool {
+    true
 }

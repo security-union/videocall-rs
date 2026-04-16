@@ -200,6 +200,10 @@ pub struct SessionLogic {
     pub instance_id: Option<String>,
     /// Transport type for this session ("websocket" or "webtransport")
     pub transport: String,
+    /// Whether this participant is the meeting host.
+    pub is_host: bool,
+    /// Whether the meeting should end when the host leaves.
+    pub end_on_host_leave: bool,
     /// Tracks outbound packet drops per sender to generate CONGESTION feedback.
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
@@ -220,11 +224,13 @@ impl SessionLogic {
         observer: bool,
         instance_id: Option<String>,
         transport: &str,
+        is_host: bool,
+        end_on_host_leave: bool,
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
-            "new session: room={} user_id={} display_name={} session_id={} observer={} transport={}",
-            room, user_id, display_name, id, observer, transport
+            "new session: room={} user_id={} display_name={} session_id={} observer={} is_host={} transport={}",
+            room, user_id, display_name, id, observer, is_host, transport
         );
 
         SessionLogic {
@@ -239,6 +245,8 @@ impl SessionLogic {
             observer,
             instance_id,
             transport: transport.to_string(),
+            is_host,
+            end_on_host_leave,
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
         }
@@ -297,6 +305,8 @@ impl SessionLogic {
             display_name: self.display_name.clone(),
             observer: self.observer,
             instance_id: self.instance_id.clone(),
+            is_host: self.is_host,
+            end_on_host_leave: self.end_on_host_leave,
         }
     }
 
@@ -347,6 +357,8 @@ impl SessionLogic {
             user_id: self.user_id.clone(),
             display_name: self.display_name.clone(),
             observer: self.observer,
+            is_host: self.is_host,
+            end_on_host_leave: self.end_on_host_leave,
         });
     }
 

@@ -97,6 +97,10 @@ impl AppError {
         Self::new(StatusCode::NOT_FOUND, APIError::not_in_meeting())
     }
 
+    pub fn joining_not_allowed() -> Self {
+        Self::new(StatusCode::FORBIDDEN, APIError::joining_not_allowed())
+    }
+
     pub fn internal(detail: &str) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

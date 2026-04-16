@@ -120,6 +120,8 @@ impl WtChatSession {
         session_manager: SessionManager,
         observer: bool,
         instance_id: Option<String>,
+        is_host: bool,
+        end_on_host_leave: bool,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -132,6 +134,8 @@ impl WtChatSession {
             observer,
             instance_id,
             "webtransport",
+            is_host,
+            end_on_host_leave,
         );
 
         WtChatSession {

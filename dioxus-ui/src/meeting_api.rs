@@ -41,10 +41,12 @@ pub async fn update_meeting(
     meeting_id: &str,
     waiting_room_enabled: bool,
     admitted_can_admit: Option<bool>,
+    end_on_host_leave: Option<bool>,
 ) -> Result<MeetingInfo, JoinError> {
     let req = videocall_meeting_types::requests::UpdateMeetingRequest {
         waiting_room_enabled: Some(waiting_room_enabled),
         admitted_can_admit,
+        end_on_host_leave,
     };
     client()?.update_meeting(meeting_id, &req).await
 }

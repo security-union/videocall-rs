@@ -48,6 +48,10 @@ pub struct JoinRoom {
     /// survives reconnects. When present, the server uses it to find and evict
     /// the stale session from a previous connection by the same client instance.
     pub instance_id: Option<String>,
+    /// Whether this participant is the meeting host.
+    pub is_host: bool,
+    /// Whether the meeting should end when the host leaves.
+    pub end_on_host_leave: bool,
 }
 
 #[derive(ActixMessage)]
@@ -75,6 +79,10 @@ pub struct Disconnect {
     /// When true, the disconnecting session is an observer (waiting room)
     /// and should NOT trigger PARTICIPANT_LEFT notifications.
     pub observer: bool,
+    /// Whether this participant is the meeting host.
+    pub is_host: bool,
+    /// Whether the meeting should end when the host leaves.
+    pub end_on_host_leave: bool,
 }
 
 #[derive(ActixMessage)]

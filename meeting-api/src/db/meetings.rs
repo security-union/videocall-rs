@@ -35,6 +35,7 @@ pub struct MeetingRow {
     pub host_display_name: Option<String>,
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
+    pub end_on_host_leave: bool,
 }
 
 /// Create a new meeting. Uses INSERT ... ON CONFLICT to handle the partial unique index.
@@ -53,6 +54,7 @@ pub async fn create(
         attendees,
         true,
         false,
+        true,
     )
     .await
 }
@@ -66,14 +68,15 @@ pub async fn create_with_options(
     attendees: &JsonValue,
     waiting_room_enabled: bool,
     admitted_can_admit: bool,
+    end_on_host_leave: bool,
 ) -> Result<MeetingRow, sqlx::Error> {
     sqlx::query_as::<_, MeetingRow>(
         r#"
-        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, admitted_can_admit)
-        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5, $6)
+        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, admitted_can_admit, end_on_host_leave)
+        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5, $6, $7)
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave
         "#,
     )
     .bind(room_id)
@@ -82,6 +85,7 @@ pub async fn create_with_options(
     .bind(attendees)
     .bind(waiting_room_enabled)
     .bind(admitted_can_admit)
+    .bind(end_on_host_leave)
     .fetch_one(pool)
     .await
 }
@@ -95,7 +99,7 @@ pub async fn get_by_room_id(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
                deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled, admitted_can_admit
+               waiting_room_enabled, admitted_can_admit, end_on_host_leave
         FROM meetings
         WHERE room_id = $1 AND deleted_at IS NULL
         "#,
@@ -116,7 +120,7 @@ pub async fn list_by_owner(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
                deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled, admitted_can_admit
+               waiting_room_enabled, admitted_can_admit, end_on_host_leave
         FROM meetings
         WHERE deleted_at IS NULL AND creator_id = $1
         ORDER BY created_at DESC
@@ -154,7 +158,7 @@ pub async fn soft_delete(
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave
         "#,
     )
     .bind(room_id)
@@ -213,7 +217,7 @@ pub async fn update_waiting_room_enabled(
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave
         "#,
     )
     .bind(room_id)
@@ -253,7 +257,7 @@ pub async fn update_admitted_can_admit(
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave
         "#,
     )
     .bind(room_id)
@@ -276,6 +280,7 @@ pub async fn update_meeting_settings(
     creator_id: &str,
     waiting_room_enabled: Option<bool>,
     admitted_can_admit: Option<bool>,
+    end_on_host_leave: Option<bool>,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let mut result: Option<MeetingRow> = None;
@@ -288,7 +293,7 @@ pub async fn update_meeting_settings(
             WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
             RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                       deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                      waiting_room_enabled, admitted_can_admit
+                      waiting_room_enabled, admitted_can_admit, end_on_host_leave
             "#,
         )
         .bind(room_id)
@@ -323,12 +328,36 @@ pub async fn update_meeting_settings(
             WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
             RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                       deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                      waiting_room_enabled, admitted_can_admit
+                      waiting_room_enabled, admitted_can_admit, end_on_host_leave
             "#,
         )
         .bind(room_id)
         .bind(creator_id)
         .bind(aca)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if updated.is_none() {
+            return Ok(None);
+        }
+
+        result = updated;
+    }
+
+    if let Some(eohl) = end_on_host_leave {
+        let updated = sqlx::query_as::<_, MeetingRow>(
+            r#"
+            UPDATE meetings
+            SET end_on_host_leave = $3
+            WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
+                      deleted_at, creator_id, password_hash, state, attendees, host_display_name,
+                      waiting_room_enabled, admitted_can_admit, end_on_host_leave
+            "#,
+        )
+        .bind(room_id)
+        .bind(creator_id)
+        .bind(eohl)
         .fetch_optional(&mut *tx)
         .await?;
 

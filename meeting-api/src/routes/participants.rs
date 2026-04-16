@@ -76,11 +76,13 @@ pub async fn join_meeting(
             &meeting_id,
             true,
             display_name.unwrap_or(&user_id),
+            meeting.end_on_host_leave,
         )?;
 
         let mut resp = row.into_participant_status(Some(token));
         resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
         resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+        resp.end_on_host_leave = Some(meeting.end_on_host_leave);
         resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
@@ -104,6 +106,7 @@ pub async fn join_meeting(
                         &meeting_id,
                         false,
                         display_name.unwrap_or(&user_id),
+                        meeting.end_on_host_leave,
                     )?)
                 } else {
                     None
@@ -122,6 +125,7 @@ pub async fn join_meeting(
                 }
                 resp.waiting_room_enabled = Some(wr_enabled);
                 resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+                resp.end_on_host_leave = Some(meeting.end_on_host_leave);
                 resp.host_display_name = meeting.host_display_name;
                 resp.host_user_id = meeting.creator_id;
                 return Ok(Json(APIResponse::ok(resp)));
@@ -143,6 +147,7 @@ pub async fn join_meeting(
                     observer_token: Some(observer),
                     waiting_room_enabled: Some(meeting.waiting_room_enabled),
                     admitted_can_admit: Some(meeting.admitted_can_admit),
+                    end_on_host_leave: Some(meeting.end_on_host_leave),
                     host_display_name: meeting.host_display_name,
                     host_user_id: meeting.creator_id,
                 };
@@ -150,11 +155,23 @@ pub async fn join_meeting(
             }
         }
 
+        // If the host left with end_on_host_leave=false and admitted_can_admit=false,
+        // no one can admit new participants — block the join attempt.
+        if !meeting.end_on_host_leave && !meeting.admitted_can_admit {
+            if let Some(ref creator_id) = meeting.creator_id.clone() {
+                let host_status =
+                    db_participants::get_status(&state.db, meeting.id, creator_id).await?;
+                let host_is_gone = host_status.map(|p| p.status != "admitted").unwrap_or(true);
+                if host_is_gone {
+                    return Err(AppError::joining_not_allowed());
+                }
+            }
+        }
+
         // Atomically check waiting_room_enabled and insert participant in one
         // transaction, using FOR UPDATE to serialize against concurrent toggles.
         let (auto_admitted, row, wr_enabled) =
-            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name)
-            .await?;
+            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name).await?;
 
         let token = if auto_admitted {
             Some(generate_room_token(
@@ -164,6 +181,7 @@ pub async fn join_meeting(
                 &meeting_id,
                 false,
                 display_name.unwrap_or(&user_id),
+                meeting.end_on_host_leave,
             )?)
         } else {
             None
@@ -185,6 +203,7 @@ pub async fn join_meeting(
         }
         resp.waiting_room_enabled = Some(wr_enabled);
         resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+        resp.end_on_host_leave = Some(meeting.end_on_host_leave);
         resp.host_display_name = meeting.host_display_name;
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
@@ -220,6 +239,7 @@ pub async fn get_my_status(
             &meeting_id,
             row.is_host,
             row.display_name.as_deref().unwrap_or(&user_id),
+            meeting.end_on_host_leave,
         )?)
     } else {
         None
@@ -228,6 +248,7 @@ pub async fn get_my_status(
     let mut resp = row.into_participant_status(token);
     resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
     resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+    resp.end_on_host_leave = Some(meeting.end_on_host_leave);
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -247,9 +268,10 @@ pub async fn leave_meeting(
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 
-    // If host left or no admitted participants remain, end the meeting.
+    // End the meeting when the host leaves only if end_on_host_leave is set,
+    // otherwise continue until the last participant leaves.
     let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
-    if is_host {
+    if is_host && meeting.end_on_host_leave {
         db_meetings::end_meeting(&state.db, meeting.id).await?;
     } else {
         let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;

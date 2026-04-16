@@ -34,6 +34,10 @@ pub enum ApiError {
     #[error("Meeting is not active. The host must join first.")]
     MeetingNotActive,
 
+    /// The host has left and joining is no longer allowed (HTTP 403, code JOINING_NOT_ALLOWED).
+    #[error("The host has left and no one can admit new participants. New participants cannot join this meeting.")]
+    JoiningNotAllowed,
+
     /// A server error with status code and body.
     #[error("Server error ({status}): {body}")]
     ServerError { status: u16, body: String },

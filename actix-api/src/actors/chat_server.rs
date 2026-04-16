@@ -54,6 +54,8 @@ struct ExecutePendingDeparture {
     room: String,
     user_id: String,
     display_name: String,
+    is_host: bool,
+    end_on_host_leave: bool,
 }
 
 /// NATS subject for cross-server stale session eviction.
@@ -76,6 +78,7 @@ struct EvictInstancePayload {
 struct EvictInstance(EvictInstancePayload);
 
 /// State stored while a departure is pending (waiting for possible reconnection).
+#[allow(dead_code)]
 struct PendingDepartureState {
     /// Handle returned by `ctx.notify_later()`, used to cancel the delayed
     /// `ExecutePendingDeparture` message if the user reconnects in time.
@@ -87,6 +90,21 @@ struct PendingDepartureState {
     /// sessions had their PARTICIPANT_JOINED broadcast. Testing sessions (e.g.,
     /// the losing connection during RTT election) never announced themselves.
     was_active: bool,
+    /// Whether the disconnecting session was the meeting host.
+    is_host: bool,
+    /// Whether the meeting should end when the host leaves.
+    end_on_host_leave: bool,
+}
+
+/// Information about a room member tracked by the ChatServer.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct RoomMemberInfo {
+    session: SessionId,
+    user_id: String,
+    display_name: String,
+    is_host: bool,
+    end_on_host_leave: bool,
 }
 
 pub struct ChatServer {
@@ -95,9 +113,10 @@ pub struct ChatServer {
     active_subs: HashMap<SessionId, JoinHandle<()>>,
     session_manager: SessionManager,
     connection_states: HashMap<SessionId, ConnectionState>,
-    /// Track which sessions are in which room, with their user_id and display_name.
-    /// Used to send PARTICIPANT_JOINED for existing peers to new joiners.
-    room_members: HashMap<String, Vec<(SessionId, String, String)>>,
+    /// Track which sessions are in which room, with their user_id, display_name,
+    /// and host status. Used to send PARTICIPANT_JOINED for existing peers to
+    /// new joiners and to determine host-leave behavior.
+    room_members: HashMap<String, Vec<RoomMemberInfo>>,
     /// Pending departures keyed by `(room_id, user_id)`. When a session disconnects
     /// we defer the PARTICIPANT_LEFT broadcast by [`RECONNECT_GRACE_PERIOD`]. If the
     /// same user reconnects before the timer fires, the departure is cancelled
@@ -138,6 +157,8 @@ impl ChatServer {
         user_id: Option<&str>,
         display_name: Option<&str>,
         observer: bool,
+        is_host: bool,
+        end_on_host_leave: bool,
     ) {
         // Remove the subscription task if it exists
         if let Some(task) = self.active_subs.remove(session_id) {
@@ -157,7 +178,7 @@ impl ChatServer {
         // Remove from room_members tracking
         if let Some(room_id) = room {
             if let Some(members) = self.room_members.get_mut(room_id) {
-                members.retain(|(sid, _, _)| sid != session_id);
+                members.retain(|m| m.session != *session_id);
                 if members.is_empty() {
                     self.room_members.remove(room_id);
                 }
@@ -199,44 +220,67 @@ impl ChatServer {
             }
 
             tokio::spawn(async move {
-                match session_manager.end_session(&room_id, &user_id).await {
-                    Ok(SessionEndResult::HostEndedMeeting) => {
-                        info!(
-                            "Host {} left room {} - ending meeting for all",
-                            user_id, room_id
-                        );
-                        // Notify all participants using MEETING packet (protobuf)
-                        let bytes = SessionManager::build_meeting_ended_packet(
-                            &room_id,
-                            "The host has ended the meeting",
-                        );
-                        let subject = format!("room.{}.system", room_id.replace(' ', "_"));
-                        if let Err(e) = nc.publish(subject, bytes.into()).await {
-                            error!("Error publishing MEETING_ENDED: {}", e);
+                // Check host-leave behavior first: if the host is leaving and
+                // end_on_host_leave is set, end the meeting for all participants.
+                if is_host && end_on_host_leave {
+                    info!(
+                        "Host {} left room {} - ending meeting for all",
+                        user_id, room_id
+                    );
+                    // Notify all participants using MEETING packet (protobuf)
+                    let bytes = SessionManager::build_meeting_ended_packet(
+                        &room_id,
+                        "The host has ended the meeting",
+                    );
+                    let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                    if let Err(e) = nc.publish(subject, bytes.into()).await {
+                        error!("Error publishing MEETING_ENDED: {}", e);
+                    }
+                    if let Err(e) = session_manager.end_session(&room_id, &user_id).await {
+                        error!("Error ending host session for room {}: {}", room_id, e);
+                    }
+                } else {
+                    // Normal participant departure
+                    match session_manager.end_session(&room_id, &user_id).await {
+                        Ok(SessionEndResult::HostEndedMeeting) => {
+                            // SessionManager indicated host ended meeting
+                            // (future-proofing for server-side tracking)
+                            info!(
+                                "Host {} left room {} - ending meeting for all (via SessionManager)",
+                                user_id, room_id
+                            );
+                            let bytes = SessionManager::build_meeting_ended_packet(
+                                &room_id,
+                                "The host has ended the meeting",
+                            );
+                            let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                            if let Err(e) = nc.publish(subject, bytes.into()).await {
+                                error!("Error publishing MEETING_ENDED: {}", e);
+                            }
                         }
-                    }
-                    Ok(SessionEndResult::LastParticipantLeft) => {
-                        info!("Last participant {} left room {}", user_id, room_id);
-                    }
-                    Ok(SessionEndResult::MeetingContinues { remaining_count }) => {
-                        info!(
-                            "Participant {} left room {}, {} remaining",
-                            user_id, room_id, remaining_count
-                        );
-                        // Notify remaining peers about the departed session
-                        let bytes = SessionManager::build_peer_left_packet(
-                            &room_id,
-                            &user_id,
-                            session_id_val,
-                            &display_name,
-                        );
-                        let subject = format!("room.{}.system", room_id.replace(' ', "_"));
-                        if let Err(e) = nc.publish(subject, bytes.into()).await {
-                            error!("Error publishing PARTICIPANT_LEFT: {}", e);
+                        Ok(SessionEndResult::LastParticipantLeft) => {
+                            info!("Last participant {} left room {}", user_id, room_id);
                         }
-                    }
-                    Err(e) => {
-                        error!("Error ending session for room {}: {}", room_id, e);
+                        Ok(SessionEndResult::MeetingContinues { remaining_count }) => {
+                            info!(
+                                "Participant {} left room {}, {} remaining",
+                                user_id, room_id, remaining_count
+                            );
+                            // Notify remaining peers about the departed session
+                            let bytes = SessionManager::build_peer_left_packet(
+                                &room_id,
+                                &user_id,
+                                session_id_val,
+                                &display_name,
+                            );
+                            let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                            if let Err(e) = nc.publish(subject, bytes.into()).await {
+                                error!("Error publishing PARTICIPANT_LEFT: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error ending session for room {}: {}", room_id, e);
+                        }
                     }
                 }
             });
@@ -276,7 +320,7 @@ impl ChatServer {
             .map(|members| {
                 members
                     .iter()
-                    .any(|(sid, uid, _)| *sid == prev_sid && uid == user_id)
+                    .any(|m| m.session == prev_sid && m.user_id == user_id)
             })
             .unwrap_or(false);
 
@@ -291,7 +335,7 @@ impl ChatServer {
         );
 
         if let Some(members) = self.room_members.get_mut(room) {
-            members.retain(|(sid, _, _)| *sid != prev_sid);
+            members.retain(|m| m.session != prev_sid);
         }
 
         if let Some(task) = self.active_subs.remove(&prev_sid) {
@@ -379,6 +423,8 @@ impl Handler<Disconnect> for ChatServer {
             user_id,
             display_name,
             observer,
+            is_host,
+            end_on_host_leave,
         }: Disconnect,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -415,6 +461,8 @@ impl Handler<Disconnect> for ChatServer {
                 Some(&user_id),
                 Some(&display_name),
                 true,
+                false,
+                true,
             );
             return;
         }
@@ -447,7 +495,7 @@ impl Handler<Disconnect> for ChatServer {
             // Clean up the replaced session's room_members entry to prevent
             // orphaned phantom peers.
             if let Some(members) = self.room_members.get_mut(&room) {
-                members.retain(|(sid, _, _)| *sid != old.old_session);
+                members.retain(|m| m.session != old.old_session);
             }
             info!(
                 "Replaced existing pending departure for user {} in room {} (old session {})",
@@ -467,6 +515,8 @@ impl Handler<Disconnect> for ChatServer {
                 room: room.clone(),
                 user_id: user_id.clone(),
                 display_name,
+                is_host,
+                end_on_host_leave,
             },
             RECONNECT_GRACE_PERIOD,
         );
@@ -477,6 +527,8 @@ impl Handler<Disconnect> for ChatServer {
                 spawn_handle: handle,
                 old_session: session,
                 was_active,
+                is_host,
+                end_on_host_leave,
             },
         );
     }
@@ -510,7 +562,15 @@ impl Handler<Leave> for ChatServer {
         // Leave is always a real participant, never an observer.
         // No display_name available from Leave message; leave_rooms will
         // fall back to user_id.
-        self.leave_rooms(&session, Some(&room), Some(&user_id), None, false);
+        self.leave_rooms(
+            &session,
+            Some(&room),
+            Some(&user_id),
+            None,
+            false,
+            false,
+            true,
+        );
     }
 }
 
@@ -548,9 +608,9 @@ impl Handler<ActivateConnection> for ChatServer {
                 // Look up room and user_id from room_members.
                 let mut room_user: Option<(String, String)> = None;
                 for (room_id, members) in &self.room_members {
-                    for (sid, uid, _) in members {
-                        if *sid == session {
-                            room_user = Some((room_id.clone(), uid.clone()));
+                    for m in members {
+                        if m.session == session {
+                            room_user = Some((room_id.clone(), m.user_id.clone()));
                             break;
                         }
                     }
@@ -598,9 +658,9 @@ impl Handler<ActivateConnection> for ChatServer {
             // Look up the session's room, user_id, and display_name from room_members.
             let mut found: Option<(String, String, String)> = None;
             for (room_id, members) in &self.room_members {
-                for (sid, uid, dname) in members {
-                    if *sid == session {
-                        found = Some((room_id.clone(), uid.clone(), dname.clone()));
+                for m in members {
+                    if m.session == session {
+                        found = Some((room_id.clone(), m.user_id.clone(), m.display_name.clone()));
                         break;
                     }
                 }
@@ -692,6 +752,8 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             room,
             user_id,
             display_name,
+            is_host,
+            end_on_host_leave,
         }: ExecutePendingDeparture,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -724,7 +786,7 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                 );
                 // Still clean up room_members and instance_index for the old session.
                 if let Some(members) = self.room_members.get_mut(&room) {
-                    members.retain(|(sid, _, _)| *sid != session);
+                    members.retain(|m| m.session != session);
                     if members.is_empty() {
                         self.room_members.remove(&room);
                     }
@@ -750,6 +812,8 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                 Some(&user_id),
                 Some(&display_name),
                 false,
+                is_host,
+                end_on_host_leave,
             );
         } else {
             info!(
@@ -836,6 +900,8 @@ impl Handler<JoinRoom> for ChatServer {
             display_name,
             observer,
             instance_id,
+            is_host,
+            end_on_host_leave,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -885,7 +951,7 @@ impl Handler<JoinRoom> for ChatServer {
 
             // Clean up stale room_members entry from the old session
             if let Some(members) = self.room_members.get_mut(&room) {
-                members.retain(|(sid, _, _)| *sid != pending.old_session);
+                members.retain(|m| m.session != pending.old_session);
             }
 
             info!(
@@ -924,7 +990,7 @@ impl Handler<JoinRoom> for ChatServer {
         // Collect existing non-observer room members for notifying the new joiner.
         // On reconnection, we still send the existing member list so the
         // reconnecting client knows who is in the room.
-        let existing_members: Vec<(SessionId, String, String)> = if !observer {
+        let existing_members: Vec<RoomMemberInfo> = if !observer {
             self.room_members.get(&room).cloned().unwrap_or_default()
         } else {
             Vec::new()
@@ -937,11 +1003,16 @@ impl Handler<JoinRoom> for ChatServer {
 
         // Track this session in room_members (only for non-observers)
         if !observer {
-            self.room_members.entry(room.clone()).or_default().push((
-                session,
-                user_id.clone(),
-                display_name.clone(),
-            ));
+            self.room_members
+                .entry(room.clone())
+                .or_default()
+                .push(RoomMemberInfo {
+                    session,
+                    user_id: user_id.clone(),
+                    display_name: display_name.clone(),
+                    is_host,
+                    end_on_host_leave,
+                });
         }
 
         // Clone the recipient so we can send existing member info directly to the new joiner
@@ -1010,24 +1081,24 @@ impl Handler<JoinRoom> for ChatServer {
 
             // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
             // This ensures the new joiner learns about all participants already in the room.
-            for (existing_sid, existing_uid, existing_display_name) in &existing_members {
+            for member in &existing_members {
                 let existing_bytes = SessionManager::build_peer_joined_packet(
                     &room_clone,
-                    existing_uid,
-                    *existing_sid,
-                    existing_display_name,
+                    &member.user_id,
+                    member.session,
+                    &member.display_name,
                 );
                 info!(
                     "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
-                    existing_uid, existing_display_name, user_id_clone
+                    member.user_id, member.display_name, user_id_clone
                 );
                 if let Err(e) = new_joiner_recipient.try_send(Message {
                     msg: existing_bytes,
-                    session: *existing_sid,
+                    session: member.session,
                 }) {
                     warn!(
                         "Failed to send existing PARTICIPANT_JOINED for {} to new joiner {}: {}",
-                        existing_uid, user_id_clone, e
+                        member.user_id, user_id_clone, e
                     );
                 }
             }
@@ -1211,6 +1282,8 @@ mod tests {
                 display_name: SYSTEM_USER_ID.to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1271,6 +1344,8 @@ mod tests {
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1303,6 +1378,8 @@ mod tests {
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1363,6 +1440,8 @@ mod tests {
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1379,6 +1458,8 @@ mod tests {
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1751,6 +1832,8 @@ mod tests {
                 display_name: "alice@example.com".to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1860,6 +1943,8 @@ mod tests {
                 display_name: "observer-user@example.com".to_string(),
                 observer: true,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1955,6 +2040,8 @@ mod tests {
                 display_name: "real-user@example.com".to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2056,6 +2143,8 @@ mod tests {
                 display_name: "testing-user@example.com".to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2121,6 +2210,8 @@ mod tests {
                 display_name: "testing-dc@example.com".to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2164,6 +2255,8 @@ mod tests {
                 user_id: "testing-dc@example.com".to_string(),
                 display_name: "testing-dc@example.com".to_string(),
                 observer: false,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
@@ -2228,6 +2321,8 @@ mod tests {
                 display_name: "observer-dc@example.com".to_string(),
                 observer: true,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2272,6 +2367,8 @@ mod tests {
                 user_id: "observer-dc@example.com".to_string(),
                 display_name: "observer-dc@example.com".to_string(),
                 observer: true,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
@@ -2336,6 +2433,8 @@ mod tests {
                 display_name: "real-dc@example.com".to_string(),
                 observer: false,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2395,6 +2494,8 @@ mod tests {
                 user_id: "real-dc@example.com".to_string(),
                 display_name: "real-dc@example.com".to_string(),
                 observer: false,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Disconnect should succeed");
@@ -2457,6 +2558,8 @@ mod tests {
                 display_name: "observer@example.com".to_string(),
                 observer: true,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2475,6 +2578,8 @@ mod tests {
                 display_name: "observer@example.com".to_string(),
                 observer: true,
                 instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2788,9 +2893,9 @@ mod tests {
             "Non-observer MUST receive MEDIA packets"
         );
     }
-    /// Returns all (session_id, user_id, display_name) tuples for a given room.
+    /// Returns all RoomMemberInfo entries for a given room.
     #[derive(ActixMessage)]
-    #[rtype(result = "Vec<(SessionId, String, String)>")]
+    #[rtype(result = "Vec<RoomMemberInfo>")]
     struct GetRoomMembers {
         room: String,
     }
@@ -2884,6 +2989,8 @@ mod tests {
                 display_name: user_id.to_string(),
                 observer: false,
                 instance_id,
+                is_host: false,
+                end_on_host_leave: true,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2954,7 +3061,10 @@ mod tests {
             .await
             .expect("GetRoomMembers should succeed");
         assert_eq!(members.len(), 1, "Room should have exactly 1 member");
-        assert_eq!(members[0].0, session_a, "Session A should be in the room");
+        assert_eq!(
+            members[0].session, session_a,
+            "Session A should be in the room"
+        );
 
         // Session B joins with same instance_id (same user reconnecting)
         let dummy_b = DummySession.start();
@@ -2984,7 +3094,7 @@ mod tests {
             "Room should have exactly 1 member after eviction"
         );
         assert_eq!(
-            members[0].0, session_b,
+            members[0].session, session_b,
             "Session B should be the sole member"
         );
 
@@ -3090,7 +3200,7 @@ mod tests {
             "Room should have 2 members (no eviction across different user_ids)"
         );
 
-        let session_ids: Vec<SessionId> = members.iter().map(|(sid, _, _)| *sid).collect();
+        let session_ids: Vec<SessionId> = members.iter().map(|m| m.session).collect();
         assert!(
             session_ids.contains(&session_a),
             "Session A (alice) should still be in room_members"
@@ -3170,7 +3280,7 @@ mod tests {
             .expect("GetRoomMembers should succeed");
         assert_eq!(members.len(), 1, "Room should have exactly 1 member");
         assert_eq!(
-            members[0].0, session_id,
+            members[0].session, session_id,
             "The session should be in room_members"
         );
 
@@ -3240,7 +3350,7 @@ mod tests {
             "Room should have exactly 1 member after first join with new instance_id"
         );
         assert_eq!(
-            members[0].0, session_id,
+            members[0].session, session_id,
             "The new session should be in room_members"
         );
 
@@ -3330,7 +3440,7 @@ mod tests {
             "Room should have 2 members (different instance_ids, same user, no eviction)"
         );
 
-        let session_ids: Vec<SessionId> = members.iter().map(|(sid, _, _)| *sid).collect();
+        let session_ids: Vec<SessionId> = members.iter().map(|m| m.session).collect();
         assert!(
             session_ids.contains(&session_a),
             "Session A should still be in room_members"

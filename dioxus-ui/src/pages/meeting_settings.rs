@@ -35,6 +35,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut waiting_room_toggle = use_signal(|| false);
     let mut admitted_can_admit_toggle = use_signal(|| false);
+    let mut end_on_host_leave_toggle = use_signal(|| true);
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let mut ending = use_signal(|| false);
@@ -71,6 +72,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     Ok(info) => {
                         waiting_room_toggle.set(info.waiting_room_enabled);
                         admitted_can_admit_toggle.set(info.admitted_can_admit);
+                        end_on_host_leave_toggle.set(info.end_on_host_leave);
                         meeting.set(Some(info));
                         loading.set(false);
                     }
@@ -163,6 +165,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let meeting_id_delete = id.clone();
 
     let meeting_id_toggle2 = id.clone();
+    let meeting_id_toggle3 = id.clone();
 
     let on_toggle_waiting_room = move |new_val: bool| {
         if saving() {
@@ -183,7 +186,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
             Some(false)
         };
         spawn(async move {
-            match update_meeting(&meeting_id, new_val, aca).await {
+            match update_meeting(&meeting_id, new_val, aca, None).await {
                 Ok(updated) => {
                     waiting_room_toggle.set(updated.waiting_room_enabled);
                     admitted_can_admit_toggle.set(updated.admitted_can_admit);
@@ -210,7 +213,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         let meeting_id = meeting_id_toggle2.clone();
         let wr = waiting_room_toggle();
         spawn(async move {
-            match update_meeting(&meeting_id, wr, Some(new_val)).await {
+            match update_meeting(&meeting_id, wr, Some(new_val), None).await {
                 Ok(updated) => {
                     waiting_room_toggle.set(updated.waiting_room_enabled);
                     admitted_can_admit_toggle.set(updated.admitted_can_admit);
@@ -219,6 +222,31 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                 Err(e) => {
                     log::error!("Failed to update admitted_can_admit: {e}");
                     admitted_can_admit_toggle.set(!new_val);
+                    saving.set(false);
+                    toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                }
+            }
+        });
+    };
+
+    let on_toggle_end_on_host_leave = move |new_val: bool| {
+        if saving() {
+            return;
+        }
+        toggle_error.set(None);
+        end_on_host_leave_toggle.set(new_val);
+        saving.set(true);
+        let meeting_id = meeting_id_toggle3.clone();
+        let wr = waiting_room_toggle();
+        spawn(async move {
+            match update_meeting(&meeting_id, wr, None, Some(new_val)).await {
+                Ok(updated) => {
+                    end_on_host_leave_toggle.set(updated.end_on_host_leave);
+                    saving.set(false);
+                }
+                Err(e) => {
+                    log::error!("Failed to update end_on_host_leave: {e}");
+                    end_on_host_leave_toggle.set(!new_val);
                     saving.set(false);
                     toggle_error.set(Some(format!("Failed to update setting: {e}")));
                 }
@@ -451,6 +479,29 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                         enabled: admitted_can_admit_toggle(),
                         on_toggle: on_toggle_admitted_can_admit,
                         disabled: saving() || !waiting_room_toggle(),
+                    }
+                }
+            }
+
+            div { class: "settings-option-row",
+                span { class: "settings-option-label", "End meeting when host leaves" }
+                div { class: "settings-option-controls",
+                    span {
+                        class: "settings-info-icon",
+                        title: "When enabled, the meeting automatically ends for all participants when the host leaves",
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg", width: "15", height: "15",
+                            view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                            stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                            circle { cx: "12", cy: "12", r: "10" }
+                            line { x1: "12", y1: "16", x2: "12", y2: "12" }
+                            line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
+                        }
+                    }
+                    ToggleSwitch {
+                        enabled: end_on_host_leave_toggle(),
+                        on_toggle: on_toggle_end_on_host_leave,
+                        disabled: saving(),
                     }
                 }
             }

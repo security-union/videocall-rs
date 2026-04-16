@@ -270,7 +270,7 @@ pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
 /// FPS ratio (received/target) below which we step DOWN one video tier.
 pub const VIDEO_TIER_DEGRADE_FPS_RATIO: f64 = 0.50;
 /// FPS ratio above which we step UP one video tier (must be sustained).
-pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.85;
+pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.70;
 
 /// Bitrate ratio (actual/ideal) below which we step DOWN one video tier.
 pub const VIDEO_TIER_DEGRADE_BITRATE_RATIO: f64 = 0.40;
@@ -458,7 +458,7 @@ pub const RTT_PROBE_CONNECTED_INTERVAL_MS: u64 = 1000;
 
 **Problem:** PID controller only adjusts bitrate. Under severe congestion, the same number of frames are sent at ever-lower quality, and resolution never changes.
 
-**Automatic behavior:** The `AdaptiveQualityManager` (1.0.1) continuously monitors network signals and automatically selects the appropriate `VideoQualityTier`. Each tier bundles resolution, framerate, and bitrate together. When the FPS ratio drops below `VIDEO_TIER_DEGRADE_FPS_RATIO` (0.50) or bitrate ratio drops below `VIDEO_TIER_DEGRADE_BITRATE_RATIO` (0.40) for `STEP_DOWN_REACTION_TIME_MS` (1500ms), the system steps down one tier. When conditions recover above `VIDEO_TIER_RECOVER_FPS_RATIO` (0.85) / `VIDEO_TIER_RECOVER_BITRATE_RATIO` (0.75) and remain stable for `STEP_UP_STABILIZATION_WINDOW_MS` (5000ms), the system steps back up. Minimum `MIN_TIER_TRANSITION_INTERVAL_MS` (3000ms) between any transitions prevents oscillation.
+**Automatic behavior:** The `AdaptiveQualityManager` (1.0.1) continuously monitors network signals and automatically selects the appropriate `VideoQualityTier`. Each tier bundles resolution, framerate, and bitrate together. When the FPS ratio drops below `VIDEO_TIER_DEGRADE_FPS_RATIO` (0.50) or bitrate ratio drops below `VIDEO_TIER_DEGRADE_BITRATE_RATIO` (0.40) for `STEP_DOWN_REACTION_TIME_MS` (1500ms), the system steps down one tier. When conditions recover above `VIDEO_TIER_RECOVER_FPS_RATIO` (0.70) / `VIDEO_TIER_RECOVER_BITRATE_RATIO` (0.75) and remain stable for `STEP_UP_STABILIZATION_WINDOW_MS` (5000ms), the system steps back up. Minimum `MIN_TIER_TRANSITION_INTERVAL_MS` (3000ms) between any transitions prevents oscillation.
 
 **Solution:**
 - `AdaptiveQualityManager` outputs a `VideoQualityTier` recommendation

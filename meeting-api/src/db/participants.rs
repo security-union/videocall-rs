@@ -68,16 +68,22 @@ pub async fn upsert_host(
 /// setting. Locks the meeting row with `FOR UPDATE` to serialize against concurrent
 /// waiting room toggles via `update_waiting_room_enabled`.
 ///
-/// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where `auto_admitted`
-/// is `true` when the participant was immediately admitted (waiting room disabled).
-/// The third element is the `waiting_room_enabled` value observed under the row lock,
-/// which avoids stale reads from a pre-transaction fetch.
+/// When `check_host_gone_for` is `Some(creator_id)`, verifies within the same transaction
+/// that the host is still admitted. Returns `Ok(None)` if the host has left — callers
+/// should respond with a "joining not allowed" error. This closes the TOCTOU window
+/// that arises when the check is performed outside the transaction.
+///
+/// Returns `Ok(Some((auto_admitted, row, waiting_room_enabled)))` on success, where
+/// `auto_admitted` is `true` when the participant was immediately admitted (waiting room
+/// disabled). The third element is the `waiting_room_enabled` value observed under the
+/// row lock.
 pub async fn join_attendee(
     pool: &PgPool,
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
-) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
+    check_host_gone_for: Option<&str>,
+) -> Result<Option<(bool, ParticipantRow, bool)>, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
     // Lock the meeting row to serialize against concurrent waiting room toggles.
@@ -86,6 +92,26 @@ pub async fn join_attendee(
             .bind(meeting_id)
             .fetch_one(&mut *tx)
             .await?;
+
+    // If requested, verify within the same transaction that the host has not left.
+    // Doing this outside the transaction creates a TOCTOU race: two concurrent
+    // requests can both pass the pre-transaction check, then both insert into a
+    // meeting where no one can admit them.
+    if let Some(creator_id) = check_host_gone_for {
+        let host_status: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2",
+        )
+        .bind(meeting_id)
+        .bind(creator_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let host_is_gone = host_status.map(|(s,)| s != "admitted").unwrap_or(true);
+        if host_is_gone {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+    }
 
     let row = if waiting_room_enabled {
         let query = format!(
@@ -124,7 +150,7 @@ pub async fn join_attendee(
     };
 
     tx.commit().await?;
-    Ok((!waiting_room_enabled, row, waiting_room_enabled))
+    Ok(Some((!waiting_room_enabled, row, waiting_room_enabled)))
 }
 
 /// Get all participants in 'waiting' status for a meeting.

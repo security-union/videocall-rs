@@ -23,6 +23,8 @@ use videocall_meeting_types::{
     responses::{APIResponse, ParticipantStatusResponse},
 };
 
+use videocall_types::validation::validate_display_name;
+
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
@@ -41,7 +43,12 @@ pub async fn join_meeting(
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let display_name = body.as_ref().and_then(|b| b.display_name.as_deref());
+    let display_name = body
+        .as_ref()
+        .and_then(|b| b.display_name.as_deref())
+        .map(|raw| validate_display_name(raw).map_err(|e| AppError::invalid_display_name(&e)))
+        .transpose()?;
+    let display_name = display_name.as_deref();
 
     let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
         Some(m) => m,
@@ -96,8 +103,9 @@ pub async fn join_meeting(
                 db_meetings::activate(&state.db, meeting.id).await?;
                 nats_events::publish_meeting_activated(state.nats.as_ref(), &meeting_id).await;
                 let (auto_admitted, row, wr_enabled) =
-                    db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name)
-                        .await?;
+                    db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name, None)
+                        .await?
+                        .expect("join_attendee with None host check never returns None");
                 let token = if auto_admitted {
                     Some(generate_room_token(
                         &state.jwt_secret,
@@ -155,23 +163,29 @@ pub async fn join_meeting(
             }
         }
 
-        // If the host left with end_on_host_leave=false and admitted_can_admit=false,
-        // no one can admit new participants — block the join attempt.
-        if !meeting.end_on_host_leave && !meeting.admitted_can_admit {
-            if let Some(ref creator_id) = meeting.creator_id.clone() {
-                let host_status =
-                    db_participants::get_status(&state.db, meeting.id, creator_id).await?;
-                let host_is_gone = host_status.map(|p| p.status != "admitted").unwrap_or(true);
-                if host_is_gone {
-                    return Err(AppError::joining_not_allowed());
-                }
-            }
-        }
+        // Pass creator_id only when the host-gone check must be enforced.
+        // Folding this check into the transaction closes the TOCTOU window where
+        // concurrent requests could both pass an out-of-transaction host-status read.
+        let check_creator = if !meeting.end_on_host_leave && !meeting.admitted_can_admit {
+            meeting.creator_id.as_deref()
+        } else {
+            None
+        };
 
         // Atomically check waiting_room_enabled and insert participant in one
         // transaction, using FOR UPDATE to serialize against concurrent toggles.
-        let (auto_admitted, row, wr_enabled) =
-            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name).await?;
+        let (auto_admitted, row, wr_enabled) = match db_participants::join_attendee(
+            &state.db,
+            meeting.id,
+            &user_id,
+            display_name,
+            check_creator,
+        )
+        .await?
+        {
+            Some(r) => r,
+            None => return Err(AppError::joining_not_allowed()),
+        };
 
         let token = if auto_admitted {
             Some(generate_room_token(
@@ -297,6 +311,10 @@ pub async fn update_display_name(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
+    // Validate the display name
+    let validated_name = validate_display_name(&body.display_name)
+        .map_err(|e| AppError::invalid_display_name(&e))?;
+
     // Validate the participant exists and is in the meeting
     db_participants::get_status(&state.db, meeting.id, &user_id)
         .await?
@@ -304,7 +322,7 @@ pub async fn update_display_name(
 
     // Update the display name in the database
     let updated_row =
-        db_participants::update_display_name(&state.db, meeting.id, &user_id, &body.display_name)
+        db_participants::update_display_name(&state.db, meeting.id, &user_id, &validated_name)
             .await?
             .ok_or_else(AppError::not_in_meeting)?;
 
@@ -313,7 +331,7 @@ pub async fn update_display_name(
         state.nats.as_ref(),
         &meeting_id,
         &user_id,
-        &body.display_name,
+        &validated_name,
     )
     .await;
 

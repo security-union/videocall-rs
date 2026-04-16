@@ -38,8 +38,11 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 
 use crate::metrics::{RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL};
+use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::validation::validate_display_name;
 use videocall_types::SYSTEM_USER_ID;
 
 use super::session_logic::{ConnectionState, SessionId};
@@ -77,6 +80,17 @@ struct EvictInstancePayload {
 #[rtype(result = "()")]
 struct EvictInstance(EvictInstancePayload);
 
+/// Internal actix message to update a room member's display name.
+/// Sent from the per-session NATS subscription loop when a
+/// PARTICIPANT_DISPLAY_NAME_CHANGED event is received.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct UpdateMemberDisplayName {
+    room_id: String,
+    user_id: String,
+    display_name: String,
+}
+
 /// State stored while a departure is pending (waiting for possible reconnection).
 #[allow(dead_code)]
 struct PendingDepartureState {
@@ -98,7 +112,6 @@ struct PendingDepartureState {
 
 /// Information about a room member tracked by the ChatServer.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct RoomMemberInfo {
     session: SessionId,
     user_id: String,
@@ -227,13 +240,25 @@ impl ChatServer {
                         "Host {} left room {} - ending meeting for all",
                         user_id, room_id
                     );
-                    // Notify all participants using MEETING packet (protobuf)
-                    let bytes = SessionManager::build_meeting_ended_packet(
+                    let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                    // First emit PARTICIPANT_LEFT so clients remove the host's video tile
+                    // before the MEETING_ENDED overlay renders. Without this, the host's
+                    // tile remains as a ghost until teardown ordering resolves it.
+                    let left_bytes = SessionManager::build_peer_left_packet(
+                        &room_id,
+                        &user_id,
+                        session_id_val,
+                        &display_name,
+                    );
+                    if let Err(e) = nc.publish(subject.clone(), left_bytes.into()).await {
+                        error!("Error publishing PARTICIPANT_LEFT for host: {}", e);
+                    }
+                    // Then end the meeting for all remaining participants.
+                    let ended_bytes = SessionManager::build_meeting_ended_packet(
                         &room_id,
                         "The host has ended the meeting",
                     );
-                    let subject = format!("room.{}.system", room_id.replace(' ', "_"));
-                    if let Err(e) = nc.publish(subject, bytes.into()).await {
+                    if let Err(e) = nc.publish(subject, ended_bytes.into()).await {
                         error!("Error publishing MEETING_ENDED: {}", e);
                     }
                     if let Err(e) = session_manager.end_session(&room_id, &user_id).await {
@@ -249,12 +274,22 @@ impl ChatServer {
                                 "Host {} left room {} - ending meeting for all (via SessionManager)",
                                 user_id, room_id
                             );
-                            let bytes = SessionManager::build_meeting_ended_packet(
+                            let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                            // Emit PARTICIPANT_LEFT first so clients clean up the host's tile.
+                            let left_bytes = SessionManager::build_peer_left_packet(
+                                &room_id,
+                                &user_id,
+                                session_id_val,
+                                &display_name,
+                            );
+                            if let Err(e) = nc.publish(subject.clone(), left_bytes.into()).await {
+                                error!("Error publishing PARTICIPANT_LEFT for host: {}", e);
+                            }
+                            let ended_bytes = SessionManager::build_meeting_ended_packet(
                                 &room_id,
                                 "The host has ended the meeting",
                             );
-                            let subject = format!("room.{}.system", room_id.replace(' ', "_"));
-                            if let Err(e) = nc.publish(subject, bytes.into()).await {
+                            if let Err(e) = nc.publish(subject, ended_bytes.into()).await {
                                 error!("Error publishing MEETING_ENDED: {}", e);
                             }
                         }
@@ -559,17 +594,26 @@ impl Handler<Leave> for ChatServer {
             );
         }
 
+        // Look up is_host, end_on_host_leave, and display_name from room_members.
+        // The Leave message carries no host info; we must resolve it from the
+        // in-memory member table so the host-leave path in leave_rooms fires
+        // correctly when the host explicitly leaves.
+        let (is_host, end_on_host_leave, display_name) = self
+            .room_members
+            .get(&room)
+            .and_then(|members| members.iter().find(|m| m.session == session))
+            .map(|m| (m.is_host, m.end_on_host_leave, Some(m.display_name.clone())))
+            .unwrap_or((false, true, None));
+
         // Leave is always a real participant, never an observer.
-        // No display_name available from Leave message; leave_rooms will
-        // fall back to user_id.
         self.leave_rooms(
             &session,
             Some(&room),
             Some(&user_id),
-            None,
+            display_name.as_deref(),
             false,
-            false,
-            true,
+            is_host,
+            end_on_host_leave,
         );
     }
 }
@@ -697,6 +741,32 @@ impl Handler<ActivateConnection> for ChatServer {
                      skipping PARTICIPANT_JOINED (likely observer or already cleaned up)",
                     session
                 );
+            }
+        }
+    }
+}
+
+/// Handle in-memory display-name updates triggered by NATS
+/// PARTICIPANT_DISPLAY_NAME_CHANGED events.
+impl Handler<UpdateMemberDisplayName> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: UpdateMemberDisplayName, _ctx: &mut Self::Context) -> Self::Result {
+        let validated_name = match validate_display_name(&msg.display_name) {
+            Ok(name) => name,
+            Err(e) => {
+                warn!(
+                    "UpdateMemberDisplayName: rejecting invalid display name from NATS for user {} in room {}: {}",
+                    msg.user_id, msg.room_id, e
+                );
+                return;
+            }
+        };
+        if let Some(members) = self.room_members.get_mut(&msg.room_id) {
+            for member in members.iter_mut() {
+                if member.user_id == msg.user_id {
+                    member.display_name = validated_name.clone();
+                }
             }
         }
     }
@@ -1020,6 +1090,7 @@ impl Handler<JoinRoom> for ChatServer {
 
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
+        let server_addr = ctx.address();
 
         let handle = tokio::spawn(async move {
             // start_session is called by the transport actors (ws_chat_session /
@@ -1106,6 +1177,101 @@ impl Handler<JoinRoom> for ChatServer {
             match nc2.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
                     while let Some(msg) = sub.next().await {
+                        // Detect PARTICIPANT_DISPLAY_NAME_CHANGED and update
+                        // in-memory room_members via the actor before forwarding.
+                        // Only system messages (room.{room}.system) carry display-name
+                        // change events — skip the protobuf parse entirely for the
+                        // high-frequency per-session media subjects.
+                        if msg.subject.ends_with(".system") {
+                            if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&msg.payload) {
+                                if wrapper.packet_type == PacketType::MEETING.into() {
+                                    if let Ok(inner) =
+                                        MeetingPacket::parse_from_bytes(&wrapper.data)
+                                    {
+                                        if inner.event_type
+                                            == MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED
+                                                .into()
+                                        {
+                                            let target = match String::from_utf8(
+                                                inner.target_user_id.to_vec(),
+                                            ) {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    warn!("UpdateMemberDisplayName: non-UTF-8 target_user_id in NATS packet, dropping");
+                                                    continue;
+                                                }
+                                            };
+                                            let new_name = match String::from_utf8(
+                                                inner.display_name.to_vec(),
+                                            ) {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    warn!("UpdateMemberDisplayName: non-UTF-8 display_name in NATS packet, dropping");
+                                                    continue;
+                                                }
+                                            };
+                                            if !target.is_empty() && !new_name.is_empty() {
+                                                let room_mismatch = !inner.room_id.is_empty()
+                                                    && inner.room_id != room_clone;
+                                                if room_mismatch {
+                                                    warn!(
+                                                        "UpdateMemberDisplayName: protobuf room_id '{}' differs from subscription room '{}', sanitizing before forwarding",
+                                                        inner.room_id, room_clone
+                                                    );
+                                                }
+                                                server_addr.do_send(UpdateMemberDisplayName {
+                                                    room_id: room_clone.clone(),
+                                                    user_id: target,
+                                                    display_name: new_name,
+                                                });
+                                                if room_mismatch {
+                                                    // Rewrite room_id so clients never see the mismatched value.
+                                                    let mut patched = inner;
+                                                    patched.room_id = room_clone.clone();
+                                                    let forwarded =
+                                                        patched.write_to_bytes().and_then(|ib| {
+                                                            let mut pw = wrapper;
+                                                            pw.data = ib;
+                                                            pw.write_to_bytes()
+                                                        });
+                                                    match forwarded {
+                                                        Ok(sanitized) => {
+                                                            let message = Message {
+                                                                msg: sanitized,
+                                                                session: session_clone,
+                                                            };
+                                                            if let Err(e) =
+                                                                session_recipient.try_send(message)
+                                                            {
+                                                                RELAY_PACKET_DROPS_TOTAL
+                                                                    .with_label_values(&[
+                                                                        &room_clone,
+                                                                        "nats_delivery",
+                                                                        "mailbox_full",
+                                                                    ])
+                                                                    .inc();
+                                                                warn!(
+                                                                    "Dropping sanitized PARTICIPANT_DISPLAY_NAME_CHANGED for session {}: {}",
+                                                                    session_clone, e
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "Failed to re-serialize sanitized PARTICIPANT_DISPLAY_NAME_CHANGED, dropping forward: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if let Err(e) = handle_msg(
                             session_recipient.clone(),
                             room_clone.clone(),

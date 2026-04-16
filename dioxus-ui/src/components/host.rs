@@ -165,9 +165,10 @@ pub fn Host(
             screen_state_cb,
         );
 
-        // Wire up congestion step-down and PLI keyframe flags
+        // Wire up congestion step-down, PLI keyframe, and re-election flags
         camera.set_congestion_step_down_flag(client.congestion_step_down_flag());
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
+        camera.set_reelection_completed_signal(client.reelection_completed_signal());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
 
         // Wire up cross-stream bandwidth coordination: the screen encoder sets
@@ -192,6 +193,8 @@ pub fn Host(
             camera.shared_encoder_output_fps(),
             camera.shared_tier_transitions(),
             screen.shared_tier_transitions(),
+            camera.shared_climb_limiter_snapshot(),
+            camera.shared_dwell_samples(),
         );
 
         // Wire up encoder controls. The microphone encoder no longer needs

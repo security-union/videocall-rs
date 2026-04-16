@@ -16,7 +16,6 @@ use dioxus::prelude::*;
 
 #[component]
 pub fn UpdateDisplayNameModal(
-    visible: bool,
     current_display_name: String,
     meeting_id: String,
     on_close: EventHandler<()>,
@@ -25,12 +24,10 @@ pub fn UpdateDisplayNameModal(
     let pending_name = use_signal(|| current_display_name.clone());
     let error_message = use_signal(|| None::<String>);
     let is_updating = use_signal(|| false);
-    let success_message = use_signal(|| None::<String>);
 
     rsx! {
-        if visible {
-            div {
-                class: "glass-backdrop",
+        div {
+            class: "glass-backdrop",
                 onkeydown: {
                     let current_display_name = current_display_name.clone();
                     let mut pending_name = pending_name;
@@ -64,7 +61,6 @@ pub fn UpdateDisplayNameModal(
                             let meeting_id = meeting_id.clone();
                             let mut error_message = error_message;
                             let mut is_updating = is_updating;
-                            let mut success_message = success_message;
                             let on_success = on_success;
 
                             move |e: Event<FormData>| {
@@ -88,7 +84,6 @@ pub fn UpdateDisplayNameModal(
 
                                         is_updating.set(true);
                                         error_message.set(None);
-                                        success_message.set(None);
 
                                         wasm_bindgen_futures::spawn_local(async move {
                                             log::info!("RENAME: API CALL INITIATED for: {}", valid_name_clone);
@@ -99,12 +94,7 @@ pub fn UpdateDisplayNameModal(
 
                                                     save_display_name_to_storage(&valid_name_clone);
                                                     is_updating.set(false);
-                                                    success_message.set(Some("Display name updated!".to_string()));
                                                     on_success.call(valid_name_clone);
-
-                                                    gloo_timers::callback::Timeout::new(2000, move || {
-                                                        success_message.set(None);
-                                                    }).forget();
                                                 }
                                                 Err(e) => {
                                                     log::error!("RENAME: API CALL FAILED: {}", e);
@@ -131,12 +121,10 @@ pub fn UpdateDisplayNameModal(
                             oninput: {
                                 let mut pending_name = pending_name;
                                 let mut error_message = error_message;
-                                let mut success_message = success_message;
 
                                 move |e: Event<FormData>| {
                                     pending_name.set(e.value());
                                     error_message.set(None);
-                                    success_message.set(None);
                                 }
                             },
                             placeholder: "Enter new display name",
@@ -146,10 +134,6 @@ pub fn UpdateDisplayNameModal(
 
                         if let Some(err) = error_message() {
                             p { style: "color:#FF453A; margin-top:6px; font-size:12px;", "{err}" }
-                        }
-
-                        if let Some(msg) = success_message() {
-                            p { style: "color:#34C759; margin-top:6px; font-size:12px;", "{msg}" }
                         }
 
                         div {
@@ -162,12 +146,10 @@ pub fn UpdateDisplayNameModal(
                                     let current_display_name = current_display_name.clone();
                                     let mut pending_name = pending_name;
                                     let mut error_message = error_message;
-                                    let mut success_message = success_message;
                                     let on_close = on_close;
 
                                     move |_| {
                                         error_message.set(None);
-                                        success_message.set(None);
                                         pending_name.set(current_display_name.clone());
                                         on_close.call(());
                                     }
@@ -186,6 +168,5 @@ pub fn UpdateDisplayNameModal(
                     }
                 }
             }
-        }
     }
 }

@@ -38,8 +38,11 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 
 use crate::metrics::{RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL};
+use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::validation::validate_display_name;
 use videocall_types::SYSTEM_USER_ID;
 
 use super::session_logic::{ConnectionState, SessionId};
@@ -76,6 +79,17 @@ struct EvictInstancePayload {
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct EvictInstance(EvictInstancePayload);
+
+/// Internal actix message to update a room member's display name.
+/// Sent from the per-session NATS subscription loop when a
+/// PARTICIPANT_DISPLAY_NAME_CHANGED event is received.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct UpdateMemberDisplayName {
+    room_id: String,
+    user_id: String,
+    display_name: String,
+}
 
 /// State stored while a departure is pending (waiting for possible reconnection).
 #[allow(dead_code)]
@@ -702,6 +716,32 @@ impl Handler<ActivateConnection> for ChatServer {
     }
 }
 
+/// Handle in-memory display-name updates triggered by NATS
+/// PARTICIPANT_DISPLAY_NAME_CHANGED events.
+impl Handler<UpdateMemberDisplayName> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: UpdateMemberDisplayName, _ctx: &mut Self::Context) -> Self::Result {
+        let validated_name = match validate_display_name(&msg.display_name) {
+            Ok(name) => name,
+            Err(e) => {
+                warn!(
+                    "UpdateMemberDisplayName: rejecting invalid display name from NATS for user {} in room {}: {}",
+                    msg.user_id, msg.room_id, e
+                );
+                return;
+            }
+        };
+        if let Some(members) = self.room_members.get_mut(&msg.room_id) {
+            for (_sid, uid, dname) in members.iter_mut() {
+                if *uid == msg.user_id {
+                    *dname = validated_name.clone();
+                }
+            }
+        }
+    }
+}
+
 /// Handle cross-server eviction requests received via NATS.
 impl Handler<EvictInstance> for ChatServer {
     type Result = ();
@@ -1020,6 +1060,7 @@ impl Handler<JoinRoom> for ChatServer {
 
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
+        let server_addr = ctx.address();
 
         let handle = tokio::spawn(async move {
             // start_session is called by the transport actors (ws_chat_session /
@@ -1106,6 +1147,101 @@ impl Handler<JoinRoom> for ChatServer {
             match nc2.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
                     while let Some(msg) = sub.next().await {
+                        // Detect PARTICIPANT_DISPLAY_NAME_CHANGED and update
+                        // in-memory room_members via the actor before forwarding.
+                        // Only system messages (room.{room}.system) carry display-name
+                        // change events — skip the protobuf parse entirely for the
+                        // high-frequency per-session media subjects.
+                        if msg.subject.ends_with(".system") {
+                            if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&msg.payload) {
+                                if wrapper.packet_type == PacketType::MEETING.into() {
+                                    if let Ok(inner) =
+                                        MeetingPacket::parse_from_bytes(&wrapper.data)
+                                    {
+                                        if inner.event_type
+                                            == MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED
+                                                .into()
+                                        {
+                                            let target = match String::from_utf8(
+                                                inner.target_user_id.to_vec(),
+                                            ) {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    warn!("UpdateMemberDisplayName: non-UTF-8 target_user_id in NATS packet, dropping");
+                                                    continue;
+                                                }
+                                            };
+                                            let new_name = match String::from_utf8(
+                                                inner.display_name.to_vec(),
+                                            ) {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    warn!("UpdateMemberDisplayName: non-UTF-8 display_name in NATS packet, dropping");
+                                                    continue;
+                                                }
+                                            };
+                                            if !target.is_empty() && !new_name.is_empty() {
+                                                let room_mismatch = !inner.room_id.is_empty()
+                                                    && inner.room_id != room_clone;
+                                                if room_mismatch {
+                                                    warn!(
+                                                        "UpdateMemberDisplayName: protobuf room_id '{}' differs from subscription room '{}', sanitizing before forwarding",
+                                                        inner.room_id, room_clone
+                                                    );
+                                                }
+                                                server_addr.do_send(UpdateMemberDisplayName {
+                                                    room_id: room_clone.clone(),
+                                                    user_id: target,
+                                                    display_name: new_name,
+                                                });
+                                                if room_mismatch {
+                                                    // Rewrite room_id so clients never see the mismatched value.
+                                                    let mut patched = inner;
+                                                    patched.room_id = room_clone.clone();
+                                                    let forwarded =
+                                                        patched.write_to_bytes().and_then(|ib| {
+                                                            let mut pw = wrapper;
+                                                            pw.data = ib;
+                                                            pw.write_to_bytes()
+                                                        });
+                                                    match forwarded {
+                                                        Ok(sanitized) => {
+                                                            let message = Message {
+                                                                msg: sanitized,
+                                                                session: session_clone,
+                                                            };
+                                                            if let Err(e) =
+                                                                session_recipient.try_send(message)
+                                                            {
+                                                                RELAY_PACKET_DROPS_TOTAL
+                                                                    .with_label_values(&[
+                                                                        &room_clone,
+                                                                        "nats_delivery",
+                                                                        "mailbox_full",
+                                                                    ])
+                                                                    .inc();
+                                                                warn!(
+                                                                    "Dropping sanitized PARTICIPANT_DISPLAY_NAME_CHANGED for session {}: {}",
+                                                                    session_clone, e
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "Failed to re-serialize sanitized PARTICIPANT_DISPLAY_NAME_CHANGED, dropping forward: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if let Err(e) = handle_msg(
                             session_recipient.clone(),
                             room_clone.clone(),

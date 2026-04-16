@@ -133,6 +133,14 @@ impl APIError {
             engineering_error: None,
         }
     }
+  
+    pub fn invalid_display_name(detail: &str) -> Self {
+        Self {
+            code: "INVALID_DISPLAY_NAME".to_string(),
+            message: format!("Invalid display name: {detail}"),
+            engineering_error: None,
+        }
+    }
 
     pub fn internal_error(detail: &str) -> Self {
         Self {

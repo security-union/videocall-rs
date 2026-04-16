@@ -35,6 +35,7 @@ use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -128,6 +129,10 @@ pub struct ConnectionManagerOptions {
     /// survives reconnects, dies on tab close. Sent to the server so it can
     /// correlate reconnections and silently evict stale sessions.
     pub instance_id: String,
+    /// Shared signal set to `true` when a re-election completes. The camera
+    /// encoder reads this to suppress false crash ceiling arming during server
+    /// swaps. Owned externally (by `VideoCallClient`) so it survives reconnections.
+    pub reelection_completed_signal: Rc<AtomicBool>,
 }
 
 /// Tracks the state of automatic reconnection after connection loss.
@@ -213,6 +218,11 @@ pub struct ConnectionManager {
     /// Previous counter values for rate calculation
     prev_packets_received: Rc<RefCell<u64>>,
     prev_packets_sent: Rc<RefCell<u64>>,
+    /// Signal set to `true` when a re-election completes successfully (new
+    /// winner elected or old connection retained after abort). The camera
+    /// encoder's control loop checks this to suppress crash ceiling arming
+    /// during server-swap transients.
+    reelection_completed_signal: Rc<AtomicBool>,
 }
 
 impl ConnectionManager {
@@ -227,6 +237,8 @@ impl ConnectionManager {
         info!("ConnectionManager starting with {total_servers} servers");
 
         let rtt_responses = Rc::new(RefCell::new(Vec::new()));
+
+        let reelection_completed_signal = options.reelection_completed_signal.clone();
 
         let manager = Self {
             connections: HashMap::new(),
@@ -262,6 +274,7 @@ impl ConnectionManager {
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
             prev_packets_received: Rc::new(RefCell::new(0)),
             prev_packets_sent: Rc::new(RefCell::new(0)),
+            reelection_completed_signal,
         };
 
         Ok(manager)
@@ -887,6 +900,11 @@ impl ConnectionManager {
                             self.old_active_is_webtransport = None;
                             self.pending_session_ids.borrow_mut().clear();
 
+                            // Signal re-election completion so the camera encoder
+                            // can suppress false crash ceiling arming.
+                            self.reelection_completed_signal
+                                .store(true, Ordering::Release);
+
                             info!(
                                 "Re-election fallback: baseline rebased to {:.1}ms, \
                                  monitoring resumes on existing connection",
@@ -994,6 +1012,10 @@ impl ConnectionManager {
                 // connection now that the new winner is carrying traffic.
                 if let Some((old_id, old_conn)) = self.old_active_connection.take() {
                     info!("Re-election complete: closing old active connection {old_id}");
+                    // Signal re-election completion so the camera encoder
+                    // can suppress false crash ceiling arming.
+                    self.reelection_completed_signal
+                        .store(true, Ordering::Release);
                     drop(old_conn);
                 }
 
@@ -1500,6 +1522,15 @@ impl ConnectionManager {
     #[allow(dead_code)]
     pub fn is_reelection_in_progress(&self) -> bool {
         self.reelection_in_progress
+    }
+
+    /// Returns the shared re-election completed signal.
+    ///
+    /// The camera encoder reads and clears this flag each tick to call
+    /// `notify_reelection_completed()` on the quality manager, suppressing
+    /// false crash ceiling arming during server swaps.
+    pub fn reelection_completed_signal(&self) -> Rc<AtomicBool> {
+        self.reelection_completed_signal.clone()
     }
 
     /// Returns the total number of configured servers (WebSocket + WebTransport).
@@ -2149,6 +2180,7 @@ mod tests {
             peer_monitor: Callback::from(|_: ()| {}),
             election_period_ms: 3000,
             instance_id: "test-instance-id".to_string(),
+            reelection_completed_signal: Rc::new(AtomicBool::new(false)),
         };
 
         ConnectionManager {
@@ -2185,6 +2217,7 @@ mod tests {
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
             prev_packets_received: Rc::new(RefCell::new(0)),
             prev_packets_sent: Rc::new(RefCell::new(0)),
+            reelection_completed_signal: Rc::new(AtomicBool::new(false)),
         }
     }
 

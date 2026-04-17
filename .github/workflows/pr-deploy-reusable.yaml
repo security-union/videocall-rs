@@ -567,18 +567,15 @@ jobs:
 
           echo "✅ Dioxus UI deployed to slot ${SLOT}"
 
-      - name: Verify rollout status
+      - name: Wait for all pods to be ready
         run: |
           SLOT=${{ steps.assign-slot.outputs.SLOT }}
           NAMESPACE="preview-slot-${SLOT}"
-          PR_NUM=${{ inputs.pr_number }}
 
-          echo "Verifying rollout status for slot ${SLOT}..."
-          kubectl rollout status deployment/websocket-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
-          kubectl rollout status deployment/api-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
-          kubectl rollout status deployment/ui-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
-          kubectl rollout status deployment/dx-pr-${PR_NUM} -n ${NAMESPACE} --timeout=180s
-          echo "✅ All deployments rolled out in slot ${SLOT}"
+          echo "Waiting for all pods to be ready in slot ${SLOT}..."
+          kubectl wait --for=condition=ready pod --all -n ${NAMESPACE} --timeout=180s
+
+          echo "✅ All pods ready in slot ${SLOT}"
 
       - name: Get deployment status
         id: deployment-status

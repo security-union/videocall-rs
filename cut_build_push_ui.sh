@@ -18,8 +18,7 @@ if ! docker build -t "$DIOXUS_IMAGE_URL" \
     --build-arg BUILD_TIMESTAMP="$BUILD_TIMESTAMP" \
     -f Dockerfile.dioxus .; then
     echo "Failed to build dioxus-ui"
-    exit 1
+else
+    docker push "$DIOXUS_IMAGE_URL"
+    echo "New image uploaded to ${DIOXUS_IMAGE_URL}"
 fi
-
-docker push "$DIOXUS_IMAGE_URL"
-echo "Pushed ${DIOXUS_IMAGE_URL}"

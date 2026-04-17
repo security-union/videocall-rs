@@ -1220,6 +1220,9 @@ mod tests {
             nats: None,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
+            display_name_rate_limiter: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 

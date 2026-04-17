@@ -66,6 +66,9 @@ pub fn build_app(pool: PgPool) -> Router {
         nats: None,
         service_version_urls: Vec::new(),
         http_client: reqwest::Client::new(),
+        display_name_rate_limiter: std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     };
     routes::router().with_state(state)
 }

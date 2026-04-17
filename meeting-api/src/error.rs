@@ -104,6 +104,13 @@ impl AppError {
         )
     }
 
+    pub fn rate_limit_exceeded() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            APIError::rate_limit_exceeded(),
+        )
+    }
+
     pub fn internal(detail: &str) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

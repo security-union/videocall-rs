@@ -13,11 +13,14 @@
 
 //! Shared application state passed to every Axum handler via `State`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::config::{Config, OAuthConfig};
 use crate::oauth::JwksCache;
 use sqlx::PgPool;
+use tokio::sync::Mutex;
 
 /// Application state shared across all request handlers.
 #[derive(Clone)]
@@ -49,6 +52,9 @@ pub struct AppState {
     pub service_version_urls: Vec<String>,
     /// Shared HTTP client for outbound requests (e.g. version fan-out).
     pub http_client: reqwest::Client,
+    /// In-memory per-user rename rate limiter.
+    /// Each entry: (window_start, count) for a 60-second sliding window.
+    pub display_name_rate_limiter: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
 }
 
 impl AppState {
@@ -86,6 +92,7 @@ impl AppState {
                 .timeout(std::time::Duration::from_secs(3))
                 .build()
                 .expect("failed to build reqwest client"),
+            display_name_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

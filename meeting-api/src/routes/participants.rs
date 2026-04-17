@@ -160,8 +160,7 @@ pub async fn join_meeting(
         // Atomically check waiting_room_enabled and insert participant in one
         // transaction, using FOR UPDATE to serialize against concurrent toggles.
         let (auto_admitted, row, wr_enabled) =
-            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name)
-            .await?;
+            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name).await?;
 
         let token = if auto_admitted {
             Some(generate_room_token(
@@ -278,6 +277,24 @@ pub async fn update_display_name(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateDisplayNameRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    // Rate-limit: 5 renames per 60-second window per user.
+    {
+        const MAX_RENAMES: u32 = 5;
+        const WINDOW_SECS: u64 = 60;
+        let mut limiter = state.display_name_rate_limiter.lock().await;
+        let entry = limiter
+            .entry(user_id.clone())
+            .or_insert_with(|| (std::time::Instant::now(), 0));
+        if entry.0.elapsed().as_secs() >= WINDOW_SECS {
+            *entry = (std::time::Instant::now(), 1);
+        } else {
+            entry.1 += 1;
+            if entry.1 > MAX_RENAMES {
+                return Err(AppError::rate_limit_exceeded());
+            }
+        }
+    }
+
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;

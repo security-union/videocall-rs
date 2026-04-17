@@ -17,8 +17,8 @@
   // ---------------------------------------------------------------------------
   // State
   // ---------------------------------------------------------------------------
-  var BUFFER_CAP = 5000;
-  var BUFFER_BYTE_BUDGET = 512 * 1024; // 512 KB — flush before hitting the 1 MB server limit
+  var BUFFER_CAP = 10000;
+  var BUFFER_BYTE_BUDGET = 768 * 1024; // 768 KB — flush before hitting the 1 MB server limit
   var UPLOAD_INTERVAL_MS = 30000;
 
   var buffer = [];
@@ -31,6 +31,26 @@
   var preambleWritten = false;
   var uploadTimer = null;
   var uploadInFlight = false;
+  var nextSeq = 0;
+
+  var highEntropyPlatform = null;
+
+  if (navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === "function") {
+    try {
+      navigator.userAgentData.getHighEntropyValues(["platform", "platformVersion"])
+        .then(function (ua) {
+          var pv = ua.platformVersion || "";
+          var major = parseInt(pv.split(".")[0], 10);
+          if (ua.platform === "Windows" && !isNaN(major)) {
+            highEntropyPlatform = major >= 13 ? "Windows 11" : "Windows 10";
+            highEntropyPlatform += " (platformVersion=" + pv + ")";
+          } else if (ua.platform) {
+            highEntropyPlatform = ua.platform + " " + pv;
+          }
+        })
+        .catch(function () {});
+    } catch (_) {}
+  }
 
   // ---------------------------------------------------------------------------
   // PII / secret scrubbing (best-effort, pattern-based)
@@ -89,6 +109,7 @@
 
   function pushEntry(level, args) {
     var entry = JSON.stringify({
+      seq: nextSeq++,
       ts: new Date().toISOString(),
       level: level,
       msg: stringify(args),
@@ -99,9 +120,18 @@
     // Evict oldest entries if over line cap
     if (buffer.length > BUFFER_CAP) {
       var removed = buffer.splice(0, buffer.length - BUFFER_CAP);
+      var removedCount = removed.length;
       for (var i = 0; i < removed.length; i++) {
         bufferBytes -= removed[i].length + 1;
       }
+      var warnEntry = JSON.stringify({
+        seq: nextSeq++,
+        ts: new Date().toISOString(),
+        level: "warn",
+        msg: "CONSOLE_LOG_COLLECTOR: evicted " + removedCount + " oldest entries (buffer cap=" + BUFFER_CAP + ")"
+      });
+      buffer.push(warnEntry);
+      bufferBytes += warnEntry.length + 1;
     }
 
     // Auto-flush when byte budget is exceeded to prevent 413s from the
@@ -126,12 +156,21 @@
     var heapTotal = mem.jsHeapSizeLimit
       ? Math.round(mem.jsHeapSizeLimit / (1024 * 1024)) + "MB"
       : "N/A";
-    var deviceMemory = nav.deviceMemory
-      ? nav.deviceMemory + " GB"
-      : "N/A";
-    var platform = (nav.userAgentData && nav.userAgentData.platform)
-      ? nav.userAgentData.platform
-      : (nav.platform || "N/A");
+    var deviceMemory;
+    if (nav.deviceMemory) {
+      var capped = (nav.deviceMemory === 8) ? " (browser-capped)" : "";
+      deviceMemory = nav.deviceMemory + " GB" + capped;
+    } else {
+      deviceMemory = "N/A (unsupported)";
+    }
+    var platform;
+    if (highEntropyPlatform) {
+      platform = highEntropyPlatform;
+    } else if (nav.userAgentData && nav.userAgentData.platform) {
+      platform = nav.userAgentData.platform;
+    } else {
+      platform = nav.platform || "N/A";
+    }
     var languages = nav.languages
       ? nav.languages.join(",")
       : (nav.language || "N/A");
@@ -148,6 +187,7 @@
       + "; languages=" + languages;
 
     var entry = JSON.stringify({
+      seq: nextSeq++,
       ts: new Date().toISOString(),
       level: "preamble",
       msg: msg,
@@ -219,9 +259,18 @@
     bufferBytes += entryBytes;
     if (buffer.length > BUFFER_CAP) {
       var removed = buffer.splice(0, buffer.length - BUFFER_CAP);
+      var removedCount = removed.length;
       for (var i = 0; i < removed.length; i++) {
         bufferBytes -= removed[i].length + 1;
       }
+      var warnEntry = JSON.stringify({
+        seq: nextSeq++,
+        ts: new Date().toISOString(),
+        level: "warn",
+        msg: "CONSOLE_LOG_COLLECTOR: evicted " + removedCount + " oldest entries (buffer cap=" + BUFFER_CAP + ")"
+      });
+      buffer.push(warnEntry);
+      bufferBytes += warnEntry.length + 1;
     }
   }
 
@@ -311,6 +360,7 @@
       // Reset so a subsequent hide/unload can flush logs accumulated while
       // the tab was re-activated.
       pageCloseFlushed = false;
+      doUpload(false);
     }
   });
 

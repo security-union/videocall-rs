@@ -22,7 +22,7 @@ use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
 use crate::constants::oauth_enabled;
 use crate::context::{
-    clear_display_name_from_storage, email_to_display_name, is_valid_meeting_id,
+    clear_display_name_from_storage, email_to_display_name, is_guid_like, is_valid_meeting_id,
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
     DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
 };
@@ -100,13 +100,21 @@ pub fn Home() -> Element {
                             // No saved name yet — derive one from the provider profile.
                             let display_name = if profile.name.contains('@') {
                                 email_to_display_name(&profile.name)
+                            } else if is_guid_like(&profile.name) {
+                                if profile.user_id.contains('@') {
+                                    email_to_display_name(&profile.user_id)
+                                } else {
+                                    String::new()
+                                }
                             } else {
                                 profile.name.clone()
                             };
-                            if let Ok(valid_name) = validate_display_name(&display_name) {
-                                save_display_name_to_storage(&valid_name);
-                                display_name_ctx.0.set(Some(valid_name.clone()));
-                                username_value.set(valid_name.clone());
+                            if !display_name.is_empty() {
+                                if let Ok(valid_name) = validate_display_name(&display_name) {
+                                    save_display_name_to_storage(&valid_name);
+                                    display_name_ctx.0.set(Some(valid_name.clone()));
+                                    username_value.set(valid_name.clone());
+                                }
                             }
                         }
                         user_profile.set(Some(profile));

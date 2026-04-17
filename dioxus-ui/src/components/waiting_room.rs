@@ -52,6 +52,7 @@ pub fn WaitingRoom(
         let observer_token = observer_token.clone();
         let meeting_id = meeting_id.clone();
         let user_id = user_id.clone();
+        let display_name = display_name.clone();
         let observer_connected = observer_connected.clone();
         use_effect(move || {
             if observer_token.is_empty() {
@@ -90,7 +91,7 @@ pub fn WaitingRoom(
 
             let opts = VideoCallClientOptions {
                 user_id: user_id.clone(),
-                display_name: String::new(),
+                display_name: display_name.clone(),
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,

@@ -36,8 +36,8 @@ pub struct QualitySnapshot {
     pub bitrate_kbps: u64,
     /// Video frames dropped per second (windowed rate)
     pub decode_errors_per_sec: f64,
-    /// Audio packet loss percentage (0.0-100.0)
-    pub audio_packet_loss_pct: f64,
+    /// Audio concealment percentage (0.0-100.0)
+    pub audio_concealment_pct: f64,
     /// Audio packets received per second (from NetEQ). Near 0 = speaker is silent (DTX).
     pub audio_packets_per_sec: f64,
     /// Average decode latency in ms (optional)
@@ -317,7 +317,7 @@ impl MeetingState {
                     fps,
                     bitrate_kbps,
                     decode_errors_per_sec: peer_stats.frames_dropped_per_sec,
-                    audio_packet_loss_pct: peer_stats.audio_packet_loss_pct,
+                    audio_concealment_pct: peer_stats.audio_concealment_pct,
                     audio_packets_per_sec,
                     avg_decode_latency_ms: peer_stats.avg_decode_latency_ms,
                     audio_quality_score: peer_stats.audio_quality_score,

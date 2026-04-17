@@ -5,7 +5,7 @@ window.__APP_CONFIG = Object.freeze({
   webTransportHost: "https://127.0.0.1:4433",
   oauthEnabled: "false",
   e2eeEnabled: "false",
-  webTransportEnabled: "false",
+  webTransportEnabled: "true",
   firefoxEnabled: "false",
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,
@@ -22,5 +22,7 @@ window.__APP_CONFIG = Object.freeze({
   oauthIssuer: "",
   oauthPrompt: "",
   oauthFlow: "",
-  searchApiBaseUrl: "http://localhost:3000/api/search/v2"
+  searchApiBaseUrl: "http://localhost:3000/api/search/v2",
+  consoleLogUploadEnabled: "false",
+  mockPeersEnabled: "false"
 });

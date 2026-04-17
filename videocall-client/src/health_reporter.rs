@@ -17,17 +17,21 @@
  */
 
 use crate::connection::ConnectionController;
+use crate::decode::peer_decode_manager::keyframe_requests_sent_count;
+use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use log::{debug, warn};
 use protobuf::Message;
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
-    PeerStats as PbPeerStats, VideoStats as PbVideoStats,
+    PeerStats as PbPeerStats, TierDwell as PbTierDwell, TierTransition as PbTierTransition,
+    VideoStats as PbVideoStats,
 };
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -40,7 +44,10 @@ use web_time::{SystemTime, UNIX_EPOCH};
 pub struct PeerHealthData {
     pub peer_id: String,
     pub last_neteq_stats: Option<Value>,
-    pub last_video_stats: Option<Value>,
+    /// Camera video stats (media_type=VIDEO).
+    pub last_camera_stats: Option<Value>,
+    /// Screen share video stats (media_type=SCREEN).
+    pub last_screen_stats: Option<Value>,
     /// Sender's self-reported audio state (from peer heartbeat metadata).
     pub audio_enabled: bool,
     /// Sender's self-reported video state (from peer heartbeat metadata).
@@ -48,8 +55,12 @@ pub struct PeerHealthData {
     pub last_update_ms: u64,
     /// Timestamp of last audio stats update (ms since epoch). 0 = never received.
     pub last_audio_update_ms: u64,
-    /// Timestamp of last video stats update (ms since epoch). 0 = never received.
-    pub last_video_update_ms: u64,
+    /// Timestamp of last camera video stats update (ms since epoch). 0 = never received.
+    pub last_camera_update_ms: u64,
+    /// Timestamp of last screen share stats update (ms since epoch). 0 = never received.
+    pub last_screen_update_ms: u64,
+    /// Cumulative decode error count across the session lifetime.
+    pub decode_errors_total: u64,
 }
 
 impl PeerHealthData {
@@ -57,12 +68,15 @@ impl PeerHealthData {
         Self {
             peer_id,
             last_neteq_stats: None,
-            last_video_stats: None,
+            last_camera_stats: None,
+            last_screen_stats: None,
             audio_enabled: false,
             video_enabled: false,
             last_update_ms: 0,
             last_audio_update_ms: 0,
-            last_video_update_ms: 0,
+            last_camera_update_ms: 0,
+            last_screen_update_ms: 0,
+            decode_errors_total: 0,
         }
     }
 
@@ -76,16 +90,46 @@ impl PeerHealthData {
         self.last_audio_update_ms = now_ms;
     }
 
-    pub fn update_video_stats(&mut self, video_stats: Value) {
-        self.last_video_stats = Some(video_stats);
+    pub fn update_camera_stats(&mut self, video_stats: Value) {
+        self.last_camera_stats = Some(video_stats);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         self.last_update_ms = now_ms;
-        self.last_video_update_ms = now_ms;
+        self.last_camera_update_ms = now_ms;
+    }
+
+    pub fn update_screen_stats(&mut self, video_stats: Value) {
+        self.last_screen_stats = Some(video_stats);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_update_ms = now_ms;
+        self.last_screen_update_ms = now_ms;
     }
 }
+
+/// Snapshot of climb-rate limiter state, updated by the encoder each tick.
+#[derive(Debug, Clone, Default)]
+pub struct ClimbLimiterSnapshot {
+    pub crash_ceiling_active: bool,
+    pub crash_ceiling_tier_index: Option<u32>,
+    pub crash_ceiling_decay_ms: Option<f64>,
+    pub step_up_blocked_ceiling: u64,
+    pub step_up_blocked_slowdown: u64,
+    pub step_up_blocked_screen_share: u64,
+}
+
+/// Shared buffer of tier transition records from camera and screen encoders.
+type TierTransitionBuffers = Rc<RefCell<Vec<Rc<RefCell<Vec<TierTransitionRecord>>>>>>;
+
+/// Shared climb-rate limiter snapshot (double-wrapped for late binding).
+type SharedClimbLimiterSnapshot = Rc<RefCell<Rc<RefCell<ClimbLimiterSnapshot>>>>;
+
+/// Shared dwell-time sample buffer (double-wrapped for late binding).
+type SharedDwellSamples = Rc<RefCell<Rc<RefCell<Vec<(String, f64)>>>>>;
 
 /// Health reporter that collects diagnostics and sends health packets
 #[derive(Debug)]
@@ -103,6 +147,37 @@ pub struct HealthReporter {
     active_server_type: Rc<RefCell<Option<String>>>,
     active_server_rtt_ms: Rc<RefCell<Option<f64>>>,
     connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
+    /// Adaptive video tier index from CameraEncoder (0=best, 7=minimal).
+    /// Wrapped in RefCell so `set_adaptive_tier_sources` (called after
+    /// `start_health_reporting`) can swap the inner Rc and the spawned loop
+    /// picks up the new atomic on its next tick.
+    adaptive_video_tier: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Adaptive audio tier index from CameraEncoder (0=high, 3=emergency).
+    adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder fps_ratio (f32 bits in AtomicU32). Wrapped in RefCell for late binding.
+    encoder_fps_ratio: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder worst peer FPS (f32 bits in AtomicU32).
+    encoder_worst_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder bitrate_ratio (f32 bits in AtomicU32).
+    encoder_bitrate_ratio: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder PID target bitrate kbps (f32 bits in AtomicU32).
+    encoder_target_bitrate_kbps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Screen share quality tier index.
+    adaptive_screen_tier: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Screen sharing active flag.
+    screen_sharing_active: Rc<RefCell<Rc<AtomicBool>>>,
+    /// Encoder output FPS (camera).
+    encoder_output_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Shared tier transition buffers (camera + screen, drained each health packet).
+    tier_transitions: TierTransitionBuffers,
+    /// Climb-rate limiter snapshot, updated by the encoder each tick.
+    /// Double-wrapped so `set_encoder_metric_sources` (called after
+    /// `start_health_reporting`) can swap the inner Rc and the spawned loop
+    /// picks up the encoder's buffer on its next tick.
+    climb_limiter_snapshot: SharedClimbLimiterSnapshot,
+    /// Dwell time samples buffer, drained each health packet.
+    /// Double-wrapped for the same late-binding reason as `climb_limiter_snapshot`.
+    dwell_samples: SharedDwellSamples,
 }
 
 impl HealthReporter {
@@ -122,6 +197,22 @@ impl HealthReporter {
             active_server_type: Rc::new(RefCell::new(None)),
             active_server_rtt_ms: Rc::new(RefCell::new(None)),
             connection_controller: Rc::new(RefCell::new(None)),
+            adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_fps_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(f32::NAN.to_bits())))),
+            encoder_worst_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_bitrate_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(
+                f32::NAN.to_bits(),
+            )))),
+            encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
+            encoder_output_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            tier_transitions: Rc::new(RefCell::new(Vec::new())),
+            climb_limiter_snapshot: Rc::new(RefCell::new(Rc::new(RefCell::new(
+                ClimbLimiterSnapshot::default(),
+            )))),
+            dwell_samples: Rc::new(RefCell::new(Rc::new(RefCell::new(Vec::new())))),
         }
     }
 
@@ -169,6 +260,46 @@ impl HealthReporter {
     /// Set the connection controller reference for communication metrics
     pub fn set_connection_controller(&self, connection_controller: Rc<ConnectionController>) {
         *self.connection_controller.borrow_mut() = Some(connection_controller);
+    }
+
+    /// Bind the adaptive quality tier atomics from a CameraEncoder so the
+    /// health reporter can include the current encoding tiers in each packet.
+    pub fn set_adaptive_tier_sources(
+        &mut self,
+        video_tier: Rc<AtomicU32>,
+        audio_tier: Rc<AtomicU32>,
+    ) {
+        *self.adaptive_video_tier.borrow_mut() = video_tier;
+        *self.adaptive_audio_tier.borrow_mut() = audio_tier;
+    }
+
+    /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder so the
+    /// health reporter can include encoder decision inputs in each health packet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_encoder_metric_sources(
+        &mut self,
+        fps_ratio: Rc<AtomicU32>,
+        worst_peer_fps: Rc<AtomicU32>,
+        bitrate_ratio: Rc<AtomicU32>,
+        target_bitrate_kbps: Rc<AtomicU32>,
+        screen_tier: Rc<AtomicU32>,
+        screen_active: Rc<AtomicBool>,
+        output_fps: Rc<AtomicU32>,
+        camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
+        dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
+    ) {
+        *self.encoder_fps_ratio.borrow_mut() = fps_ratio;
+        *self.encoder_worst_peer_fps.borrow_mut() = worst_peer_fps;
+        *self.encoder_bitrate_ratio.borrow_mut() = bitrate_ratio;
+        *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
+        *self.adaptive_screen_tier.borrow_mut() = screen_tier;
+        *self.screen_sharing_active.borrow_mut() = screen_active;
+        *self.encoder_output_fps.borrow_mut() = output_fps;
+        *self.tier_transitions.borrow_mut() = vec![camera_transitions, screen_transitions];
+        *self.climb_limiter_snapshot.borrow_mut() = climb_limiter_snapshot;
+        *self.dwell_samples.borrow_mut() = dwell_samples;
     }
 
     /// Start subscribing to real diagnostics events via videocall_diagnostics
@@ -360,8 +491,19 @@ impl HealthReporter {
                     .entry(target_peer.to_string())
                     .or_insert_with(|| PeerHealthData::new(target_peer.to_string()));
 
-                // Extract video stats from metrics
-                let mut video_stats = match &peer_data.last_video_stats {
+                // Determine if this is camera or screen based on media_type metric.
+                let is_screen = event.metrics.iter().any(|m| {
+                    m.name == "media_type"
+                        && matches!(&m.value, MetricValue::Text(s) if s == "SCREEN")
+                });
+
+                // Pick the right stats bucket (camera or screen).
+                let existing = if is_screen {
+                    &peer_data.last_screen_stats
+                } else {
+                    &peer_data.last_camera_stats
+                };
+                let mut video_stats = match existing {
                     Some(Value::Object(map)) => Value::Object(map.clone()),
                     _ => json!({}),
                 };
@@ -394,6 +536,11 @@ impl HealthReporter {
                                 video_stats["decode_errors_per_sec"] = json!(error_rate);
                             }
                         }
+                        "decode_errors_total" => {
+                            if let MetricValue::U64(total) = &metric.value {
+                                peer_data.decode_errors_total = *total;
+                            }
+                        }
                         "bitrate_kbps" => match &metric.value {
                             MetricValue::U64(bitrate) => {
                                 video_stats["bitrate_kbps"] = json!(bitrate);
@@ -407,8 +554,13 @@ impl HealthReporter {
                     }
                 }
 
-                peer_data.update_video_stats(video_stats);
-                debug!("Updated video health for peer: {target_peer}");
+                if is_screen {
+                    peer_data.update_screen_stats(video_stats);
+                    debug!("Updated screen health for peer: {target_peer}");
+                } else {
+                    peer_data.update_camera_stats(video_stats);
+                    debug!("Updated camera health for peer: {target_peer}");
+                }
             }
         }
     }
@@ -433,6 +585,18 @@ impl HealthReporter {
         let active_server_type = Rc::downgrade(&self.active_server_type);
         let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
         let connection_controller = Rc::downgrade(&self.connection_controller);
+        let adaptive_video_tier = self.adaptive_video_tier.clone();
+        let adaptive_audio_tier = self.adaptive_audio_tier.clone();
+        let encoder_fps_ratio = self.encoder_fps_ratio.clone();
+        let encoder_worst_peer_fps = self.encoder_worst_peer_fps.clone();
+        let encoder_bitrate_ratio = self.encoder_bitrate_ratio.clone();
+        let encoder_target_bitrate_kbps = self.encoder_target_bitrate_kbps.clone();
+        let adaptive_screen_tier = self.adaptive_screen_tier.clone();
+        let screen_sharing_active = self.screen_sharing_active.clone();
+        let encoder_output_fps = self.encoder_output_fps.clone();
+        let tier_transitions = self.tier_transitions.clone();
+        let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
+        let dwell_samples = self.dwell_samples.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -485,6 +649,53 @@ impl HealthReporter {
                                 (None, None, None)
                             };
 
+                        // Read encoder decision inputs from shared atomics (f32 bits → f64).
+                        let fps_ratio_val =
+                            f32::from_bits(encoder_fps_ratio.borrow().load(Ordering::Relaxed))
+                                as f64;
+                        let worst_peer_fps_val =
+                            f32::from_bits(encoder_worst_peer_fps.borrow().load(Ordering::Relaxed))
+                                as f64;
+                        let bitrate_ratio_val =
+                            f32::from_bits(encoder_bitrate_ratio.borrow().load(Ordering::Relaxed))
+                                as f64;
+                        let target_bitrate_kbps_val = f32::from_bits(
+                            encoder_target_bitrate_kbps.borrow().load(Ordering::Relaxed),
+                        ) as f64;
+                        let screen_tier_val = adaptive_screen_tier.borrow().load(Ordering::Relaxed);
+                        let screen_active_val =
+                            screen_sharing_active.borrow().load(Ordering::Relaxed);
+                        let output_fps_val = encoder_output_fps.borrow().load(Ordering::Relaxed);
+
+                        // Drain tier transitions from all encoder buffers.
+                        let mut drained_transitions = Vec::new();
+                        if let Ok(buffers) = tier_transitions.try_borrow() {
+                            for buf in buffers.iter() {
+                                if let Ok(mut t) = buf.try_borrow_mut() {
+                                    drained_transitions.append(&mut *t);
+                                }
+                            }
+                        }
+
+                        // Snapshot climb-rate limiter state (double-wrap: outer then inner).
+                        let limiter_snap = climb_limiter_snapshot
+                            .try_borrow()
+                            .ok()
+                            .and_then(|outer| outer.try_borrow().ok().map(|s| s.clone()))
+                            .unwrap_or_default();
+
+                        // Drain dwell samples (double-wrap: outer then inner).
+                        let drained_dwells: Vec<(String, f64)> = dwell_samples
+                            .try_borrow()
+                            .ok()
+                            .and_then(|outer| {
+                                outer
+                                    .try_borrow_mut()
+                                    .ok()
+                                    .map(|mut d| std::mem::take(&mut *d))
+                            })
+                            .unwrap_or_default();
+
                         let health_packet = Self::create_health_packet(
                             &session_id_val,
                             &meeting_id,
@@ -499,6 +710,21 @@ impl HealthReporter {
                             send_queue_bytes,
                             packets_received_per_sec,
                             packets_sent_per_sec,
+                            adaptive_video_tier.borrow().load(Ordering::Relaxed),
+                            adaptive_audio_tier.borrow().load(Ordering::Relaxed),
+                            videocall_transport::webtransport::datagram_drop_count(),
+                            videocall_transport::websocket::websocket_drop_count(),
+                            keyframe_requests_sent_count(),
+                            fps_ratio_val,
+                            worst_peer_fps_val,
+                            bitrate_ratio_val,
+                            target_bitrate_kbps_val,
+                            screen_tier_val,
+                            screen_active_val,
+                            output_fps_val,
+                            drained_transitions,
+                            limiter_snap,
+                            drained_dwells,
                         );
 
                         if let Some(packet) = health_packet {
@@ -530,6 +756,21 @@ impl HealthReporter {
         send_queue_bytes: Option<u64>,
         packets_received_per_sec: Option<f64>,
         packets_sent_per_sec: Option<f64>,
+        adaptive_video_tier: u32,
+        adaptive_audio_tier: u32,
+        datagram_drops_total: u64,
+        websocket_drops_total: u64,
+        keyframe_requests_sent_total: u64,
+        encoder_fps_ratio: f64,
+        encoder_worst_peer_fps: f64,
+        encoder_bitrate_ratio: f64,
+        encoder_target_bitrate_kbps: f64,
+        adaptive_screen_tier: u32,
+        screen_sharing_active: bool,
+        encoder_output_fps: u32,
+        tier_transitions: Vec<TierTransitionRecord>,
+        climb_limiter: ClimbLimiterSnapshot,
+        dwell_samples: Vec<(String, f64)>,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -565,6 +806,71 @@ impl HealthReporter {
         pb.send_queue_bytes = send_queue_bytes;
         pb.packets_received_per_sec = packets_received_per_sec;
         pb.packets_sent_per_sec = packets_sent_per_sec;
+
+        // Receiver-side metrics: adaptive quality and transport health
+        pb.adaptive_video_tier = Some(adaptive_video_tier);
+        pb.adaptive_audio_tier = Some(adaptive_audio_tier);
+        pb.datagram_drops_total = Some(datagram_drops_total);
+        pb.websocket_drops_total = Some(websocket_drops_total);
+        pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
+
+        // Encoder decision inputs (P0)
+        if encoder_fps_ratio.is_finite() {
+            pb.encoder_fps_ratio = Some(encoder_fps_ratio);
+        }
+        if encoder_worst_peer_fps.is_finite() {
+            pb.encoder_worst_peer_fps = Some(encoder_worst_peer_fps);
+        }
+        pb.adaptive_screen_tier = Some(adaptive_screen_tier);
+        pb.screen_sharing_active = Some(screen_sharing_active);
+
+        // Encoder outputs (P1)
+        // encoder_output_fps uses > 0 (not is_finite) because 0 means the encoder
+        // hasn't started yet, which isn't diagnostic. The other encoder metrics
+        // allow 0.0 through because a zero ratio/bitrate IS the diagnostic signal.
+        if encoder_output_fps > 0 {
+            pb.encoder_output_fps = Some(encoder_output_fps);
+        }
+        if encoder_target_bitrate_kbps.is_finite() {
+            pb.encoder_target_bitrate_kbps = Some(encoder_target_bitrate_kbps);
+        }
+        if encoder_bitrate_ratio.is_finite() {
+            pb.encoder_bitrate_ratio = Some(encoder_bitrate_ratio);
+        }
+
+        // Tier transition events (P2)
+        for t in &tier_transitions {
+            let mut pb_t = PbTierTransition::new();
+            pb_t.direction = t.direction.to_string();
+            pb_t.stream = t.stream.to_string();
+            pb_t.from_tier = t.from_tier.clone();
+            pb_t.to_tier = t.to_tier.clone();
+            pb_t.trigger = t.trigger.to_string();
+            pb.tier_transitions.push(pb_t);
+        }
+
+        // Climb-rate limiter telemetry (PR-H)
+        pb.crash_ceiling_active = Some(climb_limiter.crash_ceiling_active);
+        if climb_limiter.crash_ceiling_active {
+            pb.crash_ceiling_tier_index = climb_limiter.crash_ceiling_tier_index;
+            pb.crash_ceiling_decay_ms = climb_limiter.crash_ceiling_decay_ms;
+        }
+        // Only emit blocked counters when non-zero to reduce packet size.
+        if climb_limiter.step_up_blocked_ceiling > 0 {
+            pb.step_up_blocked_ceiling = Some(climb_limiter.step_up_blocked_ceiling);
+        }
+        if climb_limiter.step_up_blocked_slowdown > 0 {
+            pb.step_up_blocked_slowdown = Some(climb_limiter.step_up_blocked_slowdown);
+        }
+        if climb_limiter.step_up_blocked_screen_share > 0 {
+            pb.step_up_blocked_screen_share = Some(climb_limiter.step_up_blocked_screen_share);
+        }
+        for (tier_label, dwell_ms) in &dwell_samples {
+            let mut pb_d = PbTierDwell::new();
+            pb_d.tier = tier_label.clone();
+            pb_d.dwell_ms = *dwell_ms;
+            pb.tier_dwells.push(pb_d);
+        }
 
         // Tab visibility and throttling
         #[cfg(target_arch = "wasm32")]
@@ -613,8 +919,11 @@ impl HealthReporter {
             // emitting DiagEvents when no frames arrive, so timestamps stop advancing).
             let audio_fresh = health_data.last_audio_update_ms > 0
                 && now_ms.saturating_sub(health_data.last_audio_update_ms) < STATS_STALE_MS;
-            let video_fresh = health_data.last_video_update_ms > 0
-                && now_ms.saturating_sub(health_data.last_video_update_ms) < STATS_STALE_MS;
+            let camera_fresh = health_data.last_camera_update_ms > 0
+                && now_ms.saturating_sub(health_data.last_camera_update_ms) < STATS_STALE_MS;
+            let video_fresh = camera_fresh
+                || (health_data.last_screen_update_ms > 0
+                    && now_ms.saturating_sub(health_data.last_screen_update_ms) < STATS_STALE_MS);
 
             let mut ps = PbPeerStats::new();
             // can_listen/can_see: receiver-observed. True only while stream is fresh.
@@ -665,7 +974,7 @@ impl HealthReporter {
                 // Clamp to 0–100: packet loss cannot exceed 100% by definition,
                 // and unsynchronised window rollovers can momentarily inflate it.
                 if packets_per_sec >= 2.0 {
-                    ps.audio_packet_loss_pct =
+                    ps.audio_concealment_pct =
                         ((expand_per_sec / packets_per_sec) * 100.0).clamp(0.0, 100.0);
                 }
 
@@ -718,8 +1027,8 @@ impl HealthReporter {
                 ps.neteq_stats = ::protobuf::MessageField::some(ns);
             }
 
-            // Video mapping
-            if let Some(video) = &health_data.last_video_stats {
+            // Camera video mapping (backward compat: goes into existing video_stats field)
+            if let Some(video) = &health_data.last_camera_stats {
                 let mut vs = PbVideoStats::new();
                 if let Some(v) = video.get("fps_received").and_then(|v| v.as_f64()) {
                     vs.fps_received = v;
@@ -735,12 +1044,35 @@ impl HealthReporter {
                 }
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 
-                // Extract decode_errors_per_sec (windowed rate) from video stats
+                // Extract decode_errors_per_sec (windowed rate) from camera video stats
                 if let Some(error_rate) =
                     video.get("decode_errors_per_sec").and_then(|v| v.as_f64())
                 {
                     ps.frames_dropped_per_sec = error_rate;
                 }
+            }
+
+            // Screen share video mapping (new field, separate from camera)
+            if let Some(screen) = &health_data.last_screen_stats {
+                let mut svs = PbVideoStats::new();
+                if let Some(v) = screen.get("fps_received").and_then(|v| v.as_f64()) {
+                    svs.fps_received = v;
+                }
+                if let Some(v) = screen.get("frames_buffered").and_then(|v| v.as_f64()) {
+                    svs.frames_buffered = v;
+                }
+                if let Some(v) = screen.get("frames_decoded").and_then(|v| v.as_u64()) {
+                    svs.frames_decoded = v;
+                }
+                if let Some(v) = screen.get("bitrate_kbps").and_then(|v| v.as_u64()) {
+                    svs.bitrate_kbps = v;
+                }
+                ps.screen_video_stats = ::protobuf::MessageField::some(svs);
+            }
+
+            // Cumulative decode error count (only set if > 0 to avoid noise)
+            if health_data.decode_errors_total > 0 {
+                ps.decoder_errors_total = Some(health_data.decode_errors_total);
             }
 
             // ── Quality scores ─────────────────────────────────────────────
@@ -762,7 +1094,7 @@ impl HealthReporter {
                     .and_then(|net| net.operation_counters.as_ref())
                     .map(|oc| oc.expand_per_sec)
                     .unwrap_or(0.0);
-                let loss = ps.audio_packet_loss_pct;
+                let loss = ps.audio_concealment_pct;
 
                 // Penalties sum to 100 max.
                 // Jitter (target_delay_ms) is intentionally excluded: in this stack it

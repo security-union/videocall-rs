@@ -165,11 +165,30 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 /// down to 360p/240p if constrained.
 pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 
+/// Label of the video quality tier to use as camera ceiling during screen sharing.
+///
+/// When screen share starts, the camera is forced to this tier and capped here
+/// to avoid bandwidth contention on the shared connection. Resolved by label
+/// (not index) so the ceiling is correct regardless of how many tiers exist.
+const SCREEN_SHARE_CAMERA_CEILING_LABEL: &str = "low";
+
+/// Resolve the camera tier ceiling index for screen sharing.
+///
+/// Looks up `SCREEN_SHARE_CAMERA_CEILING_LABEL` in `VIDEO_QUALITY_TIERS`.
+/// Falls back to second-lowest tier if the label isn't found.
+pub fn screen_share_camera_ceiling_index() -> usize {
+    VIDEO_QUALITY_TIERS
+        .iter()
+        .position(|t| t.label == SCREEN_SHARE_CAMERA_CEILING_LABEL)
+        .unwrap_or_else(|| VIDEO_QUALITY_TIERS.len().saturating_sub(2))
+}
+
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
 /// Screen share starts at "medium" (720p/10fps) — readable content from
-/// the first frame with room to step up to 1080p or down to 480p based
-/// on network conditions.
+/// the first frame with room to step up to 1080p or down to 720p/5fps
+/// based on network conditions. The floor stays at 720p to keep text
+/// readable even at minimum quality.
 pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
 
 // ---------------------------------------------------------------------------
@@ -200,12 +219,12 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
     },
     VideoQualityTier {
         label: "low",
-        max_width: 854,
-        max_height: 480,
+        max_width: 1280,
+        max_height: 720,
         target_fps: 5,
-        ideal_bitrate_kbps: 250,
-        min_bitrate_kbps: 100,
-        max_bitrate_kbps: 400,
+        ideal_bitrate_kbps: 300,
+        min_bitrate_kbps: 150,
+        max_bitrate_kbps: 500,
         keyframe_interval_frames: 25, // ~5s at 5fps
     },
 ];
@@ -263,8 +282,29 @@ pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
 ///
 /// FPS ratio (received/target) below which we step DOWN one video tier.
 pub const VIDEO_TIER_DEGRADE_FPS_RATIO: f64 = 0.50;
+/// Lenient FPS degradation threshold used when `effective_peer_count < 3`.
+///
+/// With fewer than 3 peers, p75 aggregation degenerates (for 1 peer it's
+/// just that peer's value; for 2 peers it's the minimum). A single
+/// struggling peer has outsized influence, so we use a more permissive
+/// threshold to avoid false degradation in small meetings.
+///
+/// **Sender CPU tradeoff:** the lenient threshold keeps the sender encoding
+/// at a higher tier for longer in 1:1 and 2-person calls. On low-power
+/// devices (old Macs with VP9 software encode, budget Chromebooks) this
+/// means more CPU time spent on the encoder before a step-down occurs.
+/// If CPU-bound senders become a problem, tightening this value (toward
+/// the standard 0.50 threshold) trades call quality for sender CPU.
+pub const VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT: f64 = 0.30;
 /// FPS ratio above which we step UP one video tier (must be sustained).
-pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.85;
+///
+/// Lowered from 0.85 to 0.70 for recovery parity with audio (0.60).
+/// At 0.85, video stayed stuck at minimal while audio recovered to high —
+/// the 0.35 gap between degrade (0.50) and recover (0.85) was too wide.
+/// At 0.70 the hysteresis gap is 0.20 (degrade 0.50, recover 0.70),
+/// which still prevents oscillation while allowing video to recover
+/// within a similar window as audio.
+pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.70;
 
 /// Bitrate ratio (actual/ideal) below which we step DOWN one video tier.
 pub const VIDEO_TIER_DEGRADE_BITRATE_RATIO: f64 = 0.40;
@@ -277,6 +317,9 @@ pub const AUDIO_TIER_RECOVER_FPS_RATIO: f64 = 0.60;
 
 /// How long conditions must remain "good" before stepping UP (milliseconds).
 /// Prevents rapid oscillation on unstable connections.
+/// Note: during active recovery slowdown (after a yo-yo crash), this window
+/// is multiplied by `RECOVERY_SLOWDOWN_FACTOR` — see the climb-rate limiter
+/// constants below.
 pub const STEP_UP_STABILIZATION_WINDOW_MS: u64 = 5000;
 
 /// How quickly we step DOWN (milliseconds). Degradation is faster than recovery.
@@ -294,6 +337,80 @@ pub const MIN_TIER_TRANSITION_INTERVAL_MS: u64 = 3000;
 /// aspect-ratio glitches. This warmup period suppresses all tier transitions
 /// until the encoder has had time to produce stable output.
 pub const QUALITY_WARMUP_MS: f64 = 5000.0;
+
+/// Default warmup duration used by `AdaptiveQualityManager::new()`.
+/// Alias for `QUALITY_WARMUP_MS` — exists so future constructors cannot
+/// silently inherit `0.0` by forgetting to set `warmup_ms`.
+pub const DEFAULT_WARMUP_MS: f64 = QUALITY_WARMUP_MS;
+
+/// Screen share warmup grace period (milliseconds).
+///
+/// Longer than camera warmup (5s) because receivers must initialize
+/// on-demand screen decoders, receive the first screen keyframe, and
+/// start reporting non-zero screen FPS. During this window the screen
+/// encoder's feedback is all zeros, which would trigger aggressive
+/// step-downs without the grace period.
+pub const SCREEN_QUALITY_WARMUP_MS: f64 = 8000.0;
+
+// ---------------------------------------------------------------------------
+// Climb-Rate Limiter (PR-H)
+// ---------------------------------------------------------------------------
+// Prevents the adaptive quality system from yo-yoing between max and min
+// quality by imposing two complementary mechanisms:
+//
+// 1. **Crash ceiling** (Option A): after a detected yo-yo (two step-downs
+//    within `YOYO_DETECTION_WINDOW_MS`), a temporary ceiling prevents
+//    recovering past the failure tier. The ceiling lifts one tier at a time
+//    after each decay period, with exponential backoff on repeated crashes.
+//
+// 2. **Recovery slowdown** (Option B): after any ceiling-arming event, the
+//    step-up stabilization window is multiplied by `RECOVERY_SLOWDOWN_FACTOR`,
+//    giving each tier genuine soak time before climbing higher. The slowdown
+//    decays linearly back to 1.0 over `RECOVERY_SLOWDOWN_DECAY_MS`.
+
+/// Base decay period (ms) before the crash ceiling lifts by one tier.
+/// After the ceiling is armed, this is how long the system waits before
+/// allowing recovery to attempt the next-higher tier.
+pub const CLIMB_COOLDOWN_BASE_MS: f64 = 120_000.0; // 2 min
+
+/// Maximum ceiling decay period (ms) after repeated crashes.
+/// The decay period doubles on each re-crash via `CLIMB_COOLDOWN_BACKOFF`
+/// but caps here to prevent indefinite quality lockout.
+pub const CLIMB_COOLDOWN_MAX_MS: f64 = 600_000.0; // 10 min
+
+/// Backoff multiplier applied to the ceiling decay period on each re-crash.
+/// Sequence: 2 min → 4 min → 8 min → 10 min (capped).
+pub const CLIMB_COOLDOWN_BACKOFF: f64 = 2.0;
+
+/// Multiplier applied to `STEP_UP_STABILIZATION_WINDOW_MS` after a yo-yo
+/// crash is detected. Gives each tier longer soak time during recovery,
+/// catching degradation at intermediate tiers before climbing higher.
+pub const RECOVERY_SLOWDOWN_FACTOR: f64 = 2.0;
+
+/// Time (ms) for the recovery slowdown factor to decay linearly from
+/// `RECOVERY_SLOWDOWN_FACTOR` back to 1.0 (normal speed).
+/// Aligned with `CLIMB_COOLDOWN_BASE_MS` cadence so the slowdown expires
+/// around the time the ceiling lifts, avoiding wasted lift attempts.
+pub const RECOVERY_SLOWDOWN_DECAY_MS: f64 = 180_000.0; // 3 min
+
+/// Time (ms) of stable operation (no step-downs) after which crash memory
+/// resets: `ceiling_decay_ms` returns to `CLIMB_COOLDOWN_BASE_MS` and the
+/// slowdown clears. Represents "this meeting is fine now."
+pub const CRASH_MEMORY_RESET_MS: f64 = 600_000.0; // 10 min
+
+/// Window (ms) for yo-yo detection (design decision 1b). A crash ceiling
+/// is only armed when a step-down occurs within this window of a prior
+/// step-down, indicating an oscillation pattern rather than a one-shot
+/// degradation from a legitimate capacity change.
+/// Set to 3 minutes — production yo-yo cycles are 30-60s, so this catches
+/// the pattern within one cycle without false positives on single events.
+pub const YOYO_DETECTION_WINDOW_MS: f64 = 180_000.0; // 3 min
+
+/// Grace period (ms) after a successful server re-election during which
+/// step-downs do NOT arm the crash ceiling. Re-elections cause an FPS
+/// collapse during the server swap that looks like a crash to AQ; without
+/// this suppression the ceiling would cap a genuinely-better path.
+pub const REELECTION_CEILING_SUPPRESSION_MS: f64 = 10_000.0; // 10s
 
 // ---------------------------------------------------------------------------
 // PID Controller Tuning
@@ -364,6 +481,18 @@ pub const KEYFRAME_REQUEST_MAX_UNANSWERED: u32 = 5;
 /// balances recovery against bandwidth cost.
 pub const KEYFRAME_REQUEST_SLOW_RETRY_MS: u64 = 15000;
 
+/// Time (milliseconds) with no packet loss before fully resetting PLI backoff
+/// state. Prevents stale congestion history from penalizing genuinely new loss
+/// events, while keeping backoff elevated during recovery windows where the
+/// network is still fragile.
+pub const KEYFRAME_BACKOFF_DECAY_MS: u64 = 30_000;
+
+/// Minimum interval (milliseconds) between PLI-forced keyframes at the
+/// encoder. Prevents the encoder from being dominated by back-to-back PLI
+/// keyframes during a request storm. Periodic (tier-controlled) keyframes
+/// are NOT subject to this cooldown.
+pub const ENCODER_PLI_COOLDOWN_MS: f64 = 2000.0;
+
 // ---------------------------------------------------------------------------
 // Reconnection
 // ---------------------------------------------------------------------------
@@ -424,6 +553,16 @@ pub const REELECTION_RTT_MIN_THRESHOLD_MS: f64 = 50.0;
 
 /// Number of consecutive degraded RTT samples before triggering re-election.
 pub const REELECTION_CONSECUTIVE_SAMPLES: u32 = 5;
+
+/// Minimum RTT improvement (ms) required for a re-election winner to beat the old active.
+/// Prevents re-election from firing on noise when RTT values are close (hysteresis).
+/// The winner must be at least this many milliseconds better than the old connection.
+pub const REELECTION_MIN_IMPROVEMENT_MS: f64 = 20.0;
+
+/// If the old active RTT exceeds this value (ms), accept any re-election winner
+/// regardless of whether it is better. The connection is so degraded that any
+/// alternative is worth trying.
+pub const REELECTION_CATASTROPHIC_RTT_MS: f64 = 5000.0;
 
 // ---------------------------------------------------------------------------
 // Heartbeat & Polling
@@ -643,6 +782,22 @@ mod tests {
     }
 
     #[test]
+    fn test_screen_share_camera_ceiling_resolves_to_low() {
+        let idx = screen_share_camera_ceiling_index();
+        assert!(
+            idx < VIDEO_QUALITY_TIERS.len(),
+            "screen_share_camera_ceiling_index ({}) out of bounds (len={})",
+            idx,
+            VIDEO_QUALITY_TIERS.len(),
+        );
+        assert_eq!(
+            VIDEO_QUALITY_TIERS[idx].label, "low",
+            "ceiling should resolve to 'low' tier, got '{}' at index {}",
+            VIDEO_QUALITY_TIERS[idx].label, idx,
+        );
+    }
+
+    #[test]
     fn test_default_screen_tier_index_in_bounds() {
         assert!(
             DEFAULT_SCREEN_TIER_INDEX < SCREEN_QUALITY_TIERS.len(),
@@ -800,6 +955,50 @@ mod tests {
             "PID output min ({}) must be < max ({})",
             PID_OUTPUT_MIN,
             PID_OUTPUT_MAX,
+        );
+    }
+
+    // =====================================================================
+    // Climb-rate limiter constant validation
+    // =====================================================================
+
+    #[test]
+    fn test_climb_rate_limiter_constants() {
+        assert!(
+            CLIMB_COOLDOWN_BASE_MS > 0.0,
+            "base cooldown must be positive"
+        );
+        assert!(
+            CLIMB_COOLDOWN_MAX_MS >= CLIMB_COOLDOWN_BASE_MS,
+            "max cooldown ({}) must be >= base ({})",
+            CLIMB_COOLDOWN_MAX_MS,
+            CLIMB_COOLDOWN_BASE_MS,
+        );
+        assert!(
+            CLIMB_COOLDOWN_BACKOFF > 1.0,
+            "backoff multiplier must be > 1.0"
+        );
+        assert!(
+            RECOVERY_SLOWDOWN_FACTOR >= 1.0,
+            "slowdown factor must be >= 1.0"
+        );
+        assert!(
+            RECOVERY_SLOWDOWN_DECAY_MS > 0.0,
+            "slowdown decay must be positive"
+        );
+        assert!(
+            CRASH_MEMORY_RESET_MS >= CLIMB_COOLDOWN_MAX_MS,
+            "crash memory reset ({}) should be >= max cooldown ({}) so ceiling decays before memory resets",
+            CRASH_MEMORY_RESET_MS,
+            CLIMB_COOLDOWN_MAX_MS,
+        );
+        assert!(
+            YOYO_DETECTION_WINDOW_MS > 0.0,
+            "yo-yo window must be positive"
+        );
+        assert!(
+            REELECTION_CEILING_SUPPRESSION_MS > 0.0,
+            "re-election suppression must be positive"
         );
     }
 

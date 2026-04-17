@@ -21,8 +21,9 @@ use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
+use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
-use crate::health_reporter::HealthReporter;
+use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
@@ -34,7 +35,7 @@ use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -144,6 +145,18 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when a remote participant joins the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_JOINED meeting event.
     pub on_peer_joined: Option<Callback<(String, String)>>,
+
+    /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
+    /// silently discarded and no peer decoder workers are created.  Only
+    /// meeting-control packets (MEETING, SESSION_ASSIGNED) are still processed.
+    ///
+    /// Set to `false` for observer clients that only need push notifications
+    /// (e.g. the waiting room or "waiting for meeting to start" screen) so
+    /// that audio from participants already in the call cannot be decoded and
+    /// played back while the local user is not yet admitted.
+    ///
+    /// Should be `true` for call participants; set to `false` only for observer/lobby clients.
+    pub decode_media: bool,
 }
 
 #[derive(Debug)]
@@ -160,6 +173,7 @@ struct InnerOptions {
     on_peer_left: Option<Callback<(String, String)>>,
     on_peer_joined: Option<Callback<(String, String)>>,
     on_display_name_changed: Option<Callback<(String, String)>>,
+    decode_media: bool,
 }
 
 #[derive(Debug)]
@@ -189,6 +203,9 @@ struct Inner {
     /// The camera encoder's diagnostics loop checks this flag and calls
     /// `force_video_step_down()` on the `EncoderBitrateController`.
     congestion_step_down_requested: Arc<AtomicBool>,
+    /// Signal set by `ConnectionManager` when a re-election completes. The
+    /// camera encoder reads and clears this to suppress crash ceiling arming.
+    reelection_completed_signal: Rc<AtomicBool>,
 }
 
 /// The main client handle for a video call session.
@@ -282,6 +299,7 @@ impl VideoCallClient {
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+        let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
         let client = Self {
             options: options.clone(),
@@ -299,6 +317,7 @@ impl VideoCallClient {
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
+                    decode_media: options.decode_media,
                 },
                 connection_controller: connection_controller.clone(),
                 connection_state: ConnectionState::Failed {
@@ -319,6 +338,7 @@ impl VideoCallClient {
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
+                reelection_completed_signal: reelection_completed_signal.clone(),
             })),
             connection_controller,
             aes,
@@ -496,6 +516,7 @@ impl VideoCallClient {
             },
             election_period_ms,
             instance_id: generate_instance_id(),
+            reelection_completed_signal: self.inner.borrow().reelection_completed_signal.clone(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -789,6 +810,64 @@ impl VideoCallClient {
     /// `EncoderBitrateController`.
     pub fn congestion_step_down_flag(&self) -> Arc<AtomicBool> {
         self.inner.borrow().congestion_step_down_requested.clone()
+    }
+
+    /// Returns a shared reference to the re-election completed signal.
+    ///
+    /// Pass this to `CameraEncoder` so that re-election events reach the
+    /// adaptive quality manager's crash ceiling suppression logic.
+    pub fn reelection_completed_signal(&self) -> Rc<AtomicBool> {
+        self.inner.borrow().reelection_completed_signal.clone()
+    }
+
+    /// Bind adaptive quality tier sources from a `CameraEncoder` to the
+    /// health reporter. Call this after creating the camera encoder so the
+    /// health reporter includes the current encoding tiers in each packet.
+    pub fn set_adaptive_tier_sources(&self, video_tier: Rc<AtomicU32>, audio_tier: Rc<AtomicU32>) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(mut reporter) = hr.try_borrow_mut() {
+                    reporter.set_adaptive_tier_sources(video_tier, audio_tier);
+                }
+            }
+        }
+    }
+
+    /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_encoder_metric_sources(
+        &self,
+        fps_ratio: Rc<AtomicU32>,
+        worst_peer_fps: Rc<AtomicU32>,
+        bitrate_ratio: Rc<AtomicU32>,
+        target_bitrate_kbps: Rc<AtomicU32>,
+        screen_tier: Rc<AtomicU32>,
+        screen_active: Rc<AtomicBool>,
+        output_fps: Rc<AtomicU32>,
+        camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
+        dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
+    ) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(mut reporter) = hr.try_borrow_mut() {
+                    reporter.set_encoder_metric_sources(
+                        fps_ratio,
+                        worst_peer_fps,
+                        bitrate_ratio,
+                        target_bitrate_kbps,
+                        screen_tier,
+                        screen_active,
+                        output_fps,
+                        camera_transitions,
+                        screen_transitions,
+                        climb_limiter_snapshot,
+                        dwell_samples,
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn aes(&self) -> Rc<Aes128State> {
@@ -1137,17 +1216,25 @@ impl Inner {
             response.session_id
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
-        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let peer_status =
-            if response.user_id == SYSTEM_USER_ID.as_bytes() || response.session_id == 0 {
-                PeerStatus::NoChange
-            } else {
-                let peer_user_id = String::from_utf8_lossy(&response.user_id);
-                self.peer_decode_manager
-                    .ensure_peer(response.session_id, &peer_user_id)
-            };
+        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0).
+        // Also skip creating peers when media decoding is disabled (observer mode): there
+        // is no point spinning up decoder workers for packets that will be dropped anyway.
+        let peer_status = if response.user_id == SYSTEM_USER_ID.as_bytes()
+            || response.session_id == 0
+            || !self.options.decode_media
+        {
+            PeerStatus::NoChange
+        } else {
+            let peer_user_id = String::from_utf8_lossy(&response.user_id);
+            self.peer_decode_manager
+                .ensure_peer(response.session_id, &peer_user_id)
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
+                // Observer/lobby clients must not receive encryption keys (defense-in-depth).
+                if !self.options.decode_media {
+                    return;
+                }
                 if !self.options.enable_e2ee {
                     return;
                 }
@@ -1176,6 +1263,10 @@ impl Inner {
                 }
             }
             Ok(PacketType::RSA_PUB_KEY) => {
+                // Observer/lobby clients must not receive encryption keys (defense-in-depth).
+                if !self.options.decode_media {
+                    return;
+                }
                 if !self.options.enable_e2ee {
                     return;
                 }
@@ -1217,6 +1308,14 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEDIA) => {
+                // When this client is in observer/lobby mode (decode_media == false),
+                // drop all media packets immediately.  The observer connection is only
+                // used to receive meeting-control push notifications; it must never
+                // decode or play back audio or video from the real call.
+                if !self.options.decode_media {
+                    return;
+                }
+
                 // Check if this is a KEYFRAME_REQUEST targeted at us (the sender).
                 // These arrive as MEDIA packets; we intercept them here before
                 // they reach the peer decode manager which would just skip them.
@@ -1273,7 +1372,11 @@ impl Inner {
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {
                         if let Err(e) = controller.set_own_session_id(response.session_id) {
-                            warn!("Failed to set own_session_id in ConnectionManager: {e}");
+                            // Expected during election: complete_connection_election()
+                            // already set own_session_id before emitting the synthetic
+                            // SESSION_ASSIGNED packet, so the ConnectionManager RefCell
+                            // is still borrowed.
+                            debug!("ConnectionManager already has session_id (borrow conflict during election): {e}");
                         }
                     }
                 }
@@ -1332,14 +1435,16 @@ impl Inner {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()
                             };
 
-                            self.peer_decode_manager.set_peer_display_name_by_user_id(
-                                &target_str,
-                                display_name.clone(),
-                            );
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager.set_peer_display_name(
+                                    meeting_packet.session_id,
+                                    display_name.clone(),
+                                );
+                            }
 
                             // NOTE: Do NOT emit on_display_name_changed here.
                             // PARTICIPANT_JOINED carries the initial display name for bookkeeping
-                            // (set_peer_display_name_by_user_id above), but it is NOT a name-change
+                            // (set_peer_display_name above), but it is NOT a name-change
                             // event.  Emitting the callback here would confuse the UI into treating
                             // every peer join as a display-name mutation — and would spuriously
                             // update the local user's own name signal on reconnect.
@@ -1456,10 +1561,21 @@ impl Inner {
                                 target_str, new_display_name, self.options.user_id
                             );
 
-                            self.peer_decode_manager.set_peer_display_name_by_user_id(
-                                &target_str,
-                                new_display_name.clone(),
-                            );
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager.set_peer_display_name(
+                                    meeting_packet.session_id,
+                                    new_display_name.clone(),
+                                );
+                            } else {
+                                // Server does not populate session_id for display
+                                // name changes — fall back to updating all sessions
+                                // belonging to this user_id. A rename logically
+                                // applies to every session of the same account.
+                                self.peer_decode_manager.set_peer_display_name_by_user_id(
+                                    &target_str,
+                                    new_display_name.clone(),
+                                );
+                            }
 
                             if let Some(cb) = &self.options.on_display_name_changed {
                                 debug!(

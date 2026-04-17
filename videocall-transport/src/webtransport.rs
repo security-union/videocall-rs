@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, Error};
 use futures::channel::oneshot::channel;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, rc::Rc};
 use thiserror::Error as ThisError;
 use videocall_types::Callback;
@@ -16,9 +17,16 @@ use js_sys::{Boolean, JsString, Promise, Reflect, Uint8Array};
 use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
-    WebTransportCloseInfo, WebTransportDatagramDuplexStream, WebTransportReceiveStream,
-    WritableStream,
+    WebTransportDatagramDuplexStream, WebTransportReceiveStream, WritableStream,
 };
+
+/// Cumulative count of datagrams dropped because the writable stream was locked.
+static DATAGRAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of datagrams dropped since process start.
+pub fn datagram_drop_count() -> u64 {
+    DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
+}
 
 /// Represents formatting errors.
 #[derive(Debug, ThisError)]
@@ -129,19 +137,12 @@ impl WebTransportService {
             Self::connect_common(url, &notification)?;
         let transport = Rc::new(transport);
 
-        Self::start_listening_incoming_datagrams(
-            transport.clone(),
-            transport.datagrams(),
-            on_datagram,
-        );
+        Self::start_listening_incoming_datagrams(transport.datagrams(), on_datagram);
         Self::start_listening_incoming_unidirectional_streams(
-            transport.clone(),
             transport.incoming_unidirectional_streams(),
             on_unidirectional_stream,
         );
-
         Self::start_listening_incoming_bidirectional_streams(
-            transport.clone(),
             transport.incoming_bidirectional_streams(),
             on_bidirectional_stream,
         );
@@ -156,7 +157,6 @@ impl WebTransportService {
     }
 
     fn start_listening_incoming_unidirectional_streams(
-        transport: Rc<WebTransport>,
         incoming_streams: ReadableStream,
         callback: Callback<WebTransportReceiveStream>,
     ) {
@@ -166,14 +166,11 @@ impl WebTransportService {
             loop {
                 let read_result = JsFuture::from(read_result.read()).await;
                 match read_result {
-                    Err(e) => {
-                        log!("Failed to read incoming unidirectional streams", &e);
-                        let reason = WebTransportCloseInfo::default();
-                        reason.set_reason(
-                            format!("Failed to read incoming unidirectional streams {e:?}")
-                                .as_str(),
-                        );
-                        transport.close_with_close_info(&reason);
+                    Err(_) => {
+                        // Expected when the transport is closed (Drop or network
+                        // failure).  Don't re-close — the transport is already
+                        // shut down and a redundant close() throws when the
+                        // session is still in "connecting" state.
                         break;
                     }
                     Ok(result) => {
@@ -204,7 +201,6 @@ impl WebTransportService {
     }
 
     fn start_listening_incoming_datagrams(
-        transport: Rc<WebTransport>,
         datagrams: WebTransportDatagramDuplexStream,
         callback: Callback<Vec<u8>>,
     ) {
@@ -214,12 +210,9 @@ impl WebTransportService {
             loop {
                 let read_result = JsFuture::from(incoming_datagrams.read()).await;
                 match read_result {
-                    Err(e) => {
-                        let reason = WebTransportCloseInfo::default();
-                        reason.set_reason(
-                            format!("Failed to read incoming datagrams {e:?}").as_str(),
-                        );
-                        transport.close_with_close_info(&reason);
+                    Err(_) => {
+                        // Expected when the transport is closed (Drop or network
+                        // failure).  Don't re-close — see unidirectional handler.
                         break;
                     }
                     Ok(result) => {
@@ -249,7 +242,6 @@ impl WebTransportService {
     }
 
     fn start_listening_incoming_bidirectional_streams(
-        transport: Rc<WebTransport>,
         streams: ReadableStream,
         callback: Callback<WebTransportBidirectionalStream>,
     ) {
@@ -258,12 +250,9 @@ impl WebTransportService {
             loop {
                 let read_result = JsFuture::from(read_result.read()).await;
                 match read_result {
-                    Err(e) => {
-                        let reason = WebTransportCloseInfo::default();
-                        reason.set_reason(
-                            format!("Failed to read incoming bidirectional streams {e:?}").as_str(),
-                        );
-                        transport.close_with_close_info(&reason);
+                    Err(_) => {
+                        // Expected when the transport is closed (Drop or network
+                        // failure).  Don't re-close — see unidirectional handler.
                         break;
                     }
                     Ok(result) => {
@@ -359,6 +348,7 @@ impl WebTransportTask {
             let stream = transport.datagrams();
             let writable: WritableStream = stream.writable();
             if writable.locked() {
+                DATAGRAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
                 log!("datagram dropped (stream busy)");
                 return;
             }

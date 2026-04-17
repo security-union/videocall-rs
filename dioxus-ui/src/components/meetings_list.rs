@@ -330,7 +330,7 @@ fn MeetingItem(
 async fn do_fetch_meetings() -> Result<ListMeetingsResponse, FetchMeetingsError> {
     let client = meeting_api_client()
         .map_err(|e| FetchMeetingsError::Other(format!("Config error: {e}")))?;
-    client.list_meetings(20, 0).await.map_err(|e| match e {
+    client.list_meetings(20, 0, None).await.map_err(|e| match e {
         videocall_meeting_client::ApiError::NotAuthenticated => FetchMeetingsError::Unauthenticated,
         other => FetchMeetingsError::Other(format!("{other}")),
     })

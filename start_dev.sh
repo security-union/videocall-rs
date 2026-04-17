@@ -14,6 +14,8 @@ export NATS_URL=${NATS_URL:-0.0.0.0:4222}
 export HEALTH_LISTEN_URL=${HEALTH_LISTEN_URL:-0.0.0.0:5321}
 export LISTEN_URL=${LISTEN_URL:-0.0.0.0:4433}
 export DATABASE_URL=${DATABASE_URL:-postgresql://$USER@localhost/actix-api-db}
+export JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
+export COOKIE_SECURE=${COOKIE_SECURE:-false}
 
 server_command="$( ((WEBTRANSPORT_ENABLED)) && echo webtransport_server || echo websocket_server )"
 
@@ -21,6 +23,7 @@ _kill() {
     kill -- -$$
     # the command spawned by cargo watch doesn't get killed with the process group, so kill it explicitly
     pkill -f "$server_command"
+    pkill -f "meeting-api"
 }
 
 trap _kill SIGINT SIGTERM SIGQUIT
@@ -46,6 +49,9 @@ pushd actix-api > /dev/null || exit
 cargo watch -x "run --bin $server_command" &
 ACTIX_PROC=$!
 popd > /dev/null || exit
+
+export MEETING_API_PORT=${MEETING_API_PORT:-8082}
+(cd meeting-api && LISTEN_ADDR=0.0.0.0:${MEETING_API_PORT} cargo watch -x "run --bin meeting-api") &
 
 pushd dioxus-ui > /dev/null || exit
 trunk serve &

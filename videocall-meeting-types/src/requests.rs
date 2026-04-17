@@ -89,6 +89,10 @@ pub struct ListMeetingsQuery {
     /// Number of meetings to skip for pagination. Defaults to 0.
     #[serde(default)]
     pub offset: i64,
+
+    /// Search query for meeting ID, state, or host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -100,6 +104,7 @@ impl Default for ListMeetingsQuery {
         Self {
             limit: default_limit(),
             offset: 0,
+            q: None,
         }
     }
 }

@@ -1,8 +1,9 @@
 window.__APP_CONFIG = Object.freeze({
   apiBaseUrl: "http://localhost:8081",
+  meetingApiBaseUrl: "http://localhost:8082",
   wsUrl: "ws://localhost:8080",
   webTransportHost: "https://127.0.0.1:4433",
-  oauthEnabled: "true",
+  oauthEnabled: "false",
   e2eeEnabled: "false",
   webTransportEnabled: "false",
   firefoxEnabled: "false",
@@ -20,5 +21,6 @@ window.__APP_CONFIG = Object.freeze({
   oauthTokenUrl: "",
   oauthIssuer: "",
   oauthPrompt: "",
-  oauthFlow: ""
+  oauthFlow: "",
+  searchApiBaseUrl: "http://localhost:3000/api/search/v2"
 });

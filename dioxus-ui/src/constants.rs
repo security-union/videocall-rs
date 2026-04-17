@@ -92,6 +92,11 @@ pub struct RuntimeConfig {
     #[serde(rename = "oauthFlow")]
     #[serde(default)]
     pub oauth_flow: Option<String>,
+    /// SearchV2 middleware base URL (e.g. "http://localhost:3000/api/search/v2").
+    /// When absent, the SearchModal falls back to the meeting-api Postgres search.
+    #[serde(rename = "searchApiBaseUrl")]
+    #[serde(default)]
+    pub search_api_base_url: Option<String>,
     #[serde(rename = "serverElectionPeriodMs")]
     pub server_election_period_ms: u64,
     #[serde(rename = "audioBitrateKbps")]
@@ -149,6 +154,10 @@ pub fn split_users(s: Option<&str>) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+pub fn search_api_base_url() -> Result<Option<String>, String> {
+    app_config().map(|c| c.search_api_base_url)
 }
 
 pub fn login_url() -> Result<String, String> {

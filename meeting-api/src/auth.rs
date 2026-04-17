@@ -106,16 +106,56 @@ impl FromRequestParts<AppState> for AuthUser {
         // Used by server-side OAuth (cookie set by /login/callback) and
         // deployments without an external identity provider.
         // ----------------------------------------------------------------
-        let token = extract_session_token(parts, &state.cookie_name)
-            .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
+        if let Some(token) = extract_session_token(parts, &state.cookie_name) {
+            let claims = token::decode_session_token(&state.jwt_secret, &token)?;
+            return Ok(AuthUser {
+                user_id: claims.sub,
+                name: claims.name,
+            });
+        }
 
-        let claims = token::decode_session_token(&state.jwt_secret, &token)?;
+        // ----------------------------------------------------------------
+        // Path 3 — Anonymous fallback (no OAuth configured)
+        //
+        // When no identity provider is configured, allow unauthenticated
+        // access with a stable anonymous identity.  This is the local
+        // development path: without an IdP there is no way to obtain a
+        // session token, so we generate one from the display_name query
+        // parameter (or a default) and return it as an anonymous user.
+        // ----------------------------------------------------------------
+        if state.oauth.is_none() {
+            let user_id = format!("anon-{:08x}", hash_remote_addr(parts));
+            return Ok(AuthUser {
+                user_id,
+                name: "Anonymous".to_string(),
+            });
+        }
 
-        Ok(AuthUser {
-            user_id: claims.sub,
-            name: claims.name,
-        })
+        Err(AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Anonymous identity helpers
+// ---------------------------------------------------------------------------
+
+/// Derive a stable-ish hash from the connecting address so the same browser
+/// session gets a consistent anonymous `user_id`.  Falls back to `0` when the
+/// remote address is unavailable (e.g. Unix socket).
+fn hash_remote_addr(parts: &Parts) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Use X-Forwarded-For if present, otherwise use the connect info extension.
+    if let Some(forwarded) = parts
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
+        forwarded.hash(&mut hasher);
+    } else if let Some(addr) = parts.extensions.get::<std::net::SocketAddr>() {
+        addr.ip().hash(&mut hasher);
+    }
+    hasher.finish() as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +215,41 @@ mod tests {
         make_state_with_cookie_name("session")
     }
 
+    /// Minimal OAuth config that keeps `state.oauth = Some(...)` so the
+    /// anonymous fallback does NOT activate.  No JWKS → Bearer tokens
+    /// still fall through to the session JWT path.
+    fn dummy_oauth_config() -> crate::config::OAuthConfig {
+        crate::config::OAuthConfig {
+            client_id: "test".into(),
+            client_secret: None,
+            redirect_url: "http://localhost/callback".into(),
+            issuer: None,
+            auth_url: "http://localhost/auth".into(),
+            token_url: "http://localhost/token".into(),
+            jwks_url: None,
+            userinfo_url: None,
+            scopes: "openid".into(),
+            after_login_url: "/".into(),
+            allowed_redirect_urls: vec![],
+            end_session_endpoint: None,
+            after_logout_url: None,
+            browser_pkce: false,
+            resource_server_audience: None,
+        }
+    }
+
+    fn make_test_state_with_oauth() -> AppState {
+        let mut s = make_test_state();
+        s.oauth = Some(dummy_oauth_config());
+        s
+    }
+
+    fn make_state_with_cookie_name_and_oauth(name: &str) -> AppState {
+        let mut s = make_state_with_cookie_name(name);
+        s.oauth = Some(dummy_oauth_config());
+        s
+    }
+
     fn make_state_with_cookie_name(name: &str) -> AppState {
         // connect_lazy creates a pool handle without actually connecting.
         // The URL is never used because no queries are executed in unit tests.
@@ -196,6 +271,8 @@ mod tests {
             nats: None,
             service_version_urls: Vec::new(),
             http_client: reqwest::Client::new(),
+            search_api_url: None,
+            search_api_token: None,
         }
     }
 
@@ -279,14 +356,33 @@ mod tests {
 
     #[tokio::test]
     async fn empty_bearer_token_returns_unauthorized() {
-        let err = extract_with_bearer("").await.unwrap_err();
+        let state = make_test_state_with_oauth();
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, "Bearer ")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn missing_credentials_returns_unauthorized() {
-        let err = extract_with_cookie(None).await.unwrap_err();
+        let state = make_test_state_with_oauth();
+        let err = extract_with_cookie_and_state(None, &state)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_anonymous_when_no_oauth() {
+        let auth = extract_with_cookie(None).await.expect("anonymous fallback");
+        assert!(auth.user_id.starts_with("anon-"));
     }
 
     #[tokio::test]
@@ -367,7 +463,7 @@ mod tests {
     /// pr1-api.sandbox.videocall.rs causing a 401.
     #[tokio::test]
     async fn production_session_cookie_rejected_by_preview_api() {
-        let state = make_state_with_cookie_name("pr1-session");
+        let state = make_state_with_cookie_name_and_oauth("pr1-session");
         let production_jwt =
             generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
         // Even with a valid JWT, the wrong cookie name must be rejected.
@@ -380,7 +476,7 @@ mod tests {
     /// Slot isolation: pr2-session= is rejected when the API expects pr1-session=.
     #[tokio::test]
     async fn different_slot_cookie_rejected() {
-        let state = make_state_with_cookie_name("pr1-session");
+        let state = make_state_with_cookie_name_and_oauth("pr1-session");
         let jwt = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
         let err = extract_with_cookie_and_state(Some(&format!("pr2-session={jwt}")), &state)
             .await
@@ -487,6 +583,8 @@ mod tests {
             nats: None,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
+            search_api_url: None,
+            search_api_token: None,
         }
     }
 

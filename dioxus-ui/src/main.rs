@@ -13,6 +13,7 @@ mod provider_config;
 mod routing;
 mod types;
 
+use crate::components::search_modal::{SearchModal, SearchVisibleCtx};
 use crate::routing::Route;
 use context::{
     load_display_name_from_storage, load_transport_preference, migrate_legacy_storage,
@@ -40,13 +41,40 @@ fn main() {
 
 #[component]
 fn App() -> Element {
+    use_context_provider(|| SearchVisibleCtx { 
+        is_visible: Signal::new(false) 
+});
+
     let display_name = use_signal(load_display_name_from_storage);
     use_context_provider(|| DisplayNameCtx(display_name));
 
     let transport_pref = use_signal(load_transport_preference);
     use_context_provider(|| TransportPreferenceCtx(transport_pref));
 
+    let search_visible = use_signal(|| false);
+    use_context_provider(|| SearchVisibleCtx { is_visible: search_visible });
+
+    use_effect(move || {
+        use wasm_bindgen::prelude::*;
+        use wasm_bindgen::JsCast;
+        let window = web_sys::window().unwrap();
+        let mut sv = search_visible;
+        let closure = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+            move |evt: web_sys::KeyboardEvent| {
+                if evt.key() == "k" && (evt.meta_key() || evt.ctrl_key()) {
+                    evt.prevent_default();
+                    sv.set(!sv());
+                }
+            },
+        );
+        window
+            .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
+            .unwrap();
+        closure.forget();
+    });
+    
     rsx! {
         Router::<Route> {}
     }
 }
+

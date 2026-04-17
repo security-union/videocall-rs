@@ -49,6 +49,10 @@ pub struct AppState {
     pub service_version_urls: Vec<String>,
     /// Shared HTTP client for outbound requests (e.g. version fan-out).
     pub http_client: reqwest::Client,
+    /// SearchV2 middleware base URL. `None` disables search push indexing.
+    pub search_api_url: Option<String>,
+    /// Bearer token for SearchV2 push authentication.
+    pub search_api_token: Option<String>,
 }
 
 impl AppState {
@@ -86,6 +90,8 @@ impl AppState {
                 .timeout(std::time::Duration::from_secs(3))
                 .build()
                 .expect("failed to build reqwest client"),
+            search_api_url: config.search_api_url.clone(),
+            search_api_token: config.search_api_token.clone(),
         }
     }
 }

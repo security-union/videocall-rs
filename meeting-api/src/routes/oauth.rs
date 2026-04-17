@@ -1220,6 +1220,8 @@ mod tests {
             nats: None,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
+            search_api_url: None,
+            search_api_token: None,
         }
     }
 

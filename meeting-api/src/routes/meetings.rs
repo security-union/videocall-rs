@@ -20,6 +20,7 @@ use axum::{
     Json,
 };
 use rand::Rng;
+use crate::search_push;
 use videocall_meeting_types::{
     requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
     responses::{
@@ -119,6 +120,13 @@ pub async fn create_meeting(
         other => AppError::from(other),
     })?;
 
+    // Fire-and-forget: push to SearchV2
+    tokio::spawn({
+        let state = state.clone();
+        let meeting = row.clone();
+        async move { search_push::push_meeting(&state, &meeting).await }
+    });
+
     let response = CreateMeetingResponse {
         meeting_id: row.room_id,
         host: user_id,
@@ -142,8 +150,21 @@ pub async fn list_meetings(
     let limit = params.limit.clamp(1, 100);
     let offset = params.offset.max(0);
 
-    let rows = db_meetings::list_by_owner(&state.db, &user_id, limit, offset).await?;
-    let total = db_meetings::count_by_owner(&state.db, &user_id).await?;
+    let (rows, total) = if let Some(q) = &params.q {
+        if !q.trim().is_empty() {
+            let rows = db_meetings::search_by_owner(&state.db, &user_id, q, limit, offset).await?;
+            let total = db_meetings::count_search_by_owner(&state.db, &user_id, q).await?;
+            (rows, total)
+        } else {
+            let rows = db_meetings::list_by_owner(&state.db, &user_id, limit, offset).await?;
+            let total = db_meetings::count_by_owner(&state.db, &user_id).await?;
+            (rows, total)
+        }
+    } else {
+        let rows = db_meetings::list_by_owner(&state.db, &user_id, limit, offset).await?;
+        let total = db_meetings::count_by_owner(&state.db, &user_id).await?;
+        (rows, total)
+    };
 
     let mut meetings = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -223,6 +244,13 @@ pub async fn delete_meeting(
 
     db_meetings::soft_delete(&state.db, &meeting_id, &user_id).await?;
 
+    // Fire-and-forget: remove from SearchV2
+    tokio::spawn({
+        let state = state.clone();
+        let room_id = meeting_id.clone();
+        async move { search_push::delete_meeting_doc(&state, &room_id).await }
+    });
+
     Ok(Json(APIResponse::ok(DeleteMeetingResponse {
         message: format!("Meeting '{meeting_id}' has been deleted"),
     })))
@@ -272,6 +300,13 @@ pub async fn end_meeting_handler(
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    // Fire-and-forget: push ended state to SearchV2
+    tokio::spawn({
+        let state = state.clone();
+        let meeting = row.clone();
+        async move { search_push::push_meeting(&state, &meeting).await }
+    });
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
@@ -336,6 +371,13 @@ pub async fn update_meeting(
         }
         row
     };
+
+    // Fire-and-forget: push updated state to SearchV2
+    tokio::spawn({
+        let state = state.clone();
+        let meeting = row.clone();
+        async move { search_push::push_meeting(&state, &meeting).await }
+    });
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));

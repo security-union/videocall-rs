@@ -50,6 +50,11 @@ pub struct Config {
     /// Internal URLs for fetching version info from peer services.
     /// Used by the aggregated `/api/v1/versions` endpoint.
     pub service_version_urls: Vec<String>,
+    /// SearchV2 middleware base URL (e.g. "http://localhost:3000/api/search/v2").
+    /// When `None`, search push indexing is silently skipped.
+    pub search_api_url: Option<String>,
+    /// Bearer token for authenticating with SearchV2 (JWT with role searchuser or pushadmin).
+    pub search_api_token: Option<String>,
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -177,6 +182,9 @@ impl Config {
             .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
             .unwrap_or_default();
 
+        let search_api_url = env::var("SEARCH_API_URL").ok().filter(|s| !s.is_empty());
+        let search_api_token = env::var("SEARCH_API_TOKEN").ok().filter(|s| !s.is_empty());
+
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
             .filter(|s| !s.is_empty())
@@ -285,6 +293,8 @@ impl Config {
             cors_allowed_origin,
             nats_url,
             service_version_urls,
+            search_api_url,
+            search_api_token,
         })
     }
 

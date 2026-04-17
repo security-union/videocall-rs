@@ -152,6 +152,18 @@ pub fn Home() -> Element {
             .unwrap_or_default()
     };
 
+    let dropdown_name = user_profile().map(|p| {
+        if is_guid_like(&p.name) {
+            if p.user_id.contains('@') {
+                email_to_display_name(&p.user_id)
+            } else {
+                p.user_id.clone()
+            }
+        } else {
+            p.name.clone()
+        }
+    });
+
     rsx! {
         div { class: "hero-container",
             BrowserCompatibility {}
@@ -169,7 +181,7 @@ pub fn Home() -> Element {
                             onclick: move |_| {
                                 show_dropdown.set(!show_dropdown());
                             },
-                            span { "{profile.name}" }
+                            span { "{dropdown_name.as_deref().unwrap_or_default()}" }
                             svg {
                                 xmlns: "http://www.w3.org/2000/svg",
                                 width: "16",
@@ -186,7 +198,7 @@ pub fn Home() -> Element {
                         if show_dropdown() {
                             div { class: "auth-dropdown-menu",
                                 div { class: "auth-dropdown-header",
-                                    p { class: "auth-dropdown-name", "{profile.name}" }
+                                    p { class: "auth-dropdown-name", "{dropdown_name.as_deref().unwrap_or_default()}" }
                                     p { class: "auth-dropdown-email", "{profile.user_id}" }
                                 }
                                 button {

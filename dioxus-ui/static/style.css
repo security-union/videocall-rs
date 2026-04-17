@@ -227,40 +227,28 @@ h3 {
 }
 
 #grid-container {
-  /* Basic grid setup */
+  position: absolute;
+  inset: 0;
   display: grid;
-  width: 100%;
-  height: 100%;
-
-  /* Layout (grid-template-columns / grid-template-rows) is set entirely
-     via inline style from Rust. CSS only provides a safe 1×1 fallback. */
-  grid-template-columns: 1fr;
-  grid-template-rows: 1fr;
-
-  /* Set reasonable gaps and padding */
-  gap: 10px;
-  padding: 16px;
+  grid-template-columns: repeat(4, 1fr); /* fallback; Rust overrides */
+  grid-template-rows: repeat(3, 1fr);    /* fallback; Rust overrides */
+  /* Desktop gap/padding — keep in sync with attendants.rs (vw >= 568.0 branch) */
+  gap: 16px;
+  padding: 20px 20px 84px 20px;
   box-sizing: border-box;
-
-  /* Items fill their cell completely */
-  justify-items: stretch;
-  align-items: stretch;
   overflow: hidden;
 }
 
 .grid-item {
-  /* Item sizing */
   width: 100%;
   height: 100%;
-  min-width: 0;  /* Required for fr-unit children to shrink properly */
-  min-height: 0; /* Required for fr-unit children to shrink properly */
+  min-width: 0;
+  min-height: 0;
 
-  /* Center content within grid item */
   display: flex;
   justify-content: center;
   align-items: center;
-  overflow: hidden; /* Prevent content like oversized canvas from breaking layout */
-  background-color: #2d2d2d; /* Slightly different background for items */
+  background-color: #2d2d2d;
 
   /* Border for visual separation */
   border: 2px solid rgba(100, 100, 100, 0.30);
@@ -268,17 +256,40 @@ h3 {
   /* Speaking glow transition is driven by inline style from Rust speak_style(). */
 }
 
-/* --- data-peers rules removed: layout is now fully computed in Rust
-       and applied as inline style on #grid-container --- */
+/* Overflow badge: "+N more" tile */
+.grid-overflow-badge {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  background-color: #1a1a1a;
+  border: 2px solid rgb(68, 68, 68);
+  border-radius: 10px;
+  color: #aaa;
+  font-size: 1.5rem;
+  font-weight: 600;
+  gap: 4px;
+}
+
+.grid-overflow-badge span {
+  font-size: 0.8rem;
+  font-weight: 400;
+  opacity: 0.7;
+}
 
 /* ============================================================
-   Mobile: narrower gap/padding, layout still from Rust
+   Mobile: narrower gap/padding
+   Keep breakpoint + values in sync with attendants.rs (vw < 568.0)
    ============================================================ */
 
-@media (max-width: 37.5em) {
+@media (max-width: 568px) {
   #grid-container {
     gap: 8px;
-    padding: 8px;
+    padding: 8px 8px 72px 8px;
   }
 
   /* Host video adjustments */
@@ -448,21 +459,21 @@ canvas {
 
 .floating-name {
   position: absolute;
-  top: 12px;
-  left: 12px;
+  top: min(12px, calc(var(--tile-h, 240px) * 0.06));
+  left: min(12px, calc(var(--tile-w, 320px) * 0.04));
   right: auto;
   bottom: auto;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  border-radius: 12px;
+  gap: min(6px, calc(var(--tile-w, 320px) * 0.02));
+  padding: min(6px, calc(var(--tile-h, 240px) * 0.03)) min(10px, calc(var(--tile-w, 320px) * 0.03));
+  border-radius: min(12px, calc(var(--tile-h, 240px) * 0.06));
   background-color: rgba(0, 0, 0, 0.36);
   color: rgba(255, 255, 255, 0.92);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
   "Helvetica Neue", Arial, sans-serif;
   font-weight: 600;
-  font-size: 14px;
+  font-size: clamp(9px, calc(var(--tile-h, 240px) * 0.07), 14px);
   line-height: 1.2;
   white-space: nowrap;
   max-width: 55%;
@@ -597,18 +608,18 @@ select {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 1rem;
+  gap: min(1rem, calc(var(--tile-h, 240px) * 0.06));
 }
 
 .placeholder-content svg {
-  width: 64px;
-  height: 64px;
+  width: min(64px, calc(var(--tile-h, 240px) * 0.3));
+  height: min(64px, calc(var(--tile-h, 240px) * 0.3));
   fill: #8a8d91;
 }
 
 .placeholder-text {
   color: #8a8d91;
-  font-size: 1.1rem;
+  font-size: clamp(0.5rem, calc(var(--tile-h, 240px) * 0.06), 1.1rem);
   font-weight: 500;
 }
 
@@ -618,12 +629,12 @@ select {
 
 .tile-top-icons {
   position: absolute;
-  top: 8px;
-  right: 8px;
+  top: min(8px, calc(var(--tile-h, 240px) * 0.04));
+  right: min(8px, calc(var(--tile-w, 320px) * 0.03));
   display: flex;
   flex-direction: row-reverse;
   align-items: center;
-  gap: 8px;
+  gap: min(8px, calc(var(--tile-w, 320px) * 0.025));
   z-index: 3;
 }
 
@@ -634,8 +645,8 @@ select {
 .pin-icon,
 .crop-icon {
   visibility: hidden;
-  width: 32px;
-  height: 32px;
+  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -652,8 +663,8 @@ select {
 
 .pin-icon svg,
 .crop-icon svg {
-  width: 20px;
-  height: 20px;
+  width: min(20px, calc(var(--tile-h, 240px) * 0.1));
+  height: min(20px, calc(var(--tile-h, 240px) * 0.1));
   flex-shrink: 0;
 }
 
@@ -682,15 +693,15 @@ select {
 .audio-indicator {
   background-color: rgba(0, 0, 0, 0.6);
   border-radius: 50%;
-  padding: 6px;
+  padding: min(6px, calc(var(--tile-h, 240px) * 0.025));
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
 .audio-indicator svg {
-  width: 20px;
-  height: 20px;
+  width: min(20px, calc(var(--tile-h, 240px) * 0.1));
+  height: min(20px, calc(var(--tile-h, 240px) * 0.1));
   stroke: white;
 }
 
@@ -1537,6 +1548,61 @@ select {
 
 @media (max-width: 37.5em) {
   .connection-led { width: 10px; height: 10px; top: 6px; right: 6px; }
+}
+
+/* ============================================================
+   Connection Quality Indicator (self-view RTT warning)
+   ============================================================ */
+
+.connection-quality-indicator {
+  position: absolute;
+  top: 8px;
+  right: 28px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px 3px 4px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 12px;
+  z-index: 5;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+  pointer-events: none;
+}
+
+.connection-quality-indicator.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.connection-quality-indicator.exiting {
+  transition-duration: 0.5s;
+}
+
+.connection-quality-indicator svg {
+  width: 16px;
+  height: 16px;
+}
+
+.connection-quality-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.9);
+  white-space: nowrap;
+  line-height: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .connection-quality-indicator,
+  .connection-quality-indicator.exiting {
+    transition: none;
+  }
+}
+
+@media (max-width: 37.5em) {
+  .connection-quality-label { display: none; }
+  .connection-quality-indicator svg { width: 14px; height: 14px; }
 }
 
 /* ============================================================
@@ -2832,8 +2898,8 @@ select {
 .signal-indicator {
   background-color: rgba(0, 0, 0, 0.6);
   border-radius: 50%;
-  width: 32px;
-  height: 32px;
+  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2853,8 +2919,8 @@ select {
   outline-offset: 2px;
 }
 .signal-indicator svg {
-  width: 18px;
-  height: 18px;
+  width: min(18px, calc(var(--tile-h, 240px) * 0.09));
+  height: min(18px, calc(var(--tile-h, 240px) * 0.09));
 }
 
 /* Signal quality popup -- inline overlay positioned within each tile */
@@ -3034,4 +3100,145 @@ select {
   pointer-events: none;
   white-space: nowrap;
   z-index: 2147483647;
+}
+
+/* ============================================================
+   Overflow Badge (+N more in meeting)
+   ============================================================ */
+
+.overflow-badge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+/* ============================================================
+   Mock Peers Popover
+   ============================================================ */
+
+.mock-peers-popover {
+  position: fixed;
+  bottom: 90px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(30, 30, 30, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 12px;
+  padding: 14px 18px;
+  z-index: 1000000;
+  min-width: 200px;
+  backdrop-filter: blur(12px);
+}
+
+.mock-peers-popover-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  font-size: 0.85rem;
+  color: #ccc;
+}
+
+.mock-peers-popover-close {
+  background: none;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 0 4px;
+}
+
+.mock-peers-popover-body label {
+  font-size: 0.75rem;
+  color: #999;
+  margin-bottom: 6px;
+  display: block;
+}
+
+.mock-peers-count-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mock-peers-count-row input[type="number"] {
+  width: 50px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  color: #fff;
+  padding: 4px;
+  font-size: 0.9rem;
+}
+
+.mock-peers-step {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  cursor: pointer;
+  font-size: 1.1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ============================================================
+   Density Mode Popover
+   ============================================================ */
+
+.density-popover {
+  position: fixed;
+  bottom: 90px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #2d2d2d;
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  gap: 8px;
+  z-index: 30;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.density-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background: #3a3b3c;
+  color: #ccc;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  min-width: 72px;
+}
+
+.density-option:hover {
+  background: #4a4b4c;
+  color: white;
+}
+
+.density-option.active {
+  border-color: #4285f4;
+  background: rgba(66, 133, 244, 0.15);
+  color: white;
+}
+
+.density-option-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.density-option-range {
+  font-size: 11px;
+  opacity: 0.6;
 }

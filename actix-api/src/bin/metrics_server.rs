@@ -46,19 +46,19 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
-    AUDIO_CONCEALMENT_PCT, AUDIO_PACKET_LOSS_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE,
-    CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_MEMORY_TOTAL_BYTES,
-    CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
-    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, DATAGRAM_DROPS_TOTAL,
-    DECODER_ERRORS_TOTAL, ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS,
-    ENCODER_TARGET_BITRATE_KBPS, ENCODER_WORST_PEER_FPS, HEALTH_REPORTS_TOTAL,
-    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
-    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
-    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
-    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
-    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS_TOTAL,
+    AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CLIENT_ACTIVE_SERVER,
+    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
+    CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_SEND_QUEUE_BYTES,
+    CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, DATAGRAM_DROPS_TOTAL, DECODER_ERRORS_TOTAL,
+    ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_TARGET_BITRATE_KBPS,
+    ENCODER_WORST_PEER_FPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL,
+    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
+    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
+    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
+    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
+    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
+    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
+    VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS_TOTAL,
 };
 
 async fn metrics_handler(
@@ -272,7 +272,6 @@ fn remove_per_peer_metrics(
     let _ = VIDEO_FPS.remove_label_values(&labels);
     let _ = VIDEO_BITRATE_KBPS.remove_label_values(&labels);
     let _ = VIDEO_FRAMES_DROPPED.remove_label_values(&labels);
-    let _ = AUDIO_PACKET_LOSS_PCT.remove_label_values(&labels);
     let _ = PEER_AUDIO_ENABLED.remove_label_values(&labels);
     let _ = PEER_VIDEO_ENABLED.remove_label_values(&labels);
     let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
@@ -762,18 +761,11 @@ fn process_health_packet_to_metrics_pb(
                         .set(total as f64);
                 }
 
-                // Audio packet loss
-                if peer_data.audio_packet_loss_pct > 0.0 {
-                    AUDIO_PACKET_LOSS_PCT
-                        .with_label_values(&peer_labels)
-                        .set(peer_data.audio_packet_loss_pct);
-                }
-
-                // Audio concealment (new name, emitting alongside old for backward compat)
+                // Audio concealment percentage (from NetEQ expand events)
                 // Always set — allows gauge to recover to 0.0 when concealment clears
                 AUDIO_CONCEALMENT_PCT
                     .with_label_values(&peer_labels)
-                    .set(peer_data.audio_packet_loss_pct);
+                    .set(peer_data.audio_concealment_pct);
 
                 // Quality scores
                 if let Some(score) = peer_data.audio_quality_score {

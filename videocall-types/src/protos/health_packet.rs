@@ -810,8 +810,8 @@ pub struct PeerStats {
     ///  Phase 1 metrics: Quality indicators (FIXED: use windowed rates)
     // @@protoc_insertion_point(field:health_packet.PeerStats.frames_dropped_per_sec)
     pub frames_dropped_per_sec: f64,
-    // @@protoc_insertion_point(field:health_packet.PeerStats.audio_packet_loss_pct)
-    pub audio_packet_loss_pct: f64,
+    // @@protoc_insertion_point(field:health_packet.PeerStats.audio_concealment_pct)
+    pub audio_concealment_pct: f64,
     // @@protoc_insertion_point(field:health_packet.PeerStats.avg_decode_latency_ms)
     pub avg_decode_latency_ms: ::std::option::Option<f64>,
     ///  Computed quality scores (0-100). Absent when the stream is inactive.
@@ -883,9 +883,9 @@ impl PeerStats {
             |m: &mut PeerStats| { &mut m.frames_dropped_per_sec },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "audio_packet_loss_pct",
-            |m: &PeerStats| { &m.audio_packet_loss_pct },
-            |m: &mut PeerStats| { &mut m.audio_packet_loss_pct },
+            "audio_concealment_pct",
+            |m: &PeerStats| { &m.audio_concealment_pct },
+            |m: &mut PeerStats| { &mut m.audio_concealment_pct },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
             "avg_decode_latency_ms",
@@ -957,7 +957,7 @@ impl ::protobuf::Message for PeerStats {
                     self.frames_dropped_per_sec = is.read_double()?;
                 },
                 65 => {
-                    self.audio_packet_loss_pct = is.read_double()?;
+                    self.audio_concealment_pct = is.read_double()?;
                 },
                 73 => {
                     self.avg_decode_latency_ms = ::std::option::Option::Some(is.read_double()?);
@@ -1012,7 +1012,7 @@ impl ::protobuf::Message for PeerStats {
         if self.frames_dropped_per_sec != 0. {
             my_size += 1 + 8;
         }
-        if self.audio_packet_loss_pct != 0. {
+        if self.audio_concealment_pct != 0. {
             my_size += 1 + 8;
         }
         if let Some(v) = self.avg_decode_latency_ms {
@@ -1061,8 +1061,8 @@ impl ::protobuf::Message for PeerStats {
         if self.frames_dropped_per_sec != 0. {
             os.write_double(7, self.frames_dropped_per_sec)?;
         }
-        if self.audio_packet_loss_pct != 0. {
-            os.write_double(8, self.audio_packet_loss_pct)?;
+        if self.audio_concealment_pct != 0. {
+            os.write_double(8, self.audio_concealment_pct)?;
         }
         if let Some(v) = self.avg_decode_latency_ms {
             os.write_double(9, v)?;
@@ -1106,7 +1106,7 @@ impl ::protobuf::Message for PeerStats {
         self.neteq_stats.clear();
         self.video_stats.clear();
         self.frames_dropped_per_sec = 0.;
-        self.audio_packet_loss_pct = 0.;
+        self.audio_concealment_pct = 0.;
         self.avg_decode_latency_ms = ::std::option::Option::None;
         self.audio_quality_score = ::std::option::Option::None;
         self.video_quality_score = ::std::option::Option::None;
@@ -1125,7 +1125,7 @@ impl ::protobuf::Message for PeerStats {
             neteq_stats: ::protobuf::MessageField::none(),
             video_stats: ::protobuf::MessageField::none(),
             frames_dropped_per_sec: 0.,
-            audio_packet_loss_pct: 0.,
+            audio_concealment_pct: 0.,
             avg_decode_latency_ms: ::std::option::Option::None,
             audio_quality_score: ::std::option::Option::None,
             video_quality_score: ::std::option::Option::None,
@@ -1234,6 +1234,21 @@ pub struct HealthPacket {
     ///  P2: Tier transition events since last health packet
     // @@protoc_insertion_point(field:health_packet.HealthPacket.tier_transitions)
     pub tier_transitions: ::std::vec::Vec<TierTransition>,
+    ///  Climb-rate limiter telemetry (PR-H)
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.crash_ceiling_active)
+    pub crash_ceiling_active: ::std::option::Option<bool>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.crash_ceiling_tier_index)
+    pub crash_ceiling_tier_index: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.crash_ceiling_decay_ms)
+    pub crash_ceiling_decay_ms: ::std::option::Option<f64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.step_up_blocked_ceiling)
+    pub step_up_blocked_ceiling: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.step_up_blocked_slowdown)
+    pub step_up_blocked_slowdown: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.step_up_blocked_screen_share)
+    pub step_up_blocked_screen_share: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.tier_dwells)
+    pub tier_dwells: ::std::vec::Vec<TierDwell>,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.HealthPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1251,7 +1266,7 @@ impl HealthPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(32);
+        let mut fields = ::std::vec::Vec::with_capacity(39);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "session_id",
@@ -1413,6 +1428,41 @@ impl HealthPacket {
             |m: &HealthPacket| { &m.tier_transitions },
             |m: &mut HealthPacket| { &mut m.tier_transitions },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "crash_ceiling_active",
+            |m: &HealthPacket| { &m.crash_ceiling_active },
+            |m: &mut HealthPacket| { &mut m.crash_ceiling_active },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "crash_ceiling_tier_index",
+            |m: &HealthPacket| { &m.crash_ceiling_tier_index },
+            |m: &mut HealthPacket| { &mut m.crash_ceiling_tier_index },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "crash_ceiling_decay_ms",
+            |m: &HealthPacket| { &m.crash_ceiling_decay_ms },
+            |m: &mut HealthPacket| { &mut m.crash_ceiling_decay_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "step_up_blocked_ceiling",
+            |m: &HealthPacket| { &m.step_up_blocked_ceiling },
+            |m: &mut HealthPacket| { &mut m.step_up_blocked_ceiling },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "step_up_blocked_slowdown",
+            |m: &HealthPacket| { &m.step_up_blocked_slowdown },
+            |m: &mut HealthPacket| { &mut m.step_up_blocked_slowdown },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "step_up_blocked_screen_share",
+            |m: &HealthPacket| { &m.step_up_blocked_screen_share },
+            |m: &mut HealthPacket| { &mut m.step_up_blocked_screen_share },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "tier_dwells",
+            |m: &HealthPacket| { &m.tier_dwells },
+            |m: &mut HealthPacket| { &mut m.tier_dwells },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HealthPacket>(
             "HealthPacket",
             fields,
@@ -1539,6 +1589,27 @@ impl ::protobuf::Message for HealthPacket {
                 258 => {
                     self.tier_transitions.push(is.read_message()?);
                 },
+                296 => {
+                    self.crash_ceiling_active = ::std::option::Option::Some(is.read_bool()?);
+                },
+                304 => {
+                    self.crash_ceiling_tier_index = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                313 => {
+                    self.crash_ceiling_decay_ms = ::std::option::Option::Some(is.read_double()?);
+                },
+                320 => {
+                    self.step_up_blocked_ceiling = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                328 => {
+                    self.step_up_blocked_slowdown = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                336 => {
+                    self.step_up_blocked_screen_share = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                346 => {
+                    self.tier_dwells.push(is.read_message()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -1652,6 +1723,28 @@ impl ::protobuf::Message for HealthPacket {
             let len = value.compute_size();
             my_size += 2 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         };
+        if let Some(v) = self.crash_ceiling_active {
+            my_size += 2 + 1;
+        }
+        if let Some(v) = self.crash_ceiling_tier_index {
+            my_size += ::protobuf::rt::uint32_size(38, v);
+        }
+        if let Some(v) = self.crash_ceiling_decay_ms {
+            my_size += 2 + 8;
+        }
+        if let Some(v) = self.step_up_blocked_ceiling {
+            my_size += ::protobuf::rt::uint64_size(40, v);
+        }
+        if let Some(v) = self.step_up_blocked_slowdown {
+            my_size += ::protobuf::rt::uint64_size(41, v);
+        }
+        if let Some(v) = self.step_up_blocked_screen_share {
+            my_size += ::protobuf::rt::uint64_size(42, v);
+        }
+        for value in &self.tier_dwells {
+            let len = value.compute_size();
+            my_size += 2 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        };
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -1761,6 +1854,27 @@ impl ::protobuf::Message for HealthPacket {
         for v in &self.tier_transitions {
             ::protobuf::rt::write_message_field_with_cached_size(32, v, os)?;
         };
+        if let Some(v) = self.crash_ceiling_active {
+            os.write_bool(37, v)?;
+        }
+        if let Some(v) = self.crash_ceiling_tier_index {
+            os.write_uint32(38, v)?;
+        }
+        if let Some(v) = self.crash_ceiling_decay_ms {
+            os.write_double(39, v)?;
+        }
+        if let Some(v) = self.step_up_blocked_ceiling {
+            os.write_uint64(40, v)?;
+        }
+        if let Some(v) = self.step_up_blocked_slowdown {
+            os.write_uint64(41, v)?;
+        }
+        if let Some(v) = self.step_up_blocked_screen_share {
+            os.write_uint64(42, v)?;
+        }
+        for v in &self.tier_dwells {
+            ::protobuf::rt::write_message_field_with_cached_size(43, v, os)?;
+        };
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -1810,6 +1924,13 @@ impl ::protobuf::Message for HealthPacket {
         self.encoder_target_bitrate_kbps = ::std::option::Option::None;
         self.encoder_bitrate_ratio = ::std::option::Option::None;
         self.tier_transitions.clear();
+        self.crash_ceiling_active = ::std::option::Option::None;
+        self.crash_ceiling_tier_index = ::std::option::Option::None;
+        self.crash_ceiling_decay_ms = ::std::option::Option::None;
+        self.step_up_blocked_ceiling = ::std::option::Option::None;
+        self.step_up_blocked_slowdown = ::std::option::Option::None;
+        self.step_up_blocked_screen_share = ::std::option::Option::None;
+        self.tier_dwells.clear();
         self.special_fields.clear();
     }
 
@@ -2030,6 +2151,146 @@ impl ::protobuf::reflect::ProtobufValue for TierTransition {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
+// @@protoc_insertion_point(message:health_packet.TierDwell)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct TierDwell {
+    // message fields
+    // @@protoc_insertion_point(field:health_packet.TierDwell.tier)
+    pub tier: ::std::string::String,
+    // @@protoc_insertion_point(field:health_packet.TierDwell.dwell_ms)
+    pub dwell_ms: f64,
+    // special fields
+    // @@protoc_insertion_point(special_field:health_packet.TierDwell.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a TierDwell {
+    fn default() -> &'a TierDwell {
+        <TierDwell as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl TierDwell {
+    pub fn new() -> TierDwell {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "tier",
+            |m: &TierDwell| { &m.tier },
+            |m: &mut TierDwell| { &mut m.tier },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "dwell_ms",
+            |m: &TierDwell| { &m.dwell_ms },
+            |m: &mut TierDwell| { &mut m.dwell_ms },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<TierDwell>(
+            "TierDwell",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for TierDwell {
+    const NAME: &'static str = "TierDwell";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.tier = is.read_string()?;
+                },
+                17 => {
+                    self.dwell_ms = is.read_double()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.tier.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.tier);
+        }
+        if self.dwell_ms != 0. {
+            my_size += 1 + 8;
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.tier.is_empty() {
+            os.write_string(1, &self.tier)?;
+        }
+        if self.dwell_ms != 0. {
+            os.write_double(2, self.dwell_ms)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> TierDwell {
+        TierDwell::new()
+    }
+
+    fn clear(&mut self) {
+        self.tier.clear();
+        self.dwell_ms = 0.;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static TierDwell {
+        static instance: TierDwell = TierDwell {
+            tier: ::std::string::String::new(),
+            dwell_ms: 0.,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for TierDwell {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("TierDwell").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for TierDwell {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for TierDwell {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x19types/health_packet.proto\x12\rhealth_packet\"\xa9\x03\n\x16NetEqO\
     perationCounters\x12$\n\x0enormal_per_sec\x18\x01\x20\x01(\x01R\x0cnorma\
@@ -2059,8 +2320,8 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x18\x05\x20\x01(\x0b2\x19.health_packet.NetEqStatsR\nneteqStats\x12:\n\
     \x0bvideo_stats\x18\x06\x20\x01(\x0b2\x19.health_packet.VideoStatsR\nvid\
     eoStats\x123\n\x16frames_dropped_per_sec\x18\x07\x20\x01(\x01R\x13frames\
-    DroppedPerSec\x121\n\x15audio_packet_loss_pct\x18\x08\x20\x01(\x01R\x12a\
-    udioPacketLossPct\x126\n\x15avg_decode_latency_ms\x18\t\x20\x01(\x01H\0R\
+    DroppedPerSec\x122\n\x15audio_concealment_pct\x18\x08\x20\x01(\x01R\x13a\
+    udioConcealmentPct\x126\n\x15avg_decode_latency_ms\x18\t\x20\x01(\x01H\0R\
     \x12avgDecodeLatencyMs\x88\x01\x01\x123\n\x13audio_quality_score\x18\n\
     \x20\x01(\x01H\x01R\x11audioQualityScore\x88\x01\x01\x123\n\x13video_qua\
     lity_score\x18\x0b\x20\x01(\x01H\x02R\x11videoQualityScore\x88\x01\x01\
@@ -2425,7 +2686,7 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(7);
+            let mut messages = ::std::vec::Vec::with_capacity(8);
             messages.push(NetEqOperationCounters::generated_message_descriptor_data());
             messages.push(NetEqNetwork::generated_message_descriptor_data());
             messages.push(NetEqStats::generated_message_descriptor_data());
@@ -2433,6 +2694,7 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(PeerStats::generated_message_descriptor_data());
             messages.push(HealthPacket::generated_message_descriptor_data());
             messages.push(TierTransition::generated_message_descriptor_data());
+            messages.push(TierDwell::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(0);
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),

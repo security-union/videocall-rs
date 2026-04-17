@@ -102,6 +102,12 @@ pub struct RuntimeConfig {
     pub screen_bitrate_kbps: u32,
     #[serde(rename = "vadThreshold", default = "default_vad_threshold")]
     pub vad_threshold: f32,
+    #[serde(rename = "consoleLogUploadEnabled")]
+    #[serde(default)]
+    pub console_log_upload_enabled: String,
+    #[serde(rename = "mockPeersEnabled")]
+    #[serde(default)]
+    pub mock_peers_enabled: String,
 }
 
 fn default_vad_threshold() -> f32 {
@@ -119,7 +125,10 @@ pub fn app_config() -> Result<RuntimeConfig, String> {
         .map_err(|e| format!("Failed to parse __APP_CONFIG: {e:?}"))
 }
 
-pub const CANVAS_LIMIT: usize = 20;
+/// Maximum number of **real** peer tiles rendered with full PeerTile treatment
+/// (canvas, diagnostics subscription, signal history). Mock peers are
+/// layout-only and bypass this limit.
+pub const CANVAS_LIMIT: usize = 30;
 
 pub fn audio_bitrate_kbps() -> Result<u32, String> {
     app_config().map(|c| c.audio_bitrate_kbps)
@@ -175,6 +184,15 @@ pub fn e2ee_enabled() -> Result<bool, String> {
 }
 pub fn firefox_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.firefox_enabled.as_str())))
+}
+pub fn console_log_upload_enabled() -> Result<bool, String> {
+    app_config().map(|c| truthy(Some(c.console_log_upload_enabled.as_str())))
+}
+
+pub fn mock_peers_enabled() -> bool {
+    app_config()
+        .map(|c| truthy(Some(c.mock_peers_enabled.as_str())))
+        .unwrap_or(false)
 }
 
 pub fn users_allowed_to_stream() -> Result<Vec<String>, String> {

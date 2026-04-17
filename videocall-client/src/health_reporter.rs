@@ -30,7 +30,8 @@ use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
-    PeerStats as PbPeerStats, TierTransition as PbTierTransition, VideoStats as PbVideoStats,
+    PeerStats as PbPeerStats, TierDwell as PbTierDwell, TierTransition as PbTierTransition,
+    VideoStats as PbVideoStats,
 };
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -110,8 +111,25 @@ impl PeerHealthData {
     }
 }
 
+/// Snapshot of climb-rate limiter state, updated by the encoder each tick.
+#[derive(Debug, Clone, Default)]
+pub struct ClimbLimiterSnapshot {
+    pub crash_ceiling_active: bool,
+    pub crash_ceiling_tier_index: Option<u32>,
+    pub crash_ceiling_decay_ms: Option<f64>,
+    pub step_up_blocked_ceiling: u64,
+    pub step_up_blocked_slowdown: u64,
+    pub step_up_blocked_screen_share: u64,
+}
+
 /// Shared buffer of tier transition records from camera and screen encoders.
 type TierTransitionBuffers = Rc<RefCell<Vec<Rc<RefCell<Vec<TierTransitionRecord>>>>>>;
+
+/// Shared climb-rate limiter snapshot (double-wrapped for late binding).
+type SharedClimbLimiterSnapshot = Rc<RefCell<Rc<RefCell<ClimbLimiterSnapshot>>>>;
+
+/// Shared dwell-time sample buffer (double-wrapped for late binding).
+type SharedDwellSamples = Rc<RefCell<Rc<RefCell<Vec<(String, f64)>>>>>;
 
 /// Health reporter that collects diagnostics and sends health packets
 #[derive(Debug)]
@@ -152,6 +170,14 @@ pub struct HealthReporter {
     encoder_output_fps: Rc<RefCell<Rc<AtomicU32>>>,
     /// Shared tier transition buffers (camera + screen, drained each health packet).
     tier_transitions: TierTransitionBuffers,
+    /// Climb-rate limiter snapshot, updated by the encoder each tick.
+    /// Double-wrapped so `set_encoder_metric_sources` (called after
+    /// `start_health_reporting`) can swap the inner Rc and the spawned loop
+    /// picks up the encoder's buffer on its next tick.
+    climb_limiter_snapshot: SharedClimbLimiterSnapshot,
+    /// Dwell time samples buffer, drained each health packet.
+    /// Double-wrapped for the same late-binding reason as `climb_limiter_snapshot`.
+    dwell_samples: SharedDwellSamples,
 }
 
 impl HealthReporter {
@@ -183,6 +209,10 @@ impl HealthReporter {
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
             encoder_output_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             tier_transitions: Rc::new(RefCell::new(Vec::new())),
+            climb_limiter_snapshot: Rc::new(RefCell::new(Rc::new(RefCell::new(
+                ClimbLimiterSnapshot::default(),
+            )))),
+            dwell_samples: Rc::new(RefCell::new(Rc::new(RefCell::new(Vec::new())))),
         }
     }
 
@@ -257,6 +287,8 @@ impl HealthReporter {
         output_fps: Rc<AtomicU32>,
         camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
+        dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
     ) {
         *self.encoder_fps_ratio.borrow_mut() = fps_ratio;
         *self.encoder_worst_peer_fps.borrow_mut() = worst_peer_fps;
@@ -266,6 +298,8 @@ impl HealthReporter {
         *self.screen_sharing_active.borrow_mut() = screen_active;
         *self.encoder_output_fps.borrow_mut() = output_fps;
         *self.tier_transitions.borrow_mut() = vec![camera_transitions, screen_transitions];
+        *self.climb_limiter_snapshot.borrow_mut() = climb_limiter_snapshot;
+        *self.dwell_samples.borrow_mut() = dwell_samples;
     }
 
     /// Start subscribing to real diagnostics events via videocall_diagnostics
@@ -561,6 +595,8 @@ impl HealthReporter {
         let screen_sharing_active = self.screen_sharing_active.clone();
         let encoder_output_fps = self.encoder_output_fps.clone();
         let tier_transitions = self.tier_transitions.clone();
+        let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
+        let dwell_samples = self.dwell_samples.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -641,6 +677,25 @@ impl HealthReporter {
                             }
                         }
 
+                        // Snapshot climb-rate limiter state (double-wrap: outer then inner).
+                        let limiter_snap = climb_limiter_snapshot
+                            .try_borrow()
+                            .ok()
+                            .and_then(|outer| outer.try_borrow().ok().map(|s| s.clone()))
+                            .unwrap_or_default();
+
+                        // Drain dwell samples (double-wrap: outer then inner).
+                        let drained_dwells: Vec<(String, f64)> = dwell_samples
+                            .try_borrow()
+                            .ok()
+                            .and_then(|outer| {
+                                outer
+                                    .try_borrow_mut()
+                                    .ok()
+                                    .map(|mut d| std::mem::take(&mut *d))
+                            })
+                            .unwrap_or_default();
+
                         let health_packet = Self::create_health_packet(
                             &session_id_val,
                             &meeting_id,
@@ -668,6 +723,8 @@ impl HealthReporter {
                             screen_active_val,
                             output_fps_val,
                             drained_transitions,
+                            limiter_snap,
+                            drained_dwells,
                         );
 
                         if let Some(packet) = health_packet {
@@ -712,6 +769,8 @@ impl HealthReporter {
         screen_sharing_active: bool,
         encoder_output_fps: u32,
         tier_transitions: Vec<TierTransitionRecord>,
+        climb_limiter: ClimbLimiterSnapshot,
+        dwell_samples: Vec<(String, f64)>,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -788,6 +847,29 @@ impl HealthReporter {
             pb_t.to_tier = t.to_tier.clone();
             pb_t.trigger = t.trigger.to_string();
             pb.tier_transitions.push(pb_t);
+        }
+
+        // Climb-rate limiter telemetry (PR-H)
+        pb.crash_ceiling_active = Some(climb_limiter.crash_ceiling_active);
+        if climb_limiter.crash_ceiling_active {
+            pb.crash_ceiling_tier_index = climb_limiter.crash_ceiling_tier_index;
+            pb.crash_ceiling_decay_ms = climb_limiter.crash_ceiling_decay_ms;
+        }
+        // Only emit blocked counters when non-zero to reduce packet size.
+        if climb_limiter.step_up_blocked_ceiling > 0 {
+            pb.step_up_blocked_ceiling = Some(climb_limiter.step_up_blocked_ceiling);
+        }
+        if climb_limiter.step_up_blocked_slowdown > 0 {
+            pb.step_up_blocked_slowdown = Some(climb_limiter.step_up_blocked_slowdown);
+        }
+        if climb_limiter.step_up_blocked_screen_share > 0 {
+            pb.step_up_blocked_screen_share = Some(climb_limiter.step_up_blocked_screen_share);
+        }
+        for (tier_label, dwell_ms) in &dwell_samples {
+            let mut pb_d = PbTierDwell::new();
+            pb_d.tier = tier_label.clone();
+            pb_d.dwell_ms = *dwell_ms;
+            pb.tier_dwells.push(pb_d);
         }
 
         // Tab visibility and throttling
@@ -892,7 +974,7 @@ impl HealthReporter {
                 // Clamp to 0–100: packet loss cannot exceed 100% by definition,
                 // and unsynchronised window rollovers can momentarily inflate it.
                 if packets_per_sec >= 2.0 {
-                    ps.audio_packet_loss_pct =
+                    ps.audio_concealment_pct =
                         ((expand_per_sec / packets_per_sec) * 100.0).clamp(0.0, 100.0);
                 }
 
@@ -1012,7 +1094,7 @@ impl HealthReporter {
                     .and_then(|net| net.operation_counters.as_ref())
                     .map(|oc| oc.expand_per_sec)
                     .unwrap_or(0.0);
-                let loss = ps.audio_packet_loss_pct;
+                let loss = ps.audio_concealment_pct;
 
                 // Penalties sum to 100 max.
                 // Jitter (target_delay_ms) is intentionally excluded: in this stack it

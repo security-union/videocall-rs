@@ -62,6 +62,7 @@ use crate::adaptive_quality_constants::{
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
+use crate::health_reporter::ClimbLimiterSnapshot;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
@@ -126,6 +127,13 @@ pub struct CameraEncoder {
     shared_encoder_target_bitrate_kbps: Rc<AtomicU32>,
     /// Tier transition events buffer, drained by health reporter each health packet.
     shared_tier_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+    /// Climb-rate limiter snapshot, updated by the encoder each tick, read by health reporter.
+    shared_climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
+    /// Dwell time samples buffer, populated by encoder, drained by health reporter.
+    shared_dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
+    /// Re-election completed signal. Set by ConnectionManager, consumed by the
+    /// encoder control loop to call `notify_reelection_completed()`.
+    reelection_completed_signal: Rc<AtomicBool>,
 }
 
 impl CameraEncoder {
@@ -175,6 +183,9 @@ impl CameraEncoder {
             shared_encoder_bitrate_ratio: Rc::new(AtomicU32::new(0)),
             shared_encoder_target_bitrate_kbps: Rc::new(AtomicU32::new(0)),
             shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
+            shared_climb_limiter_snapshot: Rc::new(RefCell::new(ClimbLimiterSnapshot::default())),
+            shared_dwell_samples: Rc::new(RefCell::new(Vec::new())),
+            reelection_completed_signal: Rc::new(AtomicBool::new(false)),
         }
     }
 
@@ -200,6 +211,9 @@ impl CameraEncoder {
         let shared_encoder_bitrate_ratio = self.shared_encoder_bitrate_ratio.clone();
         let shared_encoder_target_bitrate_kbps = self.shared_encoder_target_bitrate_kbps.clone();
         let shared_tier_transitions = self.shared_tier_transitions.clone();
+        let shared_climb_limiter_snapshot = self.shared_climb_limiter_snapshot.clone();
+        let shared_dwell_samples = self.shared_dwell_samples.clone();
+        let reelection_completed_signal = self.reelection_completed_signal.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -253,6 +267,46 @@ impl CameraEncoder {
                 let transitions = encoder_control.drain_tier_transitions();
                 if !transitions.is_empty() {
                     shared_tier_transitions.borrow_mut().extend(transitions);
+                }
+
+                // Check re-election completed signal. When ConnectionManager
+                // completes a re-election, it sets this flag. We consume it
+                // here so the quality manager suppresses crash ceiling arming
+                // during the server-swap transient.
+                if reelection_completed_signal.swap(false, Ordering::AcqRel) {
+                    log::info!("CameraEncoder: re-election completed, notifying quality manager");
+                    encoder_control.notify_reelection_completed();
+                }
+
+                // Update climb-rate limiter snapshot for health reporting.
+                if let Some(info) = encoder_control.crash_ceiling_info() {
+                    let (ceiling_idx, _label, decay_ms) = info;
+                    let mut snap = shared_climb_limiter_snapshot.borrow_mut();
+                    snap.crash_ceiling_active = true;
+                    snap.crash_ceiling_tier_index = Some(ceiling_idx as u32);
+                    snap.crash_ceiling_decay_ms = Some(decay_ms);
+                } else {
+                    let mut snap = shared_climb_limiter_snapshot.borrow_mut();
+                    snap.crash_ceiling_active = false;
+                    snap.crash_ceiling_tier_index = None;
+                    snap.crash_ceiling_decay_ms = None;
+                }
+                {
+                    let (ceiling, slowdown, screen) = encoder_control.step_up_blocked_counts();
+                    let mut snap = shared_climb_limiter_snapshot.borrow_mut();
+                    snap.step_up_blocked_ceiling = ceiling;
+                    snap.step_up_blocked_slowdown = slowdown;
+                    snap.step_up_blocked_screen_share = screen;
+                }
+
+                // Drain dwell samples into shared buffer for health reporting.
+                let dwells = encoder_control.drain_dwell_samples();
+                if !dwells.is_empty() {
+                    shared_dwell_samples.borrow_mut().extend(
+                        dwells
+                            .into_iter()
+                            .map(|(label, ms)| (label.to_string(), ms)),
+                    );
                 }
 
                 if let Some(bitrate) = output_wasted {
@@ -377,6 +431,30 @@ impl CameraEncoder {
     /// Returns the shared tier transitions buffer for health reporting.
     pub fn shared_tier_transitions(&self) -> Rc<RefCell<Vec<TierTransitionRecord>>> {
         self.shared_tier_transitions.clone()
+    }
+
+    /// Returns the shared climb-rate limiter snapshot for health reporting.
+    pub fn shared_climb_limiter_snapshot(&self) -> Rc<RefCell<ClimbLimiterSnapshot>> {
+        self.shared_climb_limiter_snapshot.clone()
+    }
+
+    /// Returns the shared dwell samples buffer for health reporting.
+    pub fn shared_dwell_samples(&self) -> Rc<RefCell<Vec<(String, f64)>>> {
+        self.shared_dwell_samples.clone()
+    }
+
+    /// Returns a shared reference to the re-election completed signal.
+    ///
+    /// The `ConnectionManager` sets this flag to `true` when a re-election
+    /// succeeds. The encoder control loop checks and clears it each tick,
+    /// calling `notify_reelection_completed()` on the quality manager.
+    pub fn reelection_completed_signal(&self) -> Rc<AtomicBool> {
+        self.reelection_completed_signal.clone()
+    }
+
+    /// Replace the internal re-election completed signal with an externally-owned one.
+    pub fn set_reelection_completed_signal(&mut self, signal: Rc<AtomicBool>) {
+        self.reelection_completed_signal = signal;
     }
 
     /// Returns a shared reference to the force-keyframe flag.

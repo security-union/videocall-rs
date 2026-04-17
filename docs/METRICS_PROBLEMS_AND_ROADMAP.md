@@ -200,7 +200,7 @@ Added to `health_packet.proto` / `HealthPacket`:
 
 Added to `PeerStats`:
 - `frames_dropped` (uint64) — initial version, later renamed to `decode_errors_per_sec`
-- `audio_packet_loss_pct` (double) — audio loss percentage
+- `audio_concealment_pct` (double) — audio concealment percentage (renamed from `audio_packet_loss_pct` in PR #318)
 
 Client collection added in `health_reporter.rs`:
 - Tab visibility read on each heartbeat
@@ -213,7 +213,7 @@ Extended `actix-api/src/bin/metrics_server.rs` to extract and expose new Phase 1
 - `videocall_client_tab_visible{meeting_id, session_id, peer_id}`
 - `videocall_client_memory_used_bytes{...}`
 - `videocall_video_frames_dropped{meeting_id, session_id, from_peer, to_peer}`
-- `videocall_audio_packet_loss_pct{...}`
+- `videocall_audio_concealment_pct{...}` (renamed from `videocall_audio_packet_loss_pct` in PR #318)
 
 #### Commit `cfb1c20b` — vcprobe NATS Subscriber Mode
 
@@ -261,7 +261,7 @@ Audio quality formula (gated on `packets_per_sec >= 2.0`, `audio_fresh`):
 ```
 audio_score = 100
     - min(expand_per_sec / 10.0, 1.0) * 70    # concealment penalty (max -70)
-    - min(audio_packet_loss_pct / 5.0, 1.0) * 30  # loss penalty (max -30)
+    - min(audio_concealment_pct / 5.0, 1.0) * 30  # concealment penalty (max -30)
 ```
 Jitter (`target_delay_ms`) was intentionally excluded from the formula: NetEQ's delay manager settles at ~120ms by default in this stack, creating a constant drag that penalizes every call regardless of network conditions. Concealment already captures the downstream effect of real jitter (packets arriving late get concealed).
 
@@ -389,7 +389,7 @@ Recommended alert rules:
 1. `call_quality_score < 40` for > 30s → Warning
 2. `call_quality_score < 20` for > 10s → Critical
 3. `target_delay_ms > 150` for > 60s → Network jitter alert
-4. `audio_packet_loss_pct > 10%` for > 20s → Packet loss alert
+4. `audio_concealment_pct > 10%` for > 20s → Audio concealment alert
 5. `send_queue_bytes > 100000` for > 30s → Client bandwidth saturation
 6. Meeting-wide: avg RTT > 200ms across ≥ 80% of participants → Server/upstream issue
 
@@ -399,7 +399,7 @@ Currently exposed (needs deployment of recent commits):
 - `videocall_client_tab_visible{meeting_id, session_id, peer_id}`
 - `videocall_client_memory_used_bytes{...}`
 - `videocall_video_frames_dropped{...}` (note: still exposes lifetime counter — should be updated to rate)
-- `videocall_audio_packet_loss_pct{...}`
+- `videocall_audio_concealment_pct{...}` (renamed from `videocall_audio_packet_loss_pct` in PR #318)
 
 **Not yet exposed to Prometheus**: `audio_quality_score`, `video_quality_score`, `call_quality_score`. Adding these to `actix-api/src/bin/metrics_server.rs` is the next highest-value instrumentation step.
 

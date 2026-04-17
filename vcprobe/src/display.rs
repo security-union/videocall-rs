@@ -253,9 +253,9 @@ fn print_health(health: &HealthPacket, verbose: bool, use_utc: bool) {
                 .as_ref()
                 .map(|v| v.bitrate_kbps)
                 .unwrap_or(0);
-            // Audio packet loss and decode errors
-            let audio_loss = if stats.audio_packet_loss_pct > 0.01 {
-                format!(" loss={:.1}%", stats.audio_packet_loss_pct)
+            // Audio concealment and decode errors
+            let audio_loss = if stats.audio_concealment_pct > 0.01 {
+                format!(" conceal={:.1}%", stats.audio_concealment_pct)
             } else {
                 String::new()
             };

@@ -1064,7 +1064,9 @@ pub fn AttendantsComponent(
         display_peers.sort_by(|a, b| {
             let ts_a = speech_map.get(a).copied().unwrap_or(0.0);
             let ts_b = speech_map.get(b).copied().unwrap_or(0.0);
-            ts_b.partial_cmp(&ts_a).unwrap_or(std::cmp::Ordering::Equal)
+            ts_b.partial_cmp(&ts_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
         });
     }
     let peers_for_display: Vec<String> = display_peers

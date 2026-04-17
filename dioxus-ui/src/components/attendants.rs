@@ -34,6 +34,7 @@ use crate::components::{
 };
 use crate::console_log_collector::{flush_console_logs, set_console_log_context};
 use crate::constants::actix_websocket_base;
+use crate::routing::Route;
 use crate::constants::{
     mock_peers_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
     CANVAS_LIMIT,
@@ -462,6 +463,7 @@ pub fn AttendantsComponent(
     // be called inside the hook closure).
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let transport_pref = (transport_pref_ctx.0)();
+    let navigator = use_navigator();
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -1190,148 +1192,199 @@ pub fn AttendantsComponent(
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
     // --- Pre-join screen ---
     if !meeting_joined() {
+        let aca_opacity = if waiting_room_toggle() { "1.0" } else { "0.4" };
         return rsx! {
             div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
-                div {
-                    id: "join-meeting-container",
-                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;",
+                div { id: "join-meeting-container", class: "hero-container",
+                    div { class: "floating-element floating-element-1" }
+                    div { class: "floating-element floating-element-2" }
+                    div { class: "floating-element floating-element-3" }
+                    div { class: "hero-content",
+                        div { class: "settings-card",
+                            if is_owner {
+                                h3 { class: "settings-card-title", "Meeting Options" }
+                            } else {
+                                h3 { class: "settings-card-title", "Ready to join the meeting?" }
+                                p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.9rem; margin-top: -0.5rem; margin-bottom: 0.5rem;",
+                                    "Click the button below to join and start listening to others."
+                                }
+                            }
 
-                    div { style: "text-align: center; color: white; margin-bottom: 2rem;",
-                        h2 { "Ready to join the meeting?" }
-                        p { "Click the button below to join and start listening to others." }
-                        if let Some(err) = connection_error() {
-                            p { style: "color: #ff6b6b; margin-top: 1rem;", "{err}" }
-                        }
-                    }
-                    if is_owner {
-                        {
-                            let meeting_id_for_toggle = id.clone();
-                            let aca_opacity = if waiting_room_toggle() { "1" } else { "0.5" };
-                            rsx! {
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
-                                    span { style: "font-size: 0.9rem;", "Waiting Room" }
-                                    crate::components::toggle_switch::ToggleSwitch {
-                                        enabled: waiting_room_toggle(),
-                                        disabled: saving(),
-                                        on_toggle: {
-                                            let meeting_id = meeting_id_for_toggle.clone();
-                                            move |new_val: bool| {
-                                                if saving() {
-                                                    return;
-                                                }
-                                                toggle_error.set(None);
-                                                waiting_room_toggle.set(new_val);
-                                                // When disabling waiting room, also disable admitted_can_admit
-                                                if !new_val {
-                                                    admitted_can_admit_toggle.set(false);
-                                                }
-                                                saving.set(true);
-                                                let meeting_id = meeting_id.clone();
-                                                let aca = if new_val { Some(admitted_can_admit_toggle()) } else { Some(false) };
-                                                wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val, aca).await {
-                                                        Ok(updated) => {
-                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
-                                                            admitted_can_admit_toggle.set(updated.admitted_can_admit);
-                                                            saving.set(false);
-                                                        }
-                                                        Err(e) => {
-                                                            log::error!("Failed to update waiting room setting: {e}");
-                                                            waiting_room_toggle.set(!new_val);
-                                                            saving.set(false);
-                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                                                        }
+                            if let Some(err) = connection_error() {
+                                p { class: "toggle-error", "{err}" }
+                            }
+
+                            if is_owner {
+                                {
+                                    let meeting_id_for_toggle = id.clone();
+                                    rsx! {
+                                        div { class: "settings-option-row",
+                                            span { class: "settings-option-label", "Waiting Room" }
+                                            div { class: "settings-option-controls",
+                                                span {
+                                                    class: "settings-info-icon",
+                                                    title: "Participants must be admitted by the host before joining",
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "15",
+                                                        height: "15",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        circle { cx: "12", cy: "12", r: "10" }
+                                                        line { x1: "12", y1: "16", x2: "12", y2: "12" }
+                                                        line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
                                                     }
-                                                });
-                                            }
-                                        },
-                                    }
-                                }
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white; opacity: {aca_opacity};",
-                                    span { style: "font-size: 0.9rem;", "Admitted can admit" }
-                                    crate::components::toggle_switch::ToggleSwitch {
-                                        enabled: admitted_can_admit_toggle(),
-                                        disabled: saving() || !waiting_room_toggle(),
-                                        on_toggle: {
-                                            let meeting_id = meeting_id_for_toggle.clone();
-                                            move |new_val: bool| {
-                                                if saving() || !waiting_room_toggle() {
-                                                    return;
                                                 }
-                                                toggle_error.set(None);
-                                                admitted_can_admit_toggle.set(new_val);
-                                                saving.set(true);
-                                                let meeting_id = meeting_id.clone();
-                                                let wr = waiting_room_toggle();
-                                                wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, wr, Some(new_val)).await {
-                                                        Ok(updated) => {
-                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
-                                                            admitted_can_admit_toggle.set(updated.admitted_can_admit);
-                                                            saving.set(false);
+                                                crate::components::toggle_switch::ToggleSwitch {
+                                                    enabled: waiting_room_toggle(),
+                                                    disabled: saving(),
+                                                    on_toggle: {
+                                                        let meeting_id = meeting_id_for_toggle.clone();
+                                                        move |new_val: bool| {
+                                                            if saving() {
+                                                                return;
+                                                            }
+                                                            toggle_error.set(None);
+                                                            waiting_room_toggle.set(new_val);
+                                                            // When disabling waiting room, also disable admitted_can_admit
+                                                            if !new_val {
+                                                                admitted_can_admit_toggle.set(false);
+                                                            }
+                                                            saving.set(true);
+                                                            let meeting_id = meeting_id.clone();
+                                                            let aca = if new_val { Some(admitted_can_admit_toggle()) } else { Some(false) };
+                                                            wasm_bindgen_futures::spawn_local(async move {
+                                                                match crate::meeting_api::update_meeting(&meeting_id, new_val, aca).await {
+                                                                    Ok(updated) => {
+                                                                        waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                                        admitted_can_admit_toggle.set(updated.admitted_can_admit);
+                                                                        saving.set(false);
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::error!("Failed to update waiting room setting: {e}");
+                                                                        waiting_room_toggle.set(!new_val);
+                                                                        saving.set(false);
+                                                                        toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                                    }
+                                                                }
+                                                            });
                                                         }
-                                                        Err(e) => {
-                                                            log::error!("Failed to update admitted_can_admit setting: {e}");
-                                                            admitted_can_admit_toggle.set(!new_val);
-                                                            saving.set(false);
-                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                                                        }
-                                                    }
-                                                });
+                                                    },
+                                                }
                                             }
-                                        },
+                                        }
+                                        div {
+                                            class: "settings-option-row",
+                                            style: "opacity: {aca_opacity};",
+                                            span { class: "settings-option-label", "Admitted can admit" }
+                                            div { class: "settings-option-controls",
+                                                span {
+                                                    class: "settings-info-icon",
+                                                    title: "Allow admitted participants to also admit others from the waiting room",
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "15",
+                                                        height: "15",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        circle { cx: "12", cy: "12", r: "10" }
+                                                        line { x1: "12", y1: "16", x2: "12", y2: "12" }
+                                                        line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
+                                                    }
+                                                }
+                                                crate::components::toggle_switch::ToggleSwitch {
+                                                    enabled: admitted_can_admit_toggle(),
+                                                    disabled: saving() || !waiting_room_toggle(),
+                                                    on_toggle: {
+                                                        let meeting_id = meeting_id_for_toggle.clone();
+                                                        move |new_val: bool| {
+                                                            if saving() || !waiting_room_toggle() {
+                                                                return;
+                                                            }
+                                                            toggle_error.set(None);
+                                                            admitted_can_admit_toggle.set(new_val);
+                                                            saving.set(true);
+                                                            let meeting_id = meeting_id.clone();
+                                                            let wr = waiting_room_toggle();
+                                                            wasm_bindgen_futures::spawn_local(async move {
+                                                                match crate::meeting_api::update_meeting(&meeting_id, wr, Some(new_val)).await {
+                                                                    Ok(updated) => {
+                                                                        waiting_room_toggle.set(updated.waiting_room_enabled);
+                                                                        admitted_can_admit_toggle.set(updated.admitted_can_admit);
+                                                                        saving.set(false);
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::error!("Failed to update admitted_can_admit setting: {e}");
+                                                                        admitted_can_admit_toggle.set(!new_val);
+                                                                        saving.set(false);
+                                                                        toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                    },
+                                                }
+                                            }
+                                        }
+                                        if let Some(err) = toggle_error() {
+                                            p { class: "toggle-error", "{err}" }
+                                        }
+                                        p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-top: 0.5rem; margin-bottom: 0.25rem;",
+                                            if waiting_room_toggle() {
+                                                "Participants will wait for your approval before joining"
+                                            } else {
+                                                "Participants will join the meeting directly"
+                                            }
+                                        }
                                     }
                                 }
-                                if let Some(err) = toggle_error() {
-                                    p { class: "toggle-error", "{err}" }
-                                }
-                                p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-bottom: 1.5rem; margin-top: -0.75rem;",
-                                    if waiting_room_toggle() {
-                                        "Participants will wait for your approval before joining"
-                                    } else {
-                                        "Participants will join the meeting directly"
-                                    }
+                            }
+
+                            div { class: "settings-action-row",
+                                button {
+                                    class: "btn-apple btn-primary settings-action-btn",
+                                    onclick: move |_| {
+                                        mda.borrow().request();
+                                    },
+                                    if is_owner { "Start Meeting" } else { "Join Meeting" }
                                 }
                             }
                         }
                     }
-                    button {
-                        class: "btn-apple btn-primary",
-                        onclick: move |_| {
-                            mda.borrow().request();
-                        },
-                        if is_owner {
-                            "Start Meeting"
-                        } else {
-                            "Join Meeting"
-                        }
-                    }
-                    if show_device_warning() {
-                        div { class: "modal-overlay",
-                            div { class: "modal-window",
-                                h3 { "Device access problem" }
-                                if let Some(err) = mic_error.read().as_ref() {
-                                    {render_single_device_error("Microphone", err)}
-                                }
-                                if let Some(err) = video_error.read().as_ref() {
-                                    {render_single_device_error("Camera", err)}
-                                }
-                                {
-                                    let mut client = client.clone();
-                                    rsx! {
-                                        button {
-                                            class: "btn-apple btn-primary",
-                                            style: "margin-top: 1.5rem;",
-                                            onclick: move |_| {
-                                                show_device_warning.set(false);
-                                                if let Err(e) = client.connect() {
-                                                    error!("Connection failed: {e:?}");
-                                                }
-                                                meeting_joined.set(true);
-                                            },
-                                            "Ok"
-                                        }
+                }
+                if show_device_warning() {
+                    div { class: "modal-overlay",
+                        div { class: "modal-window",
+                            h3 { "Device access problem" }
+                            if let Some(err) = mic_error.read().as_ref() {
+                                {render_single_device_error("Microphone", err)}
+                            }
+                            if let Some(err) = video_error.read().as_ref() {
+                                {render_single_device_error("Camera", err)}
+                            }
+                            {
+                                let mut client = client.clone();
+                                rsx! {
+                                    button {
+                                        class: "btn-apple btn-primary",
+                                        style: "margin-top: 1.5rem;",
+                                        onclick: move |_| {
+                                            show_device_warning.set(false);
+                                            if let Err(e) = client.connect() {
+                                                error!("Connection failed: {e:?}");
+                                            }
+                                            meeting_joined.set(true);
+                                        },
+                                        "Ok"
                                     }
                                 }
                             }

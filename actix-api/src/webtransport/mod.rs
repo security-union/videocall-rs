@@ -355,7 +355,8 @@ async fn handle_webtransport_session(
     instance_id: Option<String>,
 ) -> anyhow::Result<()> {
     // Create channel for actor → WebTransport I/O
-    let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
+    let (outbound_tx, outbound_rx) =
+        mpsc::channel::<WtOutbound>(crate::constants::WT_OUTBOUND_CHANNEL_CAPACITY);
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(

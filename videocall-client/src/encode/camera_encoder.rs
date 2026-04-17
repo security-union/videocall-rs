@@ -220,6 +220,9 @@ impl CameraEncoder {
                 current_fps.clone(),
             );
             let mut prev_screen_active = false;
+            let mut last_ws_drop_snapshot: u64 =
+                videocall_transport::websocket::websocket_drop_count();
+            let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
             while let Some(event) = diagnostics_receiver.next().await {
                 // Check for screen sharing state transitions and coordinate
                 // camera quality to avoid bandwidth contention.
@@ -241,6 +244,37 @@ impl CameraEncoder {
                         "CameraEncoder: server CONGESTION signal received, forcing video step-down"
                     );
                     encoder_control.force_video_step_down();
+                }
+
+                // Client-side WebSocket backpressure detection.
+                // When the browser's TCP send buffer is full, outbound packets
+                // are dropped locally (see websocket.rs send_binary). If enough
+                // drops accumulate within the sliding window, self-trigger an AQ
+                // step-down without waiting for the server. For WebTransport
+                // users, websocket_drop_count() always returns 0 so this is a
+                // no-op.
+                {
+                    let current_ws_drops = videocall_transport::websocket::websocket_drop_count();
+                    let now_ms = js_sys::Date::now();
+                    let elapsed_ms = now_ms - ws_drop_window_start_ms;
+
+                    if elapsed_ms >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_WINDOW_MS
+                    {
+                        let delta = current_ws_drops - last_ws_drop_snapshot;
+                        if delta
+                            >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_DROP_THRESHOLD
+                        {
+                            log::warn!(
+                                "CameraEncoder: client WS backpressure detected ({} drops in {:.0}ms), \
+                                 forcing video step-down",
+                                delta,
+                                elapsed_ms,
+                            );
+                            encoder_control.force_video_step_down();
+                        }
+                        last_ws_drop_snapshot = current_ws_drops;
+                        ws_drop_window_start_ms = now_ms;
+                    }
                 }
 
                 let output_wasted = encoder_control.process_diagnostics_packet(event);

@@ -94,10 +94,9 @@ struct CmdKHandle {
 impl CmdKHandle {
     fn remove(&self) {
         use wasm_bindgen::JsCast;
-        let _ = self.window.remove_event_listener_with_callback(
-            "keydown",
-            self.closure.as_ref().unchecked_ref(),
-        );
+        let _ = self
+            .window
+            .remove_event_listener_with_callback("keydown", self.closure.as_ref().unchecked_ref());
     }
 }
 
@@ -108,18 +107,16 @@ fn register_cmd_k_listener(search_visible: Signal<bool>) -> std::rc::Rc<CmdKHand
 
     let window = web_sys::window().expect("window is available in a browser context");
     let mut sv = search_visible;
-    let closure = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
-        move |evt: web_sys::KeyboardEvent| {
+    let closure =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |evt: web_sys::KeyboardEvent| {
             if evt.key() == "k" && (evt.meta_key() || evt.ctrl_key()) {
                 evt.prevent_default();
                 sv.set(!sv());
             }
-        },
-    );
+        });
     window
         .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
         .expect("failed to register Cmd-K keydown listener");
 
     std::rc::Rc::new(CmdKHandle { closure, window })
 }
-

@@ -194,8 +194,8 @@ async fn search_v2(base_url: &str, q: &str) -> Result<Vec<SearchResult>, String>
 
 /// Fallback: query meeting-api Postgres search via the typed client.
 async fn search_fallback(q: &str) -> Result<Vec<SearchResult>, String> {
-    let client = crate::constants::meeting_api_client()
-        .map_err(|e| format!("Client config error: {e}"))?;
+    let client =
+        crate::constants::meeting_api_client().map_err(|e| format!("Client config error: {e}"))?;
     let response = client
         .list_meetings(20, 0, Some(q))
         .await
@@ -220,9 +220,7 @@ pub fn SearchModal() -> Element {
     let mut is_loading = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
 
-    let search_base = crate::constants::search_api_base_url()
-        .ok()
-        .flatten();
+    let search_base = crate::constants::search_api_base_url().ok().flatten();
 
     use_resource(move || {
         let q = query.read().clone();
@@ -235,8 +233,28 @@ pub fn SearchModal() -> Element {
             is_loading.set(true);
             error.set(None);
 
+            // SearchV2 is the primary path when configured; Postgres is a
+            // fallback.  Fall back on:
+            //   1. any SearchV2 error (network failure, 5xx, parse error), AND
+            //   2. a successful-but-empty response when the user has no
+            //      stored id_token — this is the local-dev case where
+            //      SearchV2 is reachable but the request went out
+            //      unauthenticated, so the CC ACL filter returns zero hits.
+            //      Postgres then answers under the anonymous / session
+            //      identity resolved by `AuthUser`.
+            // Authenticated users with a real empty result set skip the
+            // fallback and see "No meetings found" immediately.
             let res = if let Some(ref url) = base {
                 match search_v2(url, &q).await {
+                    Ok(items)
+                        if items.is_empty() && crate::auth::get_stored_id_token().is_none() =>
+                    {
+                        log::info!(
+                            "SearchV2 returned 0 results for unauthenticated request; \
+                             trying Postgres fallback"
+                        );
+                        search_fallback(&q).await
+                    }
                     Ok(items) => Ok(items),
                     Err(e) => {
                         log::warn!("SearchV2 unavailable ({e}), falling back to Postgres");
@@ -314,18 +332,17 @@ pub fn SearchModal() -> Element {
                                 } else {
                                     "margin-left:12px; flex-shrink:0; border-radius:9999px; background:rgba(202,138,4,0.15); padding:3px 10px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:#facc15;"
                                 };
-                                let badge_text = if is_active {
-                                    "Join".to_string()
+                                let badge_text: &str = if is_active {
+                                    "Join"
                                 } else if is_ended {
-                                    "Ended".to_string()
+                                    "Ended"
                                 } else {
-                                    result.state.clone()
+                                    result.state.as_str()
                                 };
-                                let href = format!("/meeting/{}", result.meeting_id);
                                 rsx! {
                                     a {
                                         key: "{result.meeting_id}",
-                                        href: "{href}",
+                                        href: "/meeting/{result.meeting_id}",
                                         style: "{row_style} text-decoration:none; color:inherit;",
                                         onclick: move |evt| {
                                             if !is_active {

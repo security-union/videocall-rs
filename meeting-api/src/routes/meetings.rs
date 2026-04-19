@@ -20,7 +20,7 @@ use axum::{
     Json,
 };
 use rand::Rng;
-use crate::search_push;
+use crate::search;
 use videocall_meeting_types::{
     requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
     responses::{
@@ -120,12 +120,10 @@ pub async fn create_meeting(
         other => AppError::from(other),
     })?;
 
-    // Fire-and-forget: push to SearchV2
-    tokio::spawn({
-        let state = state.clone();
-        let meeting = row.clone();
-        async move { search_push::push_meeting(&state, &meeting).await }
-    });
+    // Fire-and-forget push to SearchV2.  See `search::spawn_repush` for the
+    // full fire-and-forget contract (no-op when disabled, re-fetches the
+    // meeting row, loads the participant roster).
+    search::spawn_repush(&state, row.id, row.room_id.clone());
 
     let response = CreateMeetingResponse {
         meeting_id: row.room_id,
@@ -248,7 +246,9 @@ pub async fn delete_meeting(
     tokio::spawn({
         let state = state.clone();
         let room_id = meeting_id.clone();
-        async move { search_push::delete_meeting_doc(&state, &room_id).await }
+        async move {
+            search::delete_meeting_doc(state.search.as_ref(), &state.http_client, &room_id).await;
+        }
     });
 
     Ok(Json(APIResponse::ok(DeleteMeetingResponse {
@@ -301,12 +301,9 @@ pub async fn end_meeting_handler(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    // Fire-and-forget: push ended state to SearchV2
-    tokio::spawn({
-        let state = state.clone();
-        let meeting = row.clone();
-        async move { search_push::push_meeting(&state, &meeting).await }
-    });
+    // Fire-and-forget push of the ended state so search results mark the
+    // meeting as completed promptly.
+    search::spawn_repush(&state, row.id, row.room_id.clone());
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
@@ -372,12 +369,9 @@ pub async fn update_meeting(
         row
     };
 
-    // Fire-and-forget: push updated state to SearchV2
-    tokio::spawn({
-        let state = state.clone();
-        let meeting = row.clone();
-        async move { search_push::push_meeting(&state, &meeting).await }
-    });
+    // Fire-and-forget push of the updated settings so search results reflect
+    // the new waiting-room / admitted_can_admit state quickly.
+    search::spawn_repush(&state, row.id, row.room_id.clone());
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));

@@ -8,6 +8,8 @@
 .idea/
 target/
 dioxus-ui/dist/
+# Developer-local config overrides (see scripts/config.local.js.example).
+dioxus-ui/scripts/config.local.js
 helm/digital-ocean-secret
 helm/global/us-east/grafana/secret.yaml
 helm-videocall-deployment/

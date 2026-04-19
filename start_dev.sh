@@ -16,6 +16,10 @@ export LISTEN_URL=${LISTEN_URL:-0.0.0.0:4433}
 export DATABASE_URL=${DATABASE_URL:-postgresql://$USER@localhost/actix-api-db}
 export JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
 export COOKIE_SECURE=${COOKIE_SECURE:-false}
+# Local dev fallback: let meeting-api resolve unauthenticated requests to a
+# stable anonymous identity so you can exercise the API without an OAuth
+# provider. Production must leave this unset (or "false").
+export ALLOW_ANONYMOUS=${ALLOW_ANONYMOUS:-true}
 
 server_command="$( ((WEBTRANSPORT_ENABLED)) && echo webtransport_server || echo websocket_server )"
 

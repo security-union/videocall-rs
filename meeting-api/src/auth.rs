@@ -115,15 +115,17 @@ impl FromRequestParts<AppState> for AuthUser {
         }
 
         // ----------------------------------------------------------------
-        // Path 3 — Anonymous fallback (no OAuth configured)
+        // Path 3 — Anonymous fallback (opt-in via ALLOW_ANONYMOUS=true)
         //
-        // When no identity provider is configured, allow unauthenticated
-        // access with a stable anonymous identity.  This is the local
-        // development path: without an IdP there is no way to obtain a
-        // session token, so we generate one from the display_name query
-        // parameter (or a default) and return it as an anonymous user.
+        // When explicitly enabled, allow unauthenticated access with a
+        // stable anonymous identity.  This is the local-development path:
+        // without an IdP there is no way to obtain a session token, so we
+        // derive a stable id from the remote address and return it as an
+        // anonymous user.  Production deployments must leave this flag off
+        // (the default) so unauthenticated requests return 401 instead of
+        // silently impersonating an anonymous user.
         // ----------------------------------------------------------------
-        if state.oauth.is_none() {
+        if state.allow_anonymous {
             let user_id = format!("anon-{:08x}", hash_remote_addr(parts));
             return Ok(AuthUser {
                 user_id,
@@ -241,12 +243,16 @@ mod tests {
     fn make_test_state_with_oauth() -> AppState {
         let mut s = make_test_state();
         s.oauth = Some(dummy_oauth_config());
+        // With OAuth configured, the anonymous fallback is off; unauthenticated
+        // requests must 401 so this mirrors the production default.
+        s.allow_anonymous = false;
         s
     }
 
     fn make_state_with_cookie_name_and_oauth(name: &str) -> AppState {
         let mut s = make_state_with_cookie_name(name);
         s.oauth = Some(dummy_oauth_config());
+        s.allow_anonymous = false;
         s
     }
 
@@ -271,8 +277,12 @@ mod tests {
             nats: None,
             service_version_urls: Vec::new(),
             http_client: reqwest::Client::new(),
-            search_api_url: None,
-            search_api_token: None,
+            search: None,
+            // Default to true in the "no OAuth" unit-test state so tests that
+            // exercise the anonymous-fallback path don't have to flip this
+            // themselves.  Tests that want to verify 401-on-missing-credentials
+            // use `make_test_state_with_oauth()` which overrides this.
+            allow_anonymous: true,
         }
     }
 
@@ -380,9 +390,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_credentials_anonymous_when_no_oauth() {
+    async fn missing_credentials_anonymous_when_allowed() {
+        // `make_test_state()` defaults to `allow_anonymous: true` so this
+        // asserts the opt-in behaviour: a request without credentials is
+        // accepted with a synthetic `anon-…` user_id.
         let auth = extract_with_cookie(None).await.expect("anonymous fallback");
         assert!(auth.user_id.starts_with("anon-"));
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_returns_unauthorized_when_anonymous_disabled() {
+        // With `allow_anonymous: false` and no OAuth, the anonymous path is
+        // closed off and missing credentials must return 401.
+        let mut state = make_test_state();
+        state.allow_anonymous = false;
+        let err = extract_with_cookie_and_state(None, &state).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -583,8 +606,10 @@ mod tests {
             nats: None,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
-            search_api_url: None,
-            search_api_token: None,
+            search: None,
+            // JWKS-mode tests exercise the OAuth path; unauthenticated
+            // requests must not fall through to an anonymous identity.
+            allow_anonymous: false,
         }
     }
 

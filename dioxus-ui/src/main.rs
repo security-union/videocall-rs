@@ -14,7 +14,7 @@ mod provider_config;
 mod routing;
 mod types;
 
-use crate::components::search_modal::{SearchModal, SearchVisibleCtx};
+use crate::components::search_modal::SearchVisibleCtx;
 use crate::routing::Route;
 use context::{
     load_display_name_from_storage, load_transport_preference, migrate_legacy_storage,
@@ -42,40 +42,84 @@ fn main() {
 
 #[component]
 fn App() -> Element {
-    use_context_provider(|| SearchVisibleCtx { 
-        is_visible: Signal::new(false) 
-});
-
     let display_name = use_signal(load_display_name_from_storage);
     use_context_provider(|| DisplayNameCtx(display_name));
 
     let transport_pref = use_signal(load_transport_preference);
     use_context_provider(|| TransportPreferenceCtx(transport_pref));
 
+    // Signal shared with the Cmd-K / Ctrl-K global shortcut and with
+    // `SearchModal` via `SearchVisibleCtx`.  There is exactly ONE provider —
+    // an earlier version of this file also registered a second, orphan
+    // `Signal::new(false)` provider that the Cmd-K handler below never drove,
+    // causing the modal to never open despite the shortcut firing.
     let search_visible = use_signal(|| false);
-    use_context_provider(|| SearchVisibleCtx { is_visible: search_visible });
-
-    use_effect(move || {
-        use wasm_bindgen::prelude::*;
-        use wasm_bindgen::JsCast;
-        let window = web_sys::window().unwrap();
-        let mut sv = search_visible;
-        let closure = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
-            move |evt: web_sys::KeyboardEvent| {
-                if evt.key() == "k" && (evt.meta_key() || evt.ctrl_key()) {
-                    evt.prevent_default();
-                    sv.set(!sv());
-                }
-            },
-        );
-        window
-            .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
-            .unwrap();
-        closure.forget();
+    use_context_provider(|| SearchVisibleCtx {
+        is_visible: search_visible,
     });
-    
+
+    // Install the global Cmd-K / Ctrl-K keyboard listener exactly once per
+    // App mount, and remove it on unmount.  Using `use_hook` (which runs
+    // once) instead of `use_effect` (which may re-run on re-renders) and
+    // keeping the `Closure` alive inside `CmdKHandle` fixes the memory leak
+    // caused by the previous `closure.forget()` pattern — that version
+    // re-installed a new listener on every re-render and never freed any of
+    // them.  The `use_drop` callback removes the listener when `App`
+    // unmounts so hot-reload scenarios don't accumulate handlers either.
+    let cmd_k_handle = use_hook(|| register_cmd_k_listener(search_visible));
+    use_drop({
+        let cmd_k_handle = cmd_k_handle.clone();
+        move || {
+            cmd_k_handle.remove();
+        }
+    });
+
     rsx! {
         Router::<Route> {}
     }
+}
+
+/// Handle to the Cmd-K / Ctrl-K global keyboard listener.
+///
+/// Keeping the [`Closure`] alive as a field is what prevents JS from
+/// reclaiming the underlying callback while the event listener still
+/// references it.  `remove()` drops the listener from the window — called
+/// from [`use_drop`] on unmount so we never accumulate dangling listeners
+/// across hot reloads.
+struct CmdKHandle {
+    closure: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::KeyboardEvent)>,
+    window: web_sys::Window,
+}
+
+impl CmdKHandle {
+    fn remove(&self) {
+        use wasm_bindgen::JsCast;
+        let _ = self.window.remove_event_listener_with_callback(
+            "keydown",
+            self.closure.as_ref().unchecked_ref(),
+        );
+    }
+}
+
+/// Register the Cmd-K / Ctrl-K shortcut that toggles [`SearchVisibleCtx`].
+fn register_cmd_k_listener(search_visible: Signal<bool>) -> std::rc::Rc<CmdKHandle> {
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    let window = web_sys::window().expect("window is available in a browser context");
+    let mut sv = search_visible;
+    let closure = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+        move |evt: web_sys::KeyboardEvent| {
+            if evt.key() == "k" && (evt.meta_key() || evt.ctrl_key()) {
+                evt.prevent_default();
+                sv.set(!sv());
+            }
+        },
+    );
+    window
+        .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
+        .expect("failed to register Cmd-K keydown listener");
+
+    std::rc::Rc::new(CmdKHandle { closure, window })
 }
 

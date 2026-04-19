@@ -38,16 +38,34 @@ struct SearchV2Hit {
     _source: SearchV2Source,
 }
 
+/// Subset of the `_source` object we care about.  We read the CC-canonical
+/// top-level fields emitted by both our push (see `meeting-api/src/search.rs`)
+/// and the built-in `VideocallCrawlerDriver`, plus fall back to
+/// `documentObject.*` for older docs that might still be in the index.
+///
+/// We intentionally do NOT deserialise `title` — on the current push path
+/// `title` is the host's display name (used to drive search relevance), not
+/// the room_id, so it would be a misleading fallback for any per-meeting
+/// field the UI needs.
 #[derive(Deserialize, Debug)]
 struct SearchV2Source {
+    // CC canonical top-level fields.
+    #[serde(rename = "meetingId", default)]
+    meeting_id: Option<String>,
     #[serde(default)]
-    title: Option<String>,
+    state: Option<String>,
+    #[serde(rename = "organizerName", default)]
+    organizer_name: Option<String>,
+    #[serde(default)]
+    organizer: Option<String>,
+    // Fallback for older docs.
     #[serde(rename = "documentObject", default)]
     document_object: Option<SearchV2DocObject>,
 }
 
 #[derive(Deserialize, Debug)]
 struct SearchV2DocObject {
+    // Old snake_case shape (pre-CC-realignment).
     #[serde(default)]
     room_id: Option<String>,
     #[serde(default)]
@@ -56,9 +74,28 @@ struct SearchV2DocObject {
     host_display_name: Option<String>,
     #[serde(default)]
     creator_id: Option<String>,
+    // New camelCase shape (matches the crawler / our current push).
+    #[serde(rename = "roomId", default)]
+    room_id_camel: Option<String>,
+    #[serde(rename = "hostDisplayName", default)]
+    host_display_name_camel: Option<String>,
 }
 
 /// Query SearchV2 middleware directly.
+///
+/// **App scope.**  Meetings live in the CC product's `cs-cc-meetings` content
+/// source (shared with the built-in `VideocallCrawlerDriver`).  We must send
+/// `X-App-Type: CC` so the middleware resolves the request under the CC ACL
+/// registry, otherwise the default `DX` filter runs and nothing matches.
+///
+/// **Authentication.**  When the user has a stored `id_token` (public-client
+/// OAuth flow), we attach it as `Authorization: Bearer <token>` so
+/// SearchV2's CC filter can scope results to the authenticated user's
+/// principals via `buildCcFilter`.  When there is no stored token — e.g.
+/// local dev with `oauthEnabled: "false"` — the request goes out
+/// unauthenticated and SearchV2 falls back to its anonymous filter; typical
+/// UX is that no meetings are returned, and [`crate::components::search_modal`]
+/// then transparently falls back to the Postgres path.
 async fn search_v2(base_url: &str, q: &str) -> Result<Vec<SearchResult>, String> {
     let url = format!("{}/mysearch", base_url.trim_end_matches('/'));
 
@@ -67,18 +104,36 @@ async fn search_v2(base_url: &str, q: &str) -> Result<Vec<SearchResult>, String>
             "must": [{
                 "query_string": {
                     "query": format!("*{}*", q),
-                    "fields": ["title", "documentObject.room_id", "documentObject.host_display_name"]
+                    // Search both CC-canonical fields and the documentObject
+                    // fallback so hits keep working across the shape transition.
+                    "fields": [
+                        "title",
+                        "meetingId",
+                        "organizerName",
+                        "documentObject.meetingId",
+                        "documentObject.roomId",
+                        "documentObject.hostDisplayName",
+                        // Legacy snake_case fields on older docs.
+                        "documentObject.room_id",
+                        "documentObject.host_display_name"
+                    ]
                 }
             }]
         },
-        "scope": ["cs-vc-meetings"],
+        "scope": ["cs-cc-meetings"],
         "page": 0,
         "pageSize": 20
     });
 
-    let resp = reqwest::Client::new()
+    let mut req = reqwest::Client::new()
         .post(&url)
-        .json(&body)
+        .header("X-App-Type", "CC")
+        .json(&body);
+    if let Some(token) = crate::auth::get_stored_id_token() {
+        req = req.bearer_auth(token);
+    }
+
+    let resp = req
         .send()
         .await
         .map_err(|e| format!("SearchV2 request failed: {e}"))?;
@@ -97,18 +152,41 @@ async fn search_v2(base_url: &str, q: &str) -> Result<Vec<SearchResult>, String>
         .hits
         .into_iter()
         .map(|hit| {
-            let doc = hit._source.document_object.as_ref();
+            let src = &hit._source;
+            let doc = src.document_object.as_ref();
+
+            // meeting_id: prefer the CC-canonical top-level `meetingId`
+            // (always present on docs from the current push), then the
+            // documentObject variants (camelCase new, snake_case legacy).
+            // `title` is NOT consulted — on the current push path it's the
+            // host's display name, so using it as a meeting_id fallback
+            // would return "Alice" instead of "standup-2024".
+            let meeting_id = src
+                .meeting_id
+                .clone()
+                .or_else(|| doc.and_then(|d| d.room_id_camel.clone()))
+                .or_else(|| doc.and_then(|d| d.room_id.clone()))
+                .unwrap_or_default();
+
+            let state = src
+                .state
+                .clone()
+                .or_else(|| doc.and_then(|d| d.state.clone()))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let host = src
+                .organizer_name
+                .clone()
+                .or_else(|| doc.and_then(|d| d.host_display_name_camel.clone()))
+                .or_else(|| doc.and_then(|d| d.host_display_name.clone()))
+                .or_else(|| src.organizer.clone())
+                .or_else(|| doc.and_then(|d| d.creator_id.clone()))
+                .unwrap_or_default();
+
             SearchResult {
-                meeting_id: doc
-                    .and_then(|d| d.room_id.clone())
-                    .or(hit._source.title.clone())
-                    .unwrap_or_default(),
-                state: doc
-                    .and_then(|d| d.state.clone())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                host: doc
-                    .and_then(|d| d.host_display_name.clone().or(d.creator_id.clone()))
-                    .unwrap_or_default(),
+                meeting_id,
+                state,
+                host,
             }
         })
         .collect())
@@ -199,7 +277,16 @@ pub fn SearchModal() -> Element {
                                 search_ctx.set_visible(false);
                             }
                         },
+                        // `autofocus` is left on as a best-effort hint, but browsers only
+                        // honour it on the initial page load — not when an element is
+                        // inserted into an already-loaded DOM (exactly our Cmd-K case).
+                        // `onmounted` fires every time the input is (re)mounted, so we
+                        // call `.set_focus(true)` directly to land the cursor in the
+                        // field whenever the modal opens.
                         autofocus: true,
+                        onmounted: move |evt| async move {
+                            let _ = evt.data.set_focus(true).await;
+                        },
                     }
                 }
                 div { style: "max-height:60vh; overflow-y:auto; padding:8px;",

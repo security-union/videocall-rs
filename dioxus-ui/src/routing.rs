@@ -9,7 +9,7 @@ use crate::pages::home::Home;
 use crate::pages::meeting::MeetingPage;
 use crate::pages::meeting_settings::MeetingSettingsPage;
 use crate::pages::oauth_callback::OAuthCallback;
-use crate::components::search_modal::{SearchModal, SearchVisibleCtx};
+use crate::components::search_modal::SearchModal;
 
 #[derive(Clone, Routable, PartialEq, Debug)]
 #[rustfmt::skip]

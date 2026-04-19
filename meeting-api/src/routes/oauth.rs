@@ -1220,8 +1220,10 @@ mod tests {
             nats: None,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
-            search_api_url: None,
-            search_api_token: None,
+            search: None,
+            // OAuth handler tests exercise the OAuth-configured path; make
+            // sure the anonymous fallback is off so behaviour matches prod.
+            allow_anonymous: false,
         }
     }
 

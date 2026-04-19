@@ -236,19 +236,22 @@ pub fn SearchModal() -> Element {
             // SearchV2 is the primary path when configured; Postgres is a
             // fallback.  Fall back on:
             //   1. any SearchV2 error (network failure, 5xx, parse error), AND
-            //   2. a successful-but-empty response when the user has no
-            //      stored id_token — this is the local-dev case where
-            //      SearchV2 is reachable but the request went out
-            //      unauthenticated, so the CC ACL filter returns zero hits.
-            //      Postgres then answers under the anonymous / session
-            //      identity resolved by `AuthUser`.
+            //   2. a successful-but-empty response when the request went out
+            //      without a stored id_token — the local-dev case where
+            //      SearchV2 is reachable but unauthenticated, so the CC ACL
+            //      filter returns zero hits.  Postgres then answers under the
+            //      anonymous / session identity resolved by `AuthUser`.
             // Authenticated users with a real empty result set skip the
             // fallback and see "No meetings found" immediately.
+            //
+            // `had_token` is captured *before* the request so a token that
+            // expires (or is cleared) while SearchV2 is responding does not
+            // flip us into the fallback path — an authenticated empty result
+            // set must be reported as such.
+            let had_token = crate::auth::get_stored_id_token().is_some();
             let res = if let Some(ref url) = base {
                 match search_v2(url, &q).await {
-                    Ok(items)
-                        if items.is_empty() && crate::auth::get_stored_id_token().is_none() =>
-                    {
+                    Ok(items) if items.is_empty() && !had_token => {
                         log::info!(
                             "SearchV2 returned 0 results for unauthenticated request; \
                              trying Postgres fallback"
@@ -317,6 +320,9 @@ pub fn SearchModal() -> Element {
                     } else {
                         for result in results.read().iter() {
                             {
+                                // Captured by the onclick closure below; the
+                                // href uses a separate interpolation so this
+                                // clone is required and cannot be removed.
                                 let id = result.meeting_id.clone();
                                 let is_active = result.state == "active" || result.state == "idle" || result.state == "created";
                                 let is_ended = result.state == "ended";

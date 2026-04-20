@@ -461,10 +461,11 @@ impl SessionLogic {
 
             // Build a CONGESTION PacketWrapper targeted at the sender.
             // `user_id`: receiver's identity (for sender-side logging).
-            // `data`: sender's user_id — the stable identifier the client
-            //         matches against (session_id is ephemeral and rotates
-            //         on reconnect, causing missed signals).
-            // `session_id`: sender's session_id (kept for NATS routing).
+            // `data`: sender's user_id (for observability on client side).
+            // `session_id`: sender's session_id — the client matches this
+            //               against its session_id history (all IDs from the
+            //               current page load) to survive reconnects while
+            //               correctly scoping to a single tab/instance.
             let congestion_packet = PacketWrapper {
                 packet_type: PacketType::CONGESTION.into(),
                 user_id: self.user_id.as_bytes().to_vec(),

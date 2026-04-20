@@ -191,6 +191,10 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
+    /// All session_ids assigned to this client instance (current page load).
+    /// Survives reconnects/re-elections. Used to match CONGESTION signals that
+    /// target a previous session_id from before re-election completed.
+    session_id_history: std::collections::HashSet<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so we deduplicate by (event_type, target_user_id) within a
@@ -328,6 +332,7 @@ impl VideoCallClient {
                     last_known_server: None,
                 },
                 own_session_id: None,
+                session_id_history: std::collections::HashSet::new(),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -1392,6 +1397,7 @@ impl Inner {
                     response.session_id
                 );
                 self.own_session_id = Some(response.session_id);
+                self.session_id_history.insert(response.session_id);
 
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {
@@ -1632,29 +1638,23 @@ impl Inner {
             Ok(PacketType::CONGESTION) => {
                 // Server-side congestion feedback: the server is dropping
                 // packets destined for a receiver because the outbound channel
-                // is full. Match on the sender user_id carried in `data` —
-                // session_id is ephemeral and rotates on reconnect.
-                let target_user_id = &response.data;
-                if target_user_id == self.options.user_id.as_bytes() {
+                // is full. Match on session_id history — the signal targets a
+                // specific session_id which may be our current or a previous
+                // one from before re-election. Using session_id history (not
+                // user_id) ensures multi-tab/multi-device sessions for the
+                // same account are independently targeted.
+                if self.session_id_history.contains(&response.session_id) {
                     warn!(
-                        "Received CONGESTION signal from server (receiver: {}), requesting quality step-down",
+                        "Received CONGESTION signal from server (receiver: {}, target_session: {}), requesting quality step-down",
                         String::from_utf8_lossy(&response.user_id),
-                    );
-                    self.congestion_step_down_requested
-                        .store(true, Ordering::Release);
-                } else if self.own_session_id == Some(response.session_id) {
-                    // Backward compat: older relays without user_id in data.
-                    warn!(
-                        "Received CONGESTION signal via session_id fallback (receiver: {}), requesting quality step-down",
-                        String::from_utf8_lossy(&response.user_id),
+                        response.session_id,
                     );
                     self.congestion_step_down_requested
                         .store(true, Ordering::Release);
                 } else {
                     debug!(
-                        "Ignoring CONGESTION signal (target_user: {}, our_user: {})",
-                        String::from_utf8_lossy(target_user_id),
-                        self.options.user_id,
+                        "Ignoring CONGESTION signal for session {} (our history: {:?})",
+                        response.session_id, self.session_id_history,
                     );
                 }
             }

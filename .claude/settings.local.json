@@ -61,7 +61,9 @@
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:crates.io)",
       "WebFetch(domain:streams.spec.whatwg.org)",
-      "WebFetch(domain:grafana.videocall.fnxlabs.com)"
+      "WebFetch(domain:grafana.videocall.fnxlabs.com)",
+      "Bash(kubectl --kubeconfig ~/vc-k3s-config.yaml -n videocall exec videocall-api-9549b5fd6-l6q9v -- ls /data/console-logs/cc7tp/2026-04-20/)",
+      "Read(//tmp/**)"
     ]
   }
 }

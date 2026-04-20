@@ -188,6 +188,8 @@ pub struct SessionLogic {
     /// Participant's chosen display name (from JWT claims).
     /// Falls back to `user_id` when no display name is available.
     pub display_name: String,
+    /// Server-authoritative guest flag (JWT `is_guest` claim).
+    pub is_guest: bool,
     pub addr: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
@@ -209,11 +211,13 @@ pub struct SessionLogic {
 impl SessionLogic {
     /// Create a new session logic instance
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: Addr<ChatServer>,
         room: String,
         user_id: String,
         display_name: String,
+        is_guest: bool,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -223,8 +227,8 @@ impl SessionLogic {
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
-            "new session: room={} user_id={} display_name={} session_id={} observer={} transport={}",
-            room, user_id, display_name, id, observer, transport
+            "new session: room={} user_id={} display_name={} is_guest={} session_id={} observer={} transport={}",
+            room, user_id, display_name, is_guest, id, observer, transport
         );
 
         SessionLogic {
@@ -232,6 +236,7 @@ impl SessionLogic {
             room,
             user_id,
             display_name,
+            is_guest,
             addr,
             nats_client,
             tracker_sender,
@@ -295,6 +300,7 @@ impl SessionLogic {
             session: self.id,
             user_id: self.user_id.clone(),
             display_name: self.display_name.clone(),
+            is_guest: self.is_guest,
             observer: self.observer,
             instance_id: self.instance_id.clone(),
         }
@@ -346,6 +352,7 @@ impl SessionLogic {
             room: self.room.clone(),
             user_id: self.user_id.clone(),
             display_name: self.display_name.clone(),
+            is_guest: self.is_guest,
             observer: self.observer,
         });
     }

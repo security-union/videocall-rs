@@ -60,6 +60,7 @@ pub async fn create(
 }
 
 /// Create a new meeting with explicit waiting_room_enabled setting.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_with_options(
     pool: &PgPool,
     room_id: &str,

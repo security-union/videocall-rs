@@ -103,6 +103,7 @@ pub fn GuestJoinPage(id: String) -> Element {
             let opts = VideoCallClientOptions {
                 user_id: user_id_for_client,
                 display_name: display_name.clone(),
+                is_guest: true,
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,

@@ -23,8 +23,6 @@ use videocall_meeting_types::{
     responses::{APIResponse, ParticipantStatusResponse},
 };
 
-use videocall_types::validation::validate_display_name;
-
 use crate::auth::AuthUser;
 use crate::auth::GuestObserver;
 use crate::db::meetings::MeetingRow;

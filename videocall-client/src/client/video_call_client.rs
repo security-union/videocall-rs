@@ -714,6 +714,22 @@ impl VideoCallClient {
         }
     }
 
+
+    /// Get the guest status for a peer by session_id string.
+    /// Returns `None` if the peer doesn't exist or no guest status has been set.
+    pub fn get_peer_is_guest(&self, session_id: &str) -> Option<bool> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get_peer_is_guest(session_id),
+            Err(_) => {
+                warn!(
+                    "Failed to borrow inner in get_peer_is_guest for session_id: {}",
+                    session_id
+                );
+                None
+            }
+        }
+    }
+
     /// Hacky function that returns true if the given peer has yet to send a frame of screen share.
     ///
     /// No reason for this function to exist, it should be deducible from the

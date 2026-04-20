@@ -106,6 +106,7 @@ pub fn WaitingRoom(
             let opts = VideoCallClientOptions {
                 user_id: user_id.clone(),
                 display_name: String::new(),
+                is_guest,
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,

@@ -52,6 +52,12 @@ pub struct MeetingPacket {
     ///  Display name of the participant (for PARTICIPANT_JOINED/LEFT events)
     // @@protoc_insertion_point(field:MeetingPacket.display_name)
     pub display_name: ::std::vec::Vec<u8>,
+    ///  Whether the participant joined as an unauthenticated guest
+    ///  (for PARTICIPANT_JOINED/LEFT events). Server-authoritative:
+    ///  filled from the validated JWT `is_guest` claim. Default
+    ///  false keeps older clients/servers wire-compatible.
+    // @@protoc_insertion_point(field:MeetingPacket.is_guest)
+    pub is_guest: bool,
     // special fields
     // @@protoc_insertion_point(special_field:MeetingPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -69,7 +75,7 @@ impl MeetingPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(10);
+        let mut fields = ::std::vec::Vec::with_capacity(11);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "event_type",
@@ -121,6 +127,11 @@ impl MeetingPacket {
             |m: &MeetingPacket| { &m.display_name },
             |m: &mut MeetingPacket| { &mut m.display_name },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "is_guest",
+            |m: &MeetingPacket| { &m.is_guest },
+            |m: &mut MeetingPacket| { &mut m.is_guest },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MeetingPacket>(
             "MeetingPacket",
             fields,
@@ -169,6 +180,9 @@ impl ::protobuf::Message for MeetingPacket {
                 82 => {
                     self.display_name = is.read_bytes()?;
                 },
+                88 => {
+                    self.is_guest = is.read_bool()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -211,6 +225,9 @@ impl ::protobuf::Message for MeetingPacket {
         if !self.display_name.is_empty() {
             my_size += ::protobuf::rt::bytes_size(10, &self.display_name);
         }
+        if self.is_guest {
+            my_size += 1 + 1;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -247,6 +264,9 @@ impl ::protobuf::Message for MeetingPacket {
         if !self.display_name.is_empty() {
             os.write_bytes(10, &self.display_name)?;
         }
+        if self.is_guest {
+            os.write_bool(11, self.is_guest)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -274,6 +294,7 @@ impl ::protobuf::Message for MeetingPacket {
         self.room_token.clear();
         self.session_id = 0;
         self.display_name.clear();
+        self.is_guest = false;
         self.special_fields.clear();
     }
 
@@ -289,6 +310,7 @@ impl ::protobuf::Message for MeetingPacket {
             room_token: ::std::string::String::new(),
             session_id: 0,
             display_name: ::std::vec::Vec::new(),
+            is_guest: false,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance

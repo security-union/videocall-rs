@@ -97,11 +97,8 @@ impl AppError {
         Self::new(StatusCode::NOT_FOUND, APIError::not_in_meeting())
     }
 
-    pub fn invalid_display_name(detail: &str) -> Self {
-        Self::new(
-            StatusCode::BAD_REQUEST,
-            APIError::invalid_display_name(detail),
-        )
+    pub fn invalid_display_name() -> Self {
+        Self::new(StatusCode::BAD_REQUEST, APIError::invalid_display_name())
     }
 
     pub fn rate_limit_exceeded() -> Self {

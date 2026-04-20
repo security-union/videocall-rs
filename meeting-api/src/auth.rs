@@ -196,7 +196,7 @@ mod tests {
             nats: None,
             service_version_urls: Vec::new(),
             http_client: reqwest::Client::new(),
-            display_name_rate_limiter: std::sync::Arc::new(tokio::sync::Mutex::new(
+            display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
         }
@@ -490,7 +490,7 @@ mod tests {
             nats: None,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
-            display_name_rate_limiter: std::sync::Arc::new(tokio::sync::Mutex::new(
+            display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
         }

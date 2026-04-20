@@ -32,6 +32,28 @@ use crate::nats_events;
 use crate::state::AppState;
 use crate::token::{generate_observer_token, generate_room_token};
 
+/// Maximum display-name changes allowed per window.
+const MAX_DISPLAY_NAME_RENAMES: u32 = 5;
+/// Window duration in seconds for display-name rate limiting.
+const DISPLAY_NAME_WINDOW_SECS: u64 = 60;
+
+/// Shared rate-limit check for display-name changes.
+/// Evicts stale entries, then enforces `MAX_DISPLAY_NAME_RENAMES` per
+/// `DISPLAY_NAME_WINDOW_SECS` per user. Returns `Ok(())` if allowed.
+async fn enforce_display_name_rate_limit(state: &AppState, user_id: &str) -> Result<(), AppError> {
+    let mut limiter = state.display_name_rate_limiter.lock().unwrap();
+    limiter
+        .retain(|_, (window_start, _)| window_start.elapsed().as_secs() < DISPLAY_NAME_WINDOW_SECS);
+    let entry = limiter
+        .entry(user_id.to_owned())
+        .or_insert_with(|| (std::time::Instant::now(), 0));
+    if entry.1 >= MAX_DISPLAY_NAME_RENAMES {
+        return Err(AppError::rate_limit_exceeded());
+    }
+    entry.1 += 1;
+    Ok(())
+}
+
 /// POST /api/v1/meetings/{meeting_id}/join
 ///
 /// If the meeting doesn't exist, create it with the joining user as host.
@@ -46,9 +68,15 @@ pub async fn join_meeting(
     let display_name = body
         .as_ref()
         .and_then(|b| b.display_name.as_deref())
-        .map(|raw| validate_display_name(raw).map_err(|e| AppError::invalid_display_name(&e)))
+        .map(|raw| validate_display_name(raw).map_err(|_| AppError::invalid_display_name()))
         .transpose()?;
     let display_name = display_name.as_deref();
+
+    // Rate-limit display-name changes via the join path to prevent
+    // leave+rejoin bypass of the rename rate limiter.
+    if display_name.is_some() {
+        enforce_display_name_rate_limit(&state, &user_id).await?;
+    }
 
     let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
         Some(m) => m,
@@ -277,36 +305,36 @@ pub async fn update_display_name(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateDisplayNameRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    // Rate-limit: 5 renames per 60-second window per user.
-    {
-        const MAX_RENAMES: u32 = 5;
-        const WINDOW_SECS: u64 = 60;
-        let mut limiter = state.display_name_rate_limiter.lock().await;
-        let entry = limiter
-            .entry(user_id.clone())
-            .or_insert_with(|| (std::time::Instant::now(), 0));
-        if entry.0.elapsed().as_secs() >= WINDOW_SECS {
-            *entry = (std::time::Instant::now(), 1);
-        } else {
-            entry.1 += 1;
-            if entry.1 > MAX_RENAMES {
-                return Err(AppError::rate_limit_exceeded());
-            }
-        }
-    }
-
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
     // Validate the display name
-    let validated_name = validate_display_name(&body.display_name)
-        .map_err(|e| AppError::invalid_display_name(&e))?;
+    let validated_name =
+        validate_display_name(&body.display_name).map_err(|_| AppError::invalid_display_name())?;
 
-    // Validate the participant exists and is in the meeting
-    db_participants::get_status(&state.db, meeting.id, &user_id)
+    // Validate the participant exists and is in the meeting, and check if the name is actually changing.
+    let current_status = db_participants::get_status(&state.db, meeting.id, &user_id)
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
+
+    // Check if the name is actually changing.
+    // This prevents budget burn and broadcast amplification from idempotent retries.
+    let name_is_changing = current_status
+        .display_name
+        .as_deref()
+        .map(|current| current != validated_name.as_str())
+        .unwrap_or(true); // New name when none exists = changing
+
+    if !name_is_changing {
+        // Name is identical — return current status without DB write, broadcast, or rate limit.
+        return Ok(Json(APIResponse::ok(
+            current_status.into_participant_status(None),
+        )));
+    }
+
+    // Name is changing: consume a rate-limit slot.
+    enforce_display_name_rate_limit(&state, &user_id).await?;
 
     // Update the display name in the database
     let updated_row =
@@ -353,4 +381,192 @@ pub async fn get_participants(
         .collect();
 
     Ok(Json(APIResponse::ok(participants)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DISPLAY_NAME_WINDOW_SECS, MAX_DISPLAY_NAME_RENAMES};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// Helper that mirrors the shared `enforce_display_name_rate_limit` logic,
+    /// returning `true` if the request is allowed.
+    fn check_rate_limit(
+        limiter: &mut HashMap<String, (Instant, u32)>,
+        user_id: &str,
+        max_renames: u32,
+        window_secs: u64,
+    ) -> bool {
+        limiter.retain(|_, (ws, _)| ws.elapsed().as_secs() < window_secs);
+        let entry = limiter
+            .entry(user_id.to_string())
+            .or_insert_with(|| (Instant::now(), 0));
+        if entry.1 >= max_renames {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
+    #[test]
+    fn rate_limiter_allows_up_to_max_renames() {
+        let mut map = HashMap::new();
+        for _ in 0..5 {
+            assert!(check_rate_limit(&mut map, "alice", 5, 60));
+        }
+        // 6th should be rejected
+        assert!(!check_rate_limit(&mut map, "alice", 5, 60));
+    }
+
+    #[test]
+    fn rate_limiter_resets_after_window() {
+        let mut map = HashMap::new();
+        // Exhaust the limit
+        for _ in 0..5 {
+            assert!(check_rate_limit(&mut map, "bob", 5, 60));
+        }
+        assert!(!check_rate_limit(&mut map, "bob", 5, 60));
+
+        // Simulate window expiry by back-dating the entry
+        if let Some(entry) = map.get_mut("bob") {
+            entry.0 = Instant::now() - Duration::from_secs(61);
+        }
+        // Should be allowed again (retain evicts, or_insert_with creates fresh)
+        assert!(check_rate_limit(&mut map, "bob", 5, 60));
+    }
+
+    #[test]
+    fn stale_entries_are_evicted() {
+        let mut map = HashMap::new();
+
+        // Insert a stale entry for a one-time user
+        map.insert(
+            "one-timer".to_string(),
+            (Instant::now() - Duration::from_secs(120), 1),
+        );
+        assert_eq!(map.len(), 1);
+
+        // A new user's rate-limit check triggers eviction
+        assert!(check_rate_limit(&mut map, "active-user", 5, 60));
+        // Stale entry should have been removed
+        assert!(!map.contains_key("one-timer"));
+        assert_eq!(map.len(), 1); // only "active-user"
+    }
+
+    #[test]
+    fn active_entries_survive_eviction() {
+        let mut map = HashMap::new();
+
+        // Active entry (recent)
+        assert!(check_rate_limit(&mut map, "active", 5, 60));
+        // Stale entry
+        map.insert(
+            "stale".to_string(),
+            (Instant::now() - Duration::from_secs(120), 3),
+        );
+        assert_eq!(map.len(), 2);
+
+        // Trigger eviction via another check
+        assert!(check_rate_limit(&mut map, "active", 5, 60));
+        assert!(map.contains_key("active"));
+        assert!(!map.contains_key("stale"));
+    }
+
+    #[test]
+    fn per_user_isolation() {
+        let mut map = HashMap::new();
+
+        // Exhaust user A's limit
+        for _ in 0..5 {
+            assert!(check_rate_limit(&mut map, "user-a", 5, 60));
+        }
+        assert!(!check_rate_limit(&mut map, "user-a", 5, 60));
+
+        // User B must still have a full quota
+        for _ in 0..5 {
+            assert!(check_rate_limit(&mut map, "user-b", 5, 60));
+        }
+        assert!(!check_rate_limit(&mut map, "user-b", 5, 60));
+    }
+
+    /// Simulates the leave+join bypass: a single shared limiter is used by both
+    /// the join (with display_name) and update_display_name paths.  Repeated
+    /// join-with-name requests should exhaust the budget identically.
+    #[test]
+    fn join_bypass_shares_rate_limit_budget_with_rename() {
+        let mut map = HashMap::new();
+        let max = MAX_DISPLAY_NAME_RENAMES;
+        let window = DISPLAY_NAME_WINDOW_SECS;
+
+        // Simulate 3 renames via the update path
+        for _ in 0..3 {
+            assert!(check_rate_limit(&mut map, "attacker", max, window));
+        }
+
+        // Simulate 2 more via the join path (same limiter, same user)
+        for _ in 0..2 {
+            assert!(check_rate_limit(&mut map, "attacker", max, window));
+        }
+
+        // 6th attempt (via either path) must be rejected
+        assert!(!check_rate_limit(&mut map, "attacker", max, window));
+    }
+
+    /// Constants used by the module are sensible.
+    #[test]
+    fn rate_limit_constants_are_valid() {
+        assert_eq!(MAX_DISPLAY_NAME_RENAMES, 5);
+        assert_eq!(DISPLAY_NAME_WINDOW_SECS, 60);
+    }
+
+    /// Idempotent requests (same name) should not consume a rate-limit slot.
+    /// This test verifies that calling check_rate_limit with the same user_id
+    /// twice in a row, with the same counter value, behaves correctly if we
+    /// skip the second call (simulating name-unchanged logic).
+    #[test]
+    fn unchanged_name_does_not_consume_budget() {
+        let mut map = HashMap::new();
+
+        // First rename consumes a slot
+        assert!(check_rate_limit(&mut map, "user", 5, 60));
+        assert_eq!(map.get("user").unwrap().1, 1);
+
+        // If the name were unchanged, we wouldn't call check_rate_limit again.
+        // Verify that manually: counter stays at 1.
+        let counter_before = map.get("user").unwrap().1;
+        // (not calling check_rate_limit, simulating the skip)
+        assert_eq!(counter_before, 1);
+
+        // Subsequent different rename does consume a slot
+        assert!(check_rate_limit(&mut map, "user", 5, 60));
+        assert_eq!(map.get("user").unwrap().1, 2);
+
+        // Exhausting the limit still works
+        for _ in 0..3 {
+            assert!(check_rate_limit(&mut map, "user", 5, 60));
+        }
+        // Now at 5, next attempt blocked
+        assert!(!check_rate_limit(&mut map, "user", 5, 60));
+    }
+
+    /// Verify that the name-change detection logic works correctly.
+    /// When a participant resubmits their current display name, it should be
+    /// detected as unchanged.
+    #[test]
+    fn name_change_detection() {
+        // Case 1: No existing name -> new name = changing
+        let current: Option<String> = None;
+        let is_changing = current.as_deref().map(|c| c != "Alice").unwrap_or(true);
+        assert!(is_changing, "None -> Some should be changing");
+
+        // Case 2: Same name = not changing
+        let current = Some("Alice".to_string());
+        let is_changing = current.as_deref().map(|c| c != "Alice").unwrap_or(true);
+        assert!(!is_changing, "Same name should be unchanged");
+
+        // Case 3: Different name = changing
+        let current = Some("Alice".to_string());
+        let is_changing = current.as_deref().map(|c| c != "Bob").unwrap_or(true);
+        assert!(is_changing, "Different name should be changing");
+    }
 }

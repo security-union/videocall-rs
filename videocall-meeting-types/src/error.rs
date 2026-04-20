@@ -126,7 +126,7 @@ impl APIError {
         }
     }
 
-    pub fn invalid_display_name(_detail: &str) -> Self {
+    pub fn invalid_display_name() -> Self {
         Self {
             code: "INVALID_DISPLAY_NAME".to_string(),
             // Use a static message to avoid echoing user-supplied characters back in

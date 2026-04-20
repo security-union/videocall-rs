@@ -14,13 +14,12 @@
 //! Shared application state passed to every Axum handler via `State`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::config::{Config, OAuthConfig};
 use crate::oauth::JwksCache;
 use sqlx::PgPool;
-use tokio::sync::Mutex;
 
 /// Application state shared across all request handlers.
 #[derive(Clone)]

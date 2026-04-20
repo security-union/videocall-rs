@@ -452,30 +452,29 @@ impl SessionLogic {
     /// If the drop threshold is exceeded, a CONGESTION `PacketWrapper` is
     /// published to NATS so the sender's client can step down its quality
     /// tier. The notification is rate-limited per sender session.
-    pub fn on_outbound_drop(&mut self, sender_session_id: u64) {
+    pub fn on_outbound_drop(&mut self, sender_session_id: u64, sender_user_id: &[u8]) {
         if let Some(sender_sid) = self.congestion_tracker.record_drop(sender_session_id) {
             warn!(
-                "Congestion: session {} dropping packets from sender {}, sending CONGESTION signal",
-                self.id, sender_sid,
+                "Congestion: session {} dropping packets from sender {} (user: {}), sending CONGESTION signal",
+                self.id, sender_sid, String::from_utf8_lossy(sender_user_id),
             );
 
             // Build a CONGESTION PacketWrapper targeted at the sender.
-            // The `user_id` is set to our session's user_id so the sender
-            // knows which receiver is congested. The `session_id` is set to
-            // the sender's session_id so NATS routing delivers it there.
+            // `user_id`: receiver's identity (for sender-side logging).
+            // `data`: sender's user_id — the stable identifier the client
+            //         matches against (session_id is ephemeral and rotates
+            //         on reconnect, causing missed signals).
+            // `session_id`: sender's session_id (kept for NATS routing).
             let congestion_packet = PacketWrapper {
                 packet_type: PacketType::CONGESTION.into(),
                 user_id: self.user_id.as_bytes().to_vec(),
+                data: sender_user_id.to_vec(),
                 session_id: sender_sid,
                 ..Default::default()
             };
 
             match congestion_packet.write_to_bytes() {
                 Ok(bytes) => {
-                    // Publish to the sender's NATS subject so only the
-                    // targeted sender receives the CONGESTION signal.
-                    // The sender's subscription filter (`room.{room}.*`)
-                    // matches `room.{room}.{sender_sid}`.
                     let subject = format!("room.{}.{}", self.room.replace(' ', "_"), sender_sid);
                     let nc = self.nats_client.clone();
                     let bytes = bytes::Bytes::from(bytes);

@@ -342,11 +342,15 @@ impl Handler<Message> for WtChatSession {
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         let bytes = self.logic.handle_outbound(&msg);
 
-        // Parse the PacketWrapper once to extract the sender's session_id
-        // and packet_type. This avoids a redundant parse in send_auto and
-        // ensures congestion tracking targets the correct (sender) session.
+        // Parse the PacketWrapper once to extract the sender's session_id,
+        // user_id, and packet_type. This avoids a redundant parse in send_auto
+        // and ensures congestion tracking targets the correct (sender) session.
         let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
         let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
+        let sender_user_id = parsed
+            .as_ref()
+            .map(|pw| pw.user_id.clone())
+            .unwrap_or_default();
         let is_media = parsed
             .as_ref()
             .map(|pw| pw.packet_type == PacketType::MEDIA.into())
@@ -361,7 +365,8 @@ impl Handler<Message> for WtChatSession {
                 // Outbound channel full -- record the drop for the actual sender
                 // so we can send CONGESTION feedback when the threshold is exceeded.
                 if sender_session_id != 0 {
-                    self.logic.on_outbound_drop(sender_session_id);
+                    self.logic
+                        .on_outbound_drop(sender_session_id, &sender_user_id);
                 }
             }
         }

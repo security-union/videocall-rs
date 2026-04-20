@@ -1632,18 +1632,29 @@ impl Inner {
             Ok(PacketType::CONGESTION) => {
                 // Server-side congestion feedback: the server is dropping
                 // packets destined for a receiver because the outbound channel
-                // is full. Only act on it if the target session matches ours.
-                if self.own_session_id == Some(response.session_id) {
+                // is full. Match on the sender user_id carried in `data` —
+                // session_id is ephemeral and rotates on reconnect.
+                let target_user_id = &response.data;
+                if target_user_id == self.options.user_id.as_bytes() {
                     warn!(
                         "Received CONGESTION signal from server (receiver: {}), requesting quality step-down",
                         String::from_utf8_lossy(&response.user_id),
                     );
                     self.congestion_step_down_requested
                         .store(true, Ordering::Release);
+                } else if self.own_session_id == Some(response.session_id) {
+                    // Backward compat: older relays without user_id in data.
+                    warn!(
+                        "Received CONGESTION signal via session_id fallback (receiver: {}), requesting quality step-down",
+                        String::from_utf8_lossy(&response.user_id),
+                    );
+                    self.congestion_step_down_requested
+                        .store(true, Ordering::Release);
                 } else {
                     debug!(
-                        "Ignoring CONGESTION signal targeted at session {} (our session: {:?})",
-                        response.session_id, self.own_session_id,
+                        "Ignoring CONGESTION signal (target_user: {}, our_user: {})",
+                        String::from_utf8_lossy(target_user_id),
+                        self.options.user_id,
                     );
                 }
             }

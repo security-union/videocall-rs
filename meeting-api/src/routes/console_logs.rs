@@ -327,7 +327,7 @@ pub async fn upload_console_logs(
 
     // --- Generate chunk filename ---
     let uuid_v7 = uuid::Uuid::now_v7();
-    let uuid_short = &uuid_v7.simple().to_string()[..8];
+    let uuid_short = &uuid_v7.simple().to_string()[..16];
     let filename = format!("{user_id}_{session_ts}_{uuid_short}.log");
 
     // --- Create directory and write file ---
@@ -398,14 +398,33 @@ pub async fn upload_console_logs(
         opts.mode(0o600);
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = opts.open(&file_path).await.map_err(|e| {
-        tracing::error!(
-            path = %file_path.display(),
-            error = %e,
-            "Failed to create console log file"
-        );
-        AppError::internal("Failed to store console log chunk")
-    })?;
+    let mut file = match opts.open(&file_path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            tracing::error!(
+                path = %file_path.display(),
+                user_id = %user_id,
+                meeting_id = %meeting_id,
+                "Console log chunk filename collision (file already exists)"
+            );
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                videocall_meeting_types::APIError {
+                    code: "CONFLICT".to_string(),
+                    message: "Chunk already exists".to_string(),
+                    engineering_error: None,
+                },
+            ));
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %file_path.display(),
+                error = %e,
+                "Failed to create console log file"
+            );
+            return Err(AppError::internal("Failed to store console log chunk"));
+        }
+    };
 
     file.write_all(&body).await.map_err(|e| {
         tracing::error!(

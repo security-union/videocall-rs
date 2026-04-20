@@ -214,11 +214,9 @@
     var url = buildUrl();
     if (!url || !userId || !sessionTimestampMs) return;
 
-    // Drain the buffer into a payload. On failure the entries will be
-    // re-prepended so they are retried on the next tick.
     var payload = buffer.join("\n") + "\n";
-    var drained = buffer.splice(0, buffer.length);
-    var drainedBytes = bufferBytes;
+    var entryCount = buffer.length;
+    buffer = [];
     bufferBytes = 0;
 
     var opts = {
@@ -239,39 +237,20 @@
     fetch(url, opts)
       .then(function (resp) {
         uploadInFlight = false;
-        if (resp.status >= 500) {
-          // Server error — re-queue for retry
-          requeue(drained, drainedBytes);
+        if (resp.ok || resp.status === 409) {
+          // 2xx: saved. 409: chunk already exists (prior upload succeeded).
+          return;
         }
-        // 4xx errors: drop the entries (client bug or disabled endpoint)
+        originals.error.call(console,
+          "CONSOLE_LOG_COLLECTOR: upload failed (" + resp.status + "), " + entryCount + " entries dropped"
+        );
       })
-      .catch(function () {
+      .catch(function (err) {
         uploadInFlight = false;
-        // Network failure — re-queue for retry
-        requeue(drained, drainedBytes);
+        originals.error.call(console,
+          "CONSOLE_LOG_COLLECTOR: upload network error, " + entryCount + " entries dropped:", err
+        );
       });
-  }
-
-  function requeue(entries, entryBytes) {
-    // Prepend the failed entries back. If combined length exceeds the cap,
-    // the oldest entries (from the failed batch) are dropped.
-    buffer = entries.concat(buffer);
-    bufferBytes += entryBytes;
-    if (buffer.length > BUFFER_CAP) {
-      var removed = buffer.splice(0, buffer.length - BUFFER_CAP);
-      var removedCount = removed.length;
-      for (var i = 0; i < removed.length; i++) {
-        bufferBytes -= removed[i].length + 1;
-      }
-      var warnEntry = JSON.stringify({
-        seq: nextSeq++,
-        ts: new Date().toISOString(),
-        level: "warn",
-        msg: "CONSOLE_LOG_COLLECTOR: evicted " + removedCount + " oldest entries (buffer cap=" + BUFFER_CAP + ")"
-      });
-      buffer.push(warnEntry);
-      bufferBytes += warnEntry.length + 1;
-    }
   }
 
   function startTimer() {

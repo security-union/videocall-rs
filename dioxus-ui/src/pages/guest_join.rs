@@ -12,7 +12,7 @@ use crate::constants::{
 };
 use crate::context::{
     resolve_transport_config, save_display_name_to_storage, validate_display_name, DisplayNameCtx,
-    TransportPreferenceCtx, DISPLAY_NAME_MAX_LEN,
+    TransportPreference, TransportPreferenceCtx, DISPLAY_NAME_MAX_LEN,
 };
 use crate::meeting_api::{join_meeting_as_guest, JoinMeetingResponse};
 use dioxus::prelude::*;
@@ -45,6 +45,189 @@ enum GuestStatus {
     Error(String),
 }
 
+// ---------------------------------------------------------------------------
+// Extracted helpers
+// ---------------------------------------------------------------------------
+
+/// Map a join/status API response to a [`GuestStatus`] variant.
+fn guest_status_from_join_response(response: &JoinMeetingResponse) -> GuestStatus {
+    let host_display_name = response.host_display_name.clone();
+    let host_user_id = response.host_user_id.clone();
+    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
+    let aca = response.admitted_can_admit.unwrap_or(false);
+    let ag = response.allow_guests.unwrap_or(false);
+
+    match response.status.as_str() {
+        "admitted" => {
+            if let Some(token) = response.room_token.clone() {
+                GuestStatus::Admitted {
+                    host_display_name,
+                    host_user_id,
+                    room_token: token,
+                    waiting_room_enabled: wr_enabled,
+                    admitted_can_admit: aca,
+                    allow_guests: ag,
+                }
+            } else {
+                GuestStatus::Error("Admitted but no room token".to_string())
+            }
+        }
+        "waiting_for_meeting" => GuestStatus::WaitingForMeeting {
+            observer_token: response.observer_token.clone().unwrap_or_default(),
+        },
+        "waiting" => GuestStatus::Waiting {
+            observer_token: response.observer_token.clone().unwrap_or_default(),
+        },
+        "rejected" => GuestStatus::Rejected,
+        _ => GuestStatus::Error(format!("Unknown status: {}", response.status)),
+    }
+}
+
+/// Apply a [`JoinMeetingResponse`] that is already known to represent admission
+/// (e.g. from the waiting-room push). Sets host metadata signals and transitions
+/// to [`GuestStatus::Admitted`].
+fn handle_admitted(
+    response: JoinMeetingResponse,
+    mut guest_status: Signal<GuestStatus>,
+    mut host_display_name: Signal<Option<String>>,
+    mut host_user_id: Signal<Option<String>>,
+    mut observer_token_signal: Signal<Option<String>>,
+) {
+    let determined_host = response.host_display_name.clone();
+    let determined_host_uid = response.host_user_id.clone();
+    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
+    let aca = response.admitted_can_admit.unwrap_or(false);
+    let ag = response.allow_guests.unwrap_or(false);
+    let token = response.room_token.unwrap_or_default();
+    host_display_name.set(determined_host.clone());
+    host_user_id.set(determined_host_uid.clone());
+    observer_token_signal.set(None);
+    guest_status.set(GuestStatus::Admitted {
+        host_display_name: determined_host,
+        host_user_id: determined_host_uid,
+        room_token: token,
+        waiting_room_enabled: wr_enabled,
+        admitted_can_admit: aca,
+        allow_guests: ag,
+    });
+}
+
+/// Build and connect the observer [`VideoCallClient`] used while waiting for
+/// the host to activate the meeting. Factored out of the component
+/// `use_effect` to keep the reactive hook body minimal.
+#[allow(clippy::too_many_arguments)]
+fn start_observer_connection(
+    observer_token: String,
+    meeting_id: String,
+    display_name: String,
+    user_id: String,
+    transport_pref: TransportPreference,
+    mut observer_client: Signal<Option<VideoCallClient>>,
+    mut guest_status: Signal<GuestStatus>,
+    mut current_user_id: Signal<Option<String>>,
+    mut host_display_name: Signal<Option<String>>,
+    mut host_user_id: Signal<Option<String>>,
+    mut observer_token_signal: Signal<Option<String>>,
+    mut came_from_waiting_room: Signal<bool>,
+) {
+    let lobby_url = |base: &str| format!("{base}/lobby?token={observer_token}");
+    let websocket_urls: Vec<String> = actix_websocket_base()
+        .unwrap_or_default()
+        .split(',')
+        .map(&lobby_url)
+        .collect();
+    let webtransport_urls: Vec<String> = webtransport_host_base()
+        .unwrap_or_default()
+        .split(',')
+        .map(&lobby_url)
+        .collect();
+
+    let (effective_wt_enabled, websocket_urls, webtransport_urls) = resolve_transport_config(
+        transport_pref,
+        webtransport_enabled().unwrap_or(false),
+        websocket_urls,
+        webtransport_urls,
+    );
+
+    let opts = VideoCallClientOptions {
+        user_id,
+        display_name: display_name.clone(),
+        is_guest: true,
+        meeting_id: meeting_id.clone(),
+        websocket_urls,
+        webtransport_urls,
+        enable_e2ee: false,
+        enable_webtransport: effective_wt_enabled,
+        on_connected: VcCallback::from(move |_| {
+            log::info!("Guest observer connection established (waiting for meeting)");
+        }),
+        on_connection_lost: VcCallback::from(move |_| {
+            log::warn!("Guest observer connection lost (waiting for meeting)");
+        }),
+        on_peer_added: VcCallback::noop(),
+        on_peer_first_frame: VcCallback::noop(),
+        on_peer_removed: None,
+        get_peer_video_canvas_id: VcCallback::from(|id| id),
+        get_peer_screen_canvas_id: VcCallback::from(|id| id),
+        enable_diagnostics: false,
+        diagnostics_update_interval_ms: None,
+        enable_health_reporting: false,
+        health_reporting_interval_ms: None,
+        on_encoder_settings_update: None,
+        rtt_testing_period_ms: 3000,
+        rtt_probe_interval_ms: None,
+        on_meeting_info: None,
+        on_meeting_ended: None,
+        on_meeting_activated: Some(VcCallback::from({
+            let meeting_id = meeting_id.clone();
+            move |_| {
+                log::info!("Guest: Meeting activated push received, re-joining...");
+                let meeting_id = meeting_id.clone();
+                let display_name = display_name.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    observer_token_signal.set(None);
+
+                    match join_meeting_as_guest(&meeting_id, &display_name).await {
+                        Ok(response) => {
+                            current_user_id.set(Some(response.user_id.clone()));
+                            host_display_name.set(response.host_display_name.clone());
+                            host_user_id.set(response.host_user_id.clone());
+                            let status = guest_status_from_join_response(&response);
+                            if matches!(&status, GuestStatus::Waiting { .. }) {
+                                came_from_waiting_room.set(true);
+                            }
+                            guest_status.set(status);
+                        }
+                        Err(e) => {
+                            guest_status.set(GuestStatus::Error(e.to_string()));
+                        }
+                    }
+                });
+            }
+        })),
+        on_participant_admitted: None,
+        on_participant_rejected: None,
+        on_waiting_room_updated: None,
+        on_speaking_changed: None,
+        on_audio_level_changed: None,
+        vad_threshold: None,
+        on_peer_left: None,
+        on_peer_joined: None,
+        on_display_name_changed: None,
+        decode_media: false,
+    };
+
+    let mut client = VideoCallClient::new(opts);
+    if let Err(e) = client.connect() {
+        log::error!("Failed to connect guest observer client: {e}");
+    }
+    observer_client.set(Some(client));
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
 #[component]
 pub fn GuestJoinPage(id: String) -> Element {
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
@@ -75,139 +258,22 @@ pub fn GuestJoinPage(id: String) -> Element {
                 }
             };
 
-            let meeting_id = meeting_id.clone();
-            let display_name = input_value();
+            let user_id_for_client = current_user_id().unwrap_or_else(|| input_value());
 
-            let lobby_url = |base: &str| format!("{base}/lobby?token={observer_token}");
-            let websocket_urls: Vec<String> = actix_websocket_base()
-                .unwrap_or_default()
-                .split(',')
-                .map(&lobby_url)
-                .collect();
-            let webtransport_urls: Vec<String> = webtransport_host_base()
-                .unwrap_or_default()
-                .split(',')
-                .map(&lobby_url)
-                .collect();
-
-            let (effective_wt_enabled, websocket_urls, webtransport_urls) =
-                resolve_transport_config(
-                    (transport_pref_ctx.0)(),
-                    webtransport_enabled().unwrap_or(false),
-                    websocket_urls,
-                    webtransport_urls,
-                );
-
-            let user_id_for_client = current_user_id().unwrap_or_else(|| display_name.clone());
-
-            let opts = VideoCallClientOptions {
-                user_id: user_id_for_client,
-                display_name: display_name.clone(),
-                is_guest: true,
-                meeting_id: meeting_id.clone(),
-                websocket_urls,
-                webtransport_urls,
-                enable_e2ee: false,
-                enable_webtransport: effective_wt_enabled,
-                on_connected: VcCallback::from(move |_| {
-                    log::info!("Guest observer connection established (waiting for meeting)");
-                }),
-                on_connection_lost: VcCallback::from(move |_| {
-                    log::warn!("Guest observer connection lost (waiting for meeting)");
-                }),
-                on_peer_added: VcCallback::noop(),
-                on_peer_first_frame: VcCallback::noop(),
-                on_peer_removed: None,
-                get_peer_video_canvas_id: VcCallback::from(|id| id),
-                get_peer_screen_canvas_id: VcCallback::from(|id| id),
-                enable_diagnostics: false,
-                diagnostics_update_interval_ms: None,
-                enable_health_reporting: false,
-                health_reporting_interval_ms: None,
-                on_encoder_settings_update: None,
-                rtt_testing_period_ms: 3000,
-                rtt_probe_interval_ms: None,
-                on_meeting_info: None,
-                on_meeting_ended: None,
-                on_meeting_activated: Some(VcCallback::from({
-                    let meeting_id = meeting_id.clone();
-                    move |_| {
-                        log::info!("Guest: Meeting activated push received, re-joining...");
-                        let meeting_id = meeting_id.clone();
-                        let display_name = display_name.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            observer_token_signal.set(None);
-
-                            match join_meeting_as_guest(&meeting_id, &display_name).await {
-                                Ok(response) => {
-                                    current_user_id.set(Some(response.user_id.clone()));
-                                    let determined_host = response.host_display_name.clone();
-                                    let determined_host_uid = response.host_user_id.clone();
-                                    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
-                                    let aca = response.admitted_can_admit.unwrap_or(false);
-                                    let ag = response.allow_guests.unwrap_or(false);
-                                    host_display_name.set(determined_host.clone());
-                                    host_user_id.set(determined_host_uid.clone());
-                                    match response.status.as_str() {
-                                        "admitted" => {
-                                            if let Some(token) = response.room_token {
-                                                guest_status.set(GuestStatus::Admitted {
-                                                    host_display_name: determined_host,
-                                                    host_user_id: determined_host_uid,
-                                                    room_token: token,
-                                                    waiting_room_enabled: wr_enabled,
-                                                    admitted_can_admit: aca,
-                                                    allow_guests: ag,
-                                                });
-                                            } else {
-                                                guest_status.set(GuestStatus::Error(
-                                                    "Admitted but no room token".to_string(),
-                                                ));
-                                            }
-                                        }
-                                        "waiting" => {
-                                            let obs_token =
-                                                response.observer_token.unwrap_or_default();
-                                            came_from_waiting_room.set(true);
-                                            guest_status.set(GuestStatus::Waiting {
-                                                observer_token: obs_token,
-                                            });
-                                        }
-                                        "rejected" => {
-                                            guest_status.set(GuestStatus::Rejected);
-                                        }
-                                        _ => {
-                                            guest_status.set(GuestStatus::Error(format!(
-                                                "Unknown status: {}",
-                                                response.status
-                                            )));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    guest_status.set(GuestStatus::Error(e.to_string()));
-                                }
-                            }
-                        });
-                    }
-                })),
-                on_participant_admitted: None,
-                on_participant_rejected: None,
-                on_waiting_room_updated: None,
-                on_speaking_changed: None,
-                on_audio_level_changed: None,
-                vad_threshold: None,
-                on_peer_left: None,
-                on_peer_joined: None,
-                on_display_name_changed: None,
-                decode_media: false,
-            };
-
-            let mut client = VideoCallClient::new(opts);
-            if let Err(e) = client.connect() {
-                log::error!("Failed to connect guest observer client: {e}");
-            }
-            observer_client.set(Some(client));
+            start_observer_connection(
+                observer_token,
+                meeting_id.clone(),
+                input_value(),
+                user_id_for_client,
+                (transport_pref_ctx.0)(),
+                observer_client,
+                guest_status,
+                current_user_id,
+                host_display_name,
+                host_user_id,
+                observer_token_signal,
+                came_from_waiting_room,
+            );
         });
     }
 
@@ -222,72 +288,27 @@ pub fn GuestJoinPage(id: String) -> Element {
             wasm_bindgen_futures::spawn_local(async move {
                 match join_meeting_as_guest(&meeting_id, &display_name).await {
                     Ok(response) => {
-                        let effective_user_id = response.user_id.clone();
-                        current_user_id.set(Some(effective_user_id));
-
-                        let determined_host = response.host_display_name.clone();
-                        let determined_host_uid = response.host_user_id.clone();
-                        let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
-                        let aca = response.admitted_can_admit.unwrap_or(false);
-                        let ag = response.allow_guests.unwrap_or(false);
-                        host_display_name.set(determined_host.clone());
-                        host_user_id.set(determined_host_uid.clone());
-
-                        match response.status.as_str() {
-                            "admitted" => {
-                                observer_token_signal.set(None);
-                                if let Some(token) = response.room_token {
-                                    guest_status.set(GuestStatus::Admitted {
-                                        host_display_name: determined_host,
-                                        host_user_id: determined_host_uid,
-                                        room_token: token,
-                                        waiting_room_enabled: wr_enabled,
-                                        admitted_can_admit: aca,
-                                        allow_guests: ag,
-                                    });
-                                } else {
-                                    guest_status.set(GuestStatus::Error(
-                                        "Admitted but no room token".to_string(),
-                                    ));
-                                }
+                        current_user_id.set(Some(response.user_id.clone()));
+                        host_display_name.set(response.host_display_name.clone());
+                        host_user_id.set(response.host_user_id.clone());
+                        let status = guest_status_from_join_response(&response);
+                        match &status {
+                            GuestStatus::WaitingForMeeting { observer_token } => {
+                                observer_token_signal.set(Some(observer_token.clone()));
                             }
-                            "waiting_for_meeting" => {
-                                let obs_token = response.observer_token.unwrap_or_default();
-                                observer_token_signal.set(Some(obs_token.clone()));
-                                guest_status.set(GuestStatus::WaitingForMeeting {
-                                    observer_token: obs_token,
-                                });
-                            }
-                            "waiting" => {
-                                let obs_token = response.observer_token.unwrap_or_default();
+                            GuestStatus::Waiting { .. } => {
                                 observer_token_signal.set(None);
                                 came_from_waiting_room.set(true);
-                                guest_status.set(GuestStatus::Waiting {
-                                    observer_token: obs_token,
-                                });
-                            }
-                            "rejected" => {
-                                observer_token_signal.set(None);
-                                guest_status.set(GuestStatus::Rejected);
                             }
                             _ => {
                                 observer_token_signal.set(None);
-                                guest_status.set(GuestStatus::Error(format!(
-                                    "Unknown status: {}",
-                                    response.status
-                                )));
                             }
                         }
+                        guest_status.set(status);
                     }
                     Err(e) => {
                         observer_token_signal.set(None);
-                        let msg = e.to_string();
-                        if msg.contains("GUESTS_NOT_ALLOWED") {
-                            guest_status
-                                .set(GuestStatus::Error("Guests are not allowed in this meeting. The meeting host must enable guest access.".to_string()));
-                        } else {
-                            guest_status.set(GuestStatus::Error(msg));
-                        }
+                        guest_status.set(GuestStatus::Error(e.to_string()));
                     }
                 }
             });
@@ -297,23 +318,13 @@ pub fn GuestJoinPage(id: String) -> Element {
     // Handle waiting room admission
     let on_admitted = {
         move |status: JoinMeetingResponse| {
-            let determined_host = status.host_display_name.clone();
-            let determined_host_uid = status.host_user_id.clone();
-            let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
-            let aca = status.admitted_can_admit.unwrap_or(false);
-            let ag = status.allow_guests.unwrap_or(false);
-            let token = status.room_token.unwrap_or_default();
-            host_display_name.set(determined_host.clone());
-            host_user_id.set(determined_host_uid.clone());
-            observer_token_signal.set(None);
-            guest_status.set(GuestStatus::Admitted {
-                host_display_name: determined_host,
-                host_user_id: determined_host_uid,
-                room_token: token,
-                waiting_room_enabled: wr_enabled,
-                admitted_can_admit: aca,
-                allow_guests: ag,
-            });
+            handle_admitted(
+                status,
+                guest_status,
+                host_display_name,
+                host_user_id,
+                observer_token_signal,
+            );
         }
     };
 

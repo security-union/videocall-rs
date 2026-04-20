@@ -81,6 +81,7 @@ pub struct CreateMeetingResponse {
     pub has_password: bool,
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
+    #[serde(default)]
     pub allow_guests: bool,
 }
 
@@ -107,6 +108,7 @@ pub struct MeetingInfoResponse {
     pub ended_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub your_status: Option<ParticipantStatusResponse>,
+    #[serde(default)]
     pub allow_guests: bool,
 }
 
@@ -140,6 +142,7 @@ pub struct MeetingSummary {
     pub waiting_count: i64,
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
+    #[serde(default)]
     pub allow_guests: bool,
 }
 

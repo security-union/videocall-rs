@@ -234,6 +234,8 @@ pub async fn check_session() -> anyhow::Result<()> {
             clear_guest_session_id();
             return Err(anyhow!("guest session; no OAuth session cookie"));
         }
+        // If OAuth tokens exist, fall through to normal check
+        clear_guest_session_id();
     }
     if crate::constants::is_pkce_flow()
         && get_stored_access_token().is_none()

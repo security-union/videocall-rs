@@ -36,17 +36,45 @@ use crate::token::{generate_observer_token, generate_room_token};
 const MAX_DISPLAY_NAME_RENAMES: u32 = 5;
 /// Window duration in seconds for display-name rate limiting.
 const DISPLAY_NAME_WINDOW_SECS: u64 = 60;
+/// Sweep cadence for stale limiter entries (every N rate-limit checks).
+const RATE_LIMIT_SWEEP_EVERY_OPS: u64 = 64;
+
+/// Returns `true` when the new display name differs from the current one
+/// (or no current name exists).
+fn is_name_changing(current: Option<&str>, new: &str) -> bool {
+    current.map(|c| c != new).unwrap_or(true)
+}
 
 /// Shared rate-limit check for display-name changes.
 /// Evicts stale entries, then enforces `MAX_DISPLAY_NAME_RENAMES` per
 /// `DISPLAY_NAME_WINDOW_SECS` per user. Returns `Ok(())` if allowed.
 async fn enforce_display_name_rate_limit(state: &AppState, user_id: &str) -> Result<(), AppError> {
-    let mut limiter = state.display_name_rate_limiter.lock().unwrap();
-    limiter
-        .retain(|_, (window_start, _)| window_start.elapsed().as_secs() < DISPLAY_NAME_WINDOW_SECS);
+    let sweep_tick = state
+        .display_name_rate_limiter_ops
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+
+    let mut limiter = state
+        .display_name_rate_limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if sweep_tick.is_multiple_of(RATE_LIMIT_SWEEP_EVERY_OPS) {
+        limiter.retain(|_, (window_start, _)| {
+            window_start.elapsed().as_secs() < DISPLAY_NAME_WINDOW_SECS
+        });
+    }
+
     let entry = limiter
         .entry(user_id.to_owned())
         .or_insert_with(|| (std::time::Instant::now(), 0));
+
+    // Even when a periodic sweep hasn't run yet, stale per-user windows must
+    // reset immediately on access.
+    if entry.0.elapsed().as_secs() >= DISPLAY_NAME_WINDOW_SECS {
+        *entry = (std::time::Instant::now(), 0);
+    }
+
     if entry.1 >= MAX_DISPLAY_NAME_RENAMES {
         return Err(AppError::rate_limit_exceeded());
     }
@@ -320,11 +348,8 @@ pub async fn update_display_name(
 
     // Check if the name is actually changing.
     // This prevents budget burn and broadcast amplification from idempotent retries.
-    let name_is_changing = current_status
-        .display_name
-        .as_deref()
-        .map(|current| current != validated_name.as_str())
-        .unwrap_or(true); // New name when none exists = changing
+    let name_is_changing =
+        is_name_changing(current_status.display_name.as_deref(), &validated_name);
 
     if !name_is_changing {
         // Name is identical — return current status without DB write, broadcast, or rate limit.
@@ -385,7 +410,7 @@ pub async fn get_participants(
 
 #[cfg(test)]
 mod tests {
-    use super::{DISPLAY_NAME_WINDOW_SECS, MAX_DISPLAY_NAME_RENAMES};
+    use super::{is_name_changing, DISPLAY_NAME_WINDOW_SECS, MAX_DISPLAY_NAME_RENAMES};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
@@ -555,18 +580,21 @@ mod tests {
     #[test]
     fn name_change_detection() {
         // Case 1: No existing name -> new name = changing
-        let current: Option<String> = None;
-        let is_changing = current.as_deref().map(|c| c != "Alice").unwrap_or(true);
-        assert!(is_changing, "None -> Some should be changing");
+        assert!(
+            is_name_changing(None, "Alice"),
+            "None -> Some should be changing"
+        );
 
         // Case 2: Same name = not changing
-        let current = Some("Alice".to_string());
-        let is_changing = current.as_deref().map(|c| c != "Alice").unwrap_or(true);
-        assert!(!is_changing, "Same name should be unchanged");
+        assert!(
+            !is_name_changing(Some("Alice"), "Alice"),
+            "Same name should be unchanged"
+        );
 
         // Case 3: Different name = changing
-        let current = Some("Alice".to_string());
-        let is_changing = current.as_deref().map(|c| c != "Bob").unwrap_or(true);
-        assert!(is_changing, "Different name should be changing");
+        assert!(
+            is_name_changing(Some("Alice"), "Bob"),
+            "Different name should be changing"
+        );
     }
 }

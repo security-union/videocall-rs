@@ -675,9 +675,9 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
         if let Some(members) = self.room_members.get_mut(&msg.room_id) {
             for (_sid, uid, dname) in members.iter_mut() {
                 if *uid == msg.user_id {
-                    *dname = validated_name;
-                    // Each user_id appears at most once per room in room_members;
-                    // stop after the first match to avoid redundant work.
+                    *dname = validated_name.clone();
+                    // Stop after the first match — one update is sufficient even
+                    // if the user has multiple sessions in the room.
                     break;
                 }
             }

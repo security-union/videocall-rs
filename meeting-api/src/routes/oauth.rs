@@ -1223,6 +1223,9 @@ mod tests {
             display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
         }
     }
 

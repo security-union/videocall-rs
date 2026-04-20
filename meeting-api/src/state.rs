@@ -14,7 +14,7 @@
 //! Shared application state passed to every Axum handler via `State`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicU64, Arc, Mutex};
 use std::time::Instant;
 
 use crate::config::{Config, OAuthConfig};
@@ -54,6 +54,8 @@ pub struct AppState {
     /// In-memory per-user rename rate limiter.
     /// Each entry: (window_start, count) for a 60-second sliding window.
     pub display_name_rate_limiter: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
+    /// Shared operation counter used to run periodic rate-limiter sweeps.
+    pub display_name_rate_limiter_ops: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -92,6 +94,7 @@ impl AppState {
                 .build()
                 .expect("failed to build reqwest client"),
             display_name_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            display_name_rate_limiter_ops: Arc::new(AtomicU64::new(0)),
         }
     }
 }

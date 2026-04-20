@@ -1144,6 +1144,8 @@ pub fn AttendantsComponent(
 
     // --- Screen share stack: tracks the order of peer screen shares (LIFO) ---
     let mut screen_share_stack: Signal<Vec<String>> = use_signal(Vec::new);
+    let previous_active_decode_set: Rc<RefCell<HashSet<u64>>> =
+        use_hook(|| Rc::new(RefCell::new(HashSet::new())));
     let active_screen_sharer: Option<String> = {
         let mut stack = screen_share_stack.write();
         // Remove peers who stopped sharing or left
@@ -1423,7 +1425,13 @@ pub fn AttendantsComponent(
             active_decode_set.insert(pinned_session_id);
         }
     }
-    client.set_active_decode_set(&active_decode_set);
+    {
+        let mut previous_active_decode_set = previous_active_decode_set.borrow_mut();
+        if *previous_active_decode_set != active_decode_set {
+            client.set_active_decode_set(&active_decode_set);
+            *previous_active_decode_set = active_decode_set.clone();
+        }
+    }
 
     let toggle_pin = {
         let client = client.clone();

@@ -211,7 +211,6 @@ pub struct SessionLogic {
 impl SessionLogic {
     /// Create a new session logic instance
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: Addr<ChatServer>,
         room: String,

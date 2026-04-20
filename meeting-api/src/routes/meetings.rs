@@ -384,12 +384,14 @@ pub async fn update_meeting(
 pub async fn get_meeting_guest_info(
     State(state): State<AppState>,
     Path(meeting_id): Path<String>,
-) -> Json<APIResponse<MeetingGuestInfoResponse>> {
-    let allow_guests = match db_meetings::get_by_room_id(&state.db, &meeting_id).await {
-        Ok(Some(row)) => row.allow_guests,
-        _ => false,
+) -> Result<Json<APIResponse<MeetingGuestInfoResponse>>, AppError> {
+    let allow_guests = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
+        Some(row) => row.allow_guests,
+        None => false,
     };
-    Json(APIResponse::ok(MeetingGuestInfoResponse { allow_guests }))
+    Ok(Json(APIResponse::ok(MeetingGuestInfoResponse {
+        allow_guests,
+    })))
 }
 
 #[cfg(test)]

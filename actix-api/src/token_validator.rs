@@ -246,6 +246,7 @@ mod tests {
             is_host: false,
             display_name: email.to_string(),
             observer: false,
+            is_guest: false,
             exp: now + exp_offset_secs,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
         };
@@ -302,6 +303,7 @@ mod tests {
             is_host: false,
             display_name: "Observer".to_string(),
             observer: true,
+            is_guest: false,
             exp: now + 600,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
         };

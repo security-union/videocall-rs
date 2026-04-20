@@ -127,6 +127,9 @@ pub struct ChatServer {
     /// Reverse map: `SessionId` → `instance_id`. Enables O(1) cleanup of
     /// `instance_index` when a session disconnects, instead of an O(n) retain scan.
     session_instance: HashMap<SessionId, String>,
+    /// Per-session server-authoritative guest flag, sourced from the JWT
+    /// `is_guest` claim captured at `JoinRoom`.
+    session_is_guest: HashMap<SessionId, bool>,
 }
 
 impl ChatServer {
@@ -142,6 +145,7 @@ impl ChatServer {
             suppress_join_broadcast: std::collections::HashSet::new(),
             instance_index: HashMap::new(),
             session_instance: HashMap::new(),
+            session_is_guest: HashMap::new(),
         }
     }
 
@@ -183,6 +187,7 @@ impl ChatServer {
             let room_id = room_id.to_string();
             let user_id = uid.to_string();
             let display_name = display_name.unwrap_or(uid).to_string();
+            let is_guest = self.session_is_guest.remove(session_id).unwrap_or(false);
             let session_manager = self.session_manager.clone();
             let nc = self.nats_connection.clone();
             let session_id_val = *session_id;
@@ -243,6 +248,7 @@ impl ChatServer {
                             &user_id,
                             session_id_val,
                             &display_name,
+                            is_guest,
                         );
                         let subject = format!("room.{}.system", room_id.replace(' ', "_"));
                         if let Err(e) = nc.publish(subject, bytes.into()).await {
@@ -392,10 +398,15 @@ impl Handler<Disconnect> for ChatServer {
             room,
             user_id,
             display_name,
+            is_guest,
             observer,
         }: Disconnect,
         ctx: &mut Self::Context,
     ) -> Self::Result {
+        // Persist the authoritative guest flag so leave_rooms can populate
+        // PARTICIPANT_LEFT consistently even if the original JoinRoom entry
+        // was evicted. `is_guest` for a session never changes mid-lifetime.
+        self.session_is_guest.entry(session).or_insert(is_guest);
         // If the session was already evicted (by a reconnecting instance_id),
         // its entries in sessions/connection_states were removed during eviction.
         // Ignore the stale Disconnect so it doesn't clobber a newer session's
@@ -624,11 +635,17 @@ impl Handler<ActivateConnection> for ChatServer {
             }
 
             if let Some((room_id, user_id, display_name)) = found {
+                let is_guest = self
+                    .session_is_guest
+                    .get(&session)
+                    .copied()
+                    .unwrap_or(false);
                 let bytes = SessionManager::build_peer_joined_packet(
                     &room_id,
                     &user_id,
                     session,
                     &display_name,
+                    is_guest,
                 );
                 let subject = format!("room.{}.system", room_id.replace(' ', "_"));
                 info!(
@@ -874,6 +891,7 @@ impl Handler<JoinRoom> for ChatServer {
             room,
             user_id,
             display_name,
+            is_guest,
             observer,
             instance_id,
         }: JoinRoom,
@@ -885,6 +903,12 @@ impl Handler<JoinRoom> for ChatServer {
         if user_id == SYSTEM_USER_ID {
             return MessageResult(Err("Cannot use reserved system user ID".into()));
         }
+
+        // Persist the server-authoritative guest flag so downstream
+        // handlers (ActivateConnection, Disconnect, leave_rooms, and the
+        // "existing members" broadcast in this handler) can retrieve it
+        // by session_id without widening the `room_members` tuple.
+        self.session_is_guest.insert(session, is_guest);
 
         if self.active_subs.contains_key(&session) {
             return MessageResult(Ok(()));
@@ -964,8 +988,21 @@ impl Handler<JoinRoom> for ChatServer {
         // Collect existing non-observer room members for notifying the new joiner.
         // On reconnection, we still send the existing member list so the
         // reconnecting client knows who is in the room.
-        let existing_members: Vec<(SessionId, String, String)> = if !observer {
-            self.room_members.get(&room).cloned().unwrap_or_default()
+        //
+        // Snapshot `is_guest` per existing session here (inside the handler,
+        // where `self` is in scope) so the spawned task can build accurate
+        // PARTICIPANT_JOINED packets without needing to re-enter the actor.
+        let existing_members: Vec<(SessionId, String, String, bool)> = if !observer {
+            self.room_members
+                .get(&room)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(sid, uid, dname)| {
+                    let g = self.session_is_guest.get(&sid).copied().unwrap_or(false);
+                    (sid, uid, dname, g)
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -1051,12 +1088,15 @@ impl Handler<JoinRoom> for ChatServer {
 
             // Send PARTICIPANT_JOINED for each existing member directly to the new joiner.
             // This ensures the new joiner learns about all participants already in the room.
-            for (existing_sid, existing_uid, existing_display_name) in &existing_members {
+            for (existing_sid, existing_uid, existing_display_name, existing_is_guest) in
+                &existing_members
+            {
                 let existing_bytes = SessionManager::build_peer_joined_packet(
                     &room_clone,
                     existing_uid,
                     *existing_sid,
                     existing_display_name,
+                    *existing_is_guest,
                 );
                 info!(
                     "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
@@ -1345,6 +1385,7 @@ mod tests {
                 room: "test-room".to_string(),
                 user_id: SYSTEM_USER_ID.to_string(),
                 display_name: SYSTEM_USER_ID.to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -1405,6 +1446,7 @@ mod tests {
                 room: "test-room-valid".to_string(),
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -1437,6 +1479,7 @@ mod tests {
                 room: "test-room".to_string(),
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -1497,6 +1540,7 @@ mod tests {
                 room: "test-room-cleanup".to_string(),
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -1513,6 +1557,7 @@ mod tests {
                 room: "test-room-cleanup".to_string(),
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -1557,6 +1602,7 @@ mod tests {
             room.clone(),
             user_id.clone(),
             user_id.clone(), // display_name fallback
+            false,           // is_guest
             nats_client.clone(),
             tracker_sender.clone(),
             session_manager.clone(),
@@ -1570,6 +1616,7 @@ mod tests {
             room.clone(),
             user_id.clone(),
             user_id.clone(), // display_name fallback
+            false,           // is_guest
             nats_client.clone(),
             tracker_sender.clone(),
             session_manager.clone(),
@@ -1885,6 +1932,7 @@ mod tests {
                 room: "test-room-broadcast".to_string(),
                 user_id: "alice@example.com".to_string(),
                 display_name: "alice@example.com".to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -1994,6 +2042,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: "observer-user@example.com".to_string(),
                 display_name: "observer-user@example.com".to_string(),
+                is_guest: false,
                 observer: true,
                 instance_id: None,
             })
@@ -2089,6 +2138,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: "real-user@example.com".to_string(),
                 display_name: "real-user@example.com".to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -2190,6 +2240,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: "testing-user@example.com".to_string(),
                 display_name: "testing-user@example.com".to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -2255,6 +2306,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: "testing-dc@example.com".to_string(),
                 display_name: "testing-dc@example.com".to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -2299,6 +2351,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: "testing-dc@example.com".to_string(),
                 display_name: "testing-dc@example.com".to_string(),
+                is_guest: false,
                 observer: false,
             })
             .await
@@ -2362,6 +2415,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: "observer-dc@example.com".to_string(),
                 display_name: "observer-dc@example.com".to_string(),
+                is_guest: false,
                 observer: true,
                 instance_id: None,
             })
@@ -2407,6 +2461,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: "observer-dc@example.com".to_string(),
                 display_name: "observer-dc@example.com".to_string(),
+                is_guest: false,
                 observer: true,
             })
             .await
@@ -2470,6 +2525,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: "real-dc@example.com".to_string(),
                 display_name: "real-dc@example.com".to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id: None,
             })
@@ -2530,6 +2586,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: "real-dc@example.com".to_string(),
                 display_name: "real-dc@example.com".to_string(),
+                is_guest: false,
                 observer: false,
             })
             .await
@@ -2591,6 +2648,7 @@ mod tests {
                 room: "test-room-observer-ok".to_string(),
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
+                is_guest: false,
                 observer: true,
                 instance_id: None,
             })
@@ -2609,6 +2667,7 @@ mod tests {
                 room: "test-room-observer-ok".to_string(),
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
+                is_guest: false,
                 observer: true,
                 instance_id: None,
             })
@@ -3018,6 +3077,7 @@ mod tests {
                 room: room.to_string(),
                 user_id: user_id.to_string(),
                 display_name: user_id.to_string(),
+                is_guest: false,
                 observer: false,
                 instance_id,
             })
@@ -3565,6 +3625,7 @@ mod tests {
                 room: room.clone(),
                 user_id: user_id.clone(),
                 display_name: user_id.clone(),
+                is_guest: false,
                 observer: false,
                 instance_id: Some(instance_id.clone()),
             })
@@ -3653,6 +3714,7 @@ mod tests {
                 room: room.clone(),
                 user_id: user_id.clone(),
                 display_name: user_id.clone(),
+                is_guest: false,
                 observer: false,
                 instance_id: Some(instance_id.clone()),
             })
@@ -3735,6 +3797,7 @@ mod tests {
                 room: room.clone(),
                 user_id: user_id.clone(),
                 display_name: user_id.clone(),
+                is_guest: false,
                 observer: false,
                 instance_id: Some(instance_id.clone()),
             })
@@ -3817,6 +3880,7 @@ mod tests {
                 room: room.clone(),
                 user_id: user_id.clone(),
                 display_name: user_id.clone(),
+                is_guest: false,
                 observer: false,
                 instance_id: Some(instance_id.clone()),
             })

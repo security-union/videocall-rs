@@ -259,6 +259,7 @@ pub fn WaitingRoom(
         let poll_interval_id = poll_interval_id.clone();
         let resolved_mount = resolved.clone();
         let resolved_interval = resolved.clone();
+        let observer_connected = observer_connected.clone();
         use_effect(move || {
             let window = match web_sys::window() {
                 Some(w) => w,
@@ -316,8 +317,13 @@ pub fn WaitingRoom(
             let meeting_id = meeting_id.clone();
             let observer_token = observer_token.clone();
             let resolved_interval = resolved_interval.clone();
+            let observer_connected = observer_connected.clone();
             let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
                 if resolved_interval.get() {
+                    return;
+                }
+                // Skip redundant HTTP polls while the push channel is live.
+                if observer_connected.get() {
                     return;
                 }
                 let meeting_id = meeting_id.clone();

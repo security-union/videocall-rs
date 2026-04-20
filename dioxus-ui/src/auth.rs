@@ -223,11 +223,17 @@ pub fn clear_user_profile() {
 /// nor the id_token is stored, the server will always return 401 — skip the
 /// network round-trip and fail immediately.
 pub async fn check_session() -> anyhow::Result<()> {
-    // Fast-path: skip the network call when a guest session ID is present,
-    // meaning this tab is (or was) a guest — no OAuth session cookie exists.
+    // Guest fast-path: skip the network call when this tab was (or is) a
+    // guest — but only when no OAuth session could exist.  When PKCE-based
+    // OAuth is active and tokens are present the user has logged in *after*
+    // a guest session; bail-out would incorrectly reject a valid session.
     if get_guest_session_id().is_some() {
+        let has_oauth_tokens = crate::constants::is_pkce_flow()
+            && (get_stored_access_token().is_some() || get_stored_id_token().is_some());
         clear_guest_session_id();
-        return Err(anyhow!("guest session; no OAuth session cookie"));
+        if !has_oauth_tokens {
+            return Err(anyhow!("guest session; no OAuth session cookie"));
+        }
     }
     if crate::constants::is_pkce_flow()
         && get_stored_access_token().is_none()

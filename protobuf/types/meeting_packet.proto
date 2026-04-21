@@ -37,5 +37,10 @@ message MeetingPacket {
   uint64 session_id = 9;
   // Display name of the participant (for PARTICIPANT_JOINED/LEFT events)
   bytes display_name = 10;
+  // Whether the participant joined as an unauthenticated guest
+  // (for PARTICIPANT_JOINED/LEFT events). Sourced from the
+  // authenticated JWT is_guest claim on the server. Default false
+  // keeps the wire format backward-compatible with older peers.
+  bool is_guest = 11;
 }
 

@@ -374,9 +374,11 @@ pub fn AttendantsComponent(
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] auto_join: bool,
     #[props(default)] is_owner: bool,
+    #[props(default)] is_guest: bool,
     #[props(default)] room_token: String,
     #[props(default = true)] waiting_room_enabled: bool,
     #[props(default)] admitted_can_admit: bool,
+    #[props(default = false)] allow_guests: bool,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -441,6 +443,7 @@ pub fn AttendantsComponent(
     let mut pending_video_enable = use_signal(|| false);
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
     let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
+    let mut allow_guests_toggle = use_signal(move || allow_guests);
     let mut saving = use_signal(|| false);
     let mut toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
@@ -509,6 +512,7 @@ pub fn AttendantsComponent(
                 .clone()
                 .unwrap_or_else(|| initial_display_name.clone()),
             display_name: initial_display_name.clone(),
+            is_guest,
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -1230,9 +1234,9 @@ pub fn AttendantsComponent(
                                                 }
                                                 saving.set(true);
                                                 let meeting_id = meeting_id.clone();
-                                                let aca = if new_val { Some(admitted_can_admit_toggle()) } else { Some(false) };
+                                                let aca = if new_val { None } else { Some(false) };
                                                 wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, new_val, aca).await {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, Some(new_val), aca, None).await {
                                                         Ok(updated) => {
                                                             waiting_room_toggle.set(updated.waiting_room_enabled);
                                                             admitted_can_admit_toggle.set(updated.admitted_can_admit);
@@ -1265,9 +1269,8 @@ pub fn AttendantsComponent(
                                                 admitted_can_admit_toggle.set(new_val);
                                                 saving.set(true);
                                                 let meeting_id = meeting_id.clone();
-                                                let wr = waiting_room_toggle();
                                                 wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, wr, Some(new_val)).await {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, None, Some(new_val), None).await {
                                                         Ok(updated) => {
                                                             waiting_room_toggle.set(updated.waiting_room_enabled);
                                                             admitted_can_admit_toggle.set(updated.admitted_can_admit);
@@ -1276,6 +1279,39 @@ pub fn AttendantsComponent(
                                                         Err(e) => {
                                                             log::error!("Failed to update admitted_can_admit setting: {e}");
                                                             admitted_can_admit_toggle.set(!new_val);
+                                                            saving.set(false);
+                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        },
+                                    }
+                                }
+                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
+                                    span { style: "font-size: 0.9rem;", "Allow guests" }
+                                    crate::components::toggle_switch::ToggleSwitch {
+                                        enabled: allow_guests_toggle(),
+                                        disabled: saving(),
+                                        on_toggle: {
+                                            let meeting_id = meeting_id_for_toggle.clone();
+                                            move |new_val: bool| {
+                                                if saving() {
+                                                    return;
+                                                }
+                                                toggle_error.set(None);
+                                                allow_guests_toggle.set(new_val);
+                                                saving.set(true);
+                                                let meeting_id = meeting_id.clone();
+                                                wasm_bindgen_futures::spawn_local(async move {
+                                                    match crate::meeting_api::update_meeting(&meeting_id, None, None, Some(new_val)).await {
+                                                        Ok(updated) => {
+                                                            allow_guests_toggle.set(updated.allow_guests);
+                                                            saving.set(false);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("Failed to update allow_guests setting: {e}");
+                                                            allow_guests_toggle.set(!new_val);
                                                             saving.set(false);
                                                             toggle_error.set(Some(format!("Failed to update setting: {e}")));
                                                         }
@@ -1755,6 +1791,8 @@ pub fn AttendantsComponent(
                                     {
                                         let hangup_client = client.clone();
                                         let hangup_id = id.clone();
+                                        let hangup_is_guest = is_guest;
+                                        let hangup_room_token = room_token.clone();
                                         rsx! {
                                             HangUpButton {
                                                 onclick: move |_| {
@@ -1781,8 +1819,11 @@ pub fn AttendantsComponent(
                                                     meeting_start_time_server.set(None);
 
                                                     let meeting_id = hangup_id.clone();
+                                                    let room_token = hangup_room_token.clone();
                                                     wasm_bindgen_futures::spawn_local(async move {
-                                                        if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
+                                                        if hangup_is_guest {
+                                                            let _ = crate::meeting_api::leave_meeting_as_guest(&meeting_id, &room_token).await;
+                                                        } else if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
                                                             log::error!("Error leaving meeting: {e}");
                                                         }
                                                         let _ = window().location().set_href("/");
@@ -1853,6 +1894,9 @@ pub fn AttendantsComponent(
                                     },
                                     reload_devices_counter: reload_devices_counter(),
                                 }
+                            }
+                            if is_guest {
+                                div { class: "guest-badge-preview", "Guest" }
                             }
                             {
                                 let status_client = client.clone();

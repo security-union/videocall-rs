@@ -157,6 +157,9 @@ pub struct VideoCallClientOptions {
     ///
     /// Should be `true` for call participants; set to `false` only for observer/lobby clients.
     pub decode_media: bool,
+
+    /// Whether the local user joined as an unauthenticated guest.
+    pub is_guest: bool,
 }
 
 #[derive(Debug)]
@@ -707,6 +710,27 @@ impl VideoCallClient {
             Err(_) => {
                 warn!(
                     "Failed to borrow inner in get_peer_display_name for session_id: {}",
+                    session_id
+                );
+                None
+            }
+        }
+    }
+
+    /// Returns whether the local user is a guest, as declared in the JWT claim
+    /// captured at client construction time.
+    pub fn is_local_guest(&self) -> Option<bool> {
+        Some(self.options.is_guest)
+    }
+
+    /// Get the guest status for a peer by session_id string.
+    /// Returns `None` if the peer doesn't exist or no guest status has been set.
+    pub fn get_peer_is_guest(&self, session_id: &str) -> Option<bool> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get_peer_is_guest(session_id),
+            Err(_) => {
+                warn!(
+                    "Failed to borrow inner in get_peer_is_guest for session_id: {}",
                     session_id
                 );
                 None
@@ -1440,6 +1464,10 @@ impl Inner {
                                 self.peer_decode_manager.set_peer_display_name(
                                     meeting_packet.session_id,
                                     display_name.clone(),
+                                );
+                                self.peer_decode_manager.set_peer_is_guest(
+                                    meeting_packet.session_id,
+                                    meeting_packet.is_guest,
                                 );
                             }
 

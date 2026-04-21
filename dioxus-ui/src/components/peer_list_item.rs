@@ -26,6 +26,7 @@ pub fn PeerListItem(
     #[props(default)] tooltip: String,
     #[props(default)] is_host: bool,
     #[props(default)] is_self: bool,
+    #[props(default)] is_guest: bool,
     #[props(default = true)] muted: bool,
     #[props(default = false)] speaking: bool,
     #[props(default)] on_edit_name: EventHandler<()>,
@@ -64,6 +65,9 @@ pub fn PeerListItem(
                     "{name}"
                     if let Some(label) = indicator {
                         span { class: "peer-indicator", "{label}" }
+                    }
+                    if is_guest {
+                        span { class: "guest-badge", "Guest" }
                     }
                     if is_self {
                         button {

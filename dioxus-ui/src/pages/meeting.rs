@@ -11,7 +11,10 @@
  * at your option.
  */
 
-use crate::auth::{check_session, get_user_profile, logout, redirect_to_login, UserProfile};
+use crate::auth::{
+    check_session, get_user_profile, handle_not_authenticated, logout, redirect_not_authenticated,
+    UserProfile,
+};
 use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
@@ -21,7 +24,7 @@ use crate::context::{
     get_or_create_local_user_id, load_display_name_from_storage, resolve_transport_config,
     save_display_name_to_storage, validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
 };
-use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
+use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -44,6 +47,7 @@ pub enum MeetingStatus {
         room_token: String,
         waiting_room_enabled: bool,
         admitted_can_admit: bool,
+        allow_guests: bool,
     },
     Rejected,
     Error(String),
@@ -76,24 +80,29 @@ pub fn MeetingPage(id: String) -> Element {
     let mut input_value_state = use_signal(|| initial_username);
 
     // Auth check effect
-    use_effect(move || {
-        if oauth_enabled().unwrap_or(false) {
-            wasm_bindgen_futures::spawn_local(async move {
-                match check_session().await {
-                    Ok(_) => auth_checked.set(true),
-                    Err(_) => {
-                        // Redirect straight to the backend OAuth login endpoint,
-                        // encoding the current meeting URL as `returnTo` so the
-                        // server bounces the user back here after sign-in.
-                        // This skips the intermediate /login SPA page entirely.
-                        redirect_to_login();
+    {
+        let id_for_auth = id.clone();
+        use_effect(move || {
+            if oauth_enabled().unwrap_or(false) {
+                let id_for_auth = id_for_auth.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let (session_result, guest_info_result) =
+                        futures::join!(check_session(), get_meeting_guest_info(&id_for_auth),);
+                    match session_result {
+                        Ok(_) => auth_checked.set(true),
+                        Err(_) => {
+                            let allow_guests = guest_info_result
+                                .map(|info| info.allow_guests)
+                                .unwrap_or(false);
+                            redirect_not_authenticated(&id_for_auth, allow_guests);
+                        }
                     }
-                }
-            });
-        } else {
-            auth_checked.set(true);
-        }
-    });
+                });
+            } else {
+                auth_checked.set(true);
+            }
+        });
+    }
 
     // Fetch user profile
     use_effect(move || {
@@ -164,6 +173,7 @@ pub fn MeetingPage(id: String) -> Element {
             let opts = VideoCallClientOptions {
                 user_id: user_id_for_client,
                 display_name: display_name.clone(),
+                is_guest: false,
                 meeting_id: meeting_id.clone(),
                 websocket_urls,
                 webtransport_urls,
@@ -217,6 +227,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     let determined_host_uid = response.host_user_id.clone();
                                     let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                                     let aca = response.admitted_can_admit.unwrap_or(false);
+                                    let ag = response.allow_guests.unwrap_or(false);
                                     host_display_name.set(determined_host.clone());
                                     host_user_id.set(determined_host_uid.clone());
                                     match response.status.as_str() {
@@ -229,6 +240,7 @@ pub fn MeetingPage(id: String) -> Element {
                                                     room_token: token,
                                                     waiting_room_enabled: wr_enabled,
                                                     admitted_can_admit: aca,
+                                                    allow_guests: ag,
                                                 });
                                             } else {
                                                 meeting_status.set(MeetingStatus::Error(
@@ -255,6 +267,9 @@ pub fn MeetingPage(id: String) -> Element {
                                             response.status
                                         ))),
                                     }
+                                }
+                                Err(JoinError::NotAuthenticated) => {
+                                    handle_not_authenticated(&meeting_id).await;
                                 }
                                 Err(e) => {
                                     meeting_status.set(MeetingStatus::Error(e.to_string()));
@@ -343,6 +358,7 @@ pub fn MeetingPage(id: String) -> Element {
                         });
                         let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                         let aca = response.admitted_can_admit.unwrap_or(false);
+                        let ag = response.allow_guests.unwrap_or(false);
                         host_display_name.set(determined_host.clone());
                         host_user_id.set(determined_host_uid.clone());
                         match response.status.as_str() {
@@ -356,6 +372,7 @@ pub fn MeetingPage(id: String) -> Element {
                                         room_token: token,
                                         waiting_room_enabled: wr_enabled,
                                         admitted_can_admit: aca,
+                                        allow_guests: ag,
                                     });
                                 } else {
                                     meeting_status.set(MeetingStatus::Error(
@@ -398,6 +415,10 @@ pub fn MeetingPage(id: String) -> Element {
                             observer_token: String::new(),
                         });
                     }
+                    Err(JoinError::NotAuthenticated) => {
+                        observer_token_signal.set(None);
+                        handle_not_authenticated(&meeting_id).await;
+                    }
                     Err(e) => {
                         observer_token_signal.set(None);
                         meeting_status.set(MeetingStatus::Error(e.to_string()));
@@ -414,6 +435,7 @@ pub fn MeetingPage(id: String) -> Element {
             let determined_host_uid = status.host_user_id.clone();
             let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
             let aca = status.admitted_can_admit.unwrap_or(false);
+            let ag = status.allow_guests.unwrap_or(false);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
             host_user_id.set(determined_host_uid.clone());
@@ -425,6 +447,7 @@ pub fn MeetingPage(id: String) -> Element {
                 room_token: token,
                 waiting_room_enabled: wr_enabled,
                 admitted_can_admit: aca,
+                allow_guests: ag,
             });
         }
     };
@@ -470,7 +493,7 @@ pub fn MeetingPage(id: String) -> Element {
     rsx! {
         match (&maybe_username, &current_meeting_status) {
             // User is admitted - show the meeting
-            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled, admitted_can_admit }) => rsx! {
+            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled, admitted_can_admit, allow_guests }) => rsx! {
                 AttendantsComponent {
                     display_name: username.clone(),
                     id: id.clone(),
@@ -487,6 +510,7 @@ pub fn MeetingPage(id: String) -> Element {
                     room_token: room_token.clone(),
                     waiting_room_enabled: *waiting_room_enabled,
                     admitted_can_admit: *admitted_can_admit,
+                    allow_guests: *allow_guests,
                 }
             },
 

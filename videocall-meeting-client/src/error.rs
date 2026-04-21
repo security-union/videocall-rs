@@ -34,6 +34,11 @@ pub enum ApiError {
     #[error("Meeting is not active. The host must join first.")]
     MeetingNotActive,
 
+    /// The meeting does not permit guest (unauthenticated) participants
+    /// (HTTP 403, code GUESTS_NOT_ALLOWED).
+    #[error("Guests are not allowed in this meeting. The meeting host must enable guest access.")]
+    GuestsNotAllowed,
+
     /// A server error with status code and body.
     #[error("Server error ({status}): {body}")]
     ServerError { status: u16, body: String },

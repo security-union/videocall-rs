@@ -594,6 +594,12 @@ pub fn AttendantsComponent(
             },
             on_peer_added: VcCallback::from(move |session_id: String| {
                 log::info!("New user joined: {session_id}");
+                // Record join time for the new peer immediately (in callback,
+                // not during render) to avoid signal-writes-during-render.
+                let mut jt = peer_join_time;
+                jt.write()
+                    .entry(session_id)
+                    .or_insert_with(js_sys::Date::now);
                 // Sound is played by on_peer_joined which has display name context.
                 let mut v = peer_list_version;
                 v.set(v() + 1);
@@ -1066,23 +1072,18 @@ pub fn AttendantsComponent(
         .filter(|session_id| *session_id != own_session)
         .collect();
     let mut display_peers = display_peers;
-    // Record join time for newly-seen peers (first render = join time).
-    // Guard the write to avoid infinite re-render loops: only write when
-    // there are peers we haven't seen before.
+    // Assign synthetic join times to mock peers for local testing.
+    // Real peers get their join time recorded in the on_peer_added callback
+    // (not during render) to avoid signal-writes-during-render loops.
     {
         let mock_count_val = debug_peer_count() as usize;
-        let has_new = {
+        let has_new_mock = {
             let jt = peer_join_time.read();
-            display_peers.iter().any(|p| !jt.contains_key(p))
-                || (0..mock_count_val).any(|i| !jt.contains_key(&format!("mock-{i}")))
+            (0..mock_count_val).any(|i| !jt.contains_key(&format!("mock-{i}")))
         };
-        if has_new {
+        if has_new_mock {
             let now = js_sys::Date::now();
             let mut jt = peer_join_time.write();
-            for peer in &display_peers {
-                jt.entry(peer.clone()).or_insert(now);
-            }
-            // Assign synthetic join times to mock peers for local testing.
             for i in 0..mock_count_val {
                 let mock_id = format!("mock-{i}");
                 jt.entry(mock_id).or_insert(now + i as f64);
@@ -1153,7 +1154,11 @@ pub fn AttendantsComponent(
         for &mode in &modes_by_density[user_rank..] {
             chosen = mode;
             let mtw = mode.min_tile_width(vw);
-            let eff = {
+            // Find the max tile count where compute_layout yields tw >= mtw.
+            // Since tile_width is monotonically non-increasing as tile count
+            // grows, we can scan downward from total_tiles (fast in practice
+            // since the breakpoint is usually close to total_tiles).
+            let capacity = {
                 let mut t = total_tiles;
                 while t > 1 {
                     let (_c, _r, tw) = compute_layout(t, avail_w, avail_h, gap);
@@ -1164,8 +1169,8 @@ pub fn AttendantsComponent(
                 }
                 t
             };
-            let vis = if total_tiles > eff {
-                eff.saturating_sub(1).max(1)
+            let vis = if total_tiles > capacity {
+                capacity.saturating_sub(1).max(1)
             } else {
                 total_tiles
             };
@@ -1208,16 +1213,24 @@ pub fn AttendantsComponent(
         (total_tiles, 0)
     };
     // --- Build unified tile list (real + mock peers) sorted by join time ---
-    // This ensures real peers and mock peers are interleaved by the order
-    // they appeared, so a user who joins after mock tiles are added will
-    // appear AFTER the mocks — not always at the front.
+    // Tiles are ordered by join time (earliest first) rather than by speech
+    // activity. This provides a stable, predictable grid that doesn't shuffle
+    // chaotically as people take turns speaking. Active speakers who overflow
+    // off-screen are promoted via the swap logic below, so they remain visible
+    // without disrupting the order of the rest of the grid.
+    //
+    // Real peers and mock peers are interleaved by the order they appeared, so
+    // a user who joins after mock tiles are added will appear AFTER the mocks
+    // — not always at the front.
+
+    // Pre-build mock IDs once to avoid repeated format!() in the hot path.
+    let mock_ids: Vec<String> = (0..mock_count).map(|i| format!("mock-{i}")).collect();
+
     let mut all_tiles: Vec<String> = Vec::with_capacity(total_tiles);
     for peer_id in display_peers.iter().take(capped_real) {
         all_tiles.push(peer_id.clone());
     }
-    for i in 0..mock_count {
-        all_tiles.push(format!("mock-{i}"));
-    }
+    all_tiles.extend_from_slice(&mock_ids);
     // Stable sort by join time (earliest first).
     {
         let join_map = peer_join_time.read();
@@ -1228,10 +1241,21 @@ pub fn AttendantsComponent(
         });
     }
 
-    // --- Promote overflow speakers ---
-    // Only move a peer from overflow to visible when they are actively speaking.
-    // Displace the least-recently-active visible tile (by speech time, fallback
-    // to join time).  Visible tiles that are themselves speaking are never displaced.
+    // --- Overflow speaker promotion ---
+    // When there are more tiles than fit on screen, the grid splits into
+    // "visible" (first `visible_tile_count` items) and "overflow" (the rest).
+    // If a peer in the overflow set is actively speaking (spoke within
+    // SPEAKER_ACTIVE_MS), we swap them into the visible set by displacing the
+    // least-recently-active visible peer that is NOT currently speaking.
+    //
+    // Algorithm:
+    // 1. Collect overflow indices whose peer spoke within SPEAKER_ACTIVE_MS,
+    //    sorted most-recent-first (so the loudest speaker gets priority).
+    // 2. Collect visible indices whose peer is NOT actively speaking, sorted
+    //    by effective timestamp ascending (least-recently-active first = best
+    //    swap candidate).
+    // 3. Pair up overflow speakers with swap candidates and swap in-place.
+    //    All index pairs are disjoint so swap order doesn't matter.
     if visible_tile_count < all_tiles.len() {
         let speech_map = peer_speech_priority.read();
         let join_map = peer_join_time.read();
@@ -1337,7 +1361,7 @@ pub fn AttendantsComponent(
              gap: {gap:.0}px; \
              padding: {pad_top:.0}px {pad_right:.0}px {pad_bottom:.0}px {pad_left:.0}px; \
              box-sizing: border-box; overflow: hidden; \
-             flex-direction: initial; flex-wrap: initial; align-items: initial; \
+             flex-direction: unset; flex-wrap: unset; align-items: unset; \
              width: auto; height: auto; \
              grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr); \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
@@ -1687,13 +1711,13 @@ pub fn AttendantsComponent(
                         }
                         // Right panel — all peer video tiles stacked vertically
                         div { style: "flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;",
-                            for (i , tile_id) in visible_tiles.iter().enumerate() {
+                            for tile_id in visible_tiles.iter() {
                                 {
                                     let is_mock = tile_id.starts_with("mock-");
                                     if is_mock {
                                         rsx! {
                                             PeerTile {
-                                                key: "split-{tile_id}",
+                                                key: "tile-{tile_id}",
                                                 peer_id: tile_id.clone(),
                                                 full_bleed: false,
                                                 host_user_id: host_user_id.clone(),
@@ -1705,7 +1729,7 @@ pub fn AttendantsComponent(
                                     } else {
                                         rsx! {
                                             PeerTile {
-                                                key: "vid-{i}-{tile_id}",
+                                                key: "tile-{tile_id}",
                                                 peer_id: tile_id.clone(),
                                                 full_bleed: false,
                                                 host_user_id: host_user_id.clone(),
@@ -1721,7 +1745,7 @@ pub fn AttendantsComponent(
                         }
                     } else {
                         // ---- Normal grid layout ----
-                        for (i , tile_id) in visible_tiles.iter().enumerate() {
+                        for tile_id in visible_tiles.iter() {
                             {
                                 let is_mock = tile_id.starts_with("mock-");
                                 let full_bleed = !is_mock
@@ -1741,7 +1765,7 @@ pub fn AttendantsComponent(
                                 } else {
                                     rsx! {
                                         PeerTile {
-                                            key: "tile-{i}-{tile_id}",
+                                            key: "tile-{tile_id}",
                                             peer_id: tile_id.clone(),
                                             full_bleed,
                                             host_user_id: host_user_id.clone(),

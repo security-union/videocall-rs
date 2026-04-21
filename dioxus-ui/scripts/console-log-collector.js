@@ -32,6 +32,7 @@
   var uploadTimer = null;
   var uploadInFlight = false;
   var nextSeq = 0;
+  var nextChunkSeq = 1;
 
   var highEntropyPlatform = null;
 
@@ -226,9 +227,13 @@
         "Content-Type": "text/plain",
         "X-User-Id": userId,
         "X-Session-Timestamp": String(sessionTimestampMs),
+        "X-Chunk-Seq": String(nextChunkSeq),
       },
       body: payload,
     };
+    // Increment BEFORE fetch so even failed requests advance the counter,
+    // preventing filename collisions on retry.
+    nextChunkSeq++;
     if (useKeepalive) {
       opts.keepalive = true;
     }
@@ -301,6 +306,8 @@
 
     // Prefer fetch with keepalive — supports custom headers and survives
     // page navigation in all modern browsers.
+    var closeChunkSeq = nextChunkSeq;
+    nextChunkSeq++;
     try {
       fetch(url, {
         method: "POST",
@@ -310,6 +317,7 @@
           "Content-Type": "text/plain",
           "X-User-Id": userId,
           "X-Session-Timestamp": String(sessionTimestampMs),
+          "X-Chunk-Seq": String(closeChunkSeq),
         },
         body: payload,
       });
@@ -321,7 +329,7 @@
         var meta = JSON.stringify({
           ts: new Date().toISOString(),
           level: "meta",
-          msg: "user_id=" + userId + "; session_ts=" + sessionTimestampMs,
+          msg: "user_id=" + userId + "; session_ts=" + sessionTimestampMs + "; chunk_seq=" + closeChunkSeq,
         });
         var beaconPayload = meta + "\n" + payload;
         var blob = new Blob([beaconPayload], { type: "text/plain" });

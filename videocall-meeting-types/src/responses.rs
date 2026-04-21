@@ -81,6 +81,8 @@ pub struct CreateMeetingResponse {
     pub has_password: bool,
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
+    #[serde(default)]
+    pub allow_guests: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}`.
@@ -106,6 +108,8 @@ pub struct MeetingInfoResponse {
     pub ended_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub your_status: Option<ParticipantStatusResponse>,
+    #[serde(default)]
+    pub allow_guests: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings`.
@@ -138,6 +142,8 @@ pub struct MeetingSummary {
     pub waiting_count: i64,
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
+    #[serde(default)]
+    pub allow_guests: bool,
 }
 
 /// Participant status returned by join, status, admit, reject, and leave endpoints.
@@ -151,6 +157,9 @@ pub struct ParticipantStatusResponse {
     pub display_name: Option<String>,
     pub status: String,
     pub is_host: bool,
+    /// Whether this participant joined as an unauthenticated guest.
+    #[serde(default)]
+    pub is_guest: bool,
     /// Unix timestamp in seconds when the participant joined/entered the waiting room.
     pub joined_at: i64,
     /// Unix timestamp in seconds when the participant was admitted, or `null`.
@@ -176,6 +185,9 @@ pub struct ParticipantStatusResponse {
     /// Meeting-level: the host's user_id (i.e. `creator_id`). Present in join/status responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_user_id: Option<String>,
+    /// Meeting-level: whether guests (unauthenticated users) are allowed to join.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_guests: Option<bool>,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}/waiting`.
@@ -196,6 +208,12 @@ pub struct AdmitAllResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeleteMeetingResponse {
     pub message: String,
+}
+
+/// Response payload for `GET /api/v1/meetings/{meeting_id}/guest-info` (public, no auth).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MeetingGuestInfoResponse {
+    pub allow_guests: bool,
 }
 
 /// Response payload for `GET /profile`.

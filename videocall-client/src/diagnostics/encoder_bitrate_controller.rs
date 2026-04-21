@@ -34,6 +34,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 const WINDOW_DURATION_SEC: u32 = 10;
 const INACTIVE_TIMEOUT_SEC: u32 = 20;
 const AQ_SUMMARY_INTERVAL_MS: f64 = 30_000.0;
+const PID_STUCK_THRESHOLD_MS: f64 = 30_000.0;
 
 /// EncoderControl is responsible for bridging the gap between the encoder and the
 /// diagnostics system.
@@ -288,6 +289,8 @@ pub struct EncoderBitrateController {
     last_target_bitrate_kbps: f64,
     /// Timestamp (ms) of the last AQ_STATUS summary log emission.
     last_aq_summary_ms: f64,
+    /// Timestamp (ms) when PID output first hit PID_OUTPUT_MAX.
+    pid_saturated_since_ms: Option<f64>,
 }
 
 impl EncoderBitrateController {
@@ -355,6 +358,7 @@ impl EncoderBitrateController {
             last_bitrate_ratio: 0.0,
             last_target_bitrate_kbps: 0.0,
             last_aq_summary_ms: 0.0,
+            pid_saturated_since_ms: None,
         }
     }
 
@@ -451,6 +455,26 @@ impl EncoderBitrateController {
         let current_error = target_fps - fps_received;
         if current_error.abs() <= PID_DEADBAND_FPS && pid_output > 0.0 {
             self.pid.reset();
+            self.pid_saturated_since_ms = None;
+        }
+
+        // Stuck-PID watchdog: if output has been at maximum for too long,
+        // force a reset. This breaks the feedback loop where reduced bitrate
+        // causes low received FPS which keeps the PID saturated indefinitely.
+        // 0.01 tolerance: PID integrator may asymptotically approach the max
+        // without reaching it exactly due to f64 accumulation rounding.
+        if pid_output >= PID_OUTPUT_MAX - 0.01 {
+            let saturated_since = *self.pid_saturated_since_ms.get_or_insert(now);
+            if now - saturated_since >= PID_STUCK_THRESHOLD_MS {
+                log::warn!(
+                    "AQ_PID_STUCK: output at maximum for {:.0}s, forcing reset",
+                    (now - saturated_since) / 1000.0,
+                );
+                self.pid.reset();
+                self.pid_saturated_since_ms = None;
+            }
+        } else {
+            self.pid_saturated_since_ms = None;
         }
 
         let base_bitrate = self.ideal_bitrate_kbps as f64;
@@ -512,6 +536,7 @@ impl EncoderBitrateController {
             let old_bitrate = self.ideal_bitrate_kbps;
             let new_tier = self.quality_manager.current_video_tier();
             self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            self.pid.reset();
             log::info!(
                 "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: pid)",
                 old_bitrate,
@@ -626,8 +651,9 @@ impl EncoderBitrateController {
             let old_bitrate = self.ideal_bitrate_kbps;
             let new_tier = self.quality_manager.current_video_tier();
             self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            self.pid.reset();
             log::info!(
-                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: forced_step_down)",
+                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: force_step_down)",
                 old_bitrate,
                 self.ideal_bitrate_kbps,
                 new_tier.label,
@@ -653,6 +679,7 @@ impl EncoderBitrateController {
                 let new_tier = self.quality_manager.current_video_tier();
                 self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
                 self.tier_changed = true;
+                self.pid.reset();
                 log::info!(
                     "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: screen_share_coordination)",
                     old_bitrate, self.ideal_bitrate_kbps, new_tier.label, self.quality_manager.video_tier_index(),

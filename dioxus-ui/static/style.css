@@ -155,6 +155,46 @@ h3 {
   flex-shrink: 0;
 }
 
+/* Guest badge — yellow pill */
+.guest-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 7px;
+  border-radius: 8px;
+  background-color: #f59e0b;
+  color: #000;
+  font-size: 0.7em;
+  font-weight: 700;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+
+/* Guest badge on the floating-name overlay on video tiles */
+.floating-name .guest-badge {
+  font-size: 0.75em;
+  padding: 1px 6px;
+  margin-left: 6px;
+}
+
+/* Guest badge on camera preview (bottom-right corner) */
+.guest-badge-preview {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  background-color: #f59e0b;
+  color: #000;
+  font-size: 0.7em;
+  font-weight: 700;
+  z-index: 30;
+  pointer-events: none;
+}
+
 .peer_item_name_container {
   display: flex;
   align-items: center;

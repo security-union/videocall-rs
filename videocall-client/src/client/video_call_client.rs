@@ -1019,19 +1019,16 @@ impl VideoCallClient {
         }
     }
 
-    /// Update the visibility state for a peer. When `visible` is `false`,
-    /// video and screen decoding is paused to save CPU. Audio is always
-    /// decoded regardless of visibility.
+    /// Update the peer set that is eligible for video/screen decode.
     ///
-    /// Called by the UI layer when an `IntersectionObserver` detects that a
-    /// peer's canvas element has scrolled in or out of the viewport.
-    pub fn set_peer_visibility(&self, peer_id: &str, visible: bool) {
-        let sid: u64 = match peer_id.parse() {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+    /// The UI layout computes this set from the peers it actively renders.
+    /// Peers outside the set remain connected and continue decoding audio, but
+    /// skip video and screen decode to cap renderer load in large meetings.
+    pub fn set_active_decode_set(&self, active_session_ids: &std::collections::HashSet<u64>) {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            inner.peer_decode_manager.set_peer_visibility(sid, visible);
+            inner
+                .peer_decode_manager
+                .set_active_decode_set(active_session_ids);
         }
     }
 

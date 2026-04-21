@@ -51,7 +51,7 @@ use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::error;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
@@ -336,7 +336,7 @@ fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     let ar: f64 = 16.0 / 9.0;
 
     for cols in 1..=n {
-        let rows = (n + cols - 1) / cols; // ceil(n / cols)
+        let rows = n.div_ceil(cols);
 
         let avail_w = (w - (cols as f64 - 1.0) * gap).max(0.0);
         let avail_h = (h - (rows as f64 - 1.0) * gap).max(0.0);
@@ -1149,6 +1149,8 @@ pub fn AttendantsComponent(
 
     // --- Screen share stack: tracks the order of peer screen shares (LIFO) ---
     let mut screen_share_stack: Signal<Vec<String>> = use_signal(Vec::new);
+    let previous_active_decode_set: Rc<RefCell<HashSet<u64>>> =
+        use_hook(|| Rc::new(RefCell::new(HashSet::new())));
     let active_screen_sharer: Option<String> = {
         let mut stack = screen_share_stack.write();
         // Remove peers who stopped sharing or left
@@ -1168,6 +1170,23 @@ pub fn AttendantsComponent(
         stack.last().cloned()
     };
     let has_screen_share = active_screen_sharer.is_some();
+
+    // ORDERING INVARIANT: the active decode set is built in 3 phases:
+    //   1. Visible layout peers (here)
+    //   2. Active screen sharer (here)
+    //   3. Pinned peer (below, after tile rendering)
+    // The dedup check against previous_active_decode_set must run AFTER all
+    // three phases. Moving any insertion after the dedup will silently desync.
+    let mut active_decode_set: HashSet<u64> = display_peers
+        .iter()
+        .take(visible_real)
+        .filter_map(|pid| pid.parse::<u64>().ok())
+        .collect();
+    if let Some(active_peer) = active_screen_sharer.as_ref() {
+        if let Ok(session_id) = active_peer.parse::<u64>() {
+            active_decode_set.insert(session_id);
+        }
+    }
 
     let container_style = if has_screen_share {
         // 2/3 screen-share panel on the left, 1/3 peer panel on the right
@@ -1280,8 +1299,25 @@ pub fn AttendantsComponent(
         }
     }
 
-    // Pinned peer glow: read current pinned value for PeerTile props
+    // Phase 3 of active_decode_set construction (see ordering invariant above).
     let current_pinned = pinned_peer_id();
+    if let Some(pinned_user_id) = current_pinned.as_deref() {
+        if let Some(pinned_session_id) = display_peers
+            .iter()
+            .find(|peer_id| client.get_peer_user_id(peer_id).as_deref() == Some(pinned_user_id))
+            .and_then(|peer_id| peer_id.parse::<u64>().ok())
+        {
+            active_decode_set.insert(pinned_session_id);
+        }
+    }
+    {
+        // Dedup: only push to client when the set actually changed.
+        let mut previous_active_decode_set = previous_active_decode_set.borrow_mut();
+        if *previous_active_decode_set != active_decode_set {
+            client.set_active_decode_set(&active_decode_set);
+            *previous_active_decode_set = active_decode_set.clone();
+        }
+    }
 
     let toggle_pin = {
         let client = client.clone();

@@ -260,7 +260,7 @@ impl CameraEncoder {
 
                     if elapsed_ms >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_WINDOW_MS
                     {
-                        let delta = current_ws_drops - last_ws_drop_snapshot;
+                        let delta = current_ws_drops.saturating_sub(last_ws_drop_snapshot);
                         if delta
                             >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_DROP_THRESHOLD
                         {

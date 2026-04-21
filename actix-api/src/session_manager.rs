@@ -160,12 +160,14 @@ impl SessionManager {
     /// Build PARTICIPANT_JOINED packet to notify peers about a new session joining the room.
     ///
     /// The `display_name` field carries the participant's display name so the
-    /// client can show friendly toast messages.
+    /// client can show friendly toast messages. The `is_guest` flag is sourced
+    /// from the authenticated JWT `is_guest` claim.
     pub fn build_peer_joined_packet(
         room_id: &str,
         user_id: &str,
         session_id: u64,
         display_name: &str,
+        is_guest: bool,
     ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::PARTICIPANT_JOINED.into(),
@@ -174,6 +176,7 @@ impl SessionManager {
             target_user_id: to_user_id_bytes(user_id),
             session_id,
             display_name: display_name.as_bytes().to_vec(),
+            is_guest,
             ..Default::default()
         };
 
@@ -193,6 +196,7 @@ impl SessionManager {
         user_id: &str,
         session_id: u64,
         display_name: &str,
+        is_guest: bool,
     ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::PARTICIPANT_LEFT.into(),
@@ -201,6 +205,7 @@ impl SessionManager {
             target_user_id: to_user_id_bytes(user_id),
             session_id,
             display_name: display_name.as_bytes().to_vec(),
+            is_guest,
             ..Default::default()
         };
 
@@ -307,7 +312,8 @@ mod tests {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-        let packet = SessionManager::build_peer_joined_packet("my-room", "bob", 42, "Bob Smith");
+        let packet =
+            SessionManager::build_peer_joined_packet("my-room", "bob", 42, "Bob Smith", false);
         let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
         assert_eq!(wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
@@ -322,6 +328,19 @@ mod tests {
         assert_eq!(inner.session_id, 42);
         assert!(inner.message.contains("bob"));
         assert_eq!(inner.display_name, "Bob Smith".as_bytes().to_vec());
+        assert!(!inner.is_guest);
+
+        // Guest path: is_guest = true propagates end-to-end.
+        let packet_guest = SessionManager::build_peer_joined_packet(
+            "my-room",
+            "guest:1234",
+            43,
+            "Guest Bob",
+            true,
+        );
+        let wrapper_guest = PacketWrapper::parse_from_bytes(&packet_guest).unwrap();
+        let inner_guest = MeetingPacket::parse_from_bytes(&wrapper_guest.data).unwrap();
+        assert!(inner_guest.is_guest);
     }
 
     #[tokio::test]
@@ -329,7 +348,8 @@ mod tests {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-        let packet = SessionManager::build_peer_left_packet("my-room", "alice", 99, "Alice Jones");
+        let packet =
+            SessionManager::build_peer_left_packet("my-room", "alice", 99, "Alice Jones", false);
         let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
         assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
 
@@ -353,8 +373,9 @@ mod tests {
         let sid = 77u64;
         let display = "Charlie Brown";
 
-        let joined_bytes = SessionManager::build_peer_joined_packet(room, user, sid, display);
-        let left_bytes = SessionManager::build_peer_left_packet(room, user, sid, display);
+        let joined_bytes =
+            SessionManager::build_peer_joined_packet(room, user, sid, display, false);
+        let left_bytes = SessionManager::build_peer_left_packet(room, user, sid, display, false);
 
         let joined_wrapper = PacketWrapper::parse_from_bytes(&joined_bytes).unwrap();
         let left_wrapper = PacketWrapper::parse_from_bytes(&left_bytes).unwrap();

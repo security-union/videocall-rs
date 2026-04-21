@@ -537,11 +537,11 @@ lazy_static! {
     )
     .expect("Failed to create relay_packet_drops_total metric");
 
-    /// Current outbound channel occupancy (WebTransport bounded channel only)
+    /// Current outbound channel occupancy per transport
     pub static ref RELAY_OUTBOUND_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
         "relay_outbound_queue_depth",
-        "Current outbound channel occupancy (WebTransport only)",
-        &["room"]
+        "Current outbound channel occupancy",
+        &["room", "transport"]
     )
     .expect("Failed to create relay_outbound_queue_depth metric");
 

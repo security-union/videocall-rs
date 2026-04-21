@@ -1166,6 +1166,12 @@ pub fn AttendantsComponent(
     };
     let has_screen_share = active_screen_sharer.is_some();
 
+    // ORDERING INVARIANT: the active decode set is built in 3 phases:
+    //   1. Visible layout peers (here)
+    //   2. Active screen sharer (here)
+    //   3. Pinned peer (below, after tile rendering)
+    // The dedup check against previous_active_decode_set must run AFTER all
+    // three phases. Moving any insertion after the dedup will silently desync.
     let mut active_decode_set: HashSet<u64> = display_peers
         .iter()
         .take(visible_real)
@@ -1414,7 +1420,7 @@ pub fn AttendantsComponent(
         }
     }
 
-    // Pinned peer glow: read current pinned value for PeerTile props
+    // Phase 3 of active_decode_set construction (see ordering invariant above).
     let current_pinned = pinned_peer_id();
     if let Some(pinned_user_id) = current_pinned.as_deref() {
         if let Some(pinned_session_id) = display_peers
@@ -1426,6 +1432,7 @@ pub fn AttendantsComponent(
         }
     }
     {
+        // Dedup: only push to client when the set actually changed.
         let mut previous_active_decode_set = previous_active_decode_set.borrow_mut();
         if *previous_active_decode_set != active_decode_set {
             client.set_active_decode_set(&active_decode_set);

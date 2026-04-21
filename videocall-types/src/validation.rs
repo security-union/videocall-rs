@@ -99,6 +99,18 @@ pub fn validate_display_name(raw: &str) -> Result<String, String> {
     Ok(value)
 }
 
+/// Returns `true` if the string matches the standard UUID/GUID format
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` — 8-4-4-4-12 hex digits).
+pub fn is_guid_like(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    s.bytes().enumerate().all(|(i, b)| match i {
+        8 | 13 | 18 | 23 => b == b'-',
+        _ => b.is_ascii_hexdigit(),
+    })
+}
+
 /// Returns `true` iff the supplied string is non-empty and contains only
 /// ASCII alphanumerics and underscores. Used for meeting ID validation.
 pub fn is_valid_meeting_id(id: &str) -> bool {
@@ -162,6 +174,21 @@ mod tests {
             validate_display_name("  hello   world  ").unwrap(),
             "hello world"
         );
+    }
+
+    #[test]
+    fn test_is_guid_like() {
+        assert!(is_guid_like("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+        assert!(is_guid_like("00000000-0000-0000-0000-000000000000"));
+        assert!(is_guid_like("ABCDEF01-2345-6789-ABCD-EF0123456789"));
+        assert!(!is_guid_like("not-a-guid"));
+        assert!(!is_guid_like(""));
+        assert!(!is_guid_like("a1b2c3d4e5f67890abcdef1234567890"));
+        assert!(!is_guid_like("a1b2c3d4-e5f6-7890-abcd-ef123456789"));
+        assert!(!is_guid_like("a1b2c3d4-e5f6-7890-abcd-ef12345678901"));
+        assert!(!is_guid_like("g1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+        assert!(!is_guid_like("John Doe"));
+        assert!(!is_guid_like("alice@example.com"));
     }
 
     #[test]

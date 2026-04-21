@@ -60,6 +60,7 @@ impl WsChatSession {
         room: String,
         user_id: String,
         display_name: String,
+        is_guest: bool,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -73,6 +74,7 @@ impl WsChatSession {
             room,
             user_id,
             display_name,
+            is_guest,
             nats_client,
             tracker_sender,
             session_manager,
@@ -370,6 +372,7 @@ mod tests {
                                     room,
                                     user_id,
                                     display_name,
+                                    false, // test sessions are never guests
                                     nats_client,
                                     tracker_sender,
                                     session_manager,

@@ -155,6 +155,8 @@ pub(crate) async fn parse_api_response<T: serde::de::DeserializeOwned + serde::S
             let text = response.text().await.unwrap_or_default();
             if text.contains("JOINING_NOT_ALLOWED") {
                 Err(ApiError::JoiningNotAllowed)
+            } else if text.contains("GUESTS_NOT_ALLOWED") {
+                Err(ApiError::GuestsNotAllowed)
             } else {
                 Err(ApiError::Forbidden(text))
             }

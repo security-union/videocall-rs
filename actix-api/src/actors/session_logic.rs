@@ -188,6 +188,8 @@ pub struct SessionLogic {
     /// Participant's chosen display name (from JWT claims).
     /// Falls back to `user_id` when no display name is available.
     pub display_name: String,
+    /// Server-authoritative guest flag (JWT `is_guest` claim).
+    pub is_guest: bool,
     pub addr: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
@@ -218,6 +220,7 @@ impl SessionLogic {
         room: String,
         user_id: String,
         display_name: String,
+        is_guest: bool,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -229,8 +232,8 @@ impl SessionLogic {
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
-            "new session: room={} user_id={} display_name={} session_id={} observer={} is_host={} transport={}",
-            room, user_id, display_name, id, observer, is_host, transport
+            "new session: room={} user_id={} display_name={} is_guest={} session_id={} observer={} is_host={} transport={}",
+            room, user_id, display_name, is_guest, id, observer, is_host, transport
         );
 
         SessionLogic {
@@ -238,6 +241,7 @@ impl SessionLogic {
             room,
             user_id,
             display_name,
+            is_guest,
             addr,
             nats_client,
             tracker_sender,
@@ -303,6 +307,7 @@ impl SessionLogic {
             session: self.id,
             user_id: self.user_id.clone(),
             display_name: self.display_name.clone(),
+            is_guest: self.is_guest,
             observer: self.observer,
             instance_id: self.instance_id.clone(),
             is_host: self.is_host,
@@ -356,6 +361,7 @@ impl SessionLogic {
             room: self.room.clone(),
             user_id: self.user_id.clone(),
             display_name: self.display_name.clone(),
+            is_guest: self.is_guest,
             observer: self.observer,
             is_host: self.is_host,
             end_on_host_leave: self.end_on_host_leave,

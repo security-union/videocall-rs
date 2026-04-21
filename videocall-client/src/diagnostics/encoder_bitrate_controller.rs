@@ -457,6 +457,8 @@ impl EncoderBitrateController {
         // Stuck-PID watchdog: if output has been at maximum for too long,
         // force a reset. This breaks the feedback loop where reduced bitrate
         // causes low received FPS which keeps the PID saturated indefinitely.
+        // 0.01 tolerance: PID integrator may asymptotically approach the max
+        // without reaching it exactly due to f64 accumulation rounding.
         if pid_output >= PID_OUTPUT_MAX - 0.01 {
             let saturated_since = *self.pid_saturated_since_ms.get_or_insert(now);
             if now - saturated_since >= PID_STUCK_THRESHOLD_MS {

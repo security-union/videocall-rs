@@ -692,10 +692,10 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
         if let Some(members) = self.room_members.get_mut(&msg.room_id) {
             for (_sid, uid, dname) in members.iter_mut() {
                 if *uid == msg.user_id {
-                    *dname = validated_name;
-                    // Stop after the first match — one update is sufficient even
-                    // if the user has multiple sessions in the room.
-                    break;
+                    // Intentionally update all matching sessions for this user.
+                    // During RTT election/reconnect windows, a user may have
+                    // multiple sessions in the same room concurrently.
+                    *dname = validated_name.clone();
                 }
             }
         }

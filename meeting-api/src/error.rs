@@ -101,6 +101,10 @@ impl AppError {
         Self::new(StatusCode::NOT_FOUND, APIError::not_in_meeting())
     }
 
+    pub fn joining_not_allowed() -> Self {
+        Self::new(StatusCode::FORBIDDEN, APIError::joining_not_allowed())
+    }
+  
     pub fn invalid_display_name(detail: &str) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,

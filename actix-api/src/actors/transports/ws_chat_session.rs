@@ -79,6 +79,8 @@ impl WsChatSession {
         session_manager: SessionManager,
         observer: bool,
         instance_id: Option<String>,
+        is_host: bool,
+        end_on_host_leave: bool,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -92,6 +94,8 @@ impl WsChatSession {
             observer,
             instance_id,
             "websocket",
+            is_host,
+            end_on_host_leave,
         );
 
         let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(WS_OUTBOUND_CHANNEL_CAPACITY);

@@ -33,6 +33,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 
 const WINDOW_DURATION_SEC: u32 = 10;
 const INACTIVE_TIMEOUT_SEC: u32 = 20;
+const AQ_SUMMARY_INTERVAL_MS: f64 = 30_000.0;
 const PID_STUCK_THRESHOLD_MS: f64 = 30_000.0;
 
 /// EncoderControl is responsible for bridging the gap between the encoder and the
@@ -286,6 +287,8 @@ pub struct EncoderBitrateController {
     last_bitrate_ratio: f64,
     /// Last PID target bitrate for external observation.
     last_target_bitrate_kbps: f64,
+    /// Timestamp (ms) of the last AQ_STATUS summary log emission.
+    last_aq_summary_ms: f64,
     /// Timestamp (ms) when PID output first hit PID_OUTPUT_MAX.
     pid_saturated_since_ms: Option<f64>,
 }
@@ -354,6 +357,7 @@ impl EncoderBitrateController {
             last_worst_peer_fps: 0.0,
             last_bitrate_ratio: 0.0,
             last_target_bitrate_kbps: 0.0,
+            last_aq_summary_ms: 0.0,
             pid_saturated_since_ms: None,
         }
     }
@@ -553,6 +557,23 @@ impl EncoderBitrateController {
         self.last_bitrate_ratio = tier_clamped / ideal_for_tier;
         self.last_target_bitrate_kbps = tier_clamped;
 
+        let should_log_summary =
+            tier_changed || (now - self.last_aq_summary_ms >= AQ_SUMMARY_INTERVAL_MS);
+        if should_log_summary {
+            self.last_aq_summary_ms = now;
+            let video_tier = self.quality_manager.current_video_tier();
+            let audio_tier = self.quality_manager.current_audio_tier();
+            log::info!(
+                "AQ_STATUS: video_tier={}({}) audio_tier={}({}) base_bitrate={} corrected_bitrate={:.0} \
+                 fps_ratio={:.2} bitrate_ratio={:.2} peers={}",
+                video_tier.label, self.quality_manager.video_tier_index(),
+                audio_tier.label, self.quality_manager.audio_tier_index(),
+                self.ideal_bitrate_kbps, tier_clamped,
+                self.last_fps_ratio, self.last_bitrate_ratio,
+                self.diagnostic_packets.peer_count(),
+            );
+        }
+
         self.last_correction_time = now;
         Some(tier_clamped)
     }
@@ -660,11 +681,8 @@ impl EncoderBitrateController {
                 self.tier_changed = true;
                 self.pid.reset();
                 log::info!(
-                    "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: screen_sharing)",
-                    old_bitrate,
-                    self.ideal_bitrate_kbps,
-                    new_tier.label,
-                    self.quality_manager.video_tier_index(),
+                    "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: screen_share_coordination)",
+                    old_bitrate, self.ideal_bitrate_kbps, new_tier.label, self.quality_manager.video_tier_index(),
                 );
             }
         } else {

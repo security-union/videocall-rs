@@ -118,7 +118,17 @@ async fn host_admits_guest(pool: &sqlx::PgPool, room_id: &str, guest_email: &str
 }
 
 /// Build a console log upload request for the given meeting and user.
+/// Includes `X-Chunk-Seq: 1` by default to exercise the numbered-filename path.
 fn console_log_request(room_id: &str, user_email: &str) -> axum::http::request::Builder {
+    console_log_request_with_seq(room_id, user_email, "1")
+}
+
+/// Build a console log upload request with an explicit chunk sequence number.
+fn console_log_request_with_seq(
+    room_id: &str,
+    user_email: &str,
+    chunk_seq: &str,
+) -> axum::http::request::Builder {
     request_with_cookie(
         "POST",
         &format!("/api/v1/meetings/{room_id}/console-logs"),
@@ -127,6 +137,7 @@ fn console_log_request(room_id: &str, user_email: &str) -> axum::http::request::
     .header("Content-Type", "text/plain")
     .header("X-User-Id", user_email)
     .header("X-Session-Timestamp", SESSION_TS)
+    .header("X-Chunk-Seq", chunk_seq)
 }
 
 // ── Test: admitted guest can upload console logs ────────────────────────────
@@ -171,7 +182,8 @@ async fn test_guest_participant_can_upload_console_logs() {
                 content, LOG_BODY,
                 "Log file content should match uploaded body"
             );
-            // Verify filename contains the guest's user_id and session timestamp.
+            // Verify filename contains the guest's user_id, session timestamp,
+            // and zero-padded chunk sequence number.
             let name = entry.file_name().unwrap().to_str().unwrap();
             assert!(
                 name.contains("guest-test@videocall.rs"),
@@ -180,6 +192,10 @@ async fn test_guest_participant_can_upload_console_logs() {
             assert!(
                 name.contains(SESSION_TS),
                 "Filename should contain the session timestamp: {name}"
+            );
+            assert!(
+                name.ends_with("_00001.log"),
+                "Filename should end with zero-padded chunk seq _00001.log: {name}"
             );
             found_log = true;
         }
@@ -398,7 +414,7 @@ async fn test_upload_quota_enforced() {
 
     // First upload: ~62 bytes, quota 70 → OK.
     let app = build_app(pool.clone());
-    let req = console_log_request(room_id, QUOTA_GUEST_EMAIL)
+    let req = console_log_request_with_seq(room_id, QUOTA_GUEST_EMAIL, "1")
         .body(Body::from(LOG_BODY))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -406,7 +422,7 @@ async fn test_upload_quota_enforced() {
 
     // Second upload: 62+62=124 > 70 → 429 Too Many Requests.
     let app = build_app(pool.clone());
-    let req = console_log_request(room_id, QUOTA_GUEST_EMAIL)
+    let req = console_log_request_with_seq(room_id, QUOTA_GUEST_EMAIL, "2")
         .body(Body::from(LOG_BODY))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();

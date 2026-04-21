@@ -455,7 +455,20 @@ impl ConnectionManager {
             }
         }
 
-        info!("Created {} connections for testing", self.connections.len());
+        let ws_count = self.connections.keys().filter(|k| k.starts_with("ws_")).count();
+        let wt_count = self.connections.keys().filter(|k| k.starts_with("wt_")).count();
+        info!(
+            "Election candidates: {} WebSocket, {} WebTransport ({} total)",
+            ws_count, wt_count, self.connections.len()
+        );
+        if !self.options.webtransport_urls.is_empty() && wt_count == 0 {
+            warn!(
+                "All {} WebTransport connections failed -- falling back to WebSocket only",
+                self.options.webtransport_urls.len()
+            );
+        } else if self.options.webtransport_urls.is_empty() {
+            info!("No WebTransport URLs offered by server -- WebSocket only");
+        }
 
         // If only one connection was created, we still need to wait for it to be established
         // Don't force immediate election - let the normal process work

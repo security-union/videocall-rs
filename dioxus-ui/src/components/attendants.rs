@@ -26,6 +26,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::PeerList,
     peer_tile::PeerTile,
+    pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
         CameraButton, DensityModeButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
@@ -442,12 +443,12 @@ pub fn AttendantsComponent(
     let mut pinned_peer_id: Signal<Option<String>> = use_signal(|| None);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
-    let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
-    let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
-    let mut end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
-    let mut allow_guests_toggle = use_signal(move || allow_guests);
-    let mut saving = use_signal(|| false);
-    let mut toggle_error = use_signal(|| None::<String>);
+    let waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
+    let end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
+    let allow_guests_toggle = use_signal(move || allow_guests);
+    let saving = use_signal(|| false);
+    let toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
     let mut host_el = use_signal(|| Option::<web_sys::Element>::None);
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
@@ -1201,212 +1202,51 @@ pub fn AttendantsComponent(
         return rsx! {
             div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
-                div {
-                    id: "join-meeting-container",
-                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;",
-
-                    div { style: "text-align: center; color: white; margin-bottom: 2rem;",
-                        h2 { "Ready to join the meeting?" }
-                        p { "Click the button below to join and start listening to others." }
-                        if let Some(err) = connection_error() {
-                            p { style: "color: #ff6b6b; margin-top: 1rem;", "{err}" }
+                div { id: "join-meeting-container", class: "hero-container",
+                    div { class: "floating-element floating-element-1" }
+                    div { class: "floating-element floating-element-2" }
+                    div { class: "floating-element floating-element-3" }
+                    div { class: "hero-content",
+                        PreJoinSettingsCard {
+                            is_owner,
+                            meeting_id: id.clone(),
+                            waiting_room_toggle,
+                            admitted_can_admit_toggle,
+                            end_on_host_leave_toggle,
+                            allow_guests_toggle,
+                            saving,
+                            toggle_error,
+                            connection_error,
+                            on_join: move |_| {
+                                mda.borrow().request();
+                            },
                         }
                     }
-                    if is_owner {
-                        {
-                            let meeting_id_for_toggle = id.clone();
-                            let aca_opacity = if waiting_room_toggle() { "1" } else { "0.5" };
-                            rsx! {
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
-                                    span { style: "font-size: 0.9rem;", "Waiting Room" }
-                                    crate::components::toggle_switch::ToggleSwitch {
-                                        enabled: waiting_room_toggle(),
-                                        disabled: saving(),
-                                        on_toggle: {
-                                            let meeting_id = meeting_id_for_toggle.clone();
-                                            move |new_val: bool| {
-                                                if saving() {
-                                                    return;
-                                                }
-                                                toggle_error.set(None);
-                                                waiting_room_toggle.set(new_val);
-                                                // When disabling waiting room, also disable admitted_can_admit
-                                                if !new_val {
-                                                    admitted_can_admit_toggle.set(false);
-                                                }
-                                                saving.set(true);
-                                                let meeting_id = meeting_id.clone();
-                                                let aca = if new_val { None } else { Some(false) };
-                                                wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, Some(new_val), aca, None, None).await {
-                                                        Ok(updated) => {
-                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
-                                                            admitted_can_admit_toggle.set(updated.admitted_can_admit);
-                                                            saving.set(false);
-                                                        }
-                                                        Err(e) => {
-                                                            log::error!("Failed to update waiting room setting: {e}");
-                                                            waiting_room_toggle.set(!new_val);
-                                                            saving.set(false);
-                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        },
-                                    }
-                                }
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white; opacity: {aca_opacity};",
-                                    span { style: "font-size: 0.9rem;", "Admitted can admit" }
-                                    crate::components::toggle_switch::ToggleSwitch {
-                                        enabled: admitted_can_admit_toggle(),
-                                        disabled: saving() || !waiting_room_toggle(),
-                                        on_toggle: {
-                                            let meeting_id = meeting_id_for_toggle.clone();
-                                            move |new_val: bool| {
-                                                if saving() || !waiting_room_toggle() {
-                                                    return;
-                                                }
-                                                toggle_error.set(None);
-                                                admitted_can_admit_toggle.set(new_val);
-                                                saving.set(true);
-                                                let meeting_id = meeting_id.clone();
-                                                wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, None, Some(new_val), None, None).await {
-                                                        Ok(updated) => {
-                                                            waiting_room_toggle.set(updated.waiting_room_enabled);
-                                                            admitted_can_admit_toggle.set(updated.admitted_can_admit);
-                                                            saving.set(false);
-                                                        }
-                                                        Err(e) => {
-                                                            log::error!("Failed to update admitted_can_admit setting: {e}");
-                                                            admitted_can_admit_toggle.set(!new_val);
-                                                            saving.set(false);
-                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        },
-                                    }
-                                }
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
-                                    span { style: "font-size: 0.9rem;", "End meeting when host leaves" }
-                                    crate::components::toggle_switch::ToggleSwitch {
-                                        enabled: end_on_host_leave_toggle(),
-                                        disabled: saving(),
-                                        on_toggle: {
-                                            let meeting_id = meeting_id_for_toggle.clone();
-                                            move |new_val: bool| {
-                                                if saving() {
-                                                    return;
-                                                }
-                                                toggle_error.set(None);
-                                                end_on_host_leave_toggle.set(new_val);
-                                                saving.set(true);
-                                                let meeting_id = meeting_id.clone();
-                                                let wr = waiting_room_toggle();
-                                                let aca = admitted_can_admit_toggle();
-                                                wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, Some(wr), Some(aca), Some(new_val), None).await {
-                                                        Ok(updated) => {
-                                                            end_on_host_leave_toggle.set(updated.end_on_host_leave);
-                                                            saving.set(false);
-                                                        }
-                                                        Err(e) => {
-                                                            log::error!("Failed to update end_on_host_leave setting: {e}");
-                                                            end_on_host_leave_toggle.set(!new_val);
-                                                            saving.set(false);
-                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        },
-                                    }
-                                }
-                                div { style: "display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.5rem; color: white;",
-                                    span { style: "font-size: 0.9rem;", "Allow guests" }
-                                    crate::components::toggle_switch::ToggleSwitch {
-                                        enabled: allow_guests_toggle(),
-                                        disabled: saving(),
-                                        on_toggle: {
-                                            let meeting_id = meeting_id_for_toggle.clone();
-                                            move |new_val: bool| {
-                                                if saving() {
-                                                    return;
-                                                }
-                                                toggle_error.set(None);
-                                                allow_guests_toggle.set(new_val);
-                                                saving.set(true);
-                                                let meeting_id = meeting_id.clone();
-                                                wasm_bindgen_futures::spawn_local(async move {
-                                                    match crate::meeting_api::update_meeting(&meeting_id, None, None, None, Some(new_val)).await {
-                                                        Ok(updated) => {
-                                                            allow_guests_toggle.set(updated.allow_guests);
-                                                            saving.set(false);
-                                                        }
-                                                        Err(e) => {
-                                                            log::error!("Failed to update allow_guests setting: {e}");
-                                                            allow_guests_toggle.set(!new_val);
-                                                            saving.set(false);
-                                                            toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        },
-                                    }
-                                }
-                                if let Some(err) = toggle_error() {
-                                    p { class: "toggle-error", "{err}" }
-                                }
-                                p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-bottom: 1.5rem; margin-top: -0.75rem;",
-                                    if waiting_room_toggle() {
-                                        "Participants will wait for your approval before joining"
-                                    } else {
-                                        "Participants will join the meeting directly"
-                                    }
-                                }
+                }
+                if show_device_warning() {
+                    div { class: "modal-overlay",
+                        div { class: "modal-window",
+                            h3 { "Device access problem" }
+                            if let Some(err) = mic_error.read().as_ref() {
+                                {render_single_device_error("Microphone", err)}
                             }
-                        }
-                    }
-                    button {
-                        class: "btn-apple btn-primary",
-                        onclick: move |_| {
-                            mda.borrow().request();
-                        },
-                        if is_owner {
-                            "Start Meeting"
-                        } else {
-                            "Join Meeting"
-                        }
-                    }
-                    if show_device_warning() {
-                        div { class: "modal-overlay",
-                            div { class: "modal-window",
-                                h3 { "Device access problem" }
-                                if let Some(err) = mic_error.read().as_ref() {
-                                    {render_single_device_error("Microphone", err)}
-                                }
-                                if let Some(err) = video_error.read().as_ref() {
-                                    {render_single_device_error("Camera", err)}
-                                }
-                                {
-                                    let mut client = client.clone();
-                                    rsx! {
-                                        button {
-                                            class: "btn-apple btn-primary",
-                                            style: "margin-top: 1.5rem;",
-                                            onclick: move |_| {
-                                                show_device_warning.set(false);
-                                                if let Err(e) = client.connect() {
-                                                    error!("Connection failed: {e:?}");
-                                                }
-                                                meeting_joined.set(true);
-                                            },
-                                            "Ok"
-                                        }
+                            if let Some(err) = video_error.read().as_ref() {
+                                {render_single_device_error("Camera", err)}
+                            }
+                            {
+                                let mut client = client.clone();
+                                rsx! {
+                                    button {
+                                        class: "btn-apple btn-primary",
+                                        style: "margin-top: 1.5rem;",
+                                        onclick: move |_| {
+                                            show_device_warning.set(false);
+                                            if let Err(e) = client.connect() {
+                                                error!("Connection failed: {e:?}");
+                                            }
+                                            meeting_joined.set(true);
+                                        },
+                                        "Ok"
                                     }
                                 }
                             }

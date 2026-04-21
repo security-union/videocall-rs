@@ -47,6 +47,7 @@ pub enum MeetingStatus {
         room_token: String,
         waiting_room_enabled: bool,
         admitted_can_admit: bool,
+        end_on_host_leave: bool,
         allow_guests: bool,
     },
     Rejected,
@@ -227,6 +228,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     let determined_host_uid = response.host_user_id.clone();
                                     let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                                     let aca = response.admitted_can_admit.unwrap_or(false);
+                                    let eohl = response.end_on_host_leave.unwrap_or(true);
                                     let ag = response.allow_guests.unwrap_or(false);
                                     host_display_name.set(determined_host.clone());
                                     host_user_id.set(determined_host_uid.clone());
@@ -240,6 +242,7 @@ pub fn MeetingPage(id: String) -> Element {
                                                     room_token: token,
                                                     waiting_room_enabled: wr_enabled,
                                                     admitted_can_admit: aca,
+                                                    end_on_host_leave: eohl,
                                                     allow_guests: ag,
                                                 });
                                             } else {
@@ -267,6 +270,11 @@ pub fn MeetingPage(id: String) -> Element {
                                             response.status
                                         ))),
                                     }
+                                }
+                                Err(JoinError::JoiningNotAllowed) => {
+                                    meeting_status.set(MeetingStatus::Error(
+                                        "The host has left and no one can admit new participants. New participants cannot join this meeting.".to_string(),
+                                    ));
                                 }
                                 Err(JoinError::NotAuthenticated) => {
                                     handle_not_authenticated(&meeting_id).await;
@@ -358,6 +366,7 @@ pub fn MeetingPage(id: String) -> Element {
                         });
                         let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
                         let aca = response.admitted_can_admit.unwrap_or(false);
+                        let eohl = response.end_on_host_leave.unwrap_or(true);
                         let ag = response.allow_guests.unwrap_or(false);
                         host_display_name.set(determined_host.clone());
                         host_user_id.set(determined_host_uid.clone());
@@ -372,6 +381,7 @@ pub fn MeetingPage(id: String) -> Element {
                                         room_token: token,
                                         waiting_room_enabled: wr_enabled,
                                         admitted_can_admit: aca,
+                                        end_on_host_leave: eohl,
                                         allow_guests: ag,
                                     });
                                 } else {
@@ -415,6 +425,12 @@ pub fn MeetingPage(id: String) -> Element {
                             observer_token: String::new(),
                         });
                     }
+                    Err(JoinError::JoiningNotAllowed) => {
+                        observer_token_signal.set(None);
+                        meeting_status.set(MeetingStatus::Error(
+                            "The host has left and no one can admit new participants. New participants cannot join this meeting.".to_string(),
+                        ));
+                    }
                     Err(JoinError::NotAuthenticated) => {
                         observer_token_signal.set(None);
                         handle_not_authenticated(&meeting_id).await;
@@ -435,6 +451,7 @@ pub fn MeetingPage(id: String) -> Element {
             let determined_host_uid = status.host_user_id.clone();
             let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
             let aca = status.admitted_can_admit.unwrap_or(false);
+            let eohl = status.end_on_host_leave.unwrap_or(true);
             let ag = status.allow_guests.unwrap_or(false);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
@@ -447,6 +464,7 @@ pub fn MeetingPage(id: String) -> Element {
                 room_token: token,
                 waiting_room_enabled: wr_enabled,
                 admitted_can_admit: aca,
+                end_on_host_leave: eohl,
                 allow_guests: ag,
             });
         }
@@ -493,7 +511,7 @@ pub fn MeetingPage(id: String) -> Element {
     rsx! {
         match (&maybe_username, &current_meeting_status) {
             // User is admitted - show the meeting
-            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled, admitted_can_admit, allow_guests }) => rsx! {
+            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled, admitted_can_admit, allow_guests, end_on_host_leave }) => rsx! {
                 AttendantsComponent {
                     display_name: username.clone(),
                     id: id.clone(),
@@ -510,6 +528,7 @@ pub fn MeetingPage(id: String) -> Element {
                     room_token: room_token.clone(),
                     waiting_room_enabled: *waiting_room_enabled,
                     admitted_can_admit: *admitted_can_admit,
+                    end_on_host_leave: *end_on_host_leave,
                     allow_guests: *allow_guests,
                 }
             },

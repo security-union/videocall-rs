@@ -379,6 +379,7 @@ pub fn AttendantsComponent(
     #[props(default)] room_token: String,
     #[props(default = true)] waiting_room_enabled: bool,
     #[props(default)] admitted_can_admit: bool,
+    #[props(default = true)] end_on_host_leave: bool,
     #[props(default = false)] allow_guests: bool,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
@@ -442,11 +443,12 @@ pub fn AttendantsComponent(
     let mut pinned_peer_id: Signal<Option<String>> = use_signal(|| None);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
-    let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
-    let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
-    let mut allow_guests_toggle = use_signal(move || allow_guests);
-    let mut saving = use_signal(|| false);
-    let mut toggle_error = use_signal(|| None::<String>);
+    let waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
+    let end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
+    let allow_guests_toggle = use_signal(move || allow_guests);
+    let saving = use_signal(|| false);
+    let toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
     let mut host_el = use_signal(|| Option::<web_sys::Element>::None);
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
@@ -1069,7 +1071,9 @@ pub fn AttendantsComponent(
         display_peers.sort_by(|a, b| {
             let ts_a = speech_map.get(a).copied().unwrap_or(0.0);
             let ts_b = speech_map.get(b).copied().unwrap_or(0.0);
-            ts_b.partial_cmp(&ts_a).unwrap_or(std::cmp::Ordering::Equal)
+            ts_b.partial_cmp(&ts_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
         });
     }
     let peers_for_display: Vec<String> = display_peers
@@ -1208,6 +1212,7 @@ pub fn AttendantsComponent(
                             meeting_id: id.clone(),
                             waiting_room_toggle,
                             admitted_can_admit_toggle,
+                            end_on_host_leave_toggle,
                             allow_guests_toggle,
                             saving,
                             toggle_error,

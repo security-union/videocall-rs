@@ -25,6 +25,7 @@ pub fn PreJoinSettingsCard(
     meeting_id: String,
     waiting_room_toggle: Signal<bool>,
     admitted_can_admit_toggle: Signal<bool>,
+    end_on_host_leave_toggle: Signal<bool>,
     allow_guests_toggle: Signal<bool>,
     saving: Signal<bool>,
     toggle_error: Signal<Option<String>>,
@@ -32,13 +33,14 @@ pub fn PreJoinSettingsCard(
     on_join: EventHandler<()>,
 ) -> Element {
     // Helper to update a meeting setting with rollback on error.
-    // All three toggle signals are captured by value (Signal is Copy) so the
+    // All toggle signals are captured by value (Signal is Copy) so the
     // async block can update whichever fields the server returns.
     let update_setting = use_hook(|| {
         Rc::new(
             move |meeting_id: String,
                   waiting_room: Option<bool>,
                   admitted_can_admit: Option<bool>,
+                  end_on_host_leave_opt: Option<bool>,
                   allow_guests_opt: Option<bool>,
                   mut rollback_signal: Signal<bool>,
                   old_val: bool,
@@ -51,6 +53,7 @@ pub fn PreJoinSettingsCard(
                         &meeting_id,
                         waiting_room,
                         admitted_can_admit,
+                        end_on_host_leave_opt,
                         allow_guests_opt,
                     )
                     .await
@@ -58,6 +61,7 @@ pub fn PreJoinSettingsCard(
                         Ok(updated) => {
                             waiting_room_toggle.set(updated.waiting_room_enabled);
                             admitted_can_admit_toggle.set(updated.admitted_can_admit);
+                            end_on_host_leave_toggle.set(updated.end_on_host_leave);
                             allow_guests_toggle.set(updated.allow_guests);
                             saving.set(false);
                         }
@@ -137,6 +141,7 @@ pub fn PreJoinSettingsCard(
                                                 Some(new_val),
                                                 aca,
                                                 None,
+                                                None,
                                                 waiting_room_toggle,
                                                 old_val,
                                                 saving,
@@ -187,7 +192,57 @@ pub fn PreJoinSettingsCard(
                                                 None,
                                                 Some(new_val),
                                                 None,
+                                                None,
                                                 admitted_can_admit_toggle,
+                                                old_val,
+                                                saving,
+                                                toggle_error,
+                                            );
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                        div { class: "settings-option-row",
+                            span { class: "settings-option-label", "End meeting when host leaves" }
+                            div { class: "settings-option-controls",
+                                span {
+                                    class: "settings-info-icon",
+                                    title: "Automatically end the meeting for all participants when the host disconnects",
+                                    svg {
+                                        xmlns: "http://www.w3.org/2000/svg",
+                                        width: "15",
+                                        height: "15",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        circle { cx: "12", cy: "12", r: "10" }
+                                        line { x1: "12", y1: "16", x2: "12", y2: "12" }
+                                        line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
+                                    }
+                                }
+                                crate::components::toggle_switch::ToggleSwitch {
+                                    enabled: end_on_host_leave_toggle(),
+                                    disabled: saving(),
+                                    on_toggle: {
+                                        let meeting_id = meeting_id_for_toggle.clone();
+                                        let update_setting = update_setting.clone();
+                                        move |new_val: bool| {
+                                            if saving() {
+                                                return;
+                                            }
+                                            let old_val = !new_val;
+                                            end_on_host_leave_toggle.set(new_val);
+                                            update_setting(
+                                                meeting_id.clone(),
+                                                None,
+                                                None,
+                                                Some(new_val),
+                                                None,
+                                                end_on_host_leave_toggle,
                                                 old_val,
                                                 saving,
                                                 toggle_error,
@@ -232,6 +287,7 @@ pub fn PreJoinSettingsCard(
                                             allow_guests_toggle.set(new_val);
                                             update_setting(
                                                 meeting_id.clone(),
+                                                None,
                                                 None,
                                                 None,
                                                 Some(new_val),

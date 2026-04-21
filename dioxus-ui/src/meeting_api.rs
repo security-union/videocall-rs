@@ -75,11 +75,13 @@ pub async fn update_meeting(
     meeting_id: &str,
     waiting_room_enabled: Option<bool>,
     admitted_can_admit: Option<bool>,
+    end_on_host_leave: Option<bool>,
     allow_guests: Option<bool>,
 ) -> Result<MeetingInfo, JoinError> {
     let req = videocall_meeting_types::requests::UpdateMeetingRequest {
         waiting_room_enabled,
         admitted_can_admit,
+        end_on_host_leave,
         allow_guests,
     };
     client()?.update_meeting(meeting_id, &req).await
@@ -138,6 +140,7 @@ pub async fn create_meeting(
         waiting_room_enabled: Some(true),
         admitted_can_admit: Some(false),
         allow_guests: Some(allow_guests),
+        end_on_host_leave: None,
     };
     client()?.create_meeting(&req).await
 }

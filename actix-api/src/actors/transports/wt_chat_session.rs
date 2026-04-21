@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::DATAGRAM_MAX_SIZE;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
-use crate::constants::CLIENT_TIMEOUT;
+use crate::constants::{CLIENT_TIMEOUT, WT_OUTBOUND_CHANNEL_CAPACITY};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL};
@@ -121,6 +121,8 @@ impl WtChatSession {
         session_manager: SessionManager,
         observer: bool,
         instance_id: Option<String>,
+        is_host: bool,
+        end_on_host_leave: bool,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -134,6 +136,8 @@ impl WtChatSession {
             observer,
             instance_id,
             "webtransport",
+            is_host,
+            end_on_host_leave,
         );
 
         WtChatSession {
@@ -218,10 +222,9 @@ impl WtChatSession {
     /// Start heartbeat check (WebTransport-specific timing)
     fn start_heartbeat(&self, ctx: &mut Context<Self>) {
         ctx.run_interval(WT_HEARTBEAT_INTERVAL, |act, ctx| {
-            // Sample outbound queue depth for Prometheus (capacity 256)
-            let depth = 256 - act.outbound_tx.capacity();
+            let depth = WT_OUTBOUND_CHANNEL_CAPACITY - act.outbound_tx.capacity();
             RELAY_OUTBOUND_QUEUE_DEPTH
-                .with_label_values(&[&act.logic.room])
+                .with_label_values(&[&act.logic.room, "webtransport"])
                 .set(depth as f64);
 
             // Check if connection is dead (channel closed)

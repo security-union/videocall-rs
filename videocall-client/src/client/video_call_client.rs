@@ -1454,6 +1454,7 @@ impl Inner {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
                             let display_name = if meeting_packet.display_name.is_empty() {
+                                warn!("PARTICIPANT_JOINED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
                                 target_str.clone()
                             } else {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()
@@ -1520,6 +1521,7 @@ impl Inner {
                                 info!("Peer left: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_left {
                                     let display_name = if meeting_packet.display_name.is_empty() {
+                                        warn!("PARTICIPANT_LEFT: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
                                         target_str.clone()
                                     } else {
                                         String::from_utf8_lossy(&meeting_packet.display_name)
@@ -1579,6 +1581,7 @@ impl Inner {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
                             let new_display_name = if meeting_packet.display_name.is_empty() {
+                                warn!("DISPLAY_NAME_CHANGED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
                                 target_str.clone()
                             } else {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()

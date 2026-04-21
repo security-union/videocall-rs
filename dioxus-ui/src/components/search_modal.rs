@@ -35,6 +35,12 @@ struct SearchV2Hits {
 
 #[derive(Deserialize, Debug)]
 struct SearchV2Hit {
+    // The ES / SearchV2 payload names this key `_source` (leading underscore).
+    // Serde maps the Rust identifier `_source` to that JSON key by default,
+    // but we spell out the rename so the association is obvious to readers
+    // and so a future refactor that renames the field (e.g. to `source`) is
+    // forced to also move the rename attribute.
+    #[serde(rename = "_source")]
     _source: SearchV2Source,
 }
 
@@ -81,6 +87,36 @@ struct SearchV2DocObject {
     host_display_name_camel: Option<String>,
 }
 
+/// Escape every Lucene `query_string` metacharacter with a leading backslash
+/// so the caller-supplied `q` is interpreted as literal text inside the
+/// `*{escaped}*` wildcard wrapper instead of as Lucene syntax.
+///
+/// Without this, characters like `:`, `(`, `)`, `*`, `?`, `"`, `\`, `/`,
+/// `&`, `|` would either make SearchV2 return HTTP 400 (broken query),
+/// let a caller escape the wildcard wrapper to probe exact/negation
+/// matches inside their own ACL scope, or hand an attacker a cheap way
+/// to run expensive Lucene queries (DoS-ish).
+///
+/// We escape the single `&` and `|` characters as well so the multi-char
+/// Boolean operators `&&` / `||` can never form — cheaper than a proper
+/// tokeniser and equally safe for this use case.
+///
+/// Reference: Lucene Classic Query Parser "Escaping Special Characters".
+fn escape_lucene_query_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' | '+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']' | '^' | '"' | '~' | '*'
+            | '?' | ':' | '/' | '&' | '|' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Query SearchV2 middleware directly.
 ///
 /// **App scope.**  Meetings live in the CC product's `cs-cc-meetings` content
@@ -96,14 +132,27 @@ struct SearchV2DocObject {
 /// unauthenticated and SearchV2 falls back to its anonymous filter; typical
 /// UX is that no meetings are returned, and [`crate::components::search_modal`]
 /// then transparently falls back to the Postgres path.
+///
+/// **Injection safety.**  `q` is escaped via [`escape_lucene_query_string`]
+/// before interpolation so Lucene metachars (`:`, `(`, `*`, `\`, etc.) in
+/// user input cannot change the query's semantics or break out of the
+/// `*{q}*` wildcard wrapper.
 async fn search_v2(base_url: &str, q: &str) -> Result<Vec<SearchResult>, String> {
     let url = format!("{}/mysearch", base_url.trim_end_matches('/'));
+
+    // Escape Lucene metachars in the caller's input so the wildcard wrapper
+    // cannot be broken out of and so characters like `:` don't change the
+    // semantics of the query (e.g. turning `room:foo` into a field-scoped
+    // match).  The ACL filter on the middleware side still enforces access
+    // control regardless, but a broken query returns HTTP 400 and a
+    // field-scoped escape would confuse the UI result set.
+    let escaped_q = escape_lucene_query_string(q);
 
     let body = serde_json::json!({
         "query": {
             "must": [{
                 "query_string": {
-                    "query": format!("*{}*", q),
+                    "query": format!("*{}*", escaped_q),
                     // Search both CC-canonical fields and the documentObject
                     // fallback so hits keep working across the shape transition.
                     "fields": [
@@ -384,5 +433,58 @@ pub fn SearchModal() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lucene_escape_passes_through_plain_text() {
+        assert_eq!(escape_lucene_query_string("standup"), "standup");
+        assert_eq!(
+            escape_lucene_query_string("weekly review 2025"),
+            "weekly review 2025"
+        );
+    }
+
+    #[test]
+    fn lucene_escape_escapes_every_metacharacter() {
+        // Each of these single characters must come out backslash-prefixed.
+        for ch in [
+            '\\', '+', '-', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '/',
+            '&', '|',
+        ] {
+            let escaped = escape_lucene_query_string(&ch.to_string());
+            assert_eq!(
+                escaped,
+                format!("\\{ch}"),
+                "metacharacter {ch:?} was not escaped"
+            );
+        }
+    }
+
+    #[test]
+    fn lucene_escape_prevents_wildcard_breakout() {
+        // A user query of `*) OR (*` used to break out of the `*{q}*` wrap
+        // and turn the query into a Boolean expression.  After escaping it
+        // must stay literal.
+        let escaped = escape_lucene_query_string("*) OR (*");
+        assert_eq!(escaped, r"\*\) OR \(\*");
+    }
+
+    #[test]
+    fn lucene_escape_neutralises_and_or_operators() {
+        // `&&` / `||` are multi-char Lucene operators; escaping the single
+        // `&` and `|` prevents the pair from forming.
+        assert_eq!(escape_lucene_query_string("a && b"), r"a \&\& b");
+        assert_eq!(escape_lucene_query_string("a || b"), r"a \|\| b");
+    }
+
+    #[test]
+    fn lucene_escape_blocks_field_scoped_injection() {
+        // `state:active` would become a field-scoped match if unescaped.
+        assert_eq!(escape_lucene_query_string("state:active"), r"state\:active");
     }
 }

@@ -13,6 +13,7 @@
 
 //! Handlers for meeting CRUD endpoints.
 
+use crate::search;
 use argon2::PasswordHasher;
 use axum::{
     extract::{Path, Query, State},
@@ -20,7 +21,6 @@ use axum::{
     Json,
 };
 use rand::Rng;
-use crate::search;
 use videocall_meeting_types::{
     requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
     responses::{

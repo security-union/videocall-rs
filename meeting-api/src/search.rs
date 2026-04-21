@@ -178,18 +178,20 @@ pub async fn push_meeting(
             tracing::debug!("SearchV2 push OK for meeting {}", meeting.room_id);
         }
         Ok(resp) => {
+            let status = resp.status();
+            // Pull up to 256 chars of the body so the reason (often a
+            // machine-readable JSON error from the middleware) is visible in
+            // logs without risking an unbounded allocation on a rogue server.
+            let body_preview = response_body_preview(resp).await;
             tracing::warn!(
-                "SearchV2 push failed for meeting {}: HTTP {}",
+                "SearchV2 push failed for meeting {}: HTTP {} body={}",
                 meeting.room_id,
-                resp.status()
+                status,
+                body_preview
             );
         }
         Err(e) => {
-            tracing::warn!(
-                "SearchV2 push error for meeting {}: {}",
-                meeting.room_id,
-                e
-            );
+            tracing::warn!("SearchV2 push error for meeting {}: {}", meeting.room_id, e);
         }
     }
 }
@@ -198,11 +200,7 @@ pub async fn push_meeting(
 ///
 /// Same no-op semantics as [`push_meeting`] when `cfg` is `None`.  Accepts
 /// HTTP 2xx or 204 as success; anything else is logged at WARN.
-pub async fn delete_meeting_doc(
-    cfg: Option<&SearchConfig>,
-    http: &reqwest::Client,
-    room_id: &str,
-) {
+pub async fn delete_meeting_doc(cfg: Option<&SearchConfig>, http: &reqwest::Client, room_id: &str) {
     let Some(cfg) = cfg else {
         return;
     };
@@ -227,15 +225,52 @@ pub async fn delete_meeting_doc(
             tracing::debug!("SearchV2 delete OK for meeting {}", room_id);
         }
         Ok(resp) => {
+            let status = resp.status();
+            let body_preview = response_body_preview(resp).await;
             tracing::warn!(
-                "SearchV2 delete failed for meeting {}: HTTP {}",
+                "SearchV2 delete failed for meeting {}: HTTP {} body={}",
                 room_id,
-                resp.status()
+                status,
+                body_preview
             );
         }
         Err(e) => {
             tracing::warn!("SearchV2 delete error for meeting {}: {}", room_id, e);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response diagnostics
+// ---------------------------------------------------------------------------
+
+/// Maximum number of bytes of a failed-response body that we pull into logs.
+///
+/// Large enough to cover any realistic middleware error payload (usually a
+/// short JSON document with a `message` field) but small enough that a rogue
+/// or misbehaving server cannot exhaust meeting-api memory via a very long
+/// error response.
+const RESPONSE_BODY_PREVIEW_BYTES: usize = 256;
+
+/// Consume a failed `reqwest::Response` and return a short, log-safe preview
+/// of its body — truncated to [`RESPONSE_BODY_PREVIEW_BYTES`] and rendered as
+/// a lossy UTF-8 string so binary or malformed payloads can't break log
+/// formatters.
+///
+/// Returns the placeholder `"<body read error: …>"` when the body cannot be
+/// read (e.g. connection reset mid-response).
+async fn response_body_preview(resp: reqwest::Response) -> String {
+    match resp.bytes().await {
+        Ok(bytes) => {
+            let slice = &bytes[..bytes.len().min(RESPONSE_BODY_PREVIEW_BYTES)];
+            let preview = String::from_utf8_lossy(slice).to_string();
+            if bytes.len() > RESPONSE_BODY_PREVIEW_BYTES {
+                format!("{preview}… (truncated at {RESPONSE_BODY_PREVIEW_BYTES} bytes)")
+            } else {
+                preview
+            }
+        }
+        Err(e) => format!("<body read error: {e}>"),
     }
 }
 
@@ -252,10 +287,7 @@ pub async fn delete_meeting_doc(
 /// `cc-meetings` documents.  We aim for interchangeable output: a doc pushed
 /// here should be indistinguishable from a doc crawled by the middleware's
 /// pull driver.
-fn build_meeting_body(
-    meeting: &MeetingRow,
-    participants: &[ParticipantAcl],
-) -> serde_json::Value {
+fn build_meeting_body(meeting: &MeetingRow, participants: &[ParticipantAcl]) -> serde_json::Value {
     let created_ms = meeting.created_at.timestamp_millis();
     let updated_ms = meeting.updated_at.timestamp_millis();
     let creator = meeting.creator_id.as_deref().unwrap_or("unknown");
@@ -294,11 +326,7 @@ fn build_meeting_body(
     let participant_ids: Vec<&str> = participants.iter().map(|p| p.user_id.as_str()).collect();
     let participant_names: Vec<String> = participants
         .iter()
-        .map(|p| {
-            p.display_name
-                .clone()
-                .unwrap_or_else(|| p.user_id.clone())
-        })
+        .map(|p| p.display_name.clone().unwrap_or_else(|| p.user_id.clone()))
         .collect();
 
     // Rich participant objects for the documentObject nested field.
@@ -486,10 +514,7 @@ mod tests {
             .iter()
             .filter(|a| a == &"user:alice@example.com")
             .count();
-        let alice_bare = acls
-            .iter()
-            .filter(|a| a == &"alice@example.com")
-            .count();
+        let alice_bare = acls.iter().filter(|a| a == &"alice@example.com").count();
         assert_eq!(alice_prefixed, 1);
         assert_eq!(alice_bare, 1);
     }

@@ -168,8 +168,7 @@ pub async fn join_meeting(
         // Atomically check waiting_room_enabled and insert participant in one
         // transaction, using FOR UPDATE to serialize against concurrent toggles.
         let (auto_admitted, row, wr_enabled) =
-            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name)
-            .await?;
+            db_participants::join_attendee(&state.db, meeting.id, &user_id, display_name).await?;
         search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
         let token = if auto_admitted {

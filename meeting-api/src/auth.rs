@@ -126,14 +126,20 @@ impl FromRequestParts<AppState> for AuthUser {
         // silently impersonating an anonymous user.
         // ----------------------------------------------------------------
         if state.allow_anonymous {
-            let user_id = format!("anon-{:08x}", hash_remote_addr(parts));
+            // 64-bit hex so two anon sessions are extremely unlikely to
+            // collide even under adversarial input (unlike the prior 32-bit
+            // encoding that would be trivially collidable).
+            let user_id = format!("anon-{:016x}", hash_remote_addr(parts));
             return Ok(AuthUser {
                 user_id,
                 name: "Anonymous".to_string(),
             });
         }
 
-        Err(AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))
+        Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            APIError::unauthorized(),
+        ))
     }
 }
 
@@ -141,23 +147,42 @@ impl FromRequestParts<AppState> for AuthUser {
 // Anonymous identity helpers
 // ---------------------------------------------------------------------------
 
-/// Derive a stable-ish hash from the connecting address so the same browser
-/// session gets a consistent anonymous `user_id`.  Falls back to `0` when the
-/// remote address is unavailable (e.g. Unix socket).
-fn hash_remote_addr(parts: &Parts) -> u32 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // Use X-Forwarded-For if present, otherwise use the connect info extension.
-    if let Some(forwarded) = parts
-        .headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        forwarded.hash(&mut hasher);
-    } else if let Some(addr) = parts.extensions.get::<std::net::SocketAddr>() {
+/// Per-process random key for the anonymous-identity hasher.  [`RandomState`]
+/// is a SipHash-1-3-based `BuildHasher` seeded from the OS random source at
+/// first use, so it produces stable hashes within a process lifetime but is
+/// not predictable across processes or from the outside — preventing an
+/// attacker from deliberately crafting colliding inputs once the flag is set.
+///
+/// We intentionally key the hasher once per process instead of per request so
+/// the same client reconnecting during the same deployment keeps the same
+/// `anon-<hex>` identity.  The key is regenerated on every restart.
+static ANON_HASHER: std::sync::LazyLock<std::collections::hash_map::RandomState> =
+    std::sync::LazyLock::new(std::collections::hash_map::RandomState::new);
+
+/// Derive a stable hash from the connecting address so the same browser
+/// session gets a consistent anonymous `user_id` for the lifetime of this
+/// process.  Returns `0` when the remote address is unavailable (e.g. Unix
+/// socket or tests without a `ConnectInfo` extension).
+///
+/// ## Trust model
+///
+/// We deliberately **do not** consult `X-Forwarded-For` / `X-Real-IP`.
+/// `ALLOW_ANONYMOUS` is a local-development feature and should never be
+/// enabled in a deployment that terminates client connections behind a proxy
+/// — but if it ever is (misconfiguration), an attacker could trivially set
+/// `X-Forwarded-For: <victim-ip>` to impersonate any anon identity.  Reading
+/// only the socket-level peer address keeps the spoofing surface zero: the
+/// request must actually come from the claimed address.
+///
+/// The hasher is keyed per-process via [`ANON_HASHER`] so the 64-bit digest is
+/// not predictable from outside even when the input (IP address) is.
+fn hash_remote_addr(parts: &Parts) -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut hasher = ANON_HASHER.build_hasher();
+    if let Some(addr) = parts.extensions.get::<std::net::SocketAddr>() {
         addr.ip().hash(&mut hasher);
     }
-    hasher.finish() as u32
+    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +429,9 @@ mod tests {
         // closed off and missing credentials must return 401.
         let mut state = make_test_state();
         state.allow_anonymous = false;
-        let err = extract_with_cookie_and_state(None, &state).await.unwrap_err();
+        let err = extract_with_cookie_and_state(None, &state)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 

@@ -241,12 +241,14 @@
           // 2xx: saved. 409: chunk already exists (prior upload succeeded).
           return;
         }
+        // Use originals.error (unwrapped) to avoid recursion — this bypasses the collector.
         originals.error.call(console,
           "CONSOLE_LOG_COLLECTOR: upload failed (" + resp.status + "), " + entryCount + " entries dropped"
         );
       })
       .catch(function (err) {
         uploadInFlight = false;
+        // Use originals.error (unwrapped) to avoid recursion — this bypasses the collector.
         originals.error.call(console,
           "CONSOLE_LOG_COLLECTOR: upload network error, " + entryCount + " entries dropped:", err
         );

@@ -76,6 +76,8 @@ fn generate_instance_id() -> String {
     )
 }
 
+const MAX_SESSION_ID_HISTORY: usize = 16;
+
 /// Configuration options for creating a [`VideoCallClient`].
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
@@ -194,7 +196,8 @@ struct Inner {
     /// All session_ids assigned to this client instance (current page load).
     /// Survives reconnects/re-elections. Used to match CONGESTION signals that
     /// target a previous session_id from before re-election completed.
-    session_id_history: std::collections::HashSet<u64>,
+    /// Bounded to MAX_SESSION_ID_HISTORY to prevent unbounded growth.
+    session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so we deduplicate by (event_type, target_user_id) within a
@@ -332,7 +335,7 @@ impl VideoCallClient {
                     last_known_server: None,
                 },
                 own_session_id: None,
-                session_id_history: std::collections::HashSet::new(),
+                session_id_history: std::collections::VecDeque::new(),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -1397,7 +1400,12 @@ impl Inner {
                     response.session_id
                 );
                 self.own_session_id = Some(response.session_id);
-                self.session_id_history.insert(response.session_id);
+                if !self.session_id_history.contains(&response.session_id) {
+                    if self.session_id_history.len() >= MAX_SESSION_ID_HISTORY {
+                        self.session_id_history.pop_front();
+                    }
+                    self.session_id_history.push_back(response.session_id);
+                }
 
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {

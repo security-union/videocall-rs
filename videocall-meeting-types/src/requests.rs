@@ -47,6 +47,11 @@ pub struct CreateMeetingRequest {
     /// on the server when omitted.
     #[serde(default)]
     pub end_on_host_leave: Option<bool>,
+
+    /// Whether guests (non-authenticated users) are allowed to join. Defaults
+    /// to `false` on the server when omitted.
+    #[serde(default)]
+    pub allow_guests: Option<bool>,
 }
 
 /// Request body for `PATCH /api/v1/meetings/{meeting_id}`.
@@ -63,6 +68,10 @@ pub struct UpdateMeetingRequest {
     /// Toggle whether the meeting ends for all when the host leaves.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_on_host_leave: Option<bool>,
+
+    /// Toggle guest access on or off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_guests: Option<bool>,
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/join`.
@@ -71,6 +80,16 @@ pub struct JoinMeetingRequest {
     /// Display name shown in the meeting UI.
     #[serde(default)]
     pub display_name: Option<String>,
+}
+
+/// Request body for `POST /api/v1/meetings/{meeting_id}/join-guest`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GuestJoinRequest {
+    /// Display name shown in the meeting UI. Must be provided by the caller.
+    pub display_name: String,
+    /// Optional stable guest identifier persisted in the client's sessionStorage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_session_id: Option<String>,
 }
 
 /// Request body for `PUT /api/v1/meetings/{meeting_id}/display-name`.

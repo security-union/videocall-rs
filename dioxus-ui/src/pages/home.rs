@@ -26,22 +26,14 @@ use crate::context::{
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
     DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
 };
+use crate::meeting_api::create_meeting;
 use crate::routing::Route;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
-use web_time::SystemTime;
 
 const TEXT_INPUT_CLASSES: &str = "input-apple";
-
-fn generate_meeting_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    format!("{millis:x}")
-}
 
 #[component]
 pub fn Home() -> Element {
@@ -73,6 +65,9 @@ pub fn Home() -> Element {
 
     // Dropdown toggle for auth menu
     let mut show_dropdown = use_signal(|| false);
+
+    let mut create_error = use_signal(|| None::<String>);
+    let mut creating = use_signal(|| false);
 
     // Fetch user profile when OAuth is enabled.
     //
@@ -328,29 +323,46 @@ pub fn Home() -> Element {
                                 }
                             }
                             div { class: "mt-2",
+                                if let Some(err) = create_error() {
+                                    p {
+                                        class: "text-sm mt-2 ml-1",
+                                        style: "color: #ff6b6b;",
+                                        "{err}"
+                                    }
+                                }
                                 button {
                                     r#type: "button",
                                     class: {
                                         let has_meeting_id = !meeting_id_value().is_empty();
                                         if has_meeting_id {
-                                            "btn-apple btn-secondary w-full flex items-center justify-center gap-2"
+                                            "btn-apple btn-secondary w-full flex items-center justify-center gap-2 mt-2"
                                         } else {
-                                            "btn-apple btn-primary w-full flex items-center justify-center gap-2"
+                                            "btn-apple btn-primary w-full flex items-center justify-center gap-2 mt-2"
                                         }
                                     },
+                                    disabled: creating(),
                                     onclick: move |_| {
                                         username_error.set(None);
+                                        create_error.set(None);
                                         let username = username_value();
                                         match validate_display_name(&username) {
                                             Ok(valid_name) => {
-                                                let meeting_id = generate_meeting_id();
                                                 username_value.set(valid_name.clone());
                                                 save_display_name_to_storage(&valid_name);
                                                 (display_name_ctx.0).set(Some(valid_name.clone()));
+                                                creating.set(true);
 
                                                 spawn(async move {
-                                                    gloo_timers::future::TimeoutFuture::new(0).await;
-                                                    navigator.push(Route::Meeting { id: meeting_id });
+                                                    match create_meeting(None, false).await {
+                                                        Ok(response) => {
+                                                            creating.set(false);
+                                                            navigator.push(Route::Meeting { id: response.meeting_id });
+                                                        }
+                                                        Err(e) => {
+                                                            creating.set(false);
+                                                            create_error.set(Some(format!("Failed to create meeting: {e}")));
+                                                        }
+                                                    }
                                                 });
                                             }
                                             Err(message) => {
@@ -358,7 +370,12 @@ pub fn Home() -> Element {
                                             }
                                         }
                                     },
-                                    span { class: "text-lg", "Create a New Meeting ID" }
+                                    if creating() {
+                                        span { class: "loading-spinner", style: "width: 18px; height: 18px;" }
+                                        span { class: "text-lg", "Creating..." }
+                                    } else {
+                                        span { class: "text-lg", "Create a New Meeting" }
+                                    }
                                 }
                             }
                         }

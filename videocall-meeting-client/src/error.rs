@@ -37,6 +37,10 @@ pub enum ApiError {
     /// The host has left and joining is no longer allowed (HTTP 403, code JOINING_NOT_ALLOWED).
     #[error("The host has left and no one can admit new participants. New participants cannot join this meeting.")]
     JoiningNotAllowed,
+    /// The meeting does not permit guest (unauthenticated) participants
+    /// (HTTP 403, code GUESTS_NOT_ALLOWED).
+    #[error("Guests are not allowed in this meeting. The meeting host must enable guest access.")]
+    GuestsNotAllowed,
 
     /// A server error with status code and body.
     #[error("Server error ({status}): {body}")]

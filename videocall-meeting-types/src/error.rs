@@ -78,6 +78,14 @@ impl APIError {
         }
     }
 
+    pub fn invalid_input(detail: &str) -> Self {
+        Self {
+            code: "INVALID_INPUT".to_string(),
+            message: detail.to_string(),
+            engineering_error: None,
+        }
+    }
+
     pub fn meeting_not_found(meeting_id: &str) -> Self {
         Self {
             code: "MEETING_NOT_FOUND".to_string(),
@@ -147,6 +155,14 @@ impl APIError {
             code: "INTERNAL_ERROR".to_string(),
             message: "Internal server error".to_string(),
             engineering_error: Some(detail.to_string()),
+        }
+    }
+
+    pub fn guests_not_allowed() -> Self {
+        Self {
+            code: "GUESTS_NOT_ALLOWED".to_string(),
+            message: "Unable to join this meeting as a guest.".to_string(),
+            engineering_error: None,
         }
     }
 }

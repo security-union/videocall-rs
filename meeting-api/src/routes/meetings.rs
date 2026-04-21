@@ -24,7 +24,7 @@ use videocall_meeting_types::{
     requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
     responses::{
         APIResponse, CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
-        MeetingInfoResponse, MeetingSummary,
+        MeetingGuestInfoResponse, MeetingInfoResponse, MeetingSummary,
     },
 };
 
@@ -102,6 +102,7 @@ pub async fn create_meeting(
     let waiting_room_enabled = body.waiting_room_enabled.unwrap_or(true);
     let admitted_can_admit = body.admitted_can_admit.unwrap_or(false);
     let end_on_host_leave = body.end_on_host_leave.unwrap_or(true);
+    let allow_guests = body.allow_guests.unwrap_or(false);
 
     let row = db_meetings::create_with_options(
         &state.db,
@@ -112,6 +113,7 @@ pub async fn create_meeting(
         waiting_room_enabled,
         admitted_can_admit,
         end_on_host_leave,
+        allow_guests,
     )
     .await
     .map_err(|e| match e {
@@ -131,6 +133,7 @@ pub async fn create_meeting(
         waiting_room_enabled: row.waiting_room_enabled,
         admitted_can_admit: row.admitted_can_admit,
         end_on_host_leave: row.end_on_host_leave,
+        allow_guests: row.allow_guests,
     };
 
     Ok((StatusCode::CREATED, Json(APIResponse::ok(response))))
@@ -166,6 +169,7 @@ pub async fn list_meetings(
             waiting_room_enabled: row.waiting_room_enabled,
             admitted_can_admit: row.admitted_can_admit,
             end_on_host_leave: row.end_on_host_leave,
+            allow_guests: row.allow_guests,
         });
     }
 
@@ -208,6 +212,7 @@ pub async fn get_meeting(
         started_at: row.started_at.timestamp_millis(),
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
+        allow_guests: row.allow_guests,
     })))
 }
 
@@ -270,6 +275,7 @@ pub async fn end_meeting_handler(
             started_at: meeting.started_at.timestamp_millis(),
             ended_at: meeting.ended_at.map(|t| t.timestamp_millis()),
             your_status,
+            allow_guests: meeting.allow_guests,
         })));
     }
 
@@ -300,6 +306,7 @@ pub async fn end_meeting_handler(
         started_at: row.started_at.timestamp_millis(),
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
+        allow_guests: row.allow_guests,
     })))
 }
 
@@ -313,6 +320,7 @@ pub async fn update_meeting(
     let row = if body.waiting_room_enabled.is_some()
         || body.admitted_can_admit.is_some()
         || body.end_on_host_leave.is_some()
+        || body.allow_guests.is_some()
     {
         // Atomically update both settings within a single transaction.
         // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
@@ -324,6 +332,7 @@ pub async fn update_meeting(
             body.waiting_room_enabled,
             body.admitted_can_admit,
             body.end_on_host_leave,
+            body.allow_guests,
         )
         .await?
         {
@@ -369,6 +378,29 @@ pub async fn update_meeting(
         started_at: row.started_at.timestamp_millis(),
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
+        allow_guests: row.allow_guests,
+    })))
+}
+
+/// GET /api/v1/meetings/{meeting_id}/guest-info
+///
+/// Public (no authentication required). Returns whether guests are allowed
+/// to join this meeting. Used by the frontend to decide whether to redirect
+/// an unauthenticated user to the guest join page.
+///
+/// NOTE: intentionally returns `{ allow_guests: false }` for both missing and
+/// guest-disabled meetings rather than a 404, to prevent meeting enumeration
+/// by unauthenticated callers.
+pub async fn get_meeting_guest_info(
+    State(state): State<AppState>,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<APIResponse<MeetingGuestInfoResponse>>, AppError> {
+    let allow_guests = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
+        Some(row) => row.allow_guests,
+        None => false,
+    };
+    Ok(Json(APIResponse::ok(MeetingGuestInfoResponse {
+        allow_guests,
     })))
 }
 

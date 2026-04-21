@@ -95,6 +95,11 @@ impl FromRequestParts<AppState> for AuthUser {
                         )
                     })?;
 
+                if user_id.starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX) {
+                    tracing::warn!("rejected bearer token with reserved guest: prefix user_id");
+                    return Err(AppError::unauthorized_msg("invalid bearer token"));
+                }
+
                 return Ok(AuthUser { user_id, name });
             }
             // No Bearer token — fall through to session cookie path below.
@@ -110,6 +115,14 @@ impl FromRequestParts<AppState> for AuthUser {
             .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
 
         let claims = token::decode_session_token(&state.jwt_secret, &token)?;
+
+        if claims
+            .sub
+            .starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX)
+        {
+            tracing::warn!("rejected session token with reserved guest: prefix user_id");
+            return Err(AppError::unauthorized_msg("invalid session token"));
+        }
 
         Ok(AuthUser {
             user_id: claims.sub,
@@ -160,6 +173,35 @@ fn extract_session_token(parts: &Parts, cookie_name: &str) -> Option<String> {
     }
     // 2. Fall back to `Authorization: Bearer <token>`.
     extract_bearer_token(parts)
+}
+
+/// Extractor for a guest waiting in the lobby. Authenticates via the
+/// `Authorization: Bearer <observer_token>` header (a signed observer JWT).
+#[derive(Debug)]
+pub struct GuestObserver {
+    pub user_id: String,
+    pub meeting_id: String,
+    pub display_name: String,
+}
+
+impl FromRequestParts<AppState> for GuestObserver {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_bearer_token(parts)
+            .ok_or_else(|| AppError::unauthorized_msg("missing Authorization: Bearer header"))?;
+
+        let claims = token::decode_guest_token(&state.jwt_secret, &token)?;
+
+        Ok(GuestObserver {
+            user_id: claims.sub,
+            meeting_id: claims.room,
+            display_name: claims.display_name,
+        })
+    }
 }
 
 #[cfg(test)]

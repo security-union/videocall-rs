@@ -284,6 +284,9 @@ pub struct Peer {
     pub is_speaking: bool,
     pub audio_level: f32,
     pub display_name: Option<String>,
+    /// Server-vouched guest indicator, sourced from the authenticated JWT
+    /// `is_guest` claim and broadcast on `PARTICIPANT_JOINED`.
+    pub is_guest: bool,
     /// Whether this peer's video/screen tiles are currently visible in the
     /// viewport (tracked via IntersectionObserver in the UI layer). When
     /// `false`, video and screen decoding is skipped to save CPU. Audio is
@@ -318,6 +321,7 @@ impl Peer {
         user_id: String,
         aes: Option<Aes128State>,
         vad_threshold: Option<f32>,
+        is_guest: bool,
     ) -> Result<Self, JsValue> {
         let sid_str = session_id.to_string();
         let (mut audio, video, screen) =
@@ -344,6 +348,7 @@ impl Peer {
             is_speaking: false,
             audio_level: 0.0,
             display_name: None,
+            is_guest,
             visible: true,
             context_initialized: false,
             vad_threshold,
@@ -782,6 +787,11 @@ pub struct PeerDecodeManager {
     /// creates a peer later (after the first media packet arrives), the display
     /// name is immediately available and does not fall back to user_id/email.
     display_name_cache: HashMap<u64, String>,
+    /// Cache of session_id -> is_guest, populated from PARTICIPANT_JOINED events.
+    /// Mirrors `display_name_cache` so a guest flag arriving before the peer
+    /// entry is created (via `ensure_peer()`) is still applied once the first
+    /// media packet brings the peer online.
+    is_guest_cache: HashMap<u64, bool>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -806,6 +816,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            is_guest_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -821,6 +832,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            is_guest_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -1045,6 +1057,11 @@ impl PeerDecodeManager {
     ) -> Result<(), JsValue> {
         let sid_str = session_id.to_string();
         debug!("Adding peer {user_id} with session_id {sid_str}");
+        let cached_is_guest = self
+            .is_guest_cache
+            .get(&session_id)
+            .copied()
+            .unwrap_or(false);
         let mut peer = Peer::new(
             self.get_video_canvas_id.emit(sid_str.clone()),
             self.get_screen_canvas_id.emit(sid_str),
@@ -1052,6 +1069,7 @@ impl PeerDecodeManager {
             user_id.to_owned(),
             aes,
             self.vad_threshold,
+            cached_is_guest,
         )?;
         // Apply cached display name if PARTICIPANT_JOINED arrived before
         // the first media packet created this peer entry.
@@ -1072,6 +1090,7 @@ impl PeerDecodeManager {
                 diag.remove_peer(&peer.sid_str);
             }
             self.display_name_cache.remove(&session_id);
+            self.is_guest_cache.remove(&session_id);
             self.on_peer_removed.emit(peer.sid_str);
         }
     }
@@ -1091,6 +1110,7 @@ impl PeerDecodeManager {
         // Clear the display name cache so stale names don't persist
         // across reconnections.
         self.display_name_cache.clear();
+        self.is_guest_cache.clear();
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
@@ -1183,6 +1203,24 @@ impl PeerDecodeManager {
         self.connected_peers
             .get(&sid)
             .and_then(|peer| peer.display_name.clone())
+    }
+
+    /// Get the server-vouched guest status for a peer by session_id string.
+    pub fn get_peer_is_guest(&self, session_id_str: &str) -> Option<bool> {
+        let sid: u64 = session_id_str.parse().ok()?;
+        if let Some(peer) = self.connected_peers.get(&sid) {
+            return Some(peer.is_guest);
+        }
+        self.is_guest_cache.get(&sid).copied()
+    }
+
+    /// Set the server-vouched guest status for a peer identified by
+    /// session_id.
+    pub fn set_peer_is_guest(&mut self, session_id: u64, is_guest: bool) {
+        self.is_guest_cache.insert(session_id, is_guest);
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            peer.is_guest = is_guest;
+        }
     }
 
     pub fn is_peer_speaking(&self, key: &str) -> bool {

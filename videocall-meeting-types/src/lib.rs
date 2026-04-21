@@ -25,3 +25,4 @@ pub mod token;
 pub use error::APIError;
 pub use responses::APIResponse;
 pub use token::RoomAccessTokenClaims;
+pub use token::GUEST_USER_ID_PREFIX;

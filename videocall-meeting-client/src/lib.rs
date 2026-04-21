@@ -153,7 +153,11 @@ pub(crate) async fn parse_api_response<T: serde::de::DeserializeOwned + serde::S
         401 => Err(ApiError::NotAuthenticated),
         403 => {
             let text = response.text().await.unwrap_or_default();
-            Err(ApiError::Forbidden(text))
+            if text.contains("GUESTS_NOT_ALLOWED") {
+                Err(ApiError::GuestsNotAllowed)
+            } else {
+                Err(ApiError::Forbidden(text))
+            }
         }
         404 => {
             let text = response.text().await.unwrap_or_default();

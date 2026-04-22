@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::costume_renderer::CostumeRenderer;
 use crate::ekg_renderer::EkgRenderer;
 use crate::video_encoder::VideoEncoderBuilder;
 use image::{ImageBuffer, Rgb};
@@ -41,7 +42,7 @@ pub struct VideoProducer {
 impl VideoProducer {
     /// Create a video producer that renders EKG frames on-the-fly.
     ///
-    /// No pre-generation needed — each frame is rendered from RMS data
+    /// No pre-generation needed -- each frame is rendered from RMS data
     /// directly in the video loop (~0.5ms per frame vs ~5ms for VP9 encode).
     pub fn from_ekg(
         user_id: String,
@@ -68,6 +69,42 @@ impl VideoProducer {
                 loop_duration,
             ) {
                 error!("Video producer error: {}", e);
+            }
+        });
+
+        Ok(VideoProducer {
+            user_id,
+            quit,
+            handle: Some(handle),
+        })
+    }
+
+    /// Create a video producer that renders costume sprite sheet frames.
+    ///
+    /// Reads pre-rendered I420 frames from the CostumeRenderer at 30fps.
+    pub fn from_costume(
+        user_id: String,
+        renderer: CostumeRenderer,
+        packet_sender: Sender<Vec<u8>>,
+        media_start: Instant,
+        loop_duration: Duration,
+        is_speaking: Arc<AtomicBool>,
+    ) -> anyhow::Result<Self> {
+        let quit = Arc::new(AtomicBool::new(false));
+        let quit_clone = quit.clone();
+        let user_id_clone = user_id.clone();
+
+        let handle = thread::spawn(move || {
+            if let Err(e) = Self::costume_video_loop(
+                user_id_clone,
+                renderer,
+                packet_sender,
+                quit_clone,
+                media_start,
+                loop_duration,
+                is_speaking,
+            ) {
+                error!("Costume video producer error: {}", e);
             }
         });
 
@@ -209,6 +246,158 @@ impl VideoProducer {
                 } else {
                     trace!(
                         "Sent VP9 frame {} ({} bytes, {}) for {}",
+                        global_sequence,
+                        frame.data.len(),
+                        if frame.key { "key" } else { "delta" },
+                        user_id
+                    );
+                }
+            }
+
+            global_sequence += 1;
+
+            // Sleep until next frame deadline (microsecond precision)
+            let next_frame_us = (frame_in_loop as u64 + 1) * frame_interval_us;
+            let sleep_target_us = if next_frame_us >= loop_duration_us {
+                loop_duration_us
+            } else {
+                next_frame_us
+            };
+            let loop_base_us = elapsed_us - position_in_loop_us;
+            let absolute_target =
+                media_start + Duration::from_micros(loop_base_us + sleep_target_us);
+            let now = Instant::now();
+            if now < absolute_target {
+                thread::sleep(absolute_target - now);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn costume_video_loop(
+        user_id: String,
+        renderer: CostumeRenderer,
+        packet_sender: Sender<Vec<u8>>,
+        quit: Arc<AtomicBool>,
+        media_start: Instant,
+        loop_duration: Duration,
+        is_speaking: Arc<AtomicBool>,
+    ) -> anyhow::Result<()> {
+        let width = renderer.width();
+        let height = renderer.height();
+        let framerate = 30u32;
+        let frame_interval_us: u64 = 1_000_000 / framerate as u64; // 33333us
+
+        info!(
+            "Costume video producer started for {} ({}x{} @ {}fps)",
+            user_id, width, height, framerate
+        );
+
+        let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
+            .set_resolution(width, height)
+            .build()?;
+        video_encoder.update_bitrate_kbps(1000)?;
+
+        let loop_duration_us = loop_duration.as_micros() as u64;
+        if loop_duration_us == 0 {
+            warn!(
+                "Costume video producer for {} has zero loop duration, exiting",
+                user_id
+            );
+            return Ok(());
+        }
+        let mut prev_frame_index: Option<usize> = None;
+        let mut global_sequence: u64 = 0;
+        let user_id_bytes = user_id.clone().into_bytes();
+
+        loop {
+            if quit.load(Ordering::Relaxed) {
+                info!("Costume video producer stopping for {}", user_id);
+                break;
+            }
+
+            let elapsed_us = media_start.elapsed().as_micros() as u64;
+            let position_in_loop_us = elapsed_us % loop_duration_us;
+            let frame_in_loop = (position_in_loop_us / frame_interval_us) as usize;
+
+            // Force keyframe at loop wrap, first frame, or every 5 seconds
+            let at_loop_wrap = match prev_frame_index {
+                Some(prev) => frame_in_loop < prev,
+                None => true,
+            };
+            let periodic_keyframe = global_sequence.is_multiple_of(framerate as u64 * 5);
+            let force_keyframe = at_loop_wrap || periodic_keyframe;
+            prev_frame_index = Some(frame_in_loop);
+
+            if global_sequence.is_multiple_of(framerate as u64 * 5) {
+                let loop_num = elapsed_us / loop_duration_us;
+                info!(
+                    "[{}] costume seq={}, frame={}, loop={}, pos={:.1}s/{:.1}s{}",
+                    user_id,
+                    global_sequence,
+                    frame_in_loop,
+                    loop_num,
+                    position_in_loop_us as f64 / 1_000_000.0,
+                    loop_duration_us as f64 / 1_000_000.0,
+                    if force_keyframe { " KEYFRAME" } else { "" }
+                );
+            }
+
+            // Read I420 frame directly from costume renderer
+            let speaking = is_speaking.load(Ordering::Relaxed);
+            let rms_value = if speaking { 0.1 } else { 0.0 };
+            let i420_data = renderer.frame_i420(rms_value, frame_in_loop);
+
+            // Encode to VP9
+            let frames_result = if force_keyframe {
+                info!(
+                    "Forcing keyframe for {} (costume seq={})",
+                    user_id, global_sequence
+                );
+                video_encoder.encode_keyframe(global_sequence as i64, i420_data)?
+            } else {
+                video_encoder.encode(global_sequence as i64, i420_data)?
+            };
+
+            for frame in frames_result {
+                let media_packet = MediaPacket {
+                    media_type: MediaType::VIDEO.into(),
+                    data: frame.data.to_vec(),
+                    user_id: user_id_bytes.clone(),
+                    frame_type: if frame.key { "key" } else { "delta" }.to_string(),
+                    timestamp: get_timestamp_ms(),
+                    duration: (1000.0 / framerate as f64),
+                    video_metadata: Some(VideoMetadata {
+                        sequence: global_sequence,
+                        codec: VideoCodec::VP9_PROFILE0_LEVEL10_8BIT.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                };
+
+                let packet_wrapper = PacketWrapper {
+                    packet_type: PacketType::MEDIA.into(),
+                    user_id: user_id_bytes.clone(),
+                    data: media_packet.write_to_bytes()?,
+                    ..Default::default()
+                };
+
+                let packet_data = packet_wrapper.write_to_bytes()?;
+                if let Err(_e) = packet_sender.try_send(packet_data) {
+                    static COSTUME_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+                    let count = COSTUME_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count % 100 == 1 {
+                        warn!(
+                            "Dropped costume video packets due to full send channel (total: {})",
+                            count,
+                        );
+                    }
+                } else {
+                    trace!(
+                        "Sent costume VP9 frame {} ({} bytes, {}) for {}",
                         global_sequence,
                         frame.data.len(),
                         if frame.key { "key" } else { "delta" },

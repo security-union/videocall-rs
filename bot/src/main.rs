@@ -18,6 +18,7 @@
 
 mod audio_producer;
 mod config;
+mod costume_renderer;
 mod ekg_renderer;
 mod health_reporter;
 mod inbound_stats;
@@ -29,11 +30,13 @@ mod websocket_client;
 mod webtransport_client;
 
 use audio_producer::AudioProducer;
-use config::{BotConfig, ClientConfig, Manifest, Transport};
+use config::{BotConfig, ClientConfig, Manifest, Transport, VideoMode};
+use costume_renderer::CostumeRenderer;
 use ekg_renderer::EkgRenderer;
 use health_reporter::{spawn_health_reporter, HealthReporterConfig};
 use inbound_stats::InboundStats;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -54,9 +57,15 @@ async fn main() -> anyhow::Result<()> {
 
     let (config, num_users) = BotConfig::from_args()?;
     info!(
-        "Transport: {:?}, JWT auth: {}",
-        config.transport,
-        config.jwt_secret.is_some()
+        "Config: ws_url={:?}, wt_url={:?}, wt_ratio={:?}, video_mode={:?}, \
+         warmup={}s, broadcasters={}, JWT auth={}",
+        config.ws_url,
+        config.wt_url,
+        config.wt_ratio,
+        config.video_mode,
+        config.warmup_secs(),
+        config.broadcasters(),
+        config.jwt_secret.is_some(),
     );
 
     // Load conversation manifest
@@ -82,24 +91,43 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| p.name.as_str())
         .collect();
 
+    // Determine broadcaster/observer split
+    let broadcaster_count = config.broadcasters();
+    let broadcaster_names: HashSet<&str> = if broadcaster_count == 0 {
+        // 0 means all broadcast
+        active_names.clone()
+    } else {
+        active_participants
+            .iter()
+            .take(broadcaster_count)
+            .map(|p| p.name.as_str())
+            .collect()
+    };
+
     info!(
-        "Active participants ({}): {}",
+        "Active participants ({}): {} | Broadcasters ({}): {}",
         n,
         active_participants
             .iter()
             .map(|p| p.name.as_str())
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        broadcaster_names.len(),
+        broadcaster_names
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", "),
     );
 
-    // Filter lines to active speakers only
+    // Filter lines to broadcaster speakers only (observers have no audio lines)
     let active_lines: Vec<&config::Line> = manifest
         .lines
         .iter()
-        .filter(|l| active_names.contains(l.speaker.as_str()))
+        .filter(|l| broadcaster_names.contains(l.speaker.as_str()))
         .collect();
     info!(
-        "Active lines: {} of {} total",
+        "Active lines: {} of {} total (broadcaster speakers only)",
         active_lines.len(),
         manifest.lines.len()
     );
@@ -111,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|line| load_wav_samples(&format!("{conv_dir}/{}", line.audio_file)))
         .collect::<Result<_, _>>()?;
 
-    // Stitch per-participant audio
+    // Stitch per-participant audio (plain conversation audio, no warmup padding)
     let pause_samples = (manifest.pause_ms as usize * 48000) / 1000;
     let mut participant_audio: HashMap<String, Vec<f32>> = HashMap::new();
     let mut total_samples: usize = 0;
@@ -144,8 +172,11 @@ async fn main() -> anyhow::Result<()> {
         n
     );
 
+    // Media start via OnceCell -- set AFTER all bots are spawned + warmup sleep
+    let media_start_cell: Arc<tokio::sync::OnceCell<Instant>> =
+        Arc::new(tokio::sync::OnceCell::new());
+
     // Spawn clients
-    let shared_media_start = Instant::now();
     let ramp_up_delay = Duration::from_millis(config.ramp_up_delay_ms.unwrap_or(1000));
     let insecure = config.insecure.unwrap_or(false);
 
@@ -157,20 +188,24 @@ async fn main() -> anyhow::Result<()> {
 
     for (index, p) in active_participants.iter().enumerate() {
         let audio_data = participant_audio.remove(&p.name).unwrap();
+        let is_broadcaster = broadcaster_names.contains(p.name.as_str());
 
         info!(
-            "Starting client {} ({}) - audio: {} samples",
+            "Starting client {} ({}) - audio: {} samples, broadcaster: {}",
             index,
             p.name,
             audio_data.len(),
+            is_broadcaster,
         );
 
         let bot_config = config.clone();
         let user_id = p.name.clone();
         let meeting_id = config.meeting_id.clone();
         let ekg_color = p.ekg_color;
-        let media_start = shared_media_start;
+        let costume_dir = p.costume_dir.clone();
+        let cell = media_start_cell.clone();
         let ld = loop_duration;
+        let total_bots = n;
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_client(
@@ -179,9 +214,13 @@ async fn main() -> anyhow::Result<()> {
                 meeting_id,
                 audio_data,
                 ekg_color,
+                costume_dir,
                 insecure,
-                media_start,
+                cell,
                 ld,
+                index,
+                total_bots,
+                is_broadcaster,
             )
             .await
             {
@@ -200,7 +239,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("All {} clients started, waiting for Ctrl+C", n);
+    // All bots spawned -- wait warmup then start media
+    let warmup = config.warmup_secs();
+    info!(
+        "All {} clients spawned, waiting {}s warmup before starting media",
+        n, warmup
+    );
+    time::sleep(Duration::from_secs(warmup)).await;
+
+    let now = Instant::now();
+    let _ = media_start_cell.set(now);
+    info!("Media start signal sent at {:?}", now);
+
+    info!("All {} clients running, waiting for Ctrl+C", n);
 
     for handle in client_handles {
         let _ = handle.await;
@@ -217,20 +268,37 @@ async fn run_client(
     meeting_id: String,
     audio_data: Vec<f32>,
     ekg_color: [u8; 3],
+    costume_dir: Option<String>,
     insecure: bool,
-    media_start: Instant,
+    media_start_cell: Arc<tokio::sync::OnceCell<Instant>>,
     loop_duration: Duration,
+    bot_index: usize,
+    total_bots: usize,
+    is_broadcaster: bool,
 ) -> anyhow::Result<()> {
-    info!("Initializing client: {}", user_id);
+    info!(
+        "Initializing client: {} (broadcaster={})",
+        user_id, is_broadcaster
+    );
+
+    // Resolve transport for this bot
+    let (resolved_transport, server_url) = bot_config.resolve_transport(bot_index, total_bots)?;
 
     let client_config = ClientConfig {
         user_id: user_id.clone(),
         meeting_id,
-        enable_audio: true,
-        enable_video: true,
+        enable_audio: is_broadcaster,
+        enable_video: is_broadcaster,
     };
 
-    let lobby_url = TransportClient::build_lobby_url(&bot_config, &client_config)?;
+    let lobby_url = TransportClient::build_lobby_url(
+        &resolved_transport,
+        &server_url,
+        bot_config.jwt_secret.as_deref(),
+        &client_config.user_id,
+        &client_config.meeting_id,
+        bot_config.token_ttl_secs(),
+    )?;
     // Redact JWT token from log output
     let display_url = lobby_url
         .as_str()
@@ -238,7 +306,9 @@ async fn run_client(
         .next()
         .unwrap_or(lobby_url.as_str());
     info!(
-        "Lobby URL: {}{}",
+        "[{}] Transport: {:?}, Lobby URL: {}{}",
+        user_id,
+        resolved_transport,
         display_url,
         if lobby_url.query().is_some() {
             "?token=<redacted>"
@@ -247,12 +317,17 @@ async fn run_client(
         }
     );
 
-    // Shared inbound stats — used by both the transport's inbound consumer
+    // Shared inbound stats -- used by both the transport's inbound consumer
     // and the health reporter for per-sender packet rate tracking.
     let stats = Arc::new(Mutex::new(InboundStats::default()));
 
-    let mut client = TransportClient::new(&bot_config.transport, client_config.clone());
-    client.connect(&lobby_url, insecure, stats.clone()).await?;
+    // Shared is_speaking flag -- audio producer sets, heartbeat/video reads
+    let is_speaking = Arc::new(AtomicBool::new(false));
+
+    let mut client = TransportClient::new(&resolved_transport, client_config.clone());
+    client
+        .connect(&lobby_url, insecure, stats.clone(), is_speaking.clone())
+        .await?;
 
     // Create packet channel for media + heartbeat + health producers
     let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(500);
@@ -262,17 +337,18 @@ async fn run_client(
 
     // For WebSocket transport, heartbeats go through the shared mpsc channel
     let quit = Arc::new(AtomicBool::new(false));
-    if matches!(bot_config.transport, Transport::WebSocket) {
+    if matches!(resolved_transport, Transport::WebSocket) {
         spawn_heartbeat_producer(
             client_config.user_id.clone(),
             client_config.enable_audio,
             client_config.enable_video,
             packet_tx.clone(),
             quit.clone(),
+            is_speaking.clone(),
         );
     }
 
-    // Spawn health reporter — sends HealthPacket every 1s so senders can
+    // Spawn health reporter -- sends HealthPacket every 1s so senders can
     // observe this bot's received FPS and adjust their encoding tiers.
     let server_url_display = lobby_url
         .as_str()
@@ -283,7 +359,7 @@ async fn run_client(
     spawn_health_reporter(
         HealthReporterConfig {
             client_config: client_config.clone(),
-            transport: bot_config.transport.clone(),
+            transport: resolved_transport.clone(),
             server_url: server_url_display,
         },
         stats,
@@ -291,31 +367,86 @@ async fn run_client(
         quit.clone(),
     );
 
-    // Compute RMS for EKG video from stitched audio
-    let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, 15);
-    let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
-    let renderer = EkgRenderer::new(ekg_color, 1280, 720);
+    // Wait for media start signal from main
+    let media_start = loop {
+        if let Some(t) = media_start_cell.get() {
+            break *t;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    info!("[{}] Media start received, beginning producers", user_id);
 
-    // Start media producers
-    let audio_producer = AudioProducer::new(
-        user_id.clone(),
-        audio_data,
-        packet_tx.clone(),
-        media_start,
-        loop_duration,
-    )?;
-    info!("Audio producer started for {}", user_id);
+    // Only spawn media producers for broadcasters
+    let _audio_producer;
+    let _video_producer;
 
-    let video_producer = VideoProducer::from_ekg(
-        user_id.clone(),
-        renderer,
-        rms,
-        max_rms,
-        packet_tx.clone(),
-        media_start,
-        loop_duration,
-    )?;
-    info!("Video producer started for {}", user_id);
+    if is_broadcaster {
+        // Start audio producer
+        _audio_producer = Some(AudioProducer::new(
+            user_id.clone(),
+            audio_data.clone(),
+            packet_tx.clone(),
+            media_start,
+            loop_duration,
+            is_speaking.clone(),
+        )?);
+        info!("Audio producer started for {}", user_id);
+
+        // Start video producer
+        let video_mode = &bot_config.video_mode;
+        if *video_mode == VideoMode::Costume {
+            if let Some(ref dir) = costume_dir {
+                let renderer = CostumeRenderer::load(Path::new(dir))?;
+                _video_producer = Some(VideoProducer::from_costume(
+                    user_id.clone(),
+                    renderer,
+                    packet_tx.clone(),
+                    media_start,
+                    loop_duration,
+                    is_speaking.clone(),
+                )?);
+                info!("Costume video producer started for {} ({})", user_id, dir);
+            } else {
+                // Costume mode but no costume_dir -- fall back to EKG
+                warn!(
+                    "[{}] video_mode=costume but no costume_dir set, falling back to EKG",
+                    user_id
+                );
+                let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, 15);
+                let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
+                let renderer = EkgRenderer::new(ekg_color, 1280, 720);
+                _video_producer = Some(VideoProducer::from_ekg(
+                    user_id.clone(),
+                    renderer,
+                    rms,
+                    max_rms,
+                    packet_tx.clone(),
+                    media_start,
+                    loop_duration,
+                )?);
+                info!("EKG video producer started for {} (fallback)", user_id);
+            }
+        } else {
+            // EKG mode
+            let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, 15);
+            let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
+            let renderer = EkgRenderer::new(ekg_color, 1280, 720);
+            _video_producer = Some(VideoProducer::from_ekg(
+                user_id.clone(),
+                renderer,
+                rms,
+                max_rms,
+                packet_tx.clone(),
+                media_start,
+                loop_duration,
+            )?);
+            info!("EKG video producer started for {}", user_id);
+        }
+    } else {
+        _audio_producer = None::<AudioProducer>;
+        _video_producer = None::<VideoProducer>;
+        info!("[{}] Observer mode -- no media producers", user_id);
+    }
 
     info!("Client {} running", user_id);
 
@@ -326,8 +457,8 @@ async fn run_client(
 
     quit.store(true, Ordering::Relaxed);
     client.stop().await;
-    drop(audio_producer);
-    drop(video_producer);
+    drop(_audio_producer);
+    drop(_video_producer);
 
     info!("Client {} shut down cleanly", user_id);
     Ok(())

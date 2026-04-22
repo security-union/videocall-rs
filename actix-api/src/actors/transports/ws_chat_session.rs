@@ -233,18 +233,13 @@ impl Handler<Message> for WsChatSession {
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "websocket", "channel_full"])
                     .inc();
-                // Parse sender session_id and user_id only on drops (not on
-                // every packet) to avoid a protobuf parse + heap alloc on the
-                // hot path.
-                let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
-                let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
-                let sender_user_id = parsed
-                    .as_ref()
-                    .map(|pw| pw.user_id.clone())
-                    .unwrap_or_default();
-                if sender_session_id != 0 {
-                    self.logic
-                        .on_outbound_drop(sender_session_id, &sender_user_id);
+                // Parse sender session_id only on drops (not on every packet)
+                // to avoid a protobuf parse + heap alloc on the hot path.
+                if let Ok(pw) = PacketWrapper::parse_from_bytes(&msg.msg) {
+                    let sender_session_id = pw.session_id;
+                    if sender_session_id != 0 {
+                        self.logic.on_outbound_drop(sender_session_id, &pw.user_id);
+                    }
                 }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {

@@ -77,10 +77,10 @@ Each costume pair is ~800 MiB of I420 frames (gitignored). Save the raw MP4s (~2
 ### 3. Configure
 
 ```yaml
-# Dual transport with ratio (recommended)
+# Transport — set one or both URLs
 ws_url: "wss://websocket.example.com"
 wt_url: "https://webtransport.example.com:443"
-wt_ratio: 0.66                    # 66% WT, 34% WS (0.0 = all WS)
+wt_ratio: 0.0                     # fraction on WebTransport (0.0–1.0, see note below)
 
 # Or legacy single-transport
 # transport: "websocket"
@@ -95,6 +95,13 @@ ramp_up_delay_ms: 500
 jwt_secret: "your-base64-secret"
 token_ttl_secs: 86400
 ```
+
+> **WebTransport limitation:** Bot WT clients currently send data but **do not receive
+> inbound streams** due to a known `accept_uni` issue in the quinn-based WT client.
+> This means WT bots don't generate relay fan-out load on the receiving side, making
+> load test results inaccurate. **Use `wt_ratio: 0.0` (all WebSocket) for load testing**
+> until the WT inbound path is fixed. Set `wt_ratio` > 0 only for testing WT
+> connectivity and outbound encoding.
 
 ### 4. Build & Run
 

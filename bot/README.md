@@ -1,18 +1,19 @@
 # Videocall Synthetic Client Bot
 
-Synthetic bot that streams real VP9 video and Opus audio to videocall-rs meetings over WebSocket or WebTransport. Simulates up to 20 participants in a scripted conversation with synchronized EKG waveform video. Useful for load testing, scale validation, and call quality measurement.
+Synthetic bot that streams real VP9 video and Opus audio to videocall-rs meetings over WebSocket or WebTransport. Simulates up to 50 participants with costume video (recorded Google Meet costume filter clips) or EKG waveforms. Supports broadcaster/observer split for webinar-style load testing.
 
 ## Features
 
-- **Dynamic N-participant mode**: generate once for 20 people, `--users N` at runtime
-- **Dual transport**: WebSocket (`wss://`) and WebTransport (`https://`)
-- **On-the-fly EKG video**: 1280x720 waveform rendered per-frame in Rust (< 1ms), no pre-generation
-- **Real VP9 encoding**: libvpx at 15fps with forced keyframes at loop restart and every 5s
-- **Opus audio**: 48kHz mono, 20ms packets (50fps), monotonic sequence numbers
-- **Microsecond A/V sync**: shared `Instant` clock with µs precision prevents progressive drift
-- **RX quality diagnostics**: per-sender jitter, sequence gaps, A/V sync delta every 10s
+- **Costume video**: pre-recorded video clips (idle + talking) driven by audio RMS, VP9 at 30fps/1000kbps — realistic webcam-like compression load
+- **EKG fallback**: animated waveform video for participants without costumes, 15fps/500kbps
+- **DTX silence suppression**: silent audio packets are skipped, matching real client behavior
+- **VAD heartbeat**: `is_speaking` flag updated from audio energy, reflected in heartbeats
+- **Rich health packets**: quality scores, concealment stats, decoder metrics — visible in Prometheus/Grafana
+- **Dual transport**: `ws_url` + `wt_url` with configurable `wt_ratio` split (0.0–1.0)
+- **Broadcaster/observer mode**: first N participants send A/V, rest are receive-only observers
+- **Warmup period**: configurable silence before conversation starts (one-time, no gap on loop)
+- **50-participant manifest**: 20 named characters + 30 observer slots
 - **JWT authentication**: mints per-client JWTs when `jwt_secret` is configured
-- **Loop boundary recovery**: forces VP9 keyframes at loop restart so video recovers instantly
 
 ## Prerequisites
 
@@ -49,34 +50,65 @@ Produces:
 
 The conversation text and participant list are in `generate-conversation-edge.py` — edit to customize.
 
-### 2. Configure
+### 2. Create costume video clips (optional)
 
-Copy the template and fill in your server details:
+For realistic video load, record costume clips using Google Meet's "Background and effects" costume filters:
 
-```bash
-cp config.yaml.template config-myenv.yaml
-```
+1. Join a Google Meet call alone, apply a costume filter (pirate, cat, robot, etc.)
+2. Record two clips per character using OBS or screen capture (crop to just the video tile):
+   - `<name>-silent.mp4` — 8-10 seconds, no talking, natural idle movement
+   - `<name>-talking.mp4` — 8-10 seconds, counting "one, two, three..." with mouth movement
+3. Normalize to I420 frames:
+   ```bash
+   mkdir -p assets/costumes/pirate
+   ffmpeg -y -i pirate-silent.mp4 -vf "scale=1280:720,fps=30" -pix_fmt yuv420p -f rawvideo assets/costumes/pirate/idle.i420
+   ffmpeg -y -i pirate-talking.mp4 -vf "scale=1280:720,fps=30" -pix_fmt yuv420p -f rawvideo assets/costumes/pirate/talking.i420
+   ```
+4. Assign costumes to participants in `conversation/manifest.yaml`:
+   ```yaml
+   - name: alice
+     voice: en-US-AvaNeural
+     ekg_color: [0, 200, 220]
+     costume_dir: assets/costumes/pirate
+   ```
+
+Each costume pair is ~800 MiB of I420 frames (gitignored). Save the raw MP4s (~2 MB each) for regeneration. The I420 files can always be recreated from the MP4s with the ffmpeg command above.
+
+### 3. Configure
 
 ```yaml
-transport: "websocket"                          # or "webtransport"
-server_url: "wss://websocket.example.com"       # wss:// for WS, https:// for WT
+# Dual transport with ratio (recommended)
+ws_url: "wss://websocket.example.com"
+wt_url: "https://webtransport.example.com:443"
+wt_ratio: 0.66                    # 66% WT, 34% WS (0.0 = all WS)
+
+# Or legacy single-transport
+# transport: "websocket"
+# server_url: "wss://websocket.example.com"
+
 meeting_id: "1"
 conversation_dir: "conversation"
+video_mode: costume               # "costume" or "ekg"
+broadcasters: 5                   # first 5 send A/V, rest observe (0 = all broadcast)
+warmup_secs: 15                   # silence before conversation starts
 ramp_up_delay_ms: 500
-# jwt_secret: "your-base64-secret-here"         # or set JWT_SECRET env var
-# insecure: true                                # skip TLS verify (WT only)
+jwt_secret: "your-base64-secret"
+token_ttl_secs: 86400
 ```
 
-### 3. Build & Run
+### 4. Build & Run
 
 ```bash
 cargo build --release -p bot
 ```
 
-Run with any number of participants (1–20):
-
 ```bash
-RUST_LOG=info ./target/release/bot --config config-myenv.yaml --users 5
+# 20 participants, all broadcasting with costumes
+RUST_LOG=info ./target/release/bot --config config.yaml --users 20
+
+# 50-person webinar: 5 broadcasters + 45 observers
+RUST_LOG=info ./target/release/bot --config config.yaml --users 50
+# (requires 50 participants in manifest — 20 named + 30 observer-NN entries)
 ```
 
 ### Static-linked build for remote deployment
@@ -116,47 +148,94 @@ Every 10 seconds each bot logs a stats line:
 
 ## Media Protocol
 
-- **Audio**: 48kHz Opus, 20ms packets (50fps), monotonic sequence numbers
-- **Video**: VP9 Profile 0, 1280x720 @ 15fps, keyframes forced at loop boundaries and every 5s
+- **Audio**: 48kHz Opus mono, 20ms packets (50fps), DTX silence suppression (RMS < 0.005)
+- **Video (costume)**: VP9 Profile 0, 1280x720 @ 30fps, 1000kbps target, pre-recorded I420 frames
+- **Video (EKG)**: VP9 Profile 0, 1280x720 @ 15fps, 500kbps target, rendered on-the-fly
+- **Health**: HealthPacket every 1s with per-peer quality scores, FPS, bitrate, concealment
+- **Heartbeat**: every 5s with VAD is_speaking flag
 - **Wire format**: Protobuf `PacketWrapper` → `MediaPacket` (same as browser client)
-- **Heartbeat**: 1Hz protobuf heartbeat via the same packet channel
+
+## Remote Deployment
+
+The bot binary dynamically links `libvpx.so.7`. Bundle it for machines without libvpx:
+
+```bash
+mkdir bot-deploy
+cp target/release/bot bot-deploy/
+strip bot-deploy/bot
+cp /lib/x86_64-linux-gnu/libvpx.so.7 bot-deploy/
+cp -r conversation bot-deploy/
+cp -r assets bot-deploy/          # ~15 GB costume frames
+cp config.yaml bot-deploy/
+
+# Launcher script (sets LD_LIBRARY_PATH and RUST_LOG)
+cat > bot-deploy/run.sh << 'EOF'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
+export RUST_LOG="${RUST_LOG:-info}"
+CONFIG="${1:-config.yaml}"
+shift 2>/dev/null || true
+exec "$DIR/bot" --config "$DIR/$CONFIG" "$@"
+EOF
+chmod +x bot-deploy/run.sh
+
+rsync -avz --progress bot-deploy/ user@remote:bot/
+```
+
+On the remote machine:
+```bash
+./run.sh config.yaml --users 20 2>&1 | tee bot.log
+```
 
 ## Configuration Reference
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `transport` | no | `"webtransport"` | `"websocket"` or `"webtransport"` |
-| `server_url` | yes | — | Server URL (`wss://` for WS, `https://` for WT) |
+| `ws_url` | * | — | WebSocket relay URL (`wss://...`) |
+| `wt_url` | * | — | WebTransport relay URL (`https://...:443`) |
+| `wt_ratio` | no | `0.66` | Fraction of bots on WebTransport (0.0–1.0) |
+| `transport` | legacy | `"webtransport"` | Legacy: `"websocket"` or `"webtransport"` |
+| `server_url` | legacy | — | Legacy: single server URL |
 | `meeting_id` | yes | — | Room to join |
 | `conversation_dir` | no | `"conversation"` | Path to manifest + line WAVs |
-| `jwt_secret` | no | — | HMAC secret for JWT auth (or `JWT_SECRET` env var) |
+| `video_mode` | no | `"ekg"` | `"costume"` (recorded clips) or `"ekg"` (waveform) |
+| `broadcasters` | no | `0` | First N send A/V, rest observe (0 = all broadcast) |
+| `warmup_secs` | no | `15` | Seconds of silence before conversation starts |
+| `jwt_secret` | no | — | HMAC secret for JWT auth |
 | `token_ttl_secs` | no | `86400` | JWT token lifetime in seconds |
 | `ramp_up_delay_ms` | no | `1000` | Delay between starting each client |
-| `insecure` | no | `false` | Skip TLS certificate verification (WT only) |
+| `insecure` | no | `false` | Skip TLS cert verification (WT only) |
+
+\* At least one of `ws_url` / `wt_url` required, or use legacy `transport` + `server_url`.
 
 CLI arguments:
 
 | Flag | Description |
 |------|-------------|
 | `--config <path>` | Path to config YAML (or `BOT_CONFIG_PATH` env var) |
-| `--users <N>` / `-n <N>` | Number of participants to simulate (default: all in manifest) |
+| `--users <N>` / `-n <N>` | Number of participants (default: all in manifest, max 50) |
 
 ## Architecture
 
 ```
 main.rs
-  ├── Reads manifest, takes first N participants
-  ├── Filters lines to active speakers, stitches per-participant audio
-  ├── Shared media clock (Instant) + loop_duration (from stitched timeline)
+  ├── Reads manifest, determines broadcaster/observer split
+  ├── Filters lines to broadcaster speakers, stitches audio
+  ├── Spawns all clients (connect + heartbeat + health immediately)
+  ├── Warmup sleep, then sets shared media_start via OnceCell
   └── Per participant:
         ├── transport.rs → websocket_client.rs / webtransport_client.rs
-        ├── audio_producer.rs  (OS thread, Opus encoding, 50fps)
-        ├── video_producer.rs  (OS thread, EKG render → VP9 encoding, 15fps)
-        ├── heartbeat producer (1Hz, via shared mpsc channel)
-        └── inbound_stats.rs   (per-sender RX quality diagnostics)
+        ├── health_reporter.rs  (tokio task, 1Hz HealthPackets)
+        ├── heartbeat producer  (5s keepalive, VAD is_speaking)
+        ├── inbound_stats.rs    (per-sender RX quality diagnostics)
+        └── [broadcasters only]:
+              ├── audio_producer.rs     (OS thread, Opus + DTX, 50fps)
+              ├── video_producer.rs     (OS thread, VP9 encoding)
+              └── costume_renderer.rs   (I420 frame selection by RMS)
 ```
 
-Both audio and video producers run on OS threads (not tokio tasks) to avoid scheduler starvation under CPU-bound VP9/Opus encoding. They derive their position from the same `Instant` epoch and wrap at the same `loop_duration`, preventing drift. Frame buffers (ImageBuffer + I420) are pre-allocated and reused to minimize heap churn at scale.
+Audio and video producers run on OS threads (not tokio tasks) to avoid scheduler starvation under CPU-bound VP9/Opus encoding. They derive their position from a shared `Instant` epoch (set after warmup) and wrap at `loop_duration`, preventing drift.
 
 ## What This Bot Measures (and What It Doesn't)
 

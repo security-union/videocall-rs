@@ -264,7 +264,9 @@ async fn run_webtransport_connection_from_request(
         .map(|(_, val)| val.into_owned());
 
     // Determine username, room, and observer flag from either the JWT or URL path params.
-    let (username, lobby_id, observer, display_name, is_guest) = if let Some(ref tok) = token {
+    let (username, lobby_id, observer, display_name, is_guest, is_host, end_on_host_leave) = if let Some(
+        ref tok,
+    ) = token {
         // Token-based flow: identity and room come from the JWT claims.
         let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
         if jwt_secret.is_empty() {
@@ -275,8 +277,8 @@ async fn run_webtransport_connection_from_request(
             anyhow!("token validation failed: {}", e.client_message())
         })?;
         info!(
-            "WT token-based connection: user_id={}, room={}, display_name={}, is_guest={}, observer={}",
-            claims.sub, claims.room, claims.display_name, claims.is_guest, claims.observer
+            "WT token-based connection: user_id={}, room={}, display_name={}, is_guest={}, observer={}, is_host={}",
+            claims.sub, claims.room, claims.display_name, claims.is_guest, claims.observer, claims.is_host
         );
         (
             claims.sub,
@@ -284,6 +286,8 @@ async fn run_webtransport_connection_from_request(
             claims.observer,
             claims.display_name,
             claims.is_guest,
+            claims.is_host,
+            claims.end_on_host_leave,
         )
     } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
         // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
@@ -304,8 +308,8 @@ async fn run_webtransport_connection_from_request(
         );
         // display_name fallback: use user_id for deprecated path
         let display = username.clone();
-        // deprecated path-based endpoint: no JWT claim, treat as non-guest & non-observer
-        (username, lobby_id, false, display, false)
+        // deprecated path-based endpoint: no JWT claim, treat as non-guest & non-observer, not host
+        (username, lobby_id, false, display, false, false, true)
     } else {
         // FF=on but no token provided
         info!("WT connection rejected: no token provided and meeting management is enabled");
@@ -331,6 +335,8 @@ async fn run_webtransport_connection_from_request(
         session_manager,
         observer,
         instance_id,
+        is_host,
+        end_on_host_leave,
     )
     .await
     {
@@ -357,9 +363,12 @@ async fn handle_webtransport_session(
     session_manager: SessionManager,
     observer: bool,
     instance_id: Option<String>,
+    is_host: bool,
+    end_on_host_leave: bool,
 ) -> anyhow::Result<()> {
     // Create channel for actor → WebTransport I/O
-    let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
+    let (outbound_tx, outbound_rx) =
+        mpsc::channel::<WtOutbound>(crate::constants::WT_OUTBOUND_CHANNEL_CAPACITY);
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(
@@ -374,6 +383,8 @@ async fn handle_webtransport_session(
         session_manager,
         observer,
         instance_id,
+        is_host,
+        end_on_host_leave,
     );
     let actor_addr = actor.start();
 

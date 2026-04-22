@@ -134,6 +134,14 @@ impl APIError {
         }
     }
 
+    pub fn joining_not_allowed() -> Self {
+        Self {
+            code: "JOINING_NOT_ALLOWED".to_string(),
+            message: "The host has left and no one can admit new participants. New participants cannot join this meeting.".to_string(),
+            engineering_error: None,
+        }
+    }
+  
     pub fn invalid_display_name(detail: &str) -> Self {
         Self {
             code: "INVALID_DISPLAY_NAME".to_string(),

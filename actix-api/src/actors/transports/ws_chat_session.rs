@@ -23,9 +23,10 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
-use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
+use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL, WS_OUTBOUND_CHANNEL_CAPACITY};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
+use crate::metrics::{RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL};
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use actix::ActorFutureExt;
@@ -34,7 +35,11 @@ use actix::{
     Running, StreamHandler, WrapFuture,
 };
 use actix_web_actors::ws::{self, WebsocketContext};
+use protobuf::Message as ProtobufMessage;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, trace};
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
@@ -51,6 +56,14 @@ pub struct WsChatSession {
 
     /// Track if ActivateConnection has been sent
     activated: bool,
+
+    /// Bounded outbound channel sender — packets are enqueued here and
+    /// drained by a `StreamHandler<Vec<u8>>` registered in `started()`.
+    /// When the channel is full, `on_outbound_drop()` fires CONGESTION.
+    outbound_tx: mpsc::Sender<Vec<u8>>,
+
+    /// Receiver half, consumed once by `started()` via `ctx.add_stream()`.
+    outbound_rx: Option<ReceiverStream<Vec<u8>>>,
 }
 
 impl WsChatSession {
@@ -66,6 +79,8 @@ impl WsChatSession {
         session_manager: SessionManager,
         observer: bool,
         instance_id: Option<String>,
+        is_host: bool,
+        end_on_host_leave: bool,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -79,18 +94,30 @@ impl WsChatSession {
             observer,
             instance_id,
             "websocket",
+            is_host,
+            end_on_host_leave,
         );
+
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(WS_OUTBOUND_CHANNEL_CAPACITY);
 
         WsChatSession {
             logic,
             heartbeat: Instant::now(),
             activated: false,
+            outbound_tx,
+            outbound_rx: Some(ReceiverStream::new(outbound_rx)),
         }
     }
 
     /// Start heartbeat check (WebSocket-specific: uses ping frames)
     fn start_heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
         ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
+            // Sample outbound queue depth for Prometheus
+            let depth = WS_OUTBOUND_CHANNEL_CAPACITY - act.outbound_tx.capacity();
+            RELAY_OUTBOUND_QUEUE_DEPTH
+                .with_label_values(&[&act.logic.room, "websocket"])
+                .set(depth as f64);
+
             if Instant::now().duration_since(act.heartbeat) > CLIENT_TIMEOUT {
                 error!("WebSocket client heartbeat failed, disconnecting!");
                 ctx.stop();
@@ -109,6 +136,12 @@ impl Actor for WsChatSession {
     type Context = WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        // Register the outbound drain stream. Packets enqueued via
+        // outbound_tx are pulled here and written as WS binary frames.
+        if let Some(rx_stream) = self.outbound_rx.take() {
+            ctx.add_stream(rx_stream);
+        }
+
         // Track connection start
         self.logic.track_connection_start();
 
@@ -181,13 +214,39 @@ impl Actor for WsChatSession {
 // Message Handlers
 // =============================================================================
 
-/// Handle outbound messages from ChatServer
+/// Handle outbound messages from ChatServer.
+///
+/// Enqueues serialized bytes into the bounded `outbound_tx` channel instead
+/// of calling `ctx.binary()` directly. The `StreamHandler<Vec<u8>>` drains
+/// the channel on the actor event loop. When the channel is full, the packet
+/// is dropped and `on_outbound_drop()` fires CONGESTION feedback to the
+/// sender via NATS — mirroring the WebTransport relay pattern.
 impl Handler<Message> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         let bytes = self.logic.handle_outbound(&msg);
-        ctx.binary(bytes);
+
+        match self.outbound_tx.try_send(bytes) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                RELAY_PACKET_DROPS_TOTAL
+                    .with_label_values(&[&self.logic.room, "websocket", "channel_full"])
+                    .inc();
+                // Parse sender session_id only on drops (not on every packet)
+                // to avoid a protobuf parse + heap alloc on the hot path.
+                let sender_session_id = PacketWrapper::parse_from_bytes(&msg.msg)
+                    .ok()
+                    .map(|pw| pw.session_id)
+                    .unwrap_or(0);
+                if sender_session_id != 0 {
+                    self.logic.on_outbound_drop(sender_session_id);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                ctx.stop();
+            }
+        }
     }
 }
 
@@ -205,6 +264,24 @@ impl Handler<Packet> for WsChatSession {
             .addr
             .do_send(self.logic.create_client_message(msg));
     }
+}
+
+// =============================================================================
+// Outbound Drain Stream Handler
+// =============================================================================
+
+/// Drain the bounded outbound channel into actual WebSocket binary frames.
+/// This runs on the actor's event loop, so writes are serialized with all
+/// other actor processing — no additional synchronization needed.
+impl StreamHandler<Vec<u8>> for WsChatSession {
+    fn handle(&mut self, bytes: Vec<u8>, ctx: &mut Self::Context) {
+        ctx.binary(bytes);
+    }
+
+    /// Override default `finished()` which calls `ctx.stop()`. The outbound
+    /// channel closing is already handled in `Handler<Message>` via
+    /// `TrySendError::Closed`, so we do NOT want the actor to stop here.
+    fn finished(&mut self, _ctx: &mut Self::Context) {}
 }
 
 // =============================================================================

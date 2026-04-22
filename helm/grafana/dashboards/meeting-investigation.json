@@ -192,7 +192,7 @@
       "targets": [
         {
           "expr": "relay_outbound_queue_depth{room=~\"$meeting\"}",
-          "legendFormat": "{{room}}",
+          "legendFormat": "{{room}} ({{transport}})",
           "refId": ""
         }
       ],

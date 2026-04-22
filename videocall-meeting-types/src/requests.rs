@@ -43,6 +43,11 @@ pub struct CreateMeetingRequest {
     #[serde(default)]
     pub admitted_can_admit: Option<bool>,
 
+    /// Whether the meeting ends for all when the host leaves. Defaults to `true`
+    /// on the server when omitted.
+    #[serde(default)]
+    pub end_on_host_leave: Option<bool>,
+
     /// Whether guests (non-authenticated users) are allowed to join. Defaults
     /// to `false` on the server when omitted.
     #[serde(default)]
@@ -60,8 +65,12 @@ pub struct UpdateMeetingRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admitted_can_admit: Option<bool>,
 
+    /// Toggle whether the meeting ends for all when the host leaves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_on_host_leave: Option<bool>,
+
     /// Toggle guest access on or off.
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_guests: Option<bool>,
 }
 

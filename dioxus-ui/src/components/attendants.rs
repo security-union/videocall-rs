@@ -1319,7 +1319,7 @@ pub fn AttendantsComponent(
         }
     }
 
-    // The visible portion of the unified tile list.
+    // The visible portion of the unified tile list (used by the normal grid layout).
     let visible_tiles: Vec<String> = all_tiles.iter().take(visible_tile_count).cloned().collect();
 
     // Map session IDs to user IDs for display (peer list sidebar — real peers only).
@@ -1356,17 +1356,112 @@ pub fn AttendantsComponent(
     };
     let has_screen_share = active_screen_sharer.is_some();
 
+    // --- Screen-share right panel: separate capacity & speaker promotion ---
+    // The right panel uses a 2-column grid of compact tiles. We compute how
+    // many fit based on the available height, then run speaker promotion
+    // independently of the normal grid's visible_tile_count.
+    let ss_panel_width = (vw / 3.0 - 32.0).max(100.0);
+    let ss_tile_w = (ss_panel_width - 8.0) / 2.0; // 2 columns, 8px gap
+    let ss_tile_h = ss_tile_w / (16.0 / 9.0);
+    let ss_avail_h = vh - 80.0 - 32.0; // minus bottom controls and padding
+    let ss_max_rows = ((ss_avail_h + 8.0) / (ss_tile_h + 8.0)).floor() as usize;
+    let ss_max_tiles = (ss_max_rows * 2).max(2);
+
+    // Build a separate tile list for screen share with its own promotion pass.
+    let (ss_tiles, ss_overflow_count) = if has_screen_share {
+        // Clone all_tiles before grid promotion may have reordered for a
+        // different visible_tile_count. Actually, all_tiles was already
+        // promoted for the grid — re-sort by join time and re-promote for ss.
+        let mut ss_all: Vec<String> = Vec::with_capacity(total_tiles);
+        for peer_id in display_peers.iter().take(capped_real) {
+            ss_all.push(peer_id.clone());
+        }
+        ss_all.extend_from_slice(&mock_ids);
+        {
+            let join_map = peer_join_time.read();
+            ss_all.sort_by(|a, b| {
+                let jt_a = join_map.get(a).copied().unwrap_or(0.0);
+                let jt_b = join_map.get(b).copied().unwrap_or(0.0);
+                jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let (ss_vis_count, ss_ovf) = if ss_all.len() > ss_max_tiles {
+            let vis = ss_max_tiles.saturating_sub(1).max(1); // reserve 1 slot for badge
+            (vis, ss_all.len() - vis)
+        } else {
+            (ss_all.len(), 0)
+        };
+
+        // Speaker promotion for the screen share visible set
+        if ss_vis_count < ss_all.len() {
+            let speech_map = peer_speech_priority.read();
+            let join_map = peer_join_time.read();
+
+            let eff_ts = |peer: &str| -> f64 {
+                speech_map
+                    .get(peer)
+                    .copied()
+                    .unwrap_or_else(|| join_map.get(peer).copied().unwrap_or(0.0))
+            };
+
+            let mut overflow_speakers: Vec<(usize, f64)> = Vec::new();
+            for i in ss_vis_count..ss_all.len() {
+                if let Some(&ts) = speech_map.get(&ss_all[i]) {
+                    if now_ms - ts < SPEAKER_ACTIVE_MS {
+                        overflow_speakers.push((i, ts));
+                    }
+                }
+            }
+            overflow_speakers.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let mut swap_candidates: Vec<(usize, f64)> = (0..ss_vis_count)
+                .filter(|&i| {
+                    speech_map
+                        .get(&ss_all[i])
+                        .map_or(true, |&ts| now_ms - ts >= SPEAKER_ACTIVE_MS)
+                })
+                .map(|i| (i, eff_ts(&ss_all[i])))
+                .collect();
+            swap_candidates.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let num_swaps = overflow_speakers.len().min(swap_candidates.len());
+            for i in 0..num_swaps {
+                ss_all.swap(swap_candidates[i].0, overflow_speakers[i].0);
+            }
+        }
+
+        let tiles: Vec<String> = ss_all.into_iter().take(ss_vis_count).collect();
+        (tiles, ss_ovf)
+    } else {
+        (Vec::new(), 0)
+    };
+
     // ORDERING INVARIANT: the active decode set is built in 3 phases:
     //   1. Visible layout peers (here)
     //   2. Active screen sharer (here)
     //   3. Pinned peer (below, after tile rendering)
     // The dedup check against previous_active_decode_set must run AFTER all
     // three phases. Moving any insertion after the dedup will silently desync.
-    let mut active_decode_set: HashSet<u64> = display_peers
-        .iter()
-        .take(visible_real)
-        .filter_map(|pid| pid.parse::<u64>().ok())
-        .collect();
+    let mut active_decode_set: HashSet<u64> = if has_screen_share {
+        // In screen share mode, decode only the tiles visible in the right panel.
+        ss_tiles
+            .iter()
+            .filter_map(|pid| pid.parse::<u64>().ok())
+            .collect()
+    } else {
+        display_peers
+            .iter()
+            .take(visible_tile_count)
+            .filter_map(|pid| pid.parse::<u64>().ok())
+            .collect()
+    };
     if let Some(active_peer) = active_screen_sharer.as_ref() {
         if let Ok(session_id) = active_peer.parse::<u64>() {
             active_decode_set.insert(session_id);
@@ -1633,9 +1728,13 @@ pub fn AttendantsComponent(
                                 }
                             }
                         }
-                        // Right panel — all peer video tiles stacked vertically
-                        div { style: "flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;",
-                            for tile_id in visible_tiles.iter() {
+                        // Right panel — 2-column grid of compact peer tiles
+                        div {
+                            style: "flex: 1; min-width: 0; height: 100%; \
+                                    display: grid; grid-template-columns: 1fr 1fr; \
+                                    gap: 8px; padding: 6px; \
+                                    align-content: start; overflow: visible;",
+                            for tile_id in ss_tiles.iter() {
                                 {
                                     let is_mock = tile_id.starts_with("mock-");
                                     if is_mock {
@@ -1664,6 +1763,15 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+                                }
+                            }
+
+                            if ss_overflow_count > 0 {
+                                div {
+                                    class: "grid-overflow-badge",
+                                    style: "aspect-ratio: 16 / 9;",
+                                    "+{ss_overflow_count}"
+                                    span { "more in meeting" }
                                 }
                             }
                         }

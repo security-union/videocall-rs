@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use crate::config::{Config, OAuthConfig};
+use crate::config::{Config, OAuthConfig, SearchConfig};
 use crate::oauth::JwksCache;
 use sqlx::PgPool;
 
@@ -47,8 +47,14 @@ pub struct AppState {
     pub nats: Option<async_nats::Client>,
     /// Internal URLs for fetching version info from peer services.
     pub service_version_urls: Vec<String>,
-    /// Shared HTTP client for outbound requests (e.g. version fan-out).
+    /// Shared HTTP client for outbound requests (e.g. version fan-out, SearchV2 push).
     pub http_client: reqwest::Client,
+    /// SearchV2 integration config. `None` disables the push path entirely;
+    /// every [`crate::search`] call becomes a no-op. See [`SearchConfig`].
+    pub search: Option<SearchConfig>,
+    /// Opt-in anonymous-auth fallback flag (mirrors [`crate::config::Config::allow_anonymous`]).
+    /// Only intended for local development; guards path 3 in the auth extractor.
+    pub allow_anonymous: bool,
 }
 
 impl AppState {
@@ -86,6 +92,8 @@ impl AppState {
                 .timeout(std::time::Duration::from_secs(3))
                 .build()
                 .expect("failed to build reqwest client"),
+            search: config.search.clone(),
+            allow_anonymous: config.allow_anonymous,
         }
     }
 }

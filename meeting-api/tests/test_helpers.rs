@@ -66,6 +66,10 @@ pub fn build_app(pool: PgPool) -> Router {
         nats: None,
         service_version_urls: Vec::new(),
         http_client: reqwest::Client::new(),
+        search: None,
+        // Integration tests use the unauthenticated entrypoints and expect a
+        // stable anonymous identity to be issued when no cookie is present.
+        allow_anonymous: true,
     };
     routes::router().with_state(state)
 }

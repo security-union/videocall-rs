@@ -18,7 +18,7 @@ use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
 /// Row returned from the `meetings` table.
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct MeetingRow {
     pub id: i32,
@@ -114,7 +114,8 @@ pub async fn get_by_room_id(
     .await
 }
 
-/// List meetings owned by `creator_id` (non-deleted), ordered by created_at DESC.
+/// List meetings the user owns OR has participated in (non-deleted),
+/// ordered by created_at DESC.
 pub async fn list_by_owner(
     pool: &PgPool,
     creator_id: &str,
@@ -123,12 +124,14 @@ pub async fn list_by_owner(
 ) -> Result<Vec<MeetingRow>, sqlx::Error> {
     sqlx::query_as::<_, MeetingRow>(
         r#"
-        SELECT id, room_id, started_at, ended_at, created_at, updated_at,
-               deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
-        FROM meetings
-        WHERE deleted_at IS NULL AND creator_id = $1
-        ORDER BY created_at DESC
+        SELECT DISTINCT m.id, m.room_id, m.started_at, m.ended_at, m.created_at, m.updated_at,
+               m.deleted_at, m.creator_id, m.password_hash, m.state, m.attendees, m.host_display_name,
+               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests
+        FROM meetings m
+        LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $1
+        WHERE m.deleted_at IS NULL
+          AND (m.creator_id = $1 OR p.user_id IS NOT NULL)
+        ORDER BY m.created_at DESC
         LIMIT $2 OFFSET $3
         "#,
     )
@@ -139,11 +142,92 @@ pub async fn list_by_owner(
     .await
 }
 
-/// Count meetings owned by `creator_id` (non-deleted).
+/// Count meetings the user owns OR has participated in (non-deleted).
 pub async fn count_by_owner(pool: &PgPool, creator_id: &str) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM meetings WHERE deleted_at IS NULL AND creator_id = $1",
+        r#"
+        SELECT COUNT(DISTINCT m.id)
+        FROM meetings m
+        LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $1
+        WHERE m.deleted_at IS NULL
+          AND (m.creator_id = $1 OR p.user_id IS NOT NULL)
+        "#,
     )
+    .bind(creator_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Escape the LIKE-special characters `%`, `_`, and `\` in user-supplied
+/// search input so they're treated as literals inside the `ILIKE` pattern.
+///
+/// Without this, a query of `%` would match everything, and `_` would match
+/// any single character — either giving callers access to rows they haven't
+/// searched for (low-severity info disclosure when combined with the
+/// participant JOIN's ACL predicate) and producing confusing result sets.
+/// The default Postgres escape character is `\`, so we double-escape
+/// backslashes before the metacharacter escapes so literal backslashes in
+/// user input survive untouched.
+fn escape_like(input: &str) -> String {
+    input
+        .replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_")
+}
+
+/// Search non-deleted meetings the user owns OR has participated in,
+/// matching a keyword against `room_id`, `state`, and `host_display_name`
+/// (case-insensitive).
+pub async fn search_by_owner(
+    pool: &PgPool,
+    creator_id: &str,
+    q: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<MeetingRow>, sqlx::Error> {
+    let pattern = format!("%{}%", escape_like(q));
+    sqlx::query_as::<_, MeetingRow>(
+        r#"
+        SELECT DISTINCT m.id, m.room_id, m.started_at, m.ended_at, m.created_at, m.updated_at,
+               m.deleted_at, m.creator_id, m.password_hash, m.state, m.attendees, m.host_display_name,
+               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests
+        FROM meetings m
+        LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $2
+        WHERE m.deleted_at IS NULL
+          AND (m.creator_id = $2 OR p.user_id IS NOT NULL)
+          AND (m.room_id ILIKE $1 OR m.state ILIKE $1 OR m.host_display_name ILIKE $1)
+        ORDER BY m.created_at DESC
+        LIMIT $3 OFFSET $4
+        "#,
+    )
+    .bind(&pattern)
+    .bind(creator_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
+/// Count non-deleted meetings the user owns OR has participated in,
+/// matching a keyword.
+pub async fn count_search_by_owner(
+    pool: &PgPool,
+    creator_id: &str,
+    q: &str,
+) -> Result<i64, sqlx::Error> {
+    let pattern = format!("%{}%", escape_like(q));
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(DISTINCT m.id)
+        FROM meetings m
+        LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $2
+        WHERE m.deleted_at IS NULL
+          AND (m.creator_id = $2 OR p.user_id IS NOT NULL)
+          AND (m.room_id ILIKE $1 OR m.state ILIKE $1 OR m.host_display_name ILIKE $1)
+        "#,
+    )
+    .bind(&pattern)
     .bind(creator_id)
     .fetch_one(pool)
     .await?;
@@ -256,3 +340,36 @@ pub async fn update_meeting_settings(
     tx.commit().await?;
     Ok(updated)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::escape_like;
+
+    #[test]
+    fn escape_like_neutralises_percent_and_underscore() {
+        // Raw `%` / `_` would be treated as wildcards and match more than the
+        // caller intended; escaped they should match the literal character.
+        assert_eq!(escape_like("%"), r"\%");
+        assert_eq!(escape_like("_"), r"\_");
+        assert_eq!(escape_like("ab%cd_ef"), r"ab\%cd\_ef");
+    }
+
+    #[test]
+    fn escape_like_preserves_plain_characters() {
+        assert_eq!(escape_like(""), "");
+        assert_eq!(escape_like("standup2024"), "standup2024");
+        assert_eq!(escape_like("my-meeting_id"), r"my-meeting\_id");
+    }
+
+    #[test]
+    fn escape_like_escapes_backslash_before_metacharacters() {
+        // Must double-escape `\` first so user-provided `\` survives and
+        // doesn't accidentally escape the `%` we add around the query later.
+        assert_eq!(escape_like(r"\"), r"\\");
+        assert_eq!(escape_like(r"a\b"), r"a\\b");
+        // A user typing a raw backslash followed by a percent must still
+        // match a literal backslash-percent, not an escaped-percent pattern.
+        assert_eq!(escape_like(r"\%"), r"\\\%");
+    }
+}
+

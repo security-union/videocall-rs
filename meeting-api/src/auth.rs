@@ -111,24 +111,90 @@ impl FromRequestParts<AppState> for AuthUser {
         // Used by server-side OAuth (cookie set by /login/callback) and
         // deployments without an external identity provider.
         // ----------------------------------------------------------------
-        let token = extract_session_token(parts, &state.cookie_name)
-            .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized()))?;
-
-        let claims = token::decode_session_token(&state.jwt_secret, &token)?;
-
-        if claims
-            .sub
-            .starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX)
-        {
-            tracing::warn!("rejected session token with reserved guest: prefix user_id");
-            return Err(AppError::unauthorized_msg("invalid session token"));
+        if let Some(token) = extract_session_token(parts, &state.cookie_name) {
+            let claims = token::decode_session_token(&state.jwt_secret, &token)?;
+            if claims
+                .sub
+                .starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX)
+            {
+                tracing::warn!("rejected session token with reserved guest: prefix user_id");
+                return Err(AppError::unauthorized_msg("invalid session token"));
+            }
+            return Ok(AuthUser {
+                user_id: claims.sub,
+                name: claims.name,
+            });
         }
 
-        Ok(AuthUser {
-            user_id: claims.sub,
-            name: claims.name,
-        })
+        // ----------------------------------------------------------------
+        // Path 3 — Anonymous fallback (opt-in via ALLOW_ANONYMOUS=true)
+        //
+        // When explicitly enabled, allow unauthenticated access with a
+        // stable anonymous identity.  This is the local-development path:
+        // without an IdP there is no way to obtain a session token, so we
+        // derive a stable id from the remote address and return it as an
+        // anonymous user.  Production deployments must leave this flag off
+        // (the default) so unauthenticated requests return 401 instead of
+        // silently impersonating an anonymous user.
+        // ----------------------------------------------------------------
+        if state.allow_anonymous {
+            // 64-bit hex so two anon sessions are extremely unlikely to
+            // collide even under adversarial input (unlike the prior 32-bit
+            // encoding that would be trivially collidable).
+            let user_id = format!("anon-{:016x}", hash_remote_addr(parts));
+            return Ok(AuthUser {
+                user_id,
+                name: "Anonymous".to_string(),
+            });
+        }
+
+        Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            APIError::unauthorized(),
+        ))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Anonymous identity helpers
+// ---------------------------------------------------------------------------
+
+/// Per-process random key for the anonymous-identity hasher.  [`RandomState`]
+/// is a SipHash-1-3-based `BuildHasher` seeded from the OS random source at
+/// first use, so it produces stable hashes within a process lifetime but is
+/// not predictable across processes or from the outside — preventing an
+/// attacker from deliberately crafting colliding inputs once the flag is set.
+///
+/// We intentionally key the hasher once per process instead of per request so
+/// the same client reconnecting during the same deployment keeps the same
+/// `anon-<hex>` identity.  The key is regenerated on every restart.
+static ANON_HASHER: std::sync::LazyLock<std::collections::hash_map::RandomState> =
+    std::sync::LazyLock::new(std::collections::hash_map::RandomState::new);
+
+/// Derive a stable hash from the connecting address so the same browser
+/// session gets a consistent anonymous `user_id` for the lifetime of this
+/// process.  Returns `0` when the remote address is unavailable (e.g. Unix
+/// socket or tests without a `ConnectInfo` extension).
+///
+/// ## Trust model
+///
+/// We deliberately **do not** consult `X-Forwarded-For` / `X-Real-IP`.
+/// `ALLOW_ANONYMOUS` is a local-development feature and should never be
+/// enabled in a deployment that terminates client connections behind a proxy
+/// — but if it ever is (misconfiguration), an attacker could trivially set
+/// `X-Forwarded-For: <victim-ip>` to impersonate any anon identity.  Reading
+/// only the socket-level peer address keeps the spoofing surface zero: the
+/// request must actually come from the claimed address.
+///
+/// The hasher is keyed per-process via [`ANON_HASHER`] so the 64-bit digest is
+/// not predictable from outside even when the input (IP address) is.
+fn hash_remote_addr(parts: &Parts) -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut hasher = ANON_HASHER.build_hasher();
+    if let Some(addr) = parts.extensions.get::<std::net::SocketAddr>() {
+        addr.ip().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +283,45 @@ mod tests {
         make_state_with_cookie_name("session")
     }
 
+    /// Minimal OAuth config that keeps `state.oauth = Some(...)` so the
+    /// anonymous fallback does NOT activate.  No JWKS → Bearer tokens
+    /// still fall through to the session JWT path.
+    fn dummy_oauth_config() -> crate::config::OAuthConfig {
+        crate::config::OAuthConfig {
+            client_id: "test".into(),
+            client_secret: None,
+            redirect_url: "http://localhost/callback".into(),
+            issuer: None,
+            auth_url: "http://localhost/auth".into(),
+            token_url: "http://localhost/token".into(),
+            jwks_url: None,
+            userinfo_url: None,
+            scopes: "openid".into(),
+            after_login_url: "/".into(),
+            allowed_redirect_urls: vec![],
+            end_session_endpoint: None,
+            after_logout_url: None,
+            browser_pkce: false,
+            resource_server_audience: None,
+        }
+    }
+
+    fn make_test_state_with_oauth() -> AppState {
+        let mut s = make_test_state();
+        s.oauth = Some(dummy_oauth_config());
+        // With OAuth configured, the anonymous fallback is off; unauthenticated
+        // requests must 401 so this mirrors the production default.
+        s.allow_anonymous = false;
+        s
+    }
+
+    fn make_state_with_cookie_name_and_oauth(name: &str) -> AppState {
+        let mut s = make_state_with_cookie_name(name);
+        s.oauth = Some(dummy_oauth_config());
+        s.allow_anonymous = false;
+        s
+    }
+
     fn make_state_with_cookie_name(name: &str) -> AppState {
         // connect_lazy creates a pool handle without actually connecting.
         // The URL is never used because no queries are executed in unit tests.
@@ -238,6 +343,12 @@ mod tests {
             nats: None,
             service_version_urls: Vec::new(),
             http_client: reqwest::Client::new(),
+            search: None,
+            // Default to true in the "no OAuth" unit-test state so tests that
+            // exercise the anonymous-fallback path don't have to flip this
+            // themselves.  Tests that want to verify 401-on-missing-credentials
+            // use `make_test_state_with_oauth()` which overrides this.
+            allow_anonymous: true,
         }
     }
 
@@ -321,13 +432,47 @@ mod tests {
 
     #[tokio::test]
     async fn empty_bearer_token_returns_unauthorized() {
-        let err = extract_with_bearer("").await.unwrap_err();
+        let state = make_test_state_with_oauth();
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, "Bearer ")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn missing_credentials_returns_unauthorized() {
-        let err = extract_with_cookie(None).await.unwrap_err();
+        let state = make_test_state_with_oauth();
+        let err = extract_with_cookie_and_state(None, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_anonymous_when_allowed() {
+        // `make_test_state()` defaults to `allow_anonymous: true` so this
+        // asserts the opt-in behaviour: a request without credentials is
+        // accepted with a synthetic `anon-…` user_id.
+        let auth = extract_with_cookie(None).await.expect("anonymous fallback");
+        assert!(auth.user_id.starts_with("anon-"));
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_returns_unauthorized_when_anonymous_disabled() {
+        // With `allow_anonymous: false` and no OAuth, the anonymous path is
+        // closed off and missing credentials must return 401.
+        let mut state = make_test_state();
+        state.allow_anonymous = false;
+        let err = extract_with_cookie_and_state(None, &state)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
@@ -409,7 +554,7 @@ mod tests {
     /// pr1-api.sandbox.videocall.rs causing a 401.
     #[tokio::test]
     async fn production_session_cookie_rejected_by_preview_api() {
-        let state = make_state_with_cookie_name("pr1-session");
+        let state = make_state_with_cookie_name_and_oauth("pr1-session");
         let production_jwt =
             generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
         // Even with a valid JWT, the wrong cookie name must be rejected.
@@ -422,7 +567,7 @@ mod tests {
     /// Slot isolation: pr2-session= is rejected when the API expects pr1-session=.
     #[tokio::test]
     async fn different_slot_cookie_rejected() {
-        let state = make_state_with_cookie_name("pr1-session");
+        let state = make_state_with_cookie_name_and_oauth("pr1-session");
         let jwt = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600).unwrap();
         let err = extract_with_cookie_and_state(Some(&format!("pr2-session={jwt}")), &state)
             .await
@@ -529,6 +674,10 @@ mod tests {
             nats: None,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
+            search: None,
+            // JWKS-mode tests exercise the OAuth path; unauthenticated
+            // requests must not fall through to an anonymous identity.
+            allow_anonymous: false,
         }
     }
 

@@ -61,6 +61,8 @@ features = [
     "Document",
     "DomTokenList",
     "Element",
+    "EventTarget",
+    "KeyboardEvent",
     "GainNode",
     "HtmlAudioElement",
     "HtmlCanvasElement",

@@ -102,6 +102,10 @@ services:
       - AFTER_LOGOUT_URL=${AFTER_LOGOUT_URL:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
       - OAUTH_BROWSER_PKCE=${OAUTH_BROWSER_PKCE:-false}
       - ALLOWED_REDIRECT_URLS=${ALLOWED_REDIRECT_URLS:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
+      # Local-dev fallback so unauthenticated requests resolve to a stable
+      # anonymous user identity instead of 401. Production (Helm) never sets
+      # this env var and therefore defaults to false.
+      - ALLOW_ANONYMOUS=${ALLOW_ANONYMOUS:-true}
       - NATS_URL=nats:4222
       - RUST_LOG=debug
       - CARGO_TARGET_DIR=/app/meeting-api/target

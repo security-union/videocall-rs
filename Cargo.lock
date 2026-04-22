@@ -8380,6 +8380,7 @@ dependencies = [
  "serial_test",
  "sqlx",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",

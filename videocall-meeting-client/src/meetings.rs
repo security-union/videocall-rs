@@ -16,7 +16,8 @@
 use videocall_meeting_types::{
     requests::{CreateMeetingRequest, UpdateMeetingRequest},
     responses::{
-        CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse, MeetingInfoResponse,
+        CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
+        MeetingGuestInfoResponse, MeetingInfoResponse,
     },
 };
 
@@ -97,6 +98,18 @@ impl MeetingApiClient {
     ) -> Result<MeetingInfoResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}");
         let response = self.patch(&path).json(request).send().await?;
+        parse_api_response(response).await
+    }
+
+    /// Get public guest info for a meeting (no authentication required).
+    ///
+    /// Calls `GET /api/v1/meetings/{meeting_id}/guest-info`.
+    pub async fn get_meeting_guest_info(
+        &self,
+        meeting_id: &str,
+    ) -> Result<MeetingGuestInfoResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/guest-info");
+        let response = self.get(&path).send().await?;
         parse_api_response(response).await
     }
 }

@@ -87,6 +87,27 @@ const PROFILE_USER_ID_KEY: &str = "vc_profile_user_id";
 /// validated id_token payload.
 const PROFILE_DISPLAY_NAME_KEY: &str = "vc_profile_display_name";
 
+/// Session-storage key for the stable guest participant ID (`guest:<uuid>`)
+/// that is reused across re-joins within the same browser tab.
+const GUEST_SESSION_ID_KEY: &str = "vc_guest_session_id";
+
+/// Read the stable guest session ID for the current tab, if any.
+pub fn get_guest_session_id() -> Option<String> {
+    SessionStorage::get::<Option<String>>(&GUEST_SESSION_ID_KEY.to_string()).flatten()
+}
+
+/// Persist the guest session ID so re-joins reuse the same participant row.
+pub fn store_guest_session_id(id: &str) {
+    SessionStorage::set(GUEST_SESSION_ID_KEY.to_string(), &Some(id.to_string()));
+}
+
+/// Clear the guest session ID.
+pub fn clear_guest_session_id() {
+    if let Ok(Some(storage)) = window().session_storage() {
+        let _ = storage.remove_item(GUEST_SESSION_ID_KEY);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Token storage
 // ---------------------------------------------------------------------------
@@ -202,6 +223,20 @@ pub fn clear_user_profile() {
 /// nor the id_token is stored, the server will always return 401 — skip the
 /// network round-trip and fail immediately.
 pub async fn check_session() -> anyhow::Result<()> {
+    // Guest fast-path: skip the network call when this tab was (or is) a
+    // guest — but only when no OAuth session could exist.  When PKCE-based
+    // OAuth is active and tokens are present the user has logged in *after*
+    // a guest session; bail-out would incorrectly reject a valid session.
+    if get_guest_session_id().is_some() {
+        let has_oauth_tokens = crate::constants::is_pkce_flow()
+            && (get_stored_access_token().is_some() || get_stored_id_token().is_some());
+        if !has_oauth_tokens {
+            clear_guest_session_id();
+            return Err(anyhow!("guest session; no OAuth session cookie"));
+        }
+        // If OAuth tokens exist, fall through to normal check
+        clear_guest_session_id();
+    }
     if crate::constants::is_pkce_flow()
         && get_stored_access_token().is_none()
         && get_stored_id_token().is_none()
@@ -456,6 +491,36 @@ pub fn redirect_to_login() {
             }
         };
         let _ = window().location().set_href(&url);
+    }
+}
+
+/// Redirect the browser to the guest entry point for a meeting.
+///
+/// Called when an unauthenticated user tries to join a meeting that allows guests.
+pub fn redirect_to_guest(meeting_id: &str) {
+    let url = format!("/meeting/{meeting_id}/guest");
+    if let Err(e) = window().location().set_href(&url) {
+        log::error!("Failed to navigate to guest URL: {e:?}");
+    }
+}
+
+/// When the user is not authenticated, check if the meeting allows guests
+/// and redirect accordingly.
+pub async fn handle_not_authenticated(meeting_id: &str) {
+    let allow_guests = crate::meeting_api::get_meeting_guest_info(meeting_id)
+        .await
+        .map(|info| info.allow_guests)
+        .unwrap_or(false);
+    redirect_not_authenticated(meeting_id, allow_guests);
+}
+
+/// Redirect based on a pre-fetched `allow_guests` value (no extra network
+/// call). Use this when guest info has already been fetched concurrently.
+pub fn redirect_not_authenticated(meeting_id: &str, allow_guests: bool) {
+    if allow_guests {
+        redirect_to_guest(meeting_id);
+    } else {
+        redirect_to_login();
     }
 }
 

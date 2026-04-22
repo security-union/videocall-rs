@@ -425,6 +425,8 @@ mod tests {
             host_display_name: Some("Alice".to_string()),
             waiting_room_enabled: true,
             admitted_can_admit: false,
+            end_on_host_leave: true,
+            allow_guests: false,
         }
     }
 

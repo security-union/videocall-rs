@@ -29,7 +29,7 @@ use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
 use log::debug;
 use protobuf::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Display, sync::Arc};
@@ -284,10 +284,14 @@ pub struct Peer {
     pub is_speaking: bool,
     pub audio_level: f32,
     pub display_name: Option<String>,
-    /// Whether this peer's video/screen tiles are currently visible in the
-    /// viewport (tracked via IntersectionObserver in the UI layer). When
-    /// `false`, video and screen decoding is skipped to save CPU. Audio is
-    /// always decoded regardless of visibility.
+    /// Server-vouched guest indicator, sourced from the authenticated JWT
+    /// `is_guest` claim and broadcast on `PARTICIPANT_JOINED`.
+    pub is_guest: bool,
+    /// Whether this peer is currently decode-active in the UI layout.
+    ///
+    /// When `false`, video and screen decoding is skipped to save CPU. Audio
+    /// is always decoded regardless so off-screen participants can still be
+    /// heard.
     pub visible: bool,
     context_initialized: bool,
     vad_threshold: Option<f32>,
@@ -318,6 +322,7 @@ impl Peer {
         user_id: String,
         aes: Option<Aes128State>,
         vad_threshold: Option<f32>,
+        is_guest: bool,
     ) -> Result<Self, JsValue> {
         let sid_str = session_id.to_string();
         let (mut audio, video, screen) =
@@ -344,7 +349,8 @@ impl Peer {
             is_speaking: false,
             audio_level: 0.0,
             display_name: None,
-            visible: true,
+            is_guest,
+            visible: false,
             context_initialized: false,
             vad_threshold,
             has_received_heartbeat: false,
@@ -782,6 +788,11 @@ pub struct PeerDecodeManager {
     /// creates a peer later (after the first media packet arrives), the display
     /// name is immediately available and does not fall back to user_id/email.
     display_name_cache: HashMap<u64, String>,
+    /// Cache of session_id -> is_guest, populated from PARTICIPANT_JOINED events.
+    /// Mirrors `display_name_cache` so a guest flag arriving before the peer
+    /// entry is created (via `ensure_peer()`) is still applied once the first
+    /// media packet brings the peer online.
+    is_guest_cache: HashMap<u64, bool>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -806,6 +817,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            is_guest_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -821,6 +833,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            is_guest_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -843,19 +856,22 @@ impl PeerDecodeManager {
         self.vad_threshold = threshold;
     }
 
-    /// Update the visibility state for a peer identified by session_id.
+    /// Update which peers are eligible for video/screen decode.
     ///
-    /// When `visible` is `false`, video and screen decoding is paused for this
-    /// peer to save CPU. Audio is always decoded regardless of visibility so
-    /// that off-screen participants can still be heard.
-    ///
-    /// Called by the UI layer when an `IntersectionObserver` detects that a
-    /// peer's canvas element has scrolled in or out of the viewport.
-    pub fn set_peer_visibility(&mut self, session_id: u64, visible: bool) {
-        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
-            if peer.visible != visible {
+    /// The meeting layout is the authoritative source of truth in the first
+    /// pass of selective decode: peers rendered in the active layout are
+    /// marked visible, and every other peer is fail-closed to skipped video
+    /// and screen decode. Audio remains decoded for all peers.
+    pub fn set_active_decode_set(&mut self, active_session_ids: &HashSet<u64>) {
+        let session_ids = self.connected_peers.ordered_keys().clone();
+        for session_id in session_ids {
+            let visible = active_session_ids.contains(&session_id);
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                if peer.visible == visible {
+                    continue;
+                }
                 debug!(
-                    "Peer {} visibility changed: {} -> {}",
+                    "Peer {} decode visibility changed: {} -> {}",
                     session_id, peer.visible, visible
                 );
                 peer.visible = visible;
@@ -1045,6 +1061,11 @@ impl PeerDecodeManager {
     ) -> Result<(), JsValue> {
         let sid_str = session_id.to_string();
         debug!("Adding peer {user_id} with session_id {sid_str}");
+        let cached_is_guest = self
+            .is_guest_cache
+            .get(&session_id)
+            .copied()
+            .unwrap_or(false);
         let mut peer = Peer::new(
             self.get_video_canvas_id.emit(sid_str.clone()),
             self.get_screen_canvas_id.emit(sid_str),
@@ -1052,6 +1073,7 @@ impl PeerDecodeManager {
             user_id.to_owned(),
             aes,
             self.vad_threshold,
+            cached_is_guest,
         )?;
         // Apply cached display name if PARTICIPANT_JOINED arrived before
         // the first media packet created this peer entry.
@@ -1072,6 +1094,7 @@ impl PeerDecodeManager {
                 diag.remove_peer(&peer.sid_str);
             }
             self.display_name_cache.remove(&session_id);
+            self.is_guest_cache.remove(&session_id);
             self.on_peer_removed.emit(peer.sid_str);
         }
     }
@@ -1091,6 +1114,7 @@ impl PeerDecodeManager {
         // Clear the display name cache so stale names don't persist
         // across reconnections.
         self.display_name_cache.clear();
+        self.is_guest_cache.clear();
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
@@ -1183,6 +1207,24 @@ impl PeerDecodeManager {
         self.connected_peers
             .get(&sid)
             .and_then(|peer| peer.display_name.clone())
+    }
+
+    /// Get the server-vouched guest status for a peer by session_id string.
+    pub fn get_peer_is_guest(&self, session_id_str: &str) -> Option<bool> {
+        let sid: u64 = session_id_str.parse().ok()?;
+        if let Some(peer) = self.connected_peers.get(&sid) {
+            return Some(peer.is_guest);
+        }
+        self.is_guest_cache.get(&sid).copied()
+    }
+
+    /// Set the server-vouched guest status for a peer identified by
+    /// session_id.
+    pub fn set_peer_is_guest(&mut self, session_id: u64, is_guest: bool) {
+        self.is_guest_cache.insert(session_id, is_guest);
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            peer.is_guest = is_guest;
+        }
     }
 
     pub fn is_peer_speaking(&self, key: &str) -> bool {
@@ -1342,7 +1384,8 @@ mod tests {
             audio_enabled: false,
             screen_enabled: false,
             display_name: None,
-            visible: true,
+            is_guest: false,
+            visible: false,
             context_initialized: false,
             has_received_heartbeat: false,
             is_speaking: false,
@@ -2337,33 +2380,68 @@ mod tests {
         }
     }
 
-    /// PeerDecodeManager::set_peer_visibility should update the peer's visible flag.
+    /// PeerDecodeManager::set_active_decode_set should update peer visibility.
     #[wasm_bindgen_test]
-    fn manager_set_peer_visibility() {
+    fn manager_set_active_decode_set() {
         let mut manager = PeerDecodeManager::new();
         let (peer, _muted) = make_test_peer(220);
-        assert!(peer.visible); // default is true
+        assert!(!peer.visible, "New peers should default to inactive decode");
         manager.connected_peers.insert(220, peer);
 
-        manager.set_peer_visibility(220, false);
+        manager.set_active_decode_set(&HashSet::new());
         assert!(
             !manager.connected_peers.get(&220).unwrap().visible,
-            "Peer should be invisible after set_peer_visibility(false)"
+            "Peer should remain inactive when omitted from active decode set"
         );
 
-        manager.set_peer_visibility(220, true);
+        manager.set_active_decode_set(&HashSet::from([220]));
         assert!(
             manager.connected_peers.get(&220).unwrap().visible,
-            "Peer should be visible after set_peer_visibility(true)"
+            "Peer should be active after entering the decode set"
         );
     }
 
-    /// set_peer_visibility on a non-existent session_id should be a no-op.
+    /// set_active_decode_set should update all peers in one pass.
     #[wasm_bindgen_test]
-    fn manager_set_peer_visibility_unknown_peer() {
+    fn manager_set_active_decode_set_updates_multiple_peers() {
         let mut manager = PeerDecodeManager::new();
-        // Should not panic.
-        manager.set_peer_visibility(99999, false);
+        let (peer_1, _muted_1) = make_test_peer(221);
+        let (peer_2, _muted_2) = make_test_peer(222);
+        manager.connected_peers.insert(221, peer_1);
+        manager.connected_peers.insert(222, peer_2);
+
+        manager.set_active_decode_set(&HashSet::from([222]));
+
+        assert!(
+            !manager.connected_peers.get(&221).unwrap().visible,
+            "Peers omitted from the active set should be inactive"
+        );
+        assert!(
+            manager.connected_peers.get(&222).unwrap().visible,
+            "Peers in the active set should be active"
+        );
+    }
+
+    /// Peers added after a layout update stay inactive until a subsequent
+    /// active-decode-set push explicitly enables them.
+    #[wasm_bindgen_test]
+    fn new_peer_remains_inactive_until_selected() {
+        let mut manager = PeerDecodeManager::new();
+        manager.set_active_decode_set(&HashSet::from([223]));
+
+        let (peer, _muted) = make_test_peer(224);
+        manager.connected_peers.insert(224, peer);
+
+        assert!(
+            !manager.connected_peers.get(&224).unwrap().visible,
+            "New peers should remain inactive until explicitly selected"
+        );
+
+        manager.set_active_decode_set(&HashSet::from([224]));
+        assert!(
+            manager.connected_peers.get(&224).unwrap().visible,
+            "The next active-set update should enable the peer"
+        );
     }
 
     /// Multiple losses: after one loss triggers a keyframe request and the loss

@@ -140,12 +140,14 @@ pub async fn join_meeting(
             &meeting_id,
             true,
             display_name.unwrap_or(&user_id),
+            meeting.end_on_host_leave,
             false,
         )?;
 
         let mut resp = row.into_participant_status(Some(token));
         resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
         resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+        resp.end_on_host_leave = Some(meeting.end_on_host_leave);
         resp.allow_guests = Some(meeting.allow_guests);
         resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
         resp.host_user_id = meeting.creator_id;
@@ -178,8 +180,62 @@ async fn join_as_attendee(
     fallback_display_name: &str,
     is_guest: bool,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    let is_host = meeting.creator_id.as_deref() == Some(user_id);
     let current_state = meeting.state.as_deref().unwrap_or("idle");
     if current_state != "active" {
+        if !meeting.waiting_room_enabled {
+            // No waiting room: auto-activate the meeting and admit
+            // a non-host joiner so they can wait inside the call.
+            db_meetings::activate(&state.db, meeting.id).await?;
+            nats_events::publish_meeting_activated(state.nats.as_ref(), meeting_id).await;
+            let (auto_admitted, row, wr_enabled) = db_participants::join_attendee(
+                &state.db,
+                meeting.id,
+                user_id,
+                display_name,
+                None,
+                is_guest,
+            )
+            .await?
+            .expect("join_attendee with None host check never returns None");
+            let token = if auto_admitted {
+                Some(generate_room_token(
+                    &state.jwt_secret,
+                    state.token_ttl_secs,
+                    user_id,
+                    meeting_id,
+                    is_host,
+                    display_name.unwrap_or(fallback_display_name),
+                    meeting.end_on_host_leave,
+                    is_guest,
+                )?)
+            } else {
+                None
+            };
+            let mut resp = row.into_participant_status(token);
+            if !auto_admitted {
+                let dn = display_name.unwrap_or(fallback_display_name);
+                resp.observer_token = Some(generate_observer_token(
+                    &state.jwt_secret,
+                    user_id,
+                    meeting_id,
+                    dn,
+                    is_guest,
+                )?);
+                nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
+            }
+            resp.waiting_room_enabled = Some(wr_enabled);
+            resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+            resp.end_on_host_leave = Some(meeting.end_on_host_leave);
+            resp.allow_guests = Some(meeting.allow_guests);
+            resp.host_display_name = meeting.host_display_name;
+            resp.host_user_id = meeting.creator_id;
+            return Ok(Json(APIResponse::ok(resp)));
+        }
+
+        // Meeting exists but isn't active yet. Return a "waiting_for_meeting"
+        // status with an observer token so the client can receive a push
+        // notification when the host activates the meeting.
         let dn = display_name.unwrap_or(fallback_display_name);
         let observer =
             generate_observer_token(&state.jwt_secret, user_id, meeting_id, dn, is_guest)?;
@@ -195,6 +251,7 @@ async fn join_as_attendee(
             observer_token: Some(observer),
             waiting_room_enabled: Some(meeting.waiting_room_enabled),
             admitted_can_admit: Some(meeting.admitted_can_admit),
+            end_on_host_leave: Some(meeting.end_on_host_leave),
             host_display_name: meeting.host_display_name,
             host_user_id: meeting.creator_id,
             allow_guests: Some(meeting.allow_guests),
@@ -202,11 +259,30 @@ async fn join_as_attendee(
         return Ok(Json(APIResponse::ok(resp)));
     }
 
+    // Pass creator_id only when the host-gone check must be enforced.
+    // Folding this check into the transaction closes the TOCTOU window where
+    // concurrent requests could both pass an out-of-transaction host-status read.
+    let check_creator = if !meeting.end_on_host_leave && !meeting.admitted_can_admit {
+        meeting.creator_id.as_deref()
+    } else {
+        None
+    };
+
     // Atomically check waiting_room_enabled and insert participant in one
     // transaction, using FOR UPDATE to serialize against concurrent toggles.
-    let (auto_admitted, row, waiting_room_enabled) =
-        db_participants::join_attendee(&state.db, meeting.id, user_id, display_name, is_guest)
-            .await?;
+    let (auto_admitted, row, waiting_room_enabled) = match db_participants::join_attendee(
+        &state.db,
+        meeting.id,
+        user_id,
+        display_name,
+        check_creator,
+        is_guest,
+    )
+    .await?
+    {
+        Some(r) => r,
+        None => return Err(AppError::joining_not_allowed()),
+    };
 
     let token = if auto_admitted {
         Some(generate_room_token(
@@ -214,8 +290,9 @@ async fn join_as_attendee(
             state.token_ttl_secs,
             user_id,
             meeting_id,
-            false,
+            is_host,
             display_name.unwrap_or(fallback_display_name),
+            meeting.end_on_host_leave,
             is_guest,
         )?)
     } else {
@@ -239,6 +316,7 @@ async fn join_as_attendee(
     }
     resp.waiting_room_enabled = Some(waiting_room_enabled);
     resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+    resp.end_on_host_leave = Some(meeting.end_on_host_leave);
     resp.allow_guests = Some(meeting.allow_guests);
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
@@ -253,8 +331,8 @@ pub async fn join_meeting_as_guest(
     Path(meeting_id): Path<String>,
     body: Json<GuestJoinRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
-    let display_name =
-        validate_display_name(&body.display_name).map_err(|_| AppError::invalid_input())?;
+    let display_name = validate_display_name(&body.display_name)
+        .map_err(|_| AppError::invalid_input("Invalid display name."))?;
     let display_name = display_name.as_str();
 
     let meeting = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
@@ -324,6 +402,7 @@ pub async fn get_my_status(
             &meeting_id,
             row.is_host,
             row.display_name.as_deref().unwrap_or(&user_id),
+            meeting.end_on_host_leave,
             false,
         )?)
     } else {
@@ -333,6 +412,7 @@ pub async fn get_my_status(
     let mut resp = row.into_participant_status(token);
     resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
     resp.admitted_can_admit = Some(meeting.admitted_can_admit);
+    resp.end_on_host_leave = Some(meeting.end_on_host_leave);
     resp.allow_guests = Some(meeting.allow_guests);
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
@@ -381,6 +461,7 @@ pub async fn get_guest_status(
             &meeting_id,
             false,
             row.display_name.as_deref().unwrap_or(&user_id),
+            meeting.end_on_host_leave,
             true,
         )?)
     } else {
@@ -410,9 +491,10 @@ pub async fn leave_meeting(
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 
-    // If host left or no admitted participants remain, end the meeting.
+    // End the meeting when the host leaves only if end_on_host_leave is set,
+    // otherwise continue until the last participant leaves.
     let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
-    if is_host {
+    if is_host && meeting.end_on_host_leave {
         db_meetings::end_meeting(&state.db, meeting.id).await?;
     } else {
         let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;

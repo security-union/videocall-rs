@@ -258,7 +258,8 @@ pub fn GuestJoinPage(id: String) -> Element {
                 }
             };
 
-            let user_id_for_client = current_user_id().unwrap_or_else(|| input_value());
+            let user_id_for_client =
+                current_user_id().unwrap_or_else(|| input_value.read().clone());
 
             start_observer_connection(
                 observer_token,

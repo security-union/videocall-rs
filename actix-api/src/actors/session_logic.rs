@@ -202,6 +202,10 @@ pub struct SessionLogic {
     pub instance_id: Option<String>,
     /// Transport type for this session ("websocket" or "webtransport")
     pub transport: String,
+    /// Whether this participant is the meeting host.
+    pub is_host: bool,
+    /// Whether the meeting should end when the host leaves.
+    pub end_on_host_leave: bool,
     /// Tracks outbound packet drops per sender to generate CONGESTION feedback.
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
@@ -223,11 +227,13 @@ impl SessionLogic {
         observer: bool,
         instance_id: Option<String>,
         transport: &str,
+        is_host: bool,
+        end_on_host_leave: bool,
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
-            "new session: room={} user_id={} display_name={} is_guest={} session_id={} observer={} transport={}",
-            room, user_id, display_name, is_guest, id, observer, transport
+            "new session: room={} user_id={} display_name={} is_guest={} session_id={} observer={} is_host={} transport={}",
+            room, user_id, display_name, is_guest, id, observer, is_host, transport
         );
 
         SessionLogic {
@@ -243,6 +249,8 @@ impl SessionLogic {
             observer,
             instance_id,
             transport: transport.to_string(),
+            is_host,
+            end_on_host_leave,
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
         }
@@ -302,6 +310,8 @@ impl SessionLogic {
             is_guest: self.is_guest,
             observer: self.observer,
             instance_id: self.instance_id.clone(),
+            is_host: self.is_host,
+            end_on_host_leave: self.end_on_host_leave,
         }
     }
 
@@ -353,6 +363,8 @@ impl SessionLogic {
             display_name: self.display_name.clone(),
             is_guest: self.is_guest,
             observer: self.observer,
+            is_host: self.is_host,
+            end_on_host_leave: self.end_on_host_leave,
         });
     }
 
@@ -452,30 +464,30 @@ impl SessionLogic {
     /// If the drop threshold is exceeded, a CONGESTION `PacketWrapper` is
     /// published to NATS so the sender's client can step down its quality
     /// tier. The notification is rate-limited per sender session.
-    pub fn on_outbound_drop(&mut self, sender_session_id: u64) {
+    pub fn on_outbound_drop(&mut self, sender_session_id: u64, sender_user_id: &[u8]) {
         if let Some(sender_sid) = self.congestion_tracker.record_drop(sender_session_id) {
             warn!(
-                "Congestion: session {} dropping packets from sender {}, sending CONGESTION signal",
-                self.id, sender_sid,
+                "Congestion: session {} dropping packets from sender {} (user: {}), sending CONGESTION signal",
+                self.id, sender_sid, String::from_utf8_lossy(sender_user_id),
             );
 
             // Build a CONGESTION PacketWrapper targeted at the sender.
-            // The `user_id` is set to our session's user_id so the sender
-            // knows which receiver is congested. The `session_id` is set to
-            // the sender's session_id so NATS routing delivers it there.
+            // `user_id`: receiver's identity (for sender-side logging).
+            // `data`: sender's user_id (for observability on client side).
+            // `session_id`: sender's session_id — the client matches this
+            //               against its session_id history (all IDs from the
+            //               current page load) to survive reconnects while
+            //               correctly scoping to a single tab/instance.
             let congestion_packet = PacketWrapper {
                 packet_type: PacketType::CONGESTION.into(),
                 user_id: self.user_id.as_bytes().to_vec(),
+                data: sender_user_id.to_vec(),
                 session_id: sender_sid,
                 ..Default::default()
             };
 
             match congestion_packet.write_to_bytes() {
                 Ok(bytes) => {
-                    // Publish to the sender's NATS subject so only the
-                    // targeted sender receives the CONGESTION signal.
-                    // The sender's subscription filter (`room.{room}.*`)
-                    // matches `room.{room}.{sender_sid}`.
                     let subject = format!("room.{}.{}", self.room.replace(' ', "_"), sender_sid);
                     let nc = self.nats_client.clone();
                     let bytes = bytes::Bytes::from(bytes);

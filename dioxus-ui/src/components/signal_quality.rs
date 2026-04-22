@@ -406,7 +406,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     // No Dioxus signal for tooltip — we manipulate a <body>-level DOM element
     // directly to escape all stacking contexts from grid-items.
     // Hide tooltip when this popup component unmounts.
-    use_drop(|| hide_body_tooltip());
+    use_drop(hide_body_tooltip);
 
     // Which legend help text is currently expanded (if any).
     let mut help_visible = use_signal(|| None::<&'static str>);
@@ -953,29 +953,6 @@ fn nice_ceil(val: f64) -> f64 {
         10.0
     };
     nice * magnitude
-}
-
-/// Infer the sender's approximate adaptive quality tier from the received
-/// resolution. Returns a human-readable label matching the tier definitions
-/// in `adaptive_quality_constants.rs`.
-fn infer_video_tier(resolution: &str) -> &'static str {
-    // Parse "WxH" to extract height for tier matching.
-    let height: u32 = resolution
-        .split('x')
-        .nth(1)
-        .and_then(|h| h.parse().ok())
-        .unwrap_or(0);
-    match height {
-        h if h >= 1080 => "Full HD",
-        h if h >= 900 => "HD+",
-        h if h >= 720 => "HD",
-        h if h >= 540 => "Standard",
-        h if h >= 480 => "Medium",
-        h if h >= 360 => "Low",
-        h if h >= 270 => "Very Low",
-        h if h > 0 => "Minimal",
-        _ => "",
-    }
 }
 
 // ---------------------------------------------------------------------------

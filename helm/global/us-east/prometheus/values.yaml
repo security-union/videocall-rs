@@ -257,13 +257,13 @@ prometheus:
                 description: "NATS publish p99 latency is {{ $value | printf \"%.1f\" }}ms"
 
             - alert: RelayQueueNearFull
-              expr: relay_outbound_queue_depth > 200
+              expr: relay_outbound_queue_depth > 100
               for: 30s
               labels:
                 severity: warning
               annotations:
-                summary: "Relay outbound queue > 200/256"
-                description: "Room {{ $labels.room }} queue depth: {{ $value }}/256"
+                summary: "Relay outbound queue near capacity ({{ $labels.transport }})"
+                description: "Room {{ $labels.room }} ({{ $labels.transport }}) queue depth: {{ $value }} (WS cap=128, WT cap=256)"
 
         - name: videocall_quality_alerts
           rules:

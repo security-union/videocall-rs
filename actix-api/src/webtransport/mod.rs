@@ -264,7 +264,9 @@ async fn run_webtransport_connection_from_request(
         .map(|(_, val)| val.into_owned());
 
     // Determine username, room, and observer flag from either the JWT or URL path params.
-    let (username, lobby_id, observer, display_name) = if let Some(ref tok) = token {
+    let (username, lobby_id, observer, display_name, is_guest, is_host, end_on_host_leave) = if let Some(
+        ref tok,
+    ) = token {
         // Token-based flow: identity and room come from the JWT claims.
         let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
         if jwt_secret.is_empty() {
@@ -275,14 +277,17 @@ async fn run_webtransport_connection_from_request(
             anyhow!("token validation failed: {}", e.client_message())
         })?;
         info!(
-            "WT token-based connection: user_id={}, room={}, display_name={}, observer={}",
-            claims.sub, claims.room, claims.display_name, claims.observer
+            "WT token-based connection: user_id={}, room={}, display_name={}, is_guest={}, observer={}, is_host={}",
+            claims.sub, claims.room, claims.display_name, claims.is_guest, claims.observer, claims.is_host
         );
         (
             claims.sub,
             claims.room,
             claims.observer,
             claims.display_name,
+            claims.is_guest,
+            claims.is_host,
+            claims.end_on_host_leave,
         )
     } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
         // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
@@ -303,7 +308,8 @@ async fn run_webtransport_connection_from_request(
         );
         // display_name fallback: use user_id for deprecated path
         let display = username.clone();
-        (username, lobby_id, false, display) // deprecated path-based endpoint: never observer
+        // deprecated path-based endpoint: no JWT claim, treat as non-guest & non-observer, not host
+        (username, lobby_id, false, display, false, false, true)
     } else {
         // FF=on but no token provided
         info!("WT connection rejected: no token provided and meeting management is enabled");
@@ -322,12 +328,15 @@ async fn run_webtransport_connection_from_request(
         &username,
         &lobby_id,
         &display_name,
+        is_guest,
         chat_server,
         nats_client,
         tracker_sender,
         session_manager,
         observer,
         instance_id,
+        is_host,
+        end_on_host_leave,
     )
     .await
     {
@@ -347,15 +356,19 @@ async fn handle_webtransport_session(
     username: &str,
     lobby_id: &str,
     display_name: &str,
+    is_guest: bool,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
     observer: bool,
     instance_id: Option<String>,
+    is_host: bool,
+    end_on_host_leave: bool,
 ) -> anyhow::Result<()> {
     // Create channel for actor → WebTransport I/O
-    let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
+    let (outbound_tx, outbound_rx) =
+        mpsc::channel::<WtOutbound>(crate::constants::WT_OUTBOUND_CHANNEL_CAPACITY);
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(
@@ -363,12 +376,15 @@ async fn handle_webtransport_session(
         lobby_id.to_string(),
         username.to_string(),
         display_name.to_string(),
+        is_guest,
         outbound_tx,
         nats_client,
         tracker_sender,
         session_manager,
         observer,
         instance_id,
+        is_host,
+        end_on_host_leave,
     );
     let actor_addr = actor.start();
 
@@ -1692,6 +1708,7 @@ mod tests {
             "wt-jwt-room-1",
             true,
             "Alice",
+            false, // is_guest
         )
         .expect("generate token");
 
@@ -1715,6 +1732,7 @@ mod tests {
             "wt-jwt-room-2",
             false,
             "Alice",
+            false, // is_guest
         )
         .expect("generate token");
 
@@ -1736,6 +1754,7 @@ mod tests {
             "wt-jwt-room-3",
             false,
             "Alice",
+            false, // is_guest
         )
         .expect("generate token");
 
@@ -1768,6 +1787,7 @@ mod tests {
             "wt-special-room",
             false,
             "Bob",
+            false, // is_guest
         )
         .expect("generate token");
 
@@ -1823,6 +1843,7 @@ mod tests {
             room,
             true,
             "Host",
+            false, // is_guest
         )
         .expect("generate host token");
 
@@ -1833,6 +1854,7 @@ mod tests {
             room,
             false,
             "Attendee",
+            false, // is_guest
         )
         .expect("generate attendee token");
 

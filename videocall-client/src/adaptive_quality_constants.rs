@@ -1064,3 +1064,17 @@ pub const CONGESTION_WINDOW_MS: u64 = 1000;
 /// (milliseconds). Prevents flooding the sender with congestion signals when
 /// many packets are dropped in quick succession.
 pub const CONGESTION_NOTIFY_MIN_INTERVAL_MS: u64 = 1000;
+
+// ---------------------------------------------------------------------------
+// Client-Side WebSocket Backpressure Self-Detection
+// ---------------------------------------------------------------------------
+
+/// Number of client-side WebSocket send-buffer drops within
+/// [`WS_SELF_CONGESTION_WINDOW_MS`] that triggers a local AQ step-down.
+///
+/// Lower than the server-side threshold (5) because client-side drops are a
+/// more direct signal — each drop means the browser TCP send buffer is full.
+pub const WS_SELF_CONGESTION_DROP_THRESHOLD: u64 = 3;
+
+/// Tumbling window (ms) for counting client-side WS drops.
+pub const WS_SELF_CONGESTION_WINDOW_MS: f64 = 1000.0;

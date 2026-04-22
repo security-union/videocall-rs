@@ -46,6 +46,10 @@ impl AppError {
         )
     }
 
+    pub fn invalid_input(detail: &str) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, APIError::invalid_input(detail))
+    }
+
     pub fn invalid_meeting_id(detail: &str) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -97,6 +101,10 @@ impl AppError {
         Self::new(StatusCode::NOT_FOUND, APIError::not_in_meeting())
     }
 
+    pub fn joining_not_allowed() -> Self {
+        Self::new(StatusCode::FORBIDDEN, APIError::joining_not_allowed())
+    }
+  
     pub fn invalid_display_name(detail: &str) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -109,6 +117,10 @@ impl AppError {
             StatusCode::INTERNAL_SERVER_ERROR,
             APIError::internal_error(detail),
         )
+    }
+
+    pub fn guests_not_allowed() -> Self {
+        Self::new(StatusCode::FORBIDDEN, APIError::guests_not_allowed())
     }
 }
 

@@ -97,11 +97,11 @@ token_ttl_secs: 86400
 ```
 
 > **WebTransport limitation:** Bot WT clients currently send data but **do not receive
-> inbound streams** due to a known `accept_uni` issue in the quinn-based WT client.
-> This means WT bots don't generate relay fan-out load on the receiving side, making
-> load test results inaccurate. **Use `wt_ratio: 0.0` (all WebSocket) for load testing**
-> until the WT inbound path is fixed. Set `wt_ratio` > 0 only for testing WT
-> connectivity and outbound encoding.
+> inbound streams** due to a lost-waker bug in `web-transport-quinn` v0.8.1's
+> `accept_uni` implementation (`FuturesUnordered` + single waker under concurrent
+> callers). This was fixed upstream in v0.11.8 but the project hasn't upgraded yet.
+> **Use `wt_ratio: 0.0` (all WebSocket) for load testing** until `web-transport-quinn`
+> is upgraded. Set `wt_ratio` > 0 only for testing WT connectivity and outbound encoding.
 
 ### 4. Build & Run
 

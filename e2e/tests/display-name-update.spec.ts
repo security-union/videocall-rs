@@ -166,6 +166,28 @@ async function updateDisplayNameRaw(
   });
 }
 
+/**
+ * Call the meeting API's POST /join endpoint and return the raw Response
+ * without throwing on non-2xx status. Useful for testing rate-limit paths.
+ */
+async function joinMeetingRaw(
+  email: string,
+  name: string,
+  meetingId: string,
+  displayName?: string,
+): Promise<Response> {
+  const token = generateSessionToken(email, name);
+  const url = `${API_URL}/api/v1/meetings/${meetingId}/join`;
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: `${COOKIE_NAME}=${token}`,
+    },
+    body: displayName !== undefined ? JSON.stringify({ display_name: displayName }) : undefined,
+  });
+}
+
 test.describe("Display name live update", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -714,5 +736,62 @@ test.describe("Display name live update", () => {
       await browser1.close();
       await browser2.close();
     }
+  });
+
+  /**
+   * Verify that the join endpoint is rate-limited when a display_name is
+   * provided. The backend enforces 5 display-name changes per 60-second
+   * window per user, and join-with-display-name counts against that budget.
+   * The 6th request should return HTTP 429.
+   */
+  test("join with display_name is rate-limited after 5 requests", async () => {
+    test.setTimeout(30_000);
+    const email = `rl-join-${Date.now()}@videocall.rs`;
+    const name = "RLJoinUser";
+
+    for (let i = 0; i < 5; i++) {
+      const meetingId = `e2e_rl_join_${Date.now()}_${i}`;
+      const res = await joinMeetingRaw(email, name, meetingId, `Name${i}`);
+      expect(res.status).toBeLessThan(400);
+    }
+
+    // 6th join-with-display-name must be rejected
+    const meetingId = `e2e_rl_join_${Date.now()}_blocked`;
+    const res = await joinMeetingRaw(email, name, meetingId, "Blocked");
+    expect(res.status).toBe(429);
+  });
+
+  /**
+   * Verify that the rename (PUT /display-name) and join-with-display-name
+   * (POST /join) paths share the same per-user rate-limit budget. Using 3
+   * renames + 2 joins should exhaust the budget, and the 6th operation
+   * (either path) must return 429.
+   */
+  test("join and rename share the same rate-limit budget", async () => {
+    test.setTimeout(30_000);
+    const email = `rl-shared-${Date.now()}@videocall.rs`;
+    const name = "RLSharedUser";
+    const meetingId = `e2e_rl_shared_${Date.now()}`;
+
+    // First join (with display_name) creates the meeting and consumes 1 slot
+    const joinRes = await joinMeetingRaw(email, name, meetingId, "InitialName");
+    expect(joinRes.status).toBeLessThan(400);
+
+    // 2 renames via PUT consume 2 more slots (total 3)
+    for (let i = 0; i < 2; i++) {
+      const res = await updateDisplayNameRaw(email, name, meetingId, `Renamed${i}`);
+      expect(res.status).toBeLessThan(400);
+    }
+
+    // 2 more joins with display_name consume 2 more slots (total 5)
+    for (let i = 0; i < 2; i++) {
+      const otherMeeting = `e2e_rl_shared_extra_${Date.now()}_${i}`;
+      const res = await joinMeetingRaw(email, name, otherMeeting, `JoinName${i}`);
+      expect(res.status).toBeLessThan(400);
+    }
+
+    // 6th operation (rename) must be rejected — budget exhausted
+    const blockedRes = await updateDisplayNameRaw(email, name, meetingId, "BlockedName");
+    expect(blockedRes.status).toBe(429);
   });
 });

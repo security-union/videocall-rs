@@ -349,6 +349,12 @@ mod tests {
             // themselves.  Tests that want to verify 401-on-missing-credentials
             // use `make_test_state_with_oauth()` which overrides this.
             allow_anonymous: true,
+            display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
         }
     }
 
@@ -678,6 +684,12 @@ mod tests {
             // JWKS-mode tests exercise the OAuth path; unauthenticated
             // requests must not fall through to an anonymous identity.
             allow_anonymous: false,
+            display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
         }
     }
 

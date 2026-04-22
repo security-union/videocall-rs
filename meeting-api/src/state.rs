@@ -13,7 +13,9 @@
 
 //! Shared application state passed to every Axum handler via `State`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{atomic::AtomicU64, Arc, Mutex};
+use std::time::Instant;
 
 use crate::config::{Config, OAuthConfig, SearchConfig};
 use crate::oauth::JwksCache;
@@ -55,6 +57,11 @@ pub struct AppState {
     /// Opt-in anonymous-auth fallback flag (mirrors [`crate::config::Config::allow_anonymous`]).
     /// Only intended for local development; guards path 3 in the auth extractor.
     pub allow_anonymous: bool,
+    /// In-memory per-user rename rate limiter.
+    /// Each entry: (window_start, count) for a 60-second sliding window.
+    pub display_name_rate_limiter: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
+    /// Shared operation counter used to run periodic rate-limiter sweeps.
+    pub display_name_rate_limiter_ops: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -94,6 +101,8 @@ impl AppState {
                 .expect("failed to build reqwest client"),
             search: config.search.clone(),
             allow_anonymous: config.allow_anonymous,
+            display_name_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            display_name_rate_limiter_ops: Arc::new(AtomicU64::new(0)),
         }
     }
 }

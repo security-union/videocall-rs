@@ -287,8 +287,9 @@ mod tests {
 
     #[test]
     fn issuer_is_videocall_meeting_backend() {
-        let token = generate_room_token(TEST_SECRET, 300, "a@b.com", "r", false, "Bob", false, false)
-            .expect("should sign");
+        let token =
+            generate_room_token(TEST_SECRET, 300, "a@b.com", "r", false, "Bob", false, false)
+                .expect("should sign");
 
         let mut validation = Validation::default();
         validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);

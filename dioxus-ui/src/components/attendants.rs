@@ -40,9 +40,9 @@ use crate::constants::{
     CANVAS_LIMIT,
 };
 use crate::context::{
-    resolve_transport_config, save_display_name_to_storage, DisplayNameCtx, LocalAudioLevelCtx,
-    MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
-    TransportPreferenceCtx,
+    resolve_transport_config, save_display_name_to_storage, validate_display_name, DisplayNameCtx,
+    LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap,
+    TransportPreference, TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -781,16 +781,27 @@ pub fn AttendantsComponent(
 
                     if user_id_for_display_name_changed.as_deref() == Some(changed_user_id.as_str())
                     {
-                        log::info!(
-                            "DIOXUS-UI: Local user display name confirmed by server: {}",
-                            new_display_name
-                        );
-                        save_display_name_to_storage(&new_display_name);
-                        let mut current_display_name = current_display_name;
-                        current_display_name.set(new_display_name.clone());
-                        let mut dn_ctx = display_name_ctx_signal;
-                        dn_ctx.set(Some(new_display_name.clone()));
-                        log::debug!("DIOXUS-UI: current_display_name signal updated");
+                        match validate_display_name(&new_display_name) {
+                            Ok(validated_name) => {
+                                log::info!(
+                                    "DIOXUS-UI: Local user display name confirmed by server: {}",
+                                    validated_name
+                                );
+                                save_display_name_to_storage(&validated_name);
+                                let mut current_display_name = current_display_name;
+                                current_display_name.set(validated_name.clone());
+                                let mut dn_ctx = display_name_ctx_signal;
+                                dn_ctx.set(Some(validated_name));
+                                log::debug!("DIOXUS-UI: current_display_name signal updated");
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "DIOXUS-UI: Ignoring invalid display name from server: {:?} ({})",
+                                    new_display_name,
+                                    e
+                                );
+                            }
+                        }
                     }
 
                     let mut v = peer_display_name_version;

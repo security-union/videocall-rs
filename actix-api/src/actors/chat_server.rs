@@ -27,7 +27,7 @@ use crate::{
 };
 
 use actix::{
-    Actor, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
+    Actor, Addr, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
     SpawnHandle,
 };
 use futures::StreamExt;
@@ -783,7 +783,7 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
         if let Some(members) = self.room_members.get_mut(&msg.room_id) {
             for member in members.iter_mut() {
                 if member.user_id == msg.user_id {
-                    member.display_name = validated_name.clone();
+                    member.display_name.clone_from(&validated_name);
                 }
             }
         }
@@ -1222,99 +1222,14 @@ impl Handler<JoinRoom> for ChatServer {
             match nc2.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
                     while let Some(msg) = sub.next().await {
-                        // Detect PARTICIPANT_DISPLAY_NAME_CHANGED and update
-                        // in-memory room_members via the actor before forwarding.
-                        // Only system messages (room.{room}.system) carry display-name
-                        // change events — skip the protobuf parse entirely for the
-                        // high-frequency per-session media subjects.
-                        if msg.subject.ends_with(".system") {
-                            if let Ok(wrapper) = PacketWrapper::parse_from_bytes(&msg.payload) {
-                                if wrapper.packet_type == PacketType::MEETING.into() {
-                                    if let Ok(inner) =
-                                        MeetingPacket::parse_from_bytes(&wrapper.data)
-                                    {
-                                        if inner.event_type
-                                            == MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED
-                                                .into()
-                                        {
-                                            let target = match String::from_utf8(
-                                                inner.target_user_id.to_vec(),
-                                            ) {
-                                                Ok(s) => s,
-                                                Err(_) => {
-                                                    warn!("UpdateMemberDisplayName: non-UTF-8 target_user_id in NATS packet, dropping");
-                                                    continue;
-                                                }
-                                            };
-                                            let new_name = match String::from_utf8(
-                                                inner.display_name.to_vec(),
-                                            ) {
-                                                Ok(s) => s,
-                                                Err(_) => {
-                                                    warn!("UpdateMemberDisplayName: non-UTF-8 display_name in NATS packet, dropping");
-                                                    continue;
-                                                }
-                                            };
-                                            if !target.is_empty() && !new_name.is_empty() {
-                                                let room_mismatch = !inner.room_id.is_empty()
-                                                    && inner.room_id != room_clone;
-                                                if room_mismatch {
-                                                    warn!(
-                                                        "UpdateMemberDisplayName: protobuf room_id '{}' differs from subscription room '{}', sanitizing before forwarding",
-                                                        inner.room_id, room_clone
-                                                    );
-                                                }
-                                                server_addr.do_send(UpdateMemberDisplayName {
-                                                    room_id: room_clone.clone(),
-                                                    user_id: target,
-                                                    display_name: new_name,
-                                                });
-                                                if room_mismatch {
-                                                    // Rewrite room_id so clients never see the mismatched value.
-                                                    let mut patched = inner;
-                                                    patched.room_id = room_clone.clone();
-                                                    let forwarded =
-                                                        patched.write_to_bytes().and_then(|ib| {
-                                                            let mut pw = wrapper;
-                                                            pw.data = ib;
-                                                            pw.write_to_bytes()
-                                                        });
-                                                    match forwarded {
-                                                        Ok(sanitized) => {
-                                                            let message = Message {
-                                                                msg: sanitized,
-                                                                session: session_clone,
-                                                            };
-                                                            if let Err(e) =
-                                                                session_recipient.try_send(message)
-                                                            {
-                                                                RELAY_PACKET_DROPS_TOTAL
-                                                                    .with_label_values(&[
-                                                                        &room_clone,
-                                                                        "nats_delivery",
-                                                                        "mailbox_full",
-                                                                    ])
-                                                                    .inc();
-                                                                warn!(
-                                                                    "Dropping sanitized PARTICIPANT_DISPLAY_NAME_CHANGED for session {}: {}",
-                                                                    session_clone, e
-                                                                );
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(
-                                                                "Failed to re-serialize sanitized PARTICIPANT_DISPLAY_NAME_CHANGED, dropping forward: {}",
-                                                                e
-                                                            );
-                                                        }
-                                                    }
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        if try_intercept_display_name_change(
+                            &msg,
+                            &room_clone,
+                            session_clone,
+                            &session_recipient,
+                            &server_addr,
+                        ) {
+                            continue;
                         }
 
                         if let Err(e) = handle_msg(
@@ -1355,6 +1270,130 @@ async fn send_meeting_info(
         Ok(_) => info!("Sent meeting start time {} to {}", start_time_ms, subject),
         Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),
     }
+}
+
+/// Checks whether `msg` is a `PARTICIPANT_DISPLAY_NAME_CHANGED` system event.
+/// If so, validates and sanitises the packet, updates actor state via `server`,
+/// and forwards the rebuilt packet to `recipient`. Returns `true` when the
+/// message has been intercepted and the caller must `continue` the NATS loop;
+/// `false` when the caller should fall through to `handle_msg`.
+fn try_intercept_display_name_change(
+    msg: &async_nats::Message,
+    room_id: &str,
+    session: SessionId,
+    recipient: &Recipient<Message>,
+    server: &Addr<ChatServer>,
+) -> bool {
+    if !msg.subject.ends_with(".system") {
+        return false;
+    }
+
+    let wrapper = match PacketWrapper::parse_from_bytes(&msg.payload) {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+
+    if wrapper.packet_type != PacketType::MEETING.into() {
+        return false;
+    }
+
+    let mut inner = match MeetingPacket::parse_from_bytes(&wrapper.data) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    if inner.event_type != MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into() {
+        return false;
+    }
+
+    let target = match String::from_utf8(std::mem::take(&mut inner.target_user_id)) {
+        Ok(s) => s,
+        Err(_) => {
+            warn!("UpdateMemberDisplayName: non-UTF-8 target_user_id in NATS packet, dropping");
+            return true;
+        }
+    };
+    let new_name = match String::from_utf8(std::mem::take(&mut inner.display_name)) {
+        Ok(s) => s,
+        Err(_) => {
+            warn!("UpdateMemberDisplayName: non-UTF-8 display_name in NATS packet, dropping");
+            return true;
+        }
+    };
+
+    if target.is_empty() || new_name.is_empty() {
+        return false;
+    }
+
+    let validated_name = match validate_display_name(&new_name) {
+        Ok(name) => name,
+        Err(e) => {
+            warn!(
+                "NATS PARTICIPANT_DISPLAY_NAME_CHANGED: rejecting invalid display name for user {} in room {}: {}",
+                target, room_id, e
+            );
+            return true;
+        }
+    };
+
+    let room_mismatch = !inner.room_id.is_empty() && inner.room_id != room_id;
+    if room_mismatch {
+        warn!(
+            "UpdateMemberDisplayName: protobuf room_id '{}' differs from subscription room '{}', sanitizing before forwarding",
+            inner.room_id, room_id
+        );
+    }
+
+    // do_send is intentional here: display-name changes are rare
+    // and low-priority. Mailbox backpressure on the actor is
+    // unlikely; if it occurs the rename is silently skipped rather
+    // than blocking the NATS subscription loop. The forwarded
+    // client packet (below) is handled separately via try_send
+    // with RELAY_PACKET_DROPS_TOTAL accounting.
+    server.do_send(UpdateMemberDisplayName {
+        room_id: room_id.to_string(),
+        user_id: target.clone(),
+        display_name: validated_name.clone(),
+    });
+
+    // Always rebuild the packet with the authoritative room_id and validated
+    // display_name so raw NATS payloads are never forwarded verbatim.
+    inner.room_id = room_id.to_string();
+    inner.target_user_id = target.into_bytes();
+    inner.display_name = validated_name.into_bytes();
+    let patched = inner;
+
+    let forwarded = patched.write_to_bytes().and_then(|ib| {
+        let mut pw = wrapper;
+        pw.data = ib;
+        pw.write_to_bytes()
+    });
+
+    match forwarded {
+        Ok(sanitized) => {
+            let message = Message {
+                msg: sanitized,
+                session,
+            };
+            if let Err(e) = recipient.try_send(message) {
+                RELAY_PACKET_DROPS_TOTAL
+                    .with_label_values(&[room_id, "nats_delivery", "mailbox_full"])
+                    .inc();
+                warn!(
+                    "Dropping sanitized PARTICIPANT_DISPLAY_NAME_CHANGED for session {}: {}",
+                    session, e
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Failed to re-serialize sanitized PARTICIPANT_DISPLAY_NAME_CHANGED, dropping forward: {}",
+                e
+            );
+        }
+    }
+
+    true
 }
 
 fn handle_msg(

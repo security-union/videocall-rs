@@ -102,6 +102,7 @@ token_ttl_secs: 86400
 > callers). This was fixed upstream in v0.11.8 but the project hasn't upgraded yet.
 > **Use `wt_ratio: 0.0` (all WebSocket) for load testing** until `web-transport-quinn`
 > is upgraded. Set `wt_ratio` > 0 only for testing WT connectivity and outbound encoding.
+> https://github01.hclpnp.com/labs-projects/videocall/issues/387 tracks upgrading.
 
 ### 4. Build & Run
 

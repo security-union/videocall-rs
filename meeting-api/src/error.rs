@@ -101,10 +101,18 @@ impl AppError {
         Self::new(StatusCode::NOT_FOUND, APIError::not_in_meeting())
     }
 
-    pub fn invalid_display_name(detail: &str) -> Self {
+    pub fn joining_not_allowed() -> Self {
+        Self::new(StatusCode::FORBIDDEN, APIError::joining_not_allowed())
+    }
+
+    pub fn invalid_display_name() -> Self {
+        Self::new(StatusCode::BAD_REQUEST, APIError::invalid_display_name())
+    }
+
+    pub fn rate_limit_exceeded() -> Self {
         Self::new(
-            StatusCode::BAD_REQUEST,
-            APIError::invalid_display_name(detail),
+            StatusCode::TOO_MANY_REQUESTS,
+            APIError::rate_limit_exceeded(),
         )
     }
 

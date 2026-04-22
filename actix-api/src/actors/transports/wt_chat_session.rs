@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::DATAGRAM_MAX_SIZE;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
-use crate::constants::CLIENT_TIMEOUT;
+use crate::constants::{CLIENT_TIMEOUT, WT_OUTBOUND_CHANNEL_CAPACITY};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL};
@@ -121,6 +121,8 @@ impl WtChatSession {
         session_manager: SessionManager,
         observer: bool,
         instance_id: Option<String>,
+        is_host: bool,
+        end_on_host_leave: bool,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -134,6 +136,8 @@ impl WtChatSession {
             observer,
             instance_id,
             "webtransport",
+            is_host,
+            end_on_host_leave,
         );
 
         WtChatSession {
@@ -218,10 +222,9 @@ impl WtChatSession {
     /// Start heartbeat check (WebTransport-specific timing)
     fn start_heartbeat(&self, ctx: &mut Context<Self>) {
         ctx.run_interval(WT_HEARTBEAT_INTERVAL, |act, ctx| {
-            // Sample outbound queue depth for Prometheus (capacity 256)
-            let depth = 256 - act.outbound_tx.capacity();
+            let depth = WT_OUTBOUND_CHANNEL_CAPACITY - act.outbound_tx.capacity();
             RELAY_OUTBOUND_QUEUE_DEPTH
-                .with_label_values(&[&act.logic.room])
+                .with_label_values(&[&act.logic.room, "webtransport"])
                 .set(depth as f64);
 
             // Check if connection is dead (channel closed)
@@ -342,11 +345,15 @@ impl Handler<Message> for WtChatSession {
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         let bytes = self.logic.handle_outbound(&msg);
 
-        // Parse the PacketWrapper once to extract the sender's session_id
-        // and packet_type. This avoids a redundant parse in send_auto and
-        // ensures congestion tracking targets the correct (sender) session.
+        // Parse the PacketWrapper once to extract the sender's session_id,
+        // user_id, and packet_type. This avoids a redundant parse in send_auto
+        // and ensures congestion tracking targets the correct (sender) session.
         let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
         let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
+        let sender_user_id = parsed
+            .as_ref()
+            .map(|pw| pw.user_id.clone())
+            .unwrap_or_default();
         let is_media = parsed
             .as_ref()
             .map(|pw| pw.packet_type == PacketType::MEDIA.into())
@@ -361,7 +368,8 @@ impl Handler<Message> for WtChatSession {
                 // Outbound channel full -- record the drop for the actual sender
                 // so we can send CONGESTION feedback when the threshold is exceeded.
                 if sender_session_id != 0 {
-                    self.logic.on_outbound_drop(sender_session_id);
+                    self.logic
+                        .on_outbound_drop(sender_session_id, &sender_user_id);
                 }
             }
         }

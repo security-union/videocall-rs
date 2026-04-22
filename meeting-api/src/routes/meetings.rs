@@ -101,6 +101,7 @@ pub async fn create_meeting(
 
     let waiting_room_enabled = body.waiting_room_enabled.unwrap_or(true);
     let admitted_can_admit = body.admitted_can_admit.unwrap_or(false);
+    let end_on_host_leave = body.end_on_host_leave.unwrap_or(true);
     let allow_guests = body.allow_guests.unwrap_or(false);
 
     let row = db_meetings::create_with_options(
@@ -111,6 +112,7 @@ pub async fn create_meeting(
         &attendees_json,
         waiting_room_enabled,
         admitted_can_admit,
+        end_on_host_leave,
         allow_guests,
     )
     .await
@@ -130,6 +132,7 @@ pub async fn create_meeting(
         has_password: password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         admitted_can_admit: row.admitted_can_admit,
+        end_on_host_leave: row.end_on_host_leave,
         allow_guests: row.allow_guests,
     };
 
@@ -165,6 +168,7 @@ pub async fn list_meetings(
             waiting_count,
             waiting_room_enabled: row.waiting_room_enabled,
             admitted_can_admit: row.admitted_can_admit,
+            end_on_host_leave: row.end_on_host_leave,
             allow_guests: row.allow_guests,
         });
     }
@@ -202,6 +206,7 @@ pub async fn get_meeting(
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         admitted_can_admit: row.admitted_can_admit,
+        end_on_host_leave: row.end_on_host_leave,
         participant_count,
         waiting_count,
         started_at: row.started_at.timestamp_millis(),
@@ -264,6 +269,7 @@ pub async fn end_meeting_handler(
             has_password: meeting.password_hash.is_some(),
             waiting_room_enabled: meeting.waiting_room_enabled,
             admitted_can_admit: meeting.admitted_can_admit,
+            end_on_host_leave: meeting.end_on_host_leave,
             participant_count,
             waiting_count,
             started_at: meeting.started_at.timestamp_millis(),
@@ -294,6 +300,7 @@ pub async fn end_meeting_handler(
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         admitted_can_admit: row.admitted_can_admit,
+        end_on_host_leave: row.end_on_host_leave,
         participant_count,
         waiting_count,
         started_at: row.started_at.timestamp_millis(),
@@ -312,6 +319,7 @@ pub async fn update_meeting(
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
     let row = if body.waiting_room_enabled.is_some()
         || body.admitted_can_admit.is_some()
+        || body.end_on_host_leave.is_some()
         || body.allow_guests.is_some()
     {
         // Atomically update both settings within a single transaction.
@@ -323,6 +331,7 @@ pub async fn update_meeting(
             &user_id,
             body.waiting_room_enabled,
             body.admitted_can_admit,
+            body.end_on_host_leave,
             body.allow_guests,
         )
         .await?
@@ -363,6 +372,7 @@ pub async fn update_meeting(
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         admitted_can_admit: row.admitted_can_admit,
+        end_on_host_leave: row.end_on_host_leave,
         participant_count,
         waiting_count,
         started_at: row.started_at.timestamp_millis(),

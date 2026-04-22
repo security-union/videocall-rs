@@ -47,6 +47,33 @@ if ! psql "$DATABASE_URL" -c 'SELECT 1' >/dev/null; then
     exit
 fi
 
+if ! [ -x "$(command -v dbmate)" ] ; then
+    echo "please install dbmate (brew install dbmate) so schema migrations stay in sync"
+    exit
+fi
+
+# Run any pending schema migrations so newly-pulled branches don't 500 on
+# missing columns. dbmate needs sslmode=disable on the connection string for
+# local postgres; append it only if the caller hasn't already specified one.
+DBMATE_URL="$DATABASE_URL"
+if [[ "$DBMATE_URL" != *"sslmode="* ]]; then
+    if [[ "$DBMATE_URL" == *"?"* ]]; then
+        DBMATE_URL="${DBMATE_URL}&sslmode=disable"
+    else
+        DBMATE_URL="${DBMATE_URL}?sslmode=disable"
+    fi
+fi
+if ! DATABASE_URL="$DBMATE_URL" dbmate --migrations-dir dbmate/db/migrations --no-dump-schema up; then
+    echo ""
+    echo "schema migration failed — servers NOT started."
+    echo "see dbmate output above. common fixes:"
+    echo "  - conflict / drift:  DATABASE_URL=\"$DBMATE_URL\" dbmate --migrations-dir dbmate/db/migrations status"
+    echo "  - roll back one:     DATABASE_URL=\"$DBMATE_URL\" dbmate --migrations-dir dbmate/db/migrations rollback"
+    echo "  - reset local db:    DATABASE_URL=\"$DBMATE_URL\" dbmate --migrations-dir dbmate/db/migrations drop && \\"
+    echo "                       DATABASE_URL=\"$DBMATE_URL\" dbmate --migrations-dir dbmate/db/migrations up"
+    exit 1
+fi
+
 nats-server --addr "$(trurl -g '{host}' "$NATS_URL")" --port "$(trurl -g '{port}' "$NATS_URL")" &
 
 pushd actix-api > /dev/null || exit

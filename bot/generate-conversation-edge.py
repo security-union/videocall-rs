@@ -41,28 +41,36 @@ TARGET_SR = 48000   # Opus encoder expects 48kHz
 
 # Participants in order — bot takes the first N.
 # Run `edge-tts --list-voices | grep en` to see all options.
+#
+# costume_dir: path to I420 frame directory (idle.i420 + talking.i420).
+#   Generate with: ffmpeg -y -i clip.mp4 -vf "scale=1280:720,fps=30" -pix_fmt yuv420p -f rawvideo idle.i420
+#   Set to None for EKG fallback or observer-only participants.
 PARTICIPANTS = [
-    {"name": "alice",   "voice": "en-US-AvaNeural",          "ekg_color": [0, 200, 220]},
-    {"name": "bob",     "voice": "en-US-AndrewNeural",       "ekg_color": [80, 220, 80]},
-    {"name": "carol",   "voice": "en-US-EmmaNeural",         "ekg_color": [220, 160, 40]},
-    {"name": "dave",    "voice": "en-US-BrianNeural",        "ekg_color": [200, 80, 200]},
-    {"name": "eve",     "voice": "en-US-JennyNeural",        "ekg_color": [220, 80, 80]},
-    {"name": "frank",   "voice": "en-US-GuyNeural",          "ekg_color": [80, 180, 220]},
-    {"name": "grace",   "voice": "en-GB-SoniaNeural",        "ekg_color": [220, 120, 180]},
-    {"name": "henry",   "voice": "en-GB-RyanNeural",         "ekg_color": [140, 220, 140]},
-    {"name": "iris",    "voice": "en-AU-NatashaNeural",      "ekg_color": [220, 200, 80]},
-    {"name": "jack",    "voice": "en-US-ChristopherNeural",  "ekg_color": [180, 140, 100]},
-    {"name": "karen",   "voice": "en-US-MichelleNeural",     "ekg_color": [100, 180, 200]},
-    {"name": "leo",     "voice": "en-GB-ThomasNeural",       "ekg_color": [200, 160, 120]},
-    {"name": "mona",    "voice": "en-US-AriaNeural",         "ekg_color": [160, 100, 220]},
-    {"name": "nick",    "voice": "en-IE-ConnorNeural",       "ekg_color": [120, 200, 160]},
-    {"name": "olivia",  "voice": "en-AU-NatashaNeural",      "ekg_color": [220, 140, 100]},
-    {"name": "pete",    "voice": "en-CA-LiamNeural",         "ekg_color": [100, 140, 220]},
-    {"name": "quinn",   "voice": "en-CA-ClaraNeural",        "ekg_color": [220, 100, 160]},
-    {"name": "rosa",    "voice": "en-IN-NeerjaNeural",       "ekg_color": [180, 220, 100]},
-    {"name": "sam",     "voice": "en-IN-PrabhatNeural",      "ekg_color": [140, 100, 180]},
-    {"name": "tina",    "voice": "en-GB-LibbyNeural",        "ekg_color": [220, 180, 140]},
+    {"name": "alice",   "voice": "en-US-AvaNeural",          "costume_dir": "assets/costumes/pirate"},
+    {"name": "bob",     "voice": "en-US-AndrewNeural",       "costume_dir": "assets/costumes/bunny"},
+    {"name": "carol",   "voice": "en-US-EmmaNeural",         "costume_dir": "assets/costumes/cat"},
+    {"name": "dave",    "voice": "en-US-BrianNeural",        "costume_dir": "assets/costumes/cowboy"},
+    {"name": "eve",     "voice": "en-US-JennyNeural",        "costume_dir": "assets/costumes/cyberspace"},
+    {"name": "frank",   "voice": "en-US-GuyNeural",          "costume_dir": "assets/costumes/dino"},
+    {"name": "grace",   "voice": "en-GB-SoniaNeural",        "costume_dir": "assets/costumes/dog"},
+    {"name": "henry",   "voice": "en-GB-RyanNeural",         "costume_dir": "assets/costumes/flying"},
+    {"name": "iris",    "voice": "en-AU-NatashaNeural",      "costume_dir": "assets/costumes/hair"},
+    {"name": "jack",    "voice": "en-US-ChristopherNeural",  "costume_dir": "assets/costumes/lightbulb"},
+    {"name": "karen",   "voice": "en-US-MichelleNeural",     "costume_dir": "assets/costumes/martian"},
+    {"name": "leo",     "voice": "en-GB-ThomasNeural",       "costume_dir": "assets/costumes/mustach"},
+    {"name": "mona",    "voice": "en-US-AriaNeural",         "costume_dir": "assets/costumes/owl"},
+    {"name": "nick",    "voice": "en-IE-ConnorNeural",       "costume_dir": "assets/costumes/pig"},
+    {"name": "olivia",  "voice": "en-AU-NatashaNeural",      "costume_dir": "assets/costumes/potato"},
+    {"name": "pete",    "voice": "en-CA-LiamNeural",         "costume_dir": "assets/costumes/puffer"},
+    {"name": "quinn",   "voice": "en-CA-ClaraNeural",        "costume_dir": "assets/costumes/sloth"},
+    {"name": "rosa",    "voice": "en-IN-NeerjaNeural",       "costume_dir": "assets/costumes/strawberry"},
+    {"name": "sam",     "voice": "en-IN-PrabhatNeural",      "costume_dir": "assets/costumes/wizard"},
+    {"name": "tina",    "voice": "en-GB-LibbyNeural"},
 ]
+
+# Additional observer-only participants (no voice, no costume, no audio lines).
+# These connect, receive, and report health but never send media.
+NUM_OBSERVERS = 30
 
 # Voice lookup by name
 VOICE_MAP = {p["name"]: p["voice"] for p in PARTICIPANTS}
@@ -210,10 +218,21 @@ async def main():
 
         print(f"        -> {wav_filename} ({duration_ms}ms)")
 
+    # Build participant list for manifest (speakers + observers)
+    all_participants = []
+    for p in PARTICIPANTS:
+        entry = {"name": p["name"], "voice": p["voice"]}
+        if "costume_dir" in p:
+            entry["costume_dir"] = p["costume_dir"]
+        all_participants.append(entry)
+
+    for i in range(1, NUM_OBSERVERS + 1):
+        all_participants.append({"name": f"observer-{i:02d}", "voice": "none"})
+
     # Write manifest
     import yaml
     manifest = {
-        "participants": PARTICIPANTS,
+        "participants": all_participants,
         "pause_ms": 800,
         "lines": manifest_lines,
     }
@@ -227,6 +246,7 @@ async def main():
     total_ms = total_speech_ms + total_pause_ms
     print(f"\nDone! {len(manifest_lines)} lines, {total_ms / 1000:.1f}s total")
     print(f"  Speech: {total_speech_ms / 1000:.1f}s, Pauses: {total_pause_ms / 1000:.1f}s")
+    print(f"  Participants: {len(PARTICIPANTS)} speakers + {NUM_OBSERVERS} observers = {len(all_participants)}")
     print(f"  Manifest: {manifest_path}")
 
 

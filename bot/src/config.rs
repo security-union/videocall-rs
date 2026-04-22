@@ -232,6 +232,7 @@ pub struct Participant {
     pub name: String,
     #[allow(dead_code)]
     pub voice: String,
+    #[serde(default = "default_ekg_color")]
     pub ekg_color: [u8; 3],
     /// Path to costume sprite sheet directory (for VideoMode::Costume).
     pub costume_dir: Option<String>,
@@ -243,6 +244,10 @@ pub struct Line {
     pub audio_file: String,
     #[allow(dead_code)]
     pub duration_ms: u64,
+}
+
+fn default_ekg_color() -> [u8; 3] {
+    [100, 100, 100]
 }
 
 impl Manifest {

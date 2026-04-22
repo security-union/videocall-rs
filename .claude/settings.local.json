@@ -61,9 +61,7 @@
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:crates.io)",
       "WebFetch(domain:streams.spec.whatwg.org)",
-      "WebFetch(domain:grafana.videocall.fnxlabs.com)",
-      "Read(//Users/ilya/.cargo/bin/**)",
-      "Read(//Users/ilya/.rustup/**)"
+      "WebFetch(domain:grafana.videocall.fnxlabs.com)"
     ]
   }
 }

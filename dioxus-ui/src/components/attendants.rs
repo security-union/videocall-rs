@@ -361,6 +361,67 @@ fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     (best_cols, best_rows, best_tw)
 }
 
+/// Promote overflow speakers into the visible portion of a tile list.
+///
+/// When there are more tiles than fit on screen, tiles beyond `visible_count`
+/// are "overflow". If an overflow peer spoke within `active_ms` of `now_ms`,
+/// swap them with the least-recently-active visible peer that is NOT speaking.
+/// The loudest overflow speaker (most recent) gets priority.
+fn promote_speakers(
+    tiles: &mut Vec<String>,
+    visible_count: usize,
+    speech_map: &HashMap<String, f64>,
+    join_map: &HashMap<String, f64>,
+    now_ms: f64,
+    active_ms: f64,
+) {
+    if visible_count >= tiles.len() {
+        return;
+    }
+
+    // Effective timestamp: last speech time if exists, else join time.
+    let eff_ts = |peer: &str| -> f64 {
+        speech_map
+            .get(peer)
+            .copied()
+            .unwrap_or_else(|| join_map.get(peer).copied().unwrap_or(0.0))
+    };
+
+    // Overflow tiles that are actively speaking (most recent first).
+    let mut overflow_speakers: Vec<(usize, f64)> = Vec::new();
+    for i in visible_count..tiles.len() {
+        if let Some(&ts) = speech_map.get(&tiles[i]) {
+            if now_ms - ts < active_ms {
+                overflow_speakers.push((i, ts));
+            }
+        }
+    }
+    overflow_speakers.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Visible non-speaking tiles as swap candidates (least recently active first).
+    let mut swap_candidates: Vec<(usize, f64)> = (0..visible_count)
+        .filter(|&i| {
+            speech_map
+                .get(&tiles[i])
+                .map_or(true, |&ts| now_ms - ts >= active_ms)
+        })
+        .map(|i| (i, eff_ts(&tiles[i])))
+        .collect();
+    swap_candidates.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Swap pairs — all indices are disjoint so order doesn't matter.
+    let num_swaps = overflow_speakers.len().min(swap_candidates.len());
+    for i in 0..num_swaps {
+        tiles.swap(swap_candidates[i].0, overflow_speakers[i].0);
+    }
+}
+
 use super::density::{DensityMode, DENSITY_MODES};
 
 #[component]
@@ -1085,7 +1146,7 @@ pub fn AttendantsComponent(
         .into_iter()
         .filter(|session_id| *session_id != own_session)
         .collect();
-    let mut display_peers = display_peers;
+    let display_peers = display_peers;
     // Assign synthetic join times to mock peers for local testing.
     // Real peers get their join time recorded in the on_peer_added callback
     // (not during render) to avoid signal-writes-during-render loops.
@@ -1255,68 +1316,18 @@ pub fn AttendantsComponent(
         });
     }
 
-    // --- Overflow speaker promotion ---
-    // When there are more tiles than fit on screen, the grid splits into
-    // "visible" (first `visible_tile_count` items) and "overflow" (the rest).
-    // If a peer in the overflow set is actively speaking (spoke within
-    // SPEAKER_ACTIVE_MS), we swap them into the visible set by displacing the
-    // least-recently-active visible peer that is NOT currently speaking.
-    //
-    // Algorithm:
-    // 1. Collect overflow indices whose peer spoke within SPEAKER_ACTIVE_MS,
-    //    sorted most-recent-first (so the loudest speaker gets priority).
-    // 2. Collect visible indices whose peer is NOT actively speaking, sorted
-    //    by effective timestamp ascending (least-recently-active first = best
-    //    swap candidate).
-    // 3. Pair up overflow speakers with swap candidates and swap in-place.
-    //    All index pairs are disjoint so swap order doesn't matter.
-    if visible_tile_count < all_tiles.len() {
+    // --- Overflow speaker promotion (see promote_speakers() docs) ---
+    {
         let speech_map = peer_speech_priority.read();
         let join_map = peer_join_time.read();
-
-        // Effective timestamp: last speech time if exists, else join time.
-        let eff_ts = |peer: &str| -> f64 {
-            speech_map
-                .get(peer)
-                .copied()
-                .unwrap_or_else(|| join_map.get(peer).copied().unwrap_or(0.0))
-        };
-
-        // Overflow tiles that are actively speaking (most recent first).
-        // Only real peers can speak — mock tiles never trigger this.
-        let mut overflow_speakers: Vec<(usize, f64)> = Vec::new();
-        for i in visible_tile_count..all_tiles.len() {
-            if let Some(&ts) = speech_map.get(&all_tiles[i]) {
-                if now_ms - ts < SPEAKER_ACTIVE_MS {
-                    overflow_speakers.push((i, ts));
-                }
-            }
-        }
-        overflow_speakers.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Visible non-speaking tiles as swap candidates (least recently active first).
-        let mut swap_candidates: Vec<(usize, f64)> = (0..visible_tile_count)
-            .filter(|&i| {
-                // Only displace tiles that are NOT actively speaking.
-                speech_map
-                    .get(&all_tiles[i])
-                    .map_or(true, |&ts| now_ms - ts >= SPEAKER_ACTIVE_MS)
-            })
-            .map(|i| (i, eff_ts(&all_tiles[i])))
-            .collect();
-        swap_candidates.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Swap pairs — all indices are disjoint so order doesn't matter.
-        let num_swaps = overflow_speakers.len().min(swap_candidates.len());
-        for i in 0..num_swaps {
-            all_tiles.swap(swap_candidates[i].0, overflow_speakers[i].0);
-        }
+        promote_speakers(
+            &mut all_tiles,
+            visible_tile_count,
+            &speech_map,
+            &join_map,
+            now_ms,
+            SPEAKER_ACTIVE_MS,
+        );
     }
 
     // The visible portion of the unified tile list (used by the normal grid layout).
@@ -1360,18 +1371,31 @@ pub fn AttendantsComponent(
     // The right panel uses a 2-column grid of compact tiles. We compute how
     // many fit based on the available height, then run speaker promotion
     // independently of the normal grid's visible_tile_count.
-    let ss_panel_width = (vw / 3.0 - 32.0).max(100.0);
-    let ss_tile_w = (ss_panel_width - 8.0) / 2.0; // 2 columns, 8px gap
+    //
+    // Layout constants must stay in sync with container_style below:
+    //   - SS_FLEX_RATIO: right panel gets 1/(2+1) of the container width
+    //   - SS_OUTER_PAD: padding: 16px 16px 80px 16px → left + right = 32px
+    //   - SS_GAP: gap between left/right panels = 10px (container gap)
+    //   - SS_GRID_GAP: gap between tiles in the 2-col grid = 8px
+    //   - SS_GRID_PAD: padding inside the right panel div = 6px each side
+    //   - SS_BOTTOM_PAD: padding-bottom (80px) from container_style
+    //   - SS_TOP_PAD: padding-top (16px) + right panel padding (6px*2)
+    const SS_COLS: f64 = 2.0;
+    const SS_GRID_GAP: f64 = 8.0;
+    const SS_BOTTOM_PAD: f64 = 80.0;
+    const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
+    // Right panel content width ≈ (vw - outer_horiz_pad - panel_gap) / 3 - grid_pad
+    let ss_panel_width = ((vw - 42.0) / 3.0 - 12.0).max(100.0);
+    let ss_tile_w = (ss_panel_width - SS_GRID_GAP) / SS_COLS;
     let ss_tile_h = ss_tile_w / (16.0 / 9.0);
-    let ss_avail_h = vh - 80.0 - 32.0; // minus bottom controls and padding
-    let ss_max_rows = ((ss_avail_h + 8.0) / (ss_tile_h + 8.0)).floor() as usize;
-    let ss_max_tiles = (ss_max_rows * 2).max(2);
+    let ss_avail_h = vh - SS_BOTTOM_PAD - SS_VERT_PAD;
+    let ss_max_rows = ((ss_avail_h + SS_GRID_GAP) / (ss_tile_h + SS_GRID_GAP)).floor() as usize;
+    let ss_max_tiles = (ss_max_rows * SS_COLS as usize).max(2);
 
-    // Build a separate tile list for screen share with its own promotion pass.
+    // Build a separate tile list for the screen-share right panel.
+    // The grid's promotion used visible_tile_count which differs from the
+    // screen-share panel's capacity, so we rebuild from scratch and re-promote.
     let (ss_tiles, ss_overflow_count) = if has_screen_share {
-        // Clone all_tiles before grid promotion may have reordered for a
-        // different visible_tile_count. Actually, all_tiles was already
-        // promoted for the grid — re-sort by join time and re-promote for ss.
         let mut ss_all: Vec<String> = Vec::with_capacity(total_tiles);
         for peer_id in display_peers.iter().take(capped_real) {
             ss_all.push(peer_id.clone());
@@ -1393,48 +1417,17 @@ pub fn AttendantsComponent(
             (ss_all.len(), 0)
         };
 
-        // Speaker promotion for the screen share visible set
-        if ss_vis_count < ss_all.len() {
+        {
             let speech_map = peer_speech_priority.read();
             let join_map = peer_join_time.read();
-
-            let eff_ts = |peer: &str| -> f64 {
-                speech_map
-                    .get(peer)
-                    .copied()
-                    .unwrap_or_else(|| join_map.get(peer).copied().unwrap_or(0.0))
-            };
-
-            let mut overflow_speakers: Vec<(usize, f64)> = Vec::new();
-            for i in ss_vis_count..ss_all.len() {
-                if let Some(&ts) = speech_map.get(&ss_all[i]) {
-                    if now_ms - ts < SPEAKER_ACTIVE_MS {
-                        overflow_speakers.push((i, ts));
-                    }
-                }
-            }
-            overflow_speakers.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            let mut swap_candidates: Vec<(usize, f64)> = (0..ss_vis_count)
-                .filter(|&i| {
-                    speech_map
-                        .get(&ss_all[i])
-                        .map_or(true, |&ts| now_ms - ts >= SPEAKER_ACTIVE_MS)
-                })
-                .map(|i| (i, eff_ts(&ss_all[i])))
-                .collect();
-            swap_candidates.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            let num_swaps = overflow_speakers.len().min(swap_candidates.len());
-            for i in 0..num_swaps {
-                ss_all.swap(swap_candidates[i].0, overflow_speakers[i].0);
-            }
+            promote_speakers(
+                &mut ss_all,
+                ss_vis_count,
+                &speech_map,
+                &join_map,
+                now_ms,
+                SPEAKER_ACTIVE_MS,
+            );
         }
 
         let tiles: Vec<String> = ss_all.into_iter().take(ss_vis_count).collect();
@@ -1456,10 +1449,11 @@ pub fn AttendantsComponent(
             .filter_map(|pid| pid.parse::<u64>().ok())
             .collect()
     } else {
-        display_peers
+        // Use visible_tiles (post-promotion) so promoted speakers are decoded.
+        // .parse::<u64>() naturally filters out mock-N IDs.
+        visible_tiles
             .iter()
-            .take(visible_tile_count)
-            .filter_map(|pid| pid.parse::<u64>().ok())
+            .filter_map(|id| id.parse::<u64>().ok())
             .collect()
     };
     if let Some(active_peer) = active_screen_sharer.as_ref() {

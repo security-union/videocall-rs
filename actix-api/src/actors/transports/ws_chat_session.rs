@@ -235,11 +235,10 @@ impl Handler<Message> for WsChatSession {
                     .inc();
                 // Parse sender session_id only on drops (not on every packet)
                 // to avoid a protobuf parse + heap alloc on the hot path.
-                if let Some(pw) = PacketWrapper::parse_from_bytes(&msg.msg).ok() {
+                if let Ok(pw) = PacketWrapper::parse_from_bytes(&msg.msg) {
                     let sender_session_id = pw.session_id;
                     if sender_session_id != 0 {
-                        self.logic
-                            .on_outbound_drop(sender_session_id, &pw.user_id);
+                        self.logic.on_outbound_drop(sender_session_id, &pw.user_id);
                     }
                 }
             }

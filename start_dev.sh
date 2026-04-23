@@ -14,6 +14,12 @@ export NATS_URL=${NATS_URL:-0.0.0.0:4222}
 export HEALTH_LISTEN_URL=${HEALTH_LISTEN_URL:-0.0.0.0:5321}
 export LISTEN_URL=${LISTEN_URL:-0.0.0.0:4433}
 export DATABASE_URL=${DATABASE_URL:-postgresql://$USER@localhost/actix-api-db}
+export JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
+export COOKIE_SECURE=${COOKIE_SECURE:-false}
+# Local dev fallback: let meeting-api resolve unauthenticated requests to a
+# stable anonymous identity so you can exercise the API without an OAuth
+# provider. Production must leave this unset (or "false").
+export ALLOW_ANONYMOUS=${ALLOW_ANONYMOUS:-true}
 
 server_command="$( ((WEBTRANSPORT_ENABLED)) && echo webtransport_server || echo websocket_server )"
 
@@ -21,6 +27,7 @@ _kill() {
     kill -- -$$
     # the command spawned by cargo watch doesn't get killed with the process group, so kill it explicitly
     pkill -f "$server_command"
+    pkill -f "meeting-api"
 }
 
 trap _kill SIGINT SIGTERM SIGQUIT
@@ -40,12 +47,42 @@ if ! psql "$DATABASE_URL" -c 'SELECT 1' >/dev/null; then
     exit
 fi
 
+if ! [ -x "$(command -v dbmate)" ] ; then
+    echo "please install dbmate (brew install dbmate) so schema migrations stay in sync"
+    exit
+fi
+
+# Run any pending schema migrations so newly-pulled branches don't 500 on
+# missing columns. dbmate needs sslmode=disable on the connection string for
+# local postgres; append it only if the caller hasn't already specified one.
+DBMATE_URL="$DATABASE_URL"
+if [[ "$DBMATE_URL" != *"sslmode="* ]]; then
+    if [[ "$DBMATE_URL" == *"?"* ]]; then
+        DBMATE_URL="${DBMATE_URL}&sslmode=disable"
+    else
+        DBMATE_URL="${DBMATE_URL}?sslmode=disable"
+    fi
+fi
+if ! DATABASE_URL="$DBMATE_URL" dbmate --migrations-dir dbmate/db/migrations --no-dump-schema up; then
+    echo ""
+    echo "schema migration failed — servers NOT started."
+    echo "see dbmate output above. common fixes:"
+    echo "  - conflict / drift:  DATABASE_URL=\"$DBMATE_URL\" dbmate --migrations-dir dbmate/db/migrations status"
+    echo "  - roll back one:     DATABASE_URL=\"$DBMATE_URL\" dbmate --migrations-dir dbmate/db/migrations rollback"
+    echo "  - reset local db:    DATABASE_URL=\"$DBMATE_URL\" dbmate --migrations-dir dbmate/db/migrations drop && \\"
+    echo "                       DATABASE_URL=\"$DBMATE_URL\" dbmate --migrations-dir dbmate/db/migrations up"
+    exit 1
+fi
+
 nats-server --addr "$(trurl -g '{host}' "$NATS_URL")" --port "$(trurl -g '{port}' "$NATS_URL")" &
 
 pushd actix-api > /dev/null || exit
 cargo watch -x "run --bin $server_command" &
 ACTIX_PROC=$!
 popd > /dev/null || exit
+
+export MEETING_API_PORT=${MEETING_API_PORT:-8082}
+(cd meeting-api && LISTEN_ADDR=0.0.0.0:${MEETING_API_PORT} cargo watch -x "run --bin meeting-api") &
 
 pushd dioxus-ui > /dev/null || exit
 trunk serve &

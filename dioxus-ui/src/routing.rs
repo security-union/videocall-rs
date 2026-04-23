@@ -5,6 +5,7 @@
 use dioxus::prelude::*;
 
 use crate::components::login::Login;
+use crate::components::search_modal::SearchModal;
 use crate::pages::guest_join::GuestJoinPage;
 use crate::pages::home::Home;
 use crate::pages::meeting::MeetingPage;
@@ -12,7 +13,9 @@ use crate::pages::meeting_settings::MeetingSettingsPage;
 use crate::pages::oauth_callback::OAuthCallback;
 
 #[derive(Clone, Routable, PartialEq, Debug)]
+#[rustfmt::skip]
 pub enum Route {
+    #[layout(Wrapper)]
     #[route("/")]
     Home {},
     #[route("/login")]
@@ -32,6 +35,14 @@ pub enum Route {
     },
     #[route("/404")]
     NotFound {},
+}
+
+#[component]
+pub fn Wrapper() -> Element {
+    rsx! {
+        SearchModal {}
+        Outlet::<Route> {}
+    }
 }
 
 /// Wrapper component for MeetingSettings route.

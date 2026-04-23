@@ -409,7 +409,7 @@ jobs:
             hard:
               requests.cpu: "300m"
               requests.memory: "512Mi"
-              limits.cpu: "800m"
+              limits.cpu: "1000m"
               limits.memory: "1Gi"
               pods: "12"
           EOF

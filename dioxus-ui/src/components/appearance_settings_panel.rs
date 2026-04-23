@@ -3,11 +3,24 @@
  * Licensed under MIT OR Apache-2.0
  */
 
+use crate::components::canvas_generator::calculate_glow_params;
 use crate::context::{
     load_custom_colors_from_storage, save_custom_colors_to_storage, AppearanceSettings,
     AppearanceSettingsCtx, GlowColor, MAX_CUSTOM_COLORS,
 };
 use dioxus::prelude::*;
+use wasm_bindgen::JsCast;
+
+fn focus_add_btn() {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("add-custom-color-btn"))
+    {
+        if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
+            let _ = html.focus();
+        }
+    }
+}
 
 #[component]
 pub fn AppearanceSettingsPanel() -> Element {
@@ -83,7 +96,8 @@ pub fn AppearanceSettingsPanel() -> Element {
                                         tabindex: "0",
                                         "aria-label": format!("Select {} glow", color.label()),
                                         "aria-pressed": if is_selected { "true" } else { "false" },
-                                        onclick: move |_| {
+                                        onclick: move |evt: Event<MouseData>| {
+                                            evt.stop_propagation();
                                             appearance_ctx.0.set(AppearanceSettings {
                                                 glow_color: color,
                                                 ..appearance_ctx.0()
@@ -113,7 +127,8 @@ pub fn AppearanceSettingsPanel() -> Element {
                                         tabindex: "0",
                                         "aria-label": format!("Select custom glow {} (delete with button)", color.to_hex()),
                                         "aria-pressed": if is_selected { "true" } else { "false" },
-                                        onclick: move |_| {
+                                        onclick: move |evt: Event<MouseData>| {
+                                            evt.stop_propagation();
                                             appearance_ctx.0.set(AppearanceSettings {
                                                 glow_color: color,
                                                 ..appearance_ctx.0()
@@ -157,11 +172,13 @@ pub fn AppearanceSettingsPanel() -> Element {
                         if custom_colors().len() < MAX_CUSTOM_COLORS {
                             div {
                                 class: "color-swatch add-color-btn",
+                                id: "add-custom-color-btn",
                                 role: "button",
                                 tabindex: "0",
                                 "aria-label": "Add custom color",
                                 title: "Add custom color",
-                                onclick: move |_| {
+                                onclick: move |evt: Event<MouseData>| {
+                                    evt.stop_propagation();
                                     let open = !show_picker();
                                     show_picker.set(open);
                                     if open {
@@ -191,11 +208,13 @@ pub fn AppearanceSettingsPanel() -> Element {
                             style: "position: fixed; inset: 0; z-index: 99;",
                             onmousedown: move |_| {
                                 show_picker.set(false);
+                                focus_add_btn();
                             },
                         }
                         div {
                             class: "custom-color-popover",
                             style: "position: relative; z-index: 100;",
+                            onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
                             {
                                 let preview_color = GlowColor::from_hex(&color_input());
                                 rsx! {
@@ -222,10 +241,17 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                 color_input.set(evt.value());
                                                 input_error.set(false);
                                             },
+                                            onkeydown: move |evt: KeyboardEvent| {
+                                                if evt.key() == Key::Escape {
+                                                    show_picker.set(false);
+                                                    focus_add_btn();
+                                                }
+                                            },
                                         }
                                         button {
                                             class: "custom-color-add-btn",
-                                            onclick: move |_| {
+                                            onclick: move |evt: Event<MouseData>| {
+                                                evt.stop_propagation();
                                                 if let Some(new_color) = GlowColor::from_hex(&color_input()) {
                                                     let colors = custom_colors();
                                                     if !colors.contains(&new_color) {
@@ -246,6 +272,12 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                 }
                                             },
                                             "Add"
+                                        }
+                                    }
+                                    if input_error() {
+                                        p {
+                                            style: "color: #ff4444; font-size: 0.75rem; margin-top: 0.25rem;",
+                                            "Invalid format - use #RRGGBB (e.g. #FF5500)"
                                         }
                                     }
                                 }
@@ -342,32 +374,26 @@ fn slider_fill_style(_value: f32, color: GlowColor) -> String {
 
 /// Compute a static glow style for the appearance preview tile.
 ///
-/// Uses the same formula as `speak_style` but with fixed outer/inner intensity
-/// constants so the preview is always visible regardless of microphone state.
-/// The CSS `preview-tile-pulsing` animation provides visual dynamism.
+/// Calls [`calculate_glow_params`] with a fixed intensity of 0.65 so the
+/// preview is always visible regardless of microphone state. The CSS
+/// `preview-tile-pulsing` animation provides visual dynamism.
 fn preview_glow_style(settings: &AppearanceSettings) -> String {
     if !settings.glow_enabled {
         return "box-shadow: none; border-color: rgba(255, 255, 255, 0.08);".to_string();
     }
 
-    const INTENSITY: f32 = 0.65;
-
     let (r, g, b) = settings.glow_color.to_rgb();
-    let brightness = settings.glow_brightness.clamp(0.0, 1.0);
-    let inner_strength = settings.inner_glow_strength.clamp(0.0, 1.0);
-    let brightness_curve = brightness * brightness;
-    let inner_curve = inner_strength * inner_strength;
-
-    let outer_blur = 14.0 + INTENSITY * (14.0 + brightness_curve * 10.0);
-    let outer_spread = 1.0 + INTENSITY * (2.0 + brightness_curve * 4.0);
-    let outer_alpha = (0.18 + INTENSITY * 0.32) * brightness_curve;
-    let inner_blur = 10.0 + INTENSITY * (10.0 + inner_curve * 12.0);
-    let inner_alpha = (0.10 + INTENSITY * 0.22) * brightness_curve * (0.25 + inner_curve * 0.75);
-    let border_alpha = (0.50 + INTENSITY * 0.42).clamp(0.45, 0.92);
-
+    let p = calculate_glow_params(0.65, settings.glow_brightness, settings.inner_glow_strength);
     format!(
-        "box-shadow: 0 0 {outer_blur:.0}px {outer_spread:.0}px rgba({r}, {g}, {b}, {outer_alpha:.2}), \
-         inset 0 0 {inner_blur:.0}px 0 rgba({r}, {g}, {b}, {inner_alpha:.2}); \
-         border-color: rgba({r}, {g}, {b}, {border_alpha:.2});",
+        "box-shadow: 0 0 {:.0}px {:.0}px rgba({r}, {g}, {b}, {:.2}), \
+         inset 0 0 {:.0}px {:.0}px rgba({r}, {g}, {b}, {:.2}); \
+         border-color: rgba({r}, {g}, {b}, {:.2});",
+        p.outer_blur,
+        p.outer_spread,
+        p.outer_alpha,
+        p.inner_blur,
+        p.inner_spread,
+        p.inner_alpha,
+        p.border_alpha,
     )
 }

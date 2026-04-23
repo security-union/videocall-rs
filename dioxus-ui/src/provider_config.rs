@@ -2,10 +2,9 @@
 
 //! Fetches and caches the OAuth provider configuration from the meeting-api.
 //!
-//! Both [`crate::auth`] (needs `auth_url` + `client_id` to build the
-//! authorization URL) and [`crate::pages::oauth_callback`] (needs `token_url`
-//! + `issuer` for the token exchange) fall back to this module when the values
-//! are not present in `window.__APP_CONFIG`.
+//! Both [`crate::auth`] and [`crate::pages::oauth_callback`] fall back to this
+//! module when the provider values they need are not present in
+//! `window.__APP_CONFIG`.
 //!
 //! The full response is cached in `sessionStorage` as a JSON string on the
 //! first successful fetch so that subsequent calls within the same tab are
@@ -32,9 +31,9 @@ struct Envelope {
 /// ## Resolution order
 ///
 /// 1. `sessionStorage` — populated by a previous call in this tab.
-/// 2. `GET /api/v1/oauth/provider-config` — the meeting-api returns all
-///    OAuth endpoints it resolved at startup (via OIDC discovery or env vars).
-///    The result is cached for the lifetime of the tab.
+/// 2. `GET /api/v1/oauth/provider-config` — the meeting-api returns all OAuth
+///    endpoints it resolved at startup (via OIDC discovery or env vars). The
+///    result is cached for the lifetime of the tab.
 ///
 /// Callers are responsible for deciding which fields they need and whether the
 /// returned config is "good enough" (e.g. `auth_url` non-empty for the login

@@ -32,6 +32,94 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry};
 
+// ─── Glow formula constants ───────────────────────────────────────────────────
+
+/// Base outer blur radius in pixels at zero audio level.
+const OUTER_BLUR_BASE: f32 = 14.0;
+/// Outer blur radius contribution per unit of audio intensity.
+const OUTER_BLUR_INTENSITY: f32 = 14.0;
+/// Additional outer blur contributed by brightness² per unit of intensity.
+const OUTER_BLUR_BRIGHTNESS: f32 = 10.0;
+
+/// Base outer spread in pixels at zero audio level.
+const OUTER_SPREAD_BASE: f32 = 1.0;
+/// Outer spread contribution per unit of audio intensity.
+const OUTER_SPREAD_INTENSITY: f32 = 2.0;
+/// Additional outer spread contributed by brightness² per unit of intensity.
+const OUTER_SPREAD_BRIGHTNESS: f32 = 4.0;
+
+/// Base outer shadow alpha at zero audio level.
+const OUTER_ALPHA_BASE: f32 = 0.18;
+/// Outer shadow alpha increase per unit of audio intensity.
+const OUTER_ALPHA_INTENSITY: f32 = 0.32;
+
+/// Base inner blur radius in pixels at zero audio level.
+const INNER_BLUR_BASE: f32 = 10.0;
+/// Inner blur radius contribution per unit of audio intensity.
+const INNER_BLUR_INTENSITY: f32 = 10.0;
+/// Additional inner blur contributed by inner-glow strength² per unit of intensity.
+const INNER_BLUR_STRENGTH: f32 = 12.0;
+
+/// Base inner shadow alpha at zero audio level.
+const INNER_ALPHA_BASE: f32 = 0.10;
+/// Inner shadow alpha increase per unit of audio intensity.
+const INNER_ALPHA_INTENSITY: f32 = 0.22;
+/// Minimum inner-strength multiplier (prevents inner glow from vanishing when strength = 0).
+const INNER_ALPHA_STRENGTH_MIN: f32 = 0.25;
+/// Range of the inner-strength multiplier.
+const INNER_ALPHA_STRENGTH_RANGE: f32 = 0.75;
+
+/// Base border alpha at zero audio level.
+const BORDER_ALPHA_BASE: f32 = 0.50;
+/// Border alpha increase per unit of audio intensity.
+const BORDER_ALPHA_INTENSITY: f32 = 0.42;
+
+// ─── Shared glow parameter struct ────────────────────────────────────────────
+
+/// Pre-computed glow parameters produced by [`calculate_glow_params`].
+pub(crate) struct GlowParams {
+    pub outer_blur: f32,
+    pub outer_spread: f32,
+    pub outer_alpha: f32,
+    pub inner_blur: f32,
+    pub inner_spread: f32,
+    pub inner_alpha: f32,
+    /// Border alpha is independent of brightness so the colored border stays
+    /// clearly visible even when glow brightness is turned down to zero.
+    pub border_alpha: f32,
+}
+
+/// Compute glow shadow parameters from the three driving variables.
+///
+/// * `intensity`      — current audio level (0.0–1.0), or a fixed preview value
+/// * `brightness`     — viewer's glow-brightness setting (0.0–1.0)
+/// * `inner_strength` — viewer's inner-glow-strength setting (0.0–1.0)
+pub(crate) fn calculate_glow_params(
+    intensity: f32,
+    brightness: f32,
+    inner_strength: f32,
+) -> GlowParams {
+    let i = intensity.clamp(0.0, 1.0);
+    let b = brightness.clamp(0.0, 1.0);
+    let s = inner_strength.clamp(0.0, 1.0);
+    let brightness_curve = b * b;
+    let inner_curve = s * s;
+    GlowParams {
+        outer_blur: OUTER_BLUR_BASE
+            + i * (OUTER_BLUR_INTENSITY + brightness_curve * OUTER_BLUR_BRIGHTNESS),
+        outer_spread: OUTER_SPREAD_BASE
+            + i * (OUTER_SPREAD_INTENSITY + brightness_curve * OUTER_SPREAD_BRIGHTNESS),
+        outer_alpha: (OUTER_ALPHA_BASE + i * OUTER_ALPHA_INTENSITY) * brightness_curve,
+        inner_blur: INNER_BLUR_BASE
+            + i * (INNER_BLUR_INTENSITY + inner_curve * INNER_BLUR_STRENGTH),
+        inner_spread: 0.0,
+        inner_alpha: (INNER_ALPHA_BASE + i * INNER_ALPHA_INTENSITY)
+            * brightness_curve
+            * (INNER_ALPHA_STRENGTH_MIN + inner_curve * INNER_ALPHA_STRENGTH_RANGE),
+        border_alpha: (BORDER_ALPHA_BASE + i * BORDER_ALPHA_INTENSITY).clamp(0.45, 0.92),
+    }
+}
+
 /// Compute the inline CSS for the speaking glow on the outer tile container.
 /// Emits `box-shadow`, `border-color`, and `transition` values driven by the
 /// viewer's local [`AppearanceSettings`].
@@ -45,25 +133,23 @@ pub(crate) fn speak_style(
     }
 
     let (r, g, b) = settings.glow_color.to_rgb();
-    let brightness = settings.glow_brightness.clamp(0.0, 1.0);
-    let inner_strength = settings.inner_glow_strength.clamp(0.0, 1.0);
-    let brightness_curve = brightness * brightness;
-    let inner_curve = inner_strength * inner_strength;
-
-    let i = audio_level.clamp(0.0, 1.0);
-    let outer_blur = 14.0 + i * (14.0 + brightness_curve * 10.0);
-    let outer_spread = 1.0 + i * (2.0 + brightness_curve * 4.0);
-    let outer_alpha = (0.18 + i * 0.32) * brightness_curve;
-    let inner_blur = 10.0 + i * (10.0 + inner_curve * 12.0);
-    let inner_alpha = (0.10 + i * 0.22) * brightness_curve * (0.25 + inner_curve * 0.75);
-    // Border alpha is independent of brightness so the colored border stays
-    // clearly visible even when glow brightness is turned down to zero.
-    let border_alpha = (0.50 + i * 0.42).clamp(0.45, 0.92);
+    let p = calculate_glow_params(
+        audio_level,
+        settings.glow_brightness,
+        settings.inner_glow_strength,
+    );
     format!(
-        "box-shadow: 0 0 {outer_blur:.0}px {outer_spread:.0}px rgba({r}, {g}, {b}, {outer_alpha:.2}), \
-         inset 0 0 {inner_blur:.0}px 0 rgba({r}, {g}, {b}, {inner_alpha:.2}); \
-         border-color: rgba({r}, {g}, {b}, {border_alpha:.2}); \
-         transition: border-color 0.15s ease-in, box-shadow 0.15s ease-in;",
+        "box-shadow: 0 0 {:.0}px {:.0}px rgba({r}, {g}, {b}, {:.2}), \
+             inset 0 0 {:.0}px {:.0}px rgba({r}, {g}, {b}, {:.2}); \
+             border-color: rgba({r}, {g}, {b}, {:.2}); \
+             transition: border-color 0.15s ease-in, box-shadow 0.15s ease-in;",
+        p.outer_blur,
+        p.outer_spread,
+        p.outer_alpha,
+        p.inner_blur,
+        p.inner_spread,
+        p.inner_alpha,
+        p.border_alpha,
     )
 }
 

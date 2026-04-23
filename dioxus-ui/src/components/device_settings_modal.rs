@@ -16,9 +16,9 @@ fn focus_element_by_id(id: &str) {
         .and_then(|w| w.document())
         .and_then(|d| d.get_element_by_id(id))
     {
-        let _ = el
-            .dyn_into::<web_sys::HtmlElement>()
-            .map(|h| h.focus());
+        if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
+            let _ = html.focus();
+        }
     }
 }
 
@@ -35,12 +35,30 @@ fn focus_option_by_position(trigger_id: &str, last: bool) {
                 0
             };
             if let Some(node) = nodes.item(index) {
-                let _ = node
-                    .dyn_into::<web_sys::HtmlElement>()
-                    .map(|h| h.focus());
+                if let Ok(html) = node.dyn_into::<web_sys::HtmlElement>() {
+                    let _ = html.focus();
+                }
             }
         }
     }
+}
+
+fn close_dropdown_and_focus(
+    mut open_dropdown: Signal<Option<&'static str>>,
+    trigger_id: &'static str,
+) {
+    open_dropdown.set(None);
+    focus_element_by_id(trigger_id);
+}
+
+fn click_target_is_within_glass_select(event: &MouseEvent) -> bool {
+    event
+    .data()
+    .downcast::<web_sys::MouseEvent>()
+    .and_then(|mouse_event| mouse_event.target())
+    .and_then(|target: web_sys::EventTarget| target.dyn_into::<web_sys::Element>().ok())
+    .and_then(|element: web_sys::Element| element.closest(".glass-select").ok().flatten())
+        .is_some()
 }
 
 #[derive(Clone, PartialEq)]
@@ -71,6 +89,7 @@ fn SettingsGlassSelect(
             button {
                 id,
                 class: if is_open { "glass-select-trigger open" } else { "glass-select-trigger" },
+                style: if is_open { "position: relative; z-index: 1001;" } else { "" },
                 r#type: "button",
                 "aria-haspopup": "listbox",
                 "aria-expanded": if is_open { "true" } else { "false" },
@@ -137,8 +156,7 @@ fn SettingsGlassSelect(
                                 move |e: MouseEvent| {
                                     e.stop_propagation();
                                     on_change.call(value.clone());
-                                    open_dropdown.set(None);
-                                    focus_element_by_id(id);
+                                    close_dropdown_and_focus(open_dropdown, id);
                                 }
                             },
                             onkeydown: {
@@ -149,13 +167,11 @@ fn SettingsGlassSelect(
                                             evt.stop_propagation();
                                             evt.prevent_default();
                                             on_change.call(value.clone());
-                                            open_dropdown.set(None);
-                                            focus_element_by_id(id);
+                                            close_dropdown_and_focus(open_dropdown, id);
                                         }
                                         Key::Escape => {
                                             evt.stop_propagation();
-                                            open_dropdown.set(None);
-                                            focus_element_by_id(id);
+                                            close_dropdown_and_focus(open_dropdown, id);
                                         }
                                         Key::ArrowDown => {
                                             evt.stop_propagation();
@@ -165,7 +181,9 @@ fn SettingsGlassSelect(
                                                 .and_then(|d| d.active_element())
                                                 .and_then(|el| el.next_element_sibling())
                                             {
-                                                let _ = next.dyn_into::<web_sys::HtmlElement>().map(|h| { let _ = h.focus(); });
+                                                if let Ok(html) = next.dyn_into::<web_sys::HtmlElement>() {
+                                                    let _ = html.focus();
+                                                }
                                             }
                                         }
                                         Key::ArrowUp => {
@@ -176,7 +194,9 @@ fn SettingsGlassSelect(
                                                 .and_then(|d| d.active_element())
                                                 .and_then(|el| el.previous_element_sibling())
                                             {
-                                                let _ = prev.dyn_into::<web_sys::HtmlElement>().map(|h| { let _ = h.focus(); });
+                                                if let Ok(html) = prev.dyn_into::<web_sys::HtmlElement>() {
+                                                    let _ = html.focus();
+                                                }
                                             }
                                         }
                                         _ => {}
@@ -300,7 +320,12 @@ pub fn DeviceSettingsModal(
                 "aria-modal": "true",
                 "aria-labelledby": "device-settings-title",
                 tabindex: "0",
-                onclick: move |e: MouseEvent| e.stop_propagation(),
+                onclick: move |e: MouseEvent| {
+                    e.stop_propagation();
+                    if open_dropdown().is_some() && !click_target_is_within_glass_select(&e) {
+                        open_dropdown.set(None);
+                    }
+                },
 
                 onkeydown: move |evt| {
                     match evt.key() {
@@ -365,7 +390,6 @@ pub fn DeviceSettingsModal(
                     }
 
                     div { class: "settings-panel",
-                        onclick: move |_| open_dropdown.set(None),
                         match active_section() {
                             SettingsSection::Audio => rsx! {
                                 div {

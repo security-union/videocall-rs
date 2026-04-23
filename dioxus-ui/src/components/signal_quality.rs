@@ -347,15 +347,21 @@ fn show_body_tooltip(x: f64, y: f64, time_str: &str, sample: &SignalSample) {
     style.set_property("top", &format!("{y:.0}px")).unwrap();
     style.set_property("display", "block").unwrap();
 
+    let video_tier = infer_video_tier(&sample.video_resolution);
     let video_line = if sample.video_resolution.is_empty() {
         format!(
             "<span style='color:#81C784'>Video: {:.1} fps | {:.0} kbps</span>",
             sample.video_fps, sample.video_bitrate_kbps
         )
-    } else {
+    } else if video_tier.is_empty() {
         format!(
             "<span style='color:#81C784'>Video: {} | {:.1} fps | {:.0} kbps</span>",
             sample.video_resolution, sample.video_fps, sample.video_bitrate_kbps
+        )
+    } else {
+        format!(
+            "<span style='color:#81C784'>Video: {} ({}) | {:.1} fps | {:.0} kbps</span>",
+            sample.video_resolution, video_tier, sample.video_fps, sample.video_bitrate_kbps
         )
     };
     let audio_line = format!(
@@ -406,7 +412,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     // No Dioxus signal for tooltip — we manipulate a <body>-level DOM element
     // directly to escape all stacking contexts from grid-items.
     // Hide tooltip when this popup component unmounts.
-    use_drop(|| hide_body_tooltip());
+    use_drop(hide_body_tooltip);
 
     // Which legend help text is currently expanded (if any).
     let mut help_visible = use_signal(|| None::<&'static str>);

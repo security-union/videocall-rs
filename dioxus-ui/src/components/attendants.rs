@@ -338,7 +338,7 @@ fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     let ar: f64 = 16.0 / 9.0;
 
     for cols in 1..=n {
-        let rows = (n + cols - 1) / cols; // ceil(n / cols)
+        let rows = n.div_ceil(cols);
 
         let avail_w = (w - (cols as f64 - 1.0) * gap).max(0.0);
         let avail_h = (h - (rows as f64 - 1.0) * gap).max(0.0);
@@ -931,25 +931,34 @@ pub fn AttendantsComponent(
     use_context_provider(|| client.clone());
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
-    use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
+    let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
+    let _ = local_audio_level_ctx.0;
     let appearance_settings = use_signal(load_appearance_settings_from_storage);
     use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
     let appearance_save_timeout: Rc<RefCell<Option<Timeout>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
 
     // Persist local-only appearance preferences for this viewer.
+    let appearance_save_timeout_effect = appearance_save_timeout.clone();
     use_effect(move || {
         let settings = appearance_settings();
-        if let Some(timeout) = appearance_save_timeout.borrow_mut().take() {
+        if let Some(timeout) = appearance_save_timeout_effect.borrow_mut().take() {
             timeout.cancel();
         }
 
-        let timeout_cell = appearance_save_timeout.clone();
+        let timeout_cell = appearance_save_timeout_effect.clone();
         let timeout = Timeout::new(300, move || {
             save_appearance_settings_to_storage(&settings);
             timeout_cell.borrow_mut().take();
         });
-        *appearance_save_timeout.borrow_mut() = Some(timeout);
+        *appearance_save_timeout_effect.borrow_mut() = Some(timeout);
+    });
+    // Cancel any pending appearance-save timeout when the component unmounts
+    // to avoid a storage write racing with navigation away from the meeting.
+    use_drop(move || {
+        if let Some(timeout) = appearance_save_timeout.borrow_mut().take() {
+            timeout.cancel();
+        }
     });
 
     // Provide the peer status map as context for child PeerTile components.

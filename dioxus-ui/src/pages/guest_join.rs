@@ -258,12 +258,13 @@ pub fn GuestJoinPage(id: String) -> Element {
                 }
             };
 
-            let user_id_for_client = current_user_id().unwrap_or_else(|| input_value());
+            let display_name = input_value();
+            let user_id_for_client = current_user_id().unwrap_or_else(|| display_name.clone());
 
             start_observer_connection(
                 observer_token,
                 meeting_id.clone(),
-                input_value(),
+                display_name,
                 user_id_for_client,
                 (transport_pref_ctx.0)(),
                 observer_client,

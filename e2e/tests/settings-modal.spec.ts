@@ -60,6 +60,49 @@ test.describe("Device settings modal", () => {
     await expect(page.locator("#modal-audio-select")).toHaveCount(0);
   });
 
+  test("microphone dropdown closes while switching to the Video tab in one click", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_settings_dropdown_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("dropdown-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator(".settings-nav-button.active")).toContainText("Audio");
+
+    const microphoneSelect = page.locator("#modal-audio-select");
+    const dropdownMenu = page.locator("#modal-audio-select + .glass-select-menu");
+    const videoTab = page.getByRole("tab", { name: "Video" });
+
+    await microphoneSelect.click();
+    await expect(dropdownMenu).toBeVisible();
+
+    await videoTab.click();
+
+    await expect(dropdownMenu).toHaveCount(0);
+    await expect(page.locator(".settings-nav-button.active")).toContainText("Video");
+    await expect(page.locator("#settings-panel-video")).toBeVisible();
+  });
+
   test("user can open the Appearance section and adjust local glow controls", async ({ page }) => {
     const meetingId = `e2e_settings_appearance_${Date.now()}`;
 
@@ -303,7 +346,9 @@ test.describe("Device settings modal", () => {
     await expect(popover.locator(".custom-color-add-btn")).toHaveText("Add");
   });
 
-  test("custom color popover closes when clicking outside", async ({ page }) => {
+  test("custom color popover closes when clicking outside and focus returns to add button", async ({
+    page,
+  }) => {
     const meetingId = `e2e_popover_click_outside_${Date.now()}`;
 
     await page.goto("/");
@@ -342,6 +387,10 @@ test.describe("Device settings modal", () => {
 
     // Popover should be dismissed
     await expect(popover).toHaveCount(0);
+
+    // Focus should return to the add button
+    const focusedElementId = await page.evaluate(() => document.activeElement?.id);
+    expect(focusedElementId).toBe("add-custom-color-btn");
   });
 
   test("invalid custom color input shows error and does not add swatch", async ({ page }) => {
@@ -387,6 +436,8 @@ test.describe("Device settings modal", () => {
     await colorInput.fill("123456");
     await addColorBtn.click();
     await expect(colorInput).toHaveClass(/error/);
+    // Error message should be visible with correct text
+    await expect(popover.locator("p")).toContainText("Invalid format");
     // Popover stays open — no swatch added
     await expect(popover).toBeVisible();
 
@@ -394,12 +445,14 @@ test.describe("Device settings modal", () => {
     await colorInput.fill("#12");
     await addColorBtn.click();
     await expect(colorInput).toHaveClass(/error/);
+    await expect(popover.locator("p")).toContainText("Invalid format");
     await expect(popover).toBeVisible();
 
     // Test invalid: non-hex characters
     await colorInput.fill("#GGGGGG");
     await addColorBtn.click();
     await expect(colorInput).toHaveClass(/error/);
+    await expect(popover.locator("p")).toContainText("Invalid format");
     await expect(popover).toBeVisible();
 
     // Confirm no new swatch was added
@@ -681,5 +734,167 @@ test.describe("Device settings modal", () => {
     await glowToggle.check();
     const previewTile = page.locator(".appearance-preview-area .preview-tile");
     await expect(previewTile).toHaveAttribute("style", /rgba\(12, 175, 255/);
+  });
+
+  test("custom color popover closes with Escape key and focus returns to add button", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_popover_escape_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("escape-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    // Open the custom color popover
+    const addBtn = page.locator('[aria-label="Add custom color"]');
+    await addBtn.click();
+
+    const popover = page.locator(".custom-color-popover");
+    await expect(popover).toBeVisible();
+
+    const colorInput = popover.locator(".custom-color-input");
+
+    // Focus the input and press Escape
+    await colorInput.click();
+    await colorInput.press("Escape");
+
+    // Popover should be dismissed
+    await expect(popover).toHaveCount(0);
+
+    // Focus should return to the add button
+    const focusedElementId = await page.evaluate(() => document.activeElement?.id);
+    expect(focusedElementId).toBe("add-custom-color-btn");
+  });
+
+  test("custom color storage is capped at MAX_CUSTOM_COLORS (10)", async ({ page }) => {
+    const meetingId = `e2e_custom_color_cap_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("storage-cap-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    // Add custom colors up to the limit
+    const colorHexValues = [
+      "#FF0000",
+      "#FF7700",
+      "#FFFF00",
+      "#00FF00",
+      "#00FFFF",
+      "#0077FF",
+      "#0000FF",
+      "#7700FF",
+      "#FF00FF",
+      "#FF77FF",
+    ];
+
+    const addBtn = page.locator('[aria-label="Add custom color"]');
+
+    // Add up to 10 colors
+    for (let i = 0; i < colorHexValues.length; i++) {
+      const shouldAddBeVisible = await addBtn.isVisible({ timeout: 1_000 }).catch(() => false);
+
+      if (!shouldAddBeVisible) {
+        // If + button is hidden, all slots are full
+        break;
+      }
+
+      await addBtn.click();
+      const popover = page.locator(".custom-color-popover");
+      await expect(popover).toBeVisible();
+
+      const colorInput = popover.locator(".custom-color-input");
+      const addColorBtn = popover.locator(".custom-color-add-btn");
+
+      await colorInput.fill(colorHexValues[i]);
+      await addColorBtn.click();
+
+      // Wait for popover to close
+      await expect(popover).toHaveCount(0);
+
+      // Small delay to ensure storage update
+      await page.waitForTimeout(300);
+    }
+
+    // Verify the add button is now hidden (no more room)
+    await expect(addBtn).toHaveCount(0);
+
+    // Verify persisted values by checking localStorage directly
+    const storedColors = await page.evaluate(() => {
+      const stored = localStorage.getItem("vc_appearance_custom_colors") ?? "";
+      return stored
+        .split(",")
+        .map((hex) => hex.trim())
+        .filter((hex) => hex.length > 0);
+    });
+
+    expect(storedColors.length).toBeLessThanOrEqual(10);
+
+    // Reload page and verify cap is still enforced
+    await page.reload();
+
+    const joinAgain = page.getByText(/Start Meeting|Join Meeting/);
+    if (await joinAgain.isVisible({ timeout: 5_000 }).catch(() => false)) {
+      await joinAgain.click();
+    }
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    // After reload, verify stored colors are still capped at 10
+    const storedColorsAfterReload = await page.evaluate(() => {
+      const stored = localStorage.getItem("vc_appearance_custom_colors") ?? "";
+      return stored
+        .split(",")
+        .map((hex) => hex.trim())
+        .filter((hex) => hex.length > 0);
+    });
+
+    expect(storedColorsAfterReload.length).toBeLessThanOrEqual(10);
+
+    // Verify UI reflects the cap: add button should still be hidden
+    await expect(page.locator('[aria-label="Add custom color"]')).toHaveCount(0);
   });
 });

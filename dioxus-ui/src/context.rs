@@ -236,6 +236,7 @@ pub fn save_custom_colors_to_storage(colors: &[GlowColor]) {
             GlowColor::Custom { r, g, b } => Some(format!("{r:02x}{g:02x}{b:02x}")),
             _ => None,
         })
+        .take(MAX_CUSTOM_COLORS)
         .collect::<Vec<_>>()
         .join(",");
     LocalStorage::set(CUSTOM_COLORS_STORAGE_KEY.to_string(), &csv);

@@ -864,6 +864,7 @@ impl PeerDecodeManager {
     /// and screen decode. Audio remains decoded for all peers.
     pub fn set_active_decode_set(&mut self, active_session_ids: &HashSet<u64>) {
         let session_ids = self.connected_peers.ordered_keys().clone();
+        let mut screen_keyframe_requests: Vec<String> = Vec::new();
         for session_id in session_ids {
             let visible = active_session_ids.contains(&session_id);
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
@@ -874,8 +875,14 @@ impl PeerDecodeManager {
                     "Peer {} decode visibility changed: {} -> {}",
                     session_id, peer.visible, visible
                 );
+                if visible && peer.screen_enabled {
+                    screen_keyframe_requests.push(peer.user_id.clone());
+                }
                 peer.visible = visible;
             }
+        }
+        for user_id in &screen_keyframe_requests {
+            self.send_keyframe_request(user_id, MediaType::SCREEN);
         }
     }
 

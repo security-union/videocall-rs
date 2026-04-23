@@ -53,6 +53,7 @@ impl WebTransportClient {
         lobby_url: &Url,
         insecure: bool,
         stats: Arc<Mutex<InboundStats>>,
+        is_speaking: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
         info!("Connecting client {} to {}", self.config.user_id, lobby_url);
 
@@ -77,7 +78,7 @@ impl WebTransportClient {
         self.send_connection_packet().await?;
 
         // Start heartbeat
-        self.start_heartbeat().await;
+        self.start_heartbeat(is_speaking).await;
         info!("Heartbeat started for {}", self.config.user_id);
 
         // Start inbound consumer to avoid being a slow consumer
@@ -105,7 +106,7 @@ impl WebTransportClient {
         Ok(())
     }
 
-    async fn start_heartbeat(&self) {
+    async fn start_heartbeat(&self, is_speaking: Arc<AtomicBool>) {
         if let Some(session) = &self.session {
             let session = session.clone();
             let user_id = self.config.user_id.clone();
@@ -123,7 +124,8 @@ impl WebTransportClient {
 
                     interval.tick().await;
 
-                    match build_heartbeat_packet(&user_id, audio_enabled, video_enabled) {
+                    let speaking = is_speaking.load(Ordering::Relaxed);
+                    match build_heartbeat_packet(&user_id, audio_enabled, video_enabled, speaking) {
                         Ok(data) => {
                             if let Err(e) = Self::send_via_session(&session, data).await {
                                 warn!("Failed to send heartbeat for {}: {}", user_id, e);

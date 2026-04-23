@@ -303,6 +303,65 @@ pub async fn update_display_name(
         .await
 }
 
+/// Load the participant roster for a SearchV2 index push.
+///
+/// Returns one row per `admitted` or `waiting` participant.  We include
+/// `waiting` users so they become searchable as soon as they enter the
+/// waiting room — they're already visible to Postgres-side searches via
+/// [`crate::db::meetings::list_by_owner`], which JOINs on any participant
+/// row regardless of status.
+///
+/// Shape is mapped into [`crate::search::ParticipantAcl`], which is the
+/// minimal subset needed for both the top-level `participants` / `acls`
+/// arrays and the richer `documentObject.participants` entries.
+///
+/// Ordering: host first (for stable creator-first ACL lists), then by
+/// admission time to keep doc diffs predictable as the roster evolves.
+pub async fn list_for_search(
+    pool: &PgPool,
+    meeting_id: i32,
+) -> Result<Vec<crate::search::ParticipantAcl>, sqlx::Error> {
+    // Module-private row struct keeps the query typed without leaking a
+    // tuple signature across fn boundaries (and pleases
+    // `clippy::type_complexity`).  joined_at is NOT NULL in the schema;
+    // admitted_at is nullable until the participant is admitted from the
+    // waiting room.
+    #[derive(sqlx::FromRow)]
+    struct SearchParticipantRow {
+        user_id: String,
+        display_name: Option<String>,
+        is_host: bool,
+        status: String,
+        joined_at: DateTime<Utc>,
+        admitted_at: Option<DateTime<Utc>>,
+    }
+
+    let rows: Vec<SearchParticipantRow> = sqlx::query_as(
+        r#"
+        SELECT user_id, display_name, is_host, status, joined_at, admitted_at
+        FROM meeting_participants
+        WHERE meeting_id = $1
+          AND status IN ('admitted', 'waiting')
+        ORDER BY is_host DESC, admitted_at NULLS LAST, created_at
+        "#,
+    )
+    .bind(meeting_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| crate::search::ParticipantAcl {
+            user_id: r.user_id,
+            display_name: r.display_name,
+            is_host: r.is_host,
+            status: r.status,
+            joined_at: Some(r.joined_at),
+            admitted_at: r.admitted_at,
+        })
+        .collect())
+}
+
 /// Count admitted participants in a meeting.
 pub async fn count_admitted(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(

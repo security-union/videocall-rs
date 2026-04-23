@@ -29,6 +29,7 @@ use crate::db::meetings::MeetingRow;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::nats_events;
+use crate::search;
 use crate::state::AppState;
 use crate::token::{generate_observer_token, generate_room_token};
 use videocall_types::validation::validate_display_name;
@@ -133,6 +134,10 @@ pub async fn join_meeting(
         let row =
             db_participants::upsert_host(&state.db, meeting.id, &user_id, display_name).await?;
 
+        // Host row inserted/updated — refresh the SearchV2 doc so the
+        // creator appears in acls/participants even on a fresh meeting.
+        search::spawn_repush(&state, meeting.id, meeting_id.clone());
+
         let token = generate_room_token(
             &state.jwt_secret,
             state.token_ttl_secs,
@@ -198,6 +203,9 @@ async fn join_as_attendee(
             )
             .await?
             .expect("join_attendee with None host check never returns None");
+            // New attendee row added — may be `admitted` or `waiting`,
+            // both of which are indexed by `list_for_search`. Re-push.
+            search::spawn_repush(state, meeting.id, meeting_id.to_string());
             let token = if auto_admitted {
                 Some(generate_room_token(
                     &state.jwt_secret,
@@ -283,6 +291,8 @@ async fn join_as_attendee(
         Some(r) => r,
         None => return Err(AppError::joining_not_allowed()),
     };
+    // New attendee row added — re-push so search hits reflect the new participant.
+    search::spawn_repush(state, meeting.id, meeting_id.to_string());
 
     let token = if auto_admitted {
         Some(generate_room_token(
@@ -491,6 +501,11 @@ pub async fn leave_meeting(
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 
+    // Participant left — they're still a row in meeting_participants but
+    // `list_for_search` filters to `admitted`/`waiting`, so this removal
+    // drops their principal from the ACL set on the next push.
+    search::spawn_repush(&state, meeting.id, meeting_id.clone());
+
     // End the meeting when the host leaves only if end_on_host_leave is set,
     // otherwise continue until the last participant leaves.
     let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
@@ -592,6 +607,10 @@ pub async fn update_display_name(
         &validated_name,
     )
     .await;
+
+    // Display-name change propagates into `participantNames` on the doc
+    // — re-push so search hits show the current name.
+    search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
     // Return the updated participant status
     Ok(Json(APIResponse::ok(

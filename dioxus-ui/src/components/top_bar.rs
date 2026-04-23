@@ -19,10 +19,12 @@
 use crate::components::icons::{
     digital_ocean::DigitalOceanIcon, discord::DiscordIcon, youtube::YoutubeIcon,
 };
+use crate::components::search_modal::SearchVisibleCtx;
 use dioxus::prelude::*;
 
 #[component]
 pub fn TopBar() -> Element {
+    let mut search_ctx = use_context::<SearchVisibleCtx>();
     rsx! {
         div {
             class: "top-bar",
@@ -59,10 +61,19 @@ pub fn TopBar() -> Element {
                     div { class: "w-16", DigitalOceanIcon {} }
                 }
             }
-            span {
-                class: "text-caption",
-                style: "margin-right:8px; color:#AEAEB2;",
-                "Made with \u{2764}\u{FE0F} by awesome developers from all over the world \u{1F30F}, hosted by Security Union \u{1F6E1}\u{FE0F}."
+            div { class: "flex items-center gap-3",
+                button {
+                    class: "flex items-center gap-1 rounded-md border border-gray-600 bg-transparent px-3 py-1 text-sm text-gray-300 hover:border-gray-400 hover:text-white",
+                    style: "cursor:pointer;",
+                    onclick: move |_| search_ctx.set_visible(true),
+                    "🔍 Search"
+                    span { style: "font-size:0.7rem; opacity:0.6;", "⌘K" }
+                }
+                span {
+                    class: "text-caption",
+                    style: "margin-right:8px; color:#AEAEB2;",
+                    "Made with \u{2764}\u{FE0F} by awesome developers from all over the world \u{1F30F}, hosted by Security Union \u{1F6E1}\u{FE0F}."
+                }
             }
         }
     }

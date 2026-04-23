@@ -41,7 +41,7 @@ postgresql:
       storageClass: ebs-sc
     resources:
       limits:
-        cpu: 200m
+        cpu: 500m
         memory: 256Mi
       requests:
         cpu: 100m

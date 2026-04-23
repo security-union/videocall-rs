@@ -103,6 +103,7 @@ services:
       - OAUTH_BROWSER_PKCE=${OAUTH_BROWSER_PKCE:-false}
       - ALLOWED_REDIRECT_URLS=${ALLOWED_REDIRECT_URLS:-http://localhost:${DIOXUS_SERVE_PORT:-3001}}
       - NATS_URL=nats:4222
+      - DEV_USER=${DEV_USER:-}
       - RUST_LOG=debug
       - CARGO_TARGET_DIR=/app/meeting-api/target
       - CARGO_INCREMENTAL=1

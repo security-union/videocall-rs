@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{atomic::AtomicU64, Arc, Mutex};
 use std::time::Instant;
 
-use crate::config::{Config, OAuthConfig};
+use crate::config::{Config, DevUser, OAuthConfig};
 use crate::oauth::JwksCache;
 use sqlx::PgPool;
 
@@ -56,6 +56,9 @@ pub struct AppState {
     pub display_name_rate_limiter: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
     /// Shared operation counter used to run periodic rate-limiter sweeps.
     pub display_name_rate_limiter_ops: Arc<AtomicU64>,
+    /// Dev-only auto-login user. When `Some`, `GET /api/v1/dev/auto-login`
+    /// issues a session cookie for this identity without any authentication.
+    pub dev_user: Option<DevUser>,
 }
 
 impl AppState {
@@ -95,6 +98,7 @@ impl AppState {
                 .expect("failed to build reqwest client"),
             display_name_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             display_name_rate_limiter_ops: Arc::new(AtomicU64::new(0)),
+            dev_user: config.dev_user.clone(),
         }
     }
 }

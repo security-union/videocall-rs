@@ -70,6 +70,7 @@ pub fn build_app(pool: PgPool) -> Router {
             std::collections::HashMap::new(),
         )),
         display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        dev_user: None,
     };
     routes::router().with_state(state)
 }

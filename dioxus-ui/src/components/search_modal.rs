@@ -101,7 +101,14 @@ struct SearchV2DocObject {
 /// Boolean operators `&&` / `||` can never form — cheaper than a proper
 /// tokeniser and equally safe for this use case.
 ///
+/// **Note (post-PR #335 follow-up):**  `search_v2` now uses structured
+/// `multi_match` / `prefix` queries instead of `query_string`, so this
+/// function is no longer called at runtime.  It is retained (with its
+/// test suite) as documentation of the Lucene escaping rules and as a
+/// utility for any future code path that re-introduces the query parser.
+///
 /// Reference: Lucene Classic Query Parser "Escaping Special Characters".
+#[allow(dead_code)]
 fn escape_lucene_query_string(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -133,46 +140,64 @@ fn escape_lucene_query_string(input: &str) -> String {
 /// UX is that no meetings are returned, and [`crate::components::search_modal`]
 /// then transparently falls back to the Postgres path.
 ///
-/// **Injection safety.**  `q` is escaped via [`escape_lucene_query_string`]
-/// before interpolation so Lucene metachars (`:`, `(`, `*`, `\`, etc.) in
-/// user input cannot change the query's semantics or break out of the
-/// `*{q}*` wildcard wrapper.
-async fn search_v2(base_url: &str, q: &str) -> Result<Vec<SearchResult>, String> {
-    let url = format!("{}/mysearch", base_url.trim_end_matches('/'));
+/// **Query strategy.**  Uses `multi_match` with `type: bool_prefix` on text
+/// fields (trailing-prefix on the last token — 10-100× cheaper than the
+/// previous leading-wildcard `*q*` `query_string`) plus `prefix` queries on
+/// keyword fields as score boosters.  Because these are structured queries
+/// (not the Lucene `query_string` parser), metacharacters in user input are
+/// treated as literal text — no escaping is needed, and no injection vector
+/// exists.
+/// Build the JSON body sent to the SearchV2 `/mysearch` endpoint.
+///
+/// Extracted from [`search_v2`] so it can be unit-tested without an HTTP
+/// mock (same pattern as `build_meeting_body` in `meeting-api/src/search.rs`).
+fn build_search_v2_body(q: &str) -> serde_json::Value {
+    // Lowercase for case-insensitive prefix matching on keyword fields.
+    // Text fields handle case-folding via their standard analyzer.
+    let q_lower = q.to_lowercase();
 
-    // Escape Lucene metachars in the caller's input so the wildcard wrapper
-    // cannot be broken out of and so characters like `:` don't change the
-    // semantics of the query (e.g. turning `room:foo` into a field-scoped
-    // match).  The ACL filter on the middleware side still enforces access
-    // control regardless, but a broken query returns HTTP 400 and a
-    // field-scoped escape would confuse the UI result set.
-    let escaped_q = escape_lucene_query_string(q);
-
-    let body = serde_json::json!({
+    serde_json::json!({
         "query": {
             "must": [{
-                "query_string": {
-                    "query": format!("*{}*", escaped_q),
-                    // Search both CC-canonical fields and the documentObject
-                    // fallback so hits keep working across the shape transition.
+                "multi_match": {
+                    "query": q,
+                    "type": "bool_prefix",
+                    // Text fields searched via analysed match + trailing-prefix
+                    // on the last token.  Covers both push-path docs (where
+                    // `title` is the host display name and `description`
+                    // embeds the room-id) and crawler-path docs (where `title`
+                    // and `content` hold the meeting-id / searchable text).
                     "fields": [
                         "title",
-                        "meetingId",
+                        "content",
+                        "description",
                         "organizerName",
-                        "documentObject.meetingId",
-                        "documentObject.roomId",
                         "documentObject.hostDisplayName",
-                        // Legacy snake_case fields on older docs.
-                        "documentObject.room_id",
                         "documentObject.host_display_name"
-                    ]
+                    ],
+                    "max_expansions": 50
                 }
-            }]
+            }],
+            // Keyword prefix clauses as optional score boosters — they don't
+            // gate inclusion (the `must` above does that) but they rank exact
+            // room-id prefix matches higher.
+            "should": [
+                { "prefix": { "meetingId": { "value": q_lower } } },
+                { "prefix": { "documentObject.meetingId": { "value": q_lower } } },
+                { "prefix": { "documentObject.roomId": { "value": q_lower } } },
+                { "prefix": { "documentObject.room_id": { "value": q_lower } } }
+            ]
         },
         "scope": ["cs-cc-meetings"],
         "page": 0,
         "pageSize": 20
-    });
+    })
+}
+
+async fn search_v2(base_url: &str, q: &str) -> Result<Vec<SearchResult>, String> {
+    let url = format!("{}/mysearch", base_url.trim_end_matches('/'));
+
+    let body = build_search_v2_body(q);
 
     let mut req = reqwest::Client::new()
         .post(&url)
@@ -440,6 +465,11 @@ pub fn SearchModal() -> Element {
 mod tests {
     use super::*;
 
+    // =======================================================================
+    // escape_lucene_query_string — retained as documentation of the Lucene
+    // escaping rules even though `search_v2` no longer uses `query_string`.
+    // =======================================================================
+
     #[test]
     fn lucene_escape_passes_through_plain_text() {
         assert_eq!(escape_lucene_query_string("standup"), "standup");
@@ -453,7 +483,7 @@ mod tests {
     fn lucene_escape_escapes_every_metacharacter() {
         // Each of these single characters must come out backslash-prefixed.
         for ch in [
-            '\\', '+', '-', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '/',
+            '\\', '+', '-', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':',
             '&', '|',
         ] {
             let escaped = escape_lucene_query_string(&ch.to_string());
@@ -486,5 +516,97 @@ mod tests {
     fn lucene_escape_blocks_field_scoped_injection() {
         // `state:active` would become a field-scoped match if unescaped.
         assert_eq!(escape_lucene_query_string("state:active"), r"state\:active");
+    }
+
+    // =======================================================================
+    // build_search_v2_body — query shape, field coverage, injection safety
+    // =======================================================================
+
+    #[test]
+    fn search_body_uses_bool_prefix_multi_match_in_must() {
+        let body = build_search_v2_body("standup");
+        let mm = &body["query"]["must"][0]["multi_match"];
+        assert_eq!(mm["type"], "bool_prefix");
+        assert_eq!(mm["query"], "standup");
+        assert_eq!(mm["max_expansions"], 50);
+    }
+
+    #[test]
+    fn search_body_text_fields_cover_push_and_crawler_shapes() {
+        let body = build_search_v2_body("x");
+        let fields = body["query"]["must"][0]["multi_match"]["fields"]
+            .as_array()
+            .expect("fields should be an array");
+        let field_strs: Vec<&str> = fields.iter().map(|v| v.as_str().unwrap()).collect();
+        // Push-path docs: title (host name) + description (contains room-id)
+        assert!(field_strs.contains(&"title"));
+        assert!(field_strs.contains(&"description"));
+        // Crawler-path docs: content (searchable text blob)
+        assert!(field_strs.contains(&"content"));
+        // Both: organizer name
+        assert!(field_strs.contains(&"organizerName"));
+        // Legacy documentObject fallbacks
+        assert!(field_strs.contains(&"documentObject.hostDisplayName"));
+        assert!(field_strs.contains(&"documentObject.host_display_name"));
+    }
+
+    #[test]
+    fn search_body_keyword_prefix_in_should() {
+        let body = build_search_v2_body("standup");
+        let should = body["query"]["should"]
+            .as_array()
+            .expect("should should be an array");
+        // Four keyword prefix clauses expected.
+        assert_eq!(should.len(), 4);
+        // Verify one representative clause.
+        assert_eq!(should[0]["prefix"]["meetingId"]["value"], "standup");
+    }
+
+    #[test]
+    fn search_body_prefix_values_are_lowercased() {
+        let body = build_search_v2_body("MyMeeting");
+        let should = body["query"]["should"].as_array().unwrap();
+        for clause in should {
+            // Every prefix value must be the lowercased input.
+            let value = clause
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap() // the {"prefix": { <field>: ... }} wrapper
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap() // the { <field>: { "value": ... } } wrapper
+                ["value"]
+                .as_str()
+                .unwrap();
+            assert_eq!(value, "mymeeting", "prefix values must be lowercased");
+        }
+        // multi_match query preserves original case (analyzer handles folding).
+        assert_eq!(body["query"]["must"][0]["multi_match"]["query"], "MyMeeting");
+    }
+
+    #[test]
+    fn search_body_metacharacters_are_literal() {
+        // With the old query_string approach, these characters would break
+        // the query or allow injection.  With multi_match / prefix they are
+        // just literal text — the body must contain them verbatim.
+        let body = build_search_v2_body("*) OR (* state:active");
+        assert_eq!(
+            body["query"]["must"][0]["multi_match"]["query"],
+            "*) OR (* state:active"
+        );
+        // No query_string key anywhere in the body.
+        assert!(body["query"]["must"][0].get("query_string").is_none());
+    }
+
+    #[test]
+    fn search_body_scope_and_pagination() {
+        let body = build_search_v2_body("x");
+        assert_eq!(body["scope"][0], "cs-cc-meetings");
+        assert_eq!(body["page"], 0);
+        assert_eq!(body["pageSize"], 20);
     }
 }

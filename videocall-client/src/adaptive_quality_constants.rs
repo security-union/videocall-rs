@@ -185,47 +185,52 @@ pub fn screen_share_camera_ceiling_index() -> usize {
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at "medium" (720p/10fps) — readable content from
-/// the first frame with room to step up to 1080p or down to 720p/5fps
-/// based on network conditions. The floor stays at 720p to keep text
-/// readable even at minimum quality.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
+/// Screen share starts at "high" (1080p/10fps) — preserves source
+/// resolution from the first frame for readable text. Steps down to
+/// 720p if network conditions degrade. The floor stays at 720p to
+/// keep text readable even at minimum quality.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0; // "high"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
 // ---------------------------------------------------------------------------
 
 /// Screen share quality tiers, ordered from highest (index 0) to lowest.
+///
+/// Screen content (text, code, diagrams) needs significantly higher bitrates
+/// than camera video to remain readable during scrolling and motion. The
+/// encoder is configured with `contentHint = 'detail'` and variable bitrate
+/// mode to accommodate burst demand during scroll events.
 pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
     VideoQualityTier {
         label: "high",
         max_width: 1920,
         max_height: 1080,
-        target_fps: 15,
-        ideal_bitrate_kbps: 1500,
-        min_bitrate_kbps: 800,
-        max_bitrate_kbps: 2500,
-        keyframe_interval_frames: 75, // ~5s at 15fps
+        target_fps: 10,
+        ideal_bitrate_kbps: 2500,
+        min_bitrate_kbps: 1500,
+        max_bitrate_kbps: 4000,
+        keyframe_interval_frames: 30, // ~3s at 10fps — frequent keyframes for text readability
     },
     VideoQualityTier {
         label: "medium",
         max_width: 1280,
         max_height: 720,
-        target_fps: 10,
-        ideal_bitrate_kbps: 600,
-        min_bitrate_kbps: 300,
-        max_bitrate_kbps: 1000,
-        keyframe_interval_frames: 50, // ~5s at 10fps
+        target_fps: 8,
+        ideal_bitrate_kbps: 1200,
+        min_bitrate_kbps: 700,
+        max_bitrate_kbps: 2000,
+        keyframe_interval_frames: 24, // ~3s at 8fps
     },
     VideoQualityTier {
         label: "low",
         max_width: 1280,
         max_height: 720,
         target_fps: 5,
-        ideal_bitrate_kbps: 300,
-        min_bitrate_kbps: 150,
-        max_bitrate_kbps: 500,
-        keyframe_interval_frames: 25, // ~5s at 5fps
+        ideal_bitrate_kbps: 500,
+        min_bitrate_kbps: 250,
+        max_bitrate_kbps: 1000,
+        keyframe_interval_frames: 15, // ~3s at 5fps
     },
 ];
 

@@ -55,7 +55,9 @@ use crate::auth::{clear_pkce_state, load_pkce_state, store_access_token, store_i
 use crate::constants::{
     meeting_api_base_url, oauth_client_id, oauth_issuer, oauth_redirect_url, oauth_token_url,
 };
-use crate::context::{email_to_display_name, save_display_name_to_storage, validate_display_name};
+use crate::context::{
+    email_to_display_name, is_guid_like, save_display_name_to_storage, validate_display_name,
+};
 use crate::id_token::decode_and_validate_id_token;
 use crate::pkce::exchange_code_with_provider;
 use dioxus::prelude::*;
@@ -525,11 +527,19 @@ async fn run_callback(query_params: String) -> Result<(), String> {
     if !raw_display_name.is_empty() {
         let display_name = if raw_display_name.contains('@') {
             email_to_display_name(&raw_display_name)
+        } else if is_guid_like(&raw_display_name) {
+            if user_id.contains('@') {
+                email_to_display_name(&user_id)
+            } else {
+                String::new()
+            }
         } else {
             raw_display_name.clone()
         };
-        if let Ok(valid) = validate_display_name(&display_name) {
-            save_display_name_to_storage(&valid);
+        if !display_name.is_empty() {
+            if let Ok(valid) = validate_display_name(&display_name) {
+                save_display_name_to_storage(&valid);
+            }
         }
     }
 

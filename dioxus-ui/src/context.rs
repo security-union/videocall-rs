@@ -19,6 +19,7 @@ pub struct DisplayNameCtx(pub Signal<Option<String>>);
 /// Local user's audio level signal, provided as context so that child
 /// components (e.g. Host) can subscribe to audio-level updates without
 /// forcing the parent AttendantsComponent to re-render.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct LocalAudioLevelCtx(pub Signal<f32>);
 
@@ -556,5 +557,6 @@ pub fn confirm_transport_change(new_value: &str, current: TransportPreference, s
 // ---------------------------------------------------------------------------
 
 pub use videocall_types::validation::{
-    email_to_display_name, is_valid_meeting_id, validate_display_name, DISPLAY_NAME_MAX_LEN,
+    email_to_display_name, is_guid_like, is_valid_meeting_id, validate_display_name,
+    DISPLAY_NAME_MAX_LEN,
 };

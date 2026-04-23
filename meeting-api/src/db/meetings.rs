@@ -35,6 +35,7 @@ pub struct MeetingRow {
     pub host_display_name: Option<String>,
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
+    pub end_on_host_leave: bool,
     pub allow_guests: bool,
 }
 
@@ -54,6 +55,7 @@ pub async fn create(
         attendees,
         true,
         false,
+        true,
         false,
     )
     .await
@@ -69,15 +71,16 @@ pub async fn create_with_options(
     attendees: &JsonValue,
     waiting_room_enabled: bool,
     admitted_can_admit: bool,
+    end_on_host_leave: bool,
     allow_guests: bool,
 ) -> Result<MeetingRow, sqlx::Error> {
     sqlx::query_as::<_, MeetingRow>(
         r#"
-        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, admitted_can_admit, allow_guests)
-        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5, $6, $7)
+        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests)
+        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5, $6, $7, $8)
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit, allow_guests
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
         "#,
     )
     .bind(room_id)
@@ -86,6 +89,7 @@ pub async fn create_with_options(
     .bind(attendees)
     .bind(waiting_room_enabled)
     .bind(admitted_can_admit)
+    .bind(end_on_host_leave)
     .bind(allow_guests)
     .fetch_one(pool)
     .await
@@ -100,7 +104,7 @@ pub async fn get_by_room_id(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
                deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled, admitted_can_admit, allow_guests
+               waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
         FROM meetings
         WHERE room_id = $1 AND deleted_at IS NULL
         "#,
@@ -121,7 +125,7 @@ pub async fn list_by_owner(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
                deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled, admitted_can_admit, allow_guests
+               waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
         FROM meetings
         WHERE deleted_at IS NULL AND creator_id = $1
         ORDER BY created_at DESC
@@ -159,7 +163,7 @@ pub async fn soft_delete(
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit, allow_guests
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
         "#,
     )
     .bind(room_id)
@@ -200,7 +204,7 @@ pub async fn set_host_display_name(
     Ok(())
 }
 
-/// Atomically update the waiting_room_enabled, admitted_can_admit, and allow_guests settings for a meeting.
+/// Atomically update the waiting_room_enabled, admitted_can_admit, end_on_host_leave, and allow_guests settings for a meeting.
 /// When disabling the waiting room, auto-admits all currently waiting participants
 /// within the same transaction to prevent race conditions.
 pub async fn update_meeting_settings(
@@ -209,6 +213,7 @@ pub async fn update_meeting_settings(
     creator_id: &str,
     waiting_room_enabled: Option<bool>,
     admitted_can_admit: Option<bool>,
+    end_on_host_leave: Option<bool>,
     allow_guests: Option<bool>,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -218,17 +223,19 @@ pub async fn update_meeting_settings(
         UPDATE meetings
         SET waiting_room_enabled = COALESCE($3, waiting_room_enabled),
             admitted_can_admit = COALESCE($4, admitted_can_admit),
-            allow_guests = COALESCE($5, allow_guests)
+            end_on_host_leave = COALESCE($5, end_on_host_leave),
+            allow_guests = COALESCE($6, allow_guests)
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit, allow_guests
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
         "#,
     )
     .bind(room_id)
     .bind(creator_id)
     .bind(waiting_room_enabled)
     .bind(admitted_can_admit)
+    .bind(end_on_host_leave)
     .bind(allow_guests)
     .fetch_optional(&mut *tx)
     .await?;

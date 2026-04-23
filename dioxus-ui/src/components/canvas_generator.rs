@@ -28,9 +28,8 @@ use crate::context::{AppearanceSettings, VideoCallClientCtx};
 use dioxus::prelude::*;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{window, HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry};
+use web_sys::{window, HtmlCanvasElement};
 
 // ─── Glow formula constants ───────────────────────────────────────────────────
 
@@ -778,22 +777,7 @@ fn UserVideo(id: String, hidden: bool) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let id_for_effect = id.clone();
 
-    // Store the IntersectionObserver together with its backing Closure so that
-    // both are kept alive for exactly as long as needed.  When the effect
-    // re-runs the old tuple is dropped, which disconnects the observer and
-    // frees the closure (instead of leaking via `Closure::forget`).
-    type ObserverState = (
-        IntersectionObserver,
-        Closure<dyn FnMut(js_sys::Array, IntersectionObserver)>,
-    );
-    let mut observer_signal: Signal<Option<ObserverState>> = use_signal(|| None);
-
     use_effect(move || {
-        // Disconnect any previous observer before creating a new one.
-        if let Some((old_observer, _old_closure)) = observer_signal.write().take() {
-            old_observer.disconnect();
-        }
-
         if let Some(elem) = gloo_utils::document().get_element_by_id(&id_for_effect) {
             if let Ok(canvas) = elem.dyn_into::<HtmlCanvasElement>() {
                 let client_ref = client.clone();
@@ -801,38 +785,7 @@ fn UserVideo(id: String, hidden: bool) -> Element {
                 if let Err(e) = client_ref.set_peer_video_canvas(&id_ref, canvas.clone()) {
                     log::debug!("Canvas not yet ready for peer {id_ref}: {e:?}");
                 }
-
-                // Set up IntersectionObserver to track visibility
-                let client_for_observer = client.clone();
-                let peer_id_for_observer = id_for_effect.clone();
-                let callback = Closure::wrap(Box::new(
-                    move |entries: js_sys::Array, _observer: IntersectionObserver| {
-                        for entry in entries.iter() {
-                            let entry: IntersectionObserverEntry = entry.unchecked_into();
-                            let is_visible = entry.is_intersecting();
-                            client_for_observer
-                                .set_peer_visibility(&peer_id_for_observer, is_visible);
-                        }
-                    },
-                )
-                    as Box<dyn FnMut(js_sys::Array, IntersectionObserver)>);
-
-                if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
-                    observer.observe(&canvas);
-                    // Store both the observer and its closure in the signal so
-                    // the closure stays alive without `forget()`.  When the
-                    // signal is overwritten or the component unmounts, both are
-                    // dropped together.
-                    observer_signal.set(Some((observer, callback)));
-                }
             }
-        }
-    });
-
-    // Disconnect the observer when the component unmounts.
-    use_drop(move || {
-        if let Some((obs, _closure)) = observer_signal.write().take() {
-            obs.disconnect();
         }
     });
 
@@ -852,22 +805,7 @@ fn ScreenCanvas(peer_id: String) -> Element {
     let canvas_id_for_effect = canvas_id.clone();
     let peer_id_for_effect = peer_id.clone();
 
-    // Store the IntersectionObserver together with its backing Closure so that
-    // both are kept alive for exactly as long as needed.  When the effect
-    // re-runs the old tuple is dropped, which disconnects the observer and
-    // frees the closure (instead of leaking via `Closure::forget`).
-    type ScreenObserverState = (
-        IntersectionObserver,
-        Closure<dyn FnMut(js_sys::Array, IntersectionObserver)>,
-    );
-    let mut observer_signal: Signal<Option<ScreenObserverState>> = use_signal(|| None);
-
     use_effect(move || {
-        // Disconnect any previous observer before creating a new one.
-        if let Some((old_observer, _old_closure)) = observer_signal.write().take() {
-            old_observer.disconnect();
-        }
-
         if let Some(elem) = gloo_utils::document().get_element_by_id(&canvas_id_for_effect) {
             if let Ok(canvas) = elem.dyn_into::<HtmlCanvasElement>() {
                 let client_ref = client.clone();
@@ -875,38 +813,7 @@ fn ScreenCanvas(peer_id: String) -> Element {
                 if let Err(e) = client_ref.set_peer_screen_canvas(&peer_id_ref, canvas.clone()) {
                     log::debug!("Screen canvas not yet ready for peer {peer_id_ref}: {e:?}");
                 }
-
-                // Set up IntersectionObserver to track visibility for screen share
-                let client_for_observer = client.clone();
-                let peer_id_for_observer = peer_id_for_effect.clone();
-                let callback = Closure::wrap(Box::new(
-                    move |entries: js_sys::Array, _observer: IntersectionObserver| {
-                        for entry in entries.iter() {
-                            let entry: IntersectionObserverEntry = entry.unchecked_into();
-                            let is_visible = entry.is_intersecting();
-                            client_for_observer
-                                .set_peer_visibility(&peer_id_for_observer, is_visible);
-                        }
-                    },
-                )
-                    as Box<dyn FnMut(js_sys::Array, IntersectionObserver)>);
-
-                if let Ok(observer) = IntersectionObserver::new(callback.as_ref().unchecked_ref()) {
-                    observer.observe(&canvas);
-                    // Store both the observer and its closure in the signal so
-                    // the closure stays alive without `forget()`.  When the
-                    // signal is overwritten or the component unmounts, both are
-                    // dropped together.
-                    observer_signal.set(Some((observer, callback)));
-                }
             }
-        }
-    });
-
-    // Disconnect the observer when the component unmounts.
-    use_drop(move || {
-        if let Some((obs, _closure)) = observer_signal.write().take() {
-            obs.disconnect();
         }
     });
 

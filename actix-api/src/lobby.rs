@@ -111,10 +111,12 @@ pub async fn ws_connect_authenticated(
     let room = claims.room;
     let observer = claims.observer;
     let display_name = claims.display_name;
+    let is_host = claims.is_host;
+    let end_on_host_leave = claims.end_on_host_leave;
     let is_guest = claims.is_guest;
 
     debug!(
-        "socket connected (token-based) for user_id={user_id}, room={room}, display_name={display_name}, is_guest={is_guest}, observer={observer}"
+        "socket connected (token-based) for user_id={user_id}, room={room}, display_name={display_name}, is_guest={is_guest}, observer={observer}, is_host={is_host}"
     );
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
@@ -132,6 +134,8 @@ pub async fn ws_connect_authenticated(
         session_manager,
         observer,
         instance_id,
+        is_host,
+        end_on_host_leave,
     );
     let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
@@ -187,6 +191,8 @@ pub async fn ws_connect(
         session_manager,
         false, // deprecated path-based endpoint: never observer
         None,  // no instance_id for deprecated endpoint
+        false, // deprecated path: not a host
+        true,  // default end_on_host_leave
     );
     let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)

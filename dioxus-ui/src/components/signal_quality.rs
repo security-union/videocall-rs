@@ -391,6 +391,24 @@ fn show_body_tooltip(x: f64, y: f64, time_str: &str, sample: &SignalSample) {
     ));
 }
 
+fn infer_video_tier(resolution: &str) -> &'static str {
+    let mut parts = resolution.split('x');
+    let _width = parts.next().and_then(|w| w.parse::<u32>().ok());
+    let height = parts.next().and_then(|h| h.parse::<u32>().ok());
+
+    match height.unwrap_or_default() {
+        h if h >= 1080 => "Full HD",
+        h if h >= 900 => "HD+",
+        h if h >= 720 => "HD",
+        h if h >= 540 => "Standard",
+        h if h >= 480 => "Medium",
+        h if h >= 360 => "Low",
+        h if h >= 270 => "Very Low",
+        h if h > 0 => "Minimal",
+        _ => "",
+    }
+}
+
 /// Hide the global tooltip.
 fn hide_body_tooltip() {
     if let Some(el) = gloo_utils::document().get_element_by_id("signal-chart-tooltip-global") {
@@ -959,29 +977,6 @@ fn nice_ceil(val: f64) -> f64 {
         10.0
     };
     nice * magnitude
-}
-
-/// Infer the sender's approximate adaptive quality tier from the received
-/// resolution. Returns a human-readable label matching the tier definitions
-/// in `adaptive_quality_constants.rs`.
-fn infer_video_tier(resolution: &str) -> &'static str {
-    // Parse "WxH" to extract height for tier matching.
-    let height: u32 = resolution
-        .split('x')
-        .nth(1)
-        .and_then(|h| h.parse().ok())
-        .unwrap_or(0);
-    match height {
-        h if h >= 1080 => "Full HD",
-        h if h >= 900 => "HD+",
-        h if h >= 720 => "HD",
-        h if h >= 540 => "Standard",
-        h if h >= 480 => "Medium",
-        h if h >= 360 => "Low",
-        h if h >= 270 => "Very Low",
-        h if h > 0 => "Minimal",
-        _ => "",
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -31,3 +31,4 @@ mod canvas_generator;
 mod peer_list;
 pub mod peer_list_item;
 mod peer_tile;
+pub mod pre_join_settings_card;

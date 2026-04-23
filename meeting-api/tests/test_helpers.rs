@@ -74,6 +74,7 @@ pub fn build_app(pool: PgPool) -> Router {
         // Integration tests use the unauthenticated entrypoints and expect a
         // stable anonymous identity to be issued when no cookie is present.
         allow_anonymous: true,
+        dev_user: None,
     };
     routes::router().with_state(state)
 }

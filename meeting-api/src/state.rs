@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{atomic::AtomicU64, Arc, Mutex};
 use std::time::Instant;
 
-use crate::config::{Config, OAuthConfig, SearchConfig};
+use crate::config::{Config, DevUser, OAuthConfig, SearchConfig};
 use crate::oauth::JwksCache;
 use sqlx::PgPool;
 
@@ -62,6 +62,9 @@ pub struct AppState {
     /// Opt-in anonymous-auth fallback flag (mirrors [`crate::config::Config::allow_anonymous`]).
     /// Only intended for local development; guards path 3 in the auth extractor.
     pub allow_anonymous: bool,
+    /// Dev-only auto-login user. When `Some`, `GET /api/v1/dev/auto-login`
+    /// issues a session cookie for this identity without any authentication.
+    pub dev_user: Option<DevUser>,
 }
 
 impl AppState {
@@ -103,6 +106,7 @@ impl AppState {
             display_name_rate_limiter_ops: Arc::new(AtomicU64::new(0)),
             search: config.search.clone(),
             allow_anonymous: config.allow_anonymous,
+            dev_user: config.dev_user.clone(),
         }
     }
 }

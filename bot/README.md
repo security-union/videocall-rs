@@ -58,8 +58,9 @@ MP4s and ffmpeg to produce the I420 frames the bot loads at runtime.
 
 **Option A: Use pre-made costume clips (recommended)**
 
-Download `costume-videos.zip` from the project's shared assets (ask the team for the
-link or check GitHub release assets). Then normalize to I420 frames:
+Download `costume-videos.zip` from the
+[GitHub release assets](https://github01.hclpnp.com/labs-projects/videocall/releases/tag/bot-v1.2.0-rc1).
+Then normalize to I420 frames:
 
 ```bash
 unzip costume-videos.zip -d /tmp

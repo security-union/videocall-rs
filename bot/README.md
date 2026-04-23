@@ -50,28 +50,47 @@ Produces:
 
 The conversation text and participant list are in `generate-conversation-edge.py` — edit to customize.
 
-### 2. Create costume video clips (optional)
+### 2. Set up costume video (for realistic video load)
 
-For realistic video load, record costume clips using Google Meet's "Background and effects" costume filters:
+The bot can use pre-recorded costume video clips instead of the default EKG waveform.
+19 costumes are already configured in the generated manifest. You just need the source
+MP4s and ffmpeg to produce the I420 frames the bot loads at runtime.
+
+**Option A: Use pre-made costume clips (recommended)**
+
+Download `costume-videos.zip` from the project's shared assets (ask the team for the
+link or check GitHub release assets). Then normalize to I420 frames:
+
+```bash
+unzip costume-videos.zip -d /tmp
+cd bot
+mkdir -p assets/costumes
+for dir in /tmp/costume-videos/*/; do
+    name=$(basename "$dir")
+    mkdir -p "assets/costumes/$name"
+    ffmpeg -y -i "$dir/silent.mp4"  -vf "scale=1280:720,fps=30" -pix_fmt yuv420p -f rawvideo "assets/costumes/$name/idle.i420"
+    ffmpeg -y -i "$dir/talking.mp4" -vf "scale=1280:720,fps=30" -pix_fmt yuv420p -f rawvideo "assets/costumes/$name/talking.i420"
+done
+```
+
+This produces ~15 GB of I420 frames in `assets/costumes/` (gitignored). The source
+MP4s in the zip are ~52 MB and should be preserved for regeneration.
+
+**Option B: Record your own costume clips**
+
+Use Google Meet's "Background and effects" costume filters to record new characters:
 
 1. Join a Google Meet call alone, apply a costume filter (pirate, cat, robot, etc.)
 2. Record two clips per character using OBS or screen capture (crop to just the video tile):
    - `<name>-silent.mp4` — 8-10 seconds, no talking, natural idle movement
    - `<name>-talking.mp4` — 8-10 seconds, counting "one, two, three..." with mouth movement
-3. Normalize to I420 frames:
-   ```bash
-   mkdir -p assets/costumes/pirate
-   ffmpeg -y -i pirate-silent.mp4 -vf "scale=1280:720,fps=30" -pix_fmt yuv420p -f rawvideo assets/costumes/pirate/idle.i420
-   ffmpeg -y -i pirate-talking.mp4 -vf "scale=1280:720,fps=30" -pix_fmt yuv420p -f rawvideo assets/costumes/pirate/talking.i420
-   ```
-4. Assign costumes to participants in `conversation/manifest.yaml`:
-   ```yaml
-   - name: alice
-     voice: en-US-AvaNeural
-     costume_dir: assets/costumes/pirate
-   ```
+3. Normalize with the same ffmpeg command above
+4. Add `costume_dir: assets/costumes/<name>` to the participant in `conversation/manifest.yaml`
 
-Each costume pair is ~800 MiB of I420 frames (gitignored). Save the raw MP4s (~2 MB each) for regeneration. The I420 files can always be recreated from the MP4s with the ffmpeg command above.
+**Option C: Skip costumes (EKG mode)**
+
+Set `video_mode: ekg` in the config file. No costume files needed — the bot renders
+animated EKG waveforms at 15fps/500kbps. Less realistic for load testing but zero setup.
 
 ### 3. Configure
 

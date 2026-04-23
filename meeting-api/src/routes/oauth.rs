@@ -1220,6 +1220,12 @@ mod tests {
             nats: None,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
+            display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
             search: None,
             // OAuth handler tests exercise the OAuth-configured path; make
             // sure the anonymous fallback is off so behaviour matches prod.

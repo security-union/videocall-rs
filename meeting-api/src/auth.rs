@@ -343,6 +343,12 @@ mod tests {
             nats: None,
             service_version_urls: Vec::new(),
             http_client: reqwest::Client::new(),
+            display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
             search: None,
             // Default to true in the "no OAuth" unit-test state so tests that
             // exercise the anonymous-fallback path don't have to flip this
@@ -674,6 +680,12 @@ mod tests {
             nats: None,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
+            display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
             search: None,
             // JWKS-mode tests exercise the OAuth path; unauthenticated
             // requests must not fall through to an anonymous identity.

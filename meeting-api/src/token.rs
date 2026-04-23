@@ -97,6 +97,31 @@ pub fn decode_session_token(secret: &str, token: &str) -> Result<SessionTokenCla
     })
 }
 
+/// Decode any guest JWT - either an observer token or a room-access token.
+/// This allows the `/leave-guest` endpoint to accept both the observer token
+/// (issued while waiting) and the room token (issued after admission), so guests can always cleanly leave.
+pub fn decode_guest_token(secret: &str, token: &str) -> Result<RoomAccessTokenClaims, AppError> {
+    let mut validation = Validation::default();
+    validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
+
+    let claims = decode::<RoomAccessTokenClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map(|data| data.claims)
+    .map_err(|e| {
+        tracing::warn!("Guest JWT validation failed: {e}");
+        AppError::unauthorized_msg("invalid or expired guest token")
+    })?;
+
+    if !claims.is_guest {
+        return Err(AppError::unauthorized_msg("token is not a guest token"));
+    }
+
+    Ok(claims)
+}
+
 // ---------------------------------------------------------------------------
 // Room access token
 // ---------------------------------------------------------------------------
@@ -109,6 +134,8 @@ pub fn generate_room_token(
     room: &str,
     is_host: bool,
     display_name: &str,
+    end_on_host_leave: bool,
+    is_guest: bool,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = RoomAccessTokenClaims {
@@ -116,8 +143,10 @@ pub fn generate_room_token(
         room: room.to_string(),
         room_join: true,
         is_host,
+        is_guest,
         display_name: display_name.to_string(),
         observer: false,
+        end_on_host_leave,
         exp: now + ttl_secs,
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
     };
@@ -146,6 +175,7 @@ pub fn generate_observer_token(
     user_id: &str,
     room: &str,
     display_name: &str,
+    is_guest: bool,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = RoomAccessTokenClaims {
@@ -153,8 +183,10 @@ pub fn generate_observer_token(
         room: room.to_string(),
         room_join: false,
         is_host: false,
+        is_guest,
         display_name: display_name.to_string(),
         observer: true,
+        end_on_host_leave: true,
         exp: now + OBSERVER_TOKEN_TTL_SECS,
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
     };
@@ -225,9 +257,17 @@ mod tests {
 
     #[test]
     fn token_round_trips_with_correct_claims() {
-        let token =
-            generate_room_token(TEST_SECRET, 600, "user@test.com", "room-42", true, "Alice")
-                .expect("should sign");
+        let token = generate_room_token(
+            TEST_SECRET,
+            600,
+            "user@test.com",
+            "room-42",
+            true,
+            "Alice",
+            true,
+            false,
+        )
+        .expect("should sign");
 
         let mut validation = Validation::default();
         validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
@@ -247,8 +287,9 @@ mod tests {
 
     #[test]
     fn issuer_is_videocall_meeting_backend() {
-        let token = generate_room_token(TEST_SECRET, 300, "a@b.com", "r", false, "Bob")
-            .expect("should sign");
+        let token =
+            generate_room_token(TEST_SECRET, 300, "a@b.com", "r", false, "Bob", false, false)
+                .expect("should sign");
 
         let mut validation = Validation::default();
         validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
@@ -266,8 +307,8 @@ mod tests {
     fn exp_is_now_plus_ttl() {
         let ttl = 900_i64;
         let before = Utc::now().timestamp();
-        let token =
-            generate_room_token(TEST_SECRET, ttl, "a@b.com", "r", false, "X").expect("should sign");
+        let token = generate_room_token(TEST_SECRET, ttl, "a@b.com", "r", false, "X", false, false)
+            .expect("should sign");
         let after = Utc::now().timestamp();
 
         let mut validation = Validation::default();
@@ -286,8 +327,8 @@ mod tests {
 
     #[test]
     fn room_join_is_always_true() {
-        let token =
-            generate_room_token(TEST_SECRET, 60, "a@b.com", "r", false, "X").expect("should sign");
+        let token = generate_room_token(TEST_SECRET, 60, "a@b.com", "r", false, "X", false, false)
+            .expect("should sign");
 
         let mut validation = Validation::default();
         validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);

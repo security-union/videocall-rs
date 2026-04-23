@@ -17,8 +17,9 @@ if ! docker build -t "$IMAGE_URL" \
     --build-arg GIT_BRANCH="$GIT_BRANCH" \
     --build-arg BUILD_TIMESTAMP="$BUILD_TIMESTAMP" \
     -f Dockerfile.actix .; then
-    echo "Failed to build server_rust"
-else
-    docker push "$IMAGE_URL"
-    echo "New image uploaded to ${IMAGE_URL}"
+    echo "Failed to build videocall-media-server"
+    exit 1
 fi
+
+docker push "$IMAGE_URL"
+echo "Pushed ${IMAGE_URL}"

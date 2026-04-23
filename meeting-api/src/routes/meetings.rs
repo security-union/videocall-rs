@@ -13,6 +13,7 @@
 
 //! Handlers for meeting CRUD endpoints.
 
+use crate::search;
 use argon2::PasswordHasher;
 use axum::{
     extract::{Path, Query, State},
@@ -24,7 +25,7 @@ use videocall_meeting_types::{
     requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
     responses::{
         APIResponse, CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
-        MeetingInfoResponse, MeetingSummary,
+        MeetingGuestInfoResponse, MeetingInfoResponse, MeetingSummary,
     },
 };
 
@@ -101,6 +102,8 @@ pub async fn create_meeting(
 
     let waiting_room_enabled = body.waiting_room_enabled.unwrap_or(true);
     let admitted_can_admit = body.admitted_can_admit.unwrap_or(false);
+    let end_on_host_leave = body.end_on_host_leave.unwrap_or(true);
+    let allow_guests = body.allow_guests.unwrap_or(false);
 
     let row = db_meetings::create_with_options(
         &state.db,
@@ -110,6 +113,8 @@ pub async fn create_meeting(
         &attendees_json,
         waiting_room_enabled,
         admitted_can_admit,
+        end_on_host_leave,
+        allow_guests,
     )
     .await
     .map_err(|e| match e {
@@ -118,6 +123,11 @@ pub async fn create_meeting(
         }
         other => AppError::from(other),
     })?;
+
+    // Fire-and-forget push to SearchV2.  See `search::spawn_repush` for the
+    // full fire-and-forget contract (no-op when disabled, re-fetches the
+    // meeting row, loads the participant roster).
+    search::spawn_repush(&state, row.id, row.room_id.clone());
 
     let response = CreateMeetingResponse {
         meeting_id: row.room_id,
@@ -128,6 +138,8 @@ pub async fn create_meeting(
         has_password: password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         admitted_can_admit: row.admitted_can_admit,
+        end_on_host_leave: row.end_on_host_leave,
+        allow_guests: row.allow_guests,
     };
 
     Ok((StatusCode::CREATED, Json(APIResponse::ok(response))))
@@ -142,8 +154,21 @@ pub async fn list_meetings(
     let limit = params.limit.clamp(1, 100);
     let offset = params.offset.max(0);
 
-    let rows = db_meetings::list_by_owner(&state.db, &user_id, limit, offset).await?;
-    let total = db_meetings::count_by_owner(&state.db, &user_id).await?;
+    let (rows, total) = if let Some(q) = &params.q {
+        if !q.trim().is_empty() {
+            let rows = db_meetings::search_by_owner(&state.db, &user_id, q, limit, offset).await?;
+            let total = db_meetings::count_search_by_owner(&state.db, &user_id, q).await?;
+            (rows, total)
+        } else {
+            let rows = db_meetings::list_by_owner(&state.db, &user_id, limit, offset).await?;
+            let total = db_meetings::count_by_owner(&state.db, &user_id).await?;
+            (rows, total)
+        }
+    } else {
+        let rows = db_meetings::list_by_owner(&state.db, &user_id, limit, offset).await?;
+        let total = db_meetings::count_by_owner(&state.db, &user_id).await?;
+        (rows, total)
+    };
 
     let mut meetings = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -162,6 +187,8 @@ pub async fn list_meetings(
             waiting_count,
             waiting_room_enabled: row.waiting_room_enabled,
             admitted_can_admit: row.admitted_can_admit,
+            end_on_host_leave: row.end_on_host_leave,
+            allow_guests: row.allow_guests,
         });
     }
 
@@ -198,11 +225,13 @@ pub async fn get_meeting(
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         admitted_can_admit: row.admitted_can_admit,
+        end_on_host_leave: row.end_on_host_leave,
         participant_count,
         waiting_count,
         started_at: row.started_at.timestamp_millis(),
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
+        allow_guests: row.allow_guests,
     })))
 }
 
@@ -222,6 +251,15 @@ pub async fn delete_meeting(
     }
 
     db_meetings::soft_delete(&state.db, &meeting_id, &user_id).await?;
+
+    // Fire-and-forget: remove from SearchV2
+    tokio::spawn({
+        let state = state.clone();
+        let room_id = meeting_id.clone();
+        async move {
+            search::delete_meeting_doc(state.search.as_ref(), &state.http_client, &room_id).await;
+        }
+    });
 
     Ok(Json(APIResponse::ok(DeleteMeetingResponse {
         message: format!("Meeting '{meeting_id}' has been deleted"),
@@ -259,11 +297,13 @@ pub async fn end_meeting_handler(
             has_password: meeting.password_hash.is_some(),
             waiting_room_enabled: meeting.waiting_room_enabled,
             admitted_can_admit: meeting.admitted_can_admit,
+            end_on_host_leave: meeting.end_on_host_leave,
             participant_count,
             waiting_count,
             started_at: meeting.started_at.timestamp_millis(),
             ended_at: meeting.ended_at.map(|t| t.timestamp_millis()),
             your_status,
+            allow_guests: meeting.allow_guests,
         })));
     }
 
@@ -272,6 +312,10 @@ pub async fn end_meeting_handler(
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    // Fire-and-forget push of the ended state so search results mark the
+    // meeting as completed promptly.
+    search::spawn_repush(&state, row.id, row.room_id.clone());
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
@@ -288,11 +332,13 @@ pub async fn end_meeting_handler(
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         admitted_can_admit: row.admitted_can_admit,
+        end_on_host_leave: row.end_on_host_leave,
         participant_count,
         waiting_count,
         started_at: row.started_at.timestamp_millis(),
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
+        allow_guests: row.allow_guests,
     })))
 }
 
@@ -303,7 +349,11 @@ pub async fn update_meeting(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
-    let row = if body.waiting_room_enabled.is_some() || body.admitted_can_admit.is_some() {
+    let row = if body.waiting_room_enabled.is_some()
+        || body.admitted_can_admit.is_some()
+        || body.end_on_host_leave.is_some()
+        || body.allow_guests.is_some()
+    {
         // Atomically update both settings within a single transaction.
         // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
         // so we only fetch separately on failure to distinguish 404 vs 403.
@@ -313,6 +363,8 @@ pub async fn update_meeting(
             &user_id,
             body.waiting_room_enabled,
             body.admitted_can_admit,
+            body.end_on_host_leave,
+            body.allow_guests,
         )
         .await?
         {
@@ -337,6 +389,10 @@ pub async fn update_meeting(
         row
     };
 
+    // Fire-and-forget push of the updated settings so search results reflect
+    // the new waiting-room / admitted_can_admit state quickly.
+    search::spawn_repush(&state, row.id, row.room_id.clone());
+
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
@@ -352,11 +408,35 @@ pub async fn update_meeting(
         has_password: row.password_hash.is_some(),
         waiting_room_enabled: row.waiting_room_enabled,
         admitted_can_admit: row.admitted_can_admit,
+        end_on_host_leave: row.end_on_host_leave,
         participant_count,
         waiting_count,
         started_at: row.started_at.timestamp_millis(),
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
+        allow_guests: row.allow_guests,
+    })))
+}
+
+/// GET /api/v1/meetings/{meeting_id}/guest-info
+///
+/// Public (no authentication required). Returns whether guests are allowed
+/// to join this meeting. Used by the frontend to decide whether to redirect
+/// an unauthenticated user to the guest join page.
+///
+/// NOTE: intentionally returns `{ allow_guests: false }` for both missing and
+/// guest-disabled meetings rather than a 404, to prevent meeting enumeration
+/// by unauthenticated callers.
+pub async fn get_meeting_guest_info(
+    State(state): State<AppState>,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<APIResponse<MeetingGuestInfoResponse>>, AppError> {
+    let allow_guests = match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
+        Some(row) => row.allow_guests,
+        None => false,
+    };
+    Ok(Json(APIResponse::ok(MeetingGuestInfoResponse {
+        allow_guests,
     })))
 }
 

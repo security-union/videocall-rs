@@ -207,6 +207,16 @@ pub async fn upload_console_logs(
         .or(query.session_ts)
         .unwrap_or_else(|| Utc::now().timestamp_millis().to_string());
 
+    // Optional chunk sequence number (1–99999). When present, produces
+    // zero-padded filenames that sort chronologically in any file manager.
+    // sendBeacon can't set headers, so this is absent for beacon fallback
+    // uploads — those fall back to UUIDv7 suffixes.
+    let chunk_seq: Option<u32> = headers
+        .get("X-Chunk-Seq")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| (1..=99999).contains(&n));
+
     // --- Validate meeting_id path-safety ---
     validate_id(&meeting_id, "meeting_id", &SAFE_MEETING_ID_RE)?;
 
@@ -326,9 +336,18 @@ pub async fn upload_console_logs(
     check_upload_quota(&user_id, body.len() as u64)?;
 
     // --- Generate chunk filename ---
-    let uuid_v7 = uuid::Uuid::now_v7();
-    let uuid_short = &uuid_v7.simple().to_string()[..8];
-    let filename = format!("{user_id}_{session_ts}_{uuid_short}.log");
+    // When a chunk sequence number is provided, zero-pad to 5 digits so files
+    // sort chronologically in any file manager (including macOS Finder which
+    // uses "natural sort" that breaks on mixed hex UUIDv7 suffixes).
+    // Fallback: sendBeacon can't set headers, so beacon uploads get a UUIDv7
+    // suffix — these sort after numbered chunks, which is acceptable.
+    let chunk_suffix = if let Some(seq) = chunk_seq {
+        format!("{seq:05}")
+    } else {
+        let uuid_v7 = uuid::Uuid::now_v7();
+        uuid_v7.simple().to_string()[..16].to_string()
+    };
+    let filename = format!("{user_id}_{session_ts}_{chunk_suffix}.log");
 
     // --- Create directory and write file ---
     let base_dir = std::env::var("CONSOLE_LOG_DIR").unwrap_or_else(|_| DEFAULT_LOG_DIR.to_string());
@@ -398,14 +417,33 @@ pub async fn upload_console_logs(
         opts.mode(0o600);
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = opts.open(&file_path).await.map_err(|e| {
-        tracing::error!(
-            path = %file_path.display(),
-            error = %e,
-            "Failed to create console log file"
-        );
-        AppError::internal("Failed to store console log chunk")
-    })?;
+    let mut file = match opts.open(&file_path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            tracing::error!(
+                path = %file_path.display(),
+                user_id = %user_id,
+                meeting_id = %meeting_id,
+                "Console log chunk filename collision (file already exists)"
+            );
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                videocall_meeting_types::APIError {
+                    code: "CONFLICT".to_string(),
+                    message: "Chunk already exists".to_string(),
+                    engineering_error: None,
+                },
+            ));
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %file_path.display(),
+                error = %e,
+                "Failed to create console log file"
+            );
+            return Err(AppError::internal("Failed to store console log chunk"));
+        }
+    };
 
     file.write_all(&body).await.map_err(|e| {
         tracing::error!(

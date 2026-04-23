@@ -155,6 +155,46 @@ h3 {
   flex-shrink: 0;
 }
 
+/* Guest badge — yellow pill */
+.guest-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 7px;
+  border-radius: 8px;
+  background-color: #f59e0b;
+  color: #000;
+  font-size: 0.7em;
+  font-weight: 700;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+
+/* Guest badge on the floating-name overlay on video tiles */
+.floating-name .guest-badge {
+  font-size: 0.75em;
+  padding: 1px 6px;
+  margin-left: 6px;
+}
+
+/* Guest badge on camera preview (bottom-right corner) */
+.guest-badge-preview {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  background-color: #f59e0b;
+  color: #000;
+  font-size: 0.7em;
+  font-weight: 700;
+  z-index: 30;
+  pointer-events: none;
+}
+
 .peer_item_name_container {
   display: flex;
   align-items: center;
@@ -2330,11 +2370,11 @@ select {
 .split-peer-tile {
   width: 100%;
   min-height: 0;
-  flex: 1 1 0;
+  aspect-ratio: 16 / 9;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
+  overflow: visible; /* allow speaking glow box-shadow to extend beyond tile */
   background-color: #2d2d2d;
   border: 2px solid rgba(100, 100, 100, 0.30);
   border-radius: 12px;
@@ -2344,6 +2384,21 @@ select {
 .split-peer-tile .canvas-container {
   width: 100%;
   height: 100%;
+  overflow: hidden; /* clip video content within tile boundaries */
+  border-radius: 10px; /* match parent radius minus border */
+}
+
+/* Bottom gradient scrim on split-peer video tiles (mirrors .grid-item rule) */
+.split-peer-tile .canvas-container.video-on::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 64px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.24), rgba(0, 0, 0, 0));
+  pointer-events: none;
+  z-index: 1;
 }
 
 /* Local screen-share preview — rendered below camera inside .host */

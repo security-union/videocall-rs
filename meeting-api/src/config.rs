@@ -50,6 +50,36 @@ pub struct Config {
     /// Internal URLs for fetching version info from peer services.
     /// Used by the aggregated `/api/v1/versions` endpoint.
     pub service_version_urls: Vec<String>,
+    /// SearchV2 integration config. `None` when the middleware is not configured
+    /// (both `SEARCH_API_URL` and `SEARCH_API_TOKEN` must be set); search push
+    /// becomes a no-op in that case. See [`crate::search`].
+    pub search: Option<SearchConfig>,
+    /// Allow unauthenticated requests to resolve to a stable "anonymous" user
+    /// identity (path 3 in [`crate::auth::AuthUser`]).  Controlled by
+    /// `ALLOW_ANONYMOUS=true`.  Default `false` — production must set this
+    /// explicitly off (or leave unset); only flip it for local development
+    /// when running without an OAuth provider.
+    pub allow_anonymous: bool,
+}
+
+/// SearchV2 / opensearch-middleware integration configuration.
+///
+/// When present on [`Config`] / [`crate::state::AppState`], the meeting-api
+/// pushes meeting lifecycle documents to the middleware's content-push API and
+/// deletes them on hard deletion.  When `None`, every push is a no-op — the
+/// SearchV2 integration degrades gracefully.
+///
+/// Populated from the `SEARCH_API_URL` and `SEARCH_API_TOKEN` env vars; both
+/// must be set for the struct to be constructed.
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    /// Base URL of the SearchV2 middleware (no trailing slash required),
+    /// e.g. `http://localhost:3000/api/search/v2`.
+    pub base_url: String,
+    /// Bearer token used for content-push authentication (a middleware JWT
+    /// with `pushadmin` or `searchadmin` role).  Not shared with end users —
+    /// this is a server-to-server admin token.
+    pub token: String,
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -139,6 +169,11 @@ impl Config {
     ///   from `OAUTH_ISSUER` when not set), `AFTER_LOGOUT_URL` (sent as
     ///   `post_logout_redirect_uri` to the provider's end-session endpoint)
     /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"` or comma-separated for multiple origins)
+    /// - `SEARCH_API_URL` + `SEARCH_API_TOKEN` (both required together to enable SearchV2 push;
+    ///   either missing → push is silently disabled). See [`SearchConfig`].
+    /// - `ALLOW_ANONYMOUS` (default: `false`) — set to `"true"` / `"1"` for local development
+    ///   only. When enabled, unauthenticated requests resolve to a stable anonymous user
+    ///   identity instead of returning 401.
     pub fn from_env() -> Result<Self, String> {
         let database_url = env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -176,6 +211,52 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
             .unwrap_or_default();
+
+        // SearchV2 push integration is enabled only when both env vars are set.
+        // Missing either one → no-op pushes (graceful degradation). We log the
+        // decision once at startup so operators can see why search isn't firing.
+        let search = match (
+            env::var("SEARCH_API_URL").ok().filter(|s| !s.is_empty()),
+            env::var("SEARCH_API_TOKEN").ok().filter(|s| !s.is_empty()),
+        ) {
+            (Some(base_url), Some(token)) => {
+                tracing::info!("SearchV2 push enabled (base_url={base_url})");
+                Some(SearchConfig { base_url, token })
+            }
+            (Some(_), None) => {
+                tracing::info!(
+                    "SearchV2 push disabled: SEARCH_API_URL set but SEARCH_API_TOKEN is missing"
+                );
+                None
+            }
+            (None, Some(_)) => {
+                tracing::info!(
+                    "SearchV2 push disabled: SEARCH_API_TOKEN set but SEARCH_API_URL is missing"
+                );
+                None
+            }
+            (None, None) => {
+                tracing::info!("SearchV2 push disabled (SEARCH_API_URL not set)");
+                None
+            }
+        };
+
+        // Anonymous auth fallback — opt-in via ALLOW_ANONYMOUS.  Accept the
+        // common truthy forms ("true"/"1", case-insensitive) and default to
+        // false so production deployments never allow anonymous by accident.
+        let allow_anonymous = env::var("ALLOW_ANONYMOUS")
+            .map(|v| {
+                let v = v.trim().to_lowercase();
+                v == "true" || v == "1"
+            })
+            .unwrap_or(false);
+        if allow_anonymous {
+            tracing::warn!(
+                "ALLOW_ANONYMOUS=true — unauthenticated requests will resolve to \
+                 anonymous identities. This is intended for local development only; \
+                 do not enable in production."
+            );
+        }
 
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
@@ -285,6 +366,8 @@ impl Config {
             cors_allowed_origin,
             nats_url,
             service_version_urls,
+            search,
+            allow_anonymous,
         })
     }
 

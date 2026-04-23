@@ -197,6 +197,7 @@ async fn test_valid_meeting_api_token_connects() {
         "jwt-room-1",
         true,
         "Alice",
+        false, // is_guest
     )
     .expect("meeting-api should generate a valid token");
 
@@ -224,6 +225,7 @@ async fn test_expired_meeting_api_token_rejected() {
         "jwt-room-2",
         false,
         "Alice",
+        false, // is_guest
     )
     .expect("should generate token");
 
@@ -246,6 +248,7 @@ async fn test_wrong_secret_token_rejected() {
         "jwt-room-3",
         false,
         "Alice",
+        false, // is_guest
     )
     .expect("should generate token");
 
@@ -279,6 +282,7 @@ async fn test_token_identity_extracted_from_jwt() {
         "my-special-room",
         false,
         "Bob",
+        false, // is_guest
     )
     .expect("should generate token");
 
@@ -355,6 +359,7 @@ async fn test_host_and_attendee_tokens_both_connect() {
         room,
         true,
         "Host Alice",
+        false, // is_guest
     )
     .expect("should generate host token");
 
@@ -366,6 +371,7 @@ async fn test_host_and_attendee_tokens_both_connect() {
         room,
         false,
         "Attendee Bob",
+        false, // is_guest
     )
     .expect("should generate attendee token");
 

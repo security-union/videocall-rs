@@ -76,6 +76,8 @@ fn generate_instance_id() -> String {
     )
 }
 
+const MAX_SESSION_ID_HISTORY: usize = 16;
+
 /// Configuration options for creating a [`VideoCallClient`].
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
@@ -157,6 +159,9 @@ pub struct VideoCallClientOptions {
     ///
     /// Should be `true` for call participants; set to `false` only for observer/lobby clients.
     pub decode_media: bool,
+
+    /// Whether the local user joined as an unauthenticated guest.
+    pub is_guest: bool,
 }
 
 #[derive(Debug)]
@@ -188,6 +193,11 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
+    /// All session_ids assigned to this client instance (current page load).
+    /// Survives reconnects/re-elections. Used to match CONGESTION signals that
+    /// target a previous session_id from before re-election completed.
+    /// Bounded to MAX_SESSION_ID_HISTORY to prevent unbounded growth.
+    session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so we deduplicate by (event_type, target_user_id) within a
@@ -325,6 +335,7 @@ impl VideoCallClient {
                     last_known_server: None,
                 },
                 own_session_id: None,
+                session_id_history: std::collections::VecDeque::new(),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -714,6 +725,27 @@ impl VideoCallClient {
         }
     }
 
+    /// Returns whether the local user is a guest, as declared in the JWT claim
+    /// captured at client construction time.
+    pub fn is_local_guest(&self) -> Option<bool> {
+        Some(self.options.is_guest)
+    }
+
+    /// Get the guest status for a peer by session_id string.
+    /// Returns `None` if the peer doesn't exist or no guest status has been set.
+    pub fn get_peer_is_guest(&self, session_id: &str) -> Option<bool> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get_peer_is_guest(session_id),
+            Err(_) => {
+                warn!(
+                    "Failed to borrow inner in get_peer_is_guest for session_id: {}",
+                    session_id
+                );
+                None
+            }
+        }
+    }
+
     /// Hacky function that returns true if the given peer has yet to send a frame of screen share.
     ///
     /// No reason for this function to exist, it should be deducible from the
@@ -987,19 +1019,16 @@ impl VideoCallClient {
         }
     }
 
-    /// Update the visibility state for a peer. When `visible` is `false`,
-    /// video and screen decoding is paused to save CPU. Audio is always
-    /// decoded regardless of visibility.
+    /// Update the peer set that is eligible for video/screen decode.
     ///
-    /// Called by the UI layer when an `IntersectionObserver` detects that a
-    /// peer's canvas element has scrolled in or out of the viewport.
-    pub fn set_peer_visibility(&self, peer_id: &str, visible: bool) {
-        let sid: u64 = match peer_id.parse() {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+    /// The UI layout computes this set from the peers it actively renders.
+    /// Peers outside the set remain connected and continue decoding audio, but
+    /// skip video and screen decode to cap renderer load in large meetings.
+    pub fn set_active_decode_set(&self, active_session_ids: &std::collections::HashSet<u64>) {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            inner.peer_decode_manager.set_peer_visibility(sid, visible);
+            inner
+                .peer_decode_manager
+                .set_active_decode_set(active_session_ids);
         }
     }
 
@@ -1368,6 +1397,12 @@ impl Inner {
                     response.session_id
                 );
                 self.own_session_id = Some(response.session_id);
+                if !self.session_id_history.contains(&response.session_id) {
+                    if self.session_id_history.len() >= MAX_SESSION_ID_HISTORY {
+                        self.session_id_history.pop_front();
+                    }
+                    self.session_id_history.push_back(response.session_id);
+                }
 
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {
@@ -1430,6 +1465,7 @@ impl Inner {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
                             let display_name = if meeting_packet.display_name.is_empty() {
+                                warn!("PARTICIPANT_JOINED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
                                 target_str.clone()
                             } else {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()
@@ -1439,6 +1475,10 @@ impl Inner {
                                 self.peer_decode_manager.set_peer_display_name(
                                     meeting_packet.session_id,
                                     display_name.clone(),
+                                );
+                                self.peer_decode_manager.set_peer_is_guest(
+                                    meeting_packet.session_id,
+                                    meeting_packet.is_guest,
                                 );
                             }
 
@@ -1492,6 +1532,7 @@ impl Inner {
                                 info!("Peer left: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_left {
                                     let display_name = if meeting_packet.display_name.is_empty() {
+                                        warn!("PARTICIPANT_LEFT: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
                                         target_str.clone()
                                     } else {
                                         String::from_utf8_lossy(&meeting_packet.display_name)
@@ -1551,6 +1592,7 @@ impl Inner {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
                             let new_display_name = if meeting_packet.display_name.is_empty() {
+                                warn!("DISPLAY_NAME_CHANGED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
                                 target_str.clone()
                             } else {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()
@@ -1604,18 +1646,23 @@ impl Inner {
             Ok(PacketType::CONGESTION) => {
                 // Server-side congestion feedback: the server is dropping
                 // packets destined for a receiver because the outbound channel
-                // is full. Only act on it if the target session matches ours.
-                if self.own_session_id == Some(response.session_id) {
+                // is full. Match on session_id history — the signal targets a
+                // specific session_id which may be our current or a previous
+                // one from before re-election. Using session_id history (not
+                // user_id) ensures multi-tab/multi-device sessions for the
+                // same account are independently targeted.
+                if self.session_id_history.contains(&response.session_id) {
                     warn!(
-                        "Received CONGESTION signal from server (receiver: {}), requesting quality step-down",
+                        "Received CONGESTION signal from server (receiver: {}, target_session: {}), requesting quality step-down",
                         String::from_utf8_lossy(&response.user_id),
+                        response.session_id,
                     );
                     self.congestion_step_down_requested
                         .store(true, Ordering::Release);
                 } else {
                     debug!(
-                        "Ignoring CONGESTION signal targeted at session {} (our session: {:?})",
-                        response.session_id, self.own_session_id,
+                        "Ignoring CONGESTION signal for session {} (our history: {:?})",
+                        response.session_id, self.session_id_history,
                     );
                 }
             }

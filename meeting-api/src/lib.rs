@@ -24,5 +24,6 @@ pub mod error;
 pub mod nats_events;
 pub mod oauth;
 pub mod routes;
+pub mod search;
 pub mod state;
 pub mod token;

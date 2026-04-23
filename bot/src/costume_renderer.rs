@@ -77,8 +77,7 @@ impl CostumeRenderer {
         })
     }
 
-    pub fn frame_i420(&self, rms_value: f32, frame_idx: usize) -> &[u8] {
-        let is_speaking = rms_value > 0.01;
+    pub fn frame_i420(&self, is_speaking: bool, frame_idx: usize) -> &[u8] {
         if is_speaking {
             let idx = frame_idx % self.talking_count;
             &self.talking_frames[idx * FRAME_BYTES..(idx + 1) * FRAME_BYTES]

@@ -68,7 +68,6 @@ For realistic video load, record costume clips using Google Meet's "Background a
    ```yaml
    - name: alice
      voice: en-US-AvaNeural
-     ekg_color: [0, 200, 220]
      costume_dir: assets/costumes/pirate
    ```
 
@@ -160,7 +159,7 @@ Every 10 seconds each bot logs a stats line:
 - **Video (costume)**: VP9 Profile 0, 1280x720 @ 30fps, 1000kbps target, pre-recorded I420 frames
 - **Video (EKG)**: VP9 Profile 0, 1280x720 @ 15fps, 500kbps target, rendered on-the-fly
 - **Health**: HealthPacket every 1s with per-peer quality scores, FPS, bitrate, concealment
-- **Heartbeat**: every 5s with VAD is_speaking flag
+- **Heartbeat**: every 1s with VAD is_speaking flag
 - **Wire format**: Protobuf `PacketWrapper` → `MediaPacket` (same as browser client)
 
 ## Remote Deployment
@@ -202,7 +201,7 @@ On the remote machine:
 |-------|----------|---------|-------------|
 | `ws_url` | * | — | WebSocket relay URL (`wss://...`) |
 | `wt_url` | * | — | WebTransport relay URL (`https://...:443`) |
-| `wt_ratio` | no | `0.66` | Fraction of bots on WebTransport (0.0–1.0) |
+| `wt_ratio` | no | `0.0` | Fraction of bots on WebTransport (0.0–1.0) |
 | `transport` | legacy | `"webtransport"` | Legacy: `"websocket"` or `"webtransport"` |
 | `server_url` | legacy | — | Legacy: single server URL |
 | `meeting_id` | yes | — | Room to join |
@@ -235,7 +234,7 @@ main.rs
   └── Per participant:
         ├── transport.rs → websocket_client.rs / webtransport_client.rs
         ├── health_reporter.rs  (tokio task, 1Hz HealthPackets)
-        ├── heartbeat producer  (5s keepalive, VAD is_speaking)
+        ├── heartbeat producer  (1s keepalive, VAD is_speaking)
         ├── inbound_stats.rs    (per-sender RX quality diagnostics)
         └── [broadcasters only]:
               ├── audio_producer.rs     (OS thread, Opus + DTX, 50fps)

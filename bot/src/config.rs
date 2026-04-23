@@ -156,7 +156,7 @@ impl BotConfig {
     ) -> anyhow::Result<(Transport, Url)> {
         // New-style: ws_url / wt_url with ratio-based split
         if self.ws_url.is_some() || self.wt_url.is_some() {
-            let ratio = self.wt_ratio.unwrap_or(1.0).clamp(0.0, 1.0);
+            let ratio = self.wt_ratio.unwrap_or(0.0).clamp(0.0, 1.0);
             let use_wt = if self.wt_url.is_some() && self.ws_url.is_some() {
                 // Assign first (ratio * total_bots) bots to WT, rest to WS
                 let wt_count = (ratio * total_bots as f64).round() as usize;
@@ -200,7 +200,7 @@ impl BotConfig {
     }
 
     pub fn token_ttl_secs(&self) -> u64 {
-        self.token_ttl_secs.unwrap_or(3600)
+        self.token_ttl_secs.unwrap_or(86400)
     }
 
     pub fn conversation_dir(&self) -> &str {

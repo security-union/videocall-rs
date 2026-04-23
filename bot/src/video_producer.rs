@@ -347,8 +347,7 @@ impl VideoProducer {
 
             // Read I420 frame directly from costume renderer
             let speaking = is_speaking.load(Ordering::Relaxed);
-            let rms_value = if speaking { 0.1 } else { 0.0 };
-            let i420_data = renderer.frame_i420(rms_value, frame_in_loop);
+            let i420_data = renderer.frame_i420(speaking, frame_in_loop);
 
             // Encode to VP9
             let frames_result = if force_keyframe {

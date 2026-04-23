@@ -172,6 +172,51 @@ async fn main() -> anyhow::Result<()> {
         n
     );
 
+    // Pre-flight memory check for costume video mode
+    if config.video_mode == VideoMode::Costume {
+        let mut total_costume_bytes: u64 = 0;
+        let mut costume_count = 0usize;
+        for p in active_participants
+            .iter()
+            .filter(|p| broadcaster_names.contains(p.name.as_str()))
+        {
+            if let Some(ref dir) = p.costume_dir {
+                let idle_path = format!("{dir}/idle.i420");
+                let talking_path = format!("{dir}/talking.i420");
+                if let (Ok(idle_meta), Ok(talk_meta)) = (
+                    std::fs::metadata(&idle_path),
+                    std::fs::metadata(&talking_path),
+                ) {
+                    total_costume_bytes += idle_meta.len() + talk_meta.len();
+                    costume_count += 1;
+                }
+            }
+        }
+        if costume_count > 0 {
+            let total_gb = total_costume_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            info!(
+                "Costume memory estimate: {:.1} GiB for {} costumes",
+                total_gb, costume_count
+            );
+            if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                if let Some(avail_line) = meminfo.lines().find(|l| l.starts_with("MemAvailable:")) {
+                    if let Some(kb_str) = avail_line.split_whitespace().nth(1) {
+                        if let Ok(avail_kb) = kb_str.parse::<u64>() {
+                            let avail_bytes = avail_kb * 1024;
+                            if total_costume_bytes > avail_bytes * 80 / 100 {
+                                warn!(
+                                    "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — risk of OOM",
+                                    total_gb,
+                                    avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Media start via OnceCell -- set AFTER all bots are spawned + warmup sleep
     let media_start_cell: Arc<tokio::sync::OnceCell<Instant>> =
         Arc::new(tokio::sync::OnceCell::new());

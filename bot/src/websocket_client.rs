@@ -258,6 +258,7 @@ pub fn build_heartbeat_packet(
     user_id: &str,
     audio_enabled: bool,
     video_enabled: bool,
+    is_speaking: bool,
 ) -> anyhow::Result<Vec<u8>> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -271,6 +272,7 @@ pub fn build_heartbeat_packet(
         heartbeat_metadata: Some(HeartbeatMetadata {
             video_enabled,
             audio_enabled,
+            is_speaking,
             ..Default::default()
         })
         .into(),
@@ -294,6 +296,7 @@ pub fn spawn_heartbeat_producer(
     video_enabled: bool,
     packet_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     quit: Arc<AtomicBool>,
+    is_speaking: Arc<AtomicBool>,
 ) {
     static HB_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -304,7 +307,8 @@ pub fn spawn_heartbeat_producer(
                 break;
             }
             interval.tick().await;
-            match build_heartbeat_packet(&user_id, audio_enabled, video_enabled) {
+            let speaking = is_speaking.load(Ordering::Relaxed);
+            match build_heartbeat_packet(&user_id, audio_enabled, video_enabled, speaking) {
                 Ok(data) => {
                     if let Err(_e) = packet_sender.try_send(data) {
                         let count = HB_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;

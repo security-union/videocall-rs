@@ -66,28 +66,22 @@ pub async fn connect_webtransport(
         });
     }
 
-    // Inbound reader — each uni stream is one PacketWrapper
+    // Inbound reader — server sends length-prefixed frames on persistent uni streams
     let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
     {
         let session = session.clone();
         tokio::spawn(async move {
             loop {
                 match session.accept_uni().await {
-                    Ok(mut stream) => {
+                    Ok(stream) => {
                         let tx = tx.clone();
+                        let quit = quit.clone();
                         tokio::spawn(async move {
-                            match stream.read_to_end(4 * 1024 * 1024).await {
-                                Ok(data) if !data.is_empty() => {
-                                    let _ = tx.send(data).await;
-                                }
-                                Ok(_) => {}
-                                Err(e) => log::debug!("stream read error: {}", e),
-                            }
+                            read_length_prefixed_stream(stream, tx, quit).await;
                         });
                     }
                     Err(e) => {
                         log::debug!("accept_uni ended: {}", e);
-                        // Signal quit so heartbeat stops
                         quit.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -104,6 +98,36 @@ async fn send_via_session(session: &web_transport_quinn::Session, data: Vec<u8>)
     stream.write_all(&data).await?;
     stream.finish()?;
     Ok(())
+}
+
+async fn read_length_prefixed_stream(
+    mut stream: web_transport_quinn::RecvStream,
+    tx: mpsc::Sender<Vec<u8>>,
+    quit: Arc<AtomicBool>,
+) {
+    let mut len_buf = [0u8; 4];
+    loop {
+        if quit.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(e) = stream.read_exact(&mut len_buf).await {
+            log::debug!("persistent stream ended: {}", e);
+            break;
+        }
+        let payload_len = u32::from_be_bytes(len_buf) as usize;
+        if payload_len > 4 * 1024 * 1024 {
+            log::warn!("abnormal frame size {}, closing stream", payload_len);
+            break;
+        }
+        let mut payload = vec![0u8; payload_len];
+        if let Err(e) = stream.read_exact(&mut payload).await {
+            log::debug!("payload read failed: {}", e);
+            break;
+        }
+        if tx.send(payload).await.is_err() {
+            break;
+        }
+    }
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────

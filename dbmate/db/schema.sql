@@ -1,3 +1,5 @@
+-- This file is regenerated automatically via `dbmate dump` against the deployed database.
+-- Schema changes live in dbmate/db/migrations/*.sql; do not hand-edit this file.
 \restrict dbmate
 
 -- Dumped from database version 18.3 (Homebrew)

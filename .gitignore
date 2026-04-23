@@ -8,6 +8,8 @@
 .idea/
 target/
 dioxus-ui/dist/
+# Developer-local config overrides (see scripts/config.local.js.example).
+dioxus-ui/scripts/config.local.js
 helm/digital-ocean-secret
 helm/global/us-east/grafana/secret.yaml
 helm-videocall-deployment/
@@ -71,7 +73,11 @@ result-*
 # e2e
 e2e/test-results
 e2e/playwright-report/**
+node_modules/
 e2e/node_modules
 e2e/node_modules/**	
+bot/assets/costumes/
+
+# AI
 .claude/worktrees/
 .claude/settings.local.json

@@ -26,6 +26,7 @@ use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::nats_events;
+use crate::search;
 use crate::state::AppState;
 
 /// Verify that the requester is the meeting host, or an admitted participant
@@ -103,6 +104,9 @@ pub async fn admit_participant(
     nats_events::publish_participant_admitted(state.nats.as_ref(), &meeting_id, &body.user_id)
         .await;
 
+    // Re-push the meeting doc so SearchV2 picks up the new ACL principal.
+    search::spawn_repush(&state, meeting.id, meeting_id.clone());
+
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }
 
@@ -133,6 +137,11 @@ pub async fn admit_all(
         .map(|r| r.into_participant_status(None))
         .collect();
 
+    // Re-push the meeting doc — potentially many new principals at once.
+    if admitted_count > 0 {
+        search::spawn_repush(&state, meeting.id, meeting_id.clone());
+    }
+
     Ok(Json(APIResponse::ok(AdmitAllResponse {
         admitted_count,
         admitted,
@@ -158,6 +167,10 @@ pub async fn reject_participant(
 
     nats_events::publish_participant_rejected(state.nats.as_ref(), &meeting_id, &body.user_id)
         .await;
+
+    // A rejected user is no longer returned by `list_for_search` — re-push so
+    // their principal drops out of the ACL set.
+    search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }

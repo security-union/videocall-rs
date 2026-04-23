@@ -1,0 +1,18 @@
+# Trunk configuration for the dioxus-ui crate.
+#
+# The only thing configured here today is a post-build hook that copies the
+# developer's optional `scripts/config.local.js` into `dist/` so runtime
+# overrides take effect.
+#
+# Why a hook instead of `<link data-trunk rel="copy-file" ...>` in index.html?
+# Trunk errors out when a copy-file target is missing, so we can't list an
+# optional file directly. The `|| true` below keeps this a no-op for devs
+# who have not created a `config.local.js` on their machine.
+
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = [
+    "-c",
+    "cp -f scripts/config.local.js dist/config.local.js 2>/dev/null || true",
+]

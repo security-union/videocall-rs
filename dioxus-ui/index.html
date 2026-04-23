@@ -12,11 +12,18 @@
         <link data-trunk rel="css" href="./static/global.css" />
         <link data-trunk rel="copy-dir" href="./static" />
         <link data-trunk rel="copy-file" href="./scripts/config.js" />
+        <!-- config.local.js: gitignored developer-override shim. Not listed as a trunk
+             copy-file because trunk errors on missing files; developers copy it into
+             dist/ themselves (or run a convenience script). See scripts/config.local.js.example. -->
         <link data-trunk rel="copy-file" href="./scripts/console-log-collector.js" />
         <!-- TOFIX: these files are not being hashed correctly, so they are not being cached -->
         <link data-trunk rel="copy-file" href="./scripts/encoderWorker.min.js" />
         <link data-trunk rel="copy-file" href="./scripts/decoderWorker.min.js" />
         <script src="/config.js"></script>
+        <!-- Optional local developer overrides. Create dioxus-ui/scripts/config.local.js
+             (gitignored) to patch defaults for local development. The onerror handler
+             silently removes the tag when the file is absent so it doesn't log a 404. -->
+        <script src="/config.local.js" onerror="this.remove()"></script>
         <script src="/console-log-collector.js"></script>
         <!-- Compile videocall-codecs's `worker.rs` as a separate WASM module for WebCodecs -->
         <link

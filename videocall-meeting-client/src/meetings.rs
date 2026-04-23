@@ -36,17 +36,23 @@ impl MeetingApiClient {
         parse_api_response(response).await
     }
 
-    /// List meetings owned by the authenticated user.
+    /// List meetings owned by the authenticated user, optionally filtered by query.
     ///
-    /// Calls `GET /api/v1/meetings?limit={limit}&offset={offset}`.
+    /// Calls `GET /api/v1/meetings?limit={limit}&offset={offset}[&q={q}]`.
     pub async fn list_meetings(
         &self,
         limit: i64,
         offset: i64,
+        q: Option<&str>,
     ) -> Result<ListMeetingsResponse, ApiError> {
+        let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+        if let Some(query_str) = q {
+            query.push(("q", query_str.to_string()));
+        }
+
         let response = self
             .get("/api/v1/meetings")
-            .query(&[("limit", limit), ("offset", offset)])
+            .query(&query)
             .send()
             .await?;
         parse_api_response(response).await

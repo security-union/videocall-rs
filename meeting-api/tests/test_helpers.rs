@@ -70,6 +70,10 @@ pub fn build_app(pool: PgPool) -> Router {
             std::collections::HashMap::new(),
         )),
         display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        search: None,
+        // Integration tests use the unauthenticated entrypoints and expect a
+        // stable anonymous identity to be issued when no cookie is present.
+        allow_anonymous: true,
     };
     routes::router().with_state(state)
 }

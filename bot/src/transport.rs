@@ -16,12 +16,13 @@
 //! Selects WebSocket or WebTransport based on config, builds the lobby URL
 //! (with JWT when configured), and delegates to the concrete client.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Receiver;
 use tracing::info;
 use url::Url;
 
-use crate::config::{BotConfig, ClientConfig, Transport};
+use crate::config::{ClientConfig, Transport};
 use crate::inbound_stats::InboundStats;
 use crate::token;
 use crate::websocket_client::WebSocketClient;
@@ -44,29 +45,25 @@ impl TransportClient {
 
     /// Build the lobby URL for this client, minting a JWT if configured.
     pub fn build_lobby_url(
-        bot_config: &BotConfig,
-        client_config: &ClientConfig,
+        transport: &Transport,
+        server_url: &Url,
+        jwt_secret: Option<&str>,
+        user_id: &str,
+        meeting_id: &str,
+        token_ttl_secs: u64,
     ) -> anyhow::Result<Url> {
-        let base = bot_config.server_url()?.to_string();
+        let base = server_url.to_string();
         let base = base.trim_end_matches('/');
 
-        let url_string = if let Some(ref secret) = bot_config.jwt_secret {
-            let token = token::mint_token(
-                secret,
-                &client_config.user_id,
-                &client_config.meeting_id,
-                bot_config.token_ttl_secs(),
-            )?;
+        let url_string = if let Some(secret) = jwt_secret {
+            let token = token::mint_token(secret, user_id, meeting_id, token_ttl_secs)?;
             format!("{base}/lobby?token={token}")
         } else {
-            format!(
-                "{base}/lobby/{}/{}",
-                client_config.user_id, client_config.meeting_id
-            )
+            format!("{base}/lobby/{user_id}/{meeting_id}")
         };
 
         // For WebSocket, convert https:// to wss:// and http:// to ws://
-        let url_string = match bot_config.transport {
+        let url_string = match transport {
             Transport::WebSocket => url_string
                 .replacen("https://", "wss://", 1)
                 .replacen("http://", "ws://", 1),
@@ -81,6 +78,7 @@ impl TransportClient {
         lobby_url: &Url,
         insecure: bool,
         stats: Arc<Mutex<InboundStats>>,
+        is_speaking: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
         match self {
             TransportClient::WebSocket(c) => {
@@ -89,7 +87,9 @@ impl TransportClient {
                 }
                 c.connect(lobby_url, stats).await
             }
-            TransportClient::WebTransport(c) => c.connect(lobby_url, insecure, stats).await,
+            TransportClient::WebTransport(c) => {
+                c.connect(lobby_url, insecure, stats, is_speaking).await
+            }
         }
     }
 

@@ -1054,7 +1054,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "videocall-types",
- "web-transport-quinn 0.8.1",
+ "web-transport-quinn",
 ]
 
 [[package]]
@@ -6128,6 +6128,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f354300ae66f76f1c85c5f84693f0ce81d747e2c3f21a45fef496d89c960bf7d"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7186006dcb21920990093f30e3dea63b7d6e977bf1256be20c3563a5db070da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6811,6 +6831,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.111",
+]
+
+[[package]]
+name = "sfv"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d471eaefb14f4b30032525bdb124b36e55ba9cb1292080e06f1a236cd10fe87"
+dependencies = [
+ "base64 0.22.1",
+ "indexmap",
+ "ref-cast",
 ]
 
 [[package]]
@@ -8337,7 +8368,7 @@ dependencies = [
  "tokio-tungstenite",
  "url",
  "videocall-types",
- "web-transport-quinn 0.8.1",
+ "web-transport-quinn",
 ]
 
 [[package]]
@@ -8389,7 +8420,7 @@ dependencies = [
  "uuid 0.8.2",
  "videocall-meeting-types",
  "videocall-types",
- "web-transport-quinn 0.8.1",
+ "web-transport-quinn",
 ]
 
 [[package]]
@@ -8410,7 +8441,7 @@ dependencies = [
  "url",
  "videocall-nokhwa",
  "videocall-types",
- "web-transport-quinn 0.8.1",
+ "web-transport-quinn",
 ]
 
 [[package]]
@@ -8589,7 +8620,7 @@ dependencies = [
  "quinn-proto",
  "ring",
  "rustls 0.23.35",
- "rustls-native-certs 0.7.3",
+ "rustls-native-certs 0.8.2",
  "thiserror 1.0.69",
  "tokio",
  "uniffi",
@@ -8597,7 +8628,7 @@ dependencies = [
  "uniffi_macros",
  "url",
  "videocall-types",
- "web-transport-quinn 0.5.1",
+ "web-transport-quinn",
 ]
 
 [[package]]
@@ -8909,52 +8940,33 @@ dependencies = [
 
 [[package]]
 name = "web-transport-proto"
-version = "0.2.8"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "974fa1e325e6cc5327de8887f189a441fcff4f8eedcd31ec87f0ef0cc5283fbc"
+checksum = "0225d295c8ac00a2e9a498aefeaf3f3c6186da12a251c938189b15b82ea22808"
 dependencies = [
  "bytes",
  "http 1.4.0",
+ "sfv",
  "thiserror 2.0.17",
+ "tokio",
  "url",
 ]
 
 [[package]]
 name = "web-transport-quinn"
-version = "0.5.1"
+version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5edbbbd8de66e931f5c8a5c9b6e660db7623f1e9042f5f03964ffa1f03c0b9b1"
+checksum = "cac11b6caf163be7f980442a26fcba15e8074a5f22e85fbb71f0f77d11cecf60"
 dependencies = [
  "bytes",
  "futures",
  "http 1.4.0",
- "log",
- "quinn",
- "quinn-proto",
- "ring",
- "rustls 0.23.35",
- "rustls-native-certs 0.8.2",
- "thiserror 2.0.17",
- "tokio",
- "url",
- "web-transport-proto",
-]
-
-[[package]]
-name = "web-transport-quinn"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccba8a1ab2aae70119c9ada57e4a2324ebe1820a18814ca47a818f01dcd00f46"
-dependencies = [
- "bytes",
- "futures",
- "http 1.4.0",
- "log",
  "quinn",
  "rustls 0.23.35",
  "rustls-native-certs 0.8.2",
  "thiserror 2.0.17",
  "tokio",
+ "tracing",
  "url",
  "web-transport-proto",
  "web-transport-trait",
@@ -8962,9 +8974,9 @@ dependencies = [
 
 [[package]]
 name = "web-transport-trait"
-version = "0.1.1"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4850148841799c83f033f4dddccb219f1f097aff6db1bda5b0d3be69fefb32bd"
+checksum = "cb67841c4a481ca3c1412ee4c9f463987401991e1ddc000903df2124f3dc85e9"
 dependencies = [
  "bytes",
 ]

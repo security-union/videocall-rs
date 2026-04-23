@@ -59,8 +59,9 @@ impl WebTransportClient {
 
         let client = if insecure {
             warn!("Certificate verification disabled (--insecure)");
-            // SAFETY: This is intentionally insecure for testing purposes
-            unsafe { ClientBuilder::new().with_no_certificate_verification()? }
+            ClientBuilder::new()
+                .dangerous()
+                .with_no_certificate_verification()?
         } else {
             ClientBuilder::new().with_system_roots()?
         };
@@ -176,22 +177,13 @@ impl WebTransportClient {
                     }
 
                     match session.accept_uni().await {
-                        Ok(mut stream) => {
+                        Ok(stream) => {
                             let user_id = user_id.clone();
                             let stats = stats.clone();
+                            let quit = quit.clone();
                             tokio::spawn(async move {
-                                match stream.read_to_end(usize::MAX).await {
-                                    Ok(data) => {
-                                        let mut s = stats.lock().unwrap();
-                                        s.record_packet(&user_id, &data);
-                                    }
-                                    Err(e) => {
-                                        debug!(
-                                            "Error reading inbound unistream for {}: {}",
-                                            user_id, e
-                                        );
-                                    }
-                                }
+                                Self::read_length_prefixed_stream(stream, &user_id, stats, quit)
+                                    .await;
                             });
                         }
                         Err(e) => {
@@ -212,6 +204,39 @@ impl WebTransportClient {
             Self::send_via_session(session, data).await
         } else {
             Err(anyhow::anyhow!("No WebTransport session available"))
+        }
+    }
+
+    async fn read_length_prefixed_stream(
+        mut stream: web_transport_quinn::RecvStream,
+        user_id: &str,
+        stats: Arc<Mutex<InboundStats>>,
+        quit: Arc<AtomicBool>,
+    ) {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if quit.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Err(e) = stream.read_exact(&mut len_buf).await {
+                debug!("Persistent stream ended for {}: {}", user_id, e);
+                break;
+            }
+            let payload_len = u32::from_be_bytes(len_buf) as usize;
+            if payload_len > 4 * 1024 * 1024 {
+                warn!(
+                    "Abnormal frame size {} for {}, closing stream",
+                    payload_len, user_id
+                );
+                break;
+            }
+            let mut payload = vec![0u8; payload_len];
+            if let Err(e) = stream.read_exact(&mut payload).await {
+                debug!("Payload read failed for {}: {}", user_id, e);
+                break;
+            }
+            let mut s = stats.lock().unwrap();
+            s.record_packet(user_id, &payload);
         }
     }
 

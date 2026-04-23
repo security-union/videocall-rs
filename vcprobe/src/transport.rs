@@ -28,8 +28,9 @@ pub async fn connect_webtransport(
 ) -> Result<mpsc::Receiver<Vec<u8>>> {
     let client = if insecure {
         log::warn!("certificate verification disabled (--insecure)");
-        // SAFETY: intentional for development/testing use
-        unsafe { ClientBuilder::new().with_no_certificate_verification()? }
+        ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()?
     } else {
         ClientBuilder::new().with_system_roots()?
     };

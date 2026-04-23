@@ -308,7 +308,11 @@ impl Config {
         } else {
             // Silently ignore DEV_USER when OAuth is enabled — it would be a
             // security risk to honour it alongside real auth.
-            if env::var("DEV_USER").ok().filter(|s| !s.is_empty()).is_some() {
+            if env::var("DEV_USER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
                 tracing::warn!(
                     "DEV_USER is set but OAuth is enabled — ignoring DEV_USER for safety"
                 );

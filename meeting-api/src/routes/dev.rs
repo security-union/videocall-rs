@@ -108,8 +108,7 @@ mod tests {
 
     #[test]
     fn dev_session_cookie_with_secure_and_domain() {
-        let cookie =
-            build_dev_session_cookie("session", "tok", 3600, Some(".example.com"), true);
+        let cookie = build_dev_session_cookie("session", "tok", 3600, Some(".example.com"), true);
         assert!(cookie.contains("; Secure"));
         assert!(cookie.contains("Domain=.example.com"));
     }

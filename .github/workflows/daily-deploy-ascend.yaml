@@ -2,7 +2,7 @@ name: Daily Deploy to Ascend (conceptcar7)
 
 on:
   workflow_run:
-    workflows: ["Daily Build Images"]
+    workflows: ["Daily Build Images (HCL)"]
     types: [completed]
     branches: [hcl-main]
   workflow_dispatch:

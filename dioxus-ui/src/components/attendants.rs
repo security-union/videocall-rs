@@ -1386,15 +1386,18 @@ pub fn AttendantsComponent(
     const SS_GRID_GAP: f64 = 8.0;
     const SS_BOTTOM_PAD: f64 = 80.0;
     const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
-    let ss_panel_width = ((vw - 42.0) / 3.0 - 12.0).max(100.0); // ≈ (vw - outer_pad - gap) / 3 - grid_pad
     let right_ratio = 1.0 - screen_share_ratio();
+    let ss_panel_width = (right_ratio * (vw - 42.0) - 12.0).max(100.0); // ≈ right_ratio * (vw - outer_pad - gap) - grid_pad
     let ss_cols = if right_ratio <= 0.25 || ss_panel_width < 180.0 {
         1.0_f64 // single column
     } else {
         2.0_f64 // two columns
     };
     let ss_avail_h = vh - SS_BOTTOM_PAD - SS_VERT_PAD;
-    let ss_tile_h = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0); // 4 rows per column
+    // Tile height: always sized to fit exactly 4 tiles per column (independent of panel width resize).
+    let ss_tile_h = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0);
+    // Natural tile width at 16:9: ss_tile_h * 16.0 / 9.0 (actual width follows grid columns).
+    // Max rows is always 4 (height is sized for exactly 4 tiles per column).
     let ss_max_rows = 4_usize;
     let ss_max_tiles = ss_max_rows * ss_cols as usize;
 

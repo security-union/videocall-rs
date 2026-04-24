@@ -101,6 +101,7 @@ async fn main() {
             // Console log upload custom headers
             http::HeaderName::from_static("x-user-id"),
             http::HeaderName::from_static("x-session-timestamp"),
+            http::HeaderName::from_static("x-chunk-seq"),
         ])
         .allow_credentials(true);
 

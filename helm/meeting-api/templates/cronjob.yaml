@@ -42,7 +42,7 @@ spec:
                 - |
                   DAYS="${CONSOLE_LOG_RETENTION_DAYS:-30}"
                   echo "Cleaning console log files older than ${DAYS} days"
-                  find /data/console-logs -type f -name '*.log' -mtime +"${DAYS}" -delete
+                  find /data/console-logs -type f \( -name '*.log' -o -name '*.log.gz' \) -mtime +"${DAYS}" -delete
                   echo "Pruning empty directories"
                   find /data/console-logs -mindepth 1 -type d -empty -delete
                   echo "Cleanup complete"

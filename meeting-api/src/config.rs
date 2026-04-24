@@ -60,6 +60,9 @@ pub struct Config {
     /// explicitly off (or leave unset); only flip it for local development
     /// when running without an OAuth provider.
     pub allow_anonymous: bool,
+    /// Dev-only auto-login user. `None` unless `DEV_USER` is set AND OAuth is
+    /// disabled. See [`DevUser`] for format and security warnings.
+    pub dev_user: Option<DevUser>,
 }
 
 /// SearchV2 / opensearch-middleware integration configuration.
@@ -80,6 +83,19 @@ pub struct SearchConfig {
     /// with `pushadmin` or `searchadmin` role).  Not shared with end users —
     /// this is a server-to-server admin token.
     pub token: String,
+}
+
+/// Dev-only auto-login user. Parsed from the `DEV_USER` env var
+/// (format: `email:display_name`). Only active when OAuth is disabled.
+///
+/// **WARNING**: This must NEVER be set in production. When set, anyone can
+/// obtain a valid session by visiting `/api/v1/dev/auto-login`.
+#[derive(Debug, Clone)]
+pub struct DevUser {
+    /// Email address used as the `sub` claim in the session JWT.
+    pub email: String,
+    /// Display name used as the `name` claim in the session JWT.
+    pub name: String,
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -353,6 +369,38 @@ impl Config {
             })
             .transpose()?;
 
+        // DEV_USER: only active when OAuth is disabled.
+        let dev_user = if oauth.is_none() {
+            env::var("DEV_USER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|raw| {
+                    let (email, name) = raw.split_once(':').ok_or_else(|| {
+                        "DEV_USER must be in format 'email:display_name' (e.g. 'dev@test.local:Dev User')".to_string()
+                    })?;
+                    let email = email.trim().to_string();
+                    let name = name.trim().to_string();
+                    if email.is_empty() || name.is_empty() {
+                        return Err("DEV_USER email and display_name must not be empty".to_string());
+                    }
+                    Ok(DevUser { email, name })
+                })
+                .transpose()?
+        } else {
+            // Silently ignore DEV_USER when OAuth is enabled — it would be a
+            // security risk to honour it alongside real auth.
+            if env::var("DEV_USER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                tracing::warn!(
+                    "DEV_USER is set but OAuth is enabled — ignoring DEV_USER for safety"
+                );
+            }
+            None
+        };
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -368,6 +416,7 @@ impl Config {
             service_version_urls,
             search,
             allow_anonymous,
+            dev_user,
         })
     }
 

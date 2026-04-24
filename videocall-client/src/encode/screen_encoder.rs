@@ -60,6 +60,19 @@ use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 
+/// Sets `bitrateMode = "variable"` on a [`VideoEncoderConfig`].
+///
+/// Variable bitrate lets the encoder burst above the target during high-motion
+/// events (scrolling, window switching) and stay below it when content is
+/// static, keeping text readable without rate-starving the encoder.
+fn set_vbr_mode(config: &VideoEncoderConfig) {
+    let _ = Reflect::set(
+        config,
+        &JsValue::from_str("bitrateMode"),
+        &JsValue::from_str("variable"),
+    );
+}
+
 /// Events emitted by [ScreenEncoder] to notify about screen share state changes.
 ///
 /// This allows the UI to react to screen share lifecycle events without managing
@@ -133,7 +146,7 @@ impl ScreenEncoder {
         on_encoder_settings_update: Callback<String>,
         on_state_change: Callback<ScreenShareEvent>,
     ) -> Self {
-        let default_tier = &SCREEN_QUALITY_TIERS[0];
+        let default_tier = &SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX];
         Self {
             client,
             state: EncoderState::new(),
@@ -379,8 +392,54 @@ impl ScreenEncoder {
                 panic!("MediaDevices not available");
             });
 
-            let screen_to_share: MediaStream = match media_devices.get_display_media() {
-                Ok(promise) => match JsFuture::from(promise).await {
+            // Build getDisplayMedia constraints requesting high-resolution capture.
+            // This tells the browser to prefer the source's native resolution rather
+            // than downscaling, which is critical for readable text and code.
+            // Use {ideal: N} dictionaries instead of bare numbers — bare numbers are
+            // treated as {exact: N} and will cause the browser to reject capture if
+            // the source (e.g. 1440p or 4K monitor) doesn't match exactly.
+            let width_constraint = js_sys::Object::new();
+            let _ = Reflect::set(
+                &width_constraint,
+                &JsValue::from_str("ideal"),
+                &JsValue::from_f64(1920.0),
+            );
+            let height_constraint = js_sys::Object::new();
+            let _ = Reflect::set(
+                &height_constraint,
+                &JsValue::from_str("ideal"),
+                &JsValue::from_f64(1080.0),
+            );
+            let framerate_constraint = js_sys::Object::new();
+            let _ = Reflect::set(
+                &framerate_constraint,
+                &JsValue::from_str("ideal"),
+                &JsValue::from_f64(10.0),
+            );
+            let video_constraints = js_sys::Object::new();
+            let _ = Reflect::set(
+                &video_constraints,
+                &JsValue::from_str("width"),
+                &width_constraint.into(),
+            );
+            let _ = Reflect::set(
+                &video_constraints,
+                &JsValue::from_str("height"),
+                &height_constraint.into(),
+            );
+            let _ = Reflect::set(
+                &video_constraints,
+                &JsValue::from_str("frameRate"),
+                &framerate_constraint.into(),
+            );
+
+            let constraints = web_sys::DisplayMediaStreamConstraints::new();
+            constraints.set_video(&video_constraints.into());
+            constraints.set_audio(&JsValue::FALSE);
+
+            let screen_to_share: MediaStream =
+                match media_devices.get_display_media_with_constraints(&constraints) {
+                    Ok(promise) => match JsFuture::from(promise).await {
                     Ok(stream) => stream.unchecked_into::<MediaStream>(),
                     Err(e) => {
                         // Check if user cancelled (NotAllowedError = permission denied/cancelled)
@@ -536,6 +595,23 @@ impl ScreenEncoder {
                 .clone()
                 .unchecked_into::<MediaStreamTrack>();
 
+            // Set contentHint = 'detail' so the encoder optimizes for sharp text
+            // and edges rather than smooth motion. This is critical for screen
+            // content readability — without it, the encoder treats the stream as
+            // camera video and applies aggressive motion-optimized quantization
+            // that makes text unreadable during scrolling.
+            //
+            // `contentHint` is a progressive enhancement (MediaStreamTrack Content Hints API,
+            // https://www.w3.org/TR/mst-content-hint/). Reflect::set silently succeeds even
+            // when the browser doesn't support the property, so this is intentionally best-effort.
+            // The `let _ =` is deliberate — swallowing the return value is correct here because
+            // a missing hint only degrades quality, it never breaks the stream.
+            let _ = Reflect::set(
+                &media_track,
+                &JsValue::from_str("contentHint"),
+                &JsValue::from_str("detail"),
+            );
+
             // Store the original track so stop() can stop it synchronously, which
             // is required to immediately dismiss the browser's capture indicator bar.
             active_video_track.borrow_mut().replace(media_track.clone());
@@ -573,6 +649,7 @@ impl ScreenEncoder {
                 VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
             screen_encoder_config.set_bitrate(local_bitrate as f64);
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
+            set_vbr_mode(&screen_encoder_config);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
                 let msg = format!("Error configuring screen encoder: {e:?}");
                 error!("{msg}");
@@ -655,6 +732,7 @@ impl ScreenEncoder {
                     );
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
+                    set_vbr_mode(&new_config);
                     if let Err(e) = screen_encoder.configure(&new_config) {
                         error!("Error reconfiguring screen encoder for tier change: {e:?}");
                     }
@@ -680,6 +758,7 @@ impl ScreenEncoder {
                     );
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
+                    set_vbr_mode(&new_config);
                     if let Err(e) = screen_encoder.configure(&new_config) {
                         error!("Error configuring screen encoder: {e:?}");
                     }
@@ -734,6 +813,7 @@ impl ScreenEncoder {
                             );
                             new_config.set_bitrate(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);
+                            set_vbr_mode(&new_config);
                             if let Err(e) = screen_encoder.configure(&new_config) {
                                 error!(
                                     "Error reconfiguring screen encoder with new dimensions: {e:?}"

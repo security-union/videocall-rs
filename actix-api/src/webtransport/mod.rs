@@ -238,8 +238,8 @@ async fn run_webtransport_connection_from_request(
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
 ) -> anyhow::Result<()> {
-    warn!("received WebTransport request: {}", request.url());
-    let uri = request.url();
+    warn!("received WebTransport request: {}", request.url);
+    let uri = &request.url;
     let path = urlencoding::decode(uri.path()).unwrap().into_owned();
 
     let parts = path.split('/').collect::<Vec<&str>>();
@@ -264,59 +264,58 @@ async fn run_webtransport_connection_from_request(
         .map(|(_, val)| val.into_owned());
 
     // Determine username, room, and observer flag from either the JWT or URL path params.
-    let (username, lobby_id, observer, display_name, is_guest, is_host, end_on_host_leave) = if let Some(
-        ref tok,
-    ) = token {
-        // Token-based flow: identity and room come from the JWT claims.
-        let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
-        if jwt_secret.is_empty() {
-            return Err(anyhow!("JWT_SECRET not set"));
-        }
-        let claims = token_validator::decode_room_token(&jwt_secret, tok).map_err(|e| {
-            e.log("WT");
-            anyhow!("token validation failed: {}", e.client_message())
-        })?;
-        info!(
+    let (username, lobby_id, observer, display_name, is_guest, is_host, end_on_host_leave) =
+        if let Some(ref tok) = token {
+            // Token-based flow: identity and room come from the JWT claims.
+            let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+            if jwt_secret.is_empty() {
+                return Err(anyhow!("JWT_SECRET not set"));
+            }
+            let claims = token_validator::decode_room_token(&jwt_secret, tok).map_err(|e| {
+                e.log("WT");
+                anyhow!("token validation failed: {}", e.client_message())
+            })?;
+            info!(
             "WT token-based connection: user_id={}, room={}, display_name={}, is_guest={}, observer={}, is_host={}",
             claims.sub, claims.room, claims.display_name, claims.is_guest, claims.observer, claims.is_host
         );
-        (
-            claims.sub,
-            claims.room,
-            claims.observer,
-            claims.display_name,
-            claims.is_guest,
-            claims.is_host,
-            claims.end_on_host_leave,
-        )
-    } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
-        // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
-        if parts.len() != 3 {
-            return Err(anyhow!(
+            (
+                claims.sub,
+                claims.room,
+                claims.observer,
+                claims.display_name,
+                claims.is_guest,
+                claims.is_host,
+                claims.end_on_host_leave,
+            )
+        } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
+            // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
+            if parts.len() != 3 {
+                return Err(anyhow!(
                 "Invalid path: expected /lobby/{{user_id}}/{{room}} (deprecated) or /lobby?token=<JWT>"
             ));
-        }
-        let username = parts[1].replace(' ', "_");
-        let lobby_id = parts[2].replace(' ', "_");
-        let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-        if !re.is_match(&username) || !re.is_match(&lobby_id) {
-            return Err(anyhow!("Invalid path input chars"));
-        }
-        info!(
-            "WT deprecated path-based connection: user_id={}, room={}",
-            username, lobby_id
-        );
-        // display_name fallback: use user_id for deprecated path
-        let display = username.clone();
-        // deprecated path-based endpoint: no JWT claim, treat as non-guest & non-observer, not host
-        (username, lobby_id, false, display, false, false, true)
-    } else {
-        // FF=on but no token provided
-        info!("WT connection rejected: no token provided and meeting management is enabled");
-        return Err(anyhow!(
-            "room access token is required. Use /lobby?token=<JWT>"
-        ));
-    };
+            }
+            let username = parts[1].replace(' ', "_");
+            let lobby_id = parts[2].replace(' ', "_");
+            let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
+            if !re.is_match(&username) || !re.is_match(&lobby_id) {
+                return Err(anyhow!("Invalid path input chars"));
+            }
+            info!(
+                "WT deprecated path-based connection: user_id={}, room={}",
+                username, lobby_id
+            );
+            // display_name fallback: use user_id for deprecated path
+            let display = username.clone();
+            // deprecated path-based endpoint: no JWT claim, treat as non-guest & non-observer, not host
+            (username, lobby_id, false, display, false, false, true)
+        } else {
+            // FF=on but no token provided
+            info!("WT connection rejected: no token provided and meeting management is enabled");
+            return Err(anyhow!(
+                "room access token is required. Use /lobby?token=<JWT>"
+            ));
+        };
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
@@ -574,12 +573,10 @@ mod tests {
         let url_str = format!("{}/lobby/{}/{}", base.trim_end_matches('/'), user, meeting);
         let url = url::Url::parse(&url_str)?;
 
-        // Create WebTransport client using 0.7.3 API (same as bot)
-        let client = unsafe {
-            web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
-        };
+        let client = web_transport_quinn::ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()?;
 
-        // Connect using modern API
         Ok(client.connect(url).await?)
     }
 
@@ -596,9 +593,9 @@ mod tests {
         );
         let url = url::Url::parse(&url_str)?;
 
-        let client = unsafe {
-            web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
-        };
+        let client = web_transport_quinn::ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()?;
         Ok(client.connect(url).await?)
     }
 

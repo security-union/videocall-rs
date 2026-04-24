@@ -107,6 +107,7 @@ services:
       # this env var and therefore defaults to false.
       - ALLOW_ANONYMOUS=${ALLOW_ANONYMOUS:-true}
       - NATS_URL=nats:4222
+      - DEV_USER=${DEV_USER:-}
       - RUST_LOG=debug
       - CARGO_TARGET_DIR=/app/meeting-api/target
       - CARGO_INCREMENTAL=1

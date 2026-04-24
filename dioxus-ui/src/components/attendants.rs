@@ -499,10 +499,14 @@ pub fn AttendantsComponent(
     let local_speaking = use_signal(|| false);
     let local_audio_level = use_signal(|| 0.0f32);
     let mut pinned_peer_id: Signal<Option<String>> = use_signal(|| None);
+<<<<<<< HEAD
     // Screen-share to participants panel ratio. Default 0.667 gives a 2:1 split.
     // Clamped to [0.3, 0.85] by the resize handle (screen share 30%–85% of width).
     let mut screen_share_ratio: Signal<f64> = use_signal(|| 0.667);
     // True while the user is actively dragging the resize handle.
+=======
+    let mut screen_share_ratio: Signal<f64> = use_signal(|| 0.667);
+>>>>>>> 72754fbd370bede4cb58e2de0e1662e646ca8c55
     let mut ss_resizing: Signal<bool> = use_signal(|| false);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
@@ -1379,10 +1383,13 @@ pub fn AttendantsComponent(
     //   - SS_GRID_PAD: padding inside the right panel div = 6px each side
     //   - SS_BOTTOM_PAD: padding-bottom (80px) from container_style
     //   - SS_TOP_PAD: padding-top (16px) + right panel padding (6px*2)
+<<<<<<< HEAD
     //
     // Tile sizing: height is fixed to fit 4 tiles per column regardless of panel width.
     // Column count collapses to 1 when right_ratio <= 0.25 or panel is too narrow.
     // Actual tile width is controlled by the CSS grid (1fr columns), not computed here.
+=======
+>>>>>>> 72754fbd370bede4cb58e2de0e1662e646ca8c55
     const SS_GRID_GAP: f64 = 8.0;
     const SS_BOTTOM_PAD: f64 = 80.0;
     const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
@@ -1394,7 +1401,14 @@ pub fn AttendantsComponent(
         2.0_f64 // two columns
     };
     let ss_avail_h = vh - SS_BOTTOM_PAD - SS_VERT_PAD;
+<<<<<<< HEAD
     let ss_tile_h = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0); // 4 rows per column
+=======
+    // Tile height: always sized to fit exactly 4 tiles per column (independent of panel width resize).
+    let ss_tile_h = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0);
+    // Natural tile width at 16:9: ss_tile_h * 16.0 / 9.0 (actual width follows grid columns).
+    // Max rows is always 4 (height is sized for exactly 4 tiles per column).
+>>>>>>> 72754fbd370bede4cb58e2de0e1662e646ca8c55
     let ss_max_rows = 4_usize;
     let ss_max_tiles = ss_max_rows * ss_cols as usize;
 

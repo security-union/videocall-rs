@@ -396,10 +396,7 @@ fn promote_speakers(
             }
         }
     }
-    overflow_speakers.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    overflow_speakers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Visible non-speaking tiles as swap candidates (least recently active first).
     let mut swap_candidates: Vec<(usize, f64)> = (0..visible_count)
@@ -410,10 +407,7 @@ fn promote_speakers(
         })
         .map(|i| (i, eff_ts(&tiles[i])))
         .collect();
-    swap_candidates.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    swap_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Swap pairs — all indices are disjoint so order doesn't matter.
     let num_swaps = overflow_speakers.len().min(swap_candidates.len());
@@ -1384,7 +1378,7 @@ pub fn AttendantsComponent(
     const SS_GRID_GAP: f64 = 8.0;
     const SS_BOTTOM_PAD: f64 = 80.0;
     const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
-    // Right panel content width ≈ (vw - outer_horiz_pad - panel_gap) / 3 - grid_pad
+                                   // Right panel content width ≈ (vw - outer_horiz_pad - panel_gap) / 3 - grid_pad
     let ss_panel_width = ((vw - 42.0) / 3.0 - 12.0).max(100.0);
     let ss_tile_w = (ss_panel_width - SS_GRID_GAP) / SS_COLS;
     let ss_tile_h = ss_tile_w / (16.0 / 9.0);

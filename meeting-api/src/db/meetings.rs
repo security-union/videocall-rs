@@ -372,4 +372,3 @@ mod tests {
         assert_eq!(escape_like(r"\%"), r"\\\%");
     }
 }
-

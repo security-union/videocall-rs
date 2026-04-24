@@ -455,11 +455,21 @@ impl ConnectionManager {
             }
         }
 
-        let ws_count = self.connections.keys().filter(|k| k.starts_with("ws_")).count();
-        let wt_count = self.connections.keys().filter(|k| k.starts_with("wt_")).count();
+        let ws_count = self
+            .connections
+            .keys()
+            .filter(|k| k.starts_with("ws_"))
+            .count();
+        let wt_count = self
+            .connections
+            .keys()
+            .filter(|k| k.starts_with("wt_"))
+            .count();
         info!(
             "Election candidates: {} WebSocket, {} WebTransport ({} total)",
-            ws_count, wt_count, self.connections.len()
+            ws_count,
+            wt_count,
+            self.connections.len()
         );
         if !self.options.webtransport_urls.is_empty() && wt_count == 0 {
             warn!(

@@ -189,19 +189,37 @@ jobs:
       - name: Check NATS deployment
         id: check-nats
         run: |
-          # Ascend runs NATS under release name "nats-ascend" with fullnameOverride=nats-ascend.
-          # Detect via StatefulSet name, not generic label, to match existing install.
-          if kubectl get statefulset nats-ascend -n ${NAMESPACE} >/dev/null 2>&1; then
-            echo "✅ NATS already deployed (nats-ascend) in ${NAMESPACE}"
+          if kubectl get deployment -n ${NAMESPACE} -l app.kubernetes.io/name=nats >/dev/null 2>&1 && \
+             [ -n "$(kubectl get statefulset nats -n ${NAMESPACE} -o name 2>/dev/null)" ]; then
+            echo "✅ NATS already deployed in ${NAMESPACE}"
             echo "nats_exists=true" >> $GITHUB_OUTPUT
           else
-            echo "⚠️  NATS not found — this workflow will NOT deploy NATS on Ascend."
-            echo "    Ascend NATS was installed out-of-band as release 'nats-ascend'."
-            echo "    If it's genuinely missing, install it manually first and re-run."
+            echo "⚠️  NATS not found, will deploy"
             echo "nats_exists=false" >> $GITHUB_OUTPUT
-            echo "::error::NATS (nats-ascend) not found — aborting deploy"
-            exit 1
           fi
+
+      - name: Deploy NATS (if not exists)
+        if: steps.check-nats.outputs.nats_exists == 'false'
+        run: |
+          echo "Deploying NATS to ${NAMESPACE} namespace..."
+
+          # Use the same base chart HCL daily uses. Release name "nats" so service is "nats"
+          # and all downstream NATS_URL=nats:4222 defaults apply. Build helm deps first.
+          helm dependency update helm/global/us-east/nats/
+
+          helm upgrade --install nats helm/global/us-east/nats/ \
+            --namespace ${NAMESPACE} \
+            --set nats.natsbox.enabled=true \
+            --set nats.reloader.enabled=true \
+            --set nats.exporter.enabled=true \
+            --set nats.nats.resources.limits.cpu=400m \
+            --set nats.nats.resources.limits.memory=600Mi \
+            --set nats.nats.resources.requests.cpu=200m \
+            --set nats.nats.resources.requests.memory=300Mi \
+            --set gateway.enabled=false \
+            --wait --timeout 5m
+
+          echo "✅ NATS deployed to ${NAMESPACE}"
 
       - name: Deploy WebTransport Server
         run: |
@@ -238,7 +256,7 @@ jobs:
             --set "env[1].name=RUST_LOG" \
             --set "env[1].value=warn,quinn=warn,web-transport-quinn=warn,async_nats=warn" \
             --set "env[2].name=NATS_URL" \
-            --set "env[2].value=nats-ascend:4222" \
+            --set "env[2].value=nats:4222" \
             --set "env[3].name=LISTEN_URL" \
             --set "env[3].value=0.0.0.0:443" \
             --set "env[4].name=HEALTH_LISTEN_URL" \
@@ -293,7 +311,7 @@ jobs:
             --set imagePullSecrets[0].name=harbor-pull-secret \
             --set fullnameOverride=videocall-websocket \
             --set "env[0].name=NATS_URL" \
-            --set "env[0].value=nats://nats-ascend.${NAMESPACE}.svc.cluster.local:4222" \
+            --set "env[0].value=nats://nats.${NAMESPACE}.svc.cluster.local:4222" \
             --set "env[1].name=JWT_SECRET" \
             --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
             --set "env[1].valueFrom.secretKeyRef.key=secret" \

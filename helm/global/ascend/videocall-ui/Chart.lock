@@ -1,6 +1,0 @@
-dependencies:
-- name: videocall-ui
-  repository: file://../../../videocall-ui
-  version: 0.1.0
-digest: sha256:55b8ae279ef146b0381523e650dbe69b98bfaa1ce92c46ed7ea427f4510535ee
-generated: "2026-04-01T14:23:43.352260809-04:00"

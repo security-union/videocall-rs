@@ -162,7 +162,7 @@ jobs:
             "jwt-secret"
             "harbor-pull-secret"
             "videocall-cc7-wildcard-tls"
-            "webtransport-tls"
+            "webtransport-ascend-tls"
           )
 
           MISSING_SECRETS=()
@@ -230,7 +230,7 @@ jobs:
             --set service.nodePort=30056 \
             --set service.healthPort=444 \
             --set "command[0]=webtransport_server" \
-            --set tlsSecret=webtransport-tls \
+            --set tlsSecret=webtransport-ascend-tls \
             --set certificateDomain=webtransport.videocall.conceptcar7.com \
             --set "env[0].name=JWT_SECRET" \
             --set "env[0].valueFrom.secretKeyRef.name=jwt-secret" \

@@ -1,14 +1,11 @@
 name: Daily Deploy to Ascend (conceptcar7)
 
 on:
-  workflow_run:
-    workflows: ["Daily Build Images (HCL)"]
-    types: [completed]
-    branches: [hcl-main]
+  # Ascend deploys are manual only. No auto-trigger on daily builds.
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag to deploy (e.g., daily-2026-03-10-0000)'
+        description: 'Image tag to deploy (e.g., daily-2026-04-24-1352)'
         required: true
         type: string
 
@@ -28,10 +25,6 @@ jobs:
   deploy:
     name: Deploy to Ascend
     runs-on: [self-hosted, linux, ascend]
-    # Only deploy if build was successful (for workflow_run trigger)
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     steps:
       - name: Setup PATH
         run: echo "/usr/local/bin" >> $GITHUB_PATH
@@ -48,27 +41,9 @@ jobs:
 
       - name: Determine image tag
         id: determine-tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.image_tag }}"
-            echo "Using manually specified tag: $TAG"
-          else
-            # For workflow_run trigger, fetch tag from build workflow job outputs via API
-            WORKFLOW_RUN_ID="${{ github.event.workflow_run.id }}"
-            echo "Fetching image tag from build workflow run ID: ${WORKFLOW_RUN_ID}"
-
-            JOBS_JSON=$(gh api repos/${{ github.repository }}/actions/runs/${WORKFLOW_RUN_ID}/jobs)
-            TAG=$(echo "$JOBS_JSON" | jq -r '.jobs[] | select(.name == "Build and push daily images") | .outputs.image_tag')
-
-            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-              echo "::error::Failed to get image tag from build workflow"
-              exit 1
-            fi
-
-            echo "Using tag from build workflow output: $TAG"
-          fi
+          TAG="${{ inputs.image_tag }}"
+          echo "Using manually specified tag: $TAG"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Deploying images with tag: $TAG"
 

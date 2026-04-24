@@ -166,7 +166,7 @@ async fn test_guest_participant_can_upload_console_logs() {
         "Admitted guest should be able to upload console logs"
     );
 
-    // Verify a .log file was written under the meeting's directory.
+    // Verify a .log.gz file was written under the meeting's directory.
     let meeting_dir = log_dir.join(room_id);
     assert!(
         meeting_dir.exists(),
@@ -176,15 +176,16 @@ async fn test_guest_participant_can_upload_console_logs() {
 
     let mut found_log = false;
     for entry in walkdir(&meeting_dir) {
-        if entry.extension().is_some_and(|ext| ext == "log") {
-            let content = std::fs::read_to_string(&entry).expect("read log file");
+        let name = entry.file_name().unwrap().to_str().unwrap();
+        if name.ends_with(".log.gz") {
+            let compressed = std::fs::read(&entry).expect("read log file");
+            let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut decoder, &mut content).expect("decompress log file");
             assert_eq!(
                 content, LOG_BODY,
-                "Log file content should match uploaded body"
+                "Decompressed log file content should match uploaded body"
             );
-            // Verify filename contains the guest's user_id, session timestamp,
-            // and zero-padded chunk sequence number.
-            let name = entry.file_name().unwrap().to_str().unwrap();
             assert!(
                 name.contains("guest-test@videocall.rs"),
                 "Filename should contain the user_id: {name}"
@@ -194,15 +195,15 @@ async fn test_guest_participant_can_upload_console_logs() {
                 "Filename should contain the session timestamp: {name}"
             );
             assert!(
-                name.ends_with("_00001.log"),
-                "Filename should end with zero-padded chunk seq _00001.log: {name}"
+                name.ends_with("_00001.log.gz"),
+                "Filename should end with zero-padded chunk seq _00001.log.gz: {name}"
             );
             found_log = true;
         }
     }
     assert!(
         found_log,
-        "At least one .log file should exist under the meeting directory"
+        "At least one .log.gz file should exist under the meeting directory"
     );
 
     cleanup_test_data(&pool, room_id).await;

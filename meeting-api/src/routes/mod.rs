@@ -14,6 +14,7 @@
 //! Axum router configuration for the Meeting Backend API.
 
 pub mod console_logs;
+pub mod dev;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
@@ -191,4 +192,6 @@ pub fn router() -> Router<AppState> {
             post(console_logs::upload_console_logs)
                 .layer(DefaultBodyLimit::max(console_logs::MAX_BODY_SIZE)),
         )
+        // Dev-only auto-login (returns 404 when DEV_USER is not configured)
+        .route("/api/v1/dev/auto-login", get(dev::auto_login))
 }

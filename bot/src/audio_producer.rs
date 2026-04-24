@@ -53,6 +53,7 @@ impl AudioProducer {
         packet_sender: Sender<Vec<u8>>,
         media_start: Instant,
         loop_duration: Duration,
+        is_speaking: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -66,6 +67,7 @@ impl AudioProducer {
                 quit_clone,
                 media_start,
                 loop_duration,
+                is_speaking,
             ) {
                 error!("Audio producer error: {}", e);
             }
@@ -85,6 +87,7 @@ impl AudioProducer {
         packet_sender: Sender<Vec<u8>>,
         media_start: Instant,
         loop_duration: Duration,
+        is_speaking: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
         info!("Loading WAV file for {}: {}", user_id, wav_path);
 
@@ -135,9 +138,11 @@ impl AudioProducer {
             packet_sender,
             media_start,
             loop_duration,
+            is_speaking,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn audio_loop(
         user_id: String,
         audio_data: Vec<f32>,
@@ -145,6 +150,7 @@ impl AudioProducer {
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
+        is_speaking: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
         if audio_data.is_empty() {
             warn!("Audio producer for {} has no audio data, exiting", user_id);
@@ -168,11 +174,11 @@ impl AudioProducer {
         // Create Opus encoder
         let mut opus_encoder = OpusEncoder::new(sample_rate, OpusChannels::Mono, OpusApp::Voip)?;
         info!(
-            "Audio producer started for {} ({}Hz, {}ch, {}ms packets)",
+            "Audio producer started for {} ({}Hz, {}ch, {}ms packets, DTX enabled)",
             user_id, sample_rate, channels, 20
         );
 
-        // Global monotonic counter — packet metadata needs strictly increasing
+        // Global monotonic counter -- packet metadata needs strictly increasing
         // values even when the audio loop wraps.
         let mut global_sequence: u64 = 0;
         let user_id_bytes = user_id.clone().into_bytes();
@@ -196,6 +202,34 @@ impl AudioProducer {
             let mut packet_samples = vec![0.0f32; samples_per_packet];
             for (i, item) in packet_samples.iter_mut().enumerate() {
                 *item = audio_data[(audio_position + i) % audio_data.len()];
+            }
+
+            // DTX: compute RMS per packet, update is_speaking flag
+            let rms = (packet_samples.iter().map(|s| s * s).sum::<f32>()
+                / packet_samples.len() as f32)
+                .sqrt();
+            is_speaking.store(rms > 0.01, Ordering::Relaxed);
+
+            // Skip encode/send for near-silence packets
+            if rms < 0.005 {
+                global_sequence += 1;
+
+                // Still need to sleep to maintain timing
+                let packet_in_loop = position_in_loop_us / packet_interval_us;
+                let next_packet_us = (packet_in_loop + 1) * packet_interval_us;
+                let sleep_target_us = if next_packet_us >= loop_duration_us {
+                    loop_duration_us
+                } else {
+                    next_packet_us
+                };
+                let loop_base_us = elapsed_us - position_in_loop_us;
+                let absolute_target =
+                    media_start + Duration::from_micros(loop_base_us + sleep_target_us);
+                let now = Instant::now();
+                if now < absolute_target {
+                    thread::sleep(absolute_target - now);
+                }
+                continue;
             }
 
             // Encode to Opus

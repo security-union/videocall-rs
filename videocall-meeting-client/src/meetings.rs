@@ -50,11 +50,7 @@ impl MeetingApiClient {
             query.push(("q", query_str.to_string()));
         }
 
-        let response = self
-            .get("/api/v1/meetings")
-            .query(&query)
-            .send()
-            .await?;
+        let response = self.get("/api/v1/meetings").query(&query).send().await?;
         parse_api_response(response).await
     }
 

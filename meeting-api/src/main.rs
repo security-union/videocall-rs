@@ -101,8 +101,19 @@ async fn main() {
             // Console log upload custom headers
             http::HeaderName::from_static("x-user-id"),
             http::HeaderName::from_static("x-session-timestamp"),
+            http::HeaderName::from_static("x-chunk-seq"),
         ])
         .allow_credentials(true);
+
+    // Warn loudly at startup if DEV_USER auto-login is active.
+    if let Some(ref dev_user) = config.dev_user {
+        tracing::warn!(
+            "DEV_USER is set — auto-login enabled for {} ({}). \
+             DO NOT use in production.",
+            dev_user.name,
+            dev_user.email
+        );
+    }
 
     let state = AppState::new(pool, &config, nats);
     let app = routes::router().layer(cors).with_state(state);

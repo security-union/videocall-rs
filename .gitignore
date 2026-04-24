@@ -76,5 +76,8 @@ e2e/playwright-report/**
 node_modules/
 e2e/node_modules
 e2e/node_modules/**
+bot/assets/costumes/
+
+# AI
 .claude/worktrees/
 .claude/settings.local.json

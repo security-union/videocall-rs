@@ -40,9 +40,10 @@ use crate::constants::{
     CANVAS_LIMIT,
 };
 use crate::context::{
-    resolve_transport_config, save_display_name_to_storage, validate_display_name, DisplayNameCtx,
-    LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap,
-    TransportPreference, TransportPreferenceCtx,
+    load_appearance_settings_from_storage, resolve_transport_config,
+    save_appearance_settings_to_storage, save_display_name_to_storage, validate_display_name,
+    AppearanceSettingsCtx, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
+    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -396,10 +397,7 @@ fn promote_speakers(
             }
         }
     }
-    overflow_speakers.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    overflow_speakers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Visible non-speaking tiles as swap candidates (least recently active first).
     let mut swap_candidates: Vec<(usize, f64)> = (0..visible_count)
@@ -410,10 +408,7 @@ fn promote_speakers(
         })
         .map(|i| (i, eff_ts(&tiles[i])))
         .collect();
-    swap_candidates.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    swap_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Swap pairs — all indices are disjoint so order doesn't matter.
     let num_swaps = overflow_speakers.len().min(swap_candidates.len());
@@ -1014,6 +1009,35 @@ pub fn AttendantsComponent(
     use_context_provider(|| client.clone());
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
+    let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
+    let _ = local_audio_level_ctx.0;
+    let appearance_settings = use_signal(load_appearance_settings_from_storage);
+    use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
+    let appearance_save_timeout: Rc<RefCell<Option<Timeout>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+
+    // Persist local-only appearance preferences for this viewer.
+    let appearance_save_timeout_effect = appearance_save_timeout.clone();
+    use_effect(move || {
+        let settings = appearance_settings();
+        if let Some(timeout) = appearance_save_timeout_effect.borrow_mut().take() {
+            timeout.cancel();
+        }
+
+        let timeout_cell = appearance_save_timeout_effect.clone();
+        let timeout = Timeout::new(300, move || {
+            save_appearance_settings_to_storage(&settings);
+            timeout_cell.borrow_mut().take();
+        });
+        *appearance_save_timeout_effect.borrow_mut() = Some(timeout);
+    });
+    // Cancel any pending appearance-save timeout when the component unmounts
+    // to avoid a storage write racing with navigation away from the meeting.
+    use_drop(move || {
+        if let Some(timeout) = appearance_save_timeout.borrow_mut().take() {
+            timeout.cancel();
+        }
+    });
 
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
@@ -1101,7 +1125,8 @@ pub fn AttendantsComponent(
     use_effect(move || {
         let audio_level = local_audio_level();
         let speaking = local_speaking();
-        let style = speak_style(audio_level, speaking);
+        let appearance = appearance_settings();
+        let style = speak_style(audio_level, speaking, &appearance);
         if let Some(el) = host_el() {
             let cl = el.class_list();
             if speaking {
@@ -1383,7 +1408,7 @@ pub fn AttendantsComponent(
     const SS_GRID_GAP: f64 = 8.0;
     const SS_BOTTOM_PAD: f64 = 80.0;
     const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
-    // Right panel content width ≈ (vw - outer_horiz_pad - panel_gap) / 3 - grid_pad
+                                   // Right panel content width ≈ (vw - outer_horiz_pad - panel_gap) / 3 - grid_pad
     let ss_panel_width = ((vw - 42.0) / 3.0 - 12.0).max(100.0);
     let ss_tile_w = (ss_panel_width - SS_GRID_GAP) / SS_COLS;
     let ss_tile_h = ss_tile_w / (16.0 / 9.0);
@@ -1883,7 +1908,7 @@ pub fn AttendantsComponent(
                     if can_stream {
                         nav { id: "host-controls-nav",
                             class: "host",
-                            style: "{speak_style(0.0, false)}",
+                            style: "box-shadow: none; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;",
                             onmounted: move |evt| {
                                 if let Some(elem) = evt.try_as_web_event() {
                                     host_el.set(Some(elem));

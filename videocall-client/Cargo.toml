@@ -70,6 +70,7 @@ features = [
     "console",
     "CodecState",
     "CanvasRenderingContext2d",
+    "DisplayMediaStreamConstraints",
     "EncodedAudioChunk",
     "EncodedAudioChunkInit",
     "EncodedAudioChunkType",

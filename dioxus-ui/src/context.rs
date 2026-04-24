@@ -23,6 +23,226 @@ pub struct DisplayNameCtx(pub Signal<Option<String>>);
 #[derive(Clone, Copy)]
 pub struct LocalAudioLevelCtx(pub Signal<f32>);
 
+/// Glow color choices for the appearance customization.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GlowColor {
+    White,
+    Cyan,
+    Magenta,
+    Plum,
+    MintGreen,
+    Custom { r: u8, g: u8, b: u8 },
+}
+
+impl GlowColor {
+    pub fn to_hex(self) -> String {
+        match self {
+            GlowColor::White => "#FFFFFF".to_string(),
+            GlowColor::Cyan => "#0CAFFF".to_string(),
+            GlowColor::Magenta => "#FF00BF".to_string(),
+            GlowColor::Plum => "#DDA0DD".to_string(),
+            GlowColor::MintGreen => "#5bcf9f".to_string(),
+            GlowColor::Custom { r, g, b } => format!("#{r:02X}{g:02X}{b:02X}"),
+        }
+    }
+
+    pub fn to_rgb(self) -> (u8, u8, u8) {
+        match self {
+            GlowColor::White => (255, 255, 255),
+            GlowColor::Cyan => (12, 175, 255),
+            GlowColor::Magenta => (255, 0, 191),
+            GlowColor::Plum => (221, 160, 221),
+            GlowColor::MintGreen => (91, 207, 159),
+            GlowColor::Custom { r, g, b } => (r, g, b),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            GlowColor::White => "White".to_string(),
+            GlowColor::Cyan => "Cyan".to_string(),
+            GlowColor::Magenta => "Magenta".to_string(),
+            GlowColor::Plum => "Plum".to_string(),
+            GlowColor::MintGreen => "Mint Green".to_string(),
+            GlowColor::Custom { r, g, b } => format!("#{r:02X}{g:02X}{b:02X}"),
+        }
+    }
+
+    fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "white" => Some(GlowColor::White),
+            "cyan" => Some(GlowColor::Cyan),
+            "magenta" => Some(GlowColor::Magenta),
+            "plum" => Some(GlowColor::Plum),
+            "mint-green" => Some(GlowColor::MintGreen),
+            other if other.starts_with("custom:") => {
+                let hex = &other[7..];
+                if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                    Some(GlowColor::Custom { r, g, b })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn to_storage(self) -> String {
+        match self {
+            GlowColor::White => "white".to_string(),
+            GlowColor::Cyan => "cyan".to_string(),
+            GlowColor::Magenta => "magenta".to_string(),
+            GlowColor::Plum => "plum".to_string(),
+            GlowColor::MintGreen => "mint-green".to_string(),
+            GlowColor::Custom { r, g, b } => format!("custom:{r:02x}{g:02x}{b:02x}"),
+        }
+    }
+
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() == 7 && hex.starts_with('#') && hex[1..].chars().all(|c| c.is_ascii_hexdigit())
+        {
+            let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
+            let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
+            let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
+            let presets = [
+                GlowColor::White,
+                GlowColor::Cyan,
+                GlowColor::Magenta,
+                GlowColor::Plum,
+                GlowColor::MintGreen,
+            ];
+            for preset in presets {
+                if preset.to_rgb() == (r, g, b) {
+                    return Some(preset);
+                }
+            }
+            Some(GlowColor::Custom { r, g, b })
+        } else {
+            None
+        }
+    }
+}
+
+/// Local appearance settings for the speaking glow effect.
+/// These settings are viewer-specific and never broadcast to other participants.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct AppearanceSettings {
+    pub glow_enabled: bool,
+    pub glow_color: GlowColor,
+    pub glow_brightness: f32,     // 0.0–1.0 scale factor
+    pub inner_glow_strength: f32, // 0.0–1.0 scale factor
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        AppearanceSettings {
+            glow_enabled: true,
+            glow_color: GlowColor::MintGreen,
+            glow_brightness: 1.0,
+            inner_glow_strength: 1.0,
+        }
+    }
+}
+
+/// Appearance settings context for sharing custom glow preferences across the component tree.
+#[derive(Clone, Copy)]
+pub struct AppearanceSettingsCtx(pub Signal<AppearanceSettings>);
+
+const APPEARANCE_GLOW_ENABLED_STORAGE_KEY: &str = "vc_appearance_glow_enabled";
+const APPEARANCE_COLOR_STORAGE_KEY: &str = "vc_appearance_glow_color";
+const APPEARANCE_BRIGHTNESS_STORAGE_KEY: &str = "vc_appearance_glow_brightness";
+const APPEARANCE_INNER_STORAGE_KEY: &str = "vc_appearance_inner_glow_strength";
+const CUSTOM_COLORS_STORAGE_KEY: &str = "vc_appearance_custom_colors";
+
+pub const MAX_CUSTOM_COLORS: usize = 10;
+
+/// Load local-only appearance settings from storage.
+///
+/// Returns defaults for any missing or invalid values.
+pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
+    let mut settings = AppearanceSettings::default();
+
+    if let Some(value) =
+        LocalStorage::get::<String>(&APPEARANCE_GLOW_ENABLED_STORAGE_KEY.to_string())
+    {
+        settings.glow_enabled = value != "false";
+    }
+
+    if let Some(color) = LocalStorage::get::<String>(&APPEARANCE_COLOR_STORAGE_KEY.to_string()) {
+        if let Some(parsed) = GlowColor::from_storage(&color) {
+            settings.glow_color = parsed;
+        }
+    }
+
+    if let Some(value) = LocalStorage::get::<f32>(&APPEARANCE_BRIGHTNESS_STORAGE_KEY.to_string()) {
+        settings.glow_brightness = value.clamp(0.0, 1.0);
+    }
+
+    if let Some(value) = LocalStorage::get::<f32>(&APPEARANCE_INNER_STORAGE_KEY.to_string()) {
+        settings.inner_glow_strength = value.clamp(0.0, 1.0);
+    }
+
+    settings
+}
+
+/// Save local-only appearance settings to storage.
+pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
+    LocalStorage::set(
+        APPEARANCE_GLOW_ENABLED_STORAGE_KEY.to_string(),
+        &settings.glow_enabled.to_string(),
+    );
+    LocalStorage::set(
+        APPEARANCE_COLOR_STORAGE_KEY.to_string(),
+        &settings.glow_color.to_storage().to_string(),
+    );
+    LocalStorage::set(
+        APPEARANCE_BRIGHTNESS_STORAGE_KEY.to_string(),
+        &settings.glow_brightness.clamp(0.0, 1.0),
+    );
+    LocalStorage::set(
+        APPEARANCE_INNER_STORAGE_KEY.to_string(),
+        &settings.inner_glow_strength.clamp(0.0, 1.0),
+    );
+}
+
+/// Load custom glow colors from local storage.
+pub fn load_custom_colors_from_storage() -> Vec<GlowColor> {
+    let Some(csv) = LocalStorage::get::<String>(&CUSTOM_COLORS_STORAGE_KEY.to_string()) else {
+        return Vec::new();
+    };
+    csv.split(',')
+        .filter_map(|hex| {
+            let hex = hex.trim();
+            if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                Some(GlowColor::Custom { r, g, b })
+            } else {
+                None
+            }
+        })
+        .take(MAX_CUSTOM_COLORS)
+        .collect()
+}
+
+/// Save custom glow colors to local storage.
+pub fn save_custom_colors_to_storage(colors: &[GlowColor]) {
+    let csv: String = colors
+        .iter()
+        .filter_map(|c| match c {
+            GlowColor::Custom { r, g, b } => Some(format!("{r:02x}{g:02x}{b:02x}")),
+            _ => None,
+        })
+        .take(MAX_CUSTOM_COLORS)
+        .collect::<Vec<_>>()
+        .join(",");
+    LocalStorage::set(CUSTOM_COLORS_STORAGE_KEY.to_string(), &csv);
+}
+
 /// VideoCallClient context for sharing the client instance across components.
 pub type VideoCallClientCtx = VideoCallClient;
 
@@ -294,11 +514,14 @@ pub fn resolve_transport_config(
     }
 }
 
-/// Handle a transport preference change from a `<select>` element.
+/// Handle a transport preference change from transport selection controls.
 ///
 /// Shows a confirmation dialog. If the user confirms, saves the preference and
-/// reloads the page. If cancelled, resets the `<select>` element back to the
-/// current value so the dropdown doesn't show a stale selection.
+/// reloads the page. If cancelled, attempts to reset a native `<select>`
+/// control (when present) back to the current value so it doesn't appear stale.
+///
+/// Custom controls (like the settings modal glass dropdown) are state-driven and
+/// naturally re-render with the current value when the user cancels.
 pub fn confirm_transport_change(new_value: &str, current: TransportPreference, select_id: &str) {
     use wasm_bindgen::JsCast;
 

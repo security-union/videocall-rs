@@ -3,6 +3,19 @@ import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
+ * Select an option from a custom GlassSelect component.
+ * Clicks the trigger button to open the dropdown menu, then clicks the
+ * matching menu item.
+ */
+async function glassSelect(page: Page, triggerId: string, optionText: string): Promise<void> {
+  const trigger = page.locator(`#${triggerId}`);
+  await trigger.click();
+  const menu = trigger.locator("..").locator(".glass-select-menu");
+  await expect(menu).toBeVisible();
+  await menu.locator(".glass-select-option", { hasText: optionText }).click();
+}
+
+/**
  * Navigate to a meeting room and join as a single user.
  *
  * Follows the same pattern used by settings-modal.spec.ts: fill meeting-id,
@@ -99,12 +112,12 @@ test.describe("Protocol selection (transport preference)", () => {
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    // The transport select should be visible
+    // The transport select trigger button should be visible
     const transportSelect = page.locator("#modal-transport-select");
     await expect(transportSelect).toBeVisible();
 
-    // Default value is "Auto" (value = "auto")
-    await expect(transportSelect).toHaveValue("auto");
+    // Default value is "Auto"
+    await expect(transportSelect.locator(".glass-select-label")).toHaveText("Auto");
   });
 
   // 2. Selecting a different protocol in settings shows confirm dialog
@@ -123,7 +136,7 @@ test.describe("Protocol selection (transport preference)", () => {
     });
 
     // Change the transport dropdown to WebSocket
-    await page.locator("#modal-transport-select").selectOption("websocket");
+    await glassSelect(page, "modal-transport-select", "WebSocket");
 
     // Wait a moment for the dialog event to propagate
     await page.waitForTimeout(500);
@@ -147,17 +160,16 @@ test.describe("Protocol selection (transport preference)", () => {
     });
 
     const transportSelect = page.locator("#modal-transport-select");
-    await expect(transportSelect).toHaveValue("auto");
+    await expect(transportSelect.locator(".glass-select-label")).toHaveText("Auto");
 
     // Try to change to WebTransport
-    await transportSelect.selectOption("webtransport");
+    await glassSelect(page, "modal-transport-select", "WebTransport");
     await page.waitForTimeout(500);
 
-    // The dropdown should still show "auto" because the user cancelled
+    // The dropdown should still show "Auto" because the user cancelled
     // Note: In Dioxus, after the dialog is dismissed and the change is
     // rejected, the component re-renders with the original value.
-    // The select element's value is controlled by the `selected` attribute.
-    await expect(transportSelect).toHaveValue("auto");
+    await expect(transportSelect.locator(".glass-select-label")).toHaveText("Auto");
   });
 
   // 4. Confirming the dialog saves to localStorage and reloads
@@ -174,7 +186,7 @@ test.describe("Protocol selection (transport preference)", () => {
     });
 
     // Change to WebSocket -- this will save and reload
-    await page.locator("#modal-transport-select").selectOption("websocket");
+    await glassSelect(page, "modal-transport-select", "WebSocket");
 
     // The page should reload. Wait for navigation to settle.
     // After reload, the app will load the meeting page again.
@@ -208,7 +220,7 @@ test.describe("Protocol selection (transport preference)", () => {
 
     // The dropdown should reflect the persisted value
     const transportSelect = page.locator("#modal-transport-select");
-    await expect(transportSelect).toHaveValue("websocket");
+    await expect(transportSelect.locator(".glass-select-label")).toHaveText("WebSocket");
 
     // Clean up: remove the localStorage entry
     await page.evaluate(() => {
@@ -273,7 +285,7 @@ test.describe("Protocol selection (transport preference)", () => {
     await switchToNetworkTab(page);
 
     const settingsSelect = page.locator("#modal-transport-select");
-    await expect(settingsSelect).toHaveValue("webtransport");
+    await expect(settingsSelect.locator(".glass-select-label")).toHaveText("WebTransport");
 
     // Close settings modal by clicking outside or pressing Escape
     await page.keyboard.press("Escape");

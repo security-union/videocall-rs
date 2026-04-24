@@ -18,6 +18,7 @@
 
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
+use crate::context::AppearanceSettingsCtx;
 use dioxus::prelude::*;
 
 #[component]
@@ -46,6 +47,15 @@ pub fn PeerListItem(
         "peer_item_mic speaking"
     } else {
         "peer_item_mic"
+    };
+
+    let appearance_ctx = use_context::<AppearanceSettingsCtx>();
+    let appearance = (appearance_ctx.0)();
+    let mic_style = if speaking && appearance.glow_enabled {
+        let hex = appearance.glow_color.to_hex();
+        format!("color: {hex};")
+    } else {
+        String::new()
     };
 
     let indicator = match (is_self, is_host) {
@@ -95,7 +105,7 @@ pub fn PeerListItem(
                     }
                 }
             }
-            div { class: "{mic_class}",
+            div { class: "{mic_class}", style: "{mic_style}",
                 MicIcon { muted: muted }
             }
         }

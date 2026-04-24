@@ -167,25 +167,21 @@ impl WebTransportClient {
         self.runtime.block_on(async move {
             // Load native certificates
             let mut root_store = RootCertStore::empty();
-            let cert_count = match load_native_certs() {
-                Ok(certs) => {
-                    let count = certs.len();
-                    for cert in certs {
-                        root_store.add(cert).map_err(|e| {
-                            WebTransportError::CertificateError(format!(
-                                "Failed to add certificate: {e}"
-                            ))
-                        })?;
-                    }
-                    count
-                }
-                Err(e) => {
-                    error!("Failed to load native certificates: {e}");
-                    return Err(WebTransportError::CertificateError(format!(
-                        "Failed to load native certificates: {e}"
-                    )));
-                }
-            };
+            let result = load_native_certs();
+            for e in &result.errors {
+                error!("Failed to load some native certificates: {e}");
+            }
+            let cert_count = result.certs.len();
+            for cert in result.certs {
+                root_store.add(cert).map_err(|e| {
+                    WebTransportError::CertificateError(format!("Failed to add certificate: {e}"))
+                })?;
+            }
+            if cert_count == 0 {
+                return Err(WebTransportError::CertificateError(
+                    "No native certificates found".to_string(),
+                ));
+            }
             info!("Loaded {cert_count} native certificates");
 
             // Create a rustls ClientConfig with the root store
@@ -194,16 +190,15 @@ impl WebTransportClient {
                 .with_no_client_auth();
 
             // Create a WebTransport client with the custom rustls config for now disable certificate verification
-            let client = unsafe {
-                ClientBuilder::new()
-                    .with_no_certificate_verification()
-                    .map_err(|e| {
-                        WebTransportError::TlsError(format!("Failed to create client: {e}"))
-                    })?
-            };
+            let client = ClientBuilder::new()
+                .dangerous()
+                .with_no_certificate_verification()
+                .map_err(|e| {
+                    WebTransportError::TlsError(format!("Failed to create client: {e}"))
+                })?;
 
             // Connect to the server
-            let session = client.connect(&url).await.map_err(|e| {
+            let session = client.connect(url).await.map_err(|e| {
                 WebTransportError::ConnectionError(format!("Failed to connect: {e}"))
             })?;
 

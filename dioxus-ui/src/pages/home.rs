@@ -20,7 +20,7 @@ use crate::auth::{check_session, get_user_profile, logout, UserProfile};
 use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
-use crate::constants::oauth_enabled;
+use crate::constants::{meeting_api_base_url, oauth_enabled};
 use crate::context::{
     clear_display_name_from_storage, email_to_display_name, is_guid_like, is_valid_meeting_id,
     load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
@@ -117,6 +117,29 @@ pub fn Home() -> Element {
                     // Session valid but profile fetch failed → leave field empty.
                 }
                 // Session invalid → field stays empty; signed-out state.
+            });
+        }
+    });
+
+    // Dev auto-login: when OAuth is disabled and no session cookie exists,
+    // attempt to acquire one by fetching the dev auto-login endpoint.
+    // The endpoint sets the cookie and returns a redirect to "/".
+    // If the endpoint returns 404 (DEV_USER not configured), we simply
+    // do nothing — the app continues to work without a session.
+    use_effect(move || {
+        if !oauth_enabled().unwrap_or(false) {
+            // Check whether a session already exists before navigating.
+            wasm_bindgen_futures::spawn_local(async move {
+                if check_session().await.is_ok() {
+                    return; // Already have a valid session — nothing to do.
+                }
+                // No valid session — try the dev auto-login endpoint.
+                if let Ok(base_url) = meeting_api_base_url() {
+                    let url = format!("{}/api/v1/dev/auto-login", base_url);
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.location().set_href(&url);
+                    }
+                }
             });
         }
     });

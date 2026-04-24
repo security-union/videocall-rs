@@ -3,25 +3,39 @@
 # Copy this file to config-<name>.yaml and fill in your values:
 #   cp config.yaml.template config-myenv.yaml
 #
-# Generate conversation assets first:
-#   python3 generate-conversation-edge.py
+# Setup:
+#   1. python3 generate-conversation-edge.py   (generates conversation audio + manifest)
+#   2. Download costume-videos.zip, unzip, run ffmpeg normalization (see README)
+#   3. cargo build --release -p bot
 #
 # Usage:
-#   bot --config config-myenv.yaml --users 5
+#   RUST_LOG=info ./target/release/bot --config config-myenv.yaml --users 20
 
-# Transport: "websocket" or "webtransport"
-transport: "websocket"
+# Transport — set one or both URLs.
+# Use wt_ratio: 0 for load testing (WT inbound is broken in web-transport-quinn 0.8.1).
+ws_url: "wss://websocket.example.com"
+# wt_url: "https://webtransport.example.com:443"
+# wt_ratio: 0.0
 
-# Server URL
-#   WebSocket:     wss://websocket.example.com  (or https:// — auto-converted to wss://)
-#   WebTransport:  https://webtransport.example.com:443
-server_url: "wss://websocket.example.com"
+# Legacy single-transport format (still supported):
+# transport: "websocket"
+# server_url: "wss://websocket.example.com"
 
-# Meeting ID to join
+# Meeting room ID
 meeting_id: "1"
 
 # Path to conversation directory (contains manifest.yaml + lines/*.wav)
 conversation_dir: "conversation"
+
+# Video mode: "costume" (pre-recorded clips) or "ekg" (animated waveform)
+video_mode: costume
+
+# Broadcaster/observer split: first N participants send A/V, rest are
+# receive-only observers. 0 = all participants broadcast.
+# broadcasters: 5
+
+# Seconds of silence before conversation starts (one-time warmup)
+warmup_secs: 15
 
 # Delay between starting each client (ms)
 ramp_up_delay_ms: 500

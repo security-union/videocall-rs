@@ -30,7 +30,10 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use chrono::{Datelike, Utc};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use regex::Regex;
+use std::io::Write;
 use tokio::io::AsyncWriteExt;
 use tracing;
 
@@ -347,7 +350,7 @@ pub async fn upload_console_logs(
         let uuid_v7 = uuid::Uuid::now_v7();
         uuid_v7.simple().to_string()[..16].to_string()
     };
-    let filename = format!("{user_id}_{session_ts}_{chunk_suffix}.log");
+    let filename = format!("{user_id}_{session_ts}_{chunk_suffix}.log.gz");
 
     // --- Create directory and write file ---
     let base_dir = std::env::var("CONSOLE_LOG_DIR").unwrap_or_else(|_| DEFAULT_LOG_DIR.to_string());
@@ -445,7 +448,25 @@ pub async fn upload_console_logs(
         }
     };
 
-    file.write_all(&body).await.map_err(|e| {
+    let compressed = tokio::task::spawn_blocking({
+        let body = body.to_vec();
+        move || {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&body)?;
+            encoder.finish()
+        }
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "Gzip compression task panicked");
+        AppError::internal("Failed to store console log chunk")
+    })?
+    .map_err(|e| {
+        tracing::error!(error = %e, "Gzip compression failed");
+        AppError::internal("Failed to store console log chunk")
+    })?;
+
+    file.write_all(&compressed).await.map_err(|e| {
         tracing::error!(
             path = %file_path.display(),
             error = %e,

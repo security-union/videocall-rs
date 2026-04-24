@@ -262,7 +262,14 @@ jobs:
             --set resources.limits.cpu=2000m \
             --set resources.limits.memory=2Gi \
             --set ingress.enabled=false \
-            --wait --timeout 5m
+            --timeout 5m
+
+          # Note: no --wait flag. The chart hardcodes service.type=LoadBalancer, and Ascend
+          # has no cloud LB controller, so EXTERNAL-IP stays <pending> indefinitely and
+          # helm --wait would timeout. HAProxy sends UDP directly to NodePort 30056 which
+          # is allocated the moment the service is created — external IP is irrelevant.
+          # Explicitly wait on the deployment instead.
+          kubectl rollout status deployment/videocall-webtransport -n ${NAMESPACE} --timeout=180s
 
           echo "✅ WebTransport server deployed (NodePort 30056 for HAProxy UDP proxy)"
 

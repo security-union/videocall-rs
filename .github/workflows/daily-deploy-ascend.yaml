@@ -317,7 +317,7 @@ jobs:
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-websocket" \
             --set "ingress.hosts[0].paths[0].service.port.number=8080" \
-            --set "ingress.annotations.nginx\.ingress\.kubernetes\.io/ssl-redirect=false" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/ssl-redirect=false" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
@@ -424,7 +424,7 @@ jobs:
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=videocall-api" \
             --set "ingress.hosts[0].paths[0].service.port.number=8081" \
-            --set "ingress.annotations.nginx\.ingress\.kubernetes\.io/ssl-redirect=false" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/ssl-redirect=false" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --set consoleLogs.enabled=true \
@@ -475,7 +475,7 @@ jobs:
             --set "ingress.hosts[0].host=app.videocall.conceptcar7.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
-            --set "ingress.annotations.nginx\.ingress\.kubernetes\.io/ssl-redirect=false" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/ssl-redirect=false" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m

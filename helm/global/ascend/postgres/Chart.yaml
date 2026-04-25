@@ -1,9 +1,0 @@
-apiVersion: v2
-name: postgres-ascend
-version: 0.1.0
-description: PostgreSQL for Ascend region
-
-dependencies:
-  - name: postgresql
-    version: 18.1.3
-    repository: https://charts.bitnami.com/bitnami

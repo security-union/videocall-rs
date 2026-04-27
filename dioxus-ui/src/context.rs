@@ -557,6 +557,6 @@ pub fn confirm_transport_change(new_value: &str, current: TransportPreference, s
 // ---------------------------------------------------------------------------
 
 pub use videocall_types::validation::{
-    email_to_display_name, is_guid_like, is_valid_meeting_id, validate_display_name,
-    DISPLAY_NAME_MAX_LEN,
+    email_to_display_name, is_allowed_display_name_char, is_guid_like, is_valid_meeting_id,
+    validate_display_name, DISPLAY_NAME_MAX_LEN,
 };

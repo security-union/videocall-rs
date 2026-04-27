@@ -127,6 +127,9 @@ pub fn decode_guest_token(secret: &str, token: &str) -> Result<RoomAccessTokenCl
 // ---------------------------------------------------------------------------
 
 /// Sign a room access token for the given participant.
+// Keep this signature stable across multiple call sites; grouping into a struct
+// would be a broader refactor with no behavioral benefit.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_room_token(
     secret: &str,
     ttl_secs: i64,

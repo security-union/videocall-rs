@@ -289,6 +289,7 @@ pub fn MeetingPage(id: String) -> Element {
                 on_participant_admitted: None,
                 on_participant_rejected: None,
                 on_waiting_room_updated: None,
+                on_meeting_settings_updated: None,
                 on_speaking_changed: None,
                 on_audio_level_changed: None,
                 vad_threshold: None,

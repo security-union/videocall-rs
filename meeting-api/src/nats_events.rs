@@ -145,6 +145,19 @@ pub async fn publish_participant_display_name_changed(
     );
 }
 
+/// Publish `MEETING_SETTINGS_UPDATED` when meeting settings change.
+pub async fn publish_meeting_settings_updated(nats: Option<&async_nats::Client>, room_id: &str) {
+    let Some(nats) = nats else { return };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::MEETING_SETTINGS_UPDATED.into(),
+        room_id: room_id.to_string(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    publish(nats, room_system_subject(room_id), bytes).await;
+    tracing::debug!("Published MEETING_SETTINGS_UPDATED for room {room_id}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +239,23 @@ mod tests {
     }
 
     #[test]
+    fn test_build_meeting_settings_updated_packet() {
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::MEETING_SETTINGS_UPDATED.into(),
+            room_id: "test-room".to_string(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::MEETING_SETTINGS_UPDATED.into()
+        );
+        assert_eq!(inner.room_id, "test-room");
+    }
+
+    #[test]
     fn test_room_system_subject() {
         assert_eq!(room_system_subject("my-room"), "room.my-room.system");
         assert_eq!(
@@ -251,5 +281,6 @@ mod tests {
         publish_participant_admitted(None, "room", "user@test.com").await;
         publish_participant_rejected(None, "room", "user@test.com").await;
         publish_waiting_room_updated(None, "room").await;
+        publish_meeting_settings_updated(None, "room").await;
     }
 }

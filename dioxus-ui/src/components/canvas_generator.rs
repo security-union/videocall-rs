@@ -362,10 +362,14 @@ pub fn generate_for_peer(
     // ---- Split-layout: screen-share left panel --------------------------------
     if decision == TileDecision::RenderScreenShare {
         let ss_canvas_crop = format!("screen-share-{}", key);
+        let ss_div_id = Rc::new(format!("screen-share-{}-div", &key));
+        let ss_div_pin = (*ss_div_id).clone();
+        let peer_user_id_for_pin_ss = peer_user_id.clone();
         let ss_name = format!("{}-screen", peer_display_name);
         let ss_name_title = ss_name.clone();
         return rsx! {
             div {
+                id: "{ss_div_id}",
                 class: "split-screen-tile",
                 div {
                     class: "canvas-container video-on",
@@ -379,10 +383,21 @@ pub fn generate_for_peer(
                             span { class: "guest-badge", "Guest" }
                         }
                     }
-                    button {
-                        onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
-                        class: "crop-icon",
-                        CropIcon {}
+                    div {
+                        class: "tile-top-icons",
+                        button {
+                            onclick: move |_| {
+                                toggle_pinned_div(&ss_div_pin);
+                                on_toggle_pin.call(peer_user_id_for_pin_ss.clone());
+                            },
+                            class: "pin-icon",
+                            PushPinIcon {}
+                        }
+                        button {
+                            onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
+                            class: "crop-icon",
+                            CropIcon {}
+                        }
                     }
                 }
             }
@@ -393,6 +408,8 @@ pub fn generate_for_peer(
     if decision == TileDecision::RenderVideo {
         let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
         let div_id_mobile = (*peer_video_div_id).clone();
+        let div_id_pin = (*peer_video_div_id).clone();
+        let peer_user_id_for_pin_vo = peer_user_id.clone();
         let pv_canvas_crop = key.clone();
         let key_clone = key.clone();
         let peer_display_name_vo = peer_display_name.clone();
@@ -462,6 +479,15 @@ pub fn generate_for_peer(
                             "aria-label": "Show signal quality",
                             onclick: move |_| show_signal_popup.toggle(),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                        }
+                        // Pin (visible on hover only)
+                        button {
+                            onclick: move |_| {
+                                toggle_pinned_div(&div_id_pin);
+                                on_toggle_pin.call(peer_user_id_for_pin_vo.clone());
+                            },
+                            class: "pin-icon",
+                            PushPinIcon {}
                         }
                         // Crop (visible on hover only)
                         button {

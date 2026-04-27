@@ -225,7 +225,7 @@ async fn join_as_attendee(
                 None
             };
             let mut resp = row.into_participant_status(token);
-            if !auto_admitted {
+            if is_guest || !auto_admitted {
                 let dn = display_name.unwrap_or(fallback_display_name);
                 resp.observer_token = Some(generate_observer_token(
                     &state.jwt_secret,
@@ -234,6 +234,8 @@ async fn join_as_attendee(
                     dn,
                     is_guest,
                 )?);
+            }
+            if !auto_admitted {
                 nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
             }
             resp.waiting_room_enabled = Some(wr_enabled);
@@ -314,9 +316,8 @@ async fn join_as_attendee(
     };
 
     let mut resp = row.into_participant_status(token);
-    // When the participant is placed in the waiting room (not auto-admitted),
-    // include an observer token so they can receive push notifications.
-    if !auto_admitted {
+    // Waiting attendees and all guests receive observer tokens for guest-status polling.
+    if is_guest || !auto_admitted {
         let dn = display_name.unwrap_or(fallback_display_name);
         resp.observer_token = Some(generate_observer_token(
             &state.jwt_secret,
@@ -325,6 +326,8 @@ async fn join_as_attendee(
             dn,
             is_guest,
         )?);
+    }
+    if !auto_admitted {
         // Notify the host that the waiting room list has changed.
         nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
     }

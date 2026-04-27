@@ -230,6 +230,134 @@ async fn test_observer_token_not_present_when_auto_admitted() {
     cleanup_test_data(&pool, room_id).await;
 }
 
+// -- Auto-admitted guest still receives observer_token ------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_auto_admitted_guest_receives_observer_token_in_active_meeting() {
+    let pool = get_test_pool().await;
+    let room_id = "test-guest-observer-auto-admit-active";
+    cleanup_test_data(&pool, room_id).await;
+
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "meeting_id": room_id,
+                "attendees": [],
+                "allow_guests": true,
+                "waiting_room_enabled": false
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        "host@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    let app = build_app(pool.clone());
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/meetings/{room_id}/join-guest"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"display_name":"Guest Auto Active"}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    assert_eq!(body.result.status, "admitted");
+    assert!(body.result.is_guest);
+    assert!(
+        body.result.room_token.is_some(),
+        "Auto-admitted guest should receive a room_token"
+    );
+    let observer = body
+        .result
+        .observer_token
+        .expect("Auto-admitted guest must receive an observer_token");
+    let claims = decode_token(&observer);
+    assert!(claims.observer);
+    assert!(!claims.room_join);
+    assert!(
+        claims
+            .sub
+            .starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX),
+        "observer token subject should be a guest user id"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_auto_admitted_guest_receives_observer_token_when_meeting_not_active() {
+    let pool = get_test_pool().await;
+    let room_id = "test-guest-observer-auto-admit-not-active";
+    cleanup_test_data(&pool, room_id).await;
+
+    // Create an idle meeting with waiting room off so guest join auto-activates
+    // and auto-admits through the non-active join path.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "meeting_id": room_id,
+                "attendees": [],
+                "allow_guests": true,
+                "waiting_room_enabled": false
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    let app = build_app(pool.clone());
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/meetings/{room_id}/join-guest"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"display_name":"Guest Auto Idle"}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    assert_eq!(body.result.status, "admitted");
+    assert!(body.result.is_guest);
+    assert!(
+        body.result.room_token.is_some(),
+        "Auto-admitted guest should receive a room_token"
+    );
+    let observer = body
+        .result
+        .observer_token
+        .expect("Auto-admitted guest must receive an observer_token");
+    let claims = decode_token(&observer);
+    assert!(claims.observer);
+    assert!(!claims.room_join);
+    assert!(
+        claims
+            .sub
+            .starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX),
+        "observer token subject should be a guest user id"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
 // -- waiting_for_meeting includes waiting_room_enabled field -------------------
 
 #[tokio::test]

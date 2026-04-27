@@ -37,6 +37,7 @@ enum GuestStatus {
         host_display_name: Option<String>,
         host_user_id: Option<String>,
         room_token: String,
+        status_observer_token: String,
         waiting_room_enabled: bool,
         admitted_can_admit: bool,
         allow_guests: bool,
@@ -50,7 +51,10 @@ enum GuestStatus {
 // ---------------------------------------------------------------------------
 
 /// Map a join/status API response to a [`GuestStatus`] variant.
-fn guest_status_from_join_response(response: &JoinMeetingResponse) -> GuestStatus {
+fn guest_status_from_join_response(
+    response: &JoinMeetingResponse,
+    fallback_status_observer_token: Option<String>,
+) -> GuestStatus {
     let host_display_name = response.host_display_name.clone();
     let host_user_id = response.host_user_id.clone();
     let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
@@ -64,6 +68,10 @@ fn guest_status_from_join_response(response: &JoinMeetingResponse) -> GuestStatu
                     host_display_name,
                     host_user_id,
                     room_token: token,
+                    status_observer_token: resolve_status_observer_token(
+                        response.observer_token.clone(),
+                        fallback_status_observer_token,
+                    ),
                     waiting_room_enabled: wr_enabled,
                     admitted_can_admit: aca,
                     allow_guests: ag,
@@ -83,11 +91,22 @@ fn guest_status_from_join_response(response: &JoinMeetingResponse) -> GuestStatu
     }
 }
 
+fn resolve_status_observer_token(
+    observer_token: Option<String>,
+    fallback_status_observer_token: Option<String>,
+) -> String {
+    observer_token
+        .filter(|t| !t.is_empty())
+        .or_else(|| fallback_status_observer_token.filter(|t| !t.is_empty()))
+        .unwrap_or_default()
+}
+
 /// Apply a [`JoinMeetingResponse`] that is already known to represent admission
 /// (e.g. from the waiting-room push). Sets host metadata signals and transitions
 /// to [`GuestStatus::Admitted`].
 fn handle_admitted(
     response: JoinMeetingResponse,
+    fallback_status_observer_token: String,
     mut guest_status: Signal<GuestStatus>,
     mut host_display_name: Signal<Option<String>>,
     mut host_user_id: Signal<Option<String>>,
@@ -99,6 +118,10 @@ fn handle_admitted(
     let aca = response.admitted_can_admit.unwrap_or(false);
     let ag = response.allow_guests.unwrap_or(false);
     let token = response.room_token.unwrap_or_default();
+    let status_observer_token = resolve_status_observer_token(
+        response.observer_token,
+        Some(fallback_status_observer_token),
+    );
     host_display_name.set(determined_host.clone());
     host_user_id.set(determined_host_uid.clone());
     observer_token_signal.set(None);
@@ -106,6 +129,7 @@ fn handle_admitted(
         host_display_name: determined_host,
         host_user_id: determined_host_uid,
         room_token: token,
+        status_observer_token,
         waiting_room_enabled: wr_enabled,
         admitted_can_admit: aca,
         allow_guests: ag,
@@ -180,10 +204,12 @@ fn start_observer_connection(
         on_meeting_ended: None,
         on_meeting_activated: Some(VcCallback::from({
             let meeting_id = meeting_id.clone();
+            let fallback_status_observer_token = observer_token.clone();
             move |_| {
                 log::info!("Guest: Meeting activated push received, re-joining...");
                 let meeting_id = meeting_id.clone();
                 let display_name = display_name.clone();
+                let fallback_status_observer_token = fallback_status_observer_token.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     observer_token_signal.set(None);
 
@@ -192,7 +218,10 @@ fn start_observer_connection(
                             current_user_id.set(Some(response.user_id.clone()));
                             host_display_name.set(response.host_display_name.clone());
                             host_user_id.set(response.host_user_id.clone());
-                            let status = guest_status_from_join_response(&response);
+                            let status = guest_status_from_join_response(
+                                &response,
+                                Some(fallback_status_observer_token),
+                            );
                             if matches!(&status, GuestStatus::Waiting { .. }) {
                                 came_from_waiting_room.set(true);
                             }
@@ -208,6 +237,7 @@ fn start_observer_connection(
         on_participant_admitted: None,
         on_participant_rejected: None,
         on_waiting_room_updated: None,
+        on_meeting_settings_updated: None,
         on_speaking_changed: None,
         on_audio_level_changed: None,
         vad_threshold: None,
@@ -284,6 +314,15 @@ pub fn GuestJoinPage(id: String) -> Element {
         move || {
             let meeting_id = meeting_id.clone();
             let display_name = input_value();
+            let fallback_status_observer_token = match guest_status() {
+                GuestStatus::Waiting { observer_token }
+                | GuestStatus::WaitingForMeeting { observer_token } => Some(observer_token),
+                GuestStatus::Admitted {
+                    status_observer_token,
+                    ..
+                } => Some(status_observer_token),
+                _ => None,
+            };
             guest_status.set(GuestStatus::Joining);
 
             wasm_bindgen_futures::spawn_local(async move {
@@ -292,7 +331,10 @@ pub fn GuestJoinPage(id: String) -> Element {
                         current_user_id.set(Some(response.user_id.clone()));
                         host_display_name.set(response.host_display_name.clone());
                         host_user_id.set(response.host_user_id.clone());
-                        let status = guest_status_from_join_response(&response);
+                        let status = guest_status_from_join_response(
+                            &response,
+                            fallback_status_observer_token,
+                        );
                         match &status {
                             GuestStatus::WaitingForMeeting { observer_token } => {
                                 observer_token_signal.set(Some(observer_token.clone()));
@@ -319,8 +361,18 @@ pub fn GuestJoinPage(id: String) -> Element {
     // Handle waiting room admission
     let on_admitted = {
         move |status: JoinMeetingResponse| {
+            let fallback_status_observer_token = match guest_status() {
+                GuestStatus::Waiting { observer_token }
+                | GuestStatus::WaitingForMeeting { observer_token } => observer_token,
+                GuestStatus::Admitted {
+                    status_observer_token,
+                    ..
+                } => status_observer_token,
+                _ => String::new(),
+            };
             handle_admitted(
                 status,
+                fallback_status_observer_token,
                 guest_status,
                 host_display_name,
                 host_user_id,
@@ -356,7 +408,7 @@ pub fn GuestJoinPage(id: String) -> Element {
     rsx! {
         match &current_guest_status {
             // Admitted — show the meeting
-            GuestStatus::Admitted { host_display_name, host_user_id, room_token, waiting_room_enabled, admitted_can_admit, allow_guests } => rsx! {
+            GuestStatus::Admitted { host_display_name, host_user_id, room_token, status_observer_token, waiting_room_enabled, admitted_can_admit, allow_guests } => rsx! {
                 AttendantsComponent {
                     display_name: display_name_for_render.clone(),
                     id: id.clone(),
@@ -368,6 +420,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                     is_owner: false,
                     is_guest: true,
                     room_token: room_token.clone(),
+                    status_observer_token: status_observer_token.clone(),
                     waiting_room_enabled: *waiting_room_enabled,
                     admitted_can_admit: *admitted_can_admit,
                     allow_guests: *allow_guests,
@@ -567,6 +620,86 @@ pub fn GuestJoinPage(id: String) -> Element {
                     }
                 }
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_response(
+        status: &str,
+        room_token: Option<&str>,
+        observer_token: Option<&str>,
+    ) -> JoinMeetingResponse {
+        JoinMeetingResponse {
+            user_id: "guest-1".to_string(),
+            display_name: Some("Guest".to_string()),
+            status: status.to_string(),
+            is_host: false,
+            is_guest: true,
+            joined_at: 0,
+            admitted_at: None,
+            room_token: room_token.map(ToString::to_string),
+            observer_token: observer_token.map(ToString::to_string),
+            waiting_room_enabled: Some(true),
+            admitted_can_admit: Some(false),
+            end_on_host_leave: Some(true),
+            host_display_name: Some("Host".to_string()),
+            host_user_id: Some("host-1".to_string()),
+            allow_guests: Some(true),
+        }
+    }
+
+    #[test]
+    fn admitted_mapping_uses_fallback_when_response_observer_missing() {
+        let response = make_response("admitted", Some("room-token"), None);
+
+        let status = guest_status_from_join_response(&response, Some("fallback-token".to_string()));
+
+        match status {
+            GuestStatus::Admitted {
+                status_observer_token,
+                ..
+            } => {
+                assert_eq!(status_observer_token, "fallback-token");
+            }
+            other => panic!("expected Admitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admitted_mapping_uses_fallback_when_response_observer_empty() {
+        let response = make_response("admitted", Some("room-token"), Some(""));
+
+        let status = guest_status_from_join_response(&response, Some("fallback-token".to_string()));
+
+        match status {
+            GuestStatus::Admitted {
+                status_observer_token,
+                ..
+            } => {
+                assert_eq!(status_observer_token, "fallback-token");
+            }
+            other => panic!("expected Admitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admitted_mapping_prefers_non_empty_response_observer_token() {
+        let response = make_response("admitted", Some("room-token"), Some("response-token"));
+
+        let status = guest_status_from_join_response(&response, Some("fallback-token".to_string()));
+
+        match status {
+            GuestStatus::Admitted {
+                status_observer_token,
+                ..
+            } => {
+                assert_eq!(status_observer_token, "response-token");
+            }
+            other => panic!("expected Admitted, got {other:?}"),
         }
     }
 }

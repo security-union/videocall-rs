@@ -347,15 +347,21 @@ fn show_body_tooltip(x: f64, y: f64, time_str: &str, sample: &SignalSample) {
     style.set_property("top", &format!("{y:.0}px")).unwrap();
     style.set_property("display", "block").unwrap();
 
+    let video_tier = infer_video_tier(&sample.video_resolution);
     let video_line = if sample.video_resolution.is_empty() {
         format!(
             "<span style='color:#81C784'>Video: {:.1} fps | {:.0} kbps</span>",
             sample.video_fps, sample.video_bitrate_kbps
         )
-    } else {
+    } else if video_tier.is_empty() {
         format!(
             "<span style='color:#81C784'>Video: {} | {:.1} fps | {:.0} kbps</span>",
             sample.video_resolution, sample.video_fps, sample.video_bitrate_kbps
+        )
+    } else {
+        format!(
+            "<span style='color:#81C784'>Video: {} ({}) | {:.1} fps | {:.0} kbps</span>",
+            sample.video_resolution, video_tier, sample.video_fps, sample.video_bitrate_kbps
         )
     };
     let audio_line = format!(
@@ -383,6 +389,24 @@ fn show_body_tooltip(x: f64, y: f64, time_str: &str, sample: &SignalSample) {
          {screen_line}\
          <div>{latency_line}</div>"
     ));
+}
+
+fn infer_video_tier(resolution: &str) -> &'static str {
+    let mut parts = resolution.split('x');
+    let _width = parts.next().and_then(|w| w.parse::<u32>().ok());
+    let height = parts.next().and_then(|h| h.parse::<u32>().ok());
+
+    match height.unwrap_or_default() {
+        h if h >= 1080 => "Full HD",
+        h if h >= 900 => "HD+",
+        h if h >= 720 => "HD",
+        h if h >= 540 => "Standard",
+        h if h >= 480 => "Medium",
+        h if h >= 360 => "Low",
+        h if h >= 270 => "Very Low",
+        h if h > 0 => "Minimal",
+        _ => "",
+    }
 }
 
 /// Hide the global tooltip.

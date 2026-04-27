@@ -21,7 +21,9 @@ use std::rc::Rc;
 
 use crate::components::canvas_generator::{generate_for_peer, AudioLevels, TileMode};
 use crate::components::signal_quality::{PeerSignalHistory, SampleData, SignalInfo};
-use crate::context::{MeetingTimeCtx, PeerSignalHistoryMap, VideoCallClientCtx};
+use crate::context::{
+    AppearanceSettingsCtx, MeetingTimeCtx, PeerSignalHistoryMap, VideoCallClientCtx,
+};
 use dioxus::prelude::*;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
@@ -200,6 +202,8 @@ pub fn PeerTile(
     };
     drop(sig_history);
 
+    let appearance = use_context::<AppearanceSettingsCtx>().0();
+
     generate_for_peer(
         &client,
         &peer_id,
@@ -222,6 +226,7 @@ pub fn PeerTile(
         show_signal_popup,
         pinned_peer_id.as_deref(),
         on_toggle_pin,
+        &appearance,
     )
 }
 

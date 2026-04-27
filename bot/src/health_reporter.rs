@@ -29,8 +29,9 @@ use tracing::{debug, info, warn};
 use crate::config::{ClientConfig, Transport};
 use crate::inbound_stats::InboundStats;
 use videocall_types::protos::health_packet::{
-    HealthPacket as PbHealthPacket, NetEqStats as PbNetEqStats, PeerStats as PbPeerStats,
-    VideoStats as PbVideoStats,
+    HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
+    NetEqOperationCounters as PbNetEqOpCounters, NetEqStats as PbNetEqStats,
+    PeerStats as PbPeerStats, VideoStats as PbVideoStats,
 };
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -148,35 +149,68 @@ fn build_health_packet(
     hp.is_tab_visible = true;
     hp.is_tab_throttled = false;
 
-    // Bot does not adapt — report tier 0 (best)
+    // Bot does not adapt -- report tier 0 (best)
     hp.adaptive_video_tier = Some(0);
     hp.adaptive_audio_tier = Some(0);
     hp.screen_sharing_active = Some(false);
 
     // Overall inbound packet rate (all senders, all types)
-    // The drain window is ~1 second, so count ≈ rate.
+    // The drain window is ~1 second, so count ~ rate.
     hp.packets_received_per_sec = Some(total_packets as f64);
+    hp.packets_sent_per_sec = Some(80.0);
 
-    // Per-sender peer stats — this is the critical part for AQ.
-    // The drain window is ~1 second, so packet counts ≈ per-second rates.
+    // Per-sender peer stats -- this is the critical part for AQ.
+    // The drain window is ~1 second, so packet counts ~ per-second rates.
     for (sender_id, counters) in sender_counters {
         let mut ps = PbPeerStats::new();
 
         ps.can_listen = counters.audio_packets > 0;
         ps.can_see = counters.video_packets > 0;
 
-        // Video stats — fps_received is the field senders use to decide
-        // quality tiers. Since we drain every ~1s, video_packets ≈ fps.
+        // Video stats -- fps_received is the field senders use to decide
+        // quality tiers. Since we drain every ~1s, video_packets ~ fps.
         let mut vs = PbVideoStats::new();
         vs.fps_received = counters.video_packets as f64;
-        vs.bitrate_kbps = counters.video_bytes * 8 / 1000; // bytes/s → kbps
+        vs.bitrate_kbps = counters.video_bytes * 8 / 1000; // bytes/s -> kbps
+        vs.frames_decoded = counters.video_packets; // bot decodes every received frame
         ps.video_stats = ::protobuf::MessageField::some(vs);
 
-        // Stub NetEQ stats — bot does not use NetEQ but the field should
-        // exist so the server doesn't treat it as missing.
+        // NetEQ stats -- bot does not use NetEQ but populate realistic values.
         let mut ns = PbNetEqStats::new();
         ns.packets_per_sec = counters.audio_packets as f64;
+
+        // Populate operation counters with normal_per_sec = audio packets
+        let mut oc = PbNetEqOpCounters::new();
+        oc.normal_per_sec = counters.audio_packets as f64;
+        let mut network = PbNetEqNetwork::new();
+        network.operation_counters = ::protobuf::MessageField::some(oc);
+        ns.network = ::protobuf::MessageField::some(network);
+
         ps.neteq_stats = ::protobuf::MessageField::some(ns);
+
+        // Audio concealment: bot has perfect playback (0% concealment)
+        ps.audio_concealment_pct = 0.0;
+
+        // Quality scores
+        let audio_flowing = counters.audio_packets > 0;
+        let video_fps = counters.video_packets as f64;
+        let audio_score: f64 = if audio_flowing { 80.0 } else { 0.0 };
+        let video_score: f64 = (video_fps / 30.0 * 100.0).min(100.0);
+        let call_score: f64 = if audio_flowing {
+            audio_score.min(video_score)
+        } else {
+            video_score
+        };
+
+        if audio_flowing {
+            ps.audio_quality_score = Some(audio_score);
+        }
+        if counters.video_packets > 0 {
+            ps.video_quality_score = Some(video_score);
+        }
+        if audio_flowing || counters.video_packets > 0 {
+            ps.call_quality_score = Some(call_score);
+        }
 
         hp.peer_stats.insert(sender_id.clone(), ps);
     }

@@ -43,6 +43,7 @@ base64 = "0.22"
 oauth2 = "4"
 url = "2"
 
+flate2 = "1"
 libc = "0.2"
 futures = "0.3"
 tracing = "0.1"

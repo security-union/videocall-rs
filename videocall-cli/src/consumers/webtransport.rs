@@ -132,7 +132,9 @@ async fn connect_to_server(options: &Stream) -> anyhow::Result<web_transport_qui
         // Create WebTransport client using 0.7.3 API (same pattern as bot)
         let client = if options.insecure_skip_verify {
             info!("WARNING: Skipping TLS certificate verification - connection is insecure!");
-            unsafe { web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()? }
+            web_transport_quinn::ClientBuilder::new()
+                .dangerous()
+                .with_no_certificate_verification()?
         } else {
             web_transport_quinn::ClientBuilder::new().with_system_roots()?
         };

@@ -368,7 +368,7 @@ fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
 /// swap them with the least-recently-active visible peer that is NOT speaking.
 /// The loudest overflow speaker (most recent) gets priority.
 fn promote_speakers(
-    tiles: &mut Vec<String>,
+    tiles: &mut [String],
     visible_count: usize,
     speech_map: &HashMap<String, f64>,
     join_map: &HashMap<String, f64>,
@@ -389,31 +389,25 @@ fn promote_speakers(
 
     // Overflow tiles that are actively speaking (most recent first).
     let mut overflow_speakers: Vec<(usize, f64)> = Vec::new();
-    for i in visible_count..tiles.len() {
-        if let Some(&ts) = speech_map.get(&tiles[i]) {
+    for (i, peer) in tiles.iter().enumerate().skip(visible_count) {
+        if let Some(&ts) = speech_map.get(peer) {
             if now_ms - ts < active_ms {
                 overflow_speakers.push((i, ts));
             }
         }
     }
-    overflow_speakers.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    overflow_speakers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Visible non-speaking tiles as swap candidates (least recently active first).
     let mut swap_candidates: Vec<(usize, f64)> = (0..visible_count)
         .filter(|&i| {
             speech_map
                 .get(&tiles[i])
-                .map_or(true, |&ts| now_ms - ts >= active_ms)
+                .is_none_or(|&ts| now_ms - ts >= active_ms)
         })
         .map(|i| (i, eff_ts(&tiles[i])))
         .collect();
-    swap_candidates.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    swap_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Swap pairs — all indices are disjoint so order doesn't matter.
     let num_swaps = overflow_speakers.len().min(swap_candidates.len());
@@ -438,6 +432,7 @@ pub fn AttendantsComponent(
     #[props(default)] is_owner: bool,
     #[props(default)] is_guest: bool,
     #[props(default)] room_token: String,
+    #[props(default)] status_observer_token: String,
     #[props(default = true)] waiting_room_enabled: bool,
     #[props(default)] admitted_can_admit: bool,
     #[props(default = true)] end_on_host_leave: bool,
@@ -445,6 +440,8 @@ pub fn AttendantsComponent(
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
+    let meeting_id_for_settings_refresh = id.clone();
+    let status_observer_token_for_settings_refresh = status_observer_token.clone();
 
     // --- State signals ---
     let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
@@ -507,10 +504,10 @@ pub fn AttendantsComponent(
     let mut pinned_peer_id: Signal<Option<String>> = use_signal(|| None);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
-    let waiting_room_toggle = use_signal(move || waiting_room_enabled);
-    let admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
-    let end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
-    let allow_guests_toggle = use_signal(move || allow_guests);
+    let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
+    let mut end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
+    let mut allow_guests_toggle = use_signal(move || allow_guests);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
@@ -732,6 +729,46 @@ pub fn AttendantsComponent(
                 log::info!("Waiting room updated push received");
                 let mut v = waiting_room_version;
                 v.set(v() + 1);
+            })),
+            on_meeting_settings_updated: Some(VcCallback::from(move |_| {
+                log::info!("Meeting settings updated push received");
+
+                let meeting_id = meeting_id_for_settings_refresh.clone();
+                let observer_token = status_observer_token_for_settings_refresh.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match crate::meeting_api::fetch_participant_status(
+                        &meeting_id,
+                        &observer_token,
+                        is_guest,
+                    )
+                    .await
+                    {
+                        Ok(status) => {
+                            let waiting_room_enabled = status.waiting_room_enabled.unwrap_or(true);
+                            if waiting_room_toggle() != waiting_room_enabled {
+                                waiting_room_toggle.set(waiting_room_enabled);
+                            }
+
+                            let admitted_can_admit = status.admitted_can_admit.unwrap_or(false);
+                            if admitted_can_admit_toggle() != admitted_can_admit {
+                                admitted_can_admit_toggle.set(admitted_can_admit);
+                            }
+
+                            let end_on_host_leave = status.end_on_host_leave.unwrap_or(true);
+                            if end_on_host_leave_toggle() != end_on_host_leave {
+                                end_on_host_leave_toggle.set(end_on_host_leave);
+                            }
+
+                            let allow_guests = status.allow_guests.unwrap_or(false);
+                            if allow_guests_toggle() != allow_guests {
+                                allow_guests_toggle.set(allow_guests);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to refresh meeting settings after push update: {e}");
+                        }
+                    }
+                });
             })),
             on_peer_left: {
                 Some(VcCallback::from(
@@ -1146,7 +1183,6 @@ pub fn AttendantsComponent(
         .into_iter()
         .filter(|session_id| *session_id != own_session)
         .collect();
-    let display_peers = display_peers;
     // Assign synthetic join times to mock peers for local testing.
     // Real peers get their join time recorded in the on_peer_added callback
     // (not during render) to avoid signal-writes-during-render loops.
@@ -1204,7 +1240,7 @@ pub fn AttendantsComponent(
             .filter(|p| {
                 speech_map
                     .get(*p)
-                    .map_or(false, |&ts| now_ms - ts < SPEAKER_ACTIVE_MS)
+                    .is_some_and(|&ts| now_ms - ts < SPEAKER_ACTIVE_MS)
             })
             .count()
     };
@@ -1384,7 +1420,7 @@ pub fn AttendantsComponent(
     const SS_GRID_GAP: f64 = 8.0;
     const SS_BOTTOM_PAD: f64 = 80.0;
     const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
-    // Right panel content width ≈ (vw - outer_horiz_pad - panel_gap) / 3 - grid_pad
+                                   // Right panel content width ≈ (vw - outer_horiz_pad - panel_gap) / 3 - grid_pad
     let ss_panel_width = ((vw - 42.0) / 3.0 - 12.0).max(100.0);
     let ss_tile_w = (ss_panel_width - SS_GRID_GAP) / SS_COLS;
     let ss_tile_h = ss_tile_w / (16.0 / 9.0);
@@ -2166,7 +2202,7 @@ pub fn AttendantsComponent(
                 }
 
                 // Waiting room controls (host or admitted participants when allowed)
-                if is_owner || admitted_can_admit {
+                if is_owner || admitted_can_admit_toggle() {
                     HostControls {
                         meeting_id: id.clone(),
                         is_admitted: true,

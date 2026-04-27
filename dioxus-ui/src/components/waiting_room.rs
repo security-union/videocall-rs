@@ -222,6 +222,7 @@ pub fn WaitingRoom(
                     }
                 })),
                 on_waiting_room_updated: None,
+                on_meeting_settings_updated: None,
                 on_speaking_changed: None,
                 on_audio_level_changed: None,
                 vad_threshold: None,

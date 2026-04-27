@@ -32,6 +32,7 @@ use videocall_meeting_types::{
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
+use crate::nats_events;
 use crate::state::AppState;
 
 const MAX_ATTENDEES: usize = 100;
@@ -349,11 +350,12 @@ pub async fn update_meeting(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
-    let row = if body.waiting_room_enabled.is_some()
+    let settings_updated = body.waiting_room_enabled.is_some()
         || body.admitted_can_admit.is_some()
         || body.end_on_host_leave.is_some()
-        || body.allow_guests.is_some()
-    {
+        || body.allow_guests.is_some();
+
+    let row = if settings_updated {
         // Atomically update both settings within a single transaction.
         // The UPDATE … WHERE creator_id = $2 folds in the ownership check,
         // so we only fetch separately on failure to distinguish 404 vs 403.
@@ -392,6 +394,10 @@ pub async fn update_meeting(
     // Fire-and-forget push of the updated settings so search results reflect
     // the new waiting-room / admitted_can_admit state quickly.
     search::spawn_repush(&state, row.id, row.room_id.clone());
+
+    if settings_updated {
+        nats_events::publish_meeting_settings_updated(state.nats.as_ref(), &row.room_id).await;
+    }
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));

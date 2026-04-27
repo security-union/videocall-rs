@@ -1,3 +1,4 @@
+import path from "node:path";
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
@@ -10,18 +11,20 @@ import { waitForServices } from "../helpers/wait-for-services";
  *    host self-view: `#host-controls-nav`)
  * - Inline `box-shadow` + `transition` via `speak_style()` on the same element
  *
- * Since Playwright uses `--use-fake-device-for-media-stream`, no real audio is
- * produced, so all participants remain in the "silent" state.  Tests verify
- * the **silent baseline** (no glow, correct transition, no speaking class) and
- * structural correctness of the elements that would receive glow.
+ * Most tests still exercise the silent baseline. Two targeted regressions now
+ * use richer fixtures:
+ * - a real WAV fixture for fake microphone input so remote speaking can be observed
+ * - a synthetic `getDisplayMedia()` shim so host screen share can start without
+ *   the native picker
  *
- * Screen-share glow suppression cannot be fully automated because
- * `getDisplayMedia()` opens a system picker that Playwright cannot drive.
- * Pinned-peer suppression requires a speaking peer to observe the glow
- * difference.  Both are documented inline with best-effort structural checks.
+ * Pinned-peer suppression still depends on a broader speaking matrix than this
+ * file currently drives, so that slice remains documented with structural
+ * checks plus Rust-level unit coverage.
  */
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
+const DEFAULT_TILE_BORDER_COLOR = "rgba(100, 100, 100, 0.30)";
+const SPEAKING_AUDIO_FIXTURE = path.resolve(__dirname, "../../dioxus-ui/assets/hi.wav");
 
 const BROWSER_ARGS = [
   "--ignore-certificate-errors",
@@ -30,6 +33,62 @@ const BROWSER_ARGS = [
   "--use-fake-ui-for-media-stream",
   "--disable-gpu",
 ];
+
+function browserArgs(fakeAudioFile?: string) {
+  if (!fakeAudioFile) {
+    return [...BROWSER_ARGS];
+  }
+
+  return [...BROWSER_ARGS, `--use-file-for-fake-audio-capture=${fakeAudioFile}`];
+}
+
+async function installSyntheticDisplayCapture(page: Page) {
+  await page.addInitScript(() => {
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices) {
+      return;
+    }
+
+    const createSyntheticDisplayStream = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1280;
+      canvas.height = 720;
+
+      const context = canvas.getContext("2d");
+      if (!context) {
+        throw new Error("2D canvas context unavailable for synthetic display capture");
+      }
+
+      let frame = 0;
+      const paint = () => {
+        frame += 1;
+        context.fillStyle = "#0b1220";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+
+        context.fillStyle = "#4fd1c5";
+        context.fillRect(80 + (frame % 320), 120, 280, 160);
+
+        context.fillStyle = "#f8fafc";
+        context.font = "bold 64px sans-serif";
+        context.fillText("Synthetic screen share", 80, 420);
+
+        context.fillStyle = "#94a3b8";
+        context.font = "32px sans-serif";
+        context.fillText(`frame ${frame}`, 80, 480);
+
+        requestAnimationFrame(paint);
+      };
+
+      paint();
+      return canvas.captureStream(12);
+    };
+
+    Object.defineProperty(mediaDevices, "getDisplayMedia", {
+      configurable: true,
+      value: async () => createSyntheticDisplayStream(),
+    });
+  });
+}
 
 async function createAuthenticatedContext(
   browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
@@ -72,6 +131,21 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
     timeout: 10_000,
   });
   await page.waitForTimeout(1500);
+}
+
+async function ensureMicrophoneEnabled(page: Page) {
+  const unmuteButton = page.getByRole("button", { name: "Unmute" });
+  if (await unmuteButton.count()) {
+    await unmuteButton.first().click();
+    await page.waitForTimeout(1_000);
+  }
+}
+
+async function muteMicrophone(page: Page) {
+  const muteButton = page.getByRole("button", { name: "Mute" });
+  await expect(muteButton.first()).toBeVisible({ timeout: 10_000 });
+  await muteButton.first().click();
+  await page.waitForTimeout(1_000);
 }
 
 async function joinMeetingFromPage(
@@ -145,9 +219,19 @@ async function setupTwoUserMeeting(
   meetingId: string,
   hostName: string,
   guestName: string,
+  options?: {
+    hostFakeAudioFile?: string;
+    guestFakeAudioFile?: string;
+    prepareHostPage?: (page: Page) => Promise<void>;
+    prepareGuestPage?: (page: Page) => Promise<void>;
+  },
 ) {
-  const browser1 = await chromium.launch({ args: BROWSER_ARGS });
-  const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+  const browser1 = await chromium.launch({
+    args: browserArgs(options?.hostFakeAudioFile),
+  });
+  const browser2 = await chromium.launch({
+    args: browserArgs(options?.guestFakeAudioFile),
+  });
 
   const hostCtx = await createAuthenticatedContext(
     browser1,
@@ -165,6 +249,13 @@ async function setupTwoUserMeeting(
   const hostPage = await hostCtx.newPage();
   const guestPage = await guestCtx.newPage();
 
+  if (options?.prepareHostPage) {
+    await options.prepareHostPage(hostPage);
+  }
+  if (options?.prepareGuestPage) {
+    await options.prepareGuestPage(guestPage);
+  }
+
   await navigateToMeeting(hostPage, meetingId, hostName);
   const hostResult = await joinMeetingFromPage(hostPage);
   expect(hostResult).toBe("in-meeting");
@@ -178,6 +269,29 @@ async function setupTwoUserMeeting(
   await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
 
   return { hostPage, guestPage, browser1, browser2 };
+}
+
+async function waitForTileToSpeak(page: Page) {
+  // Works in both grid layout (.grid-item) and split layout (.split-peer-tile)
+  const peerTile = page.locator(".split-peer-tile, #grid-container .grid-item").first();
+  await expect(peerTile).toBeVisible({ timeout: 30_000 });
+
+  await expect
+    .poll(
+      async () => {
+        const className = (await peerTile.getAttribute("class")) || "";
+        const style = (await peerTile.getAttribute("style")) || "";
+        const hasExplicitGlow = style.includes("box-shadow") && !style.includes("box-shadow: none");
+        return className.includes("speaking-tile") || hasExplicitGlow;
+      },
+      {
+        timeout: 30_000,
+        message: "expected peer tile to enter the speaking-highlight state",
+      },
+    )
+    .toBe(true);
+
+  return peerTile;
 }
 
 test.describe("Speaker highlight glow on video tiles", () => {
@@ -216,6 +330,54 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const tileStyle = await outerTile.getAttribute("style");
       expect(tileStyle).toBeTruthy();
       expect(tileStyle).toContain("box-shadow: none");
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("remote participant border resets to the default color after they stop speaking", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(150_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_glow_reset_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "ResetHost",
+      "ResetGuest",
+      {
+        guestFakeAudioFile: SPEAKING_AUDIO_FIXTURE,
+      },
+    );
+
+    try {
+      await ensureMicrophoneEnabled(guestPage);
+
+      const peerTile = await waitForTileToSpeak(hostPage);
+
+      await muteMicrophone(guestPage);
+
+      await expect
+        .poll(
+          async () => ({
+            className: (await peerTile.getAttribute("class")) || "",
+            style: (await peerTile.getAttribute("style")) || "",
+          }),
+          {
+            timeout: 30_000,
+            message: "expected remote peer highlight to clear after speech stops",
+          },
+        )
+        .toMatchObject({
+          className: expect.not.stringContaining("speaking-tile"),
+          style: expect.stringContaining(`border-color: ${DEFAULT_TILE_BORDER_COLOR}`),
+        });
+
+      const clearedStyle = (await peerTile.getAttribute("style")) || "";
+      expect(clearedStyle).toContain("box-shadow: none");
     } finally {
       await browser1.close();
       await browser2.close();
@@ -327,21 +489,22 @@ test.describe("Speaker highlight glow on video tiles", () => {
   // ──────────────────────────────────────────────────────────────────────
   // 4. Screen-share tiles — no glow
   //
-  // LIMITATION: Cannot be fully automated. getDisplayMedia() opens a
-  // system-level picker that Playwright cannot drive. However, the code
-  // path is verified here structurally:
+  // The generic no-screen-share baseline is still covered structurally below.
+  // For the host-speaking-while-screen-sharing regression, this file now also
+  // includes a synthetic `getDisplayMedia()` path that can drive the split
+  // layout without the native OS picker.
+  //
+  // Screen-share tiles themselves should still never receive speaking glow:
   //   - In the grid layout, screen-share tiles are rendered inside a
   //     separate `.grid-item` div WITHOUT speaking-tile or box-shadow.
   //   - In the split layout (TileMode::ScreenOnly), the screen share
   //     renders inside a `.split-screen-tile` div with NO glow props.
-  //   - The Rust source (`canvas_generator.rs` line 216) sets
-  //     `is_suppressed = true` when `is_screen_share_enabled_for_peer`
-  //     is true, which forces `visible_audio_level = 0` and removes the
-  //     `.speaking-tile` class.
+  //   - The Rust source (`canvas_generator.rs`) suppresses glow for the
+  //     screen-share canvas while leaving the speaker's participant tile
+  //     eligible for highlight.
   //
-  // The test below verifies that in a normal (no-screen-share) meeting
-  // the grid-item tiles do NOT have screen-share glow artifacts or stale
-  // split-screen-tile elements.
+  // The baseline test below verifies that in a normal (no-screen-share)
+  // meeting the grid-item tiles do NOT have stale split-layout artifacts.
   // ──────────────────────────────────────────────────────────────────────
   test("grid-item tiles in a normal meeting have no stale screen-share glow artifacts", async ({
     baseURL,
@@ -373,6 +536,44 @@ test.describe("Speaker highlight glow on video tiles", () => {
 
       const cls = await outerTile.getAttribute("class");
       expect(cls).not.toContain("speaking-tile");
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("host remains highlighted for other participants while screen sharing", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_glow_host_ss_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "ScreenHost",
+      "ScreenGuest",
+      {
+        hostFakeAudioFile: SPEAKING_AUDIO_FIXTURE,
+        prepareHostPage: installSyntheticDisplayCapture,
+      },
+    );
+
+    try {
+      await ensureMicrophoneEnabled(hostPage);
+
+      await hostPage.getByRole("button", { name: "Share Screen" }).click();
+
+      await expect(guestPage.locator(".split-screen-tile")).toBeVisible({ timeout: 30_000 });
+      await expect(guestPage.locator(".screen-share-resize-handle")).toBeVisible({
+        timeout: 30_000,
+      });
+
+      const hostParticipantTile = await waitForTileToSpeak(guestPage);
+      const highlightedStyle = (await hostParticipantTile.getAttribute("style")) || "";
+
+      expect(highlightedStyle).not.toContain(`border-color: ${DEFAULT_TILE_BORDER_COLOR}`);
     } finally {
       await browser1.close();
       await browser2.close();

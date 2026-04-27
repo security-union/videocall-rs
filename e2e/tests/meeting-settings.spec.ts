@@ -1,4 +1,4 @@
-import { test, expect, Page, chromium } from "@playwright/test";
+import { test, expect, Page, chromium, Locator } from "@playwright/test";
 import { injectSessionCookie, generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -312,11 +312,7 @@ async function hostJoinAndConfigureEohl(
 /**
  * Join as a guest, handling the waiting room if present.
  */
-async function guestJoinMeeting(
-  guestPage: Page,
-  hostPage: Page,
-  meetingId: string,
-): Promise<void> {
+async function guestJoinMeeting(guestPage: Page, hostPage: Page, meetingId: string): Promise<void> {
   await guestPage.goto("/");
   await guestPage.waitForTimeout(1500);
 
@@ -466,6 +462,190 @@ test.describe("Meeting settings – End meeting when host leaves lifecycle", () 
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+});
+
+async function navigateToMeetingFromHome(
+  page: Page,
+  meetingId: string,
+  username: string,
+): Promise<void> {
+  await page.goto("/");
+  await expect(page.locator("#meeting-id")).toBeVisible({ timeout: 20_000 });
+
+  await page.locator("#meeting-id").click();
+  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+  await page.locator("#username").click();
+  await page.locator("#username").fill("");
+  await page.locator("#username").pressSequentially(username, { delay: 50 });
+  await page.locator("#username").press("Enter");
+  await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+  await expect(page.getByText(/Start Meeting|Join Meeting|Waiting to be admitted/)).toBeVisible({
+    timeout: 20_000,
+  });
+}
+
+async function joinMeetingWhenReady(page: Page): Promise<"in-meeting" | "waiting"> {
+  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const waitingRoom = page.getByText("Waiting to be admitted");
+
+  const result = await Promise.race([
+    joinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
+    waitingRoom.waitFor({ timeout: 20_000 }).then(() => "waiting" as const),
+  ]);
+
+  if (result === "waiting") {
+    return "waiting";
+  }
+
+  const grid = page.locator("#grid-container");
+  if (!(await grid.isVisible())) {
+    try {
+      await joinButton.click({ timeout: 5_000 });
+    } catch (error) {
+      if (!(await grid.isVisible())) {
+        throw error;
+      }
+    }
+  }
+  await expect(grid).toBeVisible({ timeout: 15_000 });
+  return "in-meeting";
+}
+
+function settingsToggle(page: Page, label: string) {
+  return page
+    .locator(".settings-option-row")
+    .filter({ hasText: label })
+    .locator('button[role="switch"]');
+}
+
+async function ensureJoinedFromTransition(joinButton: Locator, grid: Locator): Promise<void> {
+  if (!(await grid.isVisible())) {
+    try {
+      await joinButton.click({ timeout: 5_000 });
+    } catch (error) {
+      if (!(await grid.isVisible())) {
+        throw error;
+      }
+    }
+  }
+  await expect(grid).toBeVisible({ timeout: 15_000 });
+}
+
+test.describe("Meeting settings – admitted_can_admit live propagation", () => {
+  test.describe.configure({ timeout: 240_000 });
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test("host toggles Participants can admit others mid-meeting and admitted participant gains controls live", async ({
+    baseURL,
+  }) => {
+    test.skip(!baseURL?.includes("3001"), "Meeting settings tests are Dioxus-only");
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_aca_live_${Date.now()}`;
+
+    const hostBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const participantBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const waitingGuestBrowser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        hostBrowser,
+        "aca-live-host@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
+      const participantCtx = await createAuthenticatedContext(
+        participantBrowser,
+        "aca-live-participant@videocall.rs",
+        "ParticipantUser",
+        uiURL,
+      );
+      const waitingGuestCtx = await createAuthenticatedContext(
+        waitingGuestBrowser,
+        "aca-live-waiting@videocall.rs",
+        "WaitingUser",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const participantPage = await participantCtx.newPage();
+      const waitingGuestPage = await waitingGuestCtx.newPage();
+
+      // Host starts the meeting.
+      await navigateToMeetingFromHome(hostPage, meetingId, "HostUser");
+      await expect(joinMeetingWhenReady(hostPage)).resolves.toBe("in-meeting");
+
+      // Admitted participant joins and is admitted by host.
+      await navigateToMeetingFromHome(participantPage, meetingId, "ParticipantUser");
+      const participantJoinState = await joinMeetingWhenReady(participantPage);
+      if (participantJoinState === "waiting") {
+        const hostAdmitParticipant = hostPage.getByTitle("Admit").first();
+        await expect(hostAdmitParticipant).toBeVisible({ timeout: 20_000 });
+        await hostAdmitParticipant.dispatchEvent("click");
+
+        const participantJoinButton = participantPage.getByText(/Start Meeting|Join Meeting/);
+        const participantGrid = participantPage.locator("#grid-container");
+        const participantTransition = await Promise.race([
+          participantJoinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
+          participantGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
+        ]);
+
+        if (participantTransition === "join") {
+          await ensureJoinedFromTransition(participantJoinButton, participantGrid);
+        }
+      }
+
+      await expect(participantPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Another user joins and remains in waiting room.
+      await navigateToMeetingFromHome(waitingGuestPage, meetingId, "WaitingUser");
+      await expect(joinMeetingWhenReady(waitingGuestPage)).resolves.toBe("waiting");
+      await expect(waitingGuestPage.getByText("Waiting to be admitted")).toBeVisible({
+        timeout: 10_000,
+      });
+
+      // With admitted_can_admit OFF, admitted participant should not have attendant controls.
+      const participantAdmitButton = participantPage.getByTitle("Admit").first();
+      await expect(participantAdmitButton).not.toBeVisible({ timeout: 5_000 });
+
+      // Host toggles admitted_can_admit ON mid-meeting.
+      await hostPage.goto(`/meeting/${meetingId}/settings`);
+      await expect(hostPage.getByText("Options")).toBeVisible({ timeout: 10_000 });
+      const admittedCanAdmitToggle = settingsToggle(hostPage, "Participants can admit others");
+      await expect(admittedCanAdmitToggle).toHaveAttribute("aria-checked", "false", {
+        timeout: 5_000,
+      });
+      await admittedCanAdmitToggle.click();
+      await expect(admittedCanAdmitToggle).toHaveAttribute("aria-checked", "true", {
+        timeout: 5_000,
+      });
+
+      // Participant page should update live without reload and show attendant control.
+      await expect(participantAdmitButton).toBeVisible({ timeout: 20_000 });
+
+      // Server remains source of truth: participant can now admit the waiting user.
+      await participantAdmitButton.dispatchEvent("click");
+
+      const waitingGuestJoinButton = waitingGuestPage.getByText(/Start Meeting|Join Meeting/);
+      const waitingGuestGrid = waitingGuestPage.locator("#grid-container");
+      const waitingGuestTransition = await Promise.race([
+        waitingGuestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
+        waitingGuestGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
+      ]);
+
+      if (waitingGuestTransition === "join") {
+        await ensureJoinedFromTransition(waitingGuestJoinButton, waitingGuestGrid);
+      }
+
+      await expect(waitingGuestPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    } finally {
+      await hostBrowser.close();
+      await participantBrowser.close();
+      await waitingGuestBrowser.close();
     }
   });
 });

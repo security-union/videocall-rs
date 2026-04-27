@@ -136,6 +136,9 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when the waiting room participant list changes (optional)
     pub on_waiting_room_updated: Option<Callback<()>>,
 
+    /// Callback triggered when meeting settings are updated (optional)
+    pub on_meeting_settings_updated: Option<Callback<()>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
     pub on_peer_left: Option<Callback<(String, String)>>,
@@ -175,6 +178,7 @@ struct InnerOptions {
     on_participant_admitted: Option<Callback<()>>,
     on_participant_rejected: Option<Callback<()>>,
     on_waiting_room_updated: Option<Callback<()>>,
+    on_meeting_settings_updated: Option<Callback<()>>,
     on_peer_left: Option<Callback<(String, String)>>,
     on_peer_joined: Option<Callback<(String, String)>>,
     on_display_name_changed: Option<Callback<(String, String)>>,
@@ -324,6 +328,7 @@ impl VideoCallClient {
                     on_participant_admitted: options.on_participant_admitted.clone(),
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
+                    on_meeting_settings_updated: options.on_meeting_settings_updated.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -1585,6 +1590,15 @@ impl Inner {
                                 meeting_packet.room_id
                             );
                             if let Some(callback) = &self.options.on_waiting_room_updated {
+                                callback.emit(());
+                            }
+                        }
+                        Ok(MeetingEventType::MEETING_SETTINGS_UPDATED) => {
+                            info!(
+                                "Received MEETING_SETTINGS_UPDATED: room={}",
+                                meeting_packet.room_id
+                            );
+                            if let Some(callback) = &self.options.on_meeting_settings_updated {
                                 callback.emit(());
                             }
                         }

@@ -69,6 +69,31 @@ pub enum ScreenShareState {
     Active,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockPosition {
+    Bottom,
+    Left,
+    Right,
+}
+
+impl DockPosition {
+    fn css_class(self) -> &'static str {
+        match self {
+            DockPosition::Bottom => "dock-bottom",
+            DockPosition::Left => "dock-left",
+            DockPosition::Right => "dock-right",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            DockPosition::Bottom => DockPosition::Left,
+            DockPosition::Left => DockPosition::Right,
+            DockPosition::Right => DockPosition::Bottom,
+        }
+    }
+}
+
 pub enum MediaErrorState {
     NoDevice,
     PermissionDenied,
@@ -369,7 +394,7 @@ fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
 /// swap them with the least-recently-active visible peer that is NOT speaking.
 /// The loudest overflow speaker (most recent) gets priority.
 fn promote_speakers(
-    tiles: &mut Vec<String>,
+    tiles: &mut [String],
     visible_count: usize,
     speech_map: &HashMap<String, f64>,
     join_map: &HashMap<String, f64>,
@@ -390,8 +415,8 @@ fn promote_speakers(
 
     // Overflow tiles that are actively speaking (most recent first).
     let mut overflow_speakers: Vec<(usize, f64)> = Vec::new();
-    for i in visible_count..tiles.len() {
-        if let Some(&ts) = speech_map.get(&tiles[i]) {
+    for (i, peer) in tiles.iter().enumerate().skip(visible_count) {
+        if let Some(&ts) = speech_map.get(peer) {
             if now_ms - ts < active_ms {
                 overflow_speakers.push((i, ts));
             }
@@ -404,7 +429,7 @@ fn promote_speakers(
         .filter(|&i| {
             speech_map
                 .get(&tiles[i])
-                .map_or(true, |&ts| now_ms - ts >= active_ms)
+                .is_none_or(|&ts| now_ms - ts >= active_ms)
         })
         .map(|i| (i, eff_ts(&tiles[i])))
         .collect();
@@ -433,6 +458,7 @@ pub fn AttendantsComponent(
     #[props(default)] is_owner: bool,
     #[props(default)] is_guest: bool,
     #[props(default)] room_token: String,
+    #[props(default)] status_observer_token: String,
     #[props(default = true)] waiting_room_enabled: bool,
     #[props(default)] admitted_can_admit: bool,
     #[props(default = true)] end_on_host_leave: bool,
@@ -440,6 +466,8 @@ pub fn AttendantsComponent(
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
+    let meeting_id_for_settings_refresh = id.clone();
+    let status_observer_token_for_settings_refresh = status_observer_token.clone();
 
     // --- State signals ---
     let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
@@ -449,6 +477,10 @@ pub fn AttendantsComponent(
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
     let mut mock_peers_open = use_signal(|| false);
+    let mut controls_visible = use_signal(|| true);
+    let mut controls_expanded = use_signal(|| true);
+    let mut dock_position: Signal<DockPosition> = use_signal(|| DockPosition::Bottom);
+    let mut dock_menu_open = use_signal(|| false);
     let encoder_settings = use_signal(|| None::<String>);
     let mut debug_peer_count = use_signal(|| 0u32);
     // Per-peer speech priority: session_id → last-spoke timestamp (ms).
@@ -474,6 +506,121 @@ pub fn AttendantsComponent(
         // Runs once (use_hook), so no accumulation on re-renders.
         cb.forget();
     });
+
+    // Dock-style auto-hide: narrow after 1s, hide after 4s of inactivity.
+    use_hook(move || {
+        let win = window();
+        // Two timer handles: one for narrowing (1s), one for hiding (4s).
+        let narrow_timer: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+        let hide_timer: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+
+        // mousemove listener
+        let nt1 = narrow_timer.clone();
+        let ht1 = hide_timer.clone();
+        let win1 = win.clone();
+        let mouse_cb = Closure::<dyn FnMut()>::new(move || {
+            controls_visible.set(true);
+            controls_expanded.set(true);
+            // Clear existing timers
+            if let Some(id) = nt1.borrow_mut().take() {
+                win1.clear_timeout_with_handle(id);
+            }
+            if let Some(id) = ht1.borrow_mut().take() {
+                win1.clear_timeout_with_handle(id);
+            }
+            // Narrow after 1s
+            let nt_inner = nt1.clone();
+            let narrow_cb = Closure::<dyn FnMut()>::once(move || {
+                nt_inner.borrow_mut().take();
+                controls_expanded.set(false);
+            });
+            let id = win1
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    narrow_cb.as_ref().unchecked_ref(), 1_000,
+                ).unwrap_or(0);
+            nt1.borrow_mut().replace(id);
+            narrow_cb.forget();
+            // Hide after 4s
+            let ht_inner = ht1.clone();
+            let hide_cb = Closure::<dyn FnMut()>::once(move || {
+                ht_inner.borrow_mut().take();
+                controls_visible.set(false);
+            });
+            let id = win1
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    hide_cb.as_ref().unchecked_ref(), 4_000,
+                ).unwrap_or(0);
+            ht1.borrow_mut().replace(id);
+            hide_cb.forget();
+        });
+        let _ = win.add_event_listener_with_callback("mousemove", mouse_cb.as_ref().unchecked_ref());
+        mouse_cb.forget();
+
+        // touchstart listener
+        let nt2 = narrow_timer.clone();
+        let ht2 = hide_timer.clone();
+        let win2 = win.clone();
+        let touch_cb = Closure::<dyn FnMut()>::new(move || {
+            controls_visible.set(true);
+            controls_expanded.set(true);
+            if let Some(id) = nt2.borrow_mut().take() {
+                win2.clear_timeout_with_handle(id);
+            }
+            if let Some(id) = ht2.borrow_mut().take() {
+                win2.clear_timeout_with_handle(id);
+            }
+            let nt_inner = nt2.clone();
+            let narrow_cb = Closure::<dyn FnMut()>::once(move || {
+                nt_inner.borrow_mut().take();
+                controls_expanded.set(false);
+            });
+            let id = win2
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    narrow_cb.as_ref().unchecked_ref(), 1_000,
+                ).unwrap_or(0);
+            nt2.borrow_mut().replace(id);
+            narrow_cb.forget();
+            let ht_inner = ht2.clone();
+            let hide_cb = Closure::<dyn FnMut()>::once(move || {
+                ht_inner.borrow_mut().take();
+                controls_visible.set(false);
+            });
+            let id = win2
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    hide_cb.as_ref().unchecked_ref(), 4_000,
+                ).unwrap_or(0);
+            ht2.borrow_mut().replace(id);
+            hide_cb.forget();
+        });
+        let _ = win.add_event_listener_with_callback("touchstart", touch_cb.as_ref().unchecked_ref());
+        touch_cb.forget();
+
+        // Initial timers
+        let nt_init = narrow_timer.clone();
+        let narrow_init = Closure::<dyn FnMut()>::once(move || {
+            nt_init.borrow_mut().take();
+            controls_expanded.set(false);
+        });
+        let id = win
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                narrow_init.as_ref().unchecked_ref(), 1_000,
+            ).unwrap_or(0);
+        narrow_timer.borrow_mut().replace(id);
+        narrow_init.forget();
+
+        let ht_init = hide_timer.clone();
+        let hide_init = Closure::<dyn FnMut()>::once(move || {
+            ht_init.borrow_mut().take();
+            controls_visible.set(false);
+        });
+        let id = win
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                hide_init.as_ref().unchecked_ref(), 4_000,
+            ).unwrap_or(0);
+        hide_timer.borrow_mut().replace(id);
+        hide_init.forget();
+    });
+
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
@@ -500,12 +647,17 @@ pub fn AttendantsComponent(
     let local_speaking = use_signal(|| false);
     let local_audio_level = use_signal(|| 0.0f32);
     let mut pinned_peer_id: Signal<Option<String>> = use_signal(|| None);
+    // Screen-share to participants panel ratio. Default 0.667 gives a 2:1 split.
+    // Clamped to [0.3, 0.85] by the resize handle (screen share 30%–85% of width).
+    let mut screen_share_ratio: Signal<f64> = use_signal(|| 0.667);
+    // True while the user is actively dragging the resize handle.
+    let mut ss_resizing: Signal<bool> = use_signal(|| false);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
-    let waiting_room_toggle = use_signal(move || waiting_room_enabled);
-    let admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
-    let end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
-    let allow_guests_toggle = use_signal(move || allow_guests);
+    let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
+    let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
+    let mut end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
+    let mut allow_guests_toggle = use_signal(move || allow_guests);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
     let waiting_room_version = use_signal(|| 0u64);
@@ -727,6 +879,46 @@ pub fn AttendantsComponent(
                 log::info!("Waiting room updated push received");
                 let mut v = waiting_room_version;
                 v.set(v() + 1);
+            })),
+            on_meeting_settings_updated: Some(VcCallback::from(move |_| {
+                log::info!("Meeting settings updated push received");
+
+                let meeting_id = meeting_id_for_settings_refresh.clone();
+                let observer_token = status_observer_token_for_settings_refresh.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match crate::meeting_api::fetch_participant_status(
+                        &meeting_id,
+                        &observer_token,
+                        is_guest,
+                    )
+                    .await
+                    {
+                        Ok(status) => {
+                            let waiting_room_enabled = status.waiting_room_enabled.unwrap_or(true);
+                            if waiting_room_toggle() != waiting_room_enabled {
+                                waiting_room_toggle.set(waiting_room_enabled);
+                            }
+
+                            let admitted_can_admit = status.admitted_can_admit.unwrap_or(false);
+                            if admitted_can_admit_toggle() != admitted_can_admit {
+                                admitted_can_admit_toggle.set(admitted_can_admit);
+                            }
+
+                            let end_on_host_leave = status.end_on_host_leave.unwrap_or(true);
+                            if end_on_host_leave_toggle() != end_on_host_leave {
+                                end_on_host_leave_toggle.set(end_on_host_leave);
+                            }
+
+                            let allow_guests = status.allow_guests.unwrap_or(false);
+                            if allow_guests_toggle() != allow_guests {
+                                allow_guests_toggle.set(allow_guests);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to refresh meeting settings after push update: {e}");
+                        }
+                    }
+                });
             })),
             on_peer_left: {
                 Some(VcCallback::from(
@@ -1138,6 +1330,7 @@ pub fn AttendantsComponent(
         }
     });
 
+
     // Check for config errors
     use_effect(move || {
         if let Err(e) = crate::constants::app_config() {
@@ -1170,7 +1363,6 @@ pub fn AttendantsComponent(
         .into_iter()
         .filter(|session_id| *session_id != own_session)
         .collect();
-    let display_peers = display_peers;
     // Assign synthetic join times to mock peers for local testing.
     // Real peers get their join time recorded in the on_peer_added callback
     // (not during render) to avoid signal-writes-during-render loops.
@@ -1228,7 +1420,7 @@ pub fn AttendantsComponent(
             .filter(|p| {
                 speech_map
                     .get(*p)
-                    .map_or(false, |&ts| now_ms - ts < SPEAKER_ACTIVE_MS)
+                    .is_some_and(|&ts| now_ms - ts < SPEAKER_ACTIVE_MS)
             })
             .count()
     };
@@ -1404,17 +1596,27 @@ pub fn AttendantsComponent(
     //   - SS_GRID_PAD: padding inside the right panel div = 6px each side
     //   - SS_BOTTOM_PAD: padding-bottom (80px) from container_style
     //   - SS_TOP_PAD: padding-top (16px) + right panel padding (6px*2)
-    const SS_COLS: f64 = 2.0;
+    //
+    // Tile sizing: height is fixed to fit 4 tiles per column regardless of panel width.
+    // Column count collapses to 1 when right_ratio <= 0.25 or panel is too narrow.
+    // Actual tile width is controlled by the CSS grid (1fr columns), not computed here.
     const SS_GRID_GAP: f64 = 8.0;
     const SS_BOTTOM_PAD: f64 = 80.0;
     const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
-                                   // Right panel content width ≈ (vw - outer_horiz_pad - panel_gap) / 3 - grid_pad
-    let ss_panel_width = ((vw - 42.0) / 3.0 - 12.0).max(100.0);
-    let ss_tile_w = (ss_panel_width - SS_GRID_GAP) / SS_COLS;
-    let ss_tile_h = ss_tile_w / (16.0 / 9.0);
+    let right_ratio = 1.0 - screen_share_ratio();
+    let ss_panel_width = (right_ratio * (vw - 42.0) - 12.0).max(100.0); // ≈ right_ratio * (vw - outer_pad - gap) - grid_pad
+    let ss_cols = if right_ratio <= 0.25 || ss_panel_width < 180.0 {
+        1.0_f64 // single column
+    } else {
+        2.0_f64 // two columns
+    };
     let ss_avail_h = vh - SS_BOTTOM_PAD - SS_VERT_PAD;
-    let ss_max_rows = ((ss_avail_h + SS_GRID_GAP) / (ss_tile_h + SS_GRID_GAP)).floor() as usize;
-    let ss_max_tiles = (ss_max_rows * SS_COLS as usize).max(2);
+    // Tile height: always sized to fit exactly 4 tiles per column (independent of panel width resize).
+    let ss_tile_h = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0);
+    // Natural tile width at 16:9: ss_tile_h * 16.0 / 9.0 (actual width follows grid columns).
+    // Max rows is always 4 (height is sized for exactly 4 tiles per column).
+    let ss_max_rows = 4_usize;
+    let ss_max_tiles = ss_max_rows * ss_cols as usize;
 
     // Build a separate tile list for the screen-share right panel.
     // The grid's promotion used visible_tile_count which differs from the
@@ -1487,7 +1689,7 @@ pub fn AttendantsComponent(
     }
 
     let container_style = if has_screen_share {
-        // 2/3 screen-share panel on the left, 1/3 peer panel on the right
+        // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
         "position: absolute; inset: 0; width: 100%; height: 100%; \
          display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
          padding: 16px 16px 80px 16px; \
@@ -1508,7 +1710,7 @@ pub fn AttendantsComponent(
              padding: {pad_top:.0}px {pad_right:.0}px {pad_bottom:.0}px {pad_left:.0}px; \
              box-sizing: border-box; overflow: hidden; \
              flex-direction: unset; flex-wrap: unset; align-items: unset; \
-             width: auto; height: auto; \
+             width: 100%; height: 100%; \
              grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr); \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
         )
@@ -1727,69 +1929,120 @@ pub fn AttendantsComponent(
                 }
 
                 div { id: "grid-container", style: "{container_style}",
-
-                    if has_screen_share {
-                        // ---- Split layout: active screen share (left 2/3) + peer videos (right 1/3) ----
-                        // Left panel — ONLY the most recent (active) screen sharer
-                        div { style: "flex: 2; min-width: 0; height: 100%; display: flex; flex-direction: column; \
-                                    align-items: center; justify-content: center; overflow: hidden;",
-                            if let Some(ref active_peer) = active_screen_sharer {
-                                PeerTile {
-                                    key: "ss-active-{active_peer}",
-                                    peer_id: active_peer.clone(),
-                                    full_bleed: true,
-                                    host_user_id: host_user_id.clone(),
-                                    render_mode: TileMode::ScreenOnly,
-                                    my_peer_id: user_id.clone(),
-                                    pinned_peer_id: current_pinned.clone(),
-                                    on_toggle_pin: toggle_pin.clone(),
-                                }
-                            }
-                        }
-                        // Right panel — 2-column grid of compact peer tiles
-                        div {
-                            style: "flex: 1; min-width: 0; height: 100%; \
-                                    display: grid; grid-template-columns: 1fr 1fr; \
-                                    gap: 8px; padding: 6px; \
-                                    align-content: start; overflow: visible;",
-                            for tile_id in ss_tiles.iter() {
-                                {
-                                    let is_mock = tile_id.starts_with("mock-");
-                                    if is_mock {
-                                        rsx! {
-                                            PeerTile {
-                                                key: "tile-{tile_id}",
-                                                peer_id: tile_id.clone(),
-                                                full_bleed: false,
-                                                host_user_id: host_user_id.clone(),
-                                                render_mode: TileMode::VideoOnly,
-                                                my_peer_id: user_id.clone(),
-                                                on_toggle_pin: move |_: String| {},
-                                            }
-                                        }
-                                    } else {
-                                        rsx! {
-                                            PeerTile {
-                                                key: "tile-{tile_id}",
-                                                peer_id: tile_id.clone(),
-                                                full_bleed: false,
-                                                host_user_id: host_user_id.clone(),
-                                                render_mode: TileMode::VideoOnly,
-                                                my_peer_id: user_id.clone(),
-                                                pinned_peer_id: current_pinned.clone(),
-                                                on_toggle_pin: toggle_pin.clone(),
-                                            }
-                                        }
+                    onmousemove: move |evt| {
+                        if ss_resizing() {
+                            let native = evt.as_web_event();
+                            if let Some(target) = native.current_target() {
+                                use wasm_bindgen::JsCast;
+                                if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
+                                    let rect = el.get_bounding_client_rect();
+                                    let x = native.client_x() as f64 - rect.left();
+                                    let w = rect.width();
+                                    if w > 0.0 {
+                                        let ratio = (x / w).clamp(0.3, 0.85);
+                                        screen_share_ratio.set(ratio);
                                     }
                                 }
                             }
+                        }
+                    },
+                    onmouseup: move |evt: MouseEvent| {
+                        if ss_resizing() {
+                            evt.prevent_default();
+                            ss_resizing.set(false);
+                        }
+                    },
+                    onmouseleave: move |evt: MouseEvent| {
+                        if ss_resizing() {
+                            evt.prevent_default();
+                            ss_resizing.set(false);
+                        }
+                    },
 
-                            if ss_overflow_count > 0 {
+                    if has_screen_share {
+                        // ---- Split layout: active screen share (left) + peer videos (right) ----
+                        {
+                            let left_pct = screen_share_ratio() * 100.0;
+                            let right_pct = (1.0 - screen_share_ratio()) * 100.0 - 0.4; // account for handle
+                            let handle_class = if ss_resizing() {
+                                "screen-share-resize-handle dragging"
+                            } else {
+                                "screen-share-resize-handle"
+                            };
+                            rsx! {
+                                // Left panel — ONLY the most recent (active) screen sharer
+                                div { style: "width: {left_pct:.2}%; min-width: 0; height: 100%; display: flex; flex-direction: column; \
+                                            align-items: center; justify-content: center; overflow: hidden;",
+                                    if let Some(ref active_peer) = active_screen_sharer {
+                                        PeerTile {
+                                            key: "ss-active-{active_peer}",
+                                            peer_id: active_peer.clone(),
+                                            full_bleed: true,
+                                            host_user_id: host_user_id.clone(),
+                                            render_mode: TileMode::ScreenOnly,
+                                            my_peer_id: user_id.clone(),
+                                            pinned_peer_id: current_pinned.clone(),
+                                            on_toggle_pin: toggle_pin.clone(),
+                                        }
+                                    }
+                                }
+                                // Resize handle
                                 div {
-                                    class: "grid-overflow-badge",
-                                    style: "aspect-ratio: 16 / 9;",
-                                    "+{ss_overflow_count}"
-                                    span { "more in meeting" }
+                                    class: "{handle_class}",
+                                    onmousedown: move |evt| {
+                                        evt.prevent_default();
+                                        ss_resizing.set(true);
+                                    },
+                                }
+                                // Right panel — 1 or 2-column grid of compact peer tiles
+                                div {
+                                    style: {
+                                        let grid_cols = if ss_cols > 1.0 { "1fr 1fr" } else { "1fr" };
+                                        format!("width: {right_pct:.2}%; min-width: 0; height: 100%; \
+                                                display: grid; grid-template-columns: {grid_cols}; \
+                                                grid-auto-rows: {ss_tile_h:.0}px; \
+                                                gap: 8px; padding: 6px; \
+                                                align-content: start; overflow: visible;")
+                                    },
+                                    for tile_id in ss_tiles.iter() {
+                                        {
+                                            let is_mock = tile_id.starts_with("mock-");
+                                            if is_mock {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_peer_id: user_id.clone(),
+                                                        on_toggle_pin: move |_: String| {},
+                                                    }
+                                                }
+                                            } else {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_peer_id: user_id.clone(),
+                                                        pinned_peer_id: current_pinned.clone(),
+                                                        on_toggle_pin: toggle_pin.clone(),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if ss_overflow_count > 0 {
+                                        div {
+                                            class: "grid-overflow-badge",
+                                            "+{ss_overflow_count}"
+                                            span { "more in meeting" }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1915,7 +2168,14 @@ pub fn AttendantsComponent(
                                 }
                             },
                             div { class: "controls",
-                                nav { class: "video-controls-container",
+                                nav {
+                                    class: {
+                                        let pos = dock_position().css_class();
+                                        let hidden = if controls_visible() { "" } else { " controls-hidden" };
+                                        let expanded = if controls_expanded() { " controls-expanded" } else { "" };
+                                        format!("video-controls-container {pos}{hidden}{expanded}")
+                                    },
+                                    // Primary: Mic button - always visible
                                     {
                                         let mda_mic = mda.clone();
                                         rsx! {
@@ -1937,6 +2197,7 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+                                    // Primary: Camera button - always visible
                                     {
                                         let mda_cam = mda.clone();
                                         rsx! {
@@ -1970,69 +2231,140 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
-                                    if !is_ios() {
-                                        {
-                                            let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                            let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting);
-                                            rsx! {
-                                                ScreenShareButton {
-                                                    active: is_active,
-                                                    disabled: is_disabled,
-                                                    onclick: move |_| {
-                                                        if matches!(screen_share_state(), ScreenShareState::Idle) {
-                                                            screen_share_state.set(ScreenShareState::Requesting);
-                                                        } else {
-                                                            screen_share_state.set(ScreenShareState::Idle);
-                                                        }
-                                                    },
+                                    // (в) Secondary buttons — hidden by default, expand on hover
+                                    div { class: "controls-secondary",
+                                        if !is_ios() {
+                                            {
+                                                let is_active = matches!(screen_share_state(), ScreenShareState::Active);
+                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting);
+                                                rsx! {
+                                                    ScreenShareButton {
+                                                        active: is_active,
+                                                        disabled: is_disabled,
+                                                        onclick: move |_| {
+                                                            if matches!(screen_share_state(), ScreenShareState::Idle) {
+                                                                screen_share_state.set(ScreenShareState::Requesting);
+                                                            } else {
+                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                            }
+                                                        },
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    PeerListButton {
-                                        open: peer_list_open(),
-                                        onclick: move |_| {
-                                            peer_list_open.set(!peer_list_open());
-                                            if peer_list_open() {
-                                                diagnostics_open.set(false);
-                                            }
-                                        },
-                                    }
-                                    if show_density_selector && !has_screen_share {
-                                        DensityModeButton {
-                                            label: density_mode().label().to_string(),
-                                            open: density_open(),
+                                        PeerListButton {
+                                            open: peer_list_open(),
                                             onclick: move |_| {
-                                                density_open.set(!density_open());
+                                                peer_list_open.set(!peer_list_open());
+                                                if peer_list_open() {
+                                                    diagnostics_open.set(false);
+                                                }
+                                            },
+                                        }
+                                        if show_density_selector && !has_screen_share {
+                                            DensityModeButton {
+                                                label: density_mode().label().to_string(),
+                                                open: density_open(),
+                                                onclick: move |_| {
+                                                    density_open.set(!density_open());
+                                                },
+                                            }
+                                        }
+                                        if mock_peers_enabled() {
+                                            MockPeersButton {
+                                                open: mock_peers_open(),
+                                                onclick: move |_| {
+                                                    mock_peers_open.set(!mock_peers_open());
+                                                },
+                                            }
+                                        }
+                                        DiagnosticsButton {
+                                            open: diagnostics_open(),
+                                            onclick: move |_| {
+                                                diagnostics_open.set(!diagnostics_open());
+                                                if diagnostics_open() {
+                                                    peer_list_open.set(false);
+                                                }
+                                            },
+                                        }
+                                        DeviceSettingsButton {
+                                            open: device_settings_open(),
+                                            onclick: move |_| {
+                                                device_settings_open.set(!device_settings_open());
+                                                if device_settings_open() {
+                                                    peer_list_open.set(false);
+                                                    diagnostics_open.set(false);
+                                                }
                                             },
                                         }
                                     }
-                                    if mock_peers_enabled() {
-                                        MockPeersButton {
-                                            open: mock_peers_open(),
-                                            onclick: move |_| {
-                                                mock_peers_open.set(!mock_peers_open());
-                                            },
+                                    // (а) Dock position dropdown — glass-select style
+                                    div { class: "dock-position-wrapper",
+                                        div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
+                                            button {
+                                                class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
+                                                title: "Dock position",
+                                                r#type: "button",
+                                                "aria-haspopup": "listbox",
+                                                "aria-expanded": if dock_menu_open() { "true" } else { "false" },
+                                                onclick: move |e| {
+                                                    e.stop_propagation();
+                                                    dock_menu_open.set(!dock_menu_open());
+                                                },
+                                                svg {
+                                                    xmlns: "http://www.w3.org/2000/svg",
+                                                    width: "20",
+                                                    height: "20",
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    rect { x: "3", y: "3", width: "7", height: "7" }
+                                                    rect { x: "14", y: "3", width: "7", height: "7" }
+                                                    rect { x: "3", y: "14", width: "7", height: "7" }
+                                                    rect { x: "14", y: "14", width: "7", height: "7" }
+                                                }
+                                            }
+                                            if dock_menu_open() {
+                                                div {
+                                                    class: "glass-select-menu",
+                                                    role: "listbox",
+                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                    div {
+                                                        class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
+                                                        role: "option",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            dock_position.set(DockPosition::Bottom);
+                                                            dock_menu_open.set(false);
+                                                        },
+                                                        "Bottom"
+                                                    }
+                                                    div {
+                                                        class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
+                                                        role: "option",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            dock_position.set(DockPosition::Left);
+                                                            dock_menu_open.set(false);
+                                                        },
+                                                        "Left"
+                                                    }
+                                                    div {
+                                                        class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
+                                                        role: "option",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            dock_position.set(DockPosition::Right);
+                                                            dock_menu_open.set(false);
+                                                        },
+                                                        "Right"
+                                                    }
+                                                }
+                                            }
                                         }
-                                    }
-                                    DiagnosticsButton {
-                                        open: diagnostics_open(),
-                                        onclick: move |_| {
-                                            diagnostics_open.set(!diagnostics_open());
-                                            if diagnostics_open() {
-                                                peer_list_open.set(false);
-                                            }
-                                        },
-                                    }
-                                    DeviceSettingsButton {
-                                        open: device_settings_open(),
-                                        onclick: move |_| {
-                                            device_settings_open.set(!device_settings_open());
-                                            if device_settings_open() {
-                                                peer_list_open.set(false);
-                                                diagnostics_open.set(false);
-                                            }
-                                        },
                                     }
                                     {
                                         let hangup_client = client.clone();
@@ -2190,7 +2522,7 @@ pub fn AttendantsComponent(
                 }
 
                 // Waiting room controls (host or admitted participants when allowed)
-                if is_owner || admitted_can_admit {
+                if is_owner || admitted_can_admit_toggle() {
                     HostControls {
                         meeting_id: id.clone(),
                         is_admitted: true,

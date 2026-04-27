@@ -440,41 +440,41 @@ impl ScreenEncoder {
             let screen_to_share: MediaStream =
                 match media_devices.get_display_media_with_constraints(&constraints) {
                     Ok(promise) => match JsFuture::from(promise).await {
-                    Ok(stream) => stream.unchecked_into::<MediaStream>(),
-                    Err(e) => {
-                        // Check if user cancelled (NotAllowedError = permission denied/cancelled)
-                        let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
-                            .ok()
-                            .and_then(|v| v.as_string())
-                            .map(|name| name == "NotAllowedError")
-                            .unwrap_or(false);
+                        Ok(stream) => stream.unchecked_into::<MediaStream>(),
+                        Err(e) => {
+                            // Check if user cancelled (NotAllowedError = permission denied/cancelled)
+                            let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
+                                .ok()
+                                .and_then(|v| v.as_string())
+                                .map(|name| name == "NotAllowedError")
+                                .unwrap_or(false);
 
-                        if is_user_cancel {
-                            log::info!("User cancelled screen sharing");
-                            if let Some(ref callback) = on_state_change {
-                                callback.emit(ScreenShareEvent::Cancelled);
+                            if is_user_cancel {
+                                log::info!("User cancelled screen sharing");
+                                if let Some(ref callback) = on_state_change {
+                                    callback.emit(ScreenShareEvent::Cancelled);
+                                }
+                            } else {
+                                let error_msg = format!("{e:?}");
+                                error!("Screen sharing error: {error_msg}");
+                                if let Some(ref callback) = on_state_change {
+                                    callback.emit(ScreenShareEvent::Failed(error_msg));
+                                }
                             }
-                        } else {
-                            let error_msg = format!("{e:?}");
-                            error!("Screen sharing error: {error_msg}");
-                            if let Some(ref callback) = on_state_change {
-                                callback.emit(ScreenShareEvent::Failed(error_msg));
-                            }
+                            enabled.store(false, Ordering::Release);
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let error_msg = format!("{e:?}");
+                        error!("Failed to get display media: {error_msg}");
+                        if let Some(ref callback) = on_state_change {
+                            callback.emit(ScreenShareEvent::Failed(error_msg));
                         }
                         enabled.store(false, Ordering::Release);
                         return;
                     }
-                },
-                Err(e) => {
-                    let error_msg = format!("{e:?}");
-                    error!("Failed to get display media: {error_msg}");
-                    if let Some(ref callback) = on_state_change {
-                        callback.emit(ScreenShareEvent::Failed(error_msg));
-                    }
-                    enabled.store(false, Ordering::Release);
-                    return;
-                }
-            };
+                };
 
             log::info!("Screen to share: {screen_to_share:?}");
 

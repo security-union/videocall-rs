@@ -1471,7 +1471,7 @@ mod tests {
         let target_fps = Rc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(1500, target_fps);
 
-        // Camera starts at DEFAULT_VIDEO_TIER_INDEX (the lowest/minimal tier).
+        // Camera starts at DEFAULT_VIDEO_TIER_INDEX (the middle-ground "standard" tier).
         let initial_index = controller.video_tier_index();
         let ceiling = screen_share_camera_ceiling_index();
 

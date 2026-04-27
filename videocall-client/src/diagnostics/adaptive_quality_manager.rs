@@ -207,10 +207,11 @@ impl AdaptiveQualityManager {
 
     /// Create a new manager for the given video tier array.
     ///
-    /// Starts at `DEFAULT_VIDEO_TIER_INDEX` (minimal/lowest). Starting at the
-    /// lowest tier ensures the system only ever upgrades, eliminating the
-    /// visible dimension-change oscillation that occurs when the PID controller
-    /// has not yet allocated enough bitrate for a higher tier.
+    /// Starts at `DEFAULT_VIDEO_TIER_INDEX` ("standard", 540p — the midpoint of
+    /// the quality ladder). Starting at the middle tier means new peers join at
+    /// an acceptable baseline quality and the PID controller adapts in either
+    /// direction: stepping up when bandwidth is plentiful, stepping down when
+    /// the network is constrained.
     ///
     /// Use `VIDEO_QUALITY_TIERS` for camera, `SCREEN_QUALITY_TIERS` for screen share.
     ///

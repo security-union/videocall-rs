@@ -158,12 +158,12 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at "medium" (480p/25fps/600kbps) keeps initial bandwidth
-/// under 1 Mbps, avoiding buffer bloat on constrained connections during
-/// the 5s warmup period when tier transitions are suppressed. The PID
-/// controller steps up to 720p/1080p if bandwidth permits, or steps
-/// down to 360p/240p if constrained.
-pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
+/// Starting at "standard" (540p/30fps/900kbps) — the midpoint of the 8-tier
+/// quality ladder (indices 0–7) — gives new peers an acceptable baseline
+/// quality immediately. The PID controller then adapts in either direction:
+/// stepping up toward 720p/1080p when bandwidth is plentiful, or stepping
+/// down toward 480p/360p/240p when the network is constrained.
+pub const DEFAULT_VIDEO_TIER_INDEX: usize = 3; // "standard"
 
 /// Label of the video quality tier to use as camera ceiling during screen sharing.
 ///
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
+        assert_eq!(tier.label, "standard", "default tier should be 'standard'");
     }
 
     #[test]

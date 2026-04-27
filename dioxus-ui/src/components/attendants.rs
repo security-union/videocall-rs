@@ -500,6 +500,11 @@ pub fn AttendantsComponent(
     let local_speaking = use_signal(|| false);
     let local_audio_level = use_signal(|| 0.0f32);
     let mut pinned_peer_id: Signal<Option<String>> = use_signal(|| None);
+    // Screen-share to participants panel ratio. Default 0.667 gives a 2:1 split.
+    // Clamped to [0.3, 0.85] by the resize handle (screen share 30%–85% of width).
+    let mut screen_share_ratio: Signal<f64> = use_signal(|| 0.667);
+    // True while the user is actively dragging the resize handle.
+    let mut ss_resizing: Signal<bool> = use_signal(|| false);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
     let waiting_room_toggle = use_signal(move || waiting_room_enabled);
@@ -1404,17 +1409,27 @@ pub fn AttendantsComponent(
     //   - SS_GRID_PAD: padding inside the right panel div = 6px each side
     //   - SS_BOTTOM_PAD: padding-bottom (80px) from container_style
     //   - SS_TOP_PAD: padding-top (16px) + right panel padding (6px*2)
-    const SS_COLS: f64 = 2.0;
+    //
+    // Tile sizing: height is fixed to fit 4 tiles per column regardless of panel width.
+    // Column count collapses to 1 when right_ratio <= 0.25 or panel is too narrow.
+    // Actual tile width is controlled by the CSS grid (1fr columns), not computed here.
     const SS_GRID_GAP: f64 = 8.0;
     const SS_BOTTOM_PAD: f64 = 80.0;
     const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
-                                   // Right panel content width ≈ (vw - outer_horiz_pad - panel_gap) / 3 - grid_pad
-    let ss_panel_width = ((vw - 42.0) / 3.0 - 12.0).max(100.0);
-    let ss_tile_w = (ss_panel_width - SS_GRID_GAP) / SS_COLS;
-    let ss_tile_h = ss_tile_w / (16.0 / 9.0);
+    let right_ratio = 1.0 - screen_share_ratio();
+    let ss_panel_width = (right_ratio * (vw - 42.0) - 12.0).max(100.0); // ≈ right_ratio * (vw - outer_pad - gap) - grid_pad
+    let ss_cols = if right_ratio <= 0.25 || ss_panel_width < 180.0 {
+        1.0_f64 // single column
+    } else {
+        2.0_f64 // two columns
+    };
     let ss_avail_h = vh - SS_BOTTOM_PAD - SS_VERT_PAD;
-    let ss_max_rows = ((ss_avail_h + SS_GRID_GAP) / (ss_tile_h + SS_GRID_GAP)).floor() as usize;
-    let ss_max_tiles = (ss_max_rows * SS_COLS as usize).max(2);
+    // Tile height: always sized to fit exactly 4 tiles per column (independent of panel width resize).
+    let ss_tile_h = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0);
+    // Natural tile width at 16:9: ss_tile_h * 16.0 / 9.0 (actual width follows grid columns).
+    // Max rows is always 4 (height is sized for exactly 4 tiles per column).
+    let ss_max_rows = 4_usize;
+    let ss_max_tiles = ss_max_rows * ss_cols as usize;
 
     // Build a separate tile list for the screen-share right panel.
     // The grid's promotion used visible_tile_count which differs from the
@@ -1487,7 +1502,7 @@ pub fn AttendantsComponent(
     }
 
     let container_style = if has_screen_share {
-        // 2/3 screen-share panel on the left, 1/3 peer panel on the right
+        // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
         "position: absolute; inset: 0; width: 100%; height: 100%; \
          display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
          padding: 16px 16px 80px 16px; \
@@ -1508,7 +1523,7 @@ pub fn AttendantsComponent(
              padding: {pad_top:.0}px {pad_right:.0}px {pad_bottom:.0}px {pad_left:.0}px; \
              box-sizing: border-box; overflow: hidden; \
              flex-direction: unset; flex-wrap: unset; align-items: unset; \
-             width: auto; height: auto; \
+             width: 100%; height: 100%; \
              grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr); \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
         )
@@ -1727,69 +1742,120 @@ pub fn AttendantsComponent(
                 }
 
                 div { id: "grid-container", style: "{container_style}",
-
-                    if has_screen_share {
-                        // ---- Split layout: active screen share (left 2/3) + peer videos (right 1/3) ----
-                        // Left panel — ONLY the most recent (active) screen sharer
-                        div { style: "flex: 2; min-width: 0; height: 100%; display: flex; flex-direction: column; \
-                                    align-items: center; justify-content: center; overflow: hidden;",
-                            if let Some(ref active_peer) = active_screen_sharer {
-                                PeerTile {
-                                    key: "ss-active-{active_peer}",
-                                    peer_id: active_peer.clone(),
-                                    full_bleed: true,
-                                    host_user_id: host_user_id.clone(),
-                                    render_mode: TileMode::ScreenOnly,
-                                    my_peer_id: user_id.clone(),
-                                    pinned_peer_id: current_pinned.clone(),
-                                    on_toggle_pin: toggle_pin.clone(),
-                                }
-                            }
-                        }
-                        // Right panel — 2-column grid of compact peer tiles
-                        div {
-                            style: "flex: 1; min-width: 0; height: 100%; \
-                                    display: grid; grid-template-columns: 1fr 1fr; \
-                                    gap: 8px; padding: 6px; \
-                                    align-content: start; overflow: visible;",
-                            for tile_id in ss_tiles.iter() {
-                                {
-                                    let is_mock = tile_id.starts_with("mock-");
-                                    if is_mock {
-                                        rsx! {
-                                            PeerTile {
-                                                key: "tile-{tile_id}",
-                                                peer_id: tile_id.clone(),
-                                                full_bleed: false,
-                                                host_user_id: host_user_id.clone(),
-                                                render_mode: TileMode::VideoOnly,
-                                                my_peer_id: user_id.clone(),
-                                                on_toggle_pin: move |_: String| {},
-                                            }
-                                        }
-                                    } else {
-                                        rsx! {
-                                            PeerTile {
-                                                key: "tile-{tile_id}",
-                                                peer_id: tile_id.clone(),
-                                                full_bleed: false,
-                                                host_user_id: host_user_id.clone(),
-                                                render_mode: TileMode::VideoOnly,
-                                                my_peer_id: user_id.clone(),
-                                                pinned_peer_id: current_pinned.clone(),
-                                                on_toggle_pin: toggle_pin.clone(),
-                                            }
-                                        }
+                    onmousemove: move |evt| {
+                        if ss_resizing() {
+                            let native = evt.as_web_event();
+                            if let Some(target) = native.current_target() {
+                                use wasm_bindgen::JsCast;
+                                if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
+                                    let rect = el.get_bounding_client_rect();
+                                    let x = native.client_x() as f64 - rect.left();
+                                    let w = rect.width();
+                                    if w > 0.0 {
+                                        let ratio = (x / w).clamp(0.3, 0.85);
+                                        screen_share_ratio.set(ratio);
                                     }
                                 }
                             }
+                        }
+                    },
+                    onmouseup: move |evt: MouseEvent| {
+                        if ss_resizing() {
+                            evt.prevent_default();
+                            ss_resizing.set(false);
+                        }
+                    },
+                    onmouseleave: move |evt: MouseEvent| {
+                        if ss_resizing() {
+                            evt.prevent_default();
+                            ss_resizing.set(false);
+                        }
+                    },
 
-                            if ss_overflow_count > 0 {
+                    if has_screen_share {
+                        // ---- Split layout: active screen share (left) + peer videos (right) ----
+                        {
+                            let left_pct = screen_share_ratio() * 100.0;
+                            let right_pct = (1.0 - screen_share_ratio()) * 100.0 - 0.4; // account for handle
+                            let handle_class = if ss_resizing() {
+                                "screen-share-resize-handle dragging"
+                            } else {
+                                "screen-share-resize-handle"
+                            };
+                            rsx! {
+                                // Left panel — ONLY the most recent (active) screen sharer
+                                div { style: "width: {left_pct:.2}%; min-width: 0; height: 100%; display: flex; flex-direction: column; \
+                                            align-items: center; justify-content: center; overflow: hidden;",
+                                    if let Some(ref active_peer) = active_screen_sharer {
+                                        PeerTile {
+                                            key: "ss-active-{active_peer}",
+                                            peer_id: active_peer.clone(),
+                                            full_bleed: true,
+                                            host_user_id: host_user_id.clone(),
+                                            render_mode: TileMode::ScreenOnly,
+                                            my_peer_id: user_id.clone(),
+                                            pinned_peer_id: current_pinned.clone(),
+                                            on_toggle_pin: toggle_pin.clone(),
+                                        }
+                                    }
+                                }
+                                // Resize handle
                                 div {
-                                    class: "grid-overflow-badge",
-                                    style: "aspect-ratio: 16 / 9;",
-                                    "+{ss_overflow_count}"
-                                    span { "more in meeting" }
+                                    class: "{handle_class}",
+                                    onmousedown: move |evt| {
+                                        evt.prevent_default();
+                                        ss_resizing.set(true);
+                                    },
+                                }
+                                // Right panel — 1 or 2-column grid of compact peer tiles
+                                div {
+                                    style: {
+                                        let grid_cols = if ss_cols > 1.0 { "1fr 1fr" } else { "1fr" };
+                                        format!("width: {right_pct:.2}%; min-width: 0; height: 100%; \
+                                                display: grid; grid-template-columns: {grid_cols}; \
+                                                grid-auto-rows: {ss_tile_h:.0}px; \
+                                                gap: 8px; padding: 6px; \
+                                                align-content: start; overflow: visible;")
+                                    },
+                                    for tile_id in ss_tiles.iter() {
+                                        {
+                                            let is_mock = tile_id.starts_with("mock-");
+                                            if is_mock {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_peer_id: user_id.clone(),
+                                                        on_toggle_pin: move |_: String| {},
+                                                    }
+                                                }
+                                            } else {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_peer_id: user_id.clone(),
+                                                        pinned_peer_id: current_pinned.clone(),
+                                                        on_toggle_pin: toggle_pin.clone(),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if ss_overflow_count > 0 {
+                                        div {
+                                            class: "grid-overflow-badge",
+                                            "+{ss_overflow_count}"
+                                            span { "more in meeting" }
+                                        }
+                                    }
                                 }
                             }
                         }

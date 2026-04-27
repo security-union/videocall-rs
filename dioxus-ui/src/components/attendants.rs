@@ -536,8 +536,10 @@ pub fn AttendantsComponent(
             });
             let id = win1
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    narrow_cb.as_ref().unchecked_ref(), 1_000,
-                ).unwrap_or(0);
+                    narrow_cb.as_ref().unchecked_ref(),
+                    1_000,
+                )
+                .unwrap_or(0);
             nt1.borrow_mut().replace(id);
             narrow_cb.forget();
             // Hide after 4s
@@ -548,12 +550,15 @@ pub fn AttendantsComponent(
             });
             let id = win1
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    hide_cb.as_ref().unchecked_ref(), 4_000,
-                ).unwrap_or(0);
+                    hide_cb.as_ref().unchecked_ref(),
+                    4_000,
+                )
+                .unwrap_or(0);
             ht1.borrow_mut().replace(id);
             hide_cb.forget();
         });
-        let _ = win.add_event_listener_with_callback("mousemove", mouse_cb.as_ref().unchecked_ref());
+        let _ =
+            win.add_event_listener_with_callback("mousemove", mouse_cb.as_ref().unchecked_ref());
         mouse_cb.forget();
 
         // touchstart listener
@@ -576,8 +581,10 @@ pub fn AttendantsComponent(
             });
             let id = win2
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    narrow_cb.as_ref().unchecked_ref(), 1_000,
-                ).unwrap_or(0);
+                    narrow_cb.as_ref().unchecked_ref(),
+                    1_000,
+                )
+                .unwrap_or(0);
             nt2.borrow_mut().replace(id);
             narrow_cb.forget();
             let ht_inner = ht2.clone();
@@ -587,12 +594,15 @@ pub fn AttendantsComponent(
             });
             let id = win2
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    hide_cb.as_ref().unchecked_ref(), 4_000,
-                ).unwrap_or(0);
+                    hide_cb.as_ref().unchecked_ref(),
+                    4_000,
+                )
+                .unwrap_or(0);
             ht2.borrow_mut().replace(id);
             hide_cb.forget();
         });
-        let _ = win.add_event_listener_with_callback("touchstart", touch_cb.as_ref().unchecked_ref());
+        let _ =
+            win.add_event_listener_with_callback("touchstart", touch_cb.as_ref().unchecked_ref());
         touch_cb.forget();
 
         // Initial timers
@@ -603,8 +613,10 @@ pub fn AttendantsComponent(
         });
         let id = win
             .set_timeout_with_callback_and_timeout_and_arguments_0(
-                narrow_init.as_ref().unchecked_ref(), 1_000,
-            ).unwrap_or(0);
+                narrow_init.as_ref().unchecked_ref(),
+                1_000,
+            )
+            .unwrap_or(0);
         narrow_timer.borrow_mut().replace(id);
         narrow_init.forget();
 
@@ -615,8 +627,10 @@ pub fn AttendantsComponent(
         });
         let id = win
             .set_timeout_with_callback_and_timeout_and_arguments_0(
-                hide_init.as_ref().unchecked_ref(), 4_000,
-            ).unwrap_or(0);
+                hide_init.as_ref().unchecked_ref(),
+                4_000,
+            )
+            .unwrap_or(0);
         hide_timer.borrow_mut().replace(id);
         hide_init.forget();
     });
@@ -1329,7 +1343,6 @@ pub fn AttendantsComponent(
             let _ = el.set_attribute("style", &style);
         }
     });
-
 
     // Check for config errors
     use_effect(move || {

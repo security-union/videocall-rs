@@ -483,8 +483,8 @@ mod tests {
     fn lucene_escape_escapes_every_metacharacter() {
         // Each of these single characters must come out backslash-prefixed.
         for ch in [
-            '\\', '+', '-', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':',
-            '&', '|',
+            '\\', '+', '-', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '&',
+            '|',
         ] {
             let escaped = escape_lucene_query_string(&ch.to_string());
             assert_eq!(
@@ -585,7 +585,10 @@ mod tests {
             assert_eq!(value, "mymeeting", "prefix values must be lowercased");
         }
         // multi_match query preserves original case (analyzer handles folding).
-        assert_eq!(body["query"]["must"][0]["multi_match"]["query"], "MyMeeting");
+        assert_eq!(
+            body["query"]["must"][0]["multi_match"]["query"],
+            "MyMeeting"
+        );
     }
 
     #[test]

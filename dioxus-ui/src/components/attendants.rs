@@ -69,6 +69,31 @@ pub enum ScreenShareState {
     Active,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockPosition {
+    Bottom,
+    Left,
+    Right,
+}
+
+impl DockPosition {
+    fn css_class(self) -> &'static str {
+        match self {
+            DockPosition::Bottom => "dock-bottom",
+            DockPosition::Left => "dock-left",
+            DockPosition::Right => "dock-right",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            DockPosition::Bottom => DockPosition::Left,
+            DockPosition::Left => DockPosition::Right,
+            DockPosition::Right => DockPosition::Bottom,
+        }
+    }
+}
+
 pub enum MediaErrorState {
     NoDevice,
     PermissionDenied,
@@ -449,6 +474,10 @@ pub fn AttendantsComponent(
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
     let mut mock_peers_open = use_signal(|| false);
+    let mut controls_visible = use_signal(|| true);
+    let mut controls_expanded = use_signal(|| true);
+    let mut dock_position: Signal<DockPosition> = use_signal(|| DockPosition::Bottom);
+    let mut dock_menu_open = use_signal(|| false);
     let encoder_settings = use_signal(|| None::<String>);
     let mut debug_peer_count = use_signal(|| 0u32);
     // Per-peer speech priority: session_id → last-spoke timestamp (ms).
@@ -474,6 +503,121 @@ pub fn AttendantsComponent(
         // Runs once (use_hook), so no accumulation on re-renders.
         cb.forget();
     });
+
+    // Dock-style auto-hide: narrow after 1s, hide after 4s of inactivity.
+    use_hook(move || {
+        let win = window();
+        // Two timer handles: one for narrowing (1s), one for hiding (4s).
+        let narrow_timer: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+        let hide_timer: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+
+        // mousemove listener
+        let nt1 = narrow_timer.clone();
+        let ht1 = hide_timer.clone();
+        let win1 = win.clone();
+        let mouse_cb = Closure::<dyn FnMut()>::new(move || {
+            controls_visible.set(true);
+            controls_expanded.set(true);
+            // Clear existing timers
+            if let Some(id) = nt1.borrow_mut().take() {
+                win1.clear_timeout_with_handle(id);
+            }
+            if let Some(id) = ht1.borrow_mut().take() {
+                win1.clear_timeout_with_handle(id);
+            }
+            // Narrow after 1s
+            let nt_inner = nt1.clone();
+            let narrow_cb = Closure::<dyn FnMut()>::once(move || {
+                nt_inner.borrow_mut().take();
+                controls_expanded.set(false);
+            });
+            let id = win1
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    narrow_cb.as_ref().unchecked_ref(), 1_000,
+                ).unwrap_or(0);
+            nt1.borrow_mut().replace(id);
+            narrow_cb.forget();
+            // Hide after 4s
+            let ht_inner = ht1.clone();
+            let hide_cb = Closure::<dyn FnMut()>::once(move || {
+                ht_inner.borrow_mut().take();
+                controls_visible.set(false);
+            });
+            let id = win1
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    hide_cb.as_ref().unchecked_ref(), 4_000,
+                ).unwrap_or(0);
+            ht1.borrow_mut().replace(id);
+            hide_cb.forget();
+        });
+        let _ = win.add_event_listener_with_callback("mousemove", mouse_cb.as_ref().unchecked_ref());
+        mouse_cb.forget();
+
+        // touchstart listener
+        let nt2 = narrow_timer.clone();
+        let ht2 = hide_timer.clone();
+        let win2 = win.clone();
+        let touch_cb = Closure::<dyn FnMut()>::new(move || {
+            controls_visible.set(true);
+            controls_expanded.set(true);
+            if let Some(id) = nt2.borrow_mut().take() {
+                win2.clear_timeout_with_handle(id);
+            }
+            if let Some(id) = ht2.borrow_mut().take() {
+                win2.clear_timeout_with_handle(id);
+            }
+            let nt_inner = nt2.clone();
+            let narrow_cb = Closure::<dyn FnMut()>::once(move || {
+                nt_inner.borrow_mut().take();
+                controls_expanded.set(false);
+            });
+            let id = win2
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    narrow_cb.as_ref().unchecked_ref(), 1_000,
+                ).unwrap_or(0);
+            nt2.borrow_mut().replace(id);
+            narrow_cb.forget();
+            let ht_inner = ht2.clone();
+            let hide_cb = Closure::<dyn FnMut()>::once(move || {
+                ht_inner.borrow_mut().take();
+                controls_visible.set(false);
+            });
+            let id = win2
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    hide_cb.as_ref().unchecked_ref(), 4_000,
+                ).unwrap_or(0);
+            ht2.borrow_mut().replace(id);
+            hide_cb.forget();
+        });
+        let _ = win.add_event_listener_with_callback("touchstart", touch_cb.as_ref().unchecked_ref());
+        touch_cb.forget();
+
+        // Initial timers
+        let nt_init = narrow_timer.clone();
+        let narrow_init = Closure::<dyn FnMut()>::once(move || {
+            nt_init.borrow_mut().take();
+            controls_expanded.set(false);
+        });
+        let id = win
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                narrow_init.as_ref().unchecked_ref(), 1_000,
+            ).unwrap_or(0);
+        narrow_timer.borrow_mut().replace(id);
+        narrow_init.forget();
+
+        let ht_init = hide_timer.clone();
+        let hide_init = Closure::<dyn FnMut()>::once(move || {
+            ht_init.borrow_mut().take();
+            controls_visible.set(false);
+        });
+        let id = win
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                hide_init.as_ref().unchecked_ref(), 4_000,
+            ).unwrap_or(0);
+        hide_timer.borrow_mut().replace(id);
+        hide_init.forget();
+    });
+
     let mut device_settings_open = use_signal(|| false);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
@@ -1142,6 +1286,7 @@ pub fn AttendantsComponent(
             let _ = el.set_attribute("style", &style);
         }
     });
+
 
     // Check for config errors
     use_effect(move || {
@@ -1981,7 +2126,14 @@ pub fn AttendantsComponent(
                                 }
                             },
                             div { class: "controls",
-                                nav { class: "video-controls-container",
+                                nav {
+                                    class: {
+                                        let pos = dock_position().css_class();
+                                        let hidden = if controls_visible() { "" } else { " controls-hidden" };
+                                        let expanded = if controls_expanded() { " controls-expanded" } else { "" };
+                                        format!("video-controls-container {pos}{hidden}{expanded}")
+                                    },
+                                    // Primary: Mic button - always visible
                                     {
                                         let mda_mic = mda.clone();
                                         rsx! {
@@ -2003,6 +2155,7 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+                                    // Primary: Camera button - always visible
                                     {
                                         let mda_cam = mda.clone();
                                         rsx! {
@@ -2036,69 +2189,140 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
-                                    if !is_ios() {
-                                        {
-                                            let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                            let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting);
-                                            rsx! {
-                                                ScreenShareButton {
-                                                    active: is_active,
-                                                    disabled: is_disabled,
-                                                    onclick: move |_| {
-                                                        if matches!(screen_share_state(), ScreenShareState::Idle) {
-                                                            screen_share_state.set(ScreenShareState::Requesting);
-                                                        } else {
-                                                            screen_share_state.set(ScreenShareState::Idle);
-                                                        }
-                                                    },
+                                    // (в) Secondary buttons — hidden by default, expand on hover
+                                    div { class: "controls-secondary",
+                                        if !is_ios() {
+                                            {
+                                                let is_active = matches!(screen_share_state(), ScreenShareState::Active);
+                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting);
+                                                rsx! {
+                                                    ScreenShareButton {
+                                                        active: is_active,
+                                                        disabled: is_disabled,
+                                                        onclick: move |_| {
+                                                            if matches!(screen_share_state(), ScreenShareState::Idle) {
+                                                                screen_share_state.set(ScreenShareState::Requesting);
+                                                            } else {
+                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                            }
+                                                        },
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    PeerListButton {
-                                        open: peer_list_open(),
-                                        onclick: move |_| {
-                                            peer_list_open.set(!peer_list_open());
-                                            if peer_list_open() {
-                                                diagnostics_open.set(false);
-                                            }
-                                        },
-                                    }
-                                    if show_density_selector && !has_screen_share {
-                                        DensityModeButton {
-                                            label: density_mode().label().to_string(),
-                                            open: density_open(),
+                                        PeerListButton {
+                                            open: peer_list_open(),
                                             onclick: move |_| {
-                                                density_open.set(!density_open());
+                                                peer_list_open.set(!peer_list_open());
+                                                if peer_list_open() {
+                                                    diagnostics_open.set(false);
+                                                }
+                                            },
+                                        }
+                                        if show_density_selector && !has_screen_share {
+                                            DensityModeButton {
+                                                label: density_mode().label().to_string(),
+                                                open: density_open(),
+                                                onclick: move |_| {
+                                                    density_open.set(!density_open());
+                                                },
+                                            }
+                                        }
+                                        if mock_peers_enabled() {
+                                            MockPeersButton {
+                                                open: mock_peers_open(),
+                                                onclick: move |_| {
+                                                    mock_peers_open.set(!mock_peers_open());
+                                                },
+                                            }
+                                        }
+                                        DiagnosticsButton {
+                                            open: diagnostics_open(),
+                                            onclick: move |_| {
+                                                diagnostics_open.set(!diagnostics_open());
+                                                if diagnostics_open() {
+                                                    peer_list_open.set(false);
+                                                }
+                                            },
+                                        }
+                                        DeviceSettingsButton {
+                                            open: device_settings_open(),
+                                            onclick: move |_| {
+                                                device_settings_open.set(!device_settings_open());
+                                                if device_settings_open() {
+                                                    peer_list_open.set(false);
+                                                    diagnostics_open.set(false);
+                                                }
                                             },
                                         }
                                     }
-                                    if mock_peers_enabled() {
-                                        MockPeersButton {
-                                            open: mock_peers_open(),
-                                            onclick: move |_| {
-                                                mock_peers_open.set(!mock_peers_open());
-                                            },
+                                    // (а) Dock position dropdown — glass-select style
+                                    div { class: "dock-position-wrapper",
+                                        div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
+                                            button {
+                                                class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
+                                                title: "Dock position",
+                                                r#type: "button",
+                                                "aria-haspopup": "listbox",
+                                                "aria-expanded": if dock_menu_open() { "true" } else { "false" },
+                                                onclick: move |e| {
+                                                    e.stop_propagation();
+                                                    dock_menu_open.set(!dock_menu_open());
+                                                },
+                                                svg {
+                                                    xmlns: "http://www.w3.org/2000/svg",
+                                                    width: "20",
+                                                    height: "20",
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    rect { x: "3", y: "3", width: "7", height: "7" }
+                                                    rect { x: "14", y: "3", width: "7", height: "7" }
+                                                    rect { x: "3", y: "14", width: "7", height: "7" }
+                                                    rect { x: "14", y: "14", width: "7", height: "7" }
+                                                }
+                                            }
+                                            if dock_menu_open() {
+                                                div {
+                                                    class: "glass-select-menu",
+                                                    role: "listbox",
+                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                    div {
+                                                        class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
+                                                        role: "option",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            dock_position.set(DockPosition::Bottom);
+                                                            dock_menu_open.set(false);
+                                                        },
+                                                        "Bottom"
+                                                    }
+                                                    div {
+                                                        class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
+                                                        role: "option",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            dock_position.set(DockPosition::Left);
+                                                            dock_menu_open.set(false);
+                                                        },
+                                                        "Left"
+                                                    }
+                                                    div {
+                                                        class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
+                                                        role: "option",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            dock_position.set(DockPosition::Right);
+                                                            dock_menu_open.set(false);
+                                                        },
+                                                        "Right"
+                                                    }
+                                                }
+                                            }
                                         }
-                                    }
-                                    DiagnosticsButton {
-                                        open: diagnostics_open(),
-                                        onclick: move |_| {
-                                            diagnostics_open.set(!diagnostics_open());
-                                            if diagnostics_open() {
-                                                peer_list_open.set(false);
-                                            }
-                                        },
-                                    }
-                                    DeviceSettingsButton {
-                                        open: device_settings_open(),
-                                        onclick: move |_| {
-                                            device_settings_open.set(!device_settings_open());
-                                            if device_settings_open() {
-                                                peer_list_open.set(false);
-                                                diagnostics_open.set(false);
-                                            }
-                                        },
                                     }
                                     {
                                         let hangup_client = client.clone();

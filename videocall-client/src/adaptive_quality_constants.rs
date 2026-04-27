@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn test_video_tier_lookup_by_index() {
         let tier = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
-        assert_eq!(tier.label, "medium", "default tier should be 'medium'");
+        assert_eq!(tier.label, "standard", "default tier should be 'standard'");
     }
 
     #[test]

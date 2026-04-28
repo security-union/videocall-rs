@@ -72,6 +72,7 @@ const INNER_ALPHA_STRENGTH_RANGE: f32 = 0.75;
 const BORDER_ALPHA_BASE: f32 = 0.50;
 /// Border alpha increase per unit of audio intensity.
 const BORDER_ALPHA_INTENSITY: f32 = 0.42;
+pub(crate) const DEFAULT_TILE_BORDER_COLOR: &str = "rgba(100, 100, 100, 0.30)";
 
 // ─── Shared glow parameter struct ────────────────────────────────────────────
 
@@ -128,7 +129,9 @@ pub(crate) fn speak_style(
     settings: &AppearanceSettings,
 ) -> String {
     if !settings.glow_enabled || !speaking_active || audio_level <= 0.0 {
-        return "box-shadow: none; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;".to_string();
+        return format!(
+            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;"
+        );
     }
 
     let (r, g, b) = settings.glow_color.to_rgb();
@@ -325,8 +328,7 @@ pub fn generate_for_peer(
         .map(|p| p == peer_user_id.as_str())
         .unwrap_or(false);
 
-    let is_suppressed =
-        is_speaking_suppressed(is_pinned, pinned_peer_id) || is_screen_share_enabled_for_peer;
+    let is_suppressed = is_speaking_suppressed(is_pinned, pinned_peer_id);
 
     let visible_audio_level = if is_suppressed { 0.0 } else { audio_level };
     let visible_mic_level = if is_suppressed { 0.0 } else { mic_audio_level };
@@ -1017,5 +1019,13 @@ mod tests {
     #[test]
     fn suppressed_non_pinned_while_pin_active_returns_true() {
         assert!(is_speaking_suppressed(false, Some("alice")));
+    }
+
+    #[test]
+    fn speak_style_reset_restores_default_border_color() {
+        let style = speak_style(0.0, false, &AppearanceSettings::default());
+
+        assert!(style.contains("box-shadow: none;"));
+        assert!(style.contains(DEFAULT_TILE_BORDER_COLOR));
     }
 }

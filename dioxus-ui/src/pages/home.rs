@@ -22,9 +22,9 @@ use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
 use crate::constants::{meeting_api_base_url, oauth_enabled};
 use crate::context::{
-    clear_display_name_from_storage, email_to_display_name, is_guid_like, is_valid_meeting_id,
-    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
+    clear_display_name_from_storage, email_to_display_name, is_allowed_display_name_char,
+    is_guid_like, is_valid_meeting_id, load_display_name_from_storage,
+    save_display_name_to_storage, validate_display_name, DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
 };
 use crate::meeting_api::create_meeting;
 use crate::routing::Route;
@@ -41,6 +41,7 @@ pub fn Home() -> Element {
 
     let mut meeting_id_ref = use_signal(|| None::<web_sys::Element>);
     let mut meeting_id_value = use_signal(String::new);
+    let mut meeting_id_error = use_signal(|| None::<String>);
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
 
     // When OAuth is enabled the display name must not be pre-populated from
@@ -309,12 +310,27 @@ pub fn Home() -> Element {
                                     maxlength: DISPLAY_NAME_MAX_LEN as i64,
                                     value: "{username_value}",
                                     oninput: move |e: Event<FormData>| {
-                                        username_value.set(e.value());
-                                        username_error.set(None);
+                                        let v = e.value();
+                                        let mut bad: Vec<char> = v
+                                            .chars()
+                                            .filter(|c| !is_allowed_display_name_char(*c))
+                                            .collect();
+                                        bad.sort();
+                                        bad.dedup();
+                                        username_value.set(v);
+                                        if bad.is_empty() {
+                                            username_error.set(None);
+                                        } else {
+                                            let chars_str: Vec<String> = bad
+                                                .iter()
+                                                .map(|c| format!("'{c}'"))
+                                                .collect();
+                                            username_error.set(Some(format!(
+                                                "{} not allowed — only letters, numbers, spaces, hyphens, underscores, apostrophes",
+                                                chars_str.join(", ")
+                                            )));
+                                        }
                                     },
-                                }
-                                p { class: "text-sm text-foreground-subtle mt-2 ml-1",
-                                    "Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes"
                                 }
                                 if let Some(err) = username_error() {
                                     p {
@@ -334,11 +350,30 @@ pub fn Home() -> Element {
                                     id: "meeting-id",
                                     class: TEXT_INPUT_CLASSES,
                                     r#type: "text",
-                                    placeholder: "Enter meeting code",
+                                    placeholder: "Enter meeting ID or generate one",
                                     required: true,
                                     pattern: "^[a-zA-Z0-9_]*$",
                                     oninput: move |e: Event<FormData>| {
-                                        meeting_id_value.set(e.value());
+                                        let v = e.value();
+                                        let mut bad: Vec<char> = v
+                                            .chars()
+                                            .filter(|c| !c.is_ascii_alphanumeric() && *c != '_')
+                                            .collect();
+                                        bad.sort();
+                                        bad.dedup();
+                                        meeting_id_value.set(v);
+                                        if bad.is_empty() {
+                                            meeting_id_error.set(None);
+                                        } else {
+                                            let chars_str: Vec<String> = bad
+                                                .iter()
+                                                .map(|c| format!("'{c}'"))
+                                                .collect();
+                                            meeting_id_error.set(Some(format!(
+                                                "{} not allowed — only letters, numbers, and underscore",
+                                                chars_str.join(", ")
+                                            )));
+                                        }
                                     },
                                     onmounted: move |evt| {
                                         if let Some(elem) = evt.try_as_web_event() {
@@ -346,78 +381,77 @@ pub fn Home() -> Element {
                                         }
                                     },
                                 }
-                                p { class: "text-sm text-foreground-subtle mt-2 ml-1",
-                                    "Characters allowed: a-z, A-Z, 0-9, and _"
-                                }
-                            }
-                            {
-                                let has_meeting_id = !meeting_id_value().is_empty();
-                                let join_btn_class = if has_meeting_id {
-                                    "btn-apple btn-primary w-full"
-                                } else {
-                                    "btn-apple btn-secondary w-full"
-                                };
-                                rsx! {
-                                    div { class: "mt-4",
-                                        button { r#type: "submit", class: join_btn_class, disabled: !has_meeting_id,
-                                            span { class: "text-lg", "Start or Join Meeting" }
-                                        }
-                                    }
-                                }
-                            }
-                            div { class: "mt-2",
-                                if let Some(err) = create_error() {
+                                if let Some(err) = meeting_id_error() {
                                     p {
                                         class: "text-sm mt-2 ml-1",
-                                        style: "color: #ff6b6b;",
+                                        style: "color:#ff6b6b;",
                                         "{err}"
                                     }
                                 }
-                                button {
-                                    r#type: "button",
-                                    class: {
-                                        let has_meeting_id = !meeting_id_value().is_empty();
-                                        if has_meeting_id {
-                                            "btn-apple btn-secondary w-full flex items-center justify-center gap-2 mt-2"
-                                        } else {
-                                            "btn-apple btn-primary w-full flex items-center justify-center gap-2 mt-2"
+                            }
+                            if !meeting_id_value().is_empty() {
+                                div { class: "mt-4",
+                                    button {
+                                        r#type: "submit",
+                                        class: "btn-apple btn-primary w-full",
+                                        span { class: "text-lg", "Start or Join Meeting" }
+                                    }
+                                }
+                            } else {
+                                div { class: "mt-4",
+                                    if let Some(err) = create_error() {
+                                        p {
+                                            class: "text-sm mb-2 ml-1",
+                                            style: "color: #ff6b6b;",
+                                            "{err}"
                                         }
-                                    },
-                                    disabled: creating(),
-                                    onclick: move |_| {
-                                        username_error.set(None);
-                                        create_error.set(None);
-                                        let username = username_value();
-                                        match validate_display_name(&username) {
-                                            Ok(valid_name) => {
-                                                username_value.set(valid_name.clone());
-                                                save_display_name_to_storage(&valid_name);
-                                                (display_name_ctx.0).set(Some(valid_name.clone()));
-                                                creating.set(true);
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "btn-apple btn-primary w-full flex items-center justify-center gap-2",
+                                        disabled: creating(),
+                                        onclick: move |_| {
+                                            username_error.set(None);
+                                            create_error.set(None);
+                                            let username = username_value();
+                                            match validate_display_name(&username) {
+                                                Ok(valid_name) => {
+                                                    username_value.set(valid_name.clone());
+                                                    save_display_name_to_storage(&valid_name);
+                                                    (display_name_ctx.0).set(Some(valid_name.clone()));
+                                                    creating.set(true);
 
-                                                spawn(async move {
-                                                    match create_meeting(None, false).await {
-                                                        Ok(response) => {
-                                                            creating.set(false);
-                                                            navigator.push(Route::Meeting { id: response.meeting_id });
+                                                    spawn(async move {
+                                                        match create_meeting(None, false).await {
+                                                            Ok(response) => {
+                                                                creating.set(false);
+                                                                let new_id = response.meeting_id;
+                                                                if let Some(el) = meeting_id_ref() {
+                                                                    if let Ok(input) = el.dyn_into::<HtmlInputElement>() {
+                                                                        input.set_value(&new_id);
+                                                                    }
+                                                                }
+                                                                meeting_id_value.set(new_id);
+                                                                meeting_id_error.set(None);
+                                                            }
+                                                            Err(e) => {
+                                                                creating.set(false);
+                                                                create_error.set(Some(format!("Failed to create meeting: {e}")));
+                                                            }
                                                         }
-                                                        Err(e) => {
-                                                            creating.set(false);
-                                                            create_error.set(Some(format!("Failed to create meeting: {e}")));
-                                                        }
-                                                    }
-                                                });
+                                                    });
+                                                }
+                                                Err(message) => {
+                                                    username_error.set(Some(message));
+                                                }
                                             }
-                                            Err(message) => {
-                                                username_error.set(Some(message));
-                                            }
+                                        },
+                                        if creating() {
+                                            span { class: "loading-spinner", style: "width: 18px; height: 18px;" }
+                                            span { class: "text-lg", "Generating..." }
+                                        } else {
+                                            span { class: "text-lg", "Generate a New Meeting ID" }
                                         }
-                                    },
-                                    if creating() {
-                                        span { class: "loading-spinner", style: "width: 18px; height: 18px;" }
-                                        span { class: "text-lg", "Creating..." }
-                                    } else {
-                                        span { class: "text-lg", "Create a New Meeting" }
                                     }
                                 }
                             }

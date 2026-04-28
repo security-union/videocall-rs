@@ -17,7 +17,10 @@ test.describe("Meetings", () => {
     await expect(page.locator("h1")).toContainText("videocall.rs");
     await expect(page.locator("#username")).toBeVisible();
     await expect(page.locator("#meeting-id")).toBeVisible();
-    await expect(page.getByText("Create a New Meeting ID")).toBeVisible();
+    // With an empty meeting-id field, only the Generate button is rendered.
+    await expect(page.getByText("Generate a New Meeting ID")).toBeVisible();
+    // The Start/Join button is NOT in the DOM until the user types into #meeting-id.
+    await expect(page.getByText("Start or Join Meeting")).toHaveCount(0);
     await page.waitForTimeout(1500);
   });
 
@@ -37,7 +40,10 @@ test.describe("Meetings", () => {
     await page.locator("#meeting-id").click();
     await page.locator("#meeting-id").pressSequentially("e2e_test_room", { delay: 80 });
     await page.waitForTimeout(1000);
+    // Once the meeting-id field has content, the button-swap kicks in:
+    // Start/Join is rendered, Generate is removed from the DOM.
     await expect(page.getByText("Start or Join Meeting")).toBeVisible();
+    await expect(page.getByText("Generate a New Meeting ID")).toHaveCount(0);
     // The display name is a controlled input (value bound to signal).
     // Clear it first in case any pre-fill occurred, then type our value.
     await page.locator("#username").click();
@@ -50,15 +56,35 @@ test.describe("Meetings", () => {
     await page.waitForTimeout(2000);
   });
 
-  test("create new meeting generates ID and navigates", async ({ page }) => {
+  test("clicking Generate populates the meeting-id field; user clicks Start/Join to enter the meeting", async ({
+    page,
+  }) => {
+    // The Generate button no longer navigates straight into a meeting.
+    // It now mints a server-side meeting ID, writes it into the #meeting-id
+    // input, and the button-swap exposes the Start/Join button. Navigation
+    // happens only when the user submits the form.
     await page.goto("/");
     await page.waitForTimeout(1500);
-    // Clear the controlled input before typing to handle any pre-fill
+
+    // Display name is required because the server records the creator.
     await page.locator("#username").click();
     await page.locator("#username").fill("");
     await page.locator("#username").pressSequentially("e2euser", { delay: 80 });
-    await page.waitForTimeout(1000);
-    await page.getByText("Create a New Meeting ID").click();
+    await page.waitForTimeout(500);
+
+    // Click Generate. Stay on home page, wait for the input to populate.
+    await page.getByText("Generate a New Meeting ID").click();
+    await expect(page.locator("#meeting-id")).not.toHaveValue("", { timeout: 10_000 });
+
+    // Sanity-check the URL did NOT change to /meeting/<id>.
+    await expect(page).toHaveURL(/\/$/);
+
+    // Button-swap should have happened: Generate gone, Start/Join visible.
+    await expect(page.getByText("Generate a New Meeting ID")).toHaveCount(0);
+    await expect(page.getByText("Start or Join Meeting")).toBeVisible();
+
+    // Click Start/Join to actually enter the meeting.
+    await page.getByText("Start or Join Meeting").click();
     await expect(page).toHaveURL(/\/meeting\/[a-f0-9]+/, { timeout: 10_000 });
     await page.waitForTimeout(2000);
   });
@@ -103,8 +129,13 @@ test.describe("Meetings", () => {
     await expect(page.getByText("Join Meeting")).toBeVisible({ timeout: 5_000 });
   });
 
-  test("display name is saved to localStorage on create new meeting", async ({ page }) => {
-    // Same persistence check, but using the "Create a New Meeting ID" button.
+  test("display name is saved to localStorage on Generate, then on Start/Join navigation", async ({
+    page,
+  }) => {
+    // Same persistence check, but using the new two-step Generate -> Start/Join
+    // flow. The display name is saved to localStorage on Generate click (in
+    // the validation success path before the async create_meeting runs); the
+    // URL change only happens once the user clicks Start/Join.
     await page.goto("/");
     await page.waitForTimeout(1500);
 
@@ -112,14 +143,87 @@ test.describe("Meetings", () => {
     await page.locator("#username").fill("");
     await page.locator("#username").pressSequentially("CreateUser", { delay: 80 });
     await page.waitForTimeout(500);
-    await page.getByText("Create a New Meeting ID").click();
+
+    // Step 1: Generate populates the field but does not navigate.
+    await page.getByText("Generate a New Meeting ID").click();
+    await expect(page.locator("#meeting-id")).not.toHaveValue("", { timeout: 10_000 });
+    await expect(page).toHaveURL(/\/$/);
+
+    // Step 2: Click Start/Join to enter the meeting.
+    await page.getByText("Start or Join Meeting").click();
     await expect(page).toHaveURL(/\/meeting\/[a-f0-9]+/, { timeout: 10_000 });
 
-    // Navigate back to home page
+    // Navigate back to home page and confirm display name was persisted.
     await page.goto("/");
     await page.waitForTimeout(2000);
-
-    // The display name input should be pre-filled from localStorage
     await expect(page.locator("#username")).toHaveValue("CreateUser", { timeout: 5_000 });
+  });
+
+  test("display name field shows inline validation error when invalid char is typed", async ({
+    page,
+  }) => {
+    // The static hint under #username is gone; an inline error <p> appears
+    // only when the user types a disallowed character, and clears as soon as
+    // the field becomes valid again.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    // Empty state shows no error.
+    await expect(page.locator("#username + p")).toHaveCount(0);
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("alice@", { delay: 80 });
+    await page.waitForTimeout(500);
+
+    // The error message should mention the offending character and "not allowed".
+    const errorLocator = page.locator("#username + p");
+    await expect(errorLocator).toBeVisible({ timeout: 5_000 });
+    await expect(errorLocator).toContainText("'@'");
+    await expect(errorLocator).toContainText("not allowed");
+
+    // Remove the invalid char — error should clear.
+    await page.locator("#username").fill("alice");
+    await page.waitForTimeout(500);
+    await expect(page.locator("#username + p")).toHaveCount(0);
+  });
+
+  test("meeting-id field shows inline validation error when invalid char is typed", async ({
+    page,
+  }) => {
+    // Hyphens are NOT allowed in meeting IDs (is_valid_meeting_id only permits
+    // alphanumerics + underscore). The inline error appears on invalid keystrokes
+    // and clears once the field is valid.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    // Empty state: no error, no static hint.
+    await expect(page.locator("#meeting-id + p")).toHaveCount(0);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially("my-room", { delay: 80 });
+    await page.waitForTimeout(500);
+
+    const errorLocator = page.locator("#meeting-id + p");
+    await expect(errorLocator).toBeVisible({ timeout: 5_000 });
+    await expect(errorLocator).toContainText("'-'");
+    await expect(errorLocator).toContainText("not allowed");
+
+    // Fix the field — error should clear.
+    await page.locator("#meeting-id").fill("myroom");
+    await page.waitForTimeout(500);
+    await expect(page.locator("#meeting-id + p")).toHaveCount(0);
+  });
+
+  test("home page does NOT show static validation hints in the empty state", async ({ page }) => {
+    // The previous static hints under both inputs were removed; only inline
+    // errors should ever appear, and only when the user types an invalid char.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await expect(
+      page.getByText("Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes"),
+    ).toHaveCount(0);
+    await expect(page.getByText("Characters allowed: a-z, A-Z, 0-9, and _")).toHaveCount(0);
   });
 });

@@ -12,6 +12,7 @@ pub mod console_log_collector;
 pub mod constants;
 pub mod context;
 pub mod id_token;
+pub mod local_storage;
 pub mod meeting_api;
 pub mod pages;
 pub mod pkce;

@@ -81,3 +81,5 @@ bot/assets/costumes/
 # AI
 .claude/worktrees/
 .claude/settings.local.json
+.claude/agent-memory
+

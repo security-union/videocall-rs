@@ -238,8 +238,8 @@ async fn run_webtransport_connection_from_request(
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
 ) -> anyhow::Result<()> {
-    warn!("received WebTransport request: {}", request.url());
-    let uri = request.url();
+    warn!("received WebTransport request: {}", request.url);
+    let uri = &request.url;
     let path = urlencoding::decode(uri.path()).unwrap().into_owned();
 
     let parts = path.split('/').collect::<Vec<&str>>();
@@ -252,60 +252,70 @@ async fn run_webtransport_connection_from_request(
         return Err(anyhow!("Invalid path: must start with /lobby"));
     }
 
-    // Extract ?token= from query string
+    // Extract ?token= and ?instance_id= from query string
     let token = uri
         .query_pairs()
         .find(|(key, _)| key == "token")
         .map(|(_, val)| val.into_owned());
 
+    let instance_id: Option<String> = uri
+        .query_pairs()
+        .find(|(key, _)| key == "instance_id")
+        .map(|(_, val)| val.into_owned());
+
     // Determine username, room, and observer flag from either the JWT or URL path params.
-    let (username, lobby_id, observer, display_name) = if let Some(ref tok) = token {
-        // Token-based flow: identity and room come from the JWT claims.
-        let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
-        if jwt_secret.is_empty() {
-            return Err(anyhow!("JWT_SECRET not set"));
-        }
-        let claims = token_validator::decode_room_token(&jwt_secret, tok).map_err(|e| {
-            e.log("WT");
-            anyhow!("token validation failed: {}", e.client_message())
-        })?;
-        info!(
-            "WT token-based connection: user_id={}, room={}, display_name={}, observer={}",
-            claims.sub, claims.room, claims.display_name, claims.observer
+    let (username, lobby_id, observer, display_name, is_guest, is_host, end_on_host_leave) =
+        if let Some(ref tok) = token {
+            // Token-based flow: identity and room come from the JWT claims.
+            let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+            if jwt_secret.is_empty() {
+                return Err(anyhow!("JWT_SECRET not set"));
+            }
+            let claims = token_validator::decode_room_token(&jwt_secret, tok).map_err(|e| {
+                e.log("WT");
+                anyhow!("token validation failed: {}", e.client_message())
+            })?;
+            info!(
+            "WT token-based connection: user_id={}, room={}, display_name={}, is_guest={}, observer={}, is_host={}",
+            claims.sub, claims.room, claims.display_name, claims.is_guest, claims.observer, claims.is_host
         );
-        (
-            claims.sub,
-            claims.room,
-            claims.observer,
-            claims.display_name,
-        )
-    } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
-        // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
-        if parts.len() != 3 {
-            return Err(anyhow!(
+            (
+                claims.sub,
+                claims.room,
+                claims.observer,
+                claims.display_name,
+                claims.is_guest,
+                claims.is_host,
+                claims.end_on_host_leave,
+            )
+        } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
+            // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
+            if parts.len() != 3 {
+                return Err(anyhow!(
                 "Invalid path: expected /lobby/{{user_id}}/{{room}} (deprecated) or /lobby?token=<JWT>"
             ));
-        }
-        let username = parts[1].replace(' ', "_");
-        let lobby_id = parts[2].replace(' ', "_");
-        let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-        if !re.is_match(&username) || !re.is_match(&lobby_id) {
-            return Err(anyhow!("Invalid path input chars"));
-        }
-        info!(
-            "WT deprecated path-based connection: user_id={}, room={}",
-            username, lobby_id
-        );
-        // display_name fallback: use user_id for deprecated path
-        let display = username.clone();
-        (username, lobby_id, false, display) // deprecated path-based endpoint: never observer
-    } else {
-        // FF=on but no token provided
-        info!("WT connection rejected: no token provided and meeting management is enabled");
-        return Err(anyhow!(
-            "room access token is required. Use /lobby?token=<JWT>"
-        ));
-    };
+            }
+            let username = parts[1].replace(' ', "_");
+            let lobby_id = parts[2].replace(' ', "_");
+            let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
+            if !re.is_match(&username) || !re.is_match(&lobby_id) {
+                return Err(anyhow!("Invalid path input chars"));
+            }
+            info!(
+                "WT deprecated path-based connection: user_id={}, room={}",
+                username, lobby_id
+            );
+            // display_name fallback: use user_id for deprecated path
+            let display = username.clone();
+            // deprecated path-based endpoint: no JWT claim, treat as non-guest & non-observer, not host
+            (username, lobby_id, false, display, false, false, true)
+        } else {
+            // FF=on but no token provided
+            info!("WT connection rejected: no token provided and meeting management is enabled");
+            return Err(anyhow!(
+                "room access token is required. Use /lobby?token=<JWT>"
+            ));
+        };
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
@@ -317,11 +327,15 @@ async fn run_webtransport_connection_from_request(
         &username,
         &lobby_id,
         &display_name,
+        is_guest,
         chat_server,
         nats_client,
         tracker_sender,
         session_manager,
         observer,
+        instance_id,
+        is_host,
+        end_on_host_leave,
     )
     .await
     {
@@ -341,14 +355,19 @@ async fn handle_webtransport_session(
     username: &str,
     lobby_id: &str,
     display_name: &str,
+    is_guest: bool,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
     observer: bool,
+    instance_id: Option<String>,
+    is_host: bool,
+    end_on_host_leave: bool,
 ) -> anyhow::Result<()> {
     // Create channel for actor → WebTransport I/O
-    let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
+    let (outbound_tx, outbound_rx) =
+        mpsc::channel::<WtOutbound>(crate::constants::WT_OUTBOUND_CHANNEL_CAPACITY);
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(
@@ -356,11 +375,15 @@ async fn handle_webtransport_session(
         lobby_id.to_string(),
         username.to_string(),
         display_name.to_string(),
+        is_guest,
         outbound_tx,
         nats_client,
         tracker_sender,
         session_manager,
         observer,
+        instance_id,
+        is_host,
+        end_on_host_leave,
     );
     let actor_addr = actor.start();
 
@@ -478,6 +501,7 @@ mod tests {
         })
     }
 
+    #[allow(dead_code)]
     async fn wait_for_condition<F, Fut, T>(
         mut condition: F,
         timeout_duration: Duration,
@@ -549,12 +573,10 @@ mod tests {
         let url_str = format!("{}/lobby/{}/{}", base.trim_end_matches('/'), user, meeting);
         let url = url::Url::parse(&url_str)?;
 
-        // Create WebTransport client using 0.7.3 API (same as bot)
-        let client = unsafe {
-            web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
-        };
+        let client = web_transport_quinn::ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()?;
 
-        // Connect using modern API
         Ok(client.connect(url).await?)
     }
 
@@ -571,9 +593,9 @@ mod tests {
         );
         let url = url::Url::parse(&url_str)?;
 
-        let client = unsafe {
-            web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
-        };
+        let client = web_transport_quinn::ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()?;
         Ok(client.connect(url).await?)
     }
 
@@ -594,48 +616,63 @@ mod tests {
     /// Wait for a session to receive its MEETING_STARTED packet.
     /// The server subscribes to NATS BEFORE sending MEETING_STARTED, so receiving
     /// this packet confirms the session is fully initialized and ready to relay packets.
+    ///
+    /// Returns the persistent `RecvStream` (if one was accepted) so the caller can
+    /// reuse it for subsequent reads. The bridge writer uses a single persistent
+    /// unidirectional stream for all `UniStream` packets, so `accept_uni()` will
+    /// only succeed once per session -- subsequent calls would block forever.
     async fn wait_for_session_ready(
         session: &web_transport_quinn::Session,
         name: &str,
-    ) -> Result<(), &'static str> {
+    ) -> Result<Option<web_transport_quinn::RecvStream>, &'static str> {
         println!("Waiting for {name} to receive MEETING_STARTED...");
-        let session_clone = session.clone();
-        wait_for_condition(
-            || {
-                let session = session_clone.clone();
-                async move {
-                    // Race between uni stream and datagram since non-MEDIA
-                    // packets (e.g., MEETING, AES_KEY) may arrive via datagrams
-                    // (send_auto routes small control packets as datagrams).
-                    let buf = tokio::select! {
-                        Ok(mut stream) = session.accept_uni() => {
-                            stream.read_to_end(usize::MAX).await.ok()
-                        }
-                        Ok(datagram) = session.read_datagram() => {
-                            Some(datagram.to_vec())
-                        }
-                        else => None,
-                    };
-                    if let Some(buf) = buf {
-                        if !buf.is_empty() {
-                            if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&buf) {
-                                if wrapper.packet_type
-                                    == videocall_types::protos::packet_wrapper::packet_wrapper::PacketType::MEETING.into()
-                                {
-                                    println!("✓ {name} received MEETING_STARTED - session ready");
-                                    return Some(());
-                                }
-                            }
-                        }
+
+        let mut persistent_stream: Option<web_transport_quinn::RecvStream> = None;
+        let mut accumulated = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let meeting_type: ::protobuf::EnumOrUnknown<VcPacketType> = VcPacketType::MEETING.into();
+
+        while std::time::Instant::now() < deadline {
+            let (data, stream) =
+                read_more_data(session, persistent_stream, Duration::from_millis(200)).await;
+            persistent_stream = stream;
+
+            if data.is_empty() {
+                continue;
+            }
+
+            // Data from a datagram (no persistent stream involved): try to parse
+            // directly since datagrams are self-contained.
+            if persistent_stream.is_none() && accumulated.is_empty() {
+                if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&data) {
+                    if wrapper.packet_type == meeting_type {
+                        println!("✓ {name} received MEETING_STARTED via datagram - session ready");
+                        return Ok(persistent_stream);
                     }
-                    None
                 }
-            },
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-        )
-        .await
-        .map(|_| ())
+                // Not MEETING_STARTED datagram -- keep waiting
+                continue;
+            }
+
+            // Data from the persistent stream: accumulate and try to parse.
+            // Multiple packets (SESSION_ASSIGNED, MEETING_STARTED) may be
+            // concatenated on the same stream. Protobuf's last-wins semantics
+            // for scalar fields means that parsing the entire accumulated
+            // buffer will yield packet_type = MEETING once MEETING_STARTED
+            // has been received (overriding any earlier SESSION_ASSIGNED).
+            accumulated.extend_from_slice(&data);
+
+            if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&accumulated) {
+                if wrapper.packet_type == meeting_type {
+                    println!(
+                        "✓ {name} received MEETING_STARTED via persistent stream - session ready"
+                    );
+                    return Ok(persistent_stream);
+                }
+            }
+        }
+
+        Err("Timed out waiting for MEETING_STARTED")
     }
 
     #[actix_rt::test]
@@ -691,11 +728,14 @@ mod tests {
         println!("Client B connected!");
 
         // Wait for both sessions to be fully ready (receive MEETING_STARTED)
-        // This confirms NATS subscriptions are established
-        wait_for_session_ready(&session_a, "client A")
+        // This confirms NATS subscriptions are established.
+        // Capture the persistent RecvStream from session_b so we can reuse it
+        // when reading relayed packets later (the bridge writer uses a single
+        // persistent uni stream, so accept_uni() only succeeds once).
+        let _stream_a = wait_for_session_ready(&session_a, "client A")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        wait_for_session_ready(&session_b, "client B")
+        let persistent_stream_b = wait_for_session_ready(&session_b, "client B")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -737,55 +777,76 @@ mod tests {
         send_packet(&session_a, bytes.clone()).await;
         println!("Packet sent from A!");
 
-        // Wait for B to receive the packet
+        // Wait for B to receive the packet.
+        //
+        // The server uses a persistent unidirectional stream for all
+        // UniStream packets (MEDIA, large control), so we read incrementally
+        // with `read()` instead of `read_to_end()` (which would block until
+        // the stream is finished — i.e., until the session ends).
+        // Control packets like PARTICIPANT_JOINED may arrive as datagrams.
         println!("Waiting for packet on B...");
-        let session_b_recv = session_b.clone();
-        let received = wait_for_condition(
-            || {
-                let session = session_b_recv.clone();
-                async move {
-                    // Race between uni stream and datagram since non-MEDIA
-                    // packets (e.g., MEETING, AES_KEY) may arrive via datagrams
-                    // (send_auto routes small control packets as datagrams).
-                    let buf = tokio::select! {
-                        Ok(mut stream) = session.accept_uni() => {
-                            stream.read_to_end(usize::MAX).await.ok()
+        let mut received: Option<Vec<u8>> = None;
+        let mut persistent_stream: Option<web_transport_quinn::RecvStream> = persistent_stream_b;
+        let mut accumulated = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+        while std::time::Instant::now() < deadline && received.is_none() {
+            let (data, stream) =
+                read_more_data(&session_b, persistent_stream, Duration::from_millis(200)).await;
+            persistent_stream = stream;
+
+            if !data.is_empty() {
+                // Check if this is a datagram (non-persistent) containing a parseable packet
+                if persistent_stream.is_none() && accumulated.is_empty() {
+                    // Data likely came from a datagram
+                    if let Ok(pkt) = VcPacketWrapper::parse_from_bytes(&data) {
+                        let media_type: ::protobuf::EnumOrUnknown<VcPacketType> =
+                            VcPacketType::MEDIA.into();
+                        if pkt.packet_type == media_type {
+                            println!(
+                                "Received MEDIA packet on B via datagram (size: {} bytes)",
+                                data.len()
+                            );
+                            received = Some(data);
+                            continue;
                         }
-                        Ok(datagram) = session.read_datagram() => {
-                            Some(datagram.to_vec())
-                        }
-                        else => None,
-                    };
-                    if let Some(buf) = buf {
-                        if !buf.is_empty() {
-                            if let Ok(pkt) = VcPacketWrapper::parse_from_bytes(&buf) {
-                                let media_type: ::protobuf::EnumOrUnknown<VcPacketType> =
-                                    VcPacketType::MEDIA.into();
-                                if pkt.packet_type == media_type {
-                                    println!(
-                                        "Received MEDIA packet on B (size: {} bytes)",
-                                        buf.len()
-                                    );
-                                    return Some(buf);
-                                }
-                                println!(
-                                    "Skipping non-MEDIA packet on B (type: {:?})",
-                                    pkt.packet_type
-                                );
-                            } else {
-                                println!("Received unparseable packet on B, returning it");
-                                return Some(buf);
-                            }
-                        }
+                        println!(
+                            "Skipping non-MEDIA datagram on B (type: {:?})",
+                            pkt.packet_type
+                        );
+                        continue;
                     }
-                    None
                 }
-            },
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-        )
-        .await
-        .expect("Should receive packet from A on B");
+
+                // Data from the persistent stream: accumulate and try to parse
+                accumulated.extend_from_slice(&data);
+
+                // Try to parse a PacketWrapper from the accumulated data.
+                // Since packets are concatenated without framing on the persistent
+                // stream, we attempt to parse from the beginning of the buffer.
+                if let Ok(pkt) = VcPacketWrapper::parse_from_bytes(&accumulated) {
+                    let media_type: ::protobuf::EnumOrUnknown<VcPacketType> =
+                        VcPacketType::MEDIA.into();
+                    if pkt.packet_type == media_type {
+                        println!(
+                            "Received MEDIA packet on B via persistent stream (size: {} bytes)",
+                            accumulated.len()
+                        );
+                        received = Some(accumulated.clone());
+                    } else {
+                        println!(
+                            "Skipping non-MEDIA packet on B (type: {:?})",
+                            pkt.packet_type
+                        );
+                        accumulated.clear();
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let received = received.expect("Should receive packet from A on B");
 
         println!("Packet successfully relayed!");
 
@@ -814,6 +875,15 @@ mod tests {
         Ok(())
     }
 
+    /// Tests cross-lobby isolation and self-echo prevention.
+    ///
+    /// This test verifies multi-packet delivery counts using server-side
+    /// `TEST_PACKET_COUNTERS`. These counters increment when the bridge
+    /// writer successfully writes a packet to the persistent unidirectional
+    /// stream (or datagram). Ordering of packets within a lobby is guaranteed
+    /// by the persistent stream (QUIC per-stream ordering); see
+    /// `test_persistent_stream_packet_ordering` for explicit client-side
+    /// ordering verification.
     #[actix_rt::test]
     async fn test_lobby_isolation() {
         let _ = tracing_subscriber::fmt()
@@ -1157,11 +1227,348 @@ mod tests {
         packet.write_to_bytes().expect("serialize wrapper")
     }
 
+    /// Create a MEDIA packet with a sequence marker embedded in `MediaPacket.data`.
+    /// The marker is `SEQ:<seq_num>:END` so it can be located in a concatenated byte
+    /// stream without needing protobuf framing.
+    fn create_sequenced_test_packet(sender: &str, seq_num: u32) -> Vec<u8> {
+        let marker = format!("SEQ:{seq_num:04}:END");
+        let media = VcMediaPacket {
+            media_type: VcMediaType::AUDIO.into(),
+            user_id: sender.as_bytes().to_vec(),
+            data: marker.into_bytes(),
+            ..Default::default()
+        };
+        let packet = VcPacketWrapper {
+            packet_type: VcPacketType::MEDIA.into(),
+            user_id: sender.as_bytes().to_vec(),
+            data: media.write_to_bytes().expect("serialize media"),
+            ..Default::default()
+        };
+        packet.write_to_bytes().expect("serialize wrapper")
+    }
+
+    /// Read a single length-prefixed frame from a persistent uni stream.
+    ///
+    /// Wire format: `[4-byte BE length][payload]`
+    ///
+    /// Returns the deframed payload bytes, or `None` if the stream is finished
+    /// or encounters an error (in which case the stream should be dropped).
+    async fn read_length_prefixed_frame(
+        stream: &mut web_transport_quinn::RecvStream,
+    ) -> Option<Vec<u8>> {
+        // Read the 4-byte big-endian length header.
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            return None;
+        }
+        let payload_len = u32::from_be_bytes(len_buf) as usize;
+        if payload_len == 0 {
+            return Some(Vec::new());
+        }
+        // Read exactly `payload_len` bytes.
+        let mut payload = vec![0u8; payload_len];
+        if stream.read_exact(&mut payload).await.is_err() {
+            return None;
+        }
+        Some(payload)
+    }
+
+    /// Accept a new uni stream or datagram from the session and read one frame.
+    ///
+    /// For uni streams the server uses length-prefix framing, so we read one
+    /// complete frame (4-byte header + payload). Datagrams are self-contained
+    /// and returned as-is.
+    async fn read_available_data(
+        session: &web_transport_quinn::Session,
+    ) -> Option<(Vec<u8>, Option<web_transport_quinn::RecvStream>)> {
+        tokio::select! {
+            Ok(mut stream) = session.accept_uni() => {
+                read_length_prefixed_frame(&mut stream)
+                    .await
+                    .map(|payload| (payload, Some(stream)))
+            }
+            Ok(datagram) = session.read_datagram() => {
+                Some((datagram.to_vec(), None))
+            }
+            else => None,
+        }
+    }
+
+    /// Read one complete packet from an already-accepted persistent uni stream,
+    /// or fall back to accepting a new stream / datagram.
+    ///
+    /// The persistent stream uses length-prefix framing (`[4-byte BE len][payload]`),
+    /// so this reads one full frame and returns the deframed payload.
+    ///
+    /// Returns the data read and optionally the (possibly updated) persistent
+    /// stream handle.
+    async fn read_more_data(
+        session: &web_transport_quinn::Session,
+        persistent: Option<web_transport_quinn::RecvStream>,
+        timeout: Duration,
+    ) -> (Vec<u8>, Option<web_transport_quinn::RecvStream>) {
+        if let Some(mut stream) = persistent {
+            // Try reading one length-prefixed frame from the persistent stream.
+            match tokio::time::timeout(timeout, read_length_prefixed_frame(&mut stream)).await {
+                Ok(Some(payload)) => {
+                    return (payload, Some(stream));
+                }
+                Ok(None) => {
+                    // Stream finished or error, drop it
+                    return (Vec::new(), None);
+                }
+                Err(_) => {
+                    // Timeout - no data available yet, return the stream for next time
+                    return (Vec::new(), Some(stream));
+                }
+            }
+        }
+
+        // No persistent stream yet, accept one or read a datagram
+        match tokio::time::timeout(timeout, read_available_data(session)).await {
+            Ok(Some((d, stream))) => (d, stream),
+            _ => (Vec::new(), None),
+        }
+    }
+
+    /// Extract sequence markers from a byte buffer. Searches for `SEQ:NNNN:END`
+    /// patterns and returns the sequence numbers in the order they appear.
+    fn extract_sequence_markers(data: &[u8]) -> Vec<u32> {
+        let mut markers = Vec::new();
+        let pattern_prefix = b"SEQ:";
+        let pattern_suffix = b":END";
+
+        let mut i = 0;
+        while i + pattern_prefix.len() + 4 + pattern_suffix.len() <= data.len() {
+            if &data[i..i + pattern_prefix.len()] == pattern_prefix {
+                let num_start = i + pattern_prefix.len();
+                let num_end = num_start + 4;
+                if num_end + pattern_suffix.len() <= data.len()
+                    && &data[num_end..num_end + pattern_suffix.len()] == pattern_suffix
+                {
+                    if let Ok(s) = std::str::from_utf8(&data[num_start..num_end]) {
+                        if let Ok(n) = s.parse::<u32>() {
+                            markers.push(n);
+                            i = num_end + pattern_suffix.len();
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        markers
+    }
+
     fn get_all_user_counts(users: &[&str]) -> Vec<u64> {
         users
             .iter()
             .map(|user| get_test_packet_counter_for_user(user))
             .collect()
+    }
+
+    // ==========================================================================
+    // Persistent Stream Ordering Test (WebTransport)
+    //
+    // Validates that multiple MEDIA packets sent through the bridge writer's
+    // persistent unidirectional stream arrive at the client in the order they
+    // were written. QUIC guarantees per-stream ordering, and the persistent
+    // stream change (bridge.rs `spawn_writer`) relies on this to deliver
+    // packets without reordering -- unlike the old per-packet-stream model
+    // where independent streams had no ordering guarantee.
+    // ==========================================================================
+
+    #[actix_rt::test]
+    async fn test_persistent_stream_packet_ordering() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_writer(std::io::stderr)
+            .try_init();
+
+        // FF=off: test packet ordering without JWT.
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
+        let test_result = tokio::time::timeout(Duration::from_secs(20), async {
+            test_persistent_stream_packet_ordering_impl().await
+        })
+        .await;
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+
+        match test_result {
+            Ok(Ok(())) => println!("Test completed successfully"),
+            Ok(Err(e)) => panic!("Test failed: {e}"),
+            Err(_) => panic!("Test timed out after 20 seconds"),
+        }
+    }
+
+    async fn test_persistent_stream_packet_ordering_impl() -> anyhow::Result<()> {
+        println!("=== STARTING PERSISTENT STREAM ORDERING TEST ===");
+
+        reset_test_packet_counters();
+        println!("Starting WebTransport server...");
+        let _wt_handle = start_webtransport_server().await;
+        wait_for_server_ready().await;
+        println!("Server ready");
+
+        let meeting = "ordering-meeting";
+        let user_sender = "sender";
+        let user_receiver = "receiver";
+        let num_packets: u32 = 10;
+
+        // Connect both clients
+        println!("Connecting sender...");
+        let session_sender = connect_client(user_sender, meeting)
+            .await
+            .expect("connect sender");
+        println!("Connecting receiver...");
+        let session_receiver = connect_client(user_receiver, meeting)
+            .await
+            .expect("connect receiver");
+
+        // Wait for both sessions to be fully ready (MEETING_STARTED).
+        // Capture the persistent RecvStream from the receiver so we can reuse
+        // it when reading sequenced packets later.
+        let _stream_sender = wait_for_session_ready(&session_sender, "sender")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let persistent_stream_receiver = wait_for_session_ready(&session_receiver, "receiver")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        // Keep connections alive
+        let sender_keep = session_sender.clone();
+        let receiver_keep = session_receiver.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                keep_alive(&sender_keep).await;
+            }
+        });
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                keep_alive(&receiver_keep).await;
+            }
+        });
+
+        // Allow NATS subscriptions to propagate
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Send activation packets so ActivateConnection fires before counting
+        let activation = create_test_packet(
+            user_sender,
+            VcMediaType::AUDIO,
+            "activation-sender".to_string(),
+        );
+        send_packet(&session_sender, activation).await;
+        let activation = create_test_packet(
+            user_receiver,
+            VcMediaType::AUDIO,
+            "activation-receiver".to_string(),
+        );
+        send_packet(&session_receiver, activation).await;
+
+        // Wait for activation broadcasts to settle
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Reset counters so we count only our sequenced packets
+        reset_test_packet_counters();
+        println!("Sending {num_packets} sequenced MEDIA packets from sender...");
+
+        // Send numbered packets from sender
+        for seq in 0..num_packets {
+            let packet = create_sequenced_test_packet(user_sender, seq);
+            send_packet(&session_sender, packet).await;
+        }
+        println!("All {num_packets} packets sent from sender");
+
+        // Wait for server-side counters to confirm all packets were written
+        // to the receiver's persistent stream
+        let expected_count = u64::from(num_packets);
+        wait_for_condition_bool(
+            || async move { get_test_packet_counter_for_user(user_receiver) >= expected_count },
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("Server should write all packets to receiver");
+
+        println!(
+            "Server wrote {} packets to receiver (expected {})",
+            get_test_packet_counter_for_user(user_receiver),
+            num_packets
+        );
+
+        // Read from receiver's session: accumulate bytes from the persistent
+        // uni stream and extract sequence markers. Reuse the stream handle
+        // returned by wait_for_session_ready (the bridge writer opens only one).
+        println!("Reading data from receiver session...");
+        let mut accumulated = Vec::new();
+        let mut persistent_stream: Option<web_transport_quinn::RecvStream> =
+            persistent_stream_receiver;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+
+        while std::time::Instant::now() < deadline {
+            let (data, stream) = read_more_data(
+                &session_receiver,
+                persistent_stream,
+                Duration::from_millis(200),
+            )
+            .await;
+            persistent_stream = stream;
+            if !data.is_empty() {
+                accumulated.extend_from_slice(&data);
+            }
+
+            // Check if we have all markers yet
+            let markers = extract_sequence_markers(&accumulated);
+            if markers.len() >= num_packets as usize {
+                break;
+            }
+        }
+
+        // Extract and verify ordering
+        let markers = extract_sequence_markers(&accumulated);
+        println!("Received {} sequence markers: {:?}", markers.len(), markers);
+
+        assert!(
+            markers.len() >= num_packets as usize,
+            "Expected at least {num_packets} sequence markers, got {} (accumulated {} bytes)",
+            markers.len(),
+            accumulated.len()
+        );
+
+        // Verify strict ordering: each marker must be greater than the previous
+        for window in markers.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "Ordering violation: sequence {} appeared before {} -- \
+                 persistent stream should guarantee QUIC in-order delivery. \
+                 Full sequence: {:?}",
+                window[0],
+                window[1],
+                markers
+            );
+        }
+
+        // Verify all expected sequence numbers are present
+        let expected: Vec<u32> = (0..num_packets).collect();
+        assert_eq!(
+            markers, expected,
+            "Expected sequences {:?} but got {:?}",
+            expected, markers,
+        );
+
+        println!("=== PERSISTENT STREAM ORDERING TEST PASSED ===");
+        println!(
+            "Verified {num_packets} packets arrived in order via the persistent \
+             uni stream. QUIC per-stream ordering guarantees make this possible."
+        );
+        Ok(())
     }
 
     // ==========================================================================
@@ -1298,6 +1705,7 @@ mod tests {
             "wt-jwt-room-1",
             true,
             "Alice",
+            false, // is_guest
         )
         .expect("generate token");
 
@@ -1321,6 +1729,7 @@ mod tests {
             "wt-jwt-room-2",
             false,
             "Alice",
+            false, // is_guest
         )
         .expect("generate token");
 
@@ -1342,6 +1751,7 @@ mod tests {
             "wt-jwt-room-3",
             false,
             "Alice",
+            false, // is_guest
         )
         .expect("generate token");
 
@@ -1374,6 +1784,7 @@ mod tests {
             "wt-special-room",
             false,
             "Bob",
+            false, // is_guest
         )
         .expect("generate token");
 
@@ -1429,6 +1840,7 @@ mod tests {
             room,
             true,
             "Host",
+            false, // is_guest
         )
         .expect("generate host token");
 
@@ -1439,6 +1851,7 @@ mod tests {
             room,
             false,
             "Attendee",
+            false, // is_guest
         )
         .expect("generate attendee token");
 

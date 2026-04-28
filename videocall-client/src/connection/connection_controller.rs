@@ -23,6 +23,7 @@ use gloo::timers::callback::Interval;
 use log::{debug, info, warn};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::AtomicBool;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 #[derive(Debug)]
@@ -240,6 +241,54 @@ impl ConnectionController {
             std::collections::HashMap::new()
         }
     }
+
+    /// Calculate packet rates per second for health reporting
+    pub fn calculate_packet_rates(&self) {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.calculate_packet_rates();
+        }
+    }
+
+    /// Get packets received per second (should be called after calculate_packet_rates)
+    pub fn get_packets_received_per_sec(&self) -> f64 {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.get_packets_received_per_sec()
+        } else {
+            0.0
+        }
+    }
+
+    /// Get packets sent per second (should be called after calculate_packet_rates)
+    pub fn get_packets_sent_per_sec(&self) -> f64 {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.get_packets_sent_per_sec()
+        } else {
+            0.0
+        }
+    }
+
+    /// Get send queue depth from the active connection (bufferedAmount for WebSocket)
+    pub fn get_send_queue_depth(&self) -> Option<u64> {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.get_send_queue_depth()
+        } else {
+            None
+        }
+    }
+
+    /// Returns the shared re-election completed signal.
+    ///
+    /// Forwards to [`ConnectionManager::reelection_completed_signal`].
+    pub fn reelection_completed_signal(&self) -> Rc<AtomicBool> {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.reelection_completed_signal()
+        } else {
+            // Fallback: return a standalone AtomicBool. This only happens if
+            // the manager is already borrowed (should not occur during setup).
+            log::warn!("ConnectionController: manager borrowed during reelection_completed_signal — returning disconnected signal");
+            Rc::new(AtomicBool::new(false))
+        }
+    }
 }
 
 impl Drop for ConnectionController {
@@ -302,6 +351,8 @@ mod tests {
             on_state_changed: state_capture.callback(),
             peer_monitor: Callback::from(|_| {}),
             election_period_ms: 1000,
+            instance_id: "test-instance-id".to_string(),
+            reelection_completed_signal: Rc::new(AtomicBool::new(false)),
         }
     }
 

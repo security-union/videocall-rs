@@ -45,6 +45,13 @@ pub enum DiagnosticEvent {
         media_type: MediaType,
         frame_size: u64, // Size of the frame in bytes
     },
+    DecodeError {
+        peer_id: String,
+        media_type: MediaType,
+    },
+    RemovePeer {
+        peer_id: String,
+    },
     RequestStats,
     SetStatsCallback(Callback<String>),
     SetReportingInterval(u64),
@@ -82,10 +89,13 @@ struct FpsTracker {
     total_frames: u32,
     #[allow(dead_code)]
     media_type: MediaType,
-    last_frame_time: f64,     // Add timestamp of last received frame
-    bytes_received: u64,      // Track total bytes received
-    last_bitrate_update: f64, // Last time we calculated bitrate
-    current_bitrate: f64,     // Current bitrate in kbits/sec
+    last_frame_time: f64,       // Add timestamp of last received frame
+    bytes_received: u64,        // Track total bytes received
+    last_bitrate_update: f64,   // Last time we calculated bitrate
+    current_bitrate: f64,       // Current bitrate in kbits/sec
+    decode_errors_count: u32,   // Windowed counter (resets every 1s)
+    decode_errors_per_sec: f64, // Decode errors per second
+    total_decode_errors: u64,   // Cumulative decode error counter (never resets)
 }
 
 impl FpsTracker {
@@ -101,6 +111,9 @@ impl FpsTracker {
             bytes_received: 0,
             last_bitrate_update: now,
             current_bitrate: 0.0,
+            decode_errors_count: 0,
+            decode_errors_per_sec: 0.0,
+            total_decode_errors: 0,
         }
     }
 
@@ -123,6 +136,10 @@ impl FpsTracker {
             let bits = (self.bytes_received * 8) as f64;
             self.current_bitrate = (bits / elapsed_ms) * 1000.0 / 1000.0; // Convert to kbits/sec
 
+            // Calculate decode errors per second
+            self.decode_errors_per_sec = (self.decode_errors_count as f64 * 1000.0) / elapsed_ms;
+            self.decode_errors_count = 0;
+
             // Reset counters
             self.bytes_received = 0;
             self.last_fps_update = now;
@@ -130,6 +147,11 @@ impl FpsTracker {
         }
 
         (self.fps, self.current_bitrate)
+    }
+
+    fn track_decode_error(&mut self) {
+        self.decode_errors_count += 1;
+        self.total_decode_errors += 1;
     }
 
     // Check if no frames have been received for a while and reset FPS if needed
@@ -195,7 +217,6 @@ impl std::fmt::Debug for JsTimer {
 pub struct DiagnosticManager {
     sender: Sender<DiagnosticEvent>,
     frames_decoded: Arc<AtomicU32>,
-    frames_dropped: Arc<AtomicU32>,
     report_interval_ms: u64,
     timer: Option<Rc<JsTimer>>,
 }
@@ -219,7 +240,6 @@ impl std::fmt::Debug for DiagnosticManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiagnosticManager")
             .field("frames_decoded", &self.frames_decoded)
-            .field("frames_dropped", &self.frames_dropped)
             .field("report_interval_ms", &self.report_interval_ms)
             .finish()
     }
@@ -245,7 +265,6 @@ impl DiagnosticManager {
         let mut manager = Self {
             sender: sender.clone(),
             frames_decoded: Arc::new(AtomicU32::new(0)),
-            frames_dropped: Arc::new(AtomicU32::new(0)),
             report_interval_ms: 500,
             timer: None,
         };
@@ -321,7 +340,7 @@ impl DiagnosticManager {
 
     // Track a frame received from a peer for a specific media type
     pub fn track_frame(&self, peer_id: &str, media_type: MediaType, frame_size: u64) -> f64 {
-        self.frames_decoded.fetch_add(1, Ordering::SeqCst);
+        self.frames_decoded.fetch_add(1, Ordering::Relaxed);
 
         if let Err(e) = self
             .sender
@@ -342,19 +361,28 @@ impl DiagnosticManager {
         0.0
     }
 
-    // Increment the frames dropped counter
-    pub fn increment_frames_dropped(&self) {
-        self.frames_dropped.fetch_add(1, Ordering::SeqCst);
+    // Track a decode error for a specific peer (Phase 1 metric - windowed counter)
+    // Note: this counts codec/decode errors (keyframe miss, parse error, decoder reset),
+    // NOT CPU-pressure-driven throughput drops (which WebCodecs does not expose).
+    pub fn track_decode_error(&self, peer_id: &str, media_type: MediaType) {
+        // Send event to worker to increment the windowed counter for this peer
+        if let Err(e) = self.sender.clone().try_send(DiagnosticEvent::DecodeError {
+            peer_id: peer_id.to_string(),
+            media_type,
+        }) {
+            error!("Failed to track decode error: {e}");
+        }
     }
 
-    // Get the current frames decoded count
-    pub fn get_frames_decoded(&self) -> u32 {
-        self.frames_decoded.load(Ordering::SeqCst)
-    }
-
-    // Get the current frames dropped count
-    pub fn get_frames_dropped(&self) -> u32 {
-        self.frames_dropped.load(Ordering::SeqCst)
+    // Remove all tracking state for a departed peer.
+    // Must be called when a peer leaves to prevent stale FpsTracker entries from
+    // broadcasting stale DiagEvents indefinitely, which would defeat the freshness gate.
+    pub fn remove_peer(&self, peer_id: &str) {
+        if let Err(e) = self.sender.clone().try_send(DiagnosticEvent::RemovePeer {
+            peer_id: peer_id.to_string(),
+        }) {
+            error!("Failed to remove peer from diagnostics: {e}");
+        }
     }
 
     // Method to be implemented fully later
@@ -399,11 +427,26 @@ impl DiagnosticWorker {
 
                 tracker.track_frame_with_size(frame_size);
             }
+            DiagnosticEvent::DecodeError {
+                peer_id,
+                media_type,
+            } => {
+                let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
+
+                let tracker = peer_trackers
+                    .entry(media_type)
+                    .or_insert_with(|| FpsTracker::new(media_type));
+
+                tracker.track_decode_error();
+            }
             DiagnosticEvent::SetStatsCallback(callback) => {
                 self.on_stats_update = Some(callback);
             }
             DiagnosticEvent::SetReportingInterval(interval) => {
                 self.report_interval_ms = interval;
+            }
+            DiagnosticEvent::RemovePeer { peer_id } => {
+                self.fps_trackers.remove(&peer_id);
             }
             DiagnosticEvent::RequestStats => {
                 self.maybe_report_stats_to_ui();
@@ -430,38 +473,49 @@ impl DiagnosticWorker {
 
         for (peer_id, peer_trackers) in &self.fps_trackers {
             for (media_type, tracker) in peer_trackers {
-                // Always publish to global diagnostics broadcast system (independent of packet handler)
-                let event = DiagEvent {
-                    subsystem: "decoder",
-                    stream_id: None,
-                    ts_ms: now_ms(),
-                    metrics: vec![
-                        metric!("fps", tracker.fps),
-                        metric!("bitrate_kbps", tracker.current_bitrate),
-                        metric!("media_type", format!("{:?}", media_type)),
-                        metric!("from_peer", self.userid.clone()),
-                        metric!("to_peer", peer_id.clone()),
-                    ],
+                // Use inactivity-aware metrics: if no frame has arrived in over 1 second,
+                // report zeros instead of stale cached values from the last active window.
+                let inactive_ms = now - tracker.last_frame_time;
+                let (fps, bitrate, decode_errors) = if inactive_ms > 1000.0 {
+                    (0.0, 0.0, 0.0)
+                } else {
+                    (
+                        tracker.fps,
+                        tracker.current_bitrate,
+                        tracker.decode_errors_per_sec,
+                    )
                 };
-                debug!(
-                    "Broadcasting decoder event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps",
-                    peer_id, media_type, tracker.fps, tracker.current_bitrate
-                );
-                let _ = global_sender().try_broadcast(event);
 
-                // Also publish a normalized video event that the health reporter uses for UI + server
-                let video_event = DiagEvent {
-                    subsystem: "video",
-                    stream_id: None,
-                    ts_ms: now_ms(),
-                    metrics: vec![
-                        metric!("fps_received", tracker.fps),
-                        metric!("bitrate_kbps", tracker.current_bitrate),
-                        metric!("from_peer", self.userid.clone()),
-                        metric!("to_peer", peer_id.clone()),
-                    ],
-                };
-                let _ = global_sender().try_broadcast(video_event);
+                // Only broadcast "video" subsystem events for VIDEO and SCREEN media types.
+                // AUDIO packet rate from fps_trackers must NOT go into the video-quality channel
+                // because:
+                //   1. Audio packet rate (~50/s) would overwrite the real video fps in the
+                //      health reporter's video_stats, showing "50 fps" instead of actual fps.
+                //   2. An inactive AUDIO tracker (fps=0) would zero out video fps even when
+                //      video is flowing fine, causing quality scores to disappear (the N-1
+                //      alternating stats bug observed in vcprobe).
+                // Audio quality is measured by NetEQ via the "neteq" subsystem — not here.
+                if *media_type != MediaType::AUDIO {
+                    let video_event = DiagEvent {
+                        subsystem: "video",
+                        stream_id: None,
+                        ts_ms: now_ms(),
+                        metrics: vec![
+                            metric!("fps_received", fps),
+                            metric!("bitrate_kbps", bitrate),
+                            metric!("decode_errors_per_sec", decode_errors),
+                            metric!("decode_errors_total", tracker.total_decode_errors),
+                            metric!("media_type", format!("{:?}", media_type)),
+                            metric!("from_peer", self.userid.clone()),
+                            metric!("to_peer", peer_id.clone()),
+                        ],
+                    };
+                    debug!(
+                        "Broadcasting video event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps, DecodeErrors={:.1}/s",
+                        peer_id, media_type, fps, bitrate, decode_errors
+                    );
+                    let _ = global_sender().try_broadcast(video_event);
+                }
 
                 // Only create and send protobuf packets if packet handler is set (legacy system)
                 if let Some(handler) = &self.packet_handler {
@@ -474,19 +528,19 @@ impl DiagnosticWorker {
 
                     if *media_type == MediaType::AUDIO {
                         let mut audio_metrics = AudioMetrics::new();
-                        audio_metrics.fps_received = tracker.fps as f32;
-                        audio_metrics.bitrate_kbps = tracker.current_bitrate as u32;
+                        audio_metrics.fps_received = fps as f32;
+                        audio_metrics.bitrate_kbps = bitrate as u32;
                         packet.audio_metrics = ::protobuf::MessageField::some(audio_metrics);
                     } else {
                         let mut video_metrics = VideoMetrics::new();
-                        video_metrics.fps_received = tracker.fps as f32;
-                        video_metrics.bitrate_kbps = tracker.current_bitrate as u32;
+                        video_metrics.fps_received = fps as f32;
+                        video_metrics.bitrate_kbps = bitrate as u32;
                         packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
                     }
 
                     debug!(
                         "Sending diagnostic packet to {}: {:?} FPS: {:.2} Bitrate: {:.1} kbit/s",
-                        peer_id, media_type, tracker.fps, tracker.current_bitrate
+                        peer_id, media_type, fps, bitrate
                     );
                     handler.emit(packet);
                 }

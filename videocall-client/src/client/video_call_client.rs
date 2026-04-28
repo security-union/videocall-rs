@@ -21,8 +21,9 @@ use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
+use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
-use crate::health_reporter::HealthReporter;
+use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
@@ -34,7 +35,7 @@ use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -51,6 +52,32 @@ use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
 
+/// Generate a cryptographically random instance ID for correlating reconnections.
+/// Uses `crypto.getRandomValues()` for unpredictability since the instance_id
+/// is used for session eviction (a predictable ID could allow targeted eviction).
+fn generate_instance_id() -> String {
+    let mut buf = [0u8; 16];
+    if let Some(crypto) = web_sys::window().and_then(|w| w.crypto().ok()) {
+        let _ = crypto.get_random_values_with_u8_array(&mut buf);
+    } else {
+        // Fallback for environments without window.crypto (e.g., workers).
+        let rand = || (js_sys::Math::random() * 0xFFFF_FFFF_u32 as f64) as u32;
+        buf[0..4].copy_from_slice(&rand().to_be_bytes());
+        buf[4..8].copy_from_slice(&rand().to_be_bytes());
+        buf[8..12].copy_from_slice(&rand().to_be_bytes());
+        buf[12..16].copy_from_slice(&rand().to_be_bytes());
+    }
+    format!(
+        "{:08x}-{:08x}-{:08x}-{:08x}",
+        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+        u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
+    )
+}
+
+const MAX_SESSION_ID_HISTORY: usize = 16;
+
 /// Configuration options for creating a [`VideoCallClient`].
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
@@ -66,6 +93,7 @@ pub struct VideoCallClientOptions {
     pub get_peer_video_canvas_id: Callback<String, String>,
     pub get_peer_screen_canvas_id: Callback<String, String>,
     pub user_id: String,
+    pub display_name: String,
     pub meeting_id: String,
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
@@ -108,13 +136,35 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when the waiting room participant list changes (optional)
     pub on_waiting_room_updated: Option<Callback<()>>,
 
+    /// Callback triggered when meeting settings are updated (optional)
+    pub on_meeting_settings_updated: Option<Callback<()>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
     pub on_peer_left: Option<Callback<(String, String)>>,
 
+    /// Callback triggered when a participant changes their display name.
+    /// Emits `(user_id, new_display_name)`.
+    pub on_display_name_changed: Option<Callback<(String, String)>>,
+
     /// Callback triggered when a remote participant joins the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_JOINED meeting event.
     pub on_peer_joined: Option<Callback<(String, String)>>,
+
+    /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
+    /// silently discarded and no peer decoder workers are created.  Only
+    /// meeting-control packets (MEETING, SESSION_ASSIGNED) are still processed.
+    ///
+    /// Set to `false` for observer clients that only need push notifications
+    /// (e.g. the waiting room or "waiting for meeting to start" screen) so
+    /// that audio from participants already in the call cannot be decoded and
+    /// played back while the local user is not yet admitted.
+    ///
+    /// Should be `true` for call participants; set to `false` only for observer/lobby clients.
+    pub decode_media: bool,
+
+    /// Whether the local user joined as an unauthenticated guest.
+    pub is_guest: bool,
 }
 
 #[derive(Debug)]
@@ -128,14 +178,17 @@ struct InnerOptions {
     on_participant_admitted: Option<Callback<()>>,
     on_participant_rejected: Option<Callback<()>>,
     on_waiting_room_updated: Option<Callback<()>>,
+    on_meeting_settings_updated: Option<Callback<()>>,
     on_peer_left: Option<Callback<(String, String)>>,
     on_peer_joined: Option<Callback<(String, String)>>,
+    on_display_name_changed: Option<Callback<(String, String)>>,
+    decode_media: bool,
 }
 
 #[derive(Debug)]
 struct Inner {
     options: InnerOptions,
-    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
+    connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     connection_state: ConnectionState,
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
@@ -144,6 +197,11 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
+    /// All session_ids assigned to this client instance (current page load).
+    /// Survives reconnects/re-elections. Used to match CONGESTION signals that
+    /// target a previous session_id from before re-election completed.
+    /// Bounded to MAX_SESSION_ID_HISTORY to prevent unbounded growth.
+    session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so we deduplicate by (event_type, target_user_id) within a
@@ -159,6 +217,9 @@ struct Inner {
     /// The camera encoder's diagnostics loop checks this flag and calls
     /// `force_video_step_down()` on the `EncoderBitrateController`.
     congestion_step_down_requested: Arc<AtomicBool>,
+    /// Signal set by `ConnectionManager` when a re-election completes. The
+    /// camera encoder reads and clears this to suppress crash ceiling arming.
+    reelection_completed_signal: Rc<AtomicBool>,
 }
 
 /// The main client handle for a video call session.
@@ -170,7 +231,7 @@ struct Inner {
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
-    connection_controller: Rc<RefCell<Option<ConnectionController>>>,
+    connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
 }
@@ -235,6 +296,7 @@ impl VideoCallClient {
             );
 
             reporter.set_meeting_id(options.meeting_id.clone());
+            reporter.set_display_name(options.display_name.clone());
 
             if let Some(interval) = options.health_reporting_interval_ms {
                 reporter.set_health_interval(interval);
@@ -245,12 +307,13 @@ impl VideoCallClient {
             None
         };
 
-        let connection_controller: Rc<RefCell<Option<ConnectionController>>> =
+        let connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>> =
             Rc::new(RefCell::new(None));
 
         let force_camera_keyframe = Arc::new(AtomicBool::new(false));
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+        let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
         let client = Self {
             options: options.clone(),
@@ -265,8 +328,11 @@ impl VideoCallClient {
                     on_participant_admitted: options.on_participant_admitted.clone(),
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
+                    on_meeting_settings_updated: options.on_meeting_settings_updated.clone(),
+                    on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
+                    decode_media: options.decode_media,
                 },
                 connection_controller: connection_controller.clone(),
                 connection_state: ConnectionState::Failed {
@@ -274,6 +340,7 @@ impl VideoCallClient {
                     last_known_server: None,
                 },
                 own_session_id: None,
+                session_id_history: std::collections::VecDeque::new(),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -287,6 +354,7 @@ impl VideoCallClient {
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
+                reelection_completed_signal: reelection_completed_signal.clone(),
             })),
             connection_controller,
             aes,
@@ -394,6 +462,8 @@ impl VideoCallClient {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
                             inner.on_inbound_media(packet);
+                        } else {
+                            warn!("on_inbound_media: transient borrow conflict, dropping packet");
                         }
                     }
                 })
@@ -430,28 +500,55 @@ impl VideoCallClient {
             },
             peer_monitor: {
                 let inner = Rc::downgrade(&self.inner);
-                let on_connection_lost = self.options.on_connection_lost.clone();
                 Callback::from(move |_| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         match inner.try_borrow_mut() {
                             Ok(mut inner) => {
-                                inner.peer_decode_manager.run_peer_monitor();
+                                let removed = inner.peer_decode_manager.run_peer_monitor();
+                                if !removed.is_empty() {
+                                    if let Some(hr) = &inner.health_reporter {
+                                        if let Ok(reporter) = hr.try_borrow() {
+                                            for peer_id in &removed {
+                                                reporter.remove_peer(peer_id);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(_) => {
-                                on_connection_lost.emit(JsValue::from_str(
-                                    "Unable to borrow inner -- not starting peer monitor",
-                                ));
+                                // Transient borrow conflict — another callback
+                                // (e.g. on_inbound_media) currently holds the
+                                // mutable borrow.  Skip this cycle; the next
+                                // 5-second interval will retry.  This must NOT
+                                // emit on_connection_lost which would trigger a
+                                // full reconnect.
+                                warn!(
+                                    "peer_monitor: transient borrow conflict, skipping this cycle"
+                                );
                             }
                         }
                     }
                 })
             },
             election_period_ms,
+            instance_id: generate_instance_id(),
+            reelection_completed_signal: self.inner.borrow().reelection_completed_signal.clone(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
 
-        *self.connection_controller.try_borrow_mut()? = Some(connection_controller);
+        // Store the controller as an Rc so we can share it with the health reporter
+        let controller_rc = Rc::new(connection_controller);
+        *self.connection_controller.try_borrow_mut()? = Some(controller_rc.clone());
+
+        // Pass the connection controller to the health reporter for communication metrics
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(hrb) = hr.try_borrow() {
+                    hrb.set_connection_controller(controller_rc);
+                }
+            }
+        }
 
         info!("ConnectionManager created with RTT testing and 1Hz diagnostics reporting");
         Ok(())
@@ -593,6 +690,14 @@ impl VideoCallClient {
         }
     }
 
+    /// Get the local session ID assigned by the server, if available.
+    pub fn get_own_session_id(&self) -> Option<String> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.own_session_id.map(|sid| sid.to_string()),
+            Err(_) => None,
+        }
+    }
+
     pub fn get_peer_user_id(&self, session_id: &str) -> Option<String> {
         let sid: u64 = session_id.parse().ok()?;
         match self.inner.try_borrow() {
@@ -618,6 +723,27 @@ impl VideoCallClient {
             Err(_) => {
                 warn!(
                     "Failed to borrow inner in get_peer_display_name for session_id: {}",
+                    session_id
+                );
+                None
+            }
+        }
+    }
+
+    /// Returns whether the local user is a guest, as declared in the JWT claim
+    /// captured at client construction time.
+    pub fn is_local_guest(&self) -> Option<bool> {
+        Some(self.options.is_guest)
+    }
+
+    /// Get the guest status for a peer by session_id string.
+    /// Returns `None` if the peer doesn't exist or no guest status has been set.
+    pub fn get_peer_is_guest(&self, session_id: &str) -> Option<bool> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get_peer_is_guest(session_id),
+            Err(_) => {
+                warn!(
+                    "Failed to borrow inner in get_peer_is_guest for session_id: {}",
                     session_id
                 );
                 None
@@ -721,6 +847,64 @@ impl VideoCallClient {
     /// `EncoderBitrateController`.
     pub fn congestion_step_down_flag(&self) -> Arc<AtomicBool> {
         self.inner.borrow().congestion_step_down_requested.clone()
+    }
+
+    /// Returns a shared reference to the re-election completed signal.
+    ///
+    /// Pass this to `CameraEncoder` so that re-election events reach the
+    /// adaptive quality manager's crash ceiling suppression logic.
+    pub fn reelection_completed_signal(&self) -> Rc<AtomicBool> {
+        self.inner.borrow().reelection_completed_signal.clone()
+    }
+
+    /// Bind adaptive quality tier sources from a `CameraEncoder` to the
+    /// health reporter. Call this after creating the camera encoder so the
+    /// health reporter includes the current encoding tiers in each packet.
+    pub fn set_adaptive_tier_sources(&self, video_tier: Rc<AtomicU32>, audio_tier: Rc<AtomicU32>) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(mut reporter) = hr.try_borrow_mut() {
+                    reporter.set_adaptive_tier_sources(video_tier, audio_tier);
+                }
+            }
+        }
+    }
+
+    /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_encoder_metric_sources(
+        &self,
+        fps_ratio: Rc<AtomicU32>,
+        worst_peer_fps: Rc<AtomicU32>,
+        bitrate_ratio: Rc<AtomicU32>,
+        target_bitrate_kbps: Rc<AtomicU32>,
+        screen_tier: Rc<AtomicU32>,
+        screen_active: Rc<AtomicBool>,
+        output_fps: Rc<AtomicU32>,
+        camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
+        climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
+        dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
+    ) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(mut reporter) = hr.try_borrow_mut() {
+                    reporter.set_encoder_metric_sources(
+                        fps_ratio,
+                        worst_peer_fps,
+                        bitrate_ratio,
+                        target_bitrate_kbps,
+                        screen_tier,
+                        screen_active,
+                        output_fps,
+                        camera_transitions,
+                        screen_transitions,
+                        climb_limiter_snapshot,
+                        dwell_samples,
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn aes(&self) -> Rc<Aes128State> {
@@ -840,19 +1024,16 @@ impl VideoCallClient {
         }
     }
 
-    /// Update the visibility state for a peer. When `visible` is `false`,
-    /// video and screen decoding is paused to save CPU. Audio is always
-    /// decoded regardless of visibility.
+    /// Update the peer set that is eligible for video/screen decode.
     ///
-    /// Called by the UI layer when an `IntersectionObserver` detects that a
-    /// peer's canvas element has scrolled in or out of the viewport.
-    pub fn set_peer_visibility(&self, peer_id: &str, visible: bool) {
-        let sid: u64 = match peer_id.parse() {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+    /// The UI layout computes this set from the peers it actively renders.
+    /// Peers outside the set remain connected and continue decoding audio, but
+    /// skip video and screen decode to cap renderer load in large meetings.
+    pub fn set_active_decode_set(&self, active_session_ids: &std::collections::HashSet<u64>) {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            inner.peer_decode_manager.set_peer_visibility(sid, visible);
+            inner
+                .peer_decode_manager
+                .set_active_decode_set(active_session_ids);
         }
     }
 
@@ -1069,17 +1250,25 @@ impl Inner {
             response.session_id
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
-        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let peer_status =
-            if response.user_id == SYSTEM_USER_ID.as_bytes() || response.session_id == 0 {
-                PeerStatus::NoChange
-            } else {
-                let peer_user_id = String::from_utf8_lossy(&response.user_id);
-                self.peer_decode_manager
-                    .ensure_peer(response.session_id, &peer_user_id)
-            };
+        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0).
+        // Also skip creating peers when media decoding is disabled (observer mode): there
+        // is no point spinning up decoder workers for packets that will be dropped anyway.
+        let peer_status = if response.user_id == SYSTEM_USER_ID.as_bytes()
+            || response.session_id == 0
+            || !self.options.decode_media
+        {
+            PeerStatus::NoChange
+        } else {
+            let peer_user_id = String::from_utf8_lossy(&response.user_id);
+            self.peer_decode_manager
+                .ensure_peer(response.session_id, &peer_user_id)
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
+                // Observer/lobby clients must not receive encryption keys (defense-in-depth).
+                if !self.options.decode_media {
+                    return;
+                }
                 if !self.options.enable_e2ee {
                     return;
                 }
@@ -1108,6 +1297,10 @@ impl Inner {
                 }
             }
             Ok(PacketType::RSA_PUB_KEY) => {
+                // Observer/lobby clients must not receive encryption keys (defense-in-depth).
+                if !self.options.decode_media {
+                    return;
+                }
                 if !self.options.enable_e2ee {
                     return;
                 }
@@ -1149,6 +1342,14 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEDIA) => {
+                // When this client is in observer/lobby mode (decode_media == false),
+                // drop all media packets immediately.  The observer connection is only
+                // used to receive meeting-control push notifications; it must never
+                // decode or play back audio or video from the real call.
+                if !self.options.decode_media {
+                    return;
+                }
+
                 // Check if this is a KEYFRAME_REQUEST targeted at us (the sender).
                 // These arrive as MEDIA packets; we intercept them here before
                 // they reach the peer decode manager which would just skip them.
@@ -1201,12 +1402,30 @@ impl Inner {
                     response.session_id
                 );
                 self.own_session_id = Some(response.session_id);
+                if !self.session_id_history.contains(&response.session_id) {
+                    if self.session_id_history.len() >= MAX_SESSION_ID_HISTORY {
+                        self.session_id_history.pop_front();
+                    }
+                    self.session_id_history.push_back(response.session_id);
+                }
 
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {
                         if let Err(e) = controller.set_own_session_id(response.session_id) {
-                            warn!("Failed to set own_session_id in ConnectionManager: {e}");
+                            // Expected during election: complete_connection_election()
+                            // already set own_session_id before emitting the synthetic
+                            // SESSION_ASSIGNED packet, so the ConnectionManager RefCell
+                            // is still borrowed.
+                            debug!("ConnectionManager already has session_id (borrow conflict during election): {e}");
                         }
+                    }
+                }
+
+                // Update health reporter with the server-assigned session_id so that
+                // HealthPacket.session_id matches PacketWrapper.session_id for room traffic.
+                if let Some(hr) = &self.health_reporter {
+                    if let Ok(mut reporter) = hr.try_borrow_mut() {
+                        reporter.set_session_id(response.session_id.to_string());
                     }
                 }
             }
@@ -1248,38 +1467,65 @@ impl Inner {
                             }
                         }
                         Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                            // Check dedup before borrowing self.options to avoid
-                            // overlapping mutable/immutable borrows.
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
                             let display_name = if meeting_packet.display_name.is_empty() {
+                                warn!("PARTICIPANT_JOINED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
                                 target_str.clone()
                             } else {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()
                             };
-                            // Store the display name on the peer so the UI can
-                            // show it on tiles instead of the raw user_id/email.
-                            self.peer_decode_manager.set_peer_display_name_by_user_id(
-                                &target_str,
-                                display_name.clone(),
-                            );
+
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager.set_peer_display_name(
+                                    meeting_packet.session_id,
+                                    display_name.clone(),
+                                );
+                                self.peer_decode_manager.set_peer_is_guest(
+                                    meeting_packet.session_id,
+                                    meeting_packet.is_guest,
+                                );
+                            }
+
+                            // NOTE: Do NOT emit on_display_name_changed here.
+                            // PARTICIPANT_JOINED carries the initial display name for bookkeeping
+                            // (set_peer_display_name above), but it is NOT a name-change
+                            // event.  Emitting the callback here would confuse the UI into treating
+                            // every peer join as a display-name mutation — and would spuriously
+                            // update the local user's own name signal on reconnect.
+                            // on_display_name_changed is reserved for PARTICIPANT_DISPLAY_NAME_CHANGED.
+
                             let should_emit = !meeting_packet.target_user_id.is_empty()
                                 && meeting_packet.target_user_id[..]
                                     != *self.options.user_id.as_bytes()
                                 && !self.is_duplicate_peer_event("joined", &target_str);
+
                             if should_emit {
                                 info!("Peer joined: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_joined {
                                     cb.emit((display_name, target_str));
                                 }
                             } else {
-                                debug!("Suppressed PARTICIPANT_JOINED for target={}", target_str,);
+                                debug!("Suppressed PARTICIPANT_JOINED for target={}", target_str);
                             }
                         }
                         Ok(MeetingEventType::PARTICIPANT_LEFT) => {
                             if meeting_packet.session_id != 0 {
                                 self.peer_decode_manager
                                     .delete_peer(meeting_packet.session_id);
+                                // Also remove from health reporter — delete_peer
+                                // cleans connected_peers and fps_trackers, but
+                                // peer_health_data is maintained separately by
+                                // the health reporter and must be cleaned
+                                // explicitly. Without this, departed peers
+                                // persist in the health packet's peer_stats,
+                                // inflating the peer count indefinitely.
+                                if let Some(hr) = &self.health_reporter {
+                                    if let Ok(reporter) = hr.try_borrow() {
+                                        reporter
+                                            .remove_peer(&meeting_packet.session_id.to_string());
+                                    }
+                                }
                             }
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
@@ -1291,6 +1537,7 @@ impl Inner {
                                 info!("Peer left: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_left {
                                     let display_name = if meeting_packet.display_name.is_empty() {
+                                        warn!("PARTICIPANT_LEFT: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
                                         target_str.clone()
                                     } else {
                                         String::from_utf8_lossy(&meeting_packet.display_name)
@@ -1346,6 +1593,55 @@ impl Inner {
                                 callback.emit(());
                             }
                         }
+                        Ok(MeetingEventType::MEETING_SETTINGS_UPDATED) => {
+                            info!(
+                                "Received MEETING_SETTINGS_UPDATED: room={}",
+                                meeting_packet.room_id
+                            );
+                            if let Some(callback) = &self.options.on_meeting_settings_updated {
+                                callback.emit(());
+                            }
+                        }
+                        Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            let new_display_name = if meeting_packet.display_name.is_empty() {
+                                warn!("DISPLAY_NAME_CHANGED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
+                                target_str.clone()
+                            } else {
+                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
+                            };
+
+                            info!(
+                                "Received PARTICIPANT_DISPLAY_NAME_CHANGED: user={} new_name=\"{}\" (local_user={})",
+                                target_str, new_display_name, self.options.user_id
+                            );
+
+                            if meeting_packet.session_id != 0 {
+                                self.peer_decode_manager.set_peer_display_name(
+                                    meeting_packet.session_id,
+                                    new_display_name.clone(),
+                                );
+                            } else {
+                                // Server does not populate session_id for display
+                                // name changes — fall back to updating all sessions
+                                // belonging to this user_id. A rename logically
+                                // applies to every session of the same account.
+                                self.peer_decode_manager.set_peer_display_name_by_user_id(
+                                    &target_str,
+                                    new_display_name.clone(),
+                                );
+                            }
+
+                            if let Some(cb) = &self.options.on_display_name_changed {
+                                debug!(
+                                    "Emitting on_display_name_changed callback for {}",
+                                    target_str
+                                );
+                                cb.emit((target_str, new_display_name));
+                                debug!("on_display_name_changed callback returned");
+                            }
+                        }
                         Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
                             error!(
                                 "Received meeting packet with unknown event type: room={}",
@@ -1364,18 +1660,23 @@ impl Inner {
             Ok(PacketType::CONGESTION) => {
                 // Server-side congestion feedback: the server is dropping
                 // packets destined for a receiver because the outbound channel
-                // is full. Only act on it if the target session matches ours.
-                if self.own_session_id == Some(response.session_id) {
+                // is full. Match on session_id history — the signal targets a
+                // specific session_id which may be our current or a previous
+                // one from before re-election. Using session_id history (not
+                // user_id) ensures multi-tab/multi-device sessions for the
+                // same account are independently targeted.
+                if self.session_id_history.contains(&response.session_id) {
                     warn!(
-                        "Received CONGESTION signal from server (receiver: {}), requesting quality step-down",
+                        "Received CONGESTION signal from server (receiver: {}, target_session: {}), requesting quality step-down",
                         String::from_utf8_lossy(&response.user_id),
+                        response.session_id,
                     );
                     self.congestion_step_down_requested
                         .store(true, Ordering::Release);
                 } else {
                     debug!(
-                        "Ignoring CONGESTION signal targeted at session {} (our session: {:?})",
-                        response.session_id, self.own_session_id,
+                        "Ignoring CONGESTION signal for session {} (our history: {:?})",
+                        response.session_id, self.session_id_history,
                     );
                 }
             }

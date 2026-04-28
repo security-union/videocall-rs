@@ -14,14 +14,20 @@ categories = ["network-programming", "multimedia"]
 
 [dependencies]
 tokio = { version = "1.28.1", features = ["full"] }
-# Remove WebSocket, add WebTransport
-web-transport-quinn = { workspace = true }
 futures = "0.3.16"
 videocall-types = { path= "../videocall-types", version = "5.0.0" }
 protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"
 url = "2.3.1"
+
+# Transports
+web-transport-quinn = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# JWT authentication
+jsonwebtoken = "9"
 
 # Audio processing (from neteq_player.rs pattern)
 hound = "3.5"  # WAV file reading

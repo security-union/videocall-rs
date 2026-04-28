@@ -1,0 +1,797 @@
+import { test, expect, chromium, Page } from "@playwright/test";
+import { generateSessionToken } from "../helpers/auth";
+import { waitForServices } from "../helpers/wait-for-services";
+
+const COOKIE_NAME = process.env.COOKIE_NAME || "session";
+const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
+
+const BROWSER_ARGS = [
+  "--ignore-certificate-errors",
+  "--origin-to-force-quic-on=127.0.0.1:4433",
+  "--use-fake-device-for-media-stream",
+  "--use-fake-ui-for-media-stream",
+  "--disable-gpu",
+];
+
+async function createAuthenticatedContext(
+  browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
+  email: string,
+  name: string,
+  uiURL: string,
+) {
+  const context = await browser.newContext({
+    baseURL: uiURL,
+    ignoreHTTPSErrors: true,
+  });
+  const token = generateSessionToken(email, name);
+  const url = new URL(uiURL);
+  await context.addCookies([
+    {
+      name: COOKIE_NAME,
+      value: token,
+      domain: url.hostname,
+      path: "/",
+      httpOnly: true,
+      secure: false,
+      sameSite: "Lax",
+    },
+  ]);
+  return context;
+}
+
+async function navigateToMeeting(page: Page, meetingId: string, username: string) {
+  await page.goto("/");
+  await page.waitForTimeout(1500);
+
+  await page.locator("#meeting-id").click();
+  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+  await page.locator("#username").click();
+  await page.locator("#username").fill("");
+  await page.locator("#username").pressSequentially(username, { delay: 50 });
+  await page.waitForTimeout(500);
+  await page.locator("#username").press("Enter");
+  await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
+    timeout: 10_000,
+  });
+  await page.waitForTimeout(1500);
+}
+
+async function joinMeetingFromPage(
+  page: Page,
+): Promise<"in-meeting" | "waiting" | "waiting-for-meeting"> {
+  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const waitingRoom = page.getByText("Waiting to be admitted");
+  const waitingForMeeting = page.getByText("Waiting for meeting to start");
+
+  const result = await Promise.race([
+    joinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
+    waitingRoom.waitFor({ timeout: 20_000 }).then(() => "waiting" as const),
+    waitingForMeeting.waitFor({ timeout: 20_000 }).then(() => "waiting-for-meeting" as const),
+  ]);
+
+  if (result === "waiting") {
+    return "waiting";
+  }
+
+  if (result === "waiting-for-meeting") {
+    return "waiting-for-meeting";
+  }
+
+  await page.waitForTimeout(1000);
+  await joinButton.click();
+  await page.waitForTimeout(3000);
+
+  await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+  return "in-meeting";
+}
+
+async function admitGuestIfNeeded(
+  hostPage: Page,
+  guestPage: Page,
+  guestResult: "in-meeting" | "waiting" | "waiting-for-meeting",
+): Promise<void> {
+  if (guestResult === "in-meeting") {
+    return;
+  }
+
+  if (guestResult === "waiting") {
+    const admitButton = hostPage.getByTitle("Admit").first();
+    await expect(admitButton).toBeVisible({ timeout: 20_000 });
+    await hostPage.waitForTimeout(1000);
+    await admitButton.dispatchEvent("click");
+    await hostPage.waitForTimeout(3000);
+
+    const guestJoinButton = guestPage.getByText(/Join Meeting|Start Meeting/);
+    const guestGrid = guestPage.locator("#grid-container");
+
+    const postAdmit = await Promise.race([
+      guestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),
+      guestGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
+    ]);
+
+    if (postAdmit === "join-button") {
+      await guestPage.waitForTimeout(1000);
+      await guestJoinButton.click();
+      await guestPage.waitForTimeout(3000);
+      await expect(guestGrid).toBeVisible({ timeout: 15_000 });
+    }
+  }
+}
+
+/**
+ * Call the meeting API's PUT /display-name endpoint directly.
+ * Uses a fresh JWT for the given user so the request is authenticated.
+ */
+async function updateDisplayNameViaApi(
+  email: string,
+  name: string,
+  meetingId: string,
+  newDisplayName: string,
+): Promise<void> {
+  const token = generateSessionToken(email, name);
+  const url = `${API_URL}/api/v1/meetings/${meetingId}/display-name`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: `${COOKIE_NAME}=${token}`,
+    },
+    body: JSON.stringify({ display_name: newDisplayName }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`PUT display-name failed (${res.status}): ${body}`);
+  }
+}
+
+/**
+ * Call the meeting API's PUT /display-name endpoint and return the raw Response
+ * without throwing on non-2xx status. Useful for testing error paths.
+ */
+async function updateDisplayNameRaw(
+  email: string,
+  name: string,
+  meetingId: string,
+  newDisplayName: string,
+): Promise<Response> {
+  const token = generateSessionToken(email, name);
+  const url = `${API_URL}/api/v1/meetings/${meetingId}/display-name`;
+  return fetch(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: `${COOKIE_NAME}=${token}`,
+    },
+    body: JSON.stringify({ display_name: newDisplayName }),
+  });
+}
+
+/**
+ * Call the meeting API's POST /join endpoint and return the raw Response
+ * without throwing on non-2xx status. Useful for testing rate-limit paths.
+ */
+async function joinMeetingRaw(
+  email: string,
+  name: string,
+  meetingId: string,
+  displayName?: string,
+): Promise<Response> {
+  const token = generateSessionToken(email, name);
+  const url = `${API_URL}/api/v1/meetings/${meetingId}/join`;
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: `${COOKIE_NAME}=${token}`,
+    },
+    body: displayName !== undefined ? JSON.stringify({ display_name: displayName }) : undefined,
+  });
+}
+
+test.describe("Display name live update", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  /**
+   * Core flow: guest changes display name via the API while in a meeting,
+   * the host sees the updated name on the peer tile in real-time — no page
+   * refresh or rejoin required. The PARTICIPANT_DISPLAY_NAME_CHANGED event
+   * propagates through NATS → WebSocket → client → UI.
+   *
+   * Currently restricted to the Dioxus UI because the Yew UI does not yet
+   * wire up the on_display_name_changed callback needed to trigger a
+   * re-render when a peer's display name changes.
+   */
+  test("name change propagates to other participant without reconnect", async ({ baseURL }) => {
+    // The Yew UI does not yet handle PARTICIPANT_DISPLAY_NAME_CHANGED for
+    // re-rendering peer tiles, so skip this test for the yew project.
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_update_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-dn@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-dn@videocall.rs",
+        "OriginalGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Collect any "Connection lost" console messages on both pages —
+      // these would indicate an unwanted reconnect cycle.
+      const hostReconnectLogs: string[] = [];
+      const guestReconnectLogs: string[] = [];
+      hostPage.on("console", (msg) => {
+        const text = msg.text();
+        if (text.includes("Connection lost")) {
+          hostReconnectLogs.push(text);
+        }
+      });
+      guestPage.on("console", (msg) => {
+        const text = msg.text();
+        if (text.includes("Connection lost")) {
+          guestReconnectLogs.push(text);
+        }
+      });
+
+      // ---- Host joins the meeting ----
+      await navigateToMeeting(hostPage, meetingId, "HostUser");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // ---- Guest joins the meeting ----
+      await navigateToMeeting(guestPage, meetingId, "OriginalGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer discovery on both sides
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+
+      const hostPeerTile = hostPage.locator("#grid-container .canvas-container");
+      await expect(hostPeerTile.first()).toBeVisible({ timeout: 30_000 });
+
+      // ---- Verify initial display name ----
+      const originalNameOnHost = hostPage.locator(".floating-name", {
+        hasText: "OriginalGuest",
+      });
+      await expect(originalNameOnHost.first()).toBeVisible({ timeout: 10_000 });
+
+      // Let join toasts clear so they don't interfere with assertions
+      await hostPage.waitForTimeout(9000);
+
+      // ---- Guest updates display name via API ----
+      await updateDisplayNameViaApi(
+        "guest-dn@videocall.rs",
+        "OriginalGuest",
+        meetingId,
+        "RenamedGuest",
+      );
+
+      // ---- Host sees the updated name in real-time (no page refresh) ----
+      const renamedOnHost = hostPage.locator(".floating-name", {
+        hasText: "RenamedGuest",
+      });
+      await expect(renamedOnHost.first()).toBeVisible({ timeout: 15_000 });
+
+      // The old name should no longer appear on any peer tile
+      await expect(originalNameOnHost).toHaveCount(0, { timeout: 5_000 });
+
+      // ---- No reconnect / connection-lost side effects ----
+      // 1) No "Connection lost" messages in browser console
+      expect(hostReconnectLogs).toHaveLength(0);
+      expect(guestReconnectLogs).toHaveLength(0);
+
+      // 2) No visible connection error banner on either page
+      await expect(hostPage.getByText("Connection lost")).toHaveCount(0);
+      await expect(guestPage.getByText("Connection lost")).toHaveCount(0);
+      await expect(hostPage.getByText("reconnecting")).toHaveCount(0);
+      await expect(guestPage.getByText("reconnecting")).toHaveCount(0);
+
+      // 3) Both grids are still visible (nobody got kicked out)
+      await expect(hostPage.locator("#grid-container")).toBeVisible();
+      await expect(guestPage.locator("#grid-container")).toBeVisible();
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * Verify that the guest's own display name signal is updated when the
+   * server confirms the change (via PARTICIPANT_DISPLAY_NAME_CHANGED).
+   * The guest's local tile should reflect the new name too.
+   */
+  test("guest sees own display name update confirmed", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_self_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-self@videocall.rs",
+        "SelfHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-self@videocall.rs",
+        "BeforeName",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host joins
+      await navigateToMeeting(hostPage, meetingId, "SelfHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins
+      await navigateToMeeting(guestPage, meetingId, "BeforeName");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer discovery
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await expect(guestPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // ---- Guest updates own display name ----
+      await updateDisplayNameViaApi(
+        "guest-self@videocall.rs",
+        "BeforeName",
+        meetingId,
+        "AfterName",
+      );
+
+      // Guest's own tile (self-view) should show the updated name.
+      // The server echoes PARTICIPANT_DISPLAY_NAME_CHANGED to ALL
+      // participants in the meeting, including the sender.
+      const guestSelfName = guestPage.locator(".floating-name", {
+        hasText: "AfterName",
+      });
+      await expect(guestSelfName.first()).toBeVisible({ timeout: 15_000 });
+
+      // Host also sees the new name
+      const guestNameOnHost = hostPage.locator(".floating-name", {
+        hasText: "AfterName",
+      });
+      await expect(guestNameOnHost.first()).toBeVisible({ timeout: 15_000 });
+
+      // Both still in meeting — no disruption
+      await expect(hostPage.locator("#grid-container")).toBeVisible();
+      await expect(guestPage.locator("#grid-container")).toBeVisible();
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * Verify that after a display name change is confirmed by the server,
+   * navigating back to the home page shows the updated name pre-filled in
+   * the username input. This tests the localStorage persistence path:
+   *   on_display_name_changed → save_display_name_to_storage → reload → load_display_name_from_storage
+   */
+  test("updated display name persists after navigating to home", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_persist_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-persist@videocall.rs",
+        "PersistHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-persist@videocall.rs",
+        "OldName",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host joins
+      await navigateToMeeting(hostPage, meetingId, "PersistHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins
+      await navigateToMeeting(guestPage, meetingId, "OldName");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer discovery
+      await expect(guestPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // Guest changes display name via API
+      await updateDisplayNameViaApi(
+        "guest-persist@videocall.rs",
+        "OldName",
+        meetingId,
+        "NewPersisted",
+      );
+
+      // Wait for the server confirmation to propagate — guest sees own new name
+      const guestSelfName = guestPage.locator(".floating-name", {
+        hasText: "NewPersisted",
+      });
+      await expect(guestSelfName.first()).toBeVisible({ timeout: 15_000 });
+
+      // Navigate guest back to home page
+      await guestPage.goto("/");
+      await guestPage.waitForTimeout(2000);
+
+      // The username input should be pre-filled with the persisted new name
+      const usernameInput = guestPage.locator("#username");
+      await expect(usernameInput).toBeVisible({ timeout: 10_000 });
+      await expect(usernameInput).toHaveValue("NewPersisted", { timeout: 5_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * Backend rejects invalid display names with HTTP 400.
+   * Characters like '@' are disallowed by validate_display_name.
+   */
+  test("invalid display name is rejected by backend with 400", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_invalid_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-inv@videocall.rs",
+        "InvalidHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-inv@videocall.rs",
+        "ValidGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host joins
+      await navigateToMeeting(hostPage, meetingId, "InvalidHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins
+      await navigateToMeeting(guestPage, meetingId, "ValidGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer discovery
+      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // ---- Attempt to set an invalid display name (contains '@') ----
+      const res = await updateDisplayNameRaw(
+        "guest-inv@videocall.rs",
+        "ValidGuest",
+        meetingId,
+        "bad@name",
+      );
+      expect(res.status).toBe(400);
+
+      // ---- Verify the old name is still shown on the host (unchanged) ----
+      const originalNameOnHost = hostPage.locator(".floating-name", {
+        hasText: "ValidGuest",
+      });
+      await expect(originalNameOnHost.first()).toBeVisible({ timeout: 10_000 });
+
+      // No name tile should contain the invalid name
+      await expect(hostPage.locator(".floating-name", { hasText: "bad@name" })).toHaveCount(0);
+
+      // Both still in meeting
+      await expect(hostPage.locator("#grid-container")).toBeVisible();
+      await expect(guestPage.locator("#grid-container")).toBeVisible();
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * After a successful rename, re-opening the rename modal should show the
+   * latest display name (not the stale original). This validates that the
+   * `current_display_name` prop is updated before the modal re-renders.
+   */
+  test("rename modal reopens with latest display name, not stale input", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_modal_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-modal@videocall.rs",
+        "ModalHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-modal@videocall.rs",
+        "FirstName",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host joins
+      await navigateToMeeting(hostPage, meetingId, "ModalHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guest joins
+      await navigateToMeeting(guestPage, meetingId, "FirstName");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      // Wait for peer discovery
+      await expect(guestPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // ---- Open the rename modal via the edit button in peer list ----
+      const editButton = guestPage.getByLabel("Edit display name");
+      await expect(editButton.first()).toBeVisible({ timeout: 10_000 });
+      await editButton.first().click();
+
+      // Modal should appear with the current name pre-filled
+      const modalInput = guestPage.locator(".card-apple input.input-apple");
+      await expect(modalInput).toBeVisible({ timeout: 5_000 });
+      await expect(modalInput).toHaveValue("FirstName", { timeout: 5_000 });
+
+      // ---- Submit a new name via the modal ----
+      await modalInput.fill("SecondName");
+      await guestPage.locator(".card-apple button[type='submit']").click();
+
+      // Wait for success confirmation and modal to close
+      await expect(guestPage.locator(".card-apple")).not.toBeVisible({ timeout: 15_000 });
+
+      // Verify the guest sees the new name on their own tile
+      const guestSelfName = guestPage.locator(".floating-name", {
+        hasText: "SecondName",
+      });
+      await expect(guestSelfName.first()).toBeVisible({ timeout: 15_000 });
+
+      // ---- Re-open the modal — it should show "SecondName", not "FirstName" ----
+      await editButton.first().click();
+      await expect(modalInput).toBeVisible({ timeout: 5_000 });
+      await expect(modalInput).toHaveValue("SecondName", { timeout: 5_000 });
+
+      // Close the modal without saving
+      await guestPage.locator(".card-apple button[type='button']").click();
+      await expect(guestPage.locator(".card-apple")).not.toBeVisible({ timeout: 5_000 });
+
+      // Both still in meeting
+      await expect(hostPage.locator("#grid-container")).toBeVisible();
+      await expect(guestPage.locator("#grid-container")).toBeVisible();
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * Late-joiner scenario: User A joins, renames via API, then User C joins
+   * *after* the rename. User C should see User A's updated display name
+   * immediately — not the original name. This validates that the server
+   * persists the renamed display name and sends it to newly joining
+   * participants via the initial participant list / peer announcement.
+   */
+  test("late joiner sees already-renamed display name", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not yet support live display name updates",
+    );
+
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_latejoin_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      // ---- User A creates and joins the meeting ----
+      const userACtx = await createAuthenticatedContext(
+        browser1,
+        "usera-late@videocall.rs",
+        "OriginalNameA",
+        uiURL,
+      );
+      const userAPage = await userACtx.newPage();
+
+      await navigateToMeeting(userAPage, meetingId, "OriginalNameA");
+      const userAResult = await joinMeetingFromPage(userAPage);
+      expect(userAResult).toBe("in-meeting");
+      await expect(userAPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // ---- User A renames via API while alone in the meeting ----
+      await updateDisplayNameViaApi(
+        "usera-late@videocall.rs",
+        "OriginalNameA",
+        meetingId,
+        "RenamedA",
+      );
+
+      // Wait for User A to see own name update confirmed on their tile
+      const userASelfName = userAPage.locator(".floating-name", {
+        hasText: "RenamedA",
+      });
+      await expect(userASelfName.first()).toBeVisible({ timeout: 15_000 });
+
+      // ---- User C joins AFTER the rename ----
+      const userCCtx = await createAuthenticatedContext(
+        browser2,
+        "userc-late@videocall.rs",
+        "UserC",
+        uiURL,
+      );
+      const userCPage = await userCCtx.newPage();
+
+      await navigateToMeeting(userCPage, meetingId, "UserC");
+      const userCResult = await joinMeetingFromPage(userCPage);
+      await admitGuestIfNeeded(userAPage, userCPage, userCResult);
+
+      // Wait for peer discovery on User C's side
+      await expect(userCPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // ---- User C should see User A's RENAMED display name ----
+      const renamedOnC = userCPage.locator(".floating-name", {
+        hasText: "RenamedA",
+      });
+      await expect(renamedOnC.first()).toBeVisible({ timeout: 15_000 });
+
+      // The original name should NOT appear on User C's view
+      await expect(userCPage.locator(".floating-name", { hasText: "OriginalNameA" })).toHaveCount(
+        0,
+        { timeout: 5_000 },
+      );
+
+      // ---- User A also sees User C ----
+      const userCNameOnA = userAPage.locator(".floating-name", {
+        hasText: "UserC",
+      });
+      await expect(userCNameOnA.first()).toBeVisible({ timeout: 15_000 });
+
+      // Both still in meeting — no disruption
+      await expect(userAPage.locator("#grid-container")).toBeVisible();
+      await expect(userCPage.locator("#grid-container")).toBeVisible();
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * Verify that the join endpoint is rate-limited when a display_name is
+   * provided. The backend enforces 5 display-name changes per 60-second
+   * window per user, and join-with-display-name counts against that budget.
+   * The 6th request should return HTTP 429.
+   */
+  test("join with display_name is rate-limited after 5 requests", async () => {
+    test.setTimeout(30_000);
+    const email = `rl-join-${Date.now()}@videocall.rs`;
+    const name = "RLJoinUser";
+
+    for (let i = 0; i < 5; i++) {
+      const meetingId = `e2e_rl_join_${Date.now()}_${i}`;
+      const res = await joinMeetingRaw(email, name, meetingId, `Name${i}`);
+      expect(res.status).toBeLessThan(400);
+    }
+
+    // 6th join-with-display-name must be rejected
+    const meetingId = `e2e_rl_join_${Date.now()}_blocked`;
+    const res = await joinMeetingRaw(email, name, meetingId, "Blocked");
+    expect(res.status).toBe(429);
+  });
+
+  /**
+   * Verify that the rename (PUT /display-name) and join-with-display-name
+   * (POST /join) paths share the same per-user rate-limit budget. Using 3
+   * renames + 2 joins should exhaust the budget, and the 6th operation
+   * (either path) must return 429.
+   */
+  test("join and rename share the same rate-limit budget", async () => {
+    test.setTimeout(30_000);
+    const email = `rl-shared-${Date.now()}@videocall.rs`;
+    const name = "RLSharedUser";
+    const meetingId = `e2e_rl_shared_${Date.now()}`;
+
+    // First join (with display_name) creates the meeting and consumes 1 slot
+    const joinRes = await joinMeetingRaw(email, name, meetingId, "InitialName");
+    expect(joinRes.status).toBeLessThan(400);
+
+    // 2 renames via PUT consume 2 more slots (total 3)
+    for (let i = 0; i < 2; i++) {
+      const res = await updateDisplayNameRaw(email, name, meetingId, `Renamed${i}`);
+      expect(res.status).toBeLessThan(400);
+    }
+
+    // 2 more joins with display_name consume 2 more slots (total 5)
+    for (let i = 0; i < 2; i++) {
+      const otherMeeting = `e2e_rl_shared_extra_${Date.now()}_${i}`;
+      const res = await joinMeetingRaw(email, name, otherMeeting, `JoinName${i}`);
+      expect(res.status).toBeLessThan(400);
+    }
+
+    // 6th operation (rename) must be rejected — budget exhausted
+    const blockedRes = await updateDisplayNameRaw(email, name, meetingId, "BlockedName");
+    expect(blockedRes.status).toBe(429);
+  });
+});

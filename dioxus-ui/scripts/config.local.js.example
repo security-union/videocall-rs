@@ -1,0 +1,42 @@
+// Local developer configuration overrides.
+//
+// Usage:
+//   1. Copy this file to config.local.js (same directory).
+//   2. Edit the values below to suit your local setup.
+//   3. Run the UI with `trunk serve` — config.local.js patches window.__APP_CONFIG
+//      at runtime, after config.js has set the defaults.
+//
+// This file is gitignored (.gitignore: dioxus-ui/scripts/config.local.js).
+// Do NOT commit a populated config.local.js; it's for your machine only.
+//
+// Notes:
+//   - config.js (the default) is copied into dist/ automatically by trunk.
+//   - config.local.js is NOT copied automatically because trunk errors on
+//     missing files. Copy it manually into dist/ after each clean build:
+//         cp dioxus-ui/scripts/config.local.js dioxus-ui/dist/config.local.js
+//     Or add a post-build hook to your workflow.
+//   - In production the Helm chart writes a fresh config.js with your
+//     production values; config.local.js is not used in prod.
+
+if (window.__APP_CONFIG) {
+  Object.assign(window.__APP_CONFIG, {
+    // --- Common dev overrides ---
+
+    // Skip OAuth login locally for faster iteration. Requires the meeting-api
+    // to be started with ALLOW_ANONYMOUS=true.
+    // oauthEnabled: "false",
+
+    // Point at a local SearchV2 / opensearch-middleware instance, or leave empty
+    // to disable the SearchV2 search path and rely on Postgres search only.
+    // searchApiBaseUrl: "",
+
+    // End-to-end encryption toggle for local testing.
+    // e2eeEnabled: "false",
+
+    // Enable verbose log upload to a local collector.
+    // consoleLogUploadEnabled: "false",
+
+    // Mock remote participants without a full stack.
+    // mockPeersEnabled: "false",
+  });
+}

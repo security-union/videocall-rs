@@ -5,8 +5,15 @@ metadata:
   labels:
     {{- include "meeting-api.labels" . | nindent 4 }}
 spec:
+  {{- if and .Values.consoleLogs.enabled (or (and .Values.autoscaling.enabled (gt (int .Values.autoscaling.maxReplicas) 1)) (and (not .Values.autoscaling.enabled) (gt (int .Values.replicaCount) 1))) }}
+  {{- fail "consoleLogs.enabled is incompatible with multiple replicas (ReadWriteOnce PVC cannot be mounted by multiple pods)" }}
+  {{- end }}
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- if .Values.consoleLogs.enabled }}
+  strategy:
+    type: Recreate
   {{- end }}
   selector:
     matchLabels:
@@ -34,12 +41,31 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             {{- toYaml .Values.env | nindent 12 }}
+            {{- if .Values.consoleLogs.enabled }}
+            - name: CONSOLE_LOG_UPLOAD_ENABLED
+              value: "true"
+            - name: CONSOLE_LOG_DIR
+              value: "/data/console-logs"
+            - name: CONSOLE_LOG_RETENTION_DAYS
+              value: {{ .Values.consoleLogs.retentionDays | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.consoleLogs.enabled }}
+          volumeMounts:
+            - name: console-logs
+              mountPath: /data/console-logs
+          {{- end }}
+      {{- if .Values.consoleLogs.enabled }}
+      volumes:
+        - name: console-logs
+          persistentVolumeClaim:
+            claimName: {{ include "meeting-api.fullname" . }}-console-logs
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

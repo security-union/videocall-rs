@@ -1,0 +1,9 @@
+apiVersion: v2
+name: metrics-api-ascend
+version: 0.1.0
+description: Metrics API server for Ascend region
+
+dependencies:
+  - name: metrics-api
+    version: 0.1.0
+    repository: file://../../../metrics-api

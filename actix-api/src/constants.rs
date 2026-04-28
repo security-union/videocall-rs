@@ -29,7 +29,7 @@ pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// If the same user_id reconnects within this window, the departure is
 /// cancelled silently — no PARTICIPANT_LEFT or PARTICIPANT_JOINED is
 /// broadcast, avoiding false join/leave notification spam.
-pub const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(2);
+pub const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
 /// Regex pattern for validating usernames and room IDs
 /// Allows alphanumeric characters, underscores, and hyphens
@@ -59,6 +59,19 @@ pub const CONGESTION_WINDOW: Duration = Duration::from_millis(1000);
 /// session. Prevents flooding the sender with congestion signals when many
 /// packets are dropped in quick succession.
 pub const CONGESTION_NOTIFY_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Bounded channel capacity for WebTransport outbound relay queue.
+///
+/// Sized for MTU-limited datagrams (~1200 bytes) and small stream
+/// messages. 256 slots provides headroom for bursty traffic.
+pub const WT_OUTBOUND_CHANNEL_CAPACITY: usize = 256;
+
+/// Bounded channel capacity for WebSocket outbound relay queue.
+///
+/// Half the WebTransport capacity because WS frames are larger
+/// (full frames vs MTU-limited datagrams). 128 slots at ~50KB avg
+/// provides ~6.4MB max queue depth.
+pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 
 // ---------------------------------------------------------------------------
 // KEYFRAME_REQUEST Rate Limiting

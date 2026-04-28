@@ -1,6 +1,4 @@
 # Default values for meeting-api.
-# This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
 nameOverride: ""
 fullnameOverride: ""
 
@@ -9,13 +7,12 @@ image:
   repository: securityunion/videocall-meeting-api
   pullPolicy: Always
   tag: latest
+imagePullSecrets: []
 env:
   - name: RUST_LOG
     value: info
   - name: LISTEN_ADDR
     value: "0.0.0.0:8081"
-  # NOTE the postgres userid and password are hard coded here, change this 
-  # in your deployment!
   - name: DATABASE_URL
     value: postgres://postgres:password@postgres-postgresql:5432/actix-api-db?sslmode=disable
   # JWT_SECRET must be provided via a Kubernetes secret.
@@ -35,16 +32,12 @@ env:
   - name: COOKIE_DOMAIN
     value: ".videocall.rs"
   # Name of the session cookie (default: "session").
-  # Override in PR preview environments to avoid collision with the production
-  # cookie which is also named "session" on the parent domain.
-  # Example: set to "pr-session" for *.sandbox.videocall.rs previews.
   - name: COOKIE_NAME
     value: "session"
   - name: CORS_ALLOWED_ORIGIN
     value: "https://app.videocall.rs"
   # --- OAuth / OIDC ---
-  # Set OAUTH_ISSUER for OIDC discovery (auto-populates auth/token/jwks URLs, see below).
-  # OAUTH_ISSUER is base URI, e.g. https://accounts.google.com or https://acme.okta.com/oauth2/default
+  # Set OAUTH_ISSUER for OIDC discovery (auto-populates auth/token/jwks URLs).
   - name: OAUTH_ISSUER
     value: ""
   - name: OAUTH_CLIENT_ID
@@ -53,14 +46,12 @@ env:
         name: oauth-credentials
         key: client-id
         optional: true
-  # Optional, omit for public clients (e.g. Okta with PKCE).
   - name: OAUTH_SECRET
     valueFrom:
       secretKeyRef:
         name: oauth-credentials
         key: client-secret
         optional: true
-  # ----- v these not needed if discovery is used v -----
   - name: OAUTH_AUTH_URL
     value: ""
   - name: OAUTH_TOKEN_URL
@@ -69,7 +60,6 @@ env:
     value: ""
   - name: OAUTH_USERINFO_URL
     value: ""
-  # ----- ^ these not needed if discovery is used ^ -----
   - name: OAUTH_REDIRECT_URL
     value: "https://api.videocall.rs/login/callback"
   - name: OAUTH_SCOPES
@@ -78,8 +68,6 @@ env:
     value: "https://app.videocall.rs"
   - name: ALLOWED_REDIRECT_URLS
     value: "https://app.videocall.rs"
-  # Comma-separated internal URLs for the aggregated /api/v1/versions endpoint.
-  # Adjust service names per region/deployment.
   - name: SERVICE_VERSION_URLS
     value: ""
 resources:
@@ -104,23 +92,14 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+consoleLogs:
+  enabled: false
+  storageSize: 10Gi
+  retentionDays: 30
+
 ingress:
   enabled: true
   className: nginx
-  annotations:
-    cert-manager.io/issuer: letsencrypt-prod
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    kubernetes.io/tls-acme: "true"
-  hosts:
-    - host: api.videocall.rs
-      paths:
-        - path: /
-          pathType: Prefix
-          service:
-            name: meeting-api
-            port:
-              number: 8081
-  tls:
-    - secretName: meeting-api-tls
-      hosts:
-        - api.videocall.rs
+  annotations: {}
+  hosts: []
+  tls: []

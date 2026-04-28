@@ -1,0 +1,63 @@
+{{- if .Values.consoleLogs.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "meeting-api.fullname" . }}-log-cleanup
+  labels:
+    {{- include "meeting-api.labels" . | nindent 4 }}
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "meeting-api.selectorLabels" . | nindent 8 }}
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            {{- include "meeting-api.selectorLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+          containers:
+            - name: log-cleanup
+              image: alpine:3.20
+              securityContext:
+                readOnlyRootFilesystem: true
+              env:
+                - name: CONSOLE_LOG_RETENTION_DAYS
+                  value: {{ .Values.consoleLogs.retentionDays | quote }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  DAYS="${CONSOLE_LOG_RETENTION_DAYS:-30}"
+                  echo "Cleaning console log files older than ${DAYS} days"
+                  find /data/console-logs -type f \( -name '*.log' -o -name '*.log.gz' \) -mtime +"${DAYS}" -delete
+                  echo "Pruning empty directories"
+                  find /data/console-logs -mindepth 1 -type d -empty -delete
+                  echo "Cleanup complete"
+              volumeMounts:
+                - name: console-logs
+                  mountPath: /data/console-logs
+              resources:
+                limits:
+                  cpu: "50m"
+                  memory: "32Mi"
+                requests:
+                  cpu: "10m"
+                  memory: "16Mi"
+          volumes:
+            - name: console-logs
+              persistentVolumeClaim:
+                claimName: {{ include "meeting-api.fullname" . }}-console-logs
+{{- end }}

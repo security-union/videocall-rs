@@ -158,19 +158,17 @@ The quickest way to get started is with our Docker-based setup:
    cd videocall-rs
    ```
 
-2. Create a `.env` file from the sample and fill in your OAuth credentials:
+2. Create a `.env` file from the sample:
    ```
    cp docker/.env-sample .env
    ```
-   Edit `.env` and set `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`.
 
-   **Getting Google OAuth credentials:**
-   - Go to [Google Cloud Console → APIs & Credentials](https://console.cloud.google.com/apis/credentials)
-   - Create an OAuth 2.0 Client ID (Web application type)
-   - Add `http://localhost:8081/login/callback` as an Authorized redirect URI
-   - Copy the Client ID and Secret into your `.env`
+   **No OAuth credentials are required for local development.** The default config disables OAuth and uses a dev auto-login that issues a session cookie automatically. To enable the auto-login, uncomment `DEV_USER` in your `.env`:
+   ```
+   DEV_USER=dev@test.local:Dev User
+   ```
 
-   > **Note:** `make up` will auto-create `.env` from the sample if it does not exist, but you must still edit it to add your credentials before the app will work.
+   To enable OAuth (optional), see [Configuring OAuth](#configuring-oauth) below.
 
 3. Start the stack:
    ```
@@ -195,6 +193,51 @@ The quickest way to get started is with our Docker-based setup:
   Then access the app at `http://localhost:8088`.
 - **Shell environment variables:** If you have `API_BASE_URL`, `OAUTH_REDIRECT_URL`, or similar variables exported in your shell profile (`~/.bashrc`, `~/.zshrc`), they will override `.env` values. Remove them from your profile before running `make up`.
 - **Slow first run:** WASM compilation inside Docker can take 5–15 minutes on a cold cache. Subsequent runs reuse the build cache and start in seconds.
+
+### Dev Auto-Login (No OAuth Required)
+
+For local development, you can skip OAuth entirely. When OAuth is disabled (the default in `docker-compose.yaml`) and `DEV_USER` is set, the meeting-api exposes a `GET /api/v1/dev/auto-login` endpoint that issues a signed session cookie and redirects to `/`. The dioxus-ui frontend automatically calls this endpoint when no session cookie exists, making local development completely frictionless.
+
+**Setup:**
+```
+# In your .env file:
+DEV_USER=dev@test.local:Dev User
+```
+
+Format is `email:display_name`. The email becomes the user ID for meetings and the display name appears in the participant list.
+
+**How it works:**
+1. Frontend loads, detects OAuth is disabled, checks for a session cookie
+2. No cookie found → redirects to `/api/v1/dev/auto-login`
+3. meeting-api generates a JWT signed with `JWT_SECRET`, sets it as a session cookie
+4. Redirects back to `/` → frontend now has a valid session
+5. All meeting operations (create, join, leave) work normally
+
+**Safety:** The auto-login endpoint returns 404 when OAuth is enabled or `DEV_USER` is not set. It cannot be activated in production. A startup warning is logged when `DEV_USER` is active.
+
+### Configuring OAuth
+
+To enable OAuth login (required for production, optional for development):
+
+1. Set up credentials with your OAuth provider:
+   - **Google:** Go to [Google Cloud Console → APIs & Credentials](https://console.cloud.google.com/apis/credentials), create an OAuth 2.0 Client ID (Web application type), add `http://localhost:8081/login/callback` as an Authorized redirect URI
+   - **Okta:** Developer Console → Applications → Create App Integration → OIDC Web Application
+
+2. Uncomment and fill in the OAuth section in your `.env`:
+   ```
+   ENABLE_OAUTH=true
+   OAUTH_PROVIDER=google
+   OAUTH_CLIENT_ID=your-public-client-id
+   OAUTH_CLIENT_SECRET=your-client-secret
+   OAUTH_ISSUER=https://accounts.google.com
+   OAUTH_AUTH_URL=https://accounts.google.com/o/oauth2/v2/auth
+   OAUTH_REDIRECT_URL=http://localhost:3001/auth/callback
+   OAUTH_BROWSER_PKCE=true
+   AFTER_LOGIN_URL=http://localhost:3001
+   ALLOWED_REDIRECT_URLS=http://localhost,http://localhost:3001
+   ```
+
+3. Remove `DEV_USER` from your `.env` (or leave it — it's ignored when OAuth is enabled).
 
 ### Nix Build System (WIP)
 
@@ -636,3 +679,4 @@ Start your journey with videocall.rs today. Whether you're building a robot, a d
 ## License
 
 This project is dual licensed under the MIT License and the Apache License 2.0. See the [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT) files for details.
+

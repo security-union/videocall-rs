@@ -13,7 +13,10 @@
 
 //! Participant action endpoints: join, leave, status, refresh token.
 
-use videocall_meeting_types::{requests::JoinMeetingRequest, responses::ParticipantStatusResponse};
+use videocall_meeting_types::{
+    requests::{GuestJoinRequest, JoinMeetingRequest, UpdateDisplayNameRequest},
+    responses::ParticipantStatusResponse,
+};
 
 use crate::error::ApiError;
 use crate::{parse_api_response, MeetingApiClient};
@@ -42,6 +45,27 @@ impl MeetingApiClient {
         parse_api_response(response).await
     }
 
+    /// Join a meeting as a guest (unauthenticated).
+    ///
+    /// Calls `POST /api/v1/meetings/{meeting_id}/join-guest`.
+    ///
+    /// The meeting must have `allow_guests` enabled. `display_name` is required.
+    /// Guests are never hosts and cannot auto-create meetings.
+    pub async fn join_meeting_as_guest(
+        &self,
+        meeting_id: &str,
+        display_name: &str,
+        guest_session_id: Option<&str>,
+    ) -> Result<ParticipantStatusResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/join-guest");
+        let body = GuestJoinRequest {
+            display_name: display_name.to_string(),
+            guest_session_id: guest_session_id.map(|s| s.to_string()),
+        };
+        let response = self.post(&path).json(&body).send().await?;
+        parse_api_response(response).await
+    }
+
     /// Check your current status in a meeting. This is the primary polling
     /// endpoint for attendees in the waiting room.
     ///
@@ -53,6 +77,23 @@ impl MeetingApiClient {
         meeting_id: &str,
     ) -> Result<ParticipantStatusResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/status");
+        let response = self.get(&path).send().await?;
+        parse_api_response(response).await
+    }
+
+    /// Check a guest participant's current status in a meeting.
+    ///
+    /// Calls `GET /api/v1/meetings/{meeting_id}/guest-status`.
+    ///
+    /// The client must be configured with `AuthMode::Bearer(observer_token)`
+    /// to pass the `GuestObserver` extractor on the server.
+    ///
+    /// When `status` is `"admitted"`, the response includes a `room_token`.
+    pub async fn get_guest_status(
+        &self,
+        meeting_id: &str,
+    ) -> Result<ParticipantStatusResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/guest-status");
         let response = self.get(&path).send().await?;
         parse_api_response(response).await
     }
@@ -82,6 +123,36 @@ impl MeetingApiClient {
     ) -> Result<ParticipantStatusResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/leave");
         let response = self.post(&path).send().await?;
+        parse_api_response(response).await
+    }
+
+    /// Leave a meeting as an unauthenticated guest.
+    ///
+    /// Calls `POST /api/v1/meetings/{meeting_id}/leave-guest`.
+    pub async fn leave_meeting_as_guest(
+        &self,
+        meeting_id: &str,
+    ) -> Result<ParticipantStatusResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/leave-guest");
+        let response = self.post(&path).send().await?;
+        parse_api_response(response).await
+    }
+
+    /// Update your display name during an active meeting.
+    ///
+    /// Calls `PUT /api/v1/meetings/{meeting_id}/display-name`.
+    ///
+    /// The display name change is broadcast to all connected participants.
+    pub async fn update_display_name(
+        &self,
+        meeting_id: &str,
+        display_name: &str,
+    ) -> Result<ParticipantStatusResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/display-name");
+        let body = UpdateDisplayNameRequest {
+            display_name: display_name.to_string(),
+        };
+        let response = self.put(&path).json(&body).send().await?;
         parse_api_response(response).await
     }
 

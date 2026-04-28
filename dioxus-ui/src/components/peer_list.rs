@@ -18,7 +18,7 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::{DisplayNameCtx, VideoCallClientCtx};
+use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
 use futures::future::{AbortHandle, Abortable};
 use std::cell::RefCell;
@@ -39,6 +39,8 @@ pub fn PeerList(
     on_toggle_meeting_info: EventHandler<()>,
     #[props(default)] host_display_name: Option<String>,
     #[props(default)] host_user_id: Option<String>,
+    #[props(default)] local_user_display_name: String,
+    #[props(default)] on_edit_self_name: EventHandler<()>,
 ) -> Element {
     let mut search_query = use_signal(String::new);
     let mut show_context_menu = use_signal(|| false);
@@ -99,11 +101,8 @@ pub fn PeerList(
         .cloned()
         .collect();
 
-    // Get username from context and append (You)
-    let display_name_ctx = use_context::<DisplayNameCtx>();
-    let current_user_name: Option<String> = (display_name_ctx.0)().clone();
-
-    let display_name = current_user_name.clone().unwrap_or_default();
+    // Use the local_user_display_name passed as prop (reactive, updates on rename)
+    let display_name = local_user_display_name.clone();
 
     // Check if current user is host by comparing authenticated user_ids
     // (not display names, which are user-chosen and spoofable).
@@ -202,7 +201,7 @@ pub fn PeerList(
                     div { class: "peer-list",
                         ul {
                             // show self as the first item with actual username
-                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_self: true, muted: self_muted, speaking: self_speaking } }
+                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_self: true, is_guest: client_ctx.is_local_guest().unwrap_or(false), muted: self_muted, speaking: self_speaking, on_edit_name: on_edit_self_name } }
 
                             for peer in filtered_peers.iter() {
                                 {
@@ -212,6 +211,7 @@ pub fn PeerList(
                                     let peer_display_name = peer_session_id
                                         .and_then(|sid| client_ctx.get_peer_display_name(sid))
                                         .unwrap_or_else(|| peer.clone());
+                                    let peer_is_guest = peer_session_id.and_then(|sid| client_ctx.get_peer_is_guest(sid)).unwrap_or(false);
                                     // Compare using authenticated user_id, not display name
                                     let is_peer_host = host_user_id
                                         .as_ref()
@@ -231,6 +231,7 @@ pub fn PeerList(
                                                 name: peer_display_name,
                                                 tooltip: peer.clone(),
                                                 is_host: is_peer_host,
+                                                is_guest: peer_is_guest,
                                                 muted: muted,
                                                 speaking: speaking,
                                             }

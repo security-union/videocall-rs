@@ -20,28 +20,20 @@ use crate::auth::{check_session, get_user_profile, logout, UserProfile};
 use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
-use crate::constants::oauth_enabled;
+use crate::constants::{meeting_api_base_url, oauth_enabled};
 use crate::context::{
-    clear_display_name_from_storage, email_to_display_name, is_valid_meeting_id,
-    load_display_name_from_storage, save_display_name_to_storage, validate_display_name,
-    DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
+    clear_display_name_from_storage, email_to_display_name, is_allowed_display_name_char,
+    is_guid_like, is_valid_meeting_id, load_display_name_from_storage,
+    save_display_name_to_storage, validate_display_name, DisplayNameCtx, DISPLAY_NAME_MAX_LEN,
 };
+use crate::meeting_api::create_meeting;
 use crate::routing::Route;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
-use web_time::SystemTime;
 
 const TEXT_INPUT_CLASSES: &str = "input-apple";
-
-fn generate_meeting_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    format!("{millis:x}")
-}
 
 #[component]
 pub fn Home() -> Element {
@@ -49,9 +41,18 @@ pub fn Home() -> Element {
 
     let mut meeting_id_ref = use_signal(|| None::<web_sys::Element>);
     let mut meeting_id_value = use_signal(String::new);
+    let mut meeting_id_error = use_signal(|| None::<String>);
     let mut display_name_ctx = use_context::<DisplayNameCtx>();
 
-    let existing_username: String = if let Some(name) = (display_name_ctx.0)() {
+    // When OAuth is enabled the display name must not be pre-populated from
+    // local storage: the user may be signed out, and showing a stale name
+    // from a previous session is misleading.  The async session-check effect
+    // below restores the stored name once a valid session is confirmed.
+    // When OAuth is disabled there is no sign-out concept, so the stored name
+    // is always shown immediately.
+    let existing_username: String = if oauth_enabled().unwrap_or(false) {
+        String::new()
+    } else if let Some(name) = (display_name_ctx.0)() {
         name
     } else {
         load_display_name_from_storage().unwrap_or_default()
@@ -66,53 +67,101 @@ pub fn Home() -> Element {
     // Dropdown toggle for auth menu
     let mut show_dropdown = use_signal(|| false);
 
-    // Set Matomo user ID early if available
-    use_effect({
-        let uid = existing_username.clone();
-        move || {
-            if !uid.is_empty() {
-                matomo_logger::set_user_id(&uid);
-            }
-        }
-    });
+    let mut create_error = use_signal(|| None::<String>);
+    let mut creating = use_signal(|| false);
 
-    // Fetch user profile when OAuth is enabled
+    // Fetch user profile when OAuth is enabled.
+    //
+    // Because the display name field starts empty for OAuth deployments (see
+    // above), this effect is responsible for restoring it once a valid session
+    // is confirmed.
+    //
+    // Flow:
+    //   • Session valid + stored name  → restore field from storage (user may
+    //     have customised it, so we prefer their choice over the profile name).
+    //   • Session valid + no stored name → derive from provider profile and
+    //     save so subsequent visits don't flash empty.
+    //   • Session invalid / check fails → field stays empty; sign-in button
+    //     is shown.
     use_effect(move || {
         if oauth_enabled().unwrap_or(false) {
             wasm_bindgen_futures::spawn_local(async move {
-                // Only fetch profile if session is valid
                 if check_session().await.is_ok() {
                     if let Ok(profile) = get_user_profile().await {
-                        // Auto-set display name from auth profile if not already saved
-                        if load_display_name_from_storage().is_none() {
-                            // Use the profile name directly; only transform if it looks like an email
+                        if let Some(stored_name) = load_display_name_from_storage() {
+                            // Session confirmed — restore the previously saved name.
+                            username_value.set(stored_name.clone());
+                            display_name_ctx.0.set(Some(stored_name.clone()));
+                        } else {
+                            // No saved name yet — derive one from the provider profile.
                             let display_name = if profile.name.contains('@') {
                                 email_to_display_name(&profile.name)
+                            } else if is_guid_like(&profile.name) {
+                                if profile.user_id.contains('@') {
+                                    email_to_display_name(&profile.user_id)
+                                } else {
+                                    String::new()
+                                }
                             } else {
                                 profile.name.clone()
                             };
-                            if let Ok(valid_name) = validate_display_name(&display_name) {
-                                save_display_name_to_storage(&valid_name);
-                                display_name_ctx.0.set(Some(valid_name.clone()));
-                                username_value.set(valid_name);
+                            if !display_name.is_empty() {
+                                if let Ok(valid_name) = validate_display_name(&display_name) {
+                                    save_display_name_to_storage(&valid_name);
+                                    display_name_ctx.0.set(Some(valid_name.clone()));
+                                    username_value.set(valid_name.clone());
+                                }
                             }
                         }
                         user_profile.set(Some(profile));
+                    }
+                    // Session valid but profile fetch failed → leave field empty.
+                }
+                // Session invalid → field stays empty; signed-out state.
+            });
+        }
+    });
+
+    // Dev auto-login: when OAuth is disabled and no session cookie exists,
+    // attempt to acquire one by fetching the dev auto-login endpoint.
+    // The endpoint sets the cookie and returns a redirect to "/".
+    // If the endpoint returns 404 (DEV_USER not configured), we simply
+    // do nothing — the app continues to work without a session.
+    use_effect(move || {
+        if !oauth_enabled().unwrap_or(false) {
+            // Check whether a session already exists before navigating.
+            wasm_bindgen_futures::spawn_local(async move {
+                if check_session().await.is_ok() {
+                    return; // Already have a valid session — nothing to do.
+                }
+                // No valid session — try the dev auto-login endpoint.
+                if let Ok(base_url) = meeting_api_base_url() {
+                    let url = format!("{}/api/v1/dev/auto-login", base_url);
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.location().set_href(&url);
                     }
                 }
             });
         }
     });
 
-    // Logout handler — clear profile state and display name, then stay on home page
+    // Logout handler: clear local state first, then navigate the browser to
+    // the meeting-api /logout endpoint.  The server clears the session cookie
+    // and, when an OIDC end_session_endpoint is configured, redirects to the
+    // provider's logout page (RP-initiated logout).  Doing a browser
+    // navigation — rather than a fetch() — ensures the provider redirect is
+    // followed as a real page load.
     let on_logout = move |_| {
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = logout().await;
-            user_profile.set(None);
-            clear_display_name_from_storage();
-            display_name_ctx.0.set(None);
-            username_value.set(String::new());
-        });
+        // Clear persisted display name before the page unloads so the user
+        // starts fresh after the OIDC provider redirects back.
+        clear_display_name_from_storage();
+        // Reset in-memory signals (best-effort; page unloads shortly after).
+        user_profile.set(None);
+        display_name_ctx.0.set(None);
+        username_value.set(String::new());
+        if let Err(e) = logout() {
+            log::error!("Logout navigation failed: {e}");
+        }
     };
 
     let get_meeting_id = move || -> String {
@@ -121,6 +170,18 @@ pub fn Home() -> Element {
             .map(|input| input.value())
             .unwrap_or_default()
     };
+
+    let dropdown_name = user_profile().map(|p| {
+        if is_guid_like(&p.name) {
+            if p.user_id.contains('@') {
+                email_to_display_name(&p.user_id)
+            } else {
+                p.user_id.clone()
+            }
+        } else {
+            p.name.clone()
+        }
+    });
 
     rsx! {
         div { class: "hero-container",
@@ -139,7 +200,7 @@ pub fn Home() -> Element {
                             onclick: move |_| {
                                 show_dropdown.set(!show_dropdown());
                             },
-                            span { "{profile.name}" }
+                            span { "{dropdown_name.as_deref().unwrap_or_default()}" }
                             svg {
                                 xmlns: "http://www.w3.org/2000/svg",
                                 width: "16",
@@ -156,7 +217,7 @@ pub fn Home() -> Element {
                         if show_dropdown() {
                             div { class: "auth-dropdown-menu",
                                 div { class: "auth-dropdown-header",
-                                    p { class: "auth-dropdown-name", "{profile.name}" }
+                                    p { class: "auth-dropdown-name", "{dropdown_name.as_deref().unwrap_or_default()}" }
                                     p { class: "auth-dropdown-email", "{profile.user_id}" }
                                 }
                                 button {
@@ -191,7 +252,6 @@ pub fn Home() -> Element {
                     path { d: "M115.0,115.0 C114.9,115.1 118.7,116.5 119.8,115.4 L133.7,101.6 C136.9,99.2 139.9,98.4 142.2,98.6 C133.8,88.0 127.5,74.4 143.8,58.0 C148.5,53.4 154.0,51.2 159.7,51.0 C160.3,49.4 163.2,43.6 171.4,40.1 C171.4,40.1 176.1,42.5 178.8,56.2 C183.1,58.6 187.2,61.8 190.9,65.4 C194.5,69.0 197.7,73.2 200.1,77.6 C213.8,80.2 216.3,84.9 216.3,84.9 C212.7,93.1 206.9,96.0 205.4,96.6 C205.1,102.4 203.0,107.8 198.3,112.5 C181.9,128.9 168.3,122.5 157.7,114.1 C157.9,116.9 156.7,120.9 152.7,124.9 L141.0,136.5 C139.8,137.7 141.6,141.9 141.8,141.8 Z", fill: "currentColor", class: "octo-body" }
                 }
             }
-
             div { class: "hero-content",
                 h1 { class: "hero-title text-center", "videocall.rs" }
                 p { class: "hero-tagline text-center",
@@ -201,152 +261,219 @@ pub fn Home() -> Element {
                     span { class: "tagline-dot", " \u{00b7} " }
                     "WASM"
                 }
-
                 div { class: "content-separator" }
 
                 // Form section
                 div { class: "w-full mb-8 card-apple p-8",
-                form {
-                    onsubmit: move |e| {
-                        e.prevent_default();
-                        username_error.set(None);
-                        let username = username_value();
-                        let meeting_id = get_meeting_id();
-                        if meeting_id.is_empty() || !is_valid_meeting_id(&meeting_id) {
-                            return;
-                        }
-                        match validate_display_name(&username) {
-                            Ok(valid_name) => {
-                                username_value.set(valid_name.clone());
-                                save_display_name_to_storage(&valid_name);
-                                (display_name_ctx.0).set(Some(valid_name.clone()));
-                                matomo_logger::set_user_id(&valid_name);
+                    form {
+                        onsubmit: move |e| {
+                            e.prevent_default();
+                            username_error.set(None);
+                            let username = username_value();
+                            let meeting_id = get_meeting_id();
+                            if meeting_id.is_empty() || !is_valid_meeting_id(&meeting_id) {
+                                return;
+                            }
+                            match validate_display_name(&username) {
+                                Ok(valid_name) => {
+                                    username_value.set(valid_name.clone());
+                                    save_display_name_to_storage(&valid_name);
+                                    (display_name_ctx.0).set(Some(valid_name.clone()));
 
-                                spawn(async move {
-                                    gloo_timers::future::TimeoutFuture::new(0).await;
-                                    navigator.push(Route::Meeting { id: meeting_id });
-                                });
+                                    spawn(async move {
+                                        gloo_timers::future::TimeoutFuture::new(0).await;
+                                        navigator.push(Route::Meeting { id: meeting_id });
+                                    });
+                                }
+                                Err(message) => {
+                                    username_error.set(Some(message));
+                                }
                             }
-                            Err(message) => {
-                                username_error.set(Some(message));
-                            }
+                        },
+                        h3 { class: "text-center text-xl font-semibold mb-6 text-white/90",
+                            "Start or Join a Meeting"
                         }
-                    },
-                    h3 { class: "text-center text-xl font-semibold mb-6 text-white/90", "Start or Join a Meeting" }
-                    div { class: "space-y-6",
-                        div {
-                            label { r#for: "username", class: "block text-white/80 text-sm font-medium mb-2 ml-1", "Display Name" }
-                            input {
-                                id: "username",
-                                class: TEXT_INPUT_CLASSES,
-                                r#type: "text",
-                                placeholder: "Enter your display name",
-                                required: true,
-                                autofocus: true,
-                                maxlength: DISPLAY_NAME_MAX_LEN as i64,
-                                value: "{username_value}",
-                                oninput: move |e: Event<FormData>| {
-                                    username_value.set(e.value());
-                                    username_error.set(None);
-                                },
-                            }
-                            p { class: "text-sm text-foreground-subtle mt-2 ml-1", "Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes" }
-                            if let Some(err) = username_error() {
-                                p { class: "text-sm mt-2 ml-1", style: "color:#ff6b6b;", "{err}" }
-                            }
-                        }
-                        div {
-                            label { r#for: "meeting-id", class: "block text-white/80 text-sm font-medium mb-2 ml-1", "Meeting ID" }
-                            input {
-                                id: "meeting-id",
-                                class: TEXT_INPUT_CLASSES,
-                                r#type: "text",
-                                placeholder: "Enter meeting code",
-                                required: true,
-                                pattern: "^[a-zA-Z0-9_]*$",
-                                oninput: move |e: Event<FormData>| {
-                                    meeting_id_value.set(e.value());
-                                },
-                                onmounted: move |evt| {
-                                    if let Some(elem) = evt.try_as_web_event() {
-                                        meeting_id_ref.set(Some(elem));
+                        div { class: "space-y-6",
+                            div {
+                                label {
+                                    r#for: "username",
+                                    class: "block text-white/80 text-sm font-medium mb-2 ml-1",
+                                    "Display Name"
+                                }
+                                input {
+                                    id: "username",
+                                    class: TEXT_INPUT_CLASSES,
+                                    r#type: "text",
+                                    placeholder: "Enter your display name",
+                                    required: true,
+                                    autofocus: true,
+                                    maxlength: DISPLAY_NAME_MAX_LEN as i64,
+                                    value: "{username_value}",
+                                    oninput: move |e: Event<FormData>| {
+                                        let v = e.value();
+                                        let mut bad: Vec<char> = v
+                                            .chars()
+                                            .filter(|c| !is_allowed_display_name_char(*c))
+                                            .collect();
+                                        bad.sort();
+                                        bad.dedup();
+                                        username_value.set(v);
+                                        if bad.is_empty() {
+                                            username_error.set(None);
+                                        } else {
+                                            let chars_str: Vec<String> = bad
+                                                .iter()
+                                                .map(|c| format!("'{c}'"))
+                                                .collect();
+                                            username_error.set(Some(format!(
+                                                "{} not allowed — only letters, numbers, spaces, hyphens, underscores, apostrophes",
+                                                chars_str.join(", ")
+                                            )));
+                                        }
+                                    },
+                                }
+                                if let Some(err) = username_error() {
+                                    p {
+                                        class: "text-sm mt-2 ml-1",
+                                        style: "color:#ff6b6b;",
+                                        "{err}"
                                     }
-                                },
+                                }
                             }
-                            p { class: "text-sm text-foreground-subtle mt-2 ml-1", "Characters allowed: a-z, A-Z, 0-9, and _" }
-                        }
-                        {
-                            let has_meeting_id = !meeting_id_value().is_empty();
-                            let join_btn_class = if has_meeting_id {
-                                "btn-apple btn-primary w-full"
-                            } else {
-                                "btn-apple btn-secondary w-full"
-                            };
-                            rsx! {
+                            div {
+                                label {
+                                    r#for: "meeting-id",
+                                    class: "block text-white/80 text-sm font-medium mb-2 ml-1",
+                                    "Meeting ID"
+                                }
+                                input {
+                                    id: "meeting-id",
+                                    class: TEXT_INPUT_CLASSES,
+                                    r#type: "text",
+                                    placeholder: "Enter meeting ID or generate one",
+                                    required: true,
+                                    pattern: "^[a-zA-Z0-9_]*$",
+                                    oninput: move |e: Event<FormData>| {
+                                        let v = e.value();
+                                        let mut bad: Vec<char> = v
+                                            .chars()
+                                            .filter(|c| !c.is_ascii_alphanumeric() && *c != '_')
+                                            .collect();
+                                        bad.sort();
+                                        bad.dedup();
+                                        meeting_id_value.set(v);
+                                        if bad.is_empty() {
+                                            meeting_id_error.set(None);
+                                        } else {
+                                            let chars_str: Vec<String> = bad
+                                                .iter()
+                                                .map(|c| format!("'{c}'"))
+                                                .collect();
+                                            meeting_id_error.set(Some(format!(
+                                                "{} not allowed — only letters, numbers, and underscore",
+                                                chars_str.join(", ")
+                                            )));
+                                        }
+                                    },
+                                    onmounted: move |evt| {
+                                        if let Some(elem) = evt.try_as_web_event() {
+                                            meeting_id_ref.set(Some(elem));
+                                        }
+                                    },
+                                }
+                                if let Some(err) = meeting_id_error() {
+                                    p {
+                                        class: "text-sm mt-2 ml-1",
+                                        style: "color:#ff6b6b;",
+                                        "{err}"
+                                    }
+                                }
+                            }
+                            if !meeting_id_value().is_empty() {
                                 div { class: "mt-4",
                                     button {
                                         r#type: "submit",
-                                        class: join_btn_class,
-                                        disabled: !has_meeting_id,
+                                        class: "btn-apple btn-primary w-full",
                                         span { class: "text-lg", "Start or Join Meeting" }
                                     }
                                 }
-                            }
-                        }
-                        div { class: "mt-2",
-                            button {
-                                r#type: "button",
-                                class: {
-                                    let has_meeting_id = !meeting_id_value().is_empty();
-                                    if has_meeting_id {
-                                        "btn-apple btn-secondary w-full flex items-center justify-center gap-2"
-                                    } else {
-                                        "btn-apple btn-primary w-full flex items-center justify-center gap-2"
-                                    }
-                                },
-                                onclick: move |_| {
-                                    username_error.set(None);
-                                    let username = username_value();
-                                    match validate_display_name(&username) {
-                                        Ok(valid_name) => {
-                                            let meeting_id = generate_meeting_id();
-                                            username_value.set(valid_name.clone());
-                                            save_display_name_to_storage(&valid_name);
-                                            (display_name_ctx.0).set(Some(valid_name.clone()));
-                                            matomo_logger::set_user_id(&valid_name);
-
-                                            spawn(async move {
-                                                gloo_timers::future::TimeoutFuture::new(0).await;
-                                                navigator.push(Route::Meeting { id: meeting_id });
-                                            });
-                                        }
-                                        Err(message) => {
-                                            username_error.set(Some(message));
+                            } else {
+                                div { class: "mt-4",
+                                    if let Some(err) = create_error() {
+                                        p {
+                                            class: "text-sm mb-2 ml-1",
+                                            style: "color: #ff6b6b;",
+                                            "{err}"
                                         }
                                     }
-                                },
-                                span { class: "text-lg", "Create a New Meeting ID" }
-                            }
-                        }
-                    }
-                }
+                                    button {
+                                        r#type: "button",
+                                        class: "btn-apple btn-primary w-full flex items-center justify-center gap-2",
+                                        disabled: creating(),
+                                        onclick: move |_| {
+                                            username_error.set(None);
+                                            create_error.set(None);
+                                            let username = username_value();
+                                            match validate_display_name(&username) {
+                                                Ok(valid_name) => {
+                                                    username_value.set(valid_name.clone());
+                                                    save_display_name_to_storage(&valid_name);
+                                                    (display_name_ctx.0).set(Some(valid_name.clone()));
+                                                    creating.set(true);
 
-                // Auth removed from here — now rendered as a fixed dropdown in the top-right
-
-                // Active meetings list — only show when OAuth is disabled
-                // or the user is authenticated (has a profile)
-                if !oauth_enabled().unwrap_or(false) || user_profile().is_some() {
-                    MeetingsList {
-                        on_select_meeting: move |meeting_id: String| {
-                            if let Some(el) = meeting_id_ref() {
-                                if let Ok(input) = el.dyn_into::<HtmlInputElement>() {
-                                    input.set_value(&meeting_id);
+                                                    spawn(async move {
+                                                        match create_meeting(None, false).await {
+                                                            Ok(response) => {
+                                                                creating.set(false);
+                                                                let new_id = response.meeting_id;
+                                                                if let Some(el) = meeting_id_ref() {
+                                                                    if let Ok(input) = el.dyn_into::<HtmlInputElement>() {
+                                                                        input.set_value(&new_id);
+                                                                    }
+                                                                }
+                                                                meeting_id_value.set(new_id);
+                                                                meeting_id_error.set(None);
+                                                            }
+                                                            Err(e) => {
+                                                                creating.set(false);
+                                                                create_error.set(Some(format!("Failed to create meeting: {e}")));
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                                Err(message) => {
+                                                    username_error.set(Some(message));
+                                                }
+                                            }
+                                        },
+                                        if creating() {
+                                            span { class: "loading-spinner", style: "width: 18px; height: 18px;" }
+                                            span { class: "text-lg", "Generating..." }
+                                        } else {
+                                            span { class: "text-lg", "Generate a New Meeting ID" }
+                                        }
+                                    }
                                 }
                             }
-                            meeting_id_value.set(meeting_id);
-                        },
+                        }
                     }
-                }
+
+                    // Auth removed from here — now rendered as a fixed dropdown in the top-right
+
+                    // Active meetings list — only show when OAuth is disabled
+                    // or the user is authenticated (has a profile)
+                    if !oauth_enabled().unwrap_or(false) || user_profile().is_some() {
+                        MeetingsList {
+                            on_select_meeting: move |meeting_id: String| {
+                                if let Some(el) = meeting_id_ref() {
+                                    if let Ok(input) = el.dyn_into::<HtmlInputElement>() {
+                                        input.set_value(&meeting_id);
+                                    }
+                                }
+                                meeting_id_value.set(meeting_id);
+                            },
+                        }
+                    }
                 }
 
                 div { class: "content-separator" }

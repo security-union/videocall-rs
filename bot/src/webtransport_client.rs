@@ -18,20 +18,20 @@
 
 use protobuf::Message;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 use tokio::time;
 use tracing::{debug, info, warn};
 use url::Url;
 use videocall_types::protos::connection_packet::ConnectionPacket;
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use web_transport_quinn::{ClientBuilder, Session};
 
 use crate::config::ClientConfig;
+use crate::inbound_stats::InboundStats;
+use crate::websocket_client::build_heartbeat_packet;
 
 pub struct WebTransportClient {
     config: ClientConfig,
@@ -48,53 +48,42 @@ impl WebTransportClient {
         }
     }
 
-    pub async fn connect(&mut self, server_url: &Url, insecure: bool) -> anyhow::Result<()> {
-        info!(
-            "Connecting client {} to {}",
-            self.config.user_id, server_url
-        );
+    pub async fn connect(
+        &mut self,
+        lobby_url: &Url,
+        insecure: bool,
+        stats: Arc<Mutex<InboundStats>>,
+        is_speaking: Arc<AtomicBool>,
+    ) -> anyhow::Result<()> {
+        info!("Connecting client {} to {}", self.config.user_id, lobby_url);
 
-        // Create WebTransport client (same logic as webtranscat)
         let client = if insecure {
             warn!("Certificate verification disabled (--insecure)");
-            // SAFETY: This is intentionally insecure for testing purposes
-            unsafe { ClientBuilder::new().with_no_certificate_verification()? }
+            ClientBuilder::new()
+                .dangerous()
+                .with_no_certificate_verification()?
         } else {
-            // Use default secure configuration with system certificates
             ClientBuilder::new().with_system_roots()?
         };
 
-        // Construct full URL with lobby path
-        let full_url = format!(
-            "{}/lobby/{}/{}",
-            server_url.as_str().trim_end_matches('/'),
-            self.config.user_id,
-            self.config.meeting_id
-        );
-        let connection_url = Url::parse(&full_url)?;
-
-        info!("Connecting to {}", connection_url);
-        let session = client.connect(connection_url).await?;
+        info!("Connecting to {}", lobby_url);
+        let session = client.connect(lobby_url.clone()).await?;
         info!(
             "WebTransport session established for {}",
             self.config.user_id
         );
 
         self.session = Some(session);
-        info!(
-            "WebTransport session established for {}",
-            self.config.user_id
-        );
 
         // Send connection packet
         self.send_connection_packet().await?;
 
         // Start heartbeat
-        self.start_heartbeat().await;
+        self.start_heartbeat(is_speaking).await;
         info!("Heartbeat started for {}", self.config.user_id);
 
         // Start inbound consumer to avoid being a slow consumer
-        self.start_inbound_consumer().await;
+        self.start_inbound_consumer(stats).await;
         info!("Inbound consumer started for {}", self.config.user_id);
 
         Ok(())
@@ -118,12 +107,12 @@ impl WebTransportClient {
         Ok(())
     }
 
-    async fn start_heartbeat(&self) {
+    async fn start_heartbeat(&self, is_speaking: Arc<AtomicBool>) {
         if let Some(session) = &self.session {
             let session = session.clone();
             let user_id = self.config.user_id.clone();
-            let video_enabled = self.config.enable_video; // Get actual video config
-            let audio_enabled = self.config.enable_audio; // Get actual audio config
+            let video_enabled = self.config.enable_video;
+            let audio_enabled = self.config.enable_audio;
             let quit = self.quit.clone();
 
             tokio::spawn(async move {
@@ -136,50 +125,50 @@ impl WebTransportClient {
 
                     interval.tick().await;
 
-                    // Use exact same timestamp calculation as videocall-cli
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("Time went backwards")
-                        .as_millis();
-
-                    let heartbeat = MediaPacket {
-                        media_type: MediaType::HEARTBEAT.into(),
-                        user_id: user_id.clone().into_bytes(),
-                        timestamp: now_ms as f64,
-                        heartbeat_metadata: Some(HeartbeatMetadata {
-                            video_enabled,
-                            audio_enabled,
-                            ..Default::default()
-                        })
-                        .into(),
-                        ..Default::default()
-                    };
-
-                    let packet = PacketWrapper {
-                        user_id: user_id.clone().into_bytes(),
-                        packet_type: PacketType::MEDIA.into(),
-                        data: heartbeat.write_to_bytes().unwrap(),
-                        ..Default::default()
-                    };
-
-                    if let Err(e) =
-                        Self::send_via_session(&session, packet.write_to_bytes().unwrap()).await
-                    {
-                        warn!("Failed to send heartbeat for {}: {}", user_id, e);
-                    } else {
-                        debug!("Sent heartbeat for {}", user_id);
+                    let speaking = is_speaking.load(Ordering::Relaxed);
+                    match build_heartbeat_packet(&user_id, audio_enabled, video_enabled, speaking) {
+                        Ok(data) => {
+                            if let Err(e) = Self::send_via_session(&session, data).await {
+                                warn!("Failed to send heartbeat for {}: {}", user_id, e);
+                            } else {
+                                debug!("Sent heartbeat for {}", user_id);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to build heartbeat for {}: {}", user_id, e);
+                        }
                     }
                 }
             });
         }
     }
 
-    /// Start a task to consume all inbound unistreams to avoid being a slow consumer
-    async fn start_inbound_consumer(&self) {
+    /// Start a task to consume all inbound unistreams and track quality stats
+    async fn start_inbound_consumer(&self, stats: Arc<Mutex<InboundStats>>) {
         if let Some(session) = &self.session {
             let session = session.clone();
             let user_id = self.config.user_id.clone();
             let quit = self.quit.clone();
+
+            let stats_clone = stats.clone();
+            let user_id_report = user_id.clone();
+            let quit_report = quit.clone();
+
+            // Periodic reporter task — mirrors the WS pattern: report, evict stale, reset.
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(10));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    if quit_report.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut s = stats_clone.lock().unwrap();
+                    s.report(&user_id_report);
+                    s.evict_stale(Duration::from_secs(60));
+                    s.reset();
+                }
+            });
 
             tokio::spawn(async move {
                 loop {
@@ -188,19 +177,13 @@ impl WebTransportClient {
                     }
 
                     match session.accept_uni().await {
-                        Ok(mut stream) => {
-                            // Drain the stream - we don't need the data, just consume it
+                        Ok(stream) => {
                             let user_id = user_id.clone();
+                            let stats = stats.clone();
+                            let quit = quit.clone();
                             tokio::spawn(async move {
-                                match stream.read_to_end(usize::MAX).await {
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        debug!(
-                                            "Error reading inbound unistream for {}: {}",
-                                            user_id, e
-                                        );
-                                    }
-                                }
+                                Self::read_length_prefixed_stream(stream, &user_id, stats, quit)
+                                    .await;
                             });
                         }
                         Err(e) => {
@@ -209,6 +192,8 @@ impl WebTransportClient {
                         }
                     }
                 }
+                let s = stats.lock().unwrap();
+                s.report(&user_id);
                 info!("Inbound consumer stopped for {}", user_id);
             });
         }
@@ -222,10 +207,43 @@ impl WebTransportClient {
         }
     }
 
+    async fn read_length_prefixed_stream(
+        mut stream: web_transport_quinn::RecvStream,
+        user_id: &str,
+        stats: Arc<Mutex<InboundStats>>,
+        quit: Arc<AtomicBool>,
+    ) {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if quit.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Err(e) = stream.read_exact(&mut len_buf).await {
+                debug!("Persistent stream ended for {}: {}", user_id, e);
+                break;
+            }
+            let payload_len = u32::from_be_bytes(len_buf) as usize;
+            if payload_len > 4 * 1024 * 1024 {
+                warn!(
+                    "Abnormal frame size {} for {}, closing stream",
+                    payload_len, user_id
+                );
+                break;
+            }
+            let mut payload = vec![0u8; payload_len];
+            if let Err(e) = stream.read_exact(&mut payload).await {
+                debug!("Payload read failed for {}: {}", user_id, e);
+                break;
+            }
+            let mut s = stats.lock().unwrap();
+            s.record_packet(user_id, &payload);
+        }
+    }
+
     async fn send_via_session(session: &Session, data: Vec<u8>) -> anyhow::Result<()> {
         let mut stream = session.open_uni().await?;
         stream.write_all(&data).await?;
-        stream.finish()?; // Remove .await as this is not async
+        stream.finish()?;
         Ok(())
     }
 

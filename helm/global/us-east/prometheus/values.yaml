@@ -1,95 +1,83 @@
-# Prometheus values for videocall monitoring (minimal resources)
+# Prometheus values for videocall monitoring
 prometheus:
-  # Prometheus server configuration
   server:
-    # Minimal resources (reduced for limited cluster)
     resources:
       limits:
+        cpu: 200m
+        memory: 512Mi
+      requests:
         cpu: 50m
         memory: 256Mi
-      requests:
-        cpu: 25m
-        memory: 128Mi
-    
-    # Single replica
+
     replicaCount: 1
-    
-    # Persistence (minimal)
+
     persistentVolume:
       enabled: true
       size: 8Gi
       storageClass: "do-block-storage"
-    
-    # Retention
+
     retention: "7d"
-    
-    # Service configuration
+
     service:
       type: ClusterIP
       servicePort: 80
-    
-    # Security context
+
     securityContext:
       runAsUser: 65534
       runAsGroup: 65534
       fsGroup: 65534
-    
-    # Global scrape configuration
+
     global:
       scrape_interval: 15s
       evaluation_interval: 15s
-    
-  # Alertmanager (disabled for minimal setup)
+
   alertmanager:
     enabled: false
-  
-  # Node exporter (disabled for minimal setup)
+
   nodeExporter:
-    enabled: false
-  
-  # Pushgateway (disabled for minimal setup)
+    enabled: true
+
   pushgateway:
     enabled: false
-  
-  # Kube-state-metrics (minimal)
+
   kubeStateMetrics:
     enabled: true
     resources:
       limits:
-        cpu: 25m
-        memory: 32Mi
+        cpu: 50m
+        memory: 64Mi
       requests:
         cpu: 10m
-        memory: 16Mi
-  
-    # Server configuration files
+        memory: 32Mi
+
   serverFiles:
     prometheus.yml:
       rule_files:
         - "alert_rules.yml"
-      
+
       scrape_configs:
+        # Prometheus self-monitoring
         - job_name: 'prometheus'
           static_configs:
             - targets: ['localhost:9090']
 
-        # Client health metrics (sessions, NetEQ, video quality, etc.)
+        # Client health metrics (NATS → metrics_server → Prometheus)
         - job_name: 'videocall-client-metrics'
           static_configs:
-            - targets: ['client-metrics-api-us-east:9091']
+            - targets: ['client-metrics-api:9091']
           metrics_path: '/metrics'
           scrape_interval: 5s
           scrape_timeout: 4s
 
-        # Server connection tracking (with session_id, stale cleanup, etc.)
+        # Server connection tracking (NATS → metrics_server_snapshot → Prometheus)
         - job_name: 'videocall-server-stats'
           static_configs:
-            - targets: ['server-metrics-api-us-east:9092']
+            - targets: ['server-metrics-api:9092']
           metrics_path: '/metrics'
           scrape_interval: 5s
           scrape_timeout: 4s
-        
-        # Kubernetes API server
+
+        # Kubernetes API server (minimal — just request totals)
         - job_name: 'kubernetes-apiservers'
           kubernetes_sd_configs:
             - role: endpoints
@@ -101,8 +89,12 @@ prometheus:
             - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
               action: keep
               regex: default;kubernetes;https
-        
-        # Kubernetes nodes
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: 'apiserver_request_total|apiserver_request_duration_seconds_count|up'
+              action: keep
+
+        # Kubernetes nodes (kubelet — minimal)
         - job_name: 'kubernetes-nodes'
           kubernetes_sd_configs:
             - role: node
@@ -119,8 +111,34 @@ prometheus:
               regex: (.+)
               target_label: __metrics_path__
               replacement: /api/v1/nodes/${1}/proxy/metrics
-        
-        # Kubernetes service endpoints
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: 'kubelet_running_pods|kubelet_node_name|up'
+              action: keep
+
+        # cAdvisor (container CPU/memory usage) — filtered to only what we need
+        - job_name: 'kubernetes-nodes-cadvisor'
+          kubernetes_sd_configs:
+            - role: node
+          scheme: https
+          tls_config:
+            ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+          relabel_configs:
+            - action: labelmap
+              regex: __meta_kubernetes_node_label_(.+)
+            - target_label: __address__
+              replacement: kubernetes.default.svc:443
+            - source_labels: [__meta_kubernetes_node_name]
+              regex: (.+)
+              target_label: __metrics_path__
+              replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: 'container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_memory_usage_bytes|machine_memory_bytes|machine_cpu_cores'
+              action: keep
+
+        # Kubernetes service endpoints (kube-state-metrics, etc.)
         - job_name: 'kubernetes-service-endpoints'
           honor_labels: true
           kubernetes_sd_configs:
@@ -161,8 +179,12 @@ prometheus:
             - source_labels: [__meta_kubernetes_pod_node_name]
               action: replace
               target_label: node
-        
-        # Kubernetes pods
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: 'kube_pod_container_resource_limits|kube_pod_container_resource_requests|kube_pod_status_phase|kube_pod_info|kube_deployment_status_replicas.*|kube_node_status_condition|up'
+              action: keep
+
+        # Kubernetes pods (auto-discovers relay servers via prometheus.io annotations)
         - job_name: 'kubernetes-pods'
           honor_labels: true
           kubernetes_sd_configs:
@@ -211,70 +233,74 @@ prometheus:
             - source_labels: [__meta_kubernetes_pod_node_name]
               action: replace
               target_label: node
-    
+
     alert_rules.yml:
       groups:
-        - name: videocall_alerts
+        - name: videocall_relay_alerts
           rules:
-            - alert: HighAudioReceptionFailures
-              expr: rate(videocall_audio_reception_failures_total[5m]) > 0.1
+            - alert: RelayPacketDrops
+              expr: rate(relay_packet_drops_total[1m]) > 0
+              for: 1m
+              labels:
+                severity: critical
+              annotations:
+                summary: "Relay server dropping packets"
+                description: "{{ $labels.room }} on {{ $labels.transport }}: {{ $value | printf \"%.1f\" }} drops/sec (reason: {{ $labels.drop_reason }})"
+
+            - alert: RelayNATSLatencyHigh
+              expr: histogram_quantile(0.99, sum(rate(relay_nats_publish_latency_ms_bucket[1m])) by (le)) > 50
               for: 2m
               labels:
                 severity: warning
               annotations:
-                summary: "High audio reception failures detected"
-                description: "Audio reception failure rate is {{ $value }} failures/sec"
-            
-            - alert: HighVideoReceptionFailures
-              expr: rate(videocall_video_reception_failures_total[5m]) > 0.1
+                summary: "NATS publish latency p99 > 50ms"
+                description: "NATS publish p99 latency is {{ $value | printf \"%.1f\" }}ms"
+
+            - alert: RelayQueueNearFull
+              expr: relay_outbound_queue_depth > 100
+              for: 30s
+              labels:
+                severity: warning
+              annotations:
+                summary: "Relay outbound queue near capacity ({{ $labels.transport }})"
+                description: "Room {{ $labels.room }} ({{ $labels.transport }}) queue depth: {{ $value }} (WS cap=128, WT cap=256)"
+
+        - name: videocall_quality_alerts
+          rules:
+            - alert: MeetingQualityDegraded
+              expr: avg by (meeting_id)(videocall_call_quality_score) < 50
               for: 2m
               labels:
                 severity: warning
               annotations:
-                summary: "High video reception failures detected"
-                description: "Video reception failure rate is {{ $value }} failures/sec"
-            
+                summary: "Meeting quality degraded"
+                description: "Meeting {{ $labels.meeting_id }} avg quality: {{ $value | printf \"%.0f\" }}/100"
+
             - alert: LowAudioConnectivity
               expr: videocall_peer_can_listen < 0.5
               for: 1m
               labels:
                 severity: critical
               annotations:
-                summary: "Low audio connectivity detected"
-                description: "Audio connectivity is {{ $value }}%"
-            
-            - alert: LowVideoConnectivity
-              expr: videocall_peer_can_see < 0.5
-              for: 1m
-              labels:
-                severity: critical
-              annotations:
-                summary: "Low video connectivity detected"
-                description: "Video connectivity is {{ $value }}%"
-            
-            - alert: HighNetEQBuffer
-              expr: videocall_neteq_audio_buffer_ms > 200
-              for: 2m
+                summary: "Peer cannot receive audio"
+                description: "{{ $labels.reporter_name }} cannot hear {{ $labels.peer_name }}"
+
+        - name: videocall_resource_alerts
+          rules:
+            - alert: ContainerCPUHigh
+              expr: 100 * sum by (container)(rate(container_cpu_usage_seconds_total{namespace="videocall",container=~"rustlemania-.*|nats"}[2m])) / sum by (container)(kube_pod_container_resource_limits{namespace="videocall",resource="cpu"}) > 85
+              for: 3m
               labels:
                 severity: warning
               annotations:
-                summary: "High NetEQ audio buffer detected"
-                description: "NetEQ audio buffer is {{ $value }}ms"
-            
-            - alert: HighPacketDecodeQueue
-              expr: videocall_neteq_packets_awaiting_decode > 20
-              for: 2m
+                summary: "Container CPU > 85% of limit"
+                description: "{{ $labels.container }} at {{ $value | printf \"%.0f\" }}% CPU"
+
+            - alert: ContainerMemoryHigh
+              expr: 100 * container_memory_working_set_bytes{namespace="videocall",container=~"rustlemania-.*|nats|prometheus-server"} / on(container,pod,namespace) kube_pod_container_resource_limits{namespace="videocall",resource="memory"} > 85
+              for: 3m
               labels:
                 severity: warning
               annotations:
-                summary: "High packet decode queue detected"
-                description: "{{ $value }} packets awaiting decode"
-            
-            - alert: HighDecodeOperations
-              expr: rate(videocall_neteq_normal_ops_per_sec[5m]) + rate(videocall_neteq_expand_ops_per_sec[5m]) + rate(videocall_neteq_accelerate_ops_per_sec[5m]) > 50
-              for: 2m
-              labels:
-                severity: warning
-              annotations:
-                summary: "High decode operations detected"
-                description: "{{ $value }} decode operations per second"
+                summary: "Container memory > 85% of limit"
+                description: "{{ $labels.container }} at {{ $value | printf \"%.0f\" }}% memory"

@@ -8,6 +8,8 @@ image:
   pullPolicy: Always
   tag: latest
 
+imagePullSecrets: []
+
 resources:
   limits:
     cpu: "50m"
@@ -40,7 +42,9 @@ runtimeConfig:
   wsUrl: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
   webTransportHost: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"
   oauthEnabled: "false"
-  oauthProvider: ""
+  oauthProvider: ""              # "google", "okta", or ""
+  oauthFlow: ""                  # "pkce" for client-side PKCE, "" for server-side OAuth
+  oauthPrompt: ""                # "login", "consent", "select_account", or "" to omit
   e2eeEnabled: "false"
   webTransportEnabled: "true"
   firefoxEnabled: "false"
@@ -50,6 +54,8 @@ runtimeConfig:
   videoBitrateKbps: 1000
   screenBitrateKbps: 1000
   vadThreshold: 0.02
+  consoleLogUploadEnabled: "false"
+  imageTag: "latest"
 
 ingress:
   enabled: true

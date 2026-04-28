@@ -52,6 +52,10 @@ pub struct RoomAccessTokenClaims {
     /// Whether this participant is the meeting host.
     pub is_host: bool,
 
+    /// Whether this participant joined as an unauthenticated guest.
+    #[serde(default)]
+    pub is_guest: bool,
+
     /// Participant's chosen display name for this meeting.
     pub display_name: String,
 
@@ -60,6 +64,12 @@ pub struct RoomAccessTokenClaims {
     /// or waiting-room admission so they can receive push notifications.
     #[serde(default)]
     pub observer: bool,
+
+    /// Whether the meeting ends for all participants when the host leaves.
+    /// Defaults to `true` for backward compatibility with older tokens that
+    /// lack this claim.
+    #[serde(default = "default_true")]
+    pub end_on_host_leave: bool,
 
     /// Expiration timestamp (Unix seconds).
     /// Token is rejected after this time.
@@ -73,3 +83,14 @@ impl RoomAccessTokenClaims {
     /// The expected issuer value for tokens produced by the Meeting Backend.
     pub const ISSUER: &'static str = "videocall-meeting-backend";
 }
+
+fn default_true() -> bool {
+    true
+}
+
+/// Prefix used for guest participant user IDs: `"guest:{uuid}"`.
+///
+/// Guest `sub` claims in [`RoomAccessTokenClaims`] always start with this
+/// prefix, so any code that receives a user ID can distinguish guests from
+/// authenticated users without inspecting the `is_guest` flag.
+pub const GUEST_USER_ID_PREFIX: &str = "guest:";

@@ -486,30 +486,177 @@ body {
   transform: scale(1.05);
 }
 
-/* Video Control Buttons */
+/* Video Control Buttons — Dock-style bar */
 .video-controls-container {
   position: fixed;
-  left: 50%;
-  bottom: 16px; /* minimal safe space */
-  transform: translateX(-50%);
+  z-index: 9000;
   display: flex;
-  gap: 1.2rem; /* add breathing room between control buttons */
-  z-index: 100;
+  gap: 1.2rem;
   padding: 0.6rem 1.25rem;
   background: rgba(28, 28, 30, 0.85);
   backdrop-filter: blur(14px);
   border-radius: 2.5rem;
   border: 1px solid #38383A;
   box-shadow: 0 10px 25px -5px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.05);
-  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: opacity 0.6s cubic-bezier(0.4, 0, 0.2, 1),
+              transform 0.55s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.3s ease;
 }
 
-.video-controls-container:hover {
+/* === (а) Dock positions === */
+
+/* Bottom (default) */
+.video-controls-container.dock-bottom {
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  flex-direction: row;
+}
+.video-controls-container.dock-bottom.controls-hidden {
+  transform: translateX(-50%) translateY(70%);
+}
+.video-controls-container.dock-bottom:hover,
+.video-controls-container.dock-bottom:not(.controls-hidden) {
+  transform: translateX(-50%) translateY(0);
+}
+.video-controls-container.dock-bottom:hover {
   transform: translateX(-50%) translateY(-2px);
-  box-shadow: 
+}
+
+/* Left side */
+.video-controls-container.dock-left {
+  left: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  flex-direction: column;
+  border-radius: 1.8rem;
+  padding: 1.25rem 0.6rem;
+}
+.video-controls-container.dock-left.controls-hidden {
+  transform: translateY(-50%) translateX(-70%);
+}
+.video-controls-container.dock-left:hover,
+.video-controls-container.dock-left:not(.controls-hidden) {
+  transform: translateY(-50%) translateX(0);
+}
+.video-controls-container.dock-left:hover {
+  transform: translateY(-50%) translateX(2px);
+}
+
+/* Right side */
+.video-controls-container.dock-right {
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  flex-direction: column;
+  border-radius: 1.8rem;
+  padding: 1.25rem 0.6rem;
+}
+.video-controls-container.dock-right.controls-hidden {
+  transform: translateY(-50%) translateX(70%);
+}
+.video-controls-container.dock-right:hover,
+.video-controls-container.dock-right:not(.controls-hidden) {
+  transform: translateY(-50%) translateX(0);
+}
+.video-controls-container.dock-right:hover {
+  transform: translateY(-50%) translateX(-2px);
+}
+
+/* === (б) Fade when inactive, full opacity on hover === */
+.video-controls-container.controls-hidden {
+  opacity: 0.1;
+}
+.video-controls-container:hover {
+  opacity: 1 !important;
+  box-shadow:
     0 15px 30px -5px rgba(0, 0, 0, 0.5),
     0 0 0 1px rgba(121, 40, 202, 0.2),
     inset 0 1px rgba(255, 255, 255, 0.07);
+}
+
+/* === (в) Narrow by default, expand on hover === */
+.controls-secondary {
+  display: flex;
+  gap: inherit;
+  overflow: hidden;
+  transition: max-width 0.45s cubic-bezier(0.4, 0, 0.2, 1),
+              max-height 0.45s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Horizontal (bottom dock): collapse width */
+.dock-bottom .controls-secondary {
+  flex-direction: row;
+  max-width: 0;
+  opacity: 0;
+}
+.dock-bottom.controls-expanded .controls-secondary,
+.dock-bottom:hover .controls-secondary {
+  max-width: 600px;
+  opacity: 1;
+}
+
+/* Vertical (left/right dock): collapse height */
+.dock-left .controls-secondary,
+.dock-right .controls-secondary {
+  flex-direction: column;
+  max-height: 0;
+  opacity: 0;
+}
+.dock-left.controls-expanded .controls-secondary,
+.dock-right.controls-expanded .controls-secondary,
+.dock-left:hover .controls-secondary,
+.dock-right:hover .controls-secondary {
+  max-height: 500px;
+  opacity: 1;
+}
+
+/* Dock position dropdown — reuses glass-select design */
+.dock-position-wrapper {
+  position: relative;
+}
+
+.dock-position-wrapper .glass-select-trigger {
+  width: auto;
+  min-width: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+.dock-position-wrapper .glass-select-trigger:hover {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.dock-position-wrapper .glass-select-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  top: auto;
+  left: 50%;
+  right: auto;
+  transform: translateX(-50%);
+  min-width: 140px;
+  border: 1px solid rgba(70, 100, 140, 0.15);
+  border-radius: 10px;
+  border-top: 1px solid rgba(70, 100, 140, 0.15);
+}
+
+/* Side dock: menu opens to the side */
+.dock-left .dock-position-wrapper .glass-select-menu {
+  bottom: auto;
+  left: calc(100% + 12px);
+  top: 50%;
+  transform: translateY(-50%);
+}
+.dock-right .dock-position-wrapper .glass-select-menu {
+  bottom: auto;
+  right: calc(100% + 12px);
+  left: auto;
+  top: 50%;
+  transform: translateY(-50%);
 }
 
 .video-control-button {
@@ -659,8 +806,10 @@ body {
 }
 
 @media (max-width: 640px) {
-  .video-controls-container {
+  .video-controls-container.dock-bottom {
     bottom: 1rem;
+  }
+  .video-controls-container {
     padding: 0.5rem 1rem;
     gap: 0.75rem;
   }
@@ -1034,39 +1183,10 @@ body {
   font-size: 0.8125rem;
 }
 
-/* Pin Icon Fixes - High Specificity Override */
-.grid-item .canvas-container .pin-icon {
-  position: absolute !important;
-  top: 8px !important;
-  right: 48px !important; /* 8px edge + 32px mic + 8px gap */
-  left: auto !important;
-  transform: none !important;
-  opacity: 0.6 !important;
-  background-color: rgba(0, 0, 0, 0.6) !important; /* match mic */
-  border-radius: 50% !important;
-  padding: 6px !important; /* match mic */
-  text-align: center !important;
-  line-height: 1 !important;
-  cursor: pointer !important;
-  z-index: 10 !important;
-  transition: opacity 0.2s ease !important;
-  border: none !important;
-  visibility: hidden !important; /* default hidden on desktop; shown on hover via media query below */
-}
-
-/* Style for the pin icon SVG */
-.grid-item .canvas-container .pin-icon svg {
-  width: 20px !important;
-  height: 20px !important;
-  display: block !important;
-}
-
+/* Pin & Crop Icon Fixes - High Specificity Override
+   Icons are now flex children of .tile-top-icons — no absolute positioning. */
+.grid-item .canvas-container .pin-icon,
 .grid-item .canvas-container .crop-icon {
-  position: absolute !important;
-  top: 8px !important;
-  right: 88px !important; /* 8px edge + mic + pin + 8px gaps */
-  left: auto !important;
-  transform: none !important;
   opacity: 0.6 !important;
   background-color: rgba(0, 0, 0, 0.6) !important;
   border-radius: 50% !important;
@@ -1074,35 +1194,32 @@ body {
   text-align: center !important;
   line-height: 1 !important;
   cursor: pointer !important;
-  z-index: 10 !important;
   transition: opacity 0.2s ease !important;
   border: none !important;
   visibility: hidden !important;
 }
 
+.grid-item .canvas-container .pin-icon svg,
 .grid-item .canvas-container .crop-icon svg {
   width: 20px !important;
   height: 20px !important;
   display: block !important;
 }
 
-/* Hide pin icon by default on desktop, show on hover */
+/* Hide pin/crop by default on desktop, show on hover */
 @media (min-width: 768px) {
-  .grid-item .canvas-container .pin-icon { opacity: 0 !important; }
-  .grid-item .canvas-container:hover .pin-icon {
-    visibility: visible !important;
-    opacity: 0.6 !important;
-  }
+  .grid-item .canvas-container .pin-icon,
   .grid-item .canvas-container .crop-icon { opacity: 0 !important; }
+  .grid-item .canvas-container:hover .pin-icon,
   .grid-item .canvas-container:hover .crop-icon {
     visibility: visible !important;
     opacity: 0.6 !important;
   }
 }
 
-/* Hide pin icon on mobile – tap tile to pin instead */
+/* Hide pin/crop on mobile -- tap tile to pin instead */
 @media (max-width: 767px) {
-  .grid-item .canvas-container .pin-icon { display: none !important; }
+  .grid-item .canvas-container .pin-icon,
   .grid-item .canvas-container .crop-icon { display: none !important; }
 }
 

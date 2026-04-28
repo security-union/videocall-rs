@@ -23,16 +23,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use js_sys::Date;
 
 use crate::adaptive_quality_constants::{
-    AudioQualityTier, VideoQualityTier, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
-    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
-    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
+    screen_share_camera_ceiling_index, AudioQualityTier, VideoQualityTier,
+    PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
+    PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
-use crate::diagnostics::adaptive_quality_manager::AdaptiveQualityManager;
+use crate::diagnostics::adaptive_quality_manager::{AdaptiveQualityManager, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 const WINDOW_DURATION_SEC: u32 = 10;
 const INACTIVE_TIMEOUT_SEC: u32 = 20;
+const AQ_SUMMARY_INTERVAL_MS: f64 = 30_000.0;
+const PID_STUCK_THRESHOLD_MS: f64 = 30_000.0;
 
 /// EncoderControl is responsible for bridging the gap between the encoder and the
 /// diagnostics system.
@@ -95,14 +97,26 @@ impl DiagnosticPacketWindow {
         None
     }
 
-    /// Get the minimum FPS received within the window
-    pub fn min_fps(&self) -> Option<f64> {
+    /// Get the average FPS received within the window.
+    ///
+    /// Uses average instead of minimum so that a single bad 1-second sample
+    /// does not poison the entire 10-second window. Average smooths transient
+    /// spikes while still reflecting sustained problems.
+    ///
+    /// **Reaction latency tradeoff:** averaging over a 10-second window means
+    /// that a sudden FPS collapse only fully registers after ~5–6 seconds
+    /// (half the window must be filled with bad samples before the average
+    /// crosses the degradation threshold). Combined with `STEP_DOWN_REACTION_TIME_MS`
+    /// (1.5s), worst-case time-to-step-down is ~7s. This is intentional: the
+    /// extra latency prevents tier oscillation on networks with short packet-loss
+    /// bursts, at the cost of slower response to genuine sustained degradation.
+    pub fn avg_fps(&self) -> Option<f64> {
         if self.packets.is_empty() {
             return None;
         }
 
-        let mut min_fps = f64::INFINITY;
-        let mut found_fps = false;
+        let mut sum_fps = 0.0;
+        let mut count = 0u32;
 
         for (_, packet) in &self.packets {
             let fps = match packet.media_type.enum_value_or_default() {
@@ -113,13 +127,13 @@ impl DiagnosticPacketWindow {
             };
 
             if let Some(fps) = fps {
-                min_fps = min_fps.min(fps);
-                found_fps = true;
+                sum_fps += fps;
+                count += 1;
             }
         }
 
-        if found_fps {
-            Some(min_fps)
+        if count > 0 {
+            Some(sum_fps / count as f64)
         } else {
             None
         }
@@ -188,25 +202,53 @@ impl DiagnosticPackets {
         });
     }
 
-    /// Get the peer with the lowest FPS
-    pub fn get_worst_fps_peer(&self) -> Option<(String, f64)> {
+    /// Get the p75 FPS across all reporting peers.
+    ///
+    /// Collects each peer's average FPS (within their diagnostic window), sorts
+    /// them, and returns the 75th percentile value together with the number of
+    /// peers that actually contributed FPS data ("effective count"). With 5
+    /// peers, the bottom ~25% (outliers with unusually low FPS) have minimal
+    /// influence on the result, preventing a single bad receiver from tanking
+    /// sender quality.
+    ///
+    /// The effective count may be less than `peer_windows.len()` when some peers
+    /// have no usable FPS data (e.g., they joined but haven't produced video
+    /// metrics yet). Callers should use this effective count — not the raw
+    /// window count — for threshold selection so that the lenient/strict
+    /// boundary stays consistent with the actual data feeding the p75.
+    ///
+    /// **Small-n behavior:** at n=3 the 0.75 quantile collapses to the median
+    /// (index `floor(2 * 0.75)` = 1 out of \[0,1,2\]). For 1–2 peers the method
+    /// falls back to the minimum. The adaptive quality manager compensates by
+    /// using `VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT` (0.30 vs 0.50) when
+    /// `effective_peer_count < 3`, so the two pieces form a balanced pair.
+    pub fn get_p75_fps(&self) -> Option<(f64, usize)> {
         if self.peer_windows.is_empty() {
             return None;
         }
 
-        let mut worst_peer = None;
-        let mut min_fps = f64::INFINITY;
+        let mut fps_values: Vec<f64> = self
+            .peer_windows
+            .values()
+            .filter_map(|window| window.avg_fps())
+            .filter(|v| v.is_finite())
+            .collect();
 
-        for (peer_id, window) in &self.peer_windows {
-            if let Some(fps) = window.min_fps() {
-                if fps < min_fps {
-                    min_fps = fps;
-                    worst_peer = Some((peer_id.clone(), fps));
-                }
-            }
+        if fps_values.is_empty() {
+            return None;
         }
 
-        worst_peer
+        let n = fps_values.len();
+        if n <= 2 {
+            // For 1-2 peers, return the minimum (conservative fallback).
+            // Lenient threshold in update_video_tier() compensates for this conservatism.
+            return fps_values.iter().copied().reduce(f64::min).map(|v| (v, n));
+        }
+
+        // Sort ascending and pick the 75th percentile.
+        fps_values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p75_index = ((n - 1) as f64 * 0.75).floor() as usize;
+        Some((fps_values[p75_index], n))
     }
 
     /// Get all active peer IDs
@@ -236,6 +278,19 @@ pub struct EncoderBitrateController {
     /// Set to `true` after any tier transition, cleared by the caller via
     /// [`Self::take_tier_changed`].
     tier_changed: bool,
+    /// Last computed fps_ratio for external observation.
+    last_fps_ratio: f64,
+    /// Last worst-peer FPS for external observation.
+    /// TODO(PR-G): rename to `last_p75_fps`; update proto field, Prometheus metric, and Grafana panel.
+    last_worst_peer_fps: f64,
+    /// Last computed bitrate_ratio for external observation.
+    last_bitrate_ratio: f64,
+    /// Last PID target bitrate for external observation.
+    last_target_bitrate_kbps: f64,
+    /// Timestamp (ms) of the last AQ_STATUS summary log emission.
+    last_aq_summary_ms: f64,
+    /// Timestamp (ms) when PID output first hit PID_OUTPUT_MAX.
+    pid_saturated_since_ms: Option<f64>,
 }
 
 impl EncoderBitrateController {
@@ -247,10 +302,11 @@ impl EncoderBitrateController {
 
     /// Create a new bitrate controller for screen share.
     ///
-    /// Uses `SCREEN_QUALITY_TIERS` starting at the highest tier (1080p) via
-    /// [`AdaptiveQualityManager::new_for_screen`]. The initial
-    /// `ideal_bitrate_kbps` is synced from the starting tier so the PID
-    /// controller does not make an unnecessary correction on the first update.
+    /// Uses `SCREEN_QUALITY_TIERS` starting at `DEFAULT_SCREEN_TIER_INDEX`
+    /// (medium/720p) via [`AdaptiveQualityManager::new_for_screen`]. The
+    /// initial `ideal_bitrate_kbps` is synced from the starting tier so the
+    /// PID controller does not make an unnecessary correction on the first
+    /// update.
     pub fn new_for_screen(
         target_fps: Rc<AtomicU32>,
         video_tiers: &'static [VideoQualityTier],
@@ -260,18 +316,7 @@ impl EncoderBitrateController {
         Self::build(tier_ideal, target_fps, quality_manager)
     }
 
-    /// Create a new bitrate controller using a custom video tier array
-    /// (e.g., `SCREEN_QUALITY_TIERS` for screen share).
-    pub fn new_with_tiers(
-        ideal_bitrate_kbps: u32,
-        target_fps: Rc<AtomicU32>,
-        video_tiers: &'static [VideoQualityTier],
-    ) -> Self {
-        let quality_manager = AdaptiveQualityManager::new(video_tiers);
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
-    }
-
-    /// Internal constructor shared by `new`, `new_with_tiers`, and `new_for_screen`.
+    /// Internal constructor shared by `new` and `new_for_screen`.
     fn build(
         ideal_bitrate_kbps: u32,
         target_fps: Rc<AtomicU32>,
@@ -308,6 +353,12 @@ impl EncoderBitrateController {
             correction_throttle_ms: PID_CORRECTION_THROTTLE_MS,
             quality_manager,
             tier_changed: false,
+            last_fps_ratio: 0.0,
+            last_worst_peer_fps: 0.0,
+            last_bitrate_ratio: 0.0,
+            last_target_bitrate_kbps: 0.0,
+            last_aq_summary_ms: 0.0,
+            pid_saturated_since_ms: None,
         }
     }
 
@@ -350,11 +401,13 @@ impl EncoderBitrateController {
             return None; // Too soon since last correction, don't emit a new one
         }
 
-        // Get the worst performing peer's FPS
-        let worst_fps = match self.diagnostic_packets.get_worst_fps_peer() {
-            Some((_, fps)) => fps,
-            None => return None,
-        };
+        // Get the p75 FPS across all reporting peers.
+        // Semantically this is now the p75 aggregate, but the field name is kept
+        // as `last_worst_peer_fps` for proto/metric compatibility (rename in PR-G).
+        // effective_peer_count is the number of peers that contributed FPS data,
+        // which may be less than peer_windows.len() (some peers may lack metrics).
+        let (worst_fps, effective_peer_count) = self.diagnostic_packets.get_p75_fps()?;
+        self.last_worst_peer_fps = worst_fps;
 
         let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
         let fps_received = worst_fps.min(target_fps);
@@ -402,6 +455,26 @@ impl EncoderBitrateController {
         let current_error = target_fps - fps_received;
         if current_error.abs() <= PID_DEADBAND_FPS && pid_output > 0.0 {
             self.pid.reset();
+            self.pid_saturated_since_ms = None;
+        }
+
+        // Stuck-PID watchdog: if output has been at maximum for too long,
+        // force a reset. This breaks the feedback loop where reduced bitrate
+        // causes low received FPS which keeps the PID saturated indefinitely.
+        // 0.01 tolerance: PID integrator may asymptotically approach the max
+        // without reaching it exactly due to f64 accumulation rounding.
+        if pid_output >= PID_OUTPUT_MAX - 0.01 {
+            let saturated_since = *self.pid_saturated_since_ms.get_or_insert(now);
+            if now - saturated_since >= PID_STUCK_THRESHOLD_MS {
+                log::warn!(
+                    "AQ_PID_STUCK: output at maximum for {:.0}s, forcing reset",
+                    (now - saturated_since) / 1000.0,
+                );
+                self.pid.reset();
+                self.pid_saturated_since_ms = None;
+            }
+        } else {
+            self.pid_saturated_since_ms = None;
         }
 
         let base_bitrate = self.ideal_bitrate_kbps as f64;
@@ -443,6 +516,9 @@ impl EncoderBitrateController {
 
         // --- Adaptive quality manager: tier selection ---
         // Feed the same signals to the quality manager for tier transitions.
+        // Use effective_peer_count (peers with FPS data) rather than
+        // peer_windows.len() so the lenient/strict threshold stays consistent
+        // with the actual peers feeding the p75 aggregation.
         let tier = self.quality_manager.current_video_tier();
         let ideal_for_tier = tier.ideal_bitrate_kbps as f64;
         let tier_changed = self.quality_manager.update(
@@ -451,13 +527,23 @@ impl EncoderBitrateController {
             final_bitrate,
             ideal_for_tier,
             now,
+            effective_peer_count,
         );
         if tier_changed {
             self.tier_changed = true;
             // Update internal ideal bitrate to match the new tier so PID
             // operates within the new tier's range going forward.
+            let old_bitrate = self.ideal_bitrate_kbps;
             let new_tier = self.quality_manager.current_video_tier();
             self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            self.pid.reset();
+            log::info!(
+                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: pid)",
+                old_bitrate,
+                self.ideal_bitrate_kbps,
+                new_tier.label,
+                self.quality_manager.video_tier_index(),
+            );
         }
 
         // Clamp the PID output to the current tier's bitrate bounds.
@@ -465,6 +551,28 @@ impl EncoderBitrateController {
         let tier_min = tier.min_bitrate_kbps as f64;
         let tier_max = tier.max_bitrate_kbps as f64;
         let tier_clamped = final_bitrate.clamp(tier_min, tier_max);
+
+        // Store encoder decision inputs for external observation (health reporting).
+        self.last_fps_ratio = fps_received / target_fps;
+        self.last_bitrate_ratio = tier_clamped / ideal_for_tier;
+        self.last_target_bitrate_kbps = tier_clamped;
+
+        let should_log_summary =
+            tier_changed || (now - self.last_aq_summary_ms >= AQ_SUMMARY_INTERVAL_MS);
+        if should_log_summary {
+            self.last_aq_summary_ms = now;
+            let video_tier = self.quality_manager.current_video_tier();
+            let audio_tier = self.quality_manager.current_audio_tier();
+            log::info!(
+                "AQ_STATUS: video_tier={}({}) audio_tier={}({}) base_bitrate={} corrected_bitrate={:.0} \
+                 fps_ratio={:.2} bitrate_ratio={:.2} peers={}",
+                video_tier.label, self.quality_manager.video_tier_index(),
+                audio_tier.label, self.quality_manager.audio_tier_index(),
+                self.ideal_bitrate_kbps, tier_clamped,
+                self.last_fps_ratio, self.last_bitrate_ratio,
+                self.diagnostic_packets.peer_count(),
+            );
+        }
 
         self.last_correction_time = now;
         Some(tier_clamped)
@@ -511,6 +619,26 @@ impl EncoderBitrateController {
         self.quality_manager.audio_tier_index()
     }
 
+    /// Last computed fps_ratio (received / target) for health reporting.
+    pub fn last_fps_ratio(&self) -> f64 {
+        self.last_fps_ratio
+    }
+
+    /// Last worst-peer FPS for health reporting.
+    pub fn last_worst_peer_fps(&self) -> f64 {
+        self.last_worst_peer_fps
+    }
+
+    /// Last computed bitrate_ratio (tier_clamped / ideal_for_tier) for health reporting.
+    pub fn last_bitrate_ratio(&self) -> f64 {
+        self.last_bitrate_ratio
+    }
+
+    /// Last PID target bitrate (kbps) for health reporting.
+    pub fn last_target_bitrate_kbps(&self) -> f64 {
+        self.last_target_bitrate_kbps
+    }
+
     /// Force an immediate video quality step-down due to server congestion.
     ///
     /// Delegates to [`AdaptiveQualityManager::force_video_step_down`].
@@ -520,10 +648,77 @@ impl EncoderBitrateController {
         let changed = self.quality_manager.force_video_step_down(now);
         if changed {
             self.tier_changed = true;
+            let old_bitrate = self.ideal_bitrate_kbps;
             let new_tier = self.quality_manager.current_video_tier();
             self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            self.pid.reset();
+            log::info!(
+                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: force_step_down)",
+                old_bitrate,
+                self.ideal_bitrate_kbps,
+                new_tier.label,
+                self.quality_manager.video_tier_index(),
+            );
         }
         changed
+    }
+
+    /// Notify this controller that screen sharing state changed.
+    ///
+    /// When screen share becomes active, the camera is forced to a conservative
+    /// tier and capped there to prevent bandwidth contention. When screen share
+    /// stops, the cap is removed and the camera recovers naturally.
+    pub fn notify_screen_sharing(&mut self, active: bool) {
+        if active {
+            let ceiling = screen_share_camera_ceiling_index();
+            let now = Date::now();
+            let changed = self.quality_manager.force_video_step_to(ceiling, now);
+            self.quality_manager.set_quality_ceiling(Some(ceiling));
+            if changed {
+                let old_bitrate = self.ideal_bitrate_kbps;
+                let new_tier = self.quality_manager.current_video_tier();
+                self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+                self.tier_changed = true;
+                self.pid.reset();
+                log::info!(
+                    "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: screen_share_coordination)",
+                    old_bitrate, self.ideal_bitrate_kbps, new_tier.label, self.quality_manager.video_tier_index(),
+                );
+            }
+        } else {
+            self.quality_manager.set_quality_ceiling(None);
+        }
+    }
+
+    /// Drain tier transition records from the quality manager.
+    pub fn drain_tier_transitions(&mut self) -> Vec<TierTransitionRecord> {
+        self.quality_manager.drain_transitions()
+    }
+
+    /// Notify the quality manager that a server re-election completed.
+    /// Suppresses crash ceiling arming for `REELECTION_CEILING_SUPPRESSION_MS`.
+    ///
+    /// Wired through: ConnectionManager → shared AtomicBool signal → CameraEncoder
+    /// control loop (checks/clears each tick) → this method.
+    pub fn notify_reelection_completed(&mut self) {
+        let now = Date::now();
+        self.quality_manager.notify_reelection_completed(now);
+    }
+
+    /// Return the current crash ceiling state, if active.
+    /// `(ceiling_index, tier_label, current_decay_ms)`
+    pub fn crash_ceiling_info(&self) -> Option<(usize, &'static str, f64)> {
+        self.quality_manager.crash_ceiling_info()
+    }
+
+    /// Return step-up blocked counters: `(ceiling, slowdown, screen_share)`.
+    pub fn step_up_blocked_counts(&self) -> (u64, u64, u64) {
+        self.quality_manager.step_up_blocked_counts()
+    }
+
+    /// Drain accumulated dwell time samples: `Vec<(tier_label, dwell_ms)>`.
+    pub fn drain_dwell_samples(&mut self) -> Vec<(&'static str, f64)> {
+        self.quality_manager.drain_dwell_samples()
     }
 }
 
@@ -661,8 +856,9 @@ mod tests {
         assert!(controller.peer_ids().contains(&"peer2".to_string()));
         assert!(controller.peer_ids().contains(&"peer3".to_string()));
 
-        // The controller should adjust bitrate based on the worst peer (peer3)
-        // Process one more packet to check the behavior
+        // With p75 aggregation, a single poor peer (peer3 at 5fps) should NOT
+        // tank the bitrate when 3 out of 4 peers are doing fine.
+        // Peers: [5, 20, 30, 30] -> p75_index = floor(3*0.75) = 2 -> p75 = 30.
         let result4 = controller.process_diagnostics_packet_with_time(
             create_test_packet("test_sender", "test_target", 30.0, 500),
             base_time + 3300.0,
@@ -670,12 +866,12 @@ mod tests {
 
         assert!(result4.is_some(), "Fourth packet should return a bitrate");
 
-        // With one very poor peer, the bitrate should be significantly reduced
+        // With p75 filtering, the single poor peer is treated as an outlier.
+        // The bitrate should remain reasonable (not aggressively reduced).
         if let Some(bitrate) = result4 {
-            // Should be much lower than ideal due to the poor peer
             assert!(
-                bitrate < ideal_bitrate_kbps as f64 * 0.7, // 70% of ideal or less
-                "Expected reduced bitrate due to poor peer, got {bitrate} bps (ideal: {ideal_bitrate_kbps} bps)"
+                bitrate > ideal_bitrate_kbps as f64 * 0.5,
+                "Expected bitrate to remain reasonable with p75 filtering, got {bitrate} kbps (ideal: {ideal_bitrate_kbps} kbps)"
             );
         }
     }
@@ -770,8 +966,8 @@ mod tests {
         assert_eq!(window.len(), 3);
         assert_eq!(window.latest_timestamp(), Some(base_time + 2000.0));
 
-        // Check min FPS (should be 20.0)
-        assert_eq!(window.min_fps(), Some(20.0));
+        // Check avg FPS: (30 + 25 + 20) / 3 = 25.0
+        assert_eq!(window.avg_fps(), Some(25.0));
 
         // Force cleanup with timestamp that should only be outside the window for the first packet
         window.cleanup(base_time + 10500.0);
@@ -784,7 +980,7 @@ mod tests {
 
         // All packets should be removed
         assert_eq!(window.len(), 0);
-        assert_eq!(window.min_fps(), None);
+        assert_eq!(window.avg_fps(), None);
     }
 
     #[wasm_bindgen_test]
@@ -1016,7 +1212,7 @@ mod tests {
             }
         }
         assert!(
-            degraded_bitrate < ideal_bitrate_kbps as f64 * 0.5,
+            degraded_bitrate < ideal_bitrate_kbps as f64 * 0.7,
             "Sustained poor FPS should significantly reduce bitrate, got {degraded_bitrate}"
         );
 
@@ -1093,10 +1289,14 @@ mod tests {
                 bitrate_at_60_target = b;
             }
         }
-        // FPS (15) is far below new target (60) — bitrate should decrease significantly
+        // FPS (15) is far below new target (60) — bitrate should decrease significantly.
+        // The PID drives bitrate toward zero, but tier-clamped output floors at the
+        // current tier's min_bitrate_kbps. Verify we hit that floor.
+        let tier_min = controller.current_video_tier().min_bitrate_kbps as f64;
         assert!(
-            bitrate_at_60_target < ideal_bitrate_kbps as f64 * 0.5,
-            "Bitrate should drop when FPS is far below new target, got {bitrate_at_60_target}"
+            bitrate_at_60_target <= tier_min + 50.0,
+            "Bitrate should drop to near tier minimum when FPS is far below target, \
+             got {bitrate_at_60_target} (tier min: {tier_min})"
         );
     }
 
@@ -1248,15 +1448,361 @@ mod tests {
         let target_fps = Rc::new(AtomicU32::new(15));
         let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
 
-        // Should start at the highest screen tier (index 0, "high")
+        // Should start at DEFAULT_SCREEN_TIER_INDEX (index 1, "medium")
         assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
-        assert_eq!(controller.current_video_tier().label, "high");
+        assert_eq!(controller.current_video_tier().label, "medium");
 
         // The ideal_bitrate_kbps should be synced with the starting tier
         let expected_bitrate = SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].ideal_bitrate_kbps;
         assert_eq!(
             controller.ideal_bitrate_kbps, expected_bitrate,
             "Initial ideal_bitrate_kbps should match the starting tier's ideal_bitrate_kbps"
+        );
+    }
+
+    // =====================================================================
+    // Screen sharing coordination (notify_screen_sharing)
+    // =====================================================================
+
+    #[wasm_bindgen_test]
+    fn test_notify_screen_sharing_active_forces_ceiling() {
+        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(1500, target_fps);
+
+        // Camera starts at DEFAULT_VIDEO_TIER_INDEX (the lowest/minimal tier).
+        let initial_index = controller.video_tier_index();
+        let ceiling = screen_share_camera_ceiling_index();
+
+        // Screen share activates — camera should jump to ceiling tier
+        controller.notify_screen_sharing(true);
+
+        assert_eq!(
+            controller.video_tier_index(),
+            ceiling,
+            "Camera should be forced to ceiling tier '{}' (index {}), was at index {}",
+            controller.current_video_tier().label,
+            controller.video_tier_index(),
+            initial_index,
+        );
+        assert_eq!(
+            controller.current_video_tier().label,
+            "low",
+            "Ceiling tier should be 'low'"
+        );
+        // ideal_bitrate should be synced with the new tier
+        assert_eq!(
+            controller.ideal_bitrate_kbps,
+            controller.current_video_tier().ideal_bitrate_kbps,
+            "ideal_bitrate_kbps should match the ceiling tier"
+        );
+        // tier_changed should be set so the encoding loop picks it up
+        assert!(
+            controller.take_tier_changed(),
+            "tier_changed should be true after screen share activation"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_notify_screen_sharing_deactivate_removes_ceiling() {
+        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(1500, target_fps);
+
+        let ceiling = screen_share_camera_ceiling_index();
+
+        // Activate then deactivate
+        controller.notify_screen_sharing(true);
+        assert_eq!(controller.video_tier_index(), ceiling);
+        controller.take_tier_changed(); // consume
+
+        controller.notify_screen_sharing(false);
+
+        // Tier doesn't change on deactivation — only the ceiling is removed.
+        // The camera stays at its current tier and recovers naturally via the
+        // PID step-up mechanism.
+        assert_eq!(
+            controller.video_tier_index(),
+            ceiling,
+            "Tier should not jump on deactivation, stays at current position"
+        );
+        assert!(
+            !controller.take_tier_changed(),
+            "tier_changed should NOT be set on deactivation (tier didn't move)"
+        );
+
+        // Feed good conditions — the camera should eventually step up past the
+        // old ceiling, proving the ceiling was actually removed.
+        //
+        // Use Date::now() as the base so timestamps are consistent with the
+        // quality manager's Date::now()-based created_at_ms and
+        // last_transition_time_ms. The +10_000 offset ensures warmup (5s) and
+        // min-transition-interval (3s) are both satisfied from the start.
+        let base = Date::now() + 10_000.0;
+        for i in 0..15 {
+            let t = base + (i as f64 * 1100.0);
+            let packet = create_test_packet("s", "peer1", 29.0, 1400);
+            controller.process_diagnostics_packet_with_time(packet, t);
+        }
+        assert!(
+            controller.video_tier_index() < ceiling,
+            "Camera should step up past old ceiling after removal, \
+             got index {} (ceiling was {})",
+            controller.video_tier_index(),
+            ceiling,
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_notify_screen_sharing_double_activation_is_idempotent() {
+        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(1500, target_fps);
+
+        let ceiling = screen_share_camera_ceiling_index();
+
+        // First activation
+        controller.notify_screen_sharing(true);
+        assert_eq!(controller.video_tier_index(), ceiling);
+        let tier_after_first = controller.current_video_tier().label;
+        let bitrate_after_first = controller.ideal_bitrate_kbps;
+        controller.take_tier_changed(); // consume
+
+        // Second activation — should be a no-op (already at ceiling)
+        controller.notify_screen_sharing(true);
+        assert_eq!(
+            controller.video_tier_index(),
+            ceiling,
+            "Double activation should not change tier"
+        );
+        assert_eq!(
+            controller.current_video_tier().label,
+            tier_after_first,
+            "Tier label should be unchanged"
+        );
+        assert_eq!(
+            controller.ideal_bitrate_kbps, bitrate_after_first,
+            "Bitrate should be unchanged"
+        );
+        assert!(
+            !controller.take_tier_changed(),
+            "tier_changed should NOT be set on redundant activation"
+        );
+    }
+
+    // =====================================================================
+    // P75 aggregation and avg_fps tests
+    // =====================================================================
+
+    #[wasm_bindgen_test]
+    fn test_avg_fps_window() {
+        let mut window = DiagnosticPacketWindow::new(10);
+        let base_time = 1000.0;
+
+        // Add packets at 30, 5, 25 fps
+        window.add_packet(base_time, create_test_packet("s", "p", 30.0, 500));
+        window.add_packet(base_time + 1000.0, create_test_packet("s", "p", 5.0, 500));
+        window.add_packet(base_time + 2000.0, create_test_packet("s", "p", 25.0, 500));
+
+        // avg should be (30 + 5 + 25) / 3 = 20.0, not 5.0 (the minimum)
+        let avg = window.avg_fps().unwrap();
+        assert!(
+            (avg - 20.0).abs() < 0.001,
+            "avg_fps should be 20.0, got {avg}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_p75_aggregation_filters_outlier() {
+        // 5 peers: 4 at 28fps, 1 at 0fps. The p75 should be ~28, not 0.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        // Add good peers
+        for i in 0..4 {
+            let target_id = format!("good_peer_{i}");
+            let packet = create_test_packet("sender", &target_id, 28.0, 500);
+            packets.process_packet(packet, base + (i as f64 * 100.0));
+        }
+        // Add bad peer
+        let bad_packet = create_test_packet("sender", "bad_peer", 0.0, 500);
+        packets.process_packet(bad_packet, base + 400.0);
+
+        assert_eq!(packets.peer_count(), 5);
+
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 5);
+        // With 5 values [0, 28, 28, 28, 28] sorted ascending,
+        // p75_index = floor(4 * 0.75) = 3, so p75 = 28.0
+        assert!(
+            (p75 - 28.0).abs() < 0.001,
+            "p75 should be ~28.0 (filtering outlier), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_p75_aggregation_with_widespread_degradation() {
+        // 5 peers: 4 at 5fps, 1 at 28fps. The p75 should be ~5.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        for i in 0..4 {
+            let target_id = format!("slow_peer_{i}");
+            let packet = create_test_packet("sender", &target_id, 5.0, 500);
+            packets.process_packet(packet, base + (i as f64 * 100.0));
+        }
+        let good_packet = create_test_packet("sender", "good_peer", 28.0, 500);
+        packets.process_packet(good_packet, base + 400.0);
+
+        assert_eq!(packets.peer_count(), 5);
+
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 5);
+        // With 5 values [5, 5, 5, 5, 28] sorted ascending,
+        // p75_index = floor(4 * 0.75) = 3, so p75 = 5.0
+        assert!(
+            (p75 - 5.0).abs() < 0.001,
+            "p75 should be ~5.0 (widespread degradation), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_single_peer_p75_returns_that_peer() {
+        // With 1 peer, get_p75_fps should return that peer's avg_fps directly.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        let packet = create_test_packet("sender", "peer1", 12.0, 500);
+        packets.process_packet(packet, base);
+
+        assert_eq!(packets.peer_count(), 1);
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 1);
+        assert!(
+            (p75 - 12.0).abs() < 0.001,
+            "Single peer p75 should be that peer's fps, got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_two_peers_p75_returns_minimum() {
+        // With 2 peers, get_p75_fps should return the minimum of the two.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        let packet1 = create_test_packet("sender", "peer1", 12.0, 500);
+        packets.process_packet(packet1, base);
+        let packet2 = create_test_packet("sender", "peer2", 28.0, 500);
+        packets.process_packet(packet2, base + 100.0);
+
+        assert_eq!(packets.peer_count(), 2);
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 2);
+        assert!(
+            (p75 - 12.0).abs() < 0.001,
+            "Two-peer p75 should be the minimum (12.0), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_three_peers_p75_filters_outlier() {
+        // With 3 peers, p75 kicks in (no longer minimum fallback).
+        // Sorted: [5, 25, 30] -> p75_index = floor(2 * 0.75) = 1 -> value = 25.
+        // The outlier at 5 fps does NOT dominate.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        packets.process_packet(create_test_packet("sender", "peer1", 30.0, 500), base);
+        packets.process_packet(
+            create_test_packet("sender", "peer2", 5.0, 500),
+            base + 100.0,
+        );
+        packets.process_packet(
+            create_test_packet("sender", "peer3", 25.0, 500),
+            base + 200.0,
+        );
+
+        assert_eq!(packets.peer_count(), 3);
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(effective_n, 3);
+        assert!(
+            (p75 - 25.0).abs() < 0.001,
+            "Three-peer p75 should be 25.0 (index 1 of [5,25,30]), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_p75_effective_count_excludes_non_fps_peers() {
+        // 3 registered peers, but one has no usable FPS (media_type=VIDEO,
+        // video_metrics=None — simulates a peer that just joined and hasn't
+        // produced video yet). effective_n should be 2, not 3, so the lenient
+        // threshold applies.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+
+        // Two peers with valid FPS
+        packets.process_packet(create_test_packet("sender", "peer1", 28.0, 500), base);
+        packets.process_packet(
+            create_test_packet("sender", "peer2", 25.0, 500),
+            base + 100.0,
+        );
+
+        // Third peer: media_type=VIDEO but video_metrics=None -> avg_fps()=None
+        let mut no_fps_packet = DiagnosticsPacket::new();
+        no_fps_packet.sender_id = "sender".to_string();
+        no_fps_packet.target_id = "peer_no_fps".to_string();
+        no_fps_packet.media_type = MediaType::VIDEO.into();
+        // Intentionally do NOT set video_metrics — it stays None.
+        packets.process_packet(no_fps_packet, base + 200.0);
+
+        // All 3 peers are registered in the window map
+        assert_eq!(packets.peer_count(), 3);
+
+        // But only 2 contributed FPS data
+        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        assert_eq!(
+            effective_n, 2,
+            "effective_n should be 2 (peer_no_fps has no FPS data), got {effective_n}"
+        );
+        // With 2 peers, p75 degenerates to min([25, 28]) = 25
+        assert!(
+            (p75 - 25.0).abs() < 0.001,
+            "p75 should be 25.0 (min of 2 effective peers), got {p75}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_pid_converges_near_target_fps() {
+        // Feed p75 = 28 fps (very close to target 30) for ~30 iterations.
+        // The PID should converge near ideal_bitrate (500 kbps) since there
+        // is very little error. This proves the PID is stable with the p75 signal.
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = 500u32;
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
+
+        // Use base_time far in the past so the warmup guard and tier transition
+        // timers in the adaptive quality manager are safely exceeded.
+        let base_time = 1000.0;
+
+        let mut final_bitrate = ideal_bitrate_kbps as f64;
+        for i in 0..30 {
+            let result = controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 28.0, 500),
+                base_time + (i as f64 * 1100.0),
+            );
+            if let Some(b) = result {
+                final_bitrate = b;
+            }
+        }
+
+        // Final bitrate should be within 10% of ideal (450-550 range).
+        assert!(
+            (450.0..=550.0).contains(&final_bitrate),
+            "PID should converge near ideal_bitrate ({ideal_bitrate_kbps}) with p75=28, \
+             got {final_bitrate}"
         );
     }
 }

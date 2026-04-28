@@ -26,18 +26,36 @@ use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::nats_events;
+use crate::search;
 use crate::state::AppState;
 
-/// Verify that the requester is the meeting host (authorization check).
-async fn require_host(state: &AppState, meeting_id: i32, user_id: &str) -> Result<(), AppError> {
+/// Verify that the requester is the meeting host, or an admitted participant
+/// when `admitted_can_admit` is enabled (authorization check).
+async fn require_host_or_can_admit(
+    state: &AppState,
+    meeting_id: i32,
+    user_id: &str,
+    admitted_can_admit: bool,
+) -> Result<(), AppError> {
     let row = db_participants::get_status(&state.db, meeting_id, user_id)
         .await?
         .ok_or_else(AppError::not_host)?;
 
-    if row.status != "admitted" || !row.is_host {
+    if row.status != "admitted" {
         return Err(AppError::not_host());
     }
-    Ok(())
+
+    // Host can always manage the waiting room
+    if row.is_host {
+        return Ok(());
+    }
+
+    // Non-host admitted participants can manage if the meeting allows it
+    if admitted_can_admit {
+        return Ok(());
+    }
+
+    Err(AppError::not_host())
 }
 
 /// GET /api/v1/meetings/{meeting_id}/waiting
@@ -50,7 +68,7 @@ pub async fn get_waiting_room(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
     let rows = db_participants::get_waiting(&state.db, meeting.id).await?;
     let waiting: Vec<ParticipantStatusResponse> = rows
@@ -75,7 +93,7 @@ pub async fn admit_participant(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
     let row = db_participants::admit(&state.db, meeting.id, &body.user_id)
         .await?
@@ -85,6 +103,9 @@ pub async fn admit_participant(
     // token via HTTP after receiving this notification.
     nats_events::publish_participant_admitted(state.nats.as_ref(), &meeting_id, &body.user_id)
         .await;
+
+    // Re-push the meeting doc so SearchV2 picks up the new ACL principal.
+    search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }
@@ -99,7 +120,7 @@ pub async fn admit_all(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
     let rows = db_participants::admit_all(&state.db, meeting.id).await?;
     let admitted_count = rows.len();
@@ -115,6 +136,11 @@ pub async fn admit_all(
         .into_iter()
         .map(|r| r.into_participant_status(None))
         .collect();
+
+    // Re-push the meeting doc — potentially many new principals at once.
+    if admitted_count > 0 {
+        search::spawn_repush(&state, meeting.id, meeting_id.clone());
+    }
 
     Ok(Json(APIResponse::ok(AdmitAllResponse {
         admitted_count,
@@ -133,7 +159,7 @@ pub async fn reject_participant(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
-    require_host(&state, meeting.id, &user_id).await?;
+    require_host_or_can_admit(&state, meeting.id, &user_id, meeting.admitted_can_admit).await?;
 
     let row = db_participants::reject(&state.db, meeting.id, &body.user_id)
         .await?
@@ -141,6 +167,10 @@ pub async fn reject_participant(
 
     nats_events::publish_participant_rejected(state.nats.as_ref(), &meeting_id, &body.user_id)
         .await;
+
+    // A rejected user is no longer returned by `list_for_search` — re-push so
+    // their principal drops out of the ACL set.
+    search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }

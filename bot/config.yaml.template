@@ -1,0 +1,50 @@
+# Bot configuration template
+#
+# Copy this file to config-<name>.yaml and fill in your values:
+#   cp config.yaml.template config-myenv.yaml
+#
+# Setup:
+#   1. python3 generate-conversation-edge.py   (generates conversation audio + manifest)
+#   2. Download costume-videos.zip, unzip, run ffmpeg normalization (see README)
+#   3. cargo build --release -p bot
+#
+# Usage:
+#   RUST_LOG=info ./target/release/bot --config config-myenv.yaml --users 20
+
+# Transport — set one or both URLs.
+# Use wt_ratio: 0 for load testing (WT inbound is broken in web-transport-quinn 0.8.1).
+ws_url: "wss://websocket.example.com"
+# wt_url: "https://webtransport.example.com:443"
+# wt_ratio: 0.0
+
+# Legacy single-transport format (still supported):
+# transport: "websocket"
+# server_url: "wss://websocket.example.com"
+
+# Meeting room ID
+meeting_id: "1"
+
+# Path to conversation directory (contains manifest.yaml + lines/*.wav)
+conversation_dir: "conversation"
+
+# Video mode: "costume" (pre-recorded clips) or "ekg" (animated waveform)
+video_mode: costume
+
+# Broadcaster/observer split: first N participants send A/V, rest are
+# receive-only observers. 0 = all participants broadcast.
+# broadcasters: 5
+
+# Seconds of silence before conversation starts (one-time warmup)
+warmup_secs: 15
+
+# Delay between starting each client (ms)
+ramp_up_delay_ms: 500
+
+# JWT secret for authentication (or set JWT_SECRET env var)
+# jwt_secret: "your-base64-secret-here"
+
+# Token TTL in seconds (default: 86400 = 24h)
+# token_ttl_secs: 86400
+
+# Skip TLS certificate verification (WebTransport only)
+# insecure: true

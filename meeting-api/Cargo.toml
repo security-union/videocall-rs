@@ -37,11 +37,14 @@ jsonwebtoken = "9"
 argon2 = "0.5"
 regex = "1"
 rand = "0.8"
+uuid = { version = "1.6", features = ["v4", "v7"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 base64 = "0.22"
 oauth2 = "4"
 url = "2"
 
+flate2 = "1"
+libc = "0.2"
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -51,3 +54,4 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 serial_test = "3"
 rsa = "0.9"
+wiremock = "0.6"

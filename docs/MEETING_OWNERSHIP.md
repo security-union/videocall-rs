@@ -206,8 +206,11 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `OAUTH_TOKEN_URL` | Cond. | -- | Token endpoint (required when `OAUTH_ISSUER` is not set) |
 | `OAUTH_JWKS_URL` | No | -- | JWKS endpoint for ID token signature verification |
 | `OAUTH_USERINFO_URL` | No | -- | UserInfo endpoint fallback when ID token lacks email |
+| `OAUTH_END_SESSION_URL` | No | -- | End session endpoint for OIDC logout |
 | `OAUTH_SCOPES` | No | `openid email profile` | Space-separated OAuth scopes |
 | `AFTER_LOGIN_URL` | No | `/` | Redirect target after successful OAuth login |
+| `AFTER_LOGOUT_URL` | No | `/` | Redirect target after successful OIDC logout |
+| `OAUTH_BROWSER_PKCE` | No | `false` | Set `true` when `OAUTH_REDIRECT_URL` points to the UI `/auth/callback` route (browser PKCE mode); `false` keeps the legacy session-cookie flow via `/login/callback` |
 
 ---
 

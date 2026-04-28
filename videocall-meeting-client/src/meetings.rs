@@ -16,7 +16,8 @@
 use videocall_meeting_types::{
     requests::{CreateMeetingRequest, UpdateMeetingRequest},
     responses::{
-        CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse, MeetingInfoResponse,
+        CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
+        MeetingGuestInfoResponse, MeetingInfoResponse,
     },
 };
 
@@ -35,19 +36,21 @@ impl MeetingApiClient {
         parse_api_response(response).await
     }
 
-    /// List meetings owned by the authenticated user.
+    /// List meetings owned by the authenticated user, optionally filtered by query.
     ///
-    /// Calls `GET /api/v1/meetings?limit={limit}&offset={offset}`.
+    /// Calls `GET /api/v1/meetings?limit={limit}&offset={offset}[&q={q}]`.
     pub async fn list_meetings(
         &self,
         limit: i64,
         offset: i64,
+        q: Option<&str>,
     ) -> Result<ListMeetingsResponse, ApiError> {
-        let response = self
-            .get("/api/v1/meetings")
-            .query(&[("limit", limit), ("offset", offset)])
-            .send()
-            .await?;
+        let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+        if let Some(query_str) = q {
+            query.push(("q", query_str.to_string()));
+        }
+
+        let response = self.get("/api/v1/meetings").query(&query).send().await?;
         parse_api_response(response).await
     }
 
@@ -91,6 +94,18 @@ impl MeetingApiClient {
     ) -> Result<MeetingInfoResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}");
         let response = self.patch(&path).json(request).send().await?;
+        parse_api_response(response).await
+    }
+
+    /// Get public guest info for a meeting (no authentication required).
+    ///
+    /// Calls `GET /api/v1/meetings/{meeting_id}/guest-info`.
+    pub async fn get_meeting_guest_info(
+        &self,
+        meeting_id: &str,
+    ) -> Result<MeetingGuestInfoResponse, ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/guest-info");
+        let response = self.get(&path).send().await?;
         parse_api_response(response).await
     }
 }

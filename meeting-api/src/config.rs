@@ -50,6 +50,52 @@ pub struct Config {
     /// Internal URLs for fetching version info from peer services.
     /// Used by the aggregated `/api/v1/versions` endpoint.
     pub service_version_urls: Vec<String>,
+    /// SearchV2 integration config. `None` when the middleware is not configured
+    /// (both `SEARCH_API_URL` and `SEARCH_API_TOKEN` must be set); search push
+    /// becomes a no-op in that case. See [`crate::search`].
+    pub search: Option<SearchConfig>,
+    /// Allow unauthenticated requests to resolve to a stable "anonymous" user
+    /// identity (path 3 in [`crate::auth::AuthUser`]).  Controlled by
+    /// `ALLOW_ANONYMOUS=true`.  Default `false` — production must set this
+    /// explicitly off (or leave unset); only flip it for local development
+    /// when running without an OAuth provider.
+    pub allow_anonymous: bool,
+    /// Dev-only auto-login user. `None` unless `DEV_USER` is set AND OAuth is
+    /// disabled. See [`DevUser`] for format and security warnings.
+    pub dev_user: Option<DevUser>,
+}
+
+/// SearchV2 / opensearch-middleware integration configuration.
+///
+/// When present on [`Config`] / [`crate::state::AppState`], the meeting-api
+/// pushes meeting lifecycle documents to the middleware's content-push API and
+/// deletes them on hard deletion.  When `None`, every push is a no-op — the
+/// SearchV2 integration degrades gracefully.
+///
+/// Populated from the `SEARCH_API_URL` and `SEARCH_API_TOKEN` env vars; both
+/// must be set for the struct to be constructed.
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    /// Base URL of the SearchV2 middleware (no trailing slash required),
+    /// e.g. `http://localhost:3000/api/search/v2`.
+    pub base_url: String,
+    /// Bearer token used for content-push authentication (a middleware JWT
+    /// with `pushadmin` or `searchadmin` role).  Not shared with end users —
+    /// this is a server-to-server admin token.
+    pub token: String,
+}
+
+/// Dev-only auto-login user. Parsed from the `DEV_USER` env var
+/// (format: `email:display_name`). Only active when OAuth is disabled.
+///
+/// **WARNING**: This must NEVER be set in production. When set, anyone can
+/// obtain a valid session by visiting `/api/v1/dev/auto-login`.
+#[derive(Debug, Clone)]
+pub struct DevUser {
+    /// Email address used as the `sub` claim in the session JWT.
+    pub email: String,
+    /// Display name used as the `name` claim in the session JWT.
+    pub name: String,
 }
 
 /// OAuth/OIDC configuration — provider-agnostic.
@@ -77,6 +123,44 @@ pub struct OAuthConfig {
     /// "http://localhost:80,http://localhost:3001"). The origin of
     /// `after_login_url` is implicitly allowed.
     pub allowed_redirect_urls: Vec<String>,
+    /// End-session endpoint for RP-initiated logout (OIDC RP-Initiated Logout
+    /// 1.0). Discovered from the provider's OpenID Configuration when
+    /// `OAUTH_ISSUER` is set, or overridden via `OAUTH_END_SESSION_URL`.
+    ///
+    /// When set, `GET /logout` redirects the browser to this URL (with
+    /// `client_id` and optionally `post_logout_redirect_uri`) after clearing
+    /// the local session cookie, so the provider also terminates the session.
+    pub end_session_endpoint: Option<String>,
+    /// URL to redirect to after the provider has completed logout
+    /// (`post_logout_redirect_uri` sent to `end_session_endpoint`).
+    /// Configured via `AFTER_LOGOUT_URL`. When not set, the parameter is
+    /// omitted from the end-session redirect.
+    pub after_logout_url: Option<String>,
+    /// When `true`, the `GET /login/callback` handler skips session-cookie
+    /// issuance after a successful token exchange.  Set this only after
+    /// pointing `OAUTH_REDIRECT_URL` at the dioxus-ui `/auth/callback` route
+    /// (browser PKCE mode) and verifying the UI handles its own token storage.
+    ///
+    /// **Default: `false`** — existing deployments that route the provider
+    /// callback through the backend (`/login/callback`) continue to receive a
+    /// session cookie and require no configuration change.  Flip to `true`
+    /// only once `OAUTH_REDIRECT_URL` has been updated to the UI route.
+    pub browser_pkce: bool,
+    /// Audience value that per-request Bearer tokens must carry in their `aud`
+    /// claim.  When `Some`, every token validated by the `AuthUser` extractor
+    /// must list this value in `aud`; tokens whose `aud` does not match are
+    /// rejected with 401 regardless of signature validity.
+    ///
+    /// Set via `OAUTH_RESOURCE_SERVER_AUDIENCE`.  Recommended for deployments
+    /// that share an identity provider with other services (Keycloak, Okta,
+    /// Entra) — without this, any JWT signed by the same IdP is accepted,
+    /// including tokens issued for unrelated client applications (confused
+    /// deputy risk, RFC 8707).
+    ///
+    /// When `None` (the default), audience validation is skipped on the
+    /// per-request path so that both id_tokens (`aud = client_id`) and access
+    /// tokens (`aud = resource-server URL`) continue to work.
+    pub resource_server_audience: Option<String>,
 }
 
 impl Config {
@@ -95,8 +179,17 @@ impl Config {
     /// - OAuth: `OAUTH_CLIENT_ID`, `OAUTH_SECRET` (optional), `OAUTH_REDIRECT_URL`,
     ///   `OAUTH_ISSUER`, `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_JWKS_URL`,
     ///   `OAUTH_USERINFO_URL`, `OAUTH_SCOPES` (default: `"openid email profile"`),
-    ///   `AFTER_LOGIN_URL`
+    ///   `AFTER_LOGIN_URL`, `OAUTH_BROWSER_PKCE` (default: `false`),
+    ///   `OAUTH_RESOURCE_SERVER_AUDIENCE` (optional; restricts per-request `aud`)
+    /// - OIDC logout: `OAUTH_END_SESSION_URL` (manual override; auto-discovered
+    ///   from `OAUTH_ISSUER` when not set), `AFTER_LOGOUT_URL` (sent as
+    ///   `post_logout_redirect_uri` to the provider's end-session endpoint)
     /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"` or comma-separated for multiple origins)
+    /// - `SEARCH_API_URL` + `SEARCH_API_TOKEN` (both required together to enable SearchV2 push;
+    ///   either missing → push is silently disabled). See [`SearchConfig`].
+    /// - `ALLOW_ANONYMOUS` (default: `false`) — set to `"true"` / `"1"` for local development
+    ///   only. When enabled, unauthenticated requests resolve to a stable anonymous user
+    ///   identity instead of returning 401.
     pub fn from_env() -> Result<Self, String> {
         let database_url = env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -135,6 +228,52 @@ impl Config {
             .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
             .unwrap_or_default();
 
+        // SearchV2 push integration is enabled only when both env vars are set.
+        // Missing either one → no-op pushes (graceful degradation). We log the
+        // decision once at startup so operators can see why search isn't firing.
+        let search = match (
+            env::var("SEARCH_API_URL").ok().filter(|s| !s.is_empty()),
+            env::var("SEARCH_API_TOKEN").ok().filter(|s| !s.is_empty()),
+        ) {
+            (Some(base_url), Some(token)) => {
+                tracing::info!("SearchV2 push enabled (base_url={base_url})");
+                Some(SearchConfig { base_url, token })
+            }
+            (Some(_), None) => {
+                tracing::info!(
+                    "SearchV2 push disabled: SEARCH_API_URL set but SEARCH_API_TOKEN is missing"
+                );
+                None
+            }
+            (None, Some(_)) => {
+                tracing::info!(
+                    "SearchV2 push disabled: SEARCH_API_TOKEN set but SEARCH_API_URL is missing"
+                );
+                None
+            }
+            (None, None) => {
+                tracing::info!("SearchV2 push disabled (SEARCH_API_URL not set)");
+                None
+            }
+        };
+
+        // Anonymous auth fallback — opt-in via ALLOW_ANONYMOUS.  Accept the
+        // common truthy forms ("true"/"1", case-insensitive) and default to
+        // false so production deployments never allow anonymous by accident.
+        let allow_anonymous = env::var("ALLOW_ANONYMOUS")
+            .map(|v| {
+                let v = v.trim().to_lowercase();
+                v == "true" || v == "1"
+            })
+            .unwrap_or(false);
+        if allow_anonymous {
+            tracing::warn!(
+                "ALLOW_ANONYMOUS=true — unauthenticated requests will resolve to \
+                 anonymous identities. This is intended for local development only; \
+                 do not enable in production."
+            );
+        }
+
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
             .filter(|s| !s.is_empty())
@@ -147,10 +286,30 @@ impl Config {
                 let userinfo_url = env::var("OAUTH_USERINFO_URL")
                     .ok()
                     .filter(|s| !s.is_empty());
+                let end_session_url = env::var("OAUTH_END_SESSION_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty());
                 let scopes = env::var("OAUTH_SCOPES")
                     .ok()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "openid email profile".to_string());
+
+                // post_logout_redirect_uri sent to the provider's end-session endpoint.
+                let after_logout_url = env::var("AFTER_LOGOUT_URL").ok().filter(|s| !s.is_empty());
+
+                // When true, GET /login/callback will not issue a session cookie.
+                // Leave false (the default) for any deployment still routing the
+                // provider redirect through the backend /login/callback handler.
+                let browser_pkce = env::var("OAUTH_BROWSER_PKCE")
+                    .map(|v| v.to_lowercase() == "true" || v == "1")
+                    .unwrap_or(false);
+
+                // Audience restriction for per-request Bearer token validation.
+                // When set, tokens whose `aud` claim does not contain this value
+                // are rejected (RFC 8707 / confused deputy mitigation).
+                let resource_server_audience = env::var("OAUTH_RESOURCE_SERVER_AUDIENCE")
+                    .ok()
+                    .filter(|s| !s.is_empty());
 
                 // When no issuer is set, auth_url and token_url must be provided manually.
                 let auth_url = match auth_url {
@@ -202,9 +361,45 @@ impl Config {
                         }
                         urls
                     },
+                    end_session_endpoint: end_session_url,
+                    after_logout_url,
+                    browser_pkce,
+                    resource_server_audience,
                 })
             })
             .transpose()?;
+
+        // DEV_USER: only active when OAuth is disabled.
+        let dev_user = if oauth.is_none() {
+            env::var("DEV_USER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|raw| {
+                    let (email, name) = raw.split_once(':').ok_or_else(|| {
+                        "DEV_USER must be in format 'email:display_name' (e.g. 'dev@test.local:Dev User')".to_string()
+                    })?;
+                    let email = email.trim().to_string();
+                    let name = name.trim().to_string();
+                    if email.is_empty() || name.is_empty() {
+                        return Err("DEV_USER email and display_name must not be empty".to_string());
+                    }
+                    Ok(DevUser { email, name })
+                })
+                .transpose()?
+        } else {
+            // Silently ignore DEV_USER when OAuth is enabled — it would be a
+            // security risk to honour it alongside real auth.
+            if env::var("DEV_USER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                tracing::warn!(
+                    "DEV_USER is set but OAuth is enabled — ignoring DEV_USER for safety"
+                );
+            }
+            None
+        };
 
         Ok(Self {
             listen_addr,
@@ -219,6 +414,9 @@ impl Config {
             cors_allowed_origin,
             nats_url,
             service_version_urls,
+            search,
+            allow_anonymous,
+            dev_user,
         })
     }
 
@@ -256,13 +454,18 @@ impl Config {
         if oauth.userinfo_url.is_none() {
             oauth.userinfo_url = endpoints.userinfo_endpoint;
         }
+        if oauth.end_session_endpoint.is_none() {
+            oauth.end_session_endpoint = endpoints.end_session_endpoint;
+        }
 
         tracing::info!(
-            "OIDC discovery complete: auth_url={}, token_url={}, jwks_url={:?}, userinfo_url={:?}",
+            "OIDC discovery complete: auth_url={}, token_url={}, jwks_url={:?}, \
+             userinfo_url={:?}, end_session_endpoint={:?}",
             oauth.auth_url,
             oauth.token_url,
             oauth.jwks_url,
-            oauth.userinfo_url
+            oauth.userinfo_url,
+            oauth.end_session_endpoint,
         );
 
         Ok(())

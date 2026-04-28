@@ -3,7 +3,7 @@ rustlemania-websocket:
   nameOverride: "websocket-us-east"
   fullnameOverride: "websocket-us-east"
 
-  replicaCount: 1  # Higher replicas for primary region
+  replicaCount: 1
 
   image:
     repository: securityunion/videocall-media-server
@@ -16,7 +16,7 @@ rustlemania-websocket:
     - name: ACTIX_PORT
       value: "8080"
     - name: NATS_URL
-      value: nats-us-east:4222  # Connect to US East NATS cluster
+      value: nats-us-east:4222
     - name: REGION
       value: "us-east"
     - name: HOSTNAME
@@ -32,13 +32,12 @@ rustlemania-websocket:
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
     - name: TOKIO_WORKER_THREADS
-      value: "2"  # Optimal for 2400m CPU (I/O bound WebSocket operations)
+      value: "2"
     - name: JWT_SECRET
       valueFrom:
         secretKeyRef:
           name: jwt-secret
           key: secret
-
 
   resources:
     limits:
@@ -49,7 +48,7 @@ rustlemania-websocket:
       memory: "128Mi"
 
   service:
-    type: ClusterIP  # Changed to ClusterIP for ingress
+    type: ClusterIP
     port: 8080
 
   ingress:
@@ -79,13 +78,6 @@ rustlemania-websocket:
     prometheus.io/port: "8080"
     prometheus.io/path: "/metrics"
 
-  autoscaling:
-    enabled: false
-    minReplicas: 1
-    maxReplicas: 12
-    targetCPUUtilizationPercentage: 70
-
-  # Node selector for US East region
   nodeSelector:
     topology.kubernetes.io/region: "nyc1"
 
@@ -100,4 +92,4 @@ rustlemania-websocket:
               operator: In
               values:
               - websocket-us-east
-          topologyKey: kubernetes.io/hostname 
+          topologyKey: kubernetes.io/hostname

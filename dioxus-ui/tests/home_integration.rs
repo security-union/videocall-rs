@@ -23,7 +23,9 @@ use web_sys::{Event, EventInit, HtmlButtonElement, HtmlInputElement};
 use dioxus::prelude::*;
 use dioxus_ui::components::config_error::ConfigError;
 use dioxus_ui::constants::app_config;
-use dioxus_ui::context::DisplayNameCtx;
+use dioxus_ui::context::{
+    load_display_name_from_storage, DisplayNameCtx, TransportPreference, TransportPreferenceCtx,
+};
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
@@ -56,16 +58,29 @@ fn ensure_root_url() {
     );
 }
 
-/// Full app wrapper: provides DisplayNameCtx then renders Router<Route>.
-/// The Router picks the component based on the current URL (pushed to "/").
+/// Full app wrapper: provides DisplayNameCtx + TransportPreferenceCtx then
+/// renders Router<Route>.  The Router picks the component based on the
+/// current URL (pushed to "/").
+///
+/// Both contexts must be provided here to match `main.rs`, because form
+/// submission in the Home route can navigate to /meeting/:id, and
+/// `MeetingPage::use_context::<TransportPreferenceCtx>()` panics when the
+/// context is missing.  Without this provider, the panic corrupts the Dioxus
+/// runtime state and breaks subsequent tests in the same binary.
 fn home_wrapper_direct() -> Element {
     let username_signal = use_signal(|| None::<String>);
     use_context_provider(|| DisplayNameCtx(username_signal));
+
+    let transport_pref = use_signal(TransportPreference::default);
+    use_context_provider(|| TransportPreferenceCtx(transport_pref));
+
     match app_config() {
         Ok(_) => rsx! {
             Router::<dioxus_ui::routing::Route> {}
         },
-        Err(e) => rsx! { ConfigError { message: e } },
+        Err(e) => rsx! {
+            ConfigError { message: e }
+        },
     }
 }
 
@@ -90,7 +105,7 @@ async fn home_page_renders_with_oauth_disabled() {
 
     // The page text should contain landmarks that identify the home screen.
     let text = mount.text_content().unwrap_or_default();
-    assert!(text.contains("videocall.rs"), "title missing");
+    assert!(text.contains("Concept Car"), "title missing");
     assert!(
         text.contains("Start or Join a Meeting"),
         "form heading missing"
@@ -322,10 +337,14 @@ async fn home_normalizes_spaces_in_display_name() {
     yield_now().await;
 
     // Navigation now succeeds, removing the Home component from the DOM,
-    // so verify the normalized username via localStorage instead.
-    let storage = web_sys::window().unwrap().local_storage().unwrap().unwrap();
-    let saved = storage.get_item("vc_display_name").unwrap().unwrap();
-    assert_eq!(saved, "John Doe");
+    // so verify the normalized username via the public storage API instead.
+    // (Direct web_sys localStorage access would see CBOR bytes, not a plain
+    // string, because dioxus-sdk-storage serialises values with CBOR+zlib.)
+    let saved = load_display_name_from_storage();
+    assert_eq!(saved, Some("John Doe".to_string()));
+
+    // Clean up the stored display name so this test doesn't pollute others.
+    dioxus_ui::context::clear_display_name_from_storage();
 
     cleanup(&mount);
     restore_fetch();

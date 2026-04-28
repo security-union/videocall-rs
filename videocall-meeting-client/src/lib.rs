@@ -110,6 +110,11 @@ impl MeetingApiClient {
         self.apply_auth(self.http.patch(self.url(path)))
     }
 
+    /// Build a PUT request with auth applied.
+    pub(crate) fn put(&self, path: &str) -> reqwest::RequestBuilder {
+        self.apply_auth(self.http.put(self.url(path)))
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -148,7 +153,13 @@ pub(crate) async fn parse_api_response<T: serde::de::DeserializeOwned + serde::S
         401 => Err(ApiError::NotAuthenticated),
         403 => {
             let text = response.text().await.unwrap_or_default();
-            Err(ApiError::Forbidden(text))
+            if text.contains("JOINING_NOT_ALLOWED") {
+                Err(ApiError::JoiningNotAllowed)
+            } else if text.contains("GUESTS_NOT_ALLOWED") {
+                Err(ApiError::GuestsNotAllowed)
+            } else {
+                Err(ApiError::Forbidden(text))
+            }
         }
         404 => {
             let text = response.text().await.unwrap_or_default();

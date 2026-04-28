@@ -52,6 +52,12 @@ pub struct MeetingPacket {
     ///  Display name of the participant (for PARTICIPANT_JOINED/LEFT events)
     // @@protoc_insertion_point(field:MeetingPacket.display_name)
     pub display_name: ::std::vec::Vec<u8>,
+    ///  Whether the participant joined as an unauthenticated guest
+    ///  (for PARTICIPANT_JOINED/LEFT events). Sourced from the
+    ///  authenticated JWT is_guest claim on the server. Default false
+    ///  keeps the wire format backward-compatible with older peers.
+    // @@protoc_insertion_point(field:MeetingPacket.is_guest)
+    pub is_guest: bool,
     // special fields
     // @@protoc_insertion_point(special_field:MeetingPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -69,7 +75,7 @@ impl MeetingPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(10);
+        let mut fields = ::std::vec::Vec::with_capacity(11);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "event_type",
@@ -121,6 +127,11 @@ impl MeetingPacket {
             |m: &MeetingPacket| { &m.display_name },
             |m: &mut MeetingPacket| { &mut m.display_name },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "is_guest",
+            |m: &MeetingPacket| { &m.is_guest },
+            |m: &mut MeetingPacket| { &mut m.is_guest },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MeetingPacket>(
             "MeetingPacket",
             fields,
@@ -169,6 +180,9 @@ impl ::protobuf::Message for MeetingPacket {
                 82 => {
                     self.display_name = is.read_bytes()?;
                 },
+                88 => {
+                    self.is_guest = is.read_bool()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -211,6 +225,9 @@ impl ::protobuf::Message for MeetingPacket {
         if !self.display_name.is_empty() {
             my_size += ::protobuf::rt::bytes_size(10, &self.display_name);
         }
+        if self.is_guest != false {
+            my_size += 1 + 1;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -247,6 +264,9 @@ impl ::protobuf::Message for MeetingPacket {
         if !self.display_name.is_empty() {
             os.write_bytes(10, &self.display_name)?;
         }
+        if self.is_guest != false {
+            os.write_bool(11, self.is_guest)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -274,6 +294,7 @@ impl ::protobuf::Message for MeetingPacket {
         self.room_token.clear();
         self.session_id = 0;
         self.display_name.clear();
+        self.is_guest = false;
         self.special_fields.clear();
     }
 
@@ -289,6 +310,7 @@ impl ::protobuf::Message for MeetingPacket {
             room_token: ::std::string::String::new(),
             session_id: 0,
             display_name: ::std::vec::Vec::new(),
+            is_guest: false,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -335,6 +357,10 @@ pub mod meeting_packet {
         PARTICIPANT_REJECTED = 7,
         // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.WAITING_ROOM_UPDATED)
         WAITING_ROOM_UPDATED = 8,
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.PARTICIPANT_DISPLAY_NAME_CHANGED)
+        PARTICIPANT_DISPLAY_NAME_CHANGED = 9,
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.MEETING_SETTINGS_UPDATED)
+        MEETING_SETTINGS_UPDATED = 10,
     }
 
     impl ::protobuf::Enum for MeetingEventType {
@@ -355,6 +381,8 @@ pub mod meeting_packet {
                 6 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_ADMITTED),
                 7 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_REJECTED),
                 8 => ::std::option::Option::Some(MeetingEventType::WAITING_ROOM_UPDATED),
+                9 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED),
+                10 => ::std::option::Option::Some(MeetingEventType::MEETING_SETTINGS_UPDATED),
                 _ => ::std::option::Option::None
             }
         }
@@ -370,6 +398,8 @@ pub mod meeting_packet {
                 "PARTICIPANT_ADMITTED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_ADMITTED),
                 "PARTICIPANT_REJECTED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_REJECTED),
                 "WAITING_ROOM_UPDATED" => ::std::option::Option::Some(MeetingEventType::WAITING_ROOM_UPDATED),
+                "PARTICIPANT_DISPLAY_NAME_CHANGED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED),
+                "MEETING_SETTINGS_UPDATED" => ::std::option::Option::Some(MeetingEventType::MEETING_SETTINGS_UPDATED),
                 _ => ::std::option::Option::None
             }
         }
@@ -384,6 +414,8 @@ pub mod meeting_packet {
             MeetingEventType::PARTICIPANT_ADMITTED,
             MeetingEventType::PARTICIPANT_REJECTED,
             MeetingEventType::WAITING_ROOM_UPDATED,
+            MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED,
+            MeetingEventType::MEETING_SETTINGS_UPDATED,
         ];
     }
 
@@ -413,7 +445,7 @@ pub mod meeting_packet {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1atypes/meeting_packet.proto\"\xe9\x04\n\rMeetingPacket\x12>\n\neven\
+    \n\x1atypes/meeting_packet.proto\"\xc8\x05\n\rMeetingPacket\x12>\n\neven\
     t_type\x18\x01\x20\x01(\x0e2\x1f.MeetingPacket.MeetingEventTypeR\teventT\
     ype\x12\x17\n\x07room_id\x18\x02\x20\x01(\tR\x06roomId\x12\"\n\rstart_ti\
     me_ms\x18\x03\x20\x01(\x04R\x0bstartTimeMs\x12\x18\n\x07message\x18\x04\
@@ -422,16 +454,18 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     ount\x12$\n\x0etarget_user_id\x18\x07\x20\x01(\x0cR\x0ctargetUserId\x12\
     \x1d\n\nroom_token\x18\x08\x20\x01(\tR\troomToken\x12\x1d\n\nsession_id\
     \x18\t\x20\x01(\x04R\tsessionId\x12!\n\x0cdisplay_name\x18\n\x20\x01(\
-    \x0cR\x0bdisplayName\"\xed\x01\n\x10MeetingEventType\x12\x1e\n\x1aMEETIN\
-    G_EVENT_TYPE_UNKNOWN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\x01\x12\x11\
-    \n\rMEETING_ENDED\x10\x02\x12\x16\n\x12PARTICIPANT_JOINED\x10\x03\x12\
-    \x14\n\x10PARTICIPANT_LEFT\x10\x04\x12\x15\n\x11MEETING_ACTIVATED\x10\
-    \x05\x12\x18\n\x14PARTICIPANT_ADMITTED\x10\x06\x12\x18\n\x14PARTICIPANT_\
-    REJECTED\x10\x07\x12\x18\n\x14WAITING_ROOM_UPDATED\x10\x08J\xac\x0c\n\
-    \x06\x12\x04\0\0%\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\nH\n\x02\x04\0\x12\
-    \x04\x03\0%\x01\x1a<\x20Meeting\x20lifecycle\x20messages\x20sent\x20betw\
+    \x0cR\x0bdisplayName\x12\x19\n\x08is_guest\x18\x0b\x20\x01(\x08R\x07isGu\
+    est\"\xb1\x02\n\x10MeetingEventType\x12\x1e\n\x1aMEETING_EVENT_TYPE_UNKN\
+    OWN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\x01\x12\x11\n\rMEETING_ENDED\
+    \x10\x02\x12\x16\n\x12PARTICIPANT_JOINED\x10\x03\x12\x14\n\x10PARTICIPAN\
+    T_LEFT\x10\x04\x12\x15\n\x11MEETING_ACTIVATED\x10\x05\x12\x18\n\x14PARTI\
+    CIPANT_ADMITTED\x10\x06\x12\x18\n\x14PARTICIPANT_REJECTED\x10\x07\x12\
+    \x18\n\x14WAITING_ROOM_UPDATED\x10\x08\x12$\n\x20PARTICIPANT_DISPLAY_NAM\
+    E_CHANGED\x10\t\x12\x1c\n\x18MEETING_SETTINGS_UPDATED\x10\nJ\x87\x10\n\
+    \x06\x12\x04\0\0.\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\nH\n\x02\x04\0\x12\
+    \x04\x03\0.\x01\x1a<\x20Meeting\x20lifecycle\x20messages\x20sent\x20betw\
     een\x20server\x20and\x20clients\n\n\n\n\x03\x04\0\x01\x12\x03\x03\x08\
-    \x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x04\x02\x16\x03\n\x0c\n\x05\x04\0\
+    \x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x04\x02\x1a\x03\n\x0c\n\x05\x04\0\
     \x04\0\x01\x12\x03\x04\x07\x17\n\r\n\x06\x04\0\x04\0\x02\0\x12\x03\x05\
     \x04#\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x05\x04\x1e\n\x0e\n\x07\
     \x04\0\x04\0\x02\0\x02\x12\x03\x05!\"\nF\n\x06\x04\0\x04\0\x02\x01\x12\
@@ -459,37 +493,50 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x04\0\x04\0\x02\x07\x02\x12\x03\x13\x1b\x1c\n*\n\x06\x04\0\x04\0\x02\
     \x08\x12\x03\x15\x04\x1d\x1a\x1b\x20Waiting\x20room\x20list\x20changed\n\
     \n\x0e\n\x07\x04\0\x04\0\x02\x08\x01\x12\x03\x15\x04\x18\n\x0e\n\x07\x04\
-    \0\x04\0\x02\x08\x02\x12\x03\x15\x1b\x1c\n\x0b\n\x04\x04\0\x02\0\x12\x03\
-    \x18\x02\"\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03\x18\x02\x12\n\x0c\n\x05\
-    \x04\0\x02\0\x01\x12\x03\x18\x13\x1d\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\
-    \x18\x20!\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x19\x02\x15\n\x0c\n\x05\x04\
-    \0\x02\x01\x05\x12\x03\x19\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\
-    \x19\t\x10\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x19\x13\x14\n\x0b\n\x04\
-    \x04\0\x02\x02\x12\x03\x1a\x02\x1b\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\
-    \x1a\x02\x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x1a\t\x16\n\x0c\n\x05\
-    \x04\0\x02\x02\x03\x12\x03\x1a\x19\x1a\n\x0b\n\x04\x04\0\x02\x03\x12\x03\
-    \x1b\x02\x15\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x1b\x02\x08\n\x0c\n\
-    \x05\x04\0\x02\x03\x01\x12\x03\x1b\t\x10\n\x0c\n\x05\x04\0\x02\x03\x03\
-    \x12\x03\x1b\x13\x14\n\x0b\n\x04\x04\0\x02\x04\x12\x03\x1c\x02\x17\n\x0c\
-    \n\x05\x04\0\x02\x04\x05\x12\x03\x1c\x02\x07\n\x0c\n\x05\x04\0\x02\x04\
-    \x01\x12\x03\x1c\x08\x12\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x1c\x15\
-    \x16\n\x0b\n\x04\x04\0\x02\x05\x12\x03\x1d\x02\x1e\n\x0c\n\x05\x04\0\x02\
-    \x05\x05\x12\x03\x1d\x02\x07\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x1d\
-    \x08\x19\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\x1d\x1c\x1d\n8\n\x04\x04\
-    \0\x02\x06\x12\x03\x1f\x02\x1b\x1a+\x20For\x20ADMITTED/REJECTED:\x20affe\
-    cted\x20user's\x20ID\n\n\x0c\n\x05\x04\0\x02\x06\x05\x12\x03\x1f\x02\x07\
-    \n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x1f\x08\x16\n\x0c\n\x05\x04\0\x02\
-    \x06\x03\x12\x03\x1f\x19\x1a\n6\n\x04\x04\0\x02\x07\x12\x03!\x02\x18\x1a\
-    )\x20For\x20ADMITTED:\x20JWT\x20to\x20upgrade\x20connection\n\n\x0c\n\
-    \x05\x04\0\x02\x07\x05\x12\x03!\x02\x08\n\x0c\n\x05\x04\0\x02\x07\x01\
-    \x12\x03!\t\x13\n\x0c\n\x05\x04\0\x02\x07\x03\x12\x03!\x16\x17\n\x0b\n\
-    \x04\x04\0\x02\x08\x12\x03\"\x02\x18\n\x0c\n\x05\x04\0\x02\x08\x05\x12\
-    \x03\"\x02\x08\n\x0c\n\x05\x04\0\x02\x08\x01\x12\x03\"\t\x13\n\x0c\n\x05\
-    \x04\0\x02\x08\x03\x12\x03\"\x16\x17\nS\n\x04\x04\0\x02\t\x12\x03$\x02\
-    \x1a\x1aF\x20Display\x20name\x20of\x20the\x20participant\x20(for\x20PART\
-    ICIPANT_JOINED/LEFT\x20events)\n\n\x0c\n\x05\x04\0\x02\t\x05\x12\x03$\
-    \x02\x07\n\x0c\n\x05\x04\0\x02\t\x01\x12\x03$\x08\x14\n\x0c\n\x05\x04\0\
-    \x02\t\x03\x12\x03$\x17\x19b\x06proto3\
+    \0\x04\0\x02\x08\x02\x12\x03\x15\x1b\x1c\n7\n\x06\x04\0\x04\0\x02\t\x12\
+    \x03\x17\x04)\x1a(\x20Participant\x20updated\x20their\x20display\x20name\
+    \n\n\x0e\n\x07\x04\0\x04\0\x02\t\x01\x12\x03\x17\x04$\n\x0e\n\x07\x04\0\
+    \x04\0\x02\t\x02\x12\x03\x17'(\n5\n\x06\x04\0\x04\0\x02\n\x12\x03\x19\
+    \x04\"\x1a&\x20Meeting\x20settings\x20updated\x20mid-meeting\n\n\x0e\n\
+    \x07\x04\0\x04\0\x02\n\x01\x12\x03\x19\x04\x1c\n\x0e\n\x07\x04\0\x04\0\
+    \x02\n\x02\x12\x03\x19\x1f!\n\x0b\n\x04\x04\0\x02\0\x12\x03\x1c\x02\"\n\
+    \x0c\n\x05\x04\0\x02\0\x06\x12\x03\x1c\x02\x12\n\x0c\n\x05\x04\0\x02\0\
+    \x01\x12\x03\x1c\x13\x1d\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x1c\x20!\n\
+    \x0b\n\x04\x04\0\x02\x01\x12\x03\x1d\x02\x15\n\x0c\n\x05\x04\0\x02\x01\
+    \x05\x12\x03\x1d\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x1d\t\x10\
+    \n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x1d\x13\x14\n\x0b\n\x04\x04\0\x02\
+    \x02\x12\x03\x1e\x02\x1b\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x1e\x02\
+    \x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x1e\t\x16\n\x0c\n\x05\x04\0\
+    \x02\x02\x03\x12\x03\x1e\x19\x1a\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x1f\
+    \x02\x15\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x1f\x02\x08\n\x0c\n\x05\
+    \x04\0\x02\x03\x01\x12\x03\x1f\t\x10\n\x0c\n\x05\x04\0\x02\x03\x03\x12\
+    \x03\x1f\x13\x14\n\x0b\n\x04\x04\0\x02\x04\x12\x03\x20\x02\x17\n\x0c\n\
+    \x05\x04\0\x02\x04\x05\x12\x03\x20\x02\x07\n\x0c\n\x05\x04\0\x02\x04\x01\
+    \x12\x03\x20\x08\x12\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x20\x15\x16\n\
+    \x0b\n\x04\x04\0\x02\x05\x12\x03!\x02\x1e\n\x0c\n\x05\x04\0\x02\x05\x05\
+    \x12\x03!\x02\x07\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03!\x08\x19\n\x0c\n\
+    \x05\x04\0\x02\x05\x03\x12\x03!\x1c\x1d\n8\n\x04\x04\0\x02\x06\x12\x03#\
+    \x02\x1b\x1a+\x20For\x20ADMITTED/REJECTED:\x20affected\x20user's\x20ID\n\
+    \n\x0c\n\x05\x04\0\x02\x06\x05\x12\x03#\x02\x07\n\x0c\n\x05\x04\0\x02\
+    \x06\x01\x12\x03#\x08\x16\n\x0c\n\x05\x04\0\x02\x06\x03\x12\x03#\x19\x1a\
+    \n6\n\x04\x04\0\x02\x07\x12\x03%\x02\x18\x1a)\x20For\x20ADMITTED:\x20JWT\
+    \x20to\x20upgrade\x20connection\n\n\x0c\n\x05\x04\0\x02\x07\x05\x12\x03%\
+    \x02\x08\n\x0c\n\x05\x04\0\x02\x07\x01\x12\x03%\t\x13\n\x0c\n\x05\x04\0\
+    \x02\x07\x03\x12\x03%\x16\x17\n\x0b\n\x04\x04\0\x02\x08\x12\x03&\x02\x18\
+    \n\x0c\n\x05\x04\0\x02\x08\x05\x12\x03&\x02\x08\n\x0c\n\x05\x04\0\x02\
+    \x08\x01\x12\x03&\t\x13\n\x0c\n\x05\x04\0\x02\x08\x03\x12\x03&\x16\x17\n\
+    S\n\x04\x04\0\x02\t\x12\x03(\x02\x1a\x1aF\x20Display\x20name\x20of\x20th\
+    e\x20participant\x20(for\x20PARTICIPANT_JOINED/LEFT\x20events)\n\n\x0c\n\
+    \x05\x04\0\x02\t\x05\x12\x03(\x02\x07\n\x0c\n\x05\x04\0\x02\t\x01\x12\
+    \x03(\x08\x14\n\x0c\n\x05\x04\0\x02\t\x03\x12\x03(\x17\x19\n\xfe\x01\n\
+    \x04\x04\0\x02\n\x12\x03-\x02\x15\x1a\xf0\x01\x20Whether\x20the\x20parti\
+    cipant\x20joined\x20as\x20an\x20unauthenticated\x20guest\n\x20(for\x20PA\
+    RTICIPANT_JOINED/LEFT\x20events).\x20Sourced\x20from\x20the\n\x20authent\
+    icated\x20JWT\x20is_guest\x20claim\x20on\x20the\x20server.\x20Default\
+    \x20false\n\x20keeps\x20the\x20wire\x20format\x20backward-compatible\x20\
+    with\x20older\x20peers.\n\n\x0c\n\x05\x04\0\x02\n\x05\x12\x03-\x02\x06\n\
+    \x0c\n\x05\x04\0\x02\n\x01\x12\x03-\x07\x0f\n\x0c\n\x05\x04\0\x02\n\x03\
+    \x12\x03-\x12\x14b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

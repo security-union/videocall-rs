@@ -13,14 +13,16 @@
 
 //! Axum router configuration for the Meeting Backend API.
 
+pub mod console_logs;
+pub mod dev;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
 pub mod waiting_room;
 
 use axum::{
-    extract::State,
-    routing::{delete, get, patch, post},
+    extract::{DefaultBodyLimit, State},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 
@@ -94,9 +96,26 @@ pub fn router() -> Router<AppState> {
         // OAuth / session
         .route("/login", get(oauth::login))
         .route("/login/callback", get(oauth::callback))
+        // Client-side OAuth exchange: UI sends {code, code_verifier, nonce} received from the
+        // provider; server performs the token exchange and returns the id_token.
+        .route("/api/v1/oauth/exchange", post(oauth::exchange))
+        // Public: provider config for the browser's PKCE flow (no auth required).
+        // Returns auth_url, token_url, client_id, scopes, and issuer — all
+        // resolved after OIDC discovery so they are correct even when only
+        // OAUTH_ISSUER was set.
+        .route("/api/v1/oauth/provider-config", get(oauth::provider_config))
+        // Authenticated: upsert the user record after a browser-side token
+        // exchange.  The id_token is validated via JWKS by the AuthUser
+        // extractor; no provider access/refresh tokens are stored.
+        .route("/api/v1/user/register", post(oauth::register_user))
         .route("/session", get(oauth::check_session))
         .route("/profile", get(oauth::get_profile))
         .route("/logout", get(oauth::logout))
+        // OIDC front-channel logout — provider calls this URL in a hidden iframe
+        // when the user logs out at the provider or via another relying party.
+        // Register {base_url}/logout/frontchannel as `frontchannel_logout_uri`
+        // in your OIDC client configuration.
+        .route("/logout/frontchannel", get(oauth::frontchannel_logout))
         // Meeting CRUD
         .route("/api/v1/meetings", get(meetings::list_meetings))
         .route("/api/v1/meetings", post(meetings::create_meeting))
@@ -113,18 +132,38 @@ pub fn router() -> Router<AppState> {
             "/api/v1/meetings/{meeting_id}/end",
             post(meetings::end_meeting_handler),
         )
+        .route(
+            "/api/v1/meetings/{meeting_id}/guest-info",
+            get(meetings::get_meeting_guest_info),
+        )
         // Participant actions
         .route(
             "/api/v1/meetings/{meeting_id}/join",
             post(participants::join_meeting),
         )
         .route(
+            "/api/v1/meetings/{meeting_id}/join-guest",
+            post(participants::join_meeting_as_guest),
+        )
+        .route(
             "/api/v1/meetings/{meeting_id}/leave",
             post(participants::leave_meeting),
         )
         .route(
+            "/api/v1/meetings/{meeting_id}/leave-guest",
+            post(participants::leave_meeting_as_guest),
+        )
+        .route(
             "/api/v1/meetings/{meeting_id}/status",
             get(participants::get_my_status),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/guest-status",
+            get(participants::get_guest_status),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/display-name",
+            put(participants::update_display_name),
         )
         .route(
             "/api/v1/meetings/{meeting_id}/participants",
@@ -147,4 +186,12 @@ pub fn router() -> Router<AppState> {
             "/api/v1/meetings/{meeting_id}/reject",
             post(waiting_room::reject_participant),
         )
+        // Console log uploads
+        .route(
+            "/api/v1/meetings/{meeting_id}/console-logs",
+            post(console_logs::upload_console_logs)
+                .layer(DefaultBodyLimit::max(console_logs::MAX_BODY_SIZE)),
+        )
+        // Dev-only auto-login (returns 404 when DEV_USER is not configured)
+        .route("/api/v1/dev/auto-login", get(dev::auto_login))
 }

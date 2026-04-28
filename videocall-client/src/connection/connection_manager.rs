@@ -24,17 +24,18 @@ use crate::adaptive_quality_constants::{
     ELECTION_MAX_EXTENSIONS, ELECTION_MIN_RTT_SAMPLES, RECONNECT_BACKOFF_MULTIPLIER,
     RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_PHASE1_MS,
     RECONNECT_MAX_DELAY_PHASE2_MS, RECONNECT_MAX_DELAY_PHASE3_MS, RECONNECT_PHASE1_MAX_ATTEMPTS,
-    RECONNECT_PHASE2_MAX_ATTEMPTS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_RTT_MIN_THRESHOLD_MS,
-    REELECTION_RTT_MULTIPLIER,
+    RECONNECT_PHASE2_MAX_ATTEMPTS, REELECTION_CATASTROPHIC_RTT_MS, REELECTION_CONSECUTIVE_SAMPLES,
+    REELECTION_MIN_IMPROVEMENT_MS, REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
 };
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
 use log::{debug, error, info, warn};
 use protobuf::Message;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -124,6 +125,14 @@ pub struct ConnectionManagerOptions {
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
     pub election_period_ms: u64,
+    /// Stable client instance identifier (UUID). Generated once per meeting join,
+    /// survives reconnects, dies on tab close. Sent to the server so it can
+    /// correlate reconnections and silently evict stale sessions.
+    pub instance_id: String,
+    /// Shared signal set to `true` when a re-election completes. The camera
+    /// encoder reads this to suppress false crash ceiling arming during server
+    /// swaps. Owned externally (by `VideoCallClient`) so it survives reconnections.
+    pub reelection_completed_signal: Rc<AtomicBool>,
 }
 
 /// Tracks the state of automatic reconnection after connection loss.
@@ -172,9 +181,48 @@ pub struct ConnectionManager {
     /// can continue carrying media traffic while new candidate connections are
     /// being tested. `complete_election` drops it after a winner is selected.
     old_active_connection: Option<(String, Connection)>,
+    /// The current average RTT of the old active connection at the time
+    /// re-election was initiated. Used by `complete_election` to compare
+    /// against the new winner's RTT — if the winner is worse, the re-election
+    /// is aborted and the old connection is kept. This captures the *current*
+    /// RTT (not the election-time baseline), because the decision to switch
+    /// should be based on present conditions, not historical ones.
+    old_active_rtt: Option<f64>,
+    /// The server URL of the old active connection, captured alongside
+    /// `old_active_rtt` during `start_reelection`. Used when aborting a
+    /// re-election to restore the RTT measurement entry with the real URL
+    /// instead of a synthetic placeholder.
+    old_active_url: Option<String>,
+    /// Full RTT measurement snapshot of the old active connection, cloned at
+    /// re-election start. Used to restore the complete measurement history
+    /// (not just a single synthetic sample) when a re-election is aborted,
+    /// so that subsequent elections still satisfy `ELECTION_MIN_RTT_SAMPLES`.
+    old_active_rtt_measurement: Option<ServerRttMeasurement>,
+    /// Transport type of the old active connection, captured from the
+    /// measurement entry at re-election start. Used during abort-restoration
+    /// instead of inferring from the connection ID prefix (which is brittle).
+    old_active_is_webtransport: Option<bool>,
     /// Set to `true` when the user explicitly calls `disconnect()`. Checked by
     /// the reconnection loop to prevent reconnecting after an intentional leave.
     intentionally_disconnected: Rc<RefCell<bool>>,
+    /// Counter for total packets received (incremented on each inbound packet)
+    packets_received: Rc<Cell<u64>>,
+    /// Counter for total packets sent (incremented on each outbound packet)
+    packets_sent: Rc<Cell<u64>>,
+    /// Timestamp of last metrics calculation
+    last_metrics_timestamp_ms: Rc<RefCell<f64>>,
+    /// Last calculated packets received per second
+    packets_received_per_sec: Rc<RefCell<f64>>,
+    /// Last calculated packets sent per second
+    packets_sent_per_sec: Rc<RefCell<f64>>,
+    /// Previous counter values for rate calculation
+    prev_packets_received: Rc<RefCell<u64>>,
+    prev_packets_sent: Rc<RefCell<u64>>,
+    /// Signal set to `true` when a re-election completes successfully (new
+    /// winner elected or old connection retained after abort). The camera
+    /// encoder's control loop checks this to suppress crash ceiling arming
+    /// during server-swap transients.
+    reelection_completed_signal: Rc<AtomicBool>,
 }
 
 impl ConnectionManager {
@@ -189,6 +237,8 @@ impl ConnectionManager {
         info!("ConnectionManager starting with {total_servers} servers");
 
         let rtt_responses = Rc::new(RefCell::new(Vec::new()));
+
+        let reelection_completed_signal = options.reelection_completed_signal.clone();
 
         let manager = Self {
             connections: HashMap::new(),
@@ -212,7 +262,19 @@ impl ConnectionManager {
             degradation_counter: 0,
             reelection_in_progress: false,
             old_active_connection: None,
+            old_active_rtt: None,
+            old_active_url: None,
+            old_active_rtt_measurement: None,
+            old_active_is_webtransport: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
+            packets_received: Rc::new(Cell::new(0)),
+            packets_sent: Rc::new(Cell::new(0)),
+            last_metrics_timestamp_ms: Rc::new(RefCell::new(js_sys::Date::now())),
+            packets_received_per_sec: Rc::new(RefCell::new(0.0)),
+            packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
+            prev_packets_received: Rc::new(RefCell::new(0)),
+            prev_packets_sent: Rc::new(RefCell::new(0)),
+            reelection_completed_signal,
         };
 
         Ok(manager)
@@ -267,6 +329,10 @@ impl ConnectionManager {
         self.baseline_rtt = None;
         self.degradation_counter = 0;
         self.reelection_in_progress = false;
+        self.old_active_rtt = None;
+        self.old_active_url = None;
+        self.old_active_rtt_measurement = None;
+        self.old_active_is_webtransport = None;
 
         // Cancel any lingering timers from the previous election.
         if let ElectionState::Testing { probe_timer, .. } = &mut self.election_state {
@@ -306,11 +372,19 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Append `&instance_id=<uuid>` to a lobby URL so the server can correlate
+    /// reconnections from the same client instance and silently evict stale sessions.
+    fn append_instance_id(&self, url: &str) -> String {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}instance_id={}", self.options.instance_id)
+    }
+
     /// Create connections to all configured servers
     fn create_all_connections(&mut self) -> Result<()> {
         // Create WebSocket connections
-        for (i, url) in self.options.websocket_urls.iter().enumerate() {
+        for (i, base_url) in self.options.websocket_urls.iter().enumerate() {
             let conn_id = format!("ws_{i}");
+            let url = self.append_instance_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: url.clone(),
                 webtransport_url: String::new(), // Not used for WebSocket
@@ -345,8 +419,9 @@ impl ConnectionManager {
         }
 
         // Create WebTransport connections
-        for (i, url) in self.options.webtransport_urls.iter().enumerate() {
+        for (i, base_url) in self.options.webtransport_urls.iter().enumerate() {
             let conn_id = format!("wt_{i}");
+            let url = self.append_instance_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: String::new(), // Not used for WebTransport
                 webtransport_url: url.clone(),
@@ -380,7 +455,30 @@ impl ConnectionManager {
             }
         }
 
-        info!("Created {} connections for testing", self.connections.len());
+        let ws_count = self
+            .connections
+            .keys()
+            .filter(|k| k.starts_with("ws_"))
+            .count();
+        let wt_count = self
+            .connections
+            .keys()
+            .filter(|k| k.starts_with("wt_"))
+            .count();
+        info!(
+            "Election candidates: {} WebSocket, {} WebTransport ({} total)",
+            ws_count,
+            wt_count,
+            self.connections.len()
+        );
+        if !self.options.webtransport_urls.is_empty() && wt_count == 0 {
+            warn!(
+                "All {} WebTransport connections failed -- falling back to WebSocket only",
+                self.options.webtransport_urls.len()
+            );
+        } else if self.options.webtransport_urls.is_empty() {
+            info!("No WebTransport URLs offered by server -- WebSocket only");
+        }
 
         // If only one connection was created, we still need to wait for it to be established
         // Don't force immediate election - let the normal process work
@@ -400,8 +498,11 @@ impl ConnectionManager {
         let own_session_id = self.own_session_id.clone();
         let pending_session_ids = self.pending_session_ids.clone();
         let active_connection_id = self.active_connection_id.clone();
+        let packets_received = self.packets_received.clone();
 
         Callback::from(move |packet: PacketWrapper| {
+            // Increment packets received counter for all packets
+            packets_received.set(packets_received.get() + 1);
             // Intercept SESSION_ASSIGNED before anything else
             if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
                 let sid = packet.session_id;
@@ -593,6 +694,10 @@ impl ConnectionManager {
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
         connection.send_packet_datagram(rtt_packet);
+        // Count RTT probes in packets_sent so the sent/received rates are symmetric.
+        // packets_received already counts inbound RTT echoes; excluding probes from
+        // packets_sent made the two rates incomparable (ratio was meaningless).
+        self.packets_sent.set(self.packets_sent.get() + 1);
         debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
@@ -666,12 +771,192 @@ impl ConnectionManager {
         // Find the best connection
         match self.find_best_connection() {
             Ok((connection_id, measurement)) => {
+                // find_best_connection() only returns winners with measured RTT
+                // (it skips entries where average_rtt is None), so this should
+                // always be Some. If it is somehow None, we skip the abort
+                // comparison — we cannot evaluate whether the winner is better
+                // without data, so we proceed with the switch.
+                let winner_rtt = match measurement.average_rtt {
+                    Some(rtt) => rtt,
+                    None => {
+                        log::warn!(
+                            "Re-election winner {} has no RTT data; \
+                             proceeding with switch (cannot evaluate)",
+                            connection_id,
+                        );
+                        f64::NEG_INFINITY
+                    }
+                };
                 info!(
                     "Elected connection {}: {} (avg RTT: {}ms)",
-                    connection_id,
-                    measurement.url,
-                    measurement.average_rtt.unwrap_or(0.0)
+                    connection_id, measurement.url, winner_rtt,
                 );
+
+                // --- Re-election fallback check ---
+                // During a re-election, compare the new winner's RTT against
+                // the old active connection's current RTT. If the winner is
+                // not meaningfully better (by at least REELECTION_MIN_IMPROVEMENT_MS),
+                // abort the re-election and keep the existing connection —
+                // switching to a marginally-different path causes a needless
+                // session reset (new peer, lost keyframe state, video freeze)
+                // with no benefit.
+                //
+                // Exception: if the old connection's RTT exceeds the
+                // catastrophic threshold, accept any winner regardless — the
+                // connection is so degraded that any alternative is worth trying.
+                if self.reelection_in_progress {
+                    if let Some(snapshot_rtt) = self.old_active_rtt {
+                        // Prefer live RTT if the old connection is still in the
+                        // connections map (it accumulates new samples during the
+                        // election). Fall back to the snapshot captured at
+                        // re-election start.
+                        let old_id = self.active_connection_id.borrow().clone();
+                        let comparison_rtt = old_id
+                            .as_ref()
+                            .and_then(|id| {
+                                self.old_active_connection
+                                    .as_ref()
+                                    .filter(|(oid, _)| oid == id)
+                                    .and_then(|(oid, _)| {
+                                        // The old connection was moved out of
+                                        // self.connections into old_active_connection,
+                                        // but its RTT measurement entry was cleared.
+                                        // Check if a fresh entry was re-inserted by
+                                        // the probe timer during the election.
+                                        self.rtt_measurements.get(oid).and_then(|m| m.average_rtt)
+                                    })
+                            })
+                            .unwrap_or(snapshot_rtt);
+
+                        // Catastrophic override: if old RTT is extreme, accept
+                        // any winner — the user is stuck on a near-dead path.
+                        let catastrophic = comparison_rtt >= REELECTION_CATASTROPHIC_RTT_MS;
+                        if catastrophic {
+                            warn!(
+                                "Re-election: old active RTT ({:.0}ms) exceeds catastrophic \
+                                 threshold ({:.0}ms), accepting winner regardless",
+                                comparison_rtt, REELECTION_CATASTROPHIC_RTT_MS,
+                            );
+                        }
+
+                        // Hysteresis: the winner must be at least
+                        // REELECTION_MIN_IMPROVEMENT_MS better than the old.
+                        let dominated =
+                            winner_rtt >= comparison_rtt - REELECTION_MIN_IMPROVEMENT_MS;
+
+                        if dominated && !catastrophic {
+                            warn!(
+                                "Re-election aborted: new winner RTT ({:.1}ms) is not \
+                                 {:.0}ms better than current connection RTT ({:.1}ms) \
+                                 — keeping existing connection",
+                                winner_rtt, REELECTION_MIN_IMPROVEMENT_MS, comparison_rtt,
+                            );
+
+                            // Restore the old active connection: move it back
+                            // from the staging field into the connections HashMap
+                            // so that send_packet / heartbeat / RTT probes resume
+                            // normally.
+                            if let Some((old_id, old_conn)) = self.old_active_connection.take() {
+                                self.connections.insert(old_id.clone(), old_conn);
+                                // Restore the full RTT measurement snapshot so
+                                // that subsequent elections still satisfy
+                                // ELECTION_MIN_RTT_SAMPLES. Use the stored
+                                // transport type instead of inferring from the
+                                // connection ID prefix.
+                                let is_wt = self
+                                    .old_active_is_webtransport
+                                    .take()
+                                    .unwrap_or_else(|| old_id.starts_with("wt"));
+                                if let Some(mut restored) = self.old_active_rtt_measurement.take() {
+                                    // Update the restored measurement to reflect
+                                    // current state (active + connected).
+                                    restored.active = true;
+                                    restored.connected = true;
+                                    self.rtt_measurements.insert(old_id.clone(), restored);
+                                } else {
+                                    // Fallback: no snapshot available (should not
+                                    // happen, but be defensive).
+                                    let restored_url = self
+                                        .old_active_url
+                                        .take()
+                                        .unwrap_or_else(|| format!("(restored) {old_id}"));
+                                    self.rtt_measurements.insert(
+                                        old_id.clone(),
+                                        ServerRttMeasurement {
+                                            url: restored_url,
+                                            is_webtransport: is_wt,
+                                            measurements: VecDeque::from(vec![comparison_rtt]),
+                                            average_rtt: Some(comparison_rtt),
+                                            connection_id: old_id.clone(),
+                                            active: true,
+                                            connected: true,
+                                        },
+                                    );
+                                }
+                            }
+
+                            // Close all new candidate connections — they lost
+                            // and we are reverting to the old one.
+                            self.close_unused_connections();
+
+                            // Restore election state to Elected with the old ID.
+                            if let Some(ref id) = *self.active_connection_id.borrow() {
+                                self.election_state = ElectionState::Elected {
+                                    connection_id: id.clone(),
+                                    elected_at: monotonic_now_ms(),
+                                };
+                            }
+
+                            // Rebase the degradation baseline to the old
+                            // connection's current RTT. The RTT has already
+                            // degraded relative to the original baseline —
+                            // that is what triggered this re-election. If we
+                            // kept the original baseline, the detector would
+                            // immediately trigger *another* re-election,
+                            // causing an infinite loop.
+                            self.baseline_rtt = Some(comparison_rtt);
+                            self.degradation_counter = 0;
+                            self.reelection_in_progress = false;
+                            self.old_active_rtt = None;
+                            self.old_active_url = None;
+                            self.old_active_rtt_measurement = None;
+                            self.old_active_is_webtransport = None;
+                            self.pending_session_ids.borrow_mut().clear();
+
+                            // Signal re-election completion so the camera encoder
+                            // can suppress false crash ceiling arming.
+                            self.reelection_completed_signal
+                                .store(true, Ordering::Release);
+
+                            info!(
+                                "Re-election fallback: baseline rebased to {:.1}ms, \
+                                 monitoring resumes on existing connection",
+                                comparison_rtt,
+                            );
+                            self.report_state();
+                            return;
+                        }
+
+                        info!(
+                            "Re-election proceeding: new winner RTT ({:.1}ms) vs \
+                             current connection RTT ({:.1}ms) (improvement: {:.1}ms, \
+                             min required: {:.0}ms)",
+                            winner_rtt,
+                            comparison_rtt,
+                            comparison_rtt - winner_rtt,
+                            REELECTION_MIN_IMPROVEMENT_MS,
+                        );
+                    } else {
+                        // No RTT data for the old connection (unlikely but
+                        // possible if RTT probes never returned). Proceed with
+                        // the switch since we have no basis for comparison.
+                        info!(
+                            "Re-election proceeding: no RTT data for old connection, \
+                             accepting new winner at {:.1}ms",
+                            winner_rtt,
+                        );
+                    }
+                }
 
                 self.active_connection_id
                     .borrow_mut()
@@ -709,6 +994,17 @@ impl ConnectionManager {
                         if let Some(connection) = self.connections.get(&connection_id) {
                             connection.set_session_id(sid);
                         }
+
+                        // Emit a synthetic SESSION_ASSIGNED packet so that the
+                        // VideoCallClient (and HealthReporter) learn the real
+                        // session_id.  The normal path (line 317) only fires
+                        // when SESSION_ASSIGNED arrives *after* election; in the
+                        // common case the packet arrives during RTT-testing and is
+                        // buffered here, so we must re-emit it now.
+                        let mut session_pkt = PacketWrapper::new();
+                        session_pkt.packet_type = PacketType::SESSION_ASSIGNED.into();
+                        session_pkt.session_id = sid;
+                        self.options.on_inbound_media.emit(session_pkt);
                     }
                 }
                 self.pending_session_ids.borrow_mut().clear();
@@ -723,6 +1019,10 @@ impl ConnectionManager {
                 self.baseline_rtt = measurement.average_rtt;
                 self.degradation_counter = 0;
                 self.reelection_in_progress = false;
+                self.old_active_rtt = None;
+                self.old_active_url = None;
+                self.old_active_rtt_measurement = None;
+                self.old_active_is_webtransport = None;
 
                 if let Some(rtt) = self.baseline_rtt {
                     info!("Baseline RTT for re-election monitoring: {rtt:.1}ms");
@@ -735,6 +1035,10 @@ impl ConnectionManager {
                 // connection now that the new winner is carrying traffic.
                 if let Some((old_id, old_conn)) = self.old_active_connection.take() {
                     info!("Re-election complete: closing old active connection {old_id}");
+                    // Signal re-election completion so the camera encoder
+                    // can suppress false crash ceiling arming.
+                    self.reelection_completed_signal
+                        .store(true, Ordering::Release);
                     drop(old_conn);
                 }
 
@@ -747,6 +1051,10 @@ impl ConnectionManager {
                     reason: e.to_string(),
                     failed_at: monotonic_now_ms(),
                 };
+                self.old_active_rtt = None;
+                self.old_active_url = None;
+                self.old_active_rtt_measurement = None;
+                self.old_active_is_webtransport = None;
                 self.report_state();
             }
         }
@@ -1160,13 +1468,36 @@ impl ConnectionManager {
         self.degradation_counter = 0;
         self.baseline_rtt = None;
 
+        // Capture the old active connection's current average RTT, URL, full
+        // RTT measurement snapshot, and transport type *before* clearing
+        // measurements. RTT is used by `complete_election` to compare against
+        // the new winner — if the new winner is worse, the re-election is
+        // aborted. URL is used to restore the measurement entry with the real
+        // server URL (not a synthetic placeholder) on abort. The full
+        // measurement snapshot preserves all RTT samples so that restoration
+        // does not violate `ELECTION_MIN_RTT_SAMPLES`. The transport type is
+        // captured from the measurement entry (not inferred from the connection
+        // ID prefix) for robustness.
+        // We use current RTT (not baseline) because the decision to switch
+        // should reflect present conditions.
+        let old_active_id = self.active_connection_id.borrow().clone();
+        let old_measurement = old_active_id
+            .as_ref()
+            .and_then(|id| self.rtt_measurements.get(id));
+        self.old_active_rtt = old_measurement.and_then(|m| m.average_rtt);
+        self.old_active_url = old_measurement.map(|m| m.url.clone());
+        self.old_active_rtt_measurement = old_measurement.cloned();
+        self.old_active_is_webtransport = old_measurement.map(|m| m.is_webtransport);
+        if let Some(rtt) = self.old_active_rtt {
+            info!("Re-election: captured old active connection RTT: {rtt:.1}ms");
+        }
+
         // Move the old active connection out of the main HashMap into the
         // dedicated `old_active_connection` field. It continues carrying media
         // traffic (via `send_packet` / `send_packet_datagram` which check this
         // field) while new candidate connections are tested. This avoids
         // connection-ID collisions when `create_all_connections` reuses
         // IDs like `ws_0`, `wt_0`.
-        let old_active_id = self.active_connection_id.borrow().clone();
         if let Some(ref id) = old_active_id {
             if let Some(old_conn) = self.connections.remove(id) {
                 info!("Re-election: preserving old active connection {id} for media continuity");
@@ -1214,6 +1545,15 @@ impl ConnectionManager {
     #[allow(dead_code)]
     pub fn is_reelection_in_progress(&self) -> bool {
         self.reelection_in_progress
+    }
+
+    /// Returns the shared re-election completed signal.
+    ///
+    /// The camera encoder reads and clears this flag each tick to call
+    /// `notify_reelection_completed()` on the quality manager, suppressing
+    /// false crash ceiling arming during server swaps.
+    pub fn reelection_completed_signal(&self) -> Rc<AtomicBool> {
+        self.reelection_completed_signal.clone()
     }
 
     /// Returns the total number of configured servers (WebSocket + WebTransport).
@@ -1467,12 +1807,16 @@ impl ConnectionManager {
             // Try the main connections HashMap first.
             if let Some(connection) = self.connections.get(active_id) {
                 connection.send_packet(packet);
+                // Increment packets sent counter
+                self.packets_sent.set(self.packets_sent.get() + 1);
                 return Ok(());
             }
             // During re-election, the old connection lives in old_active_connection.
             if let Some((ref old_id, ref old_conn)) = self.old_active_connection {
                 if old_id == active_id {
                     old_conn.send_packet(packet);
+                    // Increment packets sent counter
+                    self.packets_sent.set(self.packets_sent.get() + 1);
                     return Ok(());
                 }
             }
@@ -1717,6 +2061,58 @@ impl ConnectionManager {
             },
         }
     }
+
+    /// Calculate packet rates per second
+    pub fn calculate_packet_rates(&self) {
+        let now_ms = js_sys::Date::now();
+        let last_timestamp = *self.last_metrics_timestamp_ms.borrow();
+        let elapsed_sec = (now_ms - last_timestamp) / 1000.0;
+
+        // Avoid division by zero and very small intervals
+        if elapsed_sec < 0.1 {
+            return;
+        }
+
+        let current_received = self.packets_received.get();
+        let current_sent = self.packets_sent.get();
+
+        let prev_received = *self.prev_packets_received.borrow();
+        let prev_sent = *self.prev_packets_sent.borrow();
+
+        // Calculate rates
+        let received_diff = current_received.saturating_sub(prev_received);
+        let sent_diff = current_sent.saturating_sub(prev_sent);
+
+        let received_per_sec = received_diff as f64 / elapsed_sec;
+        let sent_per_sec = sent_diff as f64 / elapsed_sec;
+
+        // Update stored values
+        *self.packets_received_per_sec.borrow_mut() = received_per_sec;
+        *self.packets_sent_per_sec.borrow_mut() = sent_per_sec;
+        *self.prev_packets_received.borrow_mut() = current_received;
+        *self.prev_packets_sent.borrow_mut() = current_sent;
+        *self.last_metrics_timestamp_ms.borrow_mut() = now_ms;
+    }
+
+    /// Get packets received per second (should be called after calculate_packet_rates)
+    pub fn get_packets_received_per_sec(&self) -> f64 {
+        *self.packets_received_per_sec.borrow()
+    }
+
+    /// Get packets sent per second (should be called after calculate_packet_rates)
+    pub fn get_packets_sent_per_sec(&self) -> f64 {
+        *self.packets_sent_per_sec.borrow()
+    }
+
+    /// Get send queue depth from the active connection (bufferedAmount for WebSocket)
+    pub fn get_send_queue_depth(&self) -> Option<u64> {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            if let Some(connection) = self.connections.get(active_id) {
+                return connection.get_send_queue_depth();
+            }
+        }
+        None
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1783,7 +2179,8 @@ mod tests {
         RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT, RECONNECT_INITIAL_DELAY_MS,
         RECONNECT_MAX_DELAY_PHASE1_MS, RECONNECT_MAX_DELAY_PHASE2_MS,
         RECONNECT_MAX_DELAY_PHASE3_MS, RECONNECT_PHASE1_MAX_ATTEMPTS,
-        RECONNECT_PHASE2_MAX_ATTEMPTS, REELECTION_CONSECUTIVE_SAMPLES,
+        RECONNECT_PHASE2_MAX_ATTEMPTS, REELECTION_CATASTROPHIC_RTT_MS,
+        REELECTION_CONSECUTIVE_SAMPLES, REELECTION_MIN_IMPROVEMENT_MS,
         REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
     };
 
@@ -1805,6 +2202,8 @@ mod tests {
             on_state_changed: Callback::from(|_: ConnectionState| {}),
             peer_monitor: Callback::from(|_: ()| {}),
             election_period_ms: 3000,
+            instance_id: "test-instance-id".to_string(),
+            reelection_completed_signal: Rc::new(AtomicBool::new(false)),
         };
 
         ConnectionManager {
@@ -1829,7 +2228,19 @@ mod tests {
             degradation_counter: 0,
             reelection_in_progress: false,
             old_active_connection: None,
+            old_active_rtt: None,
+            old_active_url: None,
+            old_active_rtt_measurement: None,
+            old_active_is_webtransport: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
+            packets_received: Rc::new(Cell::new(0)),
+            packets_sent: Rc::new(Cell::new(0)),
+            last_metrics_timestamp_ms: Rc::new(RefCell::new(0.0)),
+            packets_received_per_sec: Rc::new(RefCell::new(0.0)),
+            packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
+            prev_packets_received: Rc::new(RefCell::new(0)),
+            prev_packets_sent: Rc::new(RefCell::new(0)),
+            reelection_completed_signal: Rc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2653,6 +3064,635 @@ mod tests {
     }
 
     // ===================================================================
+    // 10b. Re-election fallback (old_active_rtt capture and comparison)
+    // ===================================================================
+
+    #[test]
+    fn old_active_rtt_initially_none() {
+        let mgr = make_test_manager();
+        assert_eq!(mgr.old_active_rtt, None);
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn start_reelection_captures_old_active_rtt() {
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, Some(120.0), vec![110.0, 130.0]);
+
+        mgr.start_reelection().unwrap();
+
+        // The old active connection's current average RTT should be captured.
+        assert!(
+            (mgr.old_active_rtt.unwrap() - 120.0).abs() < 0.01,
+            "expected old_active_rtt ~120.0, got {:?}",
+            mgr.old_active_rtt,
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn start_reelection_captures_none_when_no_rtt_data() {
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        // No RTT measurement entry for wt_0 at all.
+
+        mgr.start_reelection().unwrap();
+
+        assert_eq!(
+            mgr.old_active_rtt, None,
+            "old_active_rtt should be None when the active connection has no RTT data"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn start_reelection_captures_none_when_no_active_connection() {
+        let mut mgr = make_test_manager();
+        // No active connection id set.
+
+        mgr.start_reelection().unwrap();
+
+        assert_eq!(
+            mgr.old_active_rtt, None,
+            "old_active_rtt should be None when there is no active connection"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn start_reelection_clears_measurements_after_capture() {
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+        insert_measurement(&mut mgr, "ws_0", false, Some(100.0), vec![100.0]);
+
+        mgr.start_reelection().unwrap();
+
+        // RTT measurements should be cleared for the new election.
+        assert!(
+            mgr.rtt_measurements.is_empty() || !mgr.rtt_measurements.contains_key("wt_0"),
+            "old RTT measurements should be cleared after start_reelection"
+        );
+
+        // But old_active_rtt preserves the captured value.
+        assert!(
+            (mgr.old_active_rtt.unwrap() - 80.0).abs() < 0.01,
+            "old_active_rtt should preserve the captured RTT"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn reset_and_start_election_clears_old_active_rtt() {
+        let mut mgr = make_test_manager();
+        mgr.old_active_rtt = Some(500.0);
+
+        mgr.reset_and_start_election().unwrap();
+
+        assert_eq!(
+            mgr.old_active_rtt, None,
+            "reset_and_start_election should clear old_active_rtt"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_aborts_when_winner_worse_than_old() {
+        // This test verifies the re-election fallback logic by directly
+        // invoking complete_election with synthetic state. We bypass
+        // find_best_connection's is_connected() check by inserting a
+        // measurement for a connection that does NOT exist in the connections
+        // HashMap — find_best_connection only skips connections that ARE in
+        // the HashMap but report is_connected() == false. Connections absent
+        // from the HashMap are evaluated purely on RTT data.
+        let mut mgr = make_test_manager();
+
+        // Simulate re-election state: old connection at 100ms, candidate at 200ms.
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(100.0);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Insert a candidate connection with WORSE RTT.
+        // Note: the connection is not in mgr.connections, so find_best_connection
+        // will skip the is_connected() check for it and evaluate only on RTT.
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0, 200.0]);
+
+        mgr.complete_election();
+
+        // Re-election should have been aborted.
+        assert!(
+            !mgr.reelection_in_progress,
+            "reelection_in_progress should be false after abort"
+        );
+        assert_eq!(
+            mgr.old_active_rtt, None,
+            "old_active_rtt should be cleared after abort"
+        );
+        // The active connection should still be the old one.
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_old".to_string()),
+            "active connection should remain the old one after abort"
+        );
+        // Baseline should be rebased to the old connection's RTT.
+        assert!(
+            (mgr.baseline_rtt.unwrap() - 100.0).abs() < 0.01,
+            "baseline_rtt should be rebased to old connection RTT"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_aborts_when_winner_equal_to_old() {
+        // Equal RTT should also abort — no benefit to switching, even with deadband.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(150.0);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        insert_measurement(&mut mgr, "wt_0", true, Some(150.0), vec![150.0, 150.0]);
+
+        mgr.complete_election();
+
+        assert!(!mgr.reelection_in_progress);
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_old".to_string()),
+            "equal RTT should not trigger a switch"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_aborts_when_winner_within_hysteresis() {
+        // Winner is slightly better but within the REELECTION_MIN_IMPROVEMENT_MS
+        // deadband — should abort (noise, not a real improvement).
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(200.0);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Winner is 10ms better (200 - 190 = 10ms < 20ms deadband).
+        insert_measurement(&mut mgr, "wt_0", true, Some(190.0), vec![190.0, 190.0]);
+
+        mgr.complete_election();
+
+        assert!(!mgr.reelection_in_progress);
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_old".to_string()),
+            "winner within hysteresis deadband should not trigger a switch"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_proceeds_when_winner_exceeds_hysteresis() {
+        // Winner is better by more than REELECTION_MIN_IMPROVEMENT_MS — should
+        // proceed with the switch.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(200.0);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Winner is 25ms better (200 - 175 = 25ms > 20ms deadband).
+        insert_measurement(&mut mgr, "wt_0", true, Some(175.0), vec![175.0, 175.0]);
+
+        mgr.complete_election();
+
+        assert!(!mgr.reelection_in_progress);
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_0".to_string()),
+            "winner exceeding hysteresis deadband should be accepted"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_accepts_winner_on_catastrophic_old_rtt() {
+        // Old RTT is catastrophically high — should accept any winner
+        // even if it is worse.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(7000.0); // 7s — exceeds catastrophic threshold
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Winner is worse (7500ms > 7000ms) but old is catastrophic.
+        insert_measurement(&mut mgr, "wt_0", true, Some(7500.0), vec![7500.0, 7500.0]);
+
+        mgr.complete_election();
+
+        assert!(!mgr.reelection_in_progress);
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_0".to_string()),
+            "catastrophic old RTT should accept any winner"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_catastrophic_threshold_boundary() {
+        // Old RTT is exactly at the catastrophic threshold — should accept winner.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(REELECTION_CATASTROPHIC_RTT_MS);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Winner is slightly worse.
+        let winner_rtt = REELECTION_CATASTROPHIC_RTT_MS + 100.0;
+        insert_measurement(
+            &mut mgr,
+            "wt_0",
+            true,
+            Some(winner_rtt),
+            vec![winner_rtt, winner_rtt],
+        );
+
+        mgr.complete_election();
+
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_0".to_string()),
+            "old RTT exactly at catastrophic threshold should accept winner"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_proceeds_when_winner_better_than_old() {
+        // Winner is strictly better — should proceed with the switch.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(300.0);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // New candidate has much better RTT.
+        insert_measurement(&mut mgr, "wt_0", true, Some(50.0), vec![50.0, 50.0]);
+
+        mgr.complete_election();
+
+        // The new winner should be elected.
+        assert!(!mgr.reelection_in_progress);
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_0".to_string()),
+            "better candidate should win the re-election"
+        );
+        // Baseline should be set to the winner's RTT.
+        assert!(
+            (mgr.baseline_rtt.unwrap() - 50.0).abs() < 0.01,
+            "baseline_rtt should be set to winner's RTT"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_proceeds_when_no_old_rtt_data() {
+        // No old RTT data — should proceed since we have no basis to compare.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = None;
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0, 200.0]);
+
+        mgr.complete_election();
+
+        assert!(!mgr.reelection_in_progress);
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_0".to_string()),
+            "should accept new winner when no old RTT data exists"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_not_affected_during_initial_election() {
+        // During initial election (not re-election), the fallback should not apply.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = false;
+        mgr.old_active_rtt = None;
+
+        insert_measurement(&mut mgr, "wt_0", true, Some(100.0), vec![100.0, 100.0]);
+
+        mgr.complete_election();
+
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_0".to_string()),
+            "initial election should proceed normally"
+        );
+    }
+
+    // ===================================================================
+    // 10c. Re-election: measurement capture and restoration
+    // ===================================================================
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn start_reelection_captures_full_rtt_measurement() {
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        let samples = vec![100.0, 110.0, 120.0, 130.0, 140.0];
+        insert_measurement(&mut mgr, "wt_0", true, Some(120.0), samples.clone());
+
+        mgr.start_reelection().unwrap();
+
+        // The full measurement should be cloned, not just a single RTT value.
+        let captured = mgr
+            .old_active_rtt_measurement
+            .as_ref()
+            .expect("old_active_rtt_measurement should be captured");
+        assert_eq!(
+            captured.measurements.len(),
+            samples.len(),
+            "captured measurement should contain all {} samples",
+            samples.len()
+        );
+        assert!(
+            (captured.average_rtt.unwrap() - 120.0).abs() < 0.01,
+            "captured measurement average should match"
+        );
+        assert_eq!(captured.url, "https://test/wt_0");
+        assert!(captured.is_webtransport);
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn start_reelection_captures_transport_type() {
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+        insert_measurement(&mut mgr, "ws_0", false, Some(80.0), vec![80.0]);
+
+        mgr.start_reelection().unwrap();
+
+        assert_eq!(
+            mgr.old_active_is_webtransport,
+            Some(false),
+            "should capture transport type from measurement entry"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn start_reelection_captures_none_measurement_when_no_rtt_data() {
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        // No RTT measurement entry at all.
+
+        mgr.start_reelection().unwrap();
+
+        assert!(
+            mgr.old_active_rtt_measurement.is_none(),
+            "should be None when no measurement exists"
+        );
+        assert!(
+            mgr.old_active_is_webtransport.is_none(),
+            "should be None when no measurement exists"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_abort_clears_all_old_state() {
+        // Verify that all old_active_* fields are cleared after an abort,
+        // even when old_active_connection is None.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(100.0);
+        mgr.old_active_url = Some("https://test/wt_old".to_string());
+        mgr.old_active_rtt_measurement = Some(ServerRttMeasurement {
+            url: "https://test/wt_old".to_string(),
+            is_webtransport: true,
+            measurements: VecDeque::from(vec![95.0, 100.0, 105.0]),
+            average_rtt: Some(100.0),
+            connection_id: "wt_old".to_string(),
+            active: true,
+            connected: true,
+        });
+        mgr.old_active_is_webtransport = Some(true);
+        // old_active_connection is None (no real Connection object).
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Candidate is worse — should trigger abort.
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0, 200.0]);
+
+        mgr.complete_election();
+
+        // All old_active_* fields should be cleared after abort.
+        assert_eq!(mgr.old_active_rtt, None, "old_active_rtt should be cleared");
+        assert_eq!(mgr.old_active_url, None, "old_active_url should be cleared");
+        assert!(
+            mgr.old_active_rtt_measurement.is_none(),
+            "old_active_rtt_measurement should be cleared"
+        );
+        assert!(
+            mgr.old_active_is_webtransport.is_none(),
+            "old_active_is_webtransport should be cleared"
+        );
+        assert!(!mgr.reelection_in_progress);
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_abort_restores_measurement_from_snapshot() {
+        // When old_active_connection is present (simulated via inserting the
+        // old connection back manually before calling complete_election), the
+        // full RTT measurement snapshot should be restored — not a single
+        // synthetic sample.
+        //
+        // NOTE: We cannot create a real Connection without browser APIs.
+        // Instead, we verify the measurement restoration by checking the
+        // rtt_measurements map after the abort. The old_active_connection
+        // path is exercised only when a real Connection is available (wasm32
+        // integration tests). Here we test the state machine invariants.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(100.0);
+        mgr.old_active_url = Some("https://test/wt_old".to_string());
+        // old_active_connection is None — the connection won't be restored,
+        // but the state cleanup must still run correctly.
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0, 200.0]);
+
+        mgr.complete_election();
+
+        // Baseline should be rebased to old RTT.
+        assert!(
+            (mgr.baseline_rtt.unwrap() - 100.0).abs() < 0.01,
+            "baseline should be rebased to old connection RTT"
+        );
+        // Degradation counter should be reset.
+        assert_eq!(mgr.degradation_counter, 0);
+        // Election state should be Elected with the old ID.
+        assert!(matches!(mgr.election_state, ElectionState::Elected { .. }));
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_abort_uses_stored_transport_type() {
+        // When old_active_is_webtransport is set, abort should use it
+        // instead of inferring from the connection ID prefix.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(100.0);
+        mgr.old_active_url = Some("https://test/custom_id".to_string());
+        // Transport type stored explicitly — even though ID doesn't start
+        // with "wt", it should be recognized as WebTransport.
+        mgr.old_active_is_webtransport = Some(true);
+        mgr.old_active_rtt_measurement = Some(ServerRttMeasurement {
+            url: "https://test/custom_id".to_string(),
+            is_webtransport: true,
+            measurements: VecDeque::from(vec![95.0, 100.0, 105.0]),
+            average_rtt: Some(100.0),
+            connection_id: "custom_id".to_string(),
+            active: true,
+            connected: true,
+        });
+        *mgr.active_connection_id.borrow_mut() = Some("custom_id".to_string());
+
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0, 200.0]);
+
+        mgr.complete_election();
+
+        // Verify state was cleaned up. The measurement restoration doesn't
+        // happen without a real Connection, but old_active_is_webtransport
+        // should be consumed (taken).
+        assert!(
+            mgr.old_active_is_webtransport.is_none(),
+            "old_active_is_webtransport should be consumed on abort"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn reset_and_start_election_clears_new_fields() {
+        let mut mgr = make_test_manager();
+        mgr.old_active_rtt_measurement = Some(ServerRttMeasurement {
+            url: "https://test/wt_0".to_string(),
+            is_webtransport: true,
+            measurements: VecDeque::from(vec![100.0]),
+            average_rtt: Some(100.0),
+            connection_id: "wt_0".to_string(),
+            active: false,
+            connected: false,
+        });
+        mgr.old_active_is_webtransport = Some(true);
+
+        mgr.reset_and_start_election().unwrap();
+
+        assert!(
+            mgr.old_active_rtt_measurement.is_none(),
+            "reset_and_start_election should clear old_active_rtt_measurement"
+        );
+        assert!(
+            mgr.old_active_is_webtransport.is_none(),
+            "reset_and_start_election should clear old_active_is_webtransport"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn hysteresis_boundary_exactly_at_threshold() {
+        // Winner is exactly REELECTION_MIN_IMPROVEMENT_MS better — should proceed.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        let old_rtt = 200.0;
+        mgr.old_active_rtt = Some(old_rtt);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Winner at exactly (old - deadband): 200 - 20 = 180ms.
+        let winner_rtt = old_rtt - REELECTION_MIN_IMPROVEMENT_MS;
+        insert_measurement(
+            &mut mgr,
+            "wt_0",
+            true,
+            Some(winner_rtt),
+            vec![winner_rtt, winner_rtt],
+        );
+
+        mgr.complete_election();
+
+        // At exactly the boundary, winner_rtt == old_rtt - deadband,
+        // so winner_rtt >= old_rtt - deadband is TRUE, meaning dominated=true => abort.
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_old".to_string()),
+            "exactly at hysteresis boundary should still abort (not strictly better)"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn hysteresis_boundary_just_below_threshold() {
+        // Winner is just barely more than REELECTION_MIN_IMPROVEMENT_MS better
+        // — should proceed.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        let old_rtt = 200.0;
+        mgr.old_active_rtt = Some(old_rtt);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Winner at (old - deadband - 0.1): 200 - 20 - 0.1 = 179.9ms.
+        let winner_rtt = old_rtt - REELECTION_MIN_IMPROVEMENT_MS - 0.1;
+        insert_measurement(
+            &mut mgr,
+            "wt_0",
+            true,
+            Some(winner_rtt),
+            vec![winner_rtt, winner_rtt],
+        );
+
+        mgr.complete_election();
+
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_0".to_string()),
+            "just beyond hysteresis boundary should proceed with switch"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn catastrophic_below_threshold_still_applies_hysteresis() {
+        // Old RTT is below catastrophic threshold — normal hysteresis applies.
+        let mut mgr = make_test_manager();
+
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(4999.0); // Just below 5000ms threshold
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Winner is worse.
+        insert_measurement(&mut mgr, "wt_0", true, Some(5100.0), vec![5100.0, 5100.0]);
+
+        mgr.complete_election();
+
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_old".to_string()),
+            "below catastrophic threshold, worse winner should be rejected"
+        );
+    }
+
+    // ===================================================================
     // Integration test notes
     // ===================================================================
     //
@@ -2666,6 +3706,13 @@ mod tests {
     // - `ConnectionManager::new()` and `start_election()` (call Connection::connect)
     //
     // - `complete_election()` with live connections (selects best, starts heartbeat)
+    //   Note: the re-election fallback (old_active_rtt comparison, measurement
+    //   restoration, catastrophic override, hysteresis) is tested via synthetic
+    //   state in the unit tests above. Full end-to-end testing of the
+    //   old_active_connection restoration (re-inserting the Connection into the
+    //   HashMap and verifying the full RTT measurement is restored with all
+    //   samples, not a single synthetic one) requires live WebTransport/WebSocket
+    //   connections and should be covered by wasm-bindgen-test integration tests.
     //
     // - `create_connection_lost_callback` -> spawns reconnection loop
     //

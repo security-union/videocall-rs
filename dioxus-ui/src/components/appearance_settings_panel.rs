@@ -3,7 +3,7 @@
  * Licensed under MIT OR Apache-2.0
  */
 
-use crate::components::canvas_generator::calculate_glow_params;
+use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BORDER_COLOR};
 use crate::context::{
     load_custom_colors_from_storage, save_custom_colors_to_storage, AppearanceSettings,
     AppearanceSettingsCtx, GlowColor, MAX_CUSTOM_COLORS,
@@ -379,7 +379,10 @@ fn slider_fill_style(_value: f32, color: GlowColor) -> String {
 /// `preview-tile-pulsing` animation provides visual dynamism.
 fn preview_glow_style(settings: &AppearanceSettings) -> String {
     if !settings.glow_enabled {
-        return "box-shadow: none; border-color: rgba(255, 255, 255, 0.08);".to_string();
+        return format!(
+            "box-shadow: none; border-color: {};",
+            DEFAULT_TILE_BORDER_COLOR
+        );
     }
 
     let (r, g, b) = settings.glow_color.to_rgb();

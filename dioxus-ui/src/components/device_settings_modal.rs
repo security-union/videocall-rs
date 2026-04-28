@@ -53,11 +53,11 @@ fn close_dropdown_and_focus(
 
 fn click_target_is_within_glass_select(event: &MouseEvent) -> bool {
     event
-    .data()
-    .downcast::<web_sys::MouseEvent>()
-    .and_then(|mouse_event| mouse_event.target())
-    .and_then(|target: web_sys::EventTarget| target.dyn_into::<web_sys::Element>().ok())
-    .and_then(|element: web_sys::Element| element.closest(".glass-select").ok().flatten())
+        .data()
+        .downcast::<web_sys::MouseEvent>()
+        .and_then(|mouse_event| mouse_event.target())
+        .and_then(|target: web_sys::EventTarget| target.dyn_into::<web_sys::Element>().ok())
+        .and_then(|element: web_sys::Element| element.closest(".glass-select").ok().flatten())
         .is_some()
 }
 

@@ -123,6 +123,48 @@ pub struct ListMeetingsResponse {
     pub offset: i64,
 }
 
+/// Response payload for `GET /api/v1/meetings/joined`.
+///
+/// Returns the meetings the authenticated user has previously been admitted into,
+/// ordered by their most recent admission time (descending). Includes both
+/// meetings the user owns and meetings they joined as a non-owner.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ListJoinedMeetingsResponse {
+    /// Meetings the user has joined, ordered by `last_joined_at` descending.
+    pub meetings: Vec<JoinedMeetingSummary>,
+    /// Total count of joined meetings returned (equal to `meetings.len()`).
+    /// Capped by the request's `limit`; not a true unbounded count.
+    pub total: i64,
+}
+
+/// Single meeting entry inside [`ListJoinedMeetingsResponse`].
+///
+/// All timestamps are Unix epoch milliseconds. The `last_joined_at` field is
+/// the timestamp used for ordering — `admitted_at` when present, falling back
+/// to `joined_at` for legacy rows where `admitted_at` was never refreshed.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct JoinedMeetingSummary {
+    pub meeting_id: String,
+    /// Meeting state: `"active"`, `"idle"`, or `"ended"`.
+    pub state: String,
+    /// Unix timestamp in milliseconds when the meeting started.
+    pub started_at: i64,
+    /// Unix timestamp in milliseconds when the meeting ended, or `null` if
+    /// still active/idle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+    pub participant_count: i64,
+    pub waiting_count: i64,
+    pub has_password: bool,
+    /// `true` when the authenticated user is the meeting owner (creator).
+    pub is_owner: bool,
+    /// Unix timestamp in milliseconds — the timestamp used for ordering.
+    /// Computed as `COALESCE(admitted_at, joined_at)` so re-admissions float
+    /// to the top while legacy rows that were never re-admitted still sort
+    /// by their original join time.
+    pub last_joined_at: i64,
+}
+
 /// Single meeting entry inside [`ListMeetingsResponse`].
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct MeetingSummary {

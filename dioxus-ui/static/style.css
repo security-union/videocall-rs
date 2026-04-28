@@ -1803,6 +1803,27 @@ select {
 .meeting-time          { color: rgba(255, 255, 255, 0.5); font-size: 0.75rem; }
 .meeting-time-separator{ color: rgba(255, 255, 255, 0.3); font-size: 0.75rem; }
 
+/* ------------------------------------------------------------
+   Joined Meetings List (sibling of MeetingsList)
+   ------------------------------------------------------------ */
+.joined-meetings-list-container { margin-bottom: 1rem; }
+
+.meeting-owner-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.625rem;
+  padding: 0.125rem 0.4375rem;
+  border-radius: var(--radius-pill, 9999px);
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  background: rgba(255, 204, 0, 0.20);
+  color: rgba(255, 214, 51, 0.95);
+  border: 1px solid rgba(255, 204, 0, 0.30);
+}
+.meeting-owner-badge svg { width: 10px; height: 10px; }
+
 /* ============================================================
    Waiting Room
    ============================================================ */

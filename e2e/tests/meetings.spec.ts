@@ -383,6 +383,161 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 1000 });
   });
 
+  test("Meeting ID info icon reveals tooltip on keyboard focus and hides on blur", async ({
+    page,
+  }) => {
+    // Keyboard accessibility parity with the Display Name tooltip: the
+    // Meeting ID info trigger has tabindex=0, so keyboard-only and
+    // touch-AT users must be able to read the tooltip without hovering.
+    // Programmatic focus() drives :focus-visible/:focus-within, which is
+    // the same CSS path used by Tab navigation — robust to whatever Tab
+    // order surrounding elements introduce.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const trigger = page.locator(meetingIdInfoTriggerSelector);
+    const tooltip = page.locator(meetingIdInfoTooltipSelector);
+
+    await expect(tooltip).toBeHidden();
+
+    await trigger.focus();
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+    await expect(tooltip).toContainText("Allowed: letters, numbers, and underscores");
+    await expect(tooltip).toContainText("Generate a New Meeting ID");
+
+    // Blurring the trigger dismisses the tooltip.
+    await trigger.blur();
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+  });
+
+  test("Display Name info icon — click toggles the tooltip open and closed", async ({ page }) => {
+    // Signal-driven click-to-toggle path (issue #460): clicking the info
+    // trigger should park the tooltip open even after the pointer leaves,
+    // and clicking the trigger again should close it. This complements
+    // the CSS `:hover` reveal path tested above and exists primarily for
+    // touch devices where there is no hover state.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const trigger = page.locator(usernameInfoTriggerSelector);
+    const tooltip = page.locator(usernameInfoTooltipSelector);
+
+    await expect(tooltip).toBeHidden();
+
+    // First click parks the tooltip open via the `--open` modifier class.
+    await trigger.click();
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+    await expect(trigger).toHaveClass(/field-label__info--open/);
+
+    // Second click toggles it back closed. After clicking the trigger we
+    // also blur it to drop the `:focus-within` CSS reveal that would
+    // otherwise keep the tooltip visible while the trigger is focused.
+    await trigger.click();
+    await trigger.blur();
+    await expect(trigger).not.toHaveClass(/field-label__info--open/);
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+  });
+
+  test("Meeting ID info icon — Enter and Space keys toggle the tooltip", async ({ page }) => {
+    // Keyboard activation parity with click-to-toggle (issue #460): with
+    // the trigger focused, pressing Enter or Space should toggle the
+    // tooltip the same way a click does. This is required for keyboard-
+    // only users who can't fall back to a click event.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const trigger = page.locator(meetingIdInfoTriggerSelector);
+    const tooltip = page.locator(meetingIdInfoTooltipSelector);
+
+    // Programmatic focus mirrors the Tab-onto-trigger flow without binding
+    // the test to whatever Tab order surrounding elements introduce.
+    await trigger.focus();
+    // Focus alone reveals the tooltip via CSS `:focus-visible`/`:focus-within`,
+    // independent of the signal-driven `--open` class — that's the existing
+    // path. We still expect it visible here so the subsequent Enter press
+    // is unambiguously the action that drives the `--open` toggle off.
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+
+    // Enter parks the signal open (toggling from None → MeetingId). The
+    // tooltip stays visible (it was already visible via focus), but the
+    // `--open` class should now be present.
+    await page.keyboard.press("Enter");
+    await expect(trigger).toHaveClass(/field-label__info--open/);
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+
+    // Space toggles it back off. With the signal cleared and only focus
+    // keeping the tooltip visible via CSS, blur to drop the focus reveal
+    // and confirm the tooltip closes.
+    await page.keyboard.press("Space");
+    await expect(trigger).not.toHaveClass(/field-label__info--open/);
+    await trigger.blur();
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+
+    // Re-open with Space to prove both keys work in the open direction
+    // too — symmetric with the Enter open above.
+    await trigger.focus();
+    await page.keyboard.press("Space");
+    await expect(trigger).toHaveClass(/field-label__info--open/);
+
+    // And close with Enter to prove Enter also closes (full symmetry).
+    await page.keyboard.press("Enter");
+    await expect(trigger).not.toHaveClass(/field-label__info--open/);
+    await trigger.blur();
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+  });
+
+  test("Open tooltip dismisses on Escape key", async ({ page }) => {
+    // Escape-to-dismiss is installed at the window level (issue #460): the
+    // home page registers a `keydown` listener that clears the open-tooltip
+    // signal when Escape is pressed, regardless of focus. This is the
+    // standard escape-hatch for any modal-ish overlay.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const trigger = page.locator(usernameInfoTriggerSelector);
+    const tooltip = page.locator(usernameInfoTooltipSelector);
+
+    // Open via click-to-toggle (verified above).
+    await trigger.click();
+    await expect(trigger).toHaveClass(/field-label__info--open/);
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+
+    // Escape clears the open-tooltip signal. Blur the trigger afterwards
+    // so any residual `:focus-within` CSS reveal doesn't keep the tooltip
+    // visible — the assertion we care about is that the `--open` class
+    // was removed.
+    await page.keyboard.press("Escape");
+    await expect(trigger).not.toHaveClass(/field-label__info--open/);
+    await trigger.blur();
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+  });
+
+  test("Open tooltip dismisses on outside click", async ({ page }) => {
+    // Outside-click dismissal is the touch-device equivalent of Escape
+    // (issue #460): a click whose target is not inside any element marked
+    // with `data-tooltip-trigger` should clear the open-tooltip signal.
+    // This exists primarily so iOS Safari users can dismiss a tooltip that
+    // got stuck via tap-focus on the trigger.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const trigger = page.locator(meetingIdInfoTriggerSelector);
+    const tooltip = page.locator(meetingIdInfoTooltipSelector);
+
+    await trigger.click();
+    await expect(trigger).toHaveClass(/field-label__info--open/);
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+
+    // Click the top-left corner of the page — far from the form region so
+    // there's no risk of an en-route hover or click landing on a tooltip
+    // trigger and re-toggling it. `force: true` keeps Playwright from
+    // refusing the click on whatever element happens to be at (5, 5).
+    await page.locator("body").click({ position: { x: 5, y: 5 }, force: true });
+    await expect(trigger).not.toHaveClass(/field-label__info--open/);
+    await trigger.blur();
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+  });
+
   test("form height is stable when Display Name validation error appears", async ({ page }) => {
     // The inline label-row error pattern is specifically designed so the
     // form's overall height does NOT change when an error appears — the

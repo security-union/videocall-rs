@@ -31,10 +31,104 @@ use crate::meeting_api::create_meeting;
 use crate::routing::Route;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
+use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
 
 const TEXT_INPUT_CLASSES: &str = "input-apple";
+
+/// Identifies which info-icon tooltip is currently "parked open" via an
+/// explicit user action (click, Enter, or Space).  The CSS `:hover` and
+/// `:focus-within` rules still drive the standard hover/keyboard-focus
+/// reveal — this signal layers click-toggle and outside-tap dismissal on
+/// top, so iOS Safari users can dismiss tooltips that get stuck via
+/// `:focus-within` after a tap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TooltipId {
+    None,
+    DisplayName,
+    MeetingId,
+}
+
+/// RAII handle for the window-level `keydown` and `click` listeners that
+/// dismiss any open tooltip on Escape or outside-tap.  The closures must
+/// be kept alive for as long as the listeners are registered (otherwise
+/// JS would reclaim them) so they live on the handle; `remove()` is
+/// invoked from `use_drop` to detach the listeners on unmount.
+struct TooltipDismissHandle {
+    keydown_closure: Closure<dyn FnMut(web_sys::KeyboardEvent)>,
+    click_closure: Closure<dyn FnMut(web_sys::Event)>,
+    window: web_sys::Window,
+}
+
+impl TooltipDismissHandle {
+    fn remove(&self) {
+        let _ = self.window.remove_event_listener_with_callback(
+            "keydown",
+            self.keydown_closure.as_ref().unchecked_ref(),
+        );
+        let _ = self.window.remove_event_listener_with_callback(
+            "click",
+            self.click_closure.as_ref().unchecked_ref(),
+        );
+    }
+}
+
+/// Install the global Escape + outside-click dismissal listeners exactly
+/// once per Home mount.  The `keydown` handler closes any open tooltip on
+/// Escape; the `click` handler closes when the click target is not inside
+/// any element marked with `data-tooltip-trigger` (the trigger spans set
+/// this attribute, so click-on-trigger is skipped here and handled by the
+/// trigger's `onclick`).
+fn register_tooltip_dismiss_listeners(
+    open_tooltip: Signal<TooltipId>,
+) -> std::rc::Rc<TooltipDismissHandle> {
+    let window = web_sys::window().expect("window is available in a browser context");
+
+    let mut sig_for_keydown = open_tooltip;
+    let keydown_closure =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |evt: web_sys::KeyboardEvent| {
+            if evt.key() == "Escape" && sig_for_keydown() != TooltipId::None {
+                sig_for_keydown.set(TooltipId::None);
+            }
+        });
+    window
+        .add_event_listener_with_callback("keydown", keydown_closure.as_ref().unchecked_ref())
+        .expect("failed to register tooltip Escape listener");
+
+    let mut sig_for_click = open_tooltip;
+    let click_closure = Closure::<dyn FnMut(web_sys::Event)>::new(move |evt: web_sys::Event| {
+        // Only act when something is open — avoid pointless ancestor walks.
+        if sig_for_click() == TooltipId::None {
+            return;
+        }
+        // If the click target (or any ancestor) is a tooltip trigger, the
+        // trigger's own `onclick` is responsible for the toggle.  Skip.
+        if let Some(target) = evt
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        {
+            if target
+                .closest("[data-tooltip-trigger]")
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return;
+            }
+        }
+        sig_for_click.set(TooltipId::None);
+    });
+    window
+        .add_event_listener_with_callback("click", click_closure.as_ref().unchecked_ref())
+        .expect("failed to register tooltip outside-click listener");
+
+    std::rc::Rc::new(TooltipDismissHandle {
+        keydown_closure,
+        click_closure,
+        window,
+    })
+}
 
 #[component]
 pub fn Home() -> Element {
@@ -70,6 +164,25 @@ pub fn Home() -> Element {
 
     let mut create_error = use_signal(|| None::<String>);
     let mut creating = use_signal(|| false);
+
+    // Tracks which (if any) info-icon tooltip the user has explicitly
+    // parked open via click / Enter / Space.  CSS still handles the
+    // hover and keyboard-focus reveal; this signal exists so we can
+    // honour Escape and outside-tap dismissal — important on iOS Safari
+    // where a tap-focus on a `<span tabindex="0">` doesn't reliably
+    // blur on subsequent taps to non-interactive page chrome.
+    let mut open_tooltip = use_signal(|| TooltipId::None);
+
+    // Install window-level Escape + outside-click listeners exactly once
+    // per Home mount.  `use_hook` (not `use_effect`) avoids re-installing
+    // on re-renders — see CmdKHandle in main.rs for the same pattern.
+    let tooltip_dismiss_handle = use_hook(|| register_tooltip_dismiss_listeners(open_tooltip));
+    use_drop({
+        let tooltip_dismiss_handle = tooltip_dismiss_handle.clone();
+        move || {
+            tooltip_dismiss_handle.remove();
+        }
+    });
 
     // Fetch user profile when OAuth is enabled.
     //
@@ -302,11 +415,36 @@ pub fn Home() -> Element {
                                     span { class: "field-label__name",
                                         "Display Name"
                                         span {
-                                            class: "field-label__info",
+                                            class: if open_tooltip() == TooltipId::DisplayName {
+                                                "field-label__info field-label__info--open"
+                                            } else {
+                                                "field-label__info"
+                                            },
                                             tabindex: 0,
                                             role: "button",
                                             aria_label: "What's allowed in Display Name?",
                                             aria_describedby: "username-info-tip",
+                                            "data-tooltip-trigger": "username",
+                                            onclick: move |e| {
+                                                e.stop_propagation();
+                                                open_tooltip.set(if open_tooltip() == TooltipId::DisplayName {
+                                                    TooltipId::None
+                                                } else {
+                                                    TooltipId::DisplayName
+                                                });
+                                            },
+                                            onkeydown: move |e| {
+                                                let key = e.key();
+                                                if key == Key::Enter || key == Key::Character(" ".to_string()) {
+                                                    e.prevent_default();
+                                                    e.stop_propagation();
+                                                    open_tooltip.set(if open_tooltip() == TooltipId::DisplayName {
+                                                        TooltipId::None
+                                                    } else {
+                                                        TooltipId::DisplayName
+                                                    });
+                                                }
+                                            },
                                             svg {
                                                 class: "field-label__info-icon",
                                                 xmlns: "http://www.w3.org/2000/svg",
@@ -332,7 +470,6 @@ pub fn Home() -> Element {
                                     }
                                     span {
                                         class: "field-label__error",
-                                        role: "alert",
                                         aria_live: "polite",
                                         "{username_error().unwrap_or_default()}"
                                     }
@@ -382,11 +519,36 @@ pub fn Home() -> Element {
                                     span { class: "field-label__name",
                                         "Meeting ID"
                                         span {
-                                            class: "field-label__info",
+                                            class: if open_tooltip() == TooltipId::MeetingId {
+                                                "field-label__info field-label__info--open"
+                                            } else {
+                                                "field-label__info"
+                                            },
                                             tabindex: 0,
                                             role: "button",
                                             aria_label: "What's allowed in Meeting ID?",
                                             aria_describedby: "meeting-id-info-tip",
+                                            "data-tooltip-trigger": "meeting-id",
+                                            onclick: move |e| {
+                                                e.stop_propagation();
+                                                open_tooltip.set(if open_tooltip() == TooltipId::MeetingId {
+                                                    TooltipId::None
+                                                } else {
+                                                    TooltipId::MeetingId
+                                                });
+                                            },
+                                            onkeydown: move |e| {
+                                                let key = e.key();
+                                                if key == Key::Enter || key == Key::Character(" ".to_string()) {
+                                                    e.prevent_default();
+                                                    e.stop_propagation();
+                                                    open_tooltip.set(if open_tooltip() == TooltipId::MeetingId {
+                                                        TooltipId::None
+                                                    } else {
+                                                        TooltipId::MeetingId
+                                                    });
+                                                }
+                                            },
                                             svg {
                                                 class: "field-label__info-icon",
                                                 xmlns: "http://www.w3.org/2000/svg",
@@ -412,7 +574,6 @@ pub fn Home() -> Element {
                                     }
                                     span {
                                         class: "field-label__error",
-                                        role: "alert",
                                         aria_live: "polite",
                                         "{meeting_id_error().unwrap_or_default()}"
                                     }

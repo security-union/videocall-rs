@@ -1803,6 +1803,27 @@ select {
 .meeting-time          { color: rgba(255, 255, 255, 0.5); font-size: 0.75rem; }
 .meeting-time-separator{ color: rgba(255, 255, 255, 0.3); font-size: 0.75rem; }
 
+/* ------------------------------------------------------------
+   Joined Meetings List (sibling of MeetingsList)
+   ------------------------------------------------------------ */
+.joined-meetings-list-container { margin-bottom: 1rem; }
+
+.meeting-owner-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.625rem;
+  padding: 0.125rem 0.4375rem;
+  border-radius: var(--radius-pill, 9999px);
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  background: rgba(255, 204, 0, 0.20);
+  color: rgba(255, 214, 51, 0.95);
+  border: 1px solid rgba(255, 204, 0, 0.30);
+}
+.meeting-owner-badge svg { width: 10px; height: 10px; }
+
 /* ============================================================
    Waiting Room
    ============================================================ */
@@ -3059,6 +3080,256 @@ select {
   font-size: 0.75rem;
   color: var(--text-secondary, rgba(255, 255, 255, 0.5));
   font-style: italic;
+}
+
+/* ── Sticky-protocol toggle row ────────────────────────────────── */
+
+.settings-section .device-setting-group.sticky-protocol-row {
+  /* Remove the bottom-edge padding the inner row already provides so the
+     toggle visually nests as a sub-control of the protocol picker without
+     looking like a separate panel. */
+  padding-block: 14px;
+}
+
+.sticky-protocol-row-inner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.sticky-protocol-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settings-section .device-setting-group .sticky-protocol-label {
+  /* Override the default 600 / 10px-bottom-margin label styling used by the
+     dropdowns above — this label sits inline with a toggle, not above an
+     input. */
+  font-size: 0.875rem;
+  font-weight: 500;
+  margin-bottom: 0;
+  cursor: pointer;
+  color: var(--text-primary, #FFFFFF);
+}
+
+.sticky-protocol-hint {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--text-secondary, rgba(255, 255, 255, 0.55));
+}
+
+/* ── Inline informational panel ────────────────────────────────── */
+
+.settings-info-panel {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(95, 130, 180, 0.22);
+  background:
+    radial-gradient(420px 220px at 0% 0%, rgba(70, 110, 160, 0.10), transparent 70%),
+    linear-gradient(180deg,
+      rgba(70, 110, 160, 0.05) 0%,
+      rgba(50, 90, 140, 0.02) 100%
+    );
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow:
+    inset 0 1px 0 rgba(120, 160, 210, 0.10),
+    0 2px 8px rgba(20, 40, 80, 0.18);
+  color: var(--text-primary, #FFFFFF);
+}
+
+.settings-info-panel-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  color: rgba(125, 165, 220, 0.95);
+}
+
+.settings-info-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settings-info-panel-title {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-primary, #FFFFFF);
+}
+
+.settings-info-panel-text {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--text-secondary, rgba(255, 255, 255, 0.65));
+}
+
+/* ── Transport segmented control ───────────────────────────────── */
+/*
+ * Three-way pill picker that replaces the glass dropdown in the Network
+ * tab. Visually echoes the modal's `.device-setting-group` panel
+ * (matching border, blur, sheen) so the radio sits flush inside the
+ * card. Each `.transport-segmented-option` is a real <button role="radio">
+ * that toggles between unselected (transparent ghost) and selected
+ * (filled glass) states.
+ */
+
+.transport-segmented-label {
+  display: block;
+  color: var(--text-primary, #FFFFFF);
+  font-size: 0.875rem;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.transport-segmented {
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  background:
+    linear-gradient(180deg,
+      rgba(70, 110, 160, 0.04) 0%,
+      rgba(50, 90, 140, 0.01) 100%
+    );
+  border: 1px solid rgba(70, 100, 140, 0.12);
+  border-radius: 10px;
+  box-shadow:
+    inset 0 1px 0 rgba(100, 140, 180, 0.06),
+    0 2px 6px rgba(20, 40, 80, 0.10);
+}
+
+.transport-segmented-option {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--text-secondary, rgba(255, 255, 255, 0.70));
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  padding: 9px 12px;
+  text-align: center;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease,
+    box-shadow 0.2s ease, transform 0.15s ease;
+  white-space: nowrap;
+}
+
+.transport-segmented-option:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary, #FFFFFF);
+}
+
+.transport-segmented-option:focus-visible {
+  outline: none;
+  border-color: rgba(95, 130, 180, 0.40);
+  box-shadow: 0 0 0 2px rgba(70, 110, 160, 0.18);
+}
+
+.transport-segmented-option:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.transport-segmented-option.selected {
+  background:
+    radial-gradient(300px 200px at 85% 80%, rgba(210, 60, 80, 0.06), transparent 65%),
+    linear-gradient(180deg,
+      rgba(80, 120, 170, 0.18) 0%,
+      rgba(60, 100, 150, 0.06) 100%
+    );
+  border-color: rgba(95, 130, 180, 0.30);
+  color: var(--text-primary, #FFFFFF);
+  box-shadow:
+    inset 0 1px 0 rgba(120, 160, 210, 0.12),
+    0 2px 8px rgba(20, 40, 80, 0.18);
+}
+
+.transport-segmented-option:active:not(.selected) {
+  transform: scale(0.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transport-segmented-option {
+    transition: none;
+  }
+}
+
+/* ── Transport "Apply" action row ──────────────────────────────── */
+
+.transport-apply-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.transport-apply-row .transport-preference-note {
+  margin: 0;
+  flex: 1 1 auto;
+}
+
+.transport-apply-button {
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(10, 132, 255, 0.25);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  backdrop-filter: blur(12px) saturate(150%);
+  border: 1px solid rgba(10, 132, 255, 0.35);
+  border-radius: var(--radius-button, 10px);
+  color: var(--text-primary, #FFFFFF);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  height: 38px;
+  padding: 0 22px;
+  flex-shrink: 0;
+  transition: background 0.2s ease, border-color 0.2s ease,
+    box-shadow 0.2s ease, transform 0.15s ease;
+}
+
+.transport-apply-button:hover {
+  background: rgba(10, 132, 255, 0.35);
+  border-color: rgba(10, 132, 255, 0.50);
+  box-shadow: 0 4px 16px rgba(10, 132, 255, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+.transport-apply-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.transport-apply-button:active {
+  background: rgba(10, 132, 255, 0.40);
+  transform: scale(0.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transport-apply-button {
+    transition: none;
+  }
 }
 
 .settings-modal {

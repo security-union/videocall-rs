@@ -108,6 +108,17 @@ body {
   --success: #30D158;
   --warning: #FF9F0A;
   --error: #FF453A;
+  /*
+   * Higher-luminance error red for use as foreground TEXT on the glass
+   * surface (--glass-bg over --surface composites to ≈ #2D2D2F).  At that
+   * background, the saturated --error #FF453A computes a contrast ratio of
+   * only ~4.06:1, which fails WCAG AA for normal text (4.5:1 required).
+   * #FF7A6E clears the bar at ~5.52:1 while still reading as "error red"
+   * and harmonizing with the --error border/glyph on invalid inputs (which
+   * convey state via shape, not text, so they don't need to clear text
+   * contrast).
+   */
+  --error-text: #FF7A6E;
 
   /* Liquid Glass material */
   --glass-bg: rgba(255, 255, 255, 0.06);
@@ -1104,6 +1115,204 @@ body {
 .hero-content form p {
   color: var(--text-quaternary);
   font-size: 0.75rem;
+}
+
+/*
+ * Inline field validation — label-row pattern.
+ *
+ * The label sits on the left; an error message sits on the right of the
+ * same row, sharing the label's already-reserved vertical space.  This
+ * avoids both layout shift (no new space appears when an error shows) and
+ * dead vertical space (no permanent gap when there is no error).
+ *
+ * Pattern:
+ *   <label class="field-label">
+ *     <span class="field-label__name">Display Name</span>
+ *     <span class="field-label__error" role="alert">'@' not allowed</span>
+ *   </label>
+ *
+ * The error span is hidden until populated.  When present it truncates with
+ * an ellipsis on viewports that cannot fit it next to the label, and the
+ * input's red border + warning glyph still convey the invalid state.
+ */
+.hero-content form label.field-label,
+.field-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+  margin-left: 0.25rem;
+  margin-right: 0.25rem;
+}
+
+.field-label__name {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-weight: 500;
+  font-size: 0.8125rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+/*
+ * Per-field info icon — opens a small popover explaining the allowed
+ * characters for the field.  CSS-only show/hide: the trigger is a
+ * focusable inline element ([role="button"][tabindex=0]) so hover, tap
+ * (which focuses on iOS Safari), and keyboard Tab all reveal the
+ * tooltip via :hover / :focus-within.  No JS state required.
+ */
+.field-label__info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  color: var(--text-tertiary);
+  cursor: help;
+  transition: color 160ms cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 160ms cubic-bezier(0.4, 0, 0.2, 1);
+  /* Reset native button-ish defaults so the span sits flush with the label */
+  -webkit-tap-highlight-color: transparent;
+}
+
+.field-label__info:hover,
+.field-label__info:focus-visible {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.field-label__info:focus {
+  outline: none;
+}
+
+.field-label__info:focus-visible {
+  box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.45);
+}
+
+.field-label__info-icon {
+  display: block;
+  pointer-events: none;
+}
+
+/*
+ * Tooltip — anchored to the icon's left edge, growing rightward.  The
+ * icons sit on the left side of the label row (just after the field
+ * name), so this orientation keeps the bubble inside the form on every
+ * viewport.  Width is capped so it never overflows narrow phones.
+ */
+.field-label__tooltip {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: -8px;
+  z-index: 20;
+  width: max-content;
+  max-width: min(260px, calc(100vw - 4rem));
+  padding: 0.5rem 0.625rem;
+  background: rgba(28, 28, 30, 0.96);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
+              0 1px 0 rgba(255, 255, 255, 0.04) inset;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 0.75rem;
+  font-weight: 400;
+  line-height: 1.4;
+  text-align: left;
+  white-space: normal;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-4px);
+  transition: opacity 160ms cubic-bezier(0.4, 0, 0.2, 1),
+              transform 160ms cubic-bezier(0.4, 0, 0.2, 1),
+              visibility 0s linear 160ms;
+}
+
+/* Tiny arrow pointing up at the icon */
+.field-label__tooltip::before {
+  content: "";
+  position: absolute;
+  top: -4px;
+  left: 13px;
+  transform: rotate(45deg);
+  width: 8px;
+  height: 8px;
+  background: rgba(28, 28, 30, 0.96);
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.field-label__info:hover .field-label__tooltip,
+.field-label__info:focus-visible .field-label__tooltip,
+.field-label__info:focus-within .field-label__tooltip,
+.field-label__info--open .field-label__tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  transition: opacity 160ms cubic-bezier(0.4, 0, 0.2, 1),
+              transform 160ms cubic-bezier(0.4, 0, 0.2, 1),
+              visibility 0s linear 0s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .field-label__tooltip,
+  .field-label__info {
+    transition: none;
+  }
+}
+
+.field-label__error {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: right;
+  /* See --error-text definition: --error fails AA on the glass surface. */
+  color: var(--error-text);
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Subtle fade-in keeps the error from appearing jarringly on every keystroke */
+  animation: field-error-in 160ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.field-label__error:empty {
+  display: none;
+}
+
+@keyframes field-error-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .field-label__error { animation: none; }
+}
+
+/* Invalid input — red border + warning glyph at the right edge.
+ * The glyph is rendered via background-image so we don't need to alter
+ * the input markup or pull in an icon font. */
+.input-apple--invalid,
+.hero-content form input.input-apple--invalid {
+  border-color: var(--error);
+  padding-right: 2.25rem;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%23FF453A' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'><circle cx='8' cy='8' r='6.75'/><line x1='8' y1='5' x2='8' y2='8.5'/><circle cx='8' cy='11' r='0.6' fill='%23FF453A' stroke='none'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+  background-size: 16px 16px;
+}
+
+.input-apple--invalid:focus,
+.hero-content form input.input-apple--invalid:focus {
+  border-color: var(--error);
+  box-shadow: 0 0 0 3px rgba(255, 69, 58, 0.25);
 }
 
 .hero-content form .space-y-6 > div {

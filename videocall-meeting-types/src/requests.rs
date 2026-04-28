@@ -136,3 +136,24 @@ impl Default for ListMeetingsQuery {
         }
     }
 }
+
+/// Query parameters for `GET /api/v1/meetings/joined`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ListJoinedMeetingsQuery {
+    /// Maximum number of joined meetings to return. Defaults to 5 when omitted.
+    /// Server clamps to a maximum of 50; negative values return 400 INVALID_INPUT.
+    #[serde(default = "default_joined_limit")]
+    pub limit: i64,
+}
+
+fn default_joined_limit() -> i64 {
+    5
+}
+
+impl Default for ListJoinedMeetingsQuery {
+    fn default() -> Self {
+        Self {
+            limit: default_joined_limit(),
+        }
+    }
+}

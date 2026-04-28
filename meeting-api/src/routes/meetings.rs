@@ -231,6 +231,9 @@ pub async fn list_joined_meetings(
     let rows = db_meetings::list_joined_by_user(&state.db, &user_id, limit).await?;
 
     let mut meetings = Vec::with_capacity(rows.len());
+    // Note: participant_count / waiting_count are read after the main SELECT
+    // in separate queries, so they may reflect a slightly newer DB snapshot
+    // than `last_joined_at`. Acceptable for this advisory home-page surface.
     for row in &rows {
         let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
         let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;

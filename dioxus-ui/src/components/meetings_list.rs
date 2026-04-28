@@ -4,6 +4,7 @@
  */
 
 use crate::components::login::{do_login, ProviderButton};
+use crate::components::meeting_format::{format_duration, format_time};
 use crate::constants::meeting_api_client;
 use crate::local_storage::{load_bool, save_bool};
 use crate::routing::Route;
@@ -354,34 +355,4 @@ async fn do_delete_meeting(meeting_id: &str) -> Result<(), String> {
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))
-}
-
-fn format_duration(duration_ms: i64) -> String {
-    let total_seconds = duration_ms / 1000;
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-
-    if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
-    } else {
-        format!("{seconds}s")
-    }
-}
-
-fn format_time(timestamp_ms: i64) -> String {
-    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(timestamp_ms as f64));
-    let hours = date.get_hours();
-    let minutes = date.get_minutes();
-    let am_pm = if hours >= 12 { "PM" } else { "AM" };
-    let hours_12 = if hours == 0 {
-        12
-    } else if hours > 12 {
-        hours - 12
-    } else {
-        hours
-    };
-    format!("{hours_12}:{minutes:02} {am_pm}")
 }

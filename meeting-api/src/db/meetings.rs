@@ -237,9 +237,8 @@ pub async fn count_search_by_owner(
 /// Row returned from [`list_joined_by_user`] — a meeting the user has been
 /// admitted into, with the join-time metadata used for ordering.
 ///
-/// The `last_joined_at` value is computed as `COALESCE(admitted_at, joined_at)`
-/// so re-admitted users sort by their most recent admission while legacy rows
-/// that were never re-admitted still sort by their original join time.
+/// The `last_joined_at` value is `p.admitted_at`. The query filters on
+/// `admitted_at IS NOT NULL`, so this column is always populated.
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct JoinedMeetingRow {
@@ -254,7 +253,8 @@ pub struct JoinedMeetingRow {
 }
 
 /// List meetings the user has been admitted into at least once, including
-/// meetings they own. Ordered by `last_joined_at` descending.
+/// meetings they own. Ordered by `last_joined_at` descending, with `m.id DESC`
+/// as a deterministic tiebreaker for same-microsecond admissions.
 ///
 /// The filter `admitted_at IS NOT NULL` is the canonical "ever admitted" check:
 /// `admitted_at` is set on every admission (initial waiting-room admit, host
@@ -275,13 +275,13 @@ pub async fn list_joined_by_user(
                m.creator_id,
                m.password_hash,
                m.state,
-               COALESCE(p.admitted_at, p.joined_at) AS last_joined_at
+               p.admitted_at AS last_joined_at
         FROM meetings m
         INNER JOIN meeting_participants p
             ON p.meeting_id = m.id AND p.user_id = $1
         WHERE m.deleted_at IS NULL
           AND p.admitted_at IS NOT NULL
-        ORDER BY COALESCE(p.admitted_at, p.joined_at) DESC
+        ORDER BY p.admitted_at DESC, m.id DESC
         LIMIT $2
         "#,
     )

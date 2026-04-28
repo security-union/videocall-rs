@@ -158,11 +158,9 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at "medium" (480p/25fps/600kbps) keeps initial bandwidth
-/// under 1 Mbps, avoiding buffer bloat on constrained connections during
-/// the 5s warmup period when tier transitions are suppressed. The PID
-/// controller steps up to 720p/1080p if bandwidth permits, or steps
-/// down to 360p/240p if constrained.
+/// Starting at "medium" (480p/25fps/600kbps). The PID controller steps up
+/// toward higher resolutions when bandwidth allows, or down toward lower
+/// resolutions when the network is constrained.
 pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 
 /// Label of the video quality tier to use as camera ceiling during screen sharing.
@@ -185,11 +183,12 @@ pub fn screen_share_camera_ceiling_index() -> usize {
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at "high" (1080p/10fps) — preserves source
-/// resolution from the first frame for readable text. Steps down to
-/// 720p if network conditions degrade. The floor stays at 720p to
-/// keep text readable even at minimum quality.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0; // "high"
+/// Starting at "medium" (720p/8fps/1200kbps) — the midpoint of the 3-tier
+/// screen-share ladder (indices 0–2) — gives new screen shares an acceptable
+/// baseline immediately. The PID controller then adapts in either direction:
+/// stepping up to 1080p when bandwidth is plentiful, or stepping down to
+/// 720p/5fps when the network is constrained.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers

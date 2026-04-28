@@ -216,9 +216,9 @@ test.describe("Guest rejection flow", () => {
       // No `.floating-name` tile matching the guest's display name should be
       // visible; the guest never received a room_token and was never connected
       // to the media bus.
-      await expect(
-        hostPage.locator(".floating-name", { hasText: guestDisplayName }),
-      ).toHaveCount(0);
+      await expect(hostPage.locator(".floating-name", { hasText: guestDisplayName })).toHaveCount(
+        0,
+      );
     } finally {
       await hostBrowser.close();
       await guestBrowser.close();

@@ -1,0 +1,54 @@
+global:
+  security:
+    # ECR public mirror images are not signed; required to pull bitnami/postgresql
+    allowInsecureImages: true
+
+postgresql:
+  auth:
+    database: actix-api-db
+    enablePostgresUser: true
+    existingSecret: postgres-credentials
+    secretKeys:
+      adminPasswordKey: postgres-password
+      userPasswordKey: password
+    username: postgres
+  backup:
+    enabled: false
+  image:
+    registry: public.ecr.aws
+    repository: bitnami/postgresql
+  metrics:
+    enabled: false
+  primary:
+    extendedConfiguration: |
+      max_connections = 50
+      shared_buffers = 32MB
+      effective_cache_size = 128MB
+      maintenance_work_mem = 16MB
+      checkpoint_completion_target = 0.9
+      wal_buffers = 4MB
+      default_statistics_target = 100
+      random_page_cost = 1.1
+      effective_io_concurrency = 200
+      work_mem = 512kB
+      min_wal_size = 256MB
+      max_wal_size = 512MB
+    persistence:
+      annotations:
+        helm.sh/resource-policy: keep
+      enabled: true
+      size: 10Gi
+      storageClass: ebs-sc
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  readReplicas:
+    replicaCount: 0
+  service:
+    ports:
+      postgresql: 5432
+    type: ClusterIP

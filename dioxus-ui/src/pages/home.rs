@@ -297,17 +297,58 @@ pub fn Home() -> Element {
                             div {
                                 label {
                                     r#for: "username",
-                                    class: "block text-white/80 text-sm font-medium mb-2 ml-1",
-                                    "Display Name"
+                                    class: "field-label",
+                                    span { class: "field-label__name",
+                                        "Display Name"
+                                        span {
+                                            class: "field-label__info",
+                                            tabindex: 0,
+                                            role: "button",
+                                            aria_label: "What's allowed in Display Name?",
+                                            aria_describedby: "username-info-tip",
+                                            svg {
+                                                class: "field-label__info-icon",
+                                                xmlns: "http://www.w3.org/2000/svg",
+                                                width: 14,
+                                                height: 14,
+                                                view_box: "0 0 16 16",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: 1.6,
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: 8, cy: 8, r: 6.75 }
+                                                line { x1: 8, y1: 7.25, x2: 8, y2: 11.25 }
+                                                circle { cx: 8, cy: 5, r: 0.55, fill: "currentColor", stroke: "none" }
+                                            }
+                                            span {
+                                                id: "username-info-tip",
+                                                class: "field-label__tooltip",
+                                                role: "tooltip",
+                                                "Your name as shown to other participants. Allowed: letters, numbers, spaces, hyphens (-), underscores (_), and apostrophes ('). Up to 50 characters."
+                                            }
+                                        }
+                                    }
+                                    span {
+                                        class: "field-label__error",
+                                        role: "alert",
+                                        aria_live: "polite",
+                                        "{username_error().unwrap_or_default()}"
+                                    }
                                 }
                                 input {
                                     id: "username",
-                                    class: TEXT_INPUT_CLASSES,
+                                    class: if username_error().is_some() {
+                                        "input-apple input-apple--invalid"
+                                    } else {
+                                        TEXT_INPUT_CLASSES
+                                    },
                                     r#type: "text",
                                     placeholder: "Enter your display name",
                                     required: true,
                                     autofocus: true,
                                     maxlength: DISPLAY_NAME_MAX_LEN as i64,
+                                    aria_invalid: username_error().is_some(),
                                     value: "{username_value}",
                                     oninput: move |e: Event<FormData>| {
                                         let v = e.value();
@@ -326,33 +367,67 @@ pub fn Home() -> Element {
                                                 .map(|c| format!("'{c}'"))
                                                 .collect();
                                             username_error.set(Some(format!(
-                                                "{} not allowed — only letters, numbers, spaces, hyphens, underscores, apostrophes",
+                                                "{} not allowed",
                                                 chars_str.join(", ")
                                             )));
                                         }
                                     },
                                 }
-                                if let Some(err) = username_error() {
-                                    p {
-                                        class: "text-sm mt-2 ml-1",
-                                        style: "color:#ff6b6b;",
-                                        "{err}"
-                                    }
-                                }
                             }
                             div {
                                 label {
                                     r#for: "meeting-id",
-                                    class: "block text-white/80 text-sm font-medium mb-2 ml-1",
-                                    "Meeting ID"
+                                    class: "field-label",
+                                    span { class: "field-label__name",
+                                        "Meeting ID"
+                                        span {
+                                            class: "field-label__info",
+                                            tabindex: 0,
+                                            role: "button",
+                                            aria_label: "What's allowed in Meeting ID?",
+                                            aria_describedby: "meeting-id-info-tip",
+                                            svg {
+                                                class: "field-label__info-icon",
+                                                xmlns: "http://www.w3.org/2000/svg",
+                                                width: 14,
+                                                height: 14,
+                                                view_box: "0 0 16 16",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: 1.6,
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: 8, cy: 8, r: 6.75 }
+                                                line { x1: 8, y1: 7.25, x2: 8, y2: 11.25 }
+                                                circle { cx: 8, cy: 5, r: 0.55, fill: "currentColor", stroke: "none" }
+                                            }
+                                            span {
+                                                id: "meeting-id-info-tip",
+                                                class: "field-label__tooltip",
+                                                role: "tooltip",
+                                                "A unique identifier for the meeting. Click \"Generate a New Meeting ID\" to create one, paste an ID shared by a host, or enter your own. Allowed: letters, numbers, and underscores (_)."
+                                            }
+                                        }
+                                    }
+                                    span {
+                                        class: "field-label__error",
+                                        role: "alert",
+                                        aria_live: "polite",
+                                        "{meeting_id_error().unwrap_or_default()}"
+                                    }
                                 }
                                 input {
                                     id: "meeting-id",
-                                    class: TEXT_INPUT_CLASSES,
+                                    class: if meeting_id_error().is_some() {
+                                        "input-apple input-apple--invalid"
+                                    } else {
+                                        TEXT_INPUT_CLASSES
+                                    },
                                     r#type: "text",
                                     placeholder: "Enter meeting ID or generate one",
                                     required: true,
                                     pattern: "^[a-zA-Z0-9_]*$",
+                                    aria_invalid: meeting_id_error().is_some(),
                                     oninput: move |e: Event<FormData>| {
                                         let v = e.value();
                                         let mut bad: Vec<char> = v
@@ -370,7 +445,7 @@ pub fn Home() -> Element {
                                                 .map(|c| format!("'{c}'"))
                                                 .collect();
                                             meeting_id_error.set(Some(format!(
-                                                "{} not allowed — only letters, numbers, and underscore",
+                                                "{} not allowed",
                                                 chars_str.join(", ")
                                             )));
                                         }
@@ -380,13 +455,6 @@ pub fn Home() -> Element {
                                             meeting_id_ref.set(Some(elem));
                                         }
                                     },
-                                }
-                                if let Some(err) = meeting_id_error() {
-                                    p {
-                                        class: "text-sm mt-2 ml-1",
-                                        style: "color:#ff6b6b;",
-                                        "{err}"
-                                    }
                                 }
                             }
                             if !meeting_id_value().is_empty() {

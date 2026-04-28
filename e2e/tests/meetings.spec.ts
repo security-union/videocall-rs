@@ -2,6 +2,22 @@ import { test, expect } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
+// Selectors for the inline label-row error pattern. The error <span> lives
+// INSIDE the <label> (right-aligned, sharing the row with the field name +
+// info icon), not adjacent to the input. The span is always present in the
+// DOM; CSS hides it via `:empty` when there's nothing to show.
+const usernameErrorSelector = 'label[for="username"] .field-label__error';
+const meetingIdErrorSelector = 'label[for="meeting-id"] .field-label__error';
+
+// Selectors for the info-icon tooltip pattern. The trigger is a focusable
+// <span role="button"> immediately after the field name; the tooltip is a
+// <span role="tooltip"> with a stable id, hidden via CSS opacity/visibility
+// until the trigger is hovered or focused.
+const usernameInfoTriggerSelector = 'label[for="username"] .field-label__info';
+const usernameInfoTooltipSelector = "#username-info-tip";
+const meetingIdInfoTriggerSelector = 'label[for="meeting-id"] .field-label__info';
+const meetingIdInfoTooltipSelector = "#meeting-id-info-tip";
+
 test.describe("Meetings", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -22,6 +38,13 @@ test.describe("Meetings", () => {
     // The Start/Join button is NOT in the DOM until the user types into #meeting-id.
     await expect(page.getByText("Start or Join Meeting")).toHaveCount(0);
     await page.waitForTimeout(1500);
+  });
+
+  test("browser tab title is exactly 'videocall.rs'", async ({ page }) => {
+    // Regression guard: the title was briefly 'videocall.rs (Dioxus)' during
+    // earlier UX work. The final state must be the bare brand name.
+    await page.goto("/");
+    await expect(page).toHaveTitle("videocall.rs");
   });
 
   test("display name input starts empty in a fresh session", async ({ page }) => {
@@ -162,68 +185,219 @@ test.describe("Meetings", () => {
   test("display name field shows inline validation error when invalid char is typed", async ({
     page,
   }) => {
-    // The static hint under #username is gone; an inline error <p> appears
-    // only when the user types a disallowed character, and clears as soon as
-    // the field becomes valid again.
+    // Inline label-row error pattern: typing a disallowed character flips
+    // the input to the --invalid state (red border + aria-invalid="true")
+    // and surfaces a short error message right-aligned in the label row.
+    // The error span is always in the DOM; it's hidden via :empty CSS when
+    // there's no message, so we assert against its text content.
     await page.goto("/");
     await page.waitForTimeout(1500);
 
-    // Empty state shows no error.
-    await expect(page.locator("#username + p")).toHaveCount(0);
+    const errorLocator = page.locator(usernameErrorSelector);
+    const usernameInput = page.locator("#username");
 
-    await page.locator("#username").click();
-    await page.locator("#username").fill("");
-    await page.locator("#username").pressSequentially("alice@", { delay: 80 });
+    // Empty state: no error text, input is in its default (valid) state.
+    await expect(errorLocator).toHaveText("");
+    await expect(usernameInput).not.toHaveClass(/input-apple--invalid/);
+
+    await usernameInput.click();
+    await usernameInput.fill("");
+    await usernameInput.pressSequentially("alice@", { delay: 80 });
     await page.waitForTimeout(500);
 
-    // The error message should mention the offending character and "not allowed".
-    const errorLocator = page.locator("#username + p");
-    await expect(errorLocator).toBeVisible({ timeout: 5_000 });
-    await expect(errorLocator).toContainText("'@'");
-    await expect(errorLocator).toContainText("not allowed");
+    // Error must be the new short form, e.g. exactly "'@' not allowed".
+    // We assert the regex form so future shape-preserving tweaks don't
+    // break this test, but the current copy must match exactly here.
+    await expect(errorLocator).toHaveText(/^'@' not allowed$/);
+    // Visual error state: red-border class + ARIA hook for assistive tech.
+    await expect(usernameInput).toHaveClass(/input-apple--invalid/);
+    await expect(usernameInput).toHaveAttribute("aria-invalid", "true");
 
-    // Remove the invalid char — error should clear.
-    await page.locator("#username").fill("alice");
+    // Remove the invalid char — error text clears, --invalid class drops.
+    await usernameInput.fill("alice");
     await page.waitForTimeout(500);
-    await expect(page.locator("#username + p")).toHaveCount(0);
+    await expect(errorLocator).toHaveText("");
+    await expect(usernameInput).not.toHaveClass(/input-apple--invalid/);
+    await expect(usernameInput).toHaveAttribute("aria-invalid", "false");
   });
 
   test("meeting-id field shows inline validation error when invalid char is typed", async ({
     page,
   }) => {
-    // Hyphens are NOT allowed in meeting IDs (is_valid_meeting_id only permits
-    // alphanumerics + underscore). The inline error appears on invalid keystrokes
-    // and clears once the field is valid.
+    // Hyphens are NOT allowed in meeting IDs (the field permits only
+    // alphanumerics + underscore). The inline error appears on invalid
+    // keystrokes, the input gets the --invalid class + aria-invalid="true",
+    // and the error clears once the field is valid again.
     await page.goto("/");
     await page.waitForTimeout(1500);
 
-    // Empty state: no error, no static hint.
-    await expect(page.locator("#meeting-id + p")).toHaveCount(0);
+    const errorLocator = page.locator(meetingIdErrorSelector);
+    const meetingIdInput = page.locator("#meeting-id");
 
-    await page.locator("#meeting-id").click();
-    await page.locator("#meeting-id").pressSequentially("my-room", { delay: 80 });
+    // Empty state: no error text, input in default (valid) state.
+    await expect(errorLocator).toHaveText("");
+    await expect(meetingIdInput).not.toHaveClass(/input-apple--invalid/);
+
+    await meetingIdInput.click();
+    await meetingIdInput.pressSequentially("my-room", { delay: 80 });
     await page.waitForTimeout(500);
 
-    const errorLocator = page.locator("#meeting-id + p");
-    await expect(errorLocator).toBeVisible({ timeout: 5_000 });
-    await expect(errorLocator).toContainText("'-'");
-    await expect(errorLocator).toContainText("not allowed");
+    // Short-form error: exactly "'-' not allowed".
+    await expect(errorLocator).toHaveText(/^'-' not allowed$/);
+    await expect(meetingIdInput).toHaveClass(/input-apple--invalid/);
+    await expect(meetingIdInput).toHaveAttribute("aria-invalid", "true");
 
-    // Fix the field — error should clear.
-    await page.locator("#meeting-id").fill("myroom");
+    // Fix the field — error text clears, --invalid class drops.
+    await meetingIdInput.fill("myroom");
     await page.waitForTimeout(500);
-    await expect(page.locator("#meeting-id + p")).toHaveCount(0);
+    await expect(errorLocator).toHaveText("");
+    await expect(meetingIdInput).not.toHaveClass(/input-apple--invalid/);
+    await expect(meetingIdInput).toHaveAttribute("aria-invalid", "false");
   });
 
   test("home page does NOT show static validation hints in the empty state", async ({ page }) => {
     // The previous static hints under both inputs were removed; only inline
-    // errors should ever appear, and only when the user types an invalid char.
+    // errors should ever appear, and only when the user types an invalid
+    // char. The same allowed-character info is now exposed only via the
+    // info-icon tooltips, which stay hidden until the icon is hovered/
+    // focused — verified separately in the tooltip tests below.
     await page.goto("/");
     await page.waitForTimeout(1500);
 
+    // No long-form static hints anywhere in the visible page.
     await expect(
       page.getByText("Allowed: letters, numbers, spaces, hyphens, underscores, apostrophes"),
     ).toHaveCount(0);
     await expect(page.getByText("Characters allowed: a-z, A-Z, 0-9, and _")).toHaveCount(0);
+
+    // Tooltips are present in the DOM but hidden by CSS until the trigger
+    // is hovered or focused.
+    await expect(page.locator(usernameInfoTooltipSelector)).toBeHidden();
+    await expect(page.locator(meetingIdInfoTooltipSelector)).toBeHidden();
+  });
+
+  test("Display Name info icon reveals tooltip on hover and hides on mouse-out", async ({
+    page,
+  }) => {
+    // The info icon is a focusable <span role="button"> next to the
+    // "Display Name" label. Hovering it should reveal the tooltip; moving
+    // the mouse off should hide it again. Substring assertions only — the
+    // exact wording may iterate but the allowed-char list is load-bearing.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const trigger = page.locator(usernameInfoTriggerSelector);
+    const tooltip = page.locator(usernameInfoTooltipSelector);
+
+    await expect(tooltip).toBeHidden();
+
+    await trigger.hover();
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+    await expect(tooltip).toContainText("Allowed: letters, numbers, spaces");
+
+    // Move the pointer off the trigger to dismiss the tooltip.
+    await page.mouse.move(0, 0);
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+  });
+
+  test("Display Name info icon reveals tooltip on keyboard focus and hides on blur", async ({
+    page,
+  }) => {
+    // Keyboard accessibility: the info trigger has tabindex=0, so users
+    // who can't hover (touch + screen readers, keyboard-only) must still
+    // be able to read the tooltip. Tabbing onto the icon should reveal
+    // it; tabbing away should dismiss it.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const trigger = page.locator(usernameInfoTriggerSelector);
+    const tooltip = page.locator(usernameInfoTooltipSelector);
+
+    await expect(tooltip).toBeHidden();
+
+    // Programmatically focus the trigger — robust to whatever Tab order
+    // surrounding elements introduce. The behaviour we care about is
+    // "tooltip becomes visible while the trigger has focus", and the
+    // CSS selector is :focus-visible/:focus-within, which both fire on
+    // a programmatic focus().
+    await trigger.focus();
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+    await expect(tooltip).toContainText("Allowed: letters, numbers, spaces");
+
+    // Blurring the trigger dismisses the tooltip.
+    await trigger.blur();
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+  });
+
+  test("Meeting ID info icon reveals tooltip on hover with the right copy", async ({ page }) => {
+    // The Meeting ID tooltip carries two load-bearing pieces: the allowed
+    // character list AND the "Generate" affordance hint. Use substring
+    // matches so the wording can be iterated without breaking this test.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const trigger = page.locator(meetingIdInfoTriggerSelector);
+    const tooltip = page.locator(meetingIdInfoTooltipSelector);
+
+    await expect(tooltip).toBeHidden();
+
+    await trigger.hover();
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+    await expect(tooltip).toContainText("Allowed: letters, numbers, and underscores");
+    await expect(tooltip).toContainText("Generate a New Meeting ID");
+
+    await page.mouse.move(0, 0);
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+  });
+
+  test("form height is stable when Display Name validation error appears", async ({ page }) => {
+    // The inline label-row error pattern is specifically designed so the
+    // form's overall height does NOT change when an error appears — the
+    // error rides into the existing label row instead of expanding a
+    // sibling region. Buttons below must not jump. We measure the form's
+    // bounding-rect height before vs. after typing an invalid character
+    // and assert they're equal (allowing 1px for sub-pixel rendering).
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const usernameInput = page.locator("#username");
+    const form = page.locator("form");
+
+    // Empty state height.
+    const heightBefore = await form.evaluate((el) => el.getBoundingClientRect().height);
+
+    await usernameInput.click();
+    await usernameInput.fill("");
+    await usernameInput.pressSequentially("alice@", { delay: 80 });
+    await page.waitForTimeout(500);
+
+    // Error is now visible — confirm so the test fails meaningfully if the
+    // error never rendered (otherwise the height check passes vacuously).
+    await expect(page.locator(usernameErrorSelector)).toHaveText(/^'@' not allowed$/);
+
+    const heightAfter = await form.evaluate((el) => el.getBoundingClientRect().height);
+
+    expect(Math.abs(heightAfter - heightBefore)).toBeLessThanOrEqual(1);
+  });
+
+  test("form height is stable when Meeting ID validation error appears", async ({ page }) => {
+    // Same no-layout-shift guarantee, this time for the Meeting ID field.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const meetingIdInput = page.locator("#meeting-id");
+    const form = page.locator("form");
+
+    const heightBefore = await form.evaluate((el) => el.getBoundingClientRect().height);
+
+    await meetingIdInput.click();
+    await meetingIdInput.pressSequentially("my-room", { delay: 80 });
+    await page.waitForTimeout(500);
+
+    await expect(page.locator(meetingIdErrorSelector)).toHaveText(/^'-' not allowed$/);
+
+    const heightAfter = await form.evaluate((el) => el.getBoundingClientRect().height);
+
+    expect(Math.abs(heightAfter - heightBefore)).toBeLessThanOrEqual(1);
   });
 });

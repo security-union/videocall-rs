@@ -306,7 +306,7 @@ pub fn Home() -> Element {
 
             // Auth dropdown — absolutely positioned in top-right of hero-container
             if oauth_enabled().unwrap_or(false) {
-                if let Some(profile) = user_profile() {
+                if let Some(profile) = user_profile().filter(|p| !p.user_id.starts_with("anon-")) {
                     div { class: "auth-dropdown-container",
                         button {
                             r#type: "button",

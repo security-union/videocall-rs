@@ -350,6 +350,33 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 1000 });
   });
 
+  test("Meeting ID info icon reveals tooltip on keyboard focus and hides on blur", async ({
+    page,
+  }) => {
+    // Keyboard accessibility parity with the Display Name tooltip: the
+    // Meeting ID info trigger has tabindex=0, so keyboard-only and
+    // touch-AT users must be able to read the tooltip without hovering.
+    // Programmatic focus() drives :focus-visible/:focus-within, which is
+    // the same CSS path used by Tab navigation — robust to whatever Tab
+    // order surrounding elements introduce.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    const trigger = page.locator(meetingIdInfoTriggerSelector);
+    const tooltip = page.locator(meetingIdInfoTooltipSelector);
+
+    await expect(tooltip).toBeHidden();
+
+    await trigger.focus();
+    await expect(tooltip).toBeVisible({ timeout: 1000 });
+    await expect(tooltip).toContainText("Allowed: letters, numbers, and underscores");
+    await expect(tooltip).toContainText("Generate a New Meeting ID");
+
+    // Blurring the trigger dismisses the tooltip.
+    await trigger.blur();
+    await expect(tooltip).toBeHidden({ timeout: 1000 });
+  });
+
   test("form height is stable when Display Name validation error appears", async ({ page }) => {
     // The inline label-row error pattern is specifically designed so the
     // form's overall height does NOT change when an error appears — the

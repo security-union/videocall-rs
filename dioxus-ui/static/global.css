@@ -108,6 +108,17 @@ body {
   --success: #30D158;
   --warning: #FF9F0A;
   --error: #FF453A;
+  /*
+   * Higher-luminance error red for use as foreground TEXT on the glass
+   * surface (--glass-bg over --surface composites to ≈ #2D2D2F).  At that
+   * background, the saturated --error #FF453A computes a contrast ratio of
+   * only ~4.06:1, which fails WCAG AA for normal text (4.5:1 required).
+   * #FF7A6E clears the bar at ~5.52:1 while still reading as "error red"
+   * and harmonizing with the --error border/glyph on invalid inputs (which
+   * convey state via shape, not text, so they don't need to clear text
+   * contrast).
+   */
+  --error-text: #FF7A6E;
 
   /* Liquid Glass material */
   --glass-bg: rgba(255, 255, 255, 0.06);
@@ -1239,7 +1250,8 @@ body {
 
 .field-label__info:hover .field-label__tooltip,
 .field-label__info:focus-visible .field-label__tooltip,
-.field-label__info:focus-within .field-label__tooltip {
+.field-label__info:focus-within .field-label__tooltip,
+.field-label__info--open .field-label__tooltip {
   opacity: 1;
   visibility: visible;
   transform: translateY(0);
@@ -1259,7 +1271,8 @@ body {
   flex: 1 1 auto;
   min-width: 0;
   text-align: right;
-  color: var(--error);
+  /* See --error-text definition: --error fails AA on the glass surface. */
+  color: var(--error-text);
   font-size: 0.75rem;
   font-weight: 500;
   line-height: 1.25;

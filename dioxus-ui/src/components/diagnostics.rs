@@ -19,7 +19,9 @@
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
-use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
+use crate::context::{
+    confirm_transport_change, load_transport_sticky, TransportPreference, TransportPreferenceCtx,
+};
 use dioxus::prelude::*;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
@@ -776,6 +778,7 @@ pub fn Diagnostics(
                                     &evt.value(),
                                     (transport_pref_ctx.0)(),
                                     "diagnostics-transport-select",
+                                    load_transport_sticky(),
                                 );
                             },
                             option {

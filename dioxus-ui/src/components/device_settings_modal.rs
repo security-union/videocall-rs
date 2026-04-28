@@ -2,7 +2,10 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
-use crate::context::{confirm_transport_change, TransportPreference};
+use crate::context::{
+    clear_transport_sticky_and_pref, load_transport_sticky, save_transport_preference,
+    save_transport_preference_session, save_transport_sticky, TransportPreference,
+};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
@@ -303,6 +306,8 @@ pub fn DeviceSettingsModal(
     let is_ios_safari = is_ios();
     let mut active_section = use_signal(|| SettingsSection::Audio);
     let mut open_dropdown: Signal<Option<&'static str>> = use_signal(|| None);
+    let mut sticky_transport = use_signal(load_transport_sticky);
+    let mut pending_protocol = use_signal(|| transport_preference);
 
     if !visible {
         return rsx! {};
@@ -501,33 +506,159 @@ pub fn DeviceSettingsModal(
                                         "Choose the transport protocol for media connections."
                                     }
 
+                                    // Selection is staged in `pending_protocol`; "Apply" commits and reloads.
                                     div { class: "device-setting-group",
-                                        label { r#for: "modal-transport-select", "Protocol" }
-                                        SettingsGlassSelect {
-                                            id: "modal-transport-select",
-                                            options: vec![
-                                                GlassSelectOption { value: "auto".to_string(), label: "Auto".to_string() },
-                                                GlassSelectOption { value: "webtransport".to_string(), label: "WebTransport".to_string() },
-                                                GlassSelectOption { value: "websocket".to_string(), label: "WebSocket".to_string() },
-                                            ],
-                                            selected_value: match transport_preference {
-                                                TransportPreference::Auto => "auto".to_string(),
-                                                TransportPreference::WebTransportOnly => "webtransport".to_string(),
-                                                TransportPreference::WebSocketOnly => "websocket".to_string(),
-                                            },
-                                            on_change: move |value: String| {
-                                                confirm_transport_change(
-                                                    &value,
-                                                    transport_preference,
-                                                    "modal-transport-select",
-                                                );
-                                            },
-                                            open_dropdown,
+                                        span {
+                                            id: "transport-segmented-label",
+                                            class: "transport-segmented-label",
+                                            "Protocol"
+                                        }
+                                        div {
+                                            class: "transport-segmented",
+                                            role: "radiogroup",
+                                            "aria-labelledby": "transport-segmented-label",
+                                            for option in [
+                                                (TransportPreference::Auto, "Auto", "transport-radio-auto"),
+                                                (TransportPreference::WebTransportOnly, "WebTransport", "transport-radio-webtransport"),
+                                                (TransportPreference::WebSocketOnly, "WebSocket", "transport-radio-websocket"),
+                                            ] {
+                                                {
+                                                    let (value, label, test_id) = option;
+                                                    let is_selected = pending_protocol() == value;
+                                                    rsx! {
+                                                        button {
+                                                            key: "{test_id}",
+                                                            r#type: "button",
+                                                            role: "radio",
+                                                            "aria-checked": if is_selected { "true" } else { "false" },
+                                                            "data-testid": test_id,
+                                                            class: if is_selected { "transport-segmented-option selected" } else { "transport-segmented-option" },
+                                                            onclick: move |_| {
+                                                                pending_protocol.set(value);
+                                                            },
+                                                            "{label}"
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
 
-                                    p { class: "transport-preference-note",
-                                        "Changing protocol will reload the page."
+                                    // Hidden for Auto since pinning Auto is a no-op.
+                                    if pending_protocol() != TransportPreference::Auto {
+                                        div { class: "device-setting-group sticky-protocol-row",
+                                            div { class: "sticky-protocol-row-inner",
+                                                div { class: "sticky-protocol-text",
+                                                    label {
+                                                        r#for: "sticky-transport-checkbox",
+                                                        class: "sticky-protocol-label",
+                                                        "Remember protocol choice"
+                                                    }
+                                                    p { class: "sticky-protocol-hint",
+                                                        "Pin this protocol across browser sessions."
+                                                    }
+                                                }
+                                                label {
+                                                    class: "glow-switch",
+                                                    "aria-label": "Remember protocol choice across browser sessions",
+                                                    input {
+                                                        id: "sticky-transport-checkbox",
+                                                        r#type: "checkbox",
+                                                        checked: sticky_transport(),
+                                                        onchange: move |evt: Event<FormData>| {
+                                                            // Persist immediately so the choice survives an unexpected tab close.
+                                                            let checked = evt.checked();
+                                                            sticky_transport.set(checked);
+                                                            if checked {
+                                                                save_transport_preference(pending_protocol());
+                                                                save_transport_sticky(true);
+                                                            } else {
+                                                                clear_transport_sticky_and_pref();
+                                                            }
+                                                        },
+                                                    }
+                                                    span { class: "glow-switch-track" }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Auto+sticky is a silent no-op, so suppress the advisory there.
+                                    if sticky_transport() && pending_protocol() != TransportPreference::Auto {
+                                        div {
+                                            class: "settings-info-panel",
+                                            role: "note",
+                                            div { class: "settings-info-panel-icon",
+                                                svg {
+                                                    view_box: "0 0 24 24",
+                                                    width: "16",
+                                                    height: "16",
+                                                    "aria-hidden": "true",
+                                                    circle {
+                                                        cx: "12",
+                                                        cy: "12",
+                                                        r: "10",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "1.5",
+                                                    }
+                                                    path {
+                                                        d: "M12 8v5",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "1.5",
+                                                        stroke_linecap: "round",
+                                                    }
+                                                    circle {
+                                                        cx: "12",
+                                                        cy: "16",
+                                                        r: "0.9",
+                                                        fill: "currentColor",
+                                                    }
+                                                }
+                                            }
+                                            div { class: "settings-info-panel-body",
+                                                p { class: "settings-info-panel-title",
+                                                    "Protocol pinned"
+                                                }
+                                                p { class: "settings-info-panel-text",
+                                                    "This protocol will be used on every future page load. To clear it, switch to Auto. Picking a different explicit protocol replaces the saved choice."
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Only shown when the pending selection diverges from the active one.
+                                    if pending_protocol() != transport_preference {
+                                        div { class: "transport-apply-row",
+                                            p { class: "transport-preference-note",
+                                                "Changing protocol will reload the page."
+                                            }
+                                            button {
+                                                r#type: "button",
+                                                class: "transport-apply-button",
+                                                "data-testid": "transport-apply-button",
+                                                onclick: move |_| {
+                                                    let pref = pending_protocol();
+                                                    match (pref, sticky_transport()) {
+                                                        (TransportPreference::Auto, _) => {
+                                                            clear_transport_sticky_and_pref();
+                                                        }
+                                                        (_, true) => {
+                                                            save_transport_preference(pref);
+                                                            save_transport_sticky(true);
+                                                        }
+                                                        (_, false) => {
+                                                            // Session-scoped: survives the reload only.
+                                                            save_transport_preference_session(pref);
+                                                        }
+                                                    }
+                                                    if let Some(w) = web_sys::window() {
+                                                        let _ = w.location().reload();
+                                                    }
+                                                },
+                                                "Apply"
+                                            }
+                                        }
                                     }
                                 }
                             },

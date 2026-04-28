@@ -140,7 +140,10 @@ impl ScreenShareState {
     /// `Requesting` (picker dialog open) intentionally returns `false` so that
     /// `Host` does not start the encoder before a stream is available.
     pub fn is_sharing(&self) -> bool {
-        matches!(self, ScreenShareState::StreamReady | ScreenShareState::Active)
+        matches!(
+            self,
+            ScreenShareState::StreamReady | ScreenShareState::Active
+        )
     }
 }
 

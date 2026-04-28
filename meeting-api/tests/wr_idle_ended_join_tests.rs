@@ -40,7 +40,9 @@ use axum::http::StatusCode;
 use serial_test::serial;
 use test_helpers::*;
 use tower::ServiceExt;
-use videocall_meeting_types::responses::{APIResponse, MeetingInfoResponse, ParticipantStatusResponse};
+use videocall_meeting_types::responses::{
+    APIResponse, MeetingInfoResponse, ParticipantStatusResponse,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

@@ -306,15 +306,7 @@ pub fn DeviceSettingsModal(
     let is_ios_safari = is_ios();
     let mut active_section = use_signal(|| SettingsSection::Audio);
     let mut open_dropdown: Signal<Option<&'static str>> = use_signal(|| None);
-    // Tracks the "Remember protocol choice" toggle. Initialised from
-    // localStorage so the checkbox reflects the persisted state when the
-    // modal opens. Updated locally on every toggle change so the contextual
-    // info panel re-renders without a full reload.
     let mut sticky_transport = use_signal(load_transport_sticky);
-    // Local pending selection in the Network tab. Initialised from the
-    // currently-active `transport_preference` prop so the segmented control
-    // mirrors reality on open. Changing a radio updates this signal only —
-    // the page is not reloaded until the user clicks "Apply".
     let mut pending_protocol = use_signal(|| transport_preference);
 
     if !visible {
@@ -514,16 +506,7 @@ pub fn DeviceSettingsModal(
                                         "Choose the transport protocol for media connections."
                                     }
 
-                                    // Segmented control acting as a radio group.
-                                    //
-                                    // Each pill button represents one transport choice.
-                                    // Clicking one updates the local `pending_protocol`
-                                    // signal but does not persist or reload — the user
-                                    // must press "Apply" to commit the change. This
-                                    // gives the rest of the section (the "Remember"
-                                    // toggle and the info panel) a chance to re-render
-                                    // against the pending choice before the page is
-                                    // reloaded.
+                                    // Selection is staged in `pending_protocol`; "Apply" commits and reloads.
                                     div { class: "device-setting-group",
                                         span {
                                             id: "transport-segmented-label",
@@ -561,19 +544,7 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // "Remember protocol choice" toggle row.
-                                    //
-                                    // Only rendered when the pending selection is a
-                                    // concrete (non-Auto) protocol — pinning Auto is a
-                                    // no-op (it just means "let the client decide"), so
-                                    // exposing the toggle there only adds noise.
-                                    //
-                                    // Reuses the existing `.glow-switch` track styling
-                                    // from the Appearance panel so the modal has a
-                                    // single, consistent toggle vocabulary. The visible
-                                    // <label> on the left is bound to the hidden
-                                    // checkbox via `r#for`/`id` for screen readers and
-                                    // makes the entire row click-targetable.
+                                    // Hidden for Auto since pinning Auto is a no-op.
                                     if pending_protocol() != TransportPreference::Auto {
                                         div { class: "device-setting-group sticky-protocol-row",
                                             div { class: "sticky-protocol-row-inner",
@@ -595,36 +566,13 @@ pub fn DeviceSettingsModal(
                                                         r#type: "checkbox",
                                                         checked: sticky_transport(),
                                                         onchange: move |evt: Event<FormData>| {
-                                                            // Persist the toggle change
-                                                            // to localStorage immediately
-                                                            // so the user's preference
-                                                            // survives an unexpected tab
-                                                            // close before they get to
-                                                            // press Apply. The Apply
-                                                            // button still owns the
-                                                            // actual reload — this is
-                                                            // purely a synchronous
-                                                            // side-effect on top of the
-                                                            // in-memory signal update.
+                                                            // Persist immediately so the choice survives an unexpected tab close.
                                                             let checked = evt.checked();
                                                             sticky_transport.set(checked);
                                                             if checked {
-                                                                // Pin the currently
-                                                                // pending protocol
-                                                                // selection alongside
-                                                                // the sticky flag so a
-                                                                // future page load
-                                                                // restores both pieces
-                                                                // of state together.
                                                                 save_transport_preference(pending_protocol());
                                                                 save_transport_sticky(true);
                                                             } else {
-                                                                // Clear both the sticky
-                                                                // flag and the saved
-                                                                // protocol — turning
-                                                                // sticky off should not
-                                                                // leave a dangling
-                                                                // preference behind.
                                                                 clear_transport_sticky_and_pref();
                                                             }
                                                         },
@@ -635,10 +583,7 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // Contextual advisory shown only when the user has
-                                    // pending a sticky non-Auto protocol — Auto+sticky
-                                    // would be a silent no-op so we don't clutter the
-                                    // UI in that state.
+                                    // Auto+sticky is a silent no-op, so suppress the advisory there.
                                     if sticky_transport() && pending_protocol() != TransportPreference::Auto {
                                         div {
                                             class: "settings-info-panel",
@@ -682,13 +627,7 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // The Apply button only appears when the pending
-                                    // selection differs from what's currently in
-                                    // effect. It is the explicit confirmation step that
-                                    // replaces the previous browser confirm() dialog —
-                                    // the helper text just below the radio group warns
-                                    // the user that pressing Apply will reload the
-                                    // page.
+                                    // Only shown when the pending selection diverges from the active one.
                                     if pending_protocol() != transport_preference {
                                         div { class: "transport-apply-row",
                                             p { class: "transport-preference-note",
@@ -702,21 +641,14 @@ pub fn DeviceSettingsModal(
                                                     let pref = pending_protocol();
                                                     match (pref, sticky_transport()) {
                                                         (TransportPreference::Auto, _) => {
-                                                            // Auto is the implicit
-                                                            // default — clear every
-                                                            // storage key so the next
-                                                            // load resolves to it.
                                                             clear_transport_sticky_and_pref();
                                                         }
                                                         (_, true) => {
-                                                            // Persist across browser
-                                                            // sessions.
                                                             save_transport_preference(pref);
                                                             save_transport_sticky(true);
                                                         }
                                                         (_, false) => {
-                                                            // Survive only the imminent
-                                                            // reload.
+                                                            // Session-scoped: survives the reload only.
                                                             save_transport_preference_session(pref);
                                                         }
                                                     }

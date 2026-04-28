@@ -18,6 +18,7 @@
 
 use crate::auth::{check_session, get_user_profile, logout, UserProfile};
 use crate::components::browser_compatibility::BrowserCompatibility;
+use crate::components::joined_meetings_list::JoinedMeetingsList;
 use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
 use crate::constants::{meeting_api_base_url, oauth_enabled};
@@ -531,6 +532,16 @@ pub fn Home() -> Element {
                     // Active meetings list — only show when OAuth is disabled
                     // or the user is authenticated (has a profile)
                     if !oauth_enabled().unwrap_or(false) || user_profile().is_some() {
+                        JoinedMeetingsList {
+                            on_select_meeting: move |meeting_id: String| {
+                                if let Some(el) = meeting_id_ref() {
+                                    if let Ok(input) = el.dyn_into::<HtmlInputElement>() {
+                                        input.set_value(&meeting_id);
+                                    }
+                                }
+                                meeting_id_value.set(meeting_id);
+                            },
+                        }
                         MeetingsList {
                             on_select_meeting: move |meeting_id: String| {
                                 if let Some(el) = meeting_id_ref() {

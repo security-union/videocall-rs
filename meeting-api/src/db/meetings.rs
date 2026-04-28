@@ -234,6 +234,63 @@ pub async fn count_search_by_owner(
     Ok(row.0)
 }
 
+/// Row returned from [`list_joined_by_user`] — a meeting the user has been
+/// admitted into, with the join-time metadata used for ordering.
+///
+/// The `last_joined_at` value is computed as `COALESCE(admitted_at, joined_at)`
+/// so re-admitted users sort by their most recent admission while legacy rows
+/// that were never re-admitted still sort by their original join time.
+#[derive(Debug, Clone, sqlx::FromRow)]
+#[allow(dead_code)]
+pub struct JoinedMeetingRow {
+    pub id: i32,
+    pub room_id: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub creator_id: Option<String>,
+    pub password_hash: Option<String>,
+    pub state: Option<String>,
+    pub last_joined_at: DateTime<Utc>,
+}
+
+/// List meetings the user has been admitted into at least once, including
+/// meetings they own. Ordered by `last_joined_at` descending.
+///
+/// The filter `admitted_at IS NOT NULL` is the canonical "ever admitted" check:
+/// `admitted_at` is set on every admission (initial waiting-room admit, host
+/// upsert, or auto-admit when the waiting room is off) and is never cleared
+/// when a participant leaves. Pure-`waiting` rows and waiting-then-rejected
+/// rows have `admitted_at IS NULL` and are excluded.
+pub async fn list_joined_by_user(
+    pool: &PgPool,
+    user_id: &str,
+    limit: i64,
+) -> Result<Vec<JoinedMeetingRow>, sqlx::Error> {
+    sqlx::query_as::<_, JoinedMeetingRow>(
+        r#"
+        SELECT m.id,
+               m.room_id,
+               m.started_at,
+               m.ended_at,
+               m.creator_id,
+               m.password_hash,
+               m.state,
+               COALESCE(p.admitted_at, p.joined_at) AS last_joined_at
+        FROM meetings m
+        INNER JOIN meeting_participants p
+            ON p.meeting_id = m.id AND p.user_id = $1
+        WHERE m.deleted_at IS NULL
+          AND p.admitted_at IS NOT NULL
+        ORDER BY COALESCE(p.admitted_at, p.joined_at) DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Soft-delete a meeting (set `deleted_at`).
 pub async fn soft_delete(
     pool: &PgPool,

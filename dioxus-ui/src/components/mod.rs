@@ -14,6 +14,7 @@ pub mod google_sign_in_button;
 pub mod host;
 pub mod host_controls;
 pub mod icons;
+pub mod joined_meetings_list;
 pub mod login;
 pub mod meeting_ended_overlay;
 pub mod meeting_info;

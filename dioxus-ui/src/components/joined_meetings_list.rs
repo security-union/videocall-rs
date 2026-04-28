@@ -3,28 +3,42 @@
  * Licensed under MIT OR Apache-2.0
  */
 
+//! "Previously Joined" meetings list — sibling component to [`MeetingsList`].
+//!
+//! Renders the last N meetings the authenticated user has been admitted into,
+//! ordered by most recent admission. Includes both meetings the user owns and
+//! meetings they joined as a non-owner.
+//!
+//! Visually mirrors `MeetingsList` (chevron toggle, state pills, participant /
+//! waiting / password indicators, click-to-navigate). The only differences:
+//! - An "Owner" badge is rendered next to the state pill when the row's
+//!   `is_owner == true`.
+//! - No edit/delete management actions — users manage their owned meetings
+//!   from the existing "My Meetings" section.
+
 use crate::components::login::{do_login, ProviderButton};
 use crate::constants::meeting_api_client;
 use crate::local_storage::{load_bool, save_bool};
 use crate::routing::Route;
 use dioxus::prelude::*;
-use videocall_meeting_types::responses::{ListMeetingsResponse, MeetingSummary};
+use videocall_meeting_types::responses::{JoinedMeetingSummary, ListJoinedMeetingsResponse};
 
-/// `localStorage` key for the "My Meetings" section's expand/collapse state.
-/// Defaults to expanded (`true`) on first load.
-const EXPANDED_STORAGE_KEY: &str = "home.my-meetings.expanded";
+/// Number of joined meetings to fetch and display. The backend default is 5,
+/// but we pass it explicitly so the UI does not depend on the default.
+const JOINED_LIMIT: u32 = 5;
 
-enum FetchMeetingsError {
+/// `localStorage` key for the "Previously Joined" section's expand/collapse
+/// state. Defaults to expanded (`true`) on first load.
+const EXPANDED_STORAGE_KEY: &str = "home.previously-joined.expanded";
+
+enum FetchJoinedError {
     Unauthenticated,
     Other(String),
 }
 
 #[component]
-pub fn MeetingsList(
-    on_select_meeting: Option<EventHandler<String>>,
-    user_id: Option<String>,
-) -> Element {
-    let mut meetings = use_signal(Vec::<MeetingSummary>::new);
+pub fn JoinedMeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element {
+    let mut meetings = use_signal(Vec::<JoinedMeetingSummary>::new);
     let mut loading = use_signal(|| true);
     let mut error = use_signal(|| None::<String>);
     let mut unauthenticated = use_signal(|| false);
@@ -38,18 +52,18 @@ pub fn MeetingsList(
         unauthenticated.set(false);
 
         spawn(async move {
-            match do_fetch_meetings().await {
+            match do_fetch_joined_meetings().await {
                 Ok(response) => {
                     meetings.set(response.meetings);
                     total.set(response.total);
                     loading.set(false);
                     error.set(None);
                 }
-                Err(FetchMeetingsError::Unauthenticated) => {
+                Err(FetchJoinedError::Unauthenticated) => {
                     loading.set(false);
                     unauthenticated.set(true);
                 }
-                Err(FetchMeetingsError::Other(e)) => {
+                Err(FetchJoinedError::Other(e)) => {
                     loading.set(false);
                     error.set(Some(e));
                 }
@@ -57,7 +71,7 @@ pub fn MeetingsList(
         });
     };
 
-    // Fetch on mount
+    // Fetch on mount.
     use_effect({
         let mut fetch_meetings = fetch_meetings;
         move || {
@@ -85,7 +99,7 @@ pub fn MeetingsList(
     };
 
     rsx! {
-        div { class: "meetings-list-container",
+        div { class: "meetings-list-container joined-meetings-list-container",
             button {
                 class: "meetings-list-toggle",
                 onclick: toggle_expanded,
@@ -103,7 +117,7 @@ pub fn MeetingsList(
                     stroke_linejoin: "round",
                     polyline { points: "6 9 12 15 18 9" }
                 }
-                span { "My Meetings" }
+                span { "Previously Joined" }
                 span { class: "meeting-count", "({total()})" }
             }
 
@@ -125,35 +139,14 @@ pub fn MeetingsList(
                             button { onclick: refresh, class: "retry-btn", "Retry" }
                         }
                     } else if meetings().is_empty() {
-                        div { class: "meetings-empty", "No meetings yet" }
+                        div { class: "meetings-empty", "No previously joined meetings" }
                     } else {
                         ul { class: "meetings-list",
                             for meeting in meetings().iter() {
-                                MeetingItem {
+                                JoinedMeetingItem {
                                     key: "{meeting.meeting_id}",
                                     meeting: meeting.clone(),
                                     on_select_meeting: on_select_meeting,
-                                    on_delete: {
-                                        #[allow(unused_mut)]
-                                        let mut fetch_meetings = fetch_meetings;
-                                        move |meeting_id: String| {
-                                            // Optimistic removal
-                                            meetings.write().retain(|m| m.meeting_id != meeting_id);
-                                            total.set(total().saturating_sub(1));
-
-                                            let meeting_id = meeting_id.clone();
-                                            let mut fetch_meetings = fetch_meetings;
-                                            spawn(async move {
-                                                match do_delete_meeting(&meeting_id).await {
-                                                    Ok(_) => fetch_meetings(),
-                                                    Err(e) => {
-                                                        error.set(Some(e));
-                                                        fetch_meetings();
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    },
                                 }
                             }
                         }
@@ -165,10 +158,9 @@ pub fn MeetingsList(
 }
 
 #[component]
-fn MeetingItem(
-    meeting: MeetingSummary,
+fn JoinedMeetingItem(
+    meeting: JoinedMeetingSummary,
     on_select_meeting: Option<EventHandler<String>>,
-    on_delete: EventHandler<String>,
 ) -> Element {
     let nav = use_navigator();
     let is_active = meeting.state == "active";
@@ -186,7 +178,6 @@ fn MeetingItem(
 
     let meeting_id = meeting.meeting_id.clone();
     let meeting_id_click = meeting_id.clone();
-    let meeting_id_delete = meeting_id.clone();
 
     let on_click = move |_| {
         if let Some(ref callback) = on_select_meeting {
@@ -198,34 +189,27 @@ fn MeetingItem(
         }
     };
 
-    let on_delete_click = move |e: MouseEvent| {
-        e.stop_propagation();
-        if web_sys::window()
-            .and_then(|w| {
-                w.confirm_with_message("Are you sure you want to delete this meeting?")
-                    .ok()
-            })
-            .unwrap_or(false)
-        {
-            on_delete.call(meeting_id_delete.clone());
-        }
-    };
-
-    let meeting_id_edit = meeting_id.clone();
-
-    let on_edit_click = move |e: MouseEvent| {
-        e.stop_propagation();
-        nav.push(Route::MeetingSettings {
-            id: meeting_id_edit.clone(),
-        });
-    };
-
     rsx! {
-        li { class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" }, style: "flex-wrap: wrap;",
+        li {
+            class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" },
+            style: "flex-wrap: wrap;",
             div { class: "meeting-item-content", onclick: on_click,
                 div { class: "meeting-info",
                     span { class: "meeting-id", "{meeting.meeting_id}" }
                     span { class: "meeting-state {state_class}", "{meeting.state}" }
+                    if meeting.is_owner {
+                        span {
+                            class: "meeting-owner-badge",
+                            title: "You own this meeting",
+                            svg {
+                                xmlns: "http://www.w3.org/2000/svg", width: "10", height: "10",
+                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                                stroke_width: "2.5", stroke_linecap: "round", stroke_linejoin: "round",
+                                path { d: "M12 2l2.39 7.36H22l-6.18 4.49L18.21 22 12 17.27 5.79 22l2.39-8.15L2 9.36h7.61L12 2z" }
+                            }
+                            "Owner"
+                        }
+                    }
                 }
                 div { class: "meeting-details",
                     if is_active {
@@ -303,57 +287,22 @@ fn MeetingItem(
                     }
                 }
             }
-            button {
-                class: "meeting-edit-btn",
-                onclick: on_edit_click,
-                title: "Meeting settings",
-                svg {
-                    xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    path { d: "M12 20h9" }
-                    path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
-                }
-            }
-            button {
-                class: if is_ended { "meeting-delete-btn meeting-delete-btn-ended" } else { "meeting-delete-btn" },
-                onclick: on_delete_click,
-                title: "Delete meeting",
-                svg {
-                    xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
-                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                    polyline { points: "3 6 5 6 21 6" }
-                    path { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }
-                    line { x1: "10", y1: "11", x2: "10", y2: "17" }
-                    line { x1: "14", y1: "11", x2: "14", y2: "17" }
-                }
-            }
         }
     }
 }
 
-async fn do_fetch_meetings() -> Result<ListMeetingsResponse, FetchMeetingsError> {
-    let client = meeting_api_client()
-        .map_err(|e| FetchMeetingsError::Other(format!("Config error: {e}")))?;
+async fn do_fetch_joined_meetings() -> Result<ListJoinedMeetingsResponse, FetchJoinedError> {
+    let client =
+        meeting_api_client().map_err(|e| FetchJoinedError::Other(format!("Config error: {e}")))?;
     client
-        .list_meetings(20, 0, None)
+        .list_joined_meetings(JOINED_LIMIT)
         .await
         .map_err(|e| match e {
             videocall_meeting_client::ApiError::NotAuthenticated => {
-                FetchMeetingsError::Unauthenticated
+                FetchJoinedError::Unauthenticated
             }
-            other => FetchMeetingsError::Other(format!("{other}")),
+            other => FetchJoinedError::Other(format!("{other}")),
         })
-}
-
-async fn do_delete_meeting(meeting_id: &str) -> Result<(), String> {
-    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
-    client
-        .delete_meeting(meeting_id)
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("{e}"))
 }
 
 fn format_duration(duration_ms: i64) -> String {

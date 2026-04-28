@@ -16,8 +16,8 @@
 use videocall_meeting_types::{
     requests::{CreateMeetingRequest, UpdateMeetingRequest},
     responses::{
-        CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
-        MeetingGuestInfoResponse, MeetingInfoResponse,
+        CreateMeetingResponse, DeleteMeetingResponse, ListJoinedMeetingsResponse,
+        ListMeetingsResponse, MeetingGuestInfoResponse, MeetingInfoResponse,
     },
 };
 
@@ -51,6 +51,24 @@ impl MeetingApiClient {
         }
 
         let response = self.get("/api/v1/meetings").query(&query).send().await?;
+        parse_api_response(response).await
+    }
+
+    /// List meetings the authenticated user has previously been admitted into,
+    /// ordered by most recent admission time (descending). Includes both
+    /// meetings the user owns and meetings they joined as a non-owner.
+    ///
+    /// Calls `GET /api/v1/meetings/joined?limit={limit}`.
+    pub async fn list_joined_meetings(
+        &self,
+        limit: u32,
+    ) -> Result<ListJoinedMeetingsResponse, ApiError> {
+        let query = [("limit", limit.to_string())];
+        let response = self
+            .get("/api/v1/meetings/joined")
+            .query(&query)
+            .send()
+            .await?;
         parse_api_response(response).await
     }
 

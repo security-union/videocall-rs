@@ -40,7 +40,9 @@ use axum::http::StatusCode;
 use serial_test::serial;
 use test_helpers::*;
 use tower::ServiceExt;
-use videocall_meeting_types::responses::{APIResponse, MeetingInfoResponse, ParticipantStatusResponse};
+use videocall_meeting_types::responses::{
+    APIResponse, MeetingInfoResponse, ParticipantStatusResponse,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -379,14 +381,14 @@ async fn test_wr_toggle_race_join_and_toggle_no_stuck_state() {
     let toggle_status_code = toggle_result.expect("toggle task must not panic");
 
     // Toggle must have succeeded.
-    assert_eq!(
-        toggle_status_code,
-        StatusCode::OK,
-        "WR toggle must succeed"
-    );
+    assert_eq!(toggle_status_code, StatusCode::OK, "WR toggle must succeed");
 
     // Join must have succeeded with HTTP 200.
-    assert_eq!(join_status_code, StatusCode::OK, "join must return HTTP 200");
+    assert_eq!(
+        join_status_code,
+        StatusCode::OK,
+        "join must return HTTP 200"
+    );
     assert!(join_body.success, "join must succeed");
 
     // The only valid outcomes are `admitted` (saw WR=off) or `waiting` (saw WR=on).

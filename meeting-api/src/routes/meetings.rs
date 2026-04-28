@@ -22,10 +22,13 @@ use axum::{
 };
 use rand::Rng;
 use videocall_meeting_types::{
-    requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
+    requests::{
+        CreateMeetingRequest, ListJoinedMeetingsQuery, ListMeetingsQuery, UpdateMeetingRequest,
+    },
     responses::{
-        APIResponse, CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
-        MeetingGuestInfoResponse, MeetingInfoResponse, MeetingSummary,
+        APIResponse, CreateMeetingResponse, DeleteMeetingResponse, JoinedMeetingSummary,
+        ListJoinedMeetingsResponse, ListMeetingsResponse, MeetingGuestInfoResponse,
+        MeetingInfoResponse, MeetingSummary,
     },
 };
 
@@ -198,6 +201,57 @@ pub async fn list_meetings(
         total,
         limit,
         offset,
+    })))
+}
+
+/// GET /api/v1/meetings/joined
+///
+/// Returns the most recent meetings the authenticated user has been admitted
+/// into, ordered by their last admission time descending. Includes meetings
+/// the user owns (which they always have a participant row for once they
+/// host-join) as well as meetings owned by others.
+///
+/// Query parameters:
+/// - `limit` (default 5, max 50, must be positive): how many rows to return.
+pub async fn list_joined_meetings(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Query(params): Query<ListJoinedMeetingsQuery>,
+) -> Result<Json<APIResponse<ListJoinedMeetingsResponse>>, AppError> {
+    // Reject negatives explicitly (per the API contract). A positive limit
+    // greater than 50 is silently clamped — that's the standard "be generous
+    // with input" behaviour the existing list endpoint also follows.
+    if params.limit < 1 {
+        return Err(AppError::invalid_input(
+            "limit must be a positive integer between 1 and 50",
+        ));
+    }
+    let limit = params.limit.min(50);
+
+    let rows = db_meetings::list_joined_by_user(&state.db, &user_id, limit).await?;
+
+    let mut meetings = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
+        let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
+
+        meetings.push(JoinedMeetingSummary {
+            meeting_id: row.room_id.clone(),
+            state: row.state.clone().unwrap_or_else(|| "idle".to_string()),
+            started_at: row.started_at.timestamp_millis(),
+            ended_at: row.ended_at.map(|t| t.timestamp_millis()),
+            participant_count,
+            waiting_count,
+            has_password: row.password_hash.is_some(),
+            is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
+            last_joined_at: row.last_joined_at.timestamp_millis(),
+        });
+    }
+
+    let total = meetings.len() as i64;
+    Ok(Json(APIResponse::ok(ListJoinedMeetingsResponse {
+        meetings,
+        total,
     })))
 }
 

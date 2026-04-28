@@ -1,9 +1,0 @@
-apiVersion: v2
-name: websocket-ascend
-version: 0.1.0
-description: WebSocket server for Ascend region
-
-dependencies:
-  - name: rustlemania-websocket
-    version: 0.1.0
-    repository: file://../../../rustlemania-websocket

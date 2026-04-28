@@ -1,0 +1,532 @@
+name: Daily Deploy to Ascend (conceptcar7)
+
+on:
+  # Ascend deploys are manual only. No auto-trigger on daily builds.
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (e.g., daily-2026-04-24-1352)'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  KUBECONFIG: /home/jboyd/ascend/ascend-cluster-config
+  NAMESPACE: videocall
+
+jobs:
+  deploy:
+    name: Deploy to Ascend
+    runs-on: [self-hosted, linux, ascend]
+    steps:
+      - name: Setup PATH
+        run: echo "/usr/local/bin" >> $GITHUB_PATH
+
+      - name: Validate kubectl and kubeconfig access
+        run: |
+          test -f "${KUBECONFIG}"
+          test -r "${KUBECONFIG}"
+          kubectl config current-context
+          CLUSTER_INFO=$(kubectl cluster-info)
+          echo "${CLUSTER_INFO}"
+          # Strip ANSI color codes before grep
+          echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://10.244.8.238:6443"
+
+      - name: Determine image tag
+        id: determine-tag
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          echo "Using manually specified tag: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Deploying images with tag: $TAG"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Add NATS Helm repo
+        run: |
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+
+      - name: Login to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          echo "Attempting Harbor login as user: $HARBOR_USERNAME"
+          if echo "$HARBOR_PASSWORD" | docker login hclcr.io -u "$HARBOR_USERNAME" --password-stdin; then
+            echo "✅ Harbor login successful"
+          else
+            echo "❌ Harbor login failed"
+            exit 1
+          fi
+
+      - name: Verify Harbor images exist
+        id: verify-images
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Checking if Harbor images exist for tag: ${TAG}..."
+          echo "Registry: ${REGISTRY}"
+
+          HARBOR_API="https://hclcr.io/api/v2.0"
+          PROJECT="hcllabs"
+
+          REPOS=(
+            "videocall-media-server"
+            "videocall-meeting-api"
+            "videocall-dioxus-ui"
+          )
+
+          MISSING_IMAGES=()
+
+          for REPO in "${REPOS[@]}"; do
+            IMAGE="${REGISTRY}/${REPO}:${TAG}"
+            echo "Checking ${IMAGE}..."
+
+            ENCODED_REPO=$(echo "${REPO}" | sed 's/\//%2F/g')
+            API_URL="${HARBOR_API}/projects/${PROJECT}/repositories/${ENCODED_REPO}/artifacts/${TAG}"
+
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" "${API_URL}")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "  ✅ Found"
+            else
+              echo "  ❌ Not found (HTTP ${HTTP_CODE})"
+              MISSING_IMAGES+=("${IMAGE}")
+            fi
+          done
+
+          if [ ${#MISSING_IMAGES[@]} -gt 0 ]; then
+            echo "❌ Missing images:"
+            for IMG in "${MISSING_IMAGES[@]}"; do
+              echo "  - ${IMG}"
+            done
+            echo "::error::Cannot deploy - required images not found in Harbor"
+            exit 1
+          else
+            echo "✅ All images found in Harbor"
+          fi
+
+      - name: Create videocall namespace (if not exists)
+        run: |
+          echo "Ensuring videocall namespace exists..."
+          kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace ${NAMESPACE} app=videocall env=ascend --overwrite
+          echo "✅ Namespace ready: ${NAMESPACE}"
+
+      - name: Verify required secrets exist
+        run: |
+          echo "Checking for required secrets in ${NAMESPACE} namespace..."
+
+          REQUIRED_SECRETS=(
+            "postgres-credentials"
+            "google-oauth-credentials"
+            "jwt-secret"
+            "harbor-pull-secret"
+            "videocall-cc7-wildcard-tls"
+            "webtransport-ascend-tls"
+          )
+
+          MISSING_SECRETS=()
+
+          for SECRET in "${REQUIRED_SECRETS[@]}"; do
+            if kubectl get secret ${SECRET} -n ${NAMESPACE} >/dev/null 2>&1; then
+              echo "  ✅ ${SECRET}"
+            else
+              echo "  ❌ ${SECRET}"
+              MISSING_SECRETS+=("${SECRET}")
+            fi
+          done
+
+          if [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets in ${NAMESPACE} namespace:"
+            for SECRET in "${MISSING_SECRETS[@]}"; do
+              echo "  - ${SECRET}"
+            done
+            exit 1
+          fi
+
+          echo "✅ All required secrets exist"
+
+      - name: Check NATS deployment
+        id: check-nats
+        run: |
+          if kubectl get deployment -n ${NAMESPACE} -l app.kubernetes.io/name=nats >/dev/null 2>&1 && \
+             [ -n "$(kubectl get statefulset nats -n ${NAMESPACE} -o name 2>/dev/null)" ]; then
+            echo "✅ NATS already deployed in ${NAMESPACE}"
+            echo "nats_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️  NATS not found, will deploy"
+            echo "nats_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy NATS (if not exists)
+        if: steps.check-nats.outputs.nats_exists == 'false'
+        run: |
+          echo "Deploying NATS to ${NAMESPACE} namespace..."
+
+          # Use the same base chart HCL daily uses. Release name "nats" so service is "nats"
+          # and all downstream NATS_URL=nats:4222 defaults apply. Build helm deps first.
+          helm dependency update helm/global/us-east/nats/
+
+          helm upgrade --install nats helm/global/us-east/nats/ \
+            --namespace ${NAMESPACE} \
+            --set nats.natsbox.enabled=true \
+            --set nats.reloader.enabled=true \
+            --set nats.exporter.enabled=true \
+            --set nats.nats.resources.limits.cpu=400m \
+            --set nats.nats.resources.limits.memory=600Mi \
+            --set nats.nats.resources.requests.cpu=200m \
+            --set nats.nats.resources.requests.memory=300Mi \
+            --set gateway.enabled=false \
+            --wait --timeout 5m
+
+          echo "✅ NATS deployed to ${NAMESPACE}"
+
+      - name: Deploy WebTransport Server
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Deploying WebTransport server to ${NAMESPACE}..."
+
+          # On Ascend:
+          #  * No cloud LB. Service is LoadBalancer (kept from HCL daily) but nodePort is pinned
+          #    to 30056 so HAProxy's NGINX QUIC proxy forwards UDP there.
+          #  * TLS terminates inside the WT pod (reads tls.crt/tls.key from secret mount),
+          #    so no ingress is needed. The webtransport-tls secret is cert-manager managed
+          #    via letsencrypt-aws ClusterIssuer (Route53 DNS-01).
+          #  * Health port (444/TCP) exposed for internal probes.
+
+          helm upgrade --install videocall-webtransport helm/rustlemania-webtransport/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=${REGISTRY}/videocall-media-server \
+            --set image.tag=${TAG} \
+            --set imagePullSecrets[0].name=harbor-pull-secret \
+            --set fullnameOverride=videocall-webtransport \
+            --set service.type=LoadBalancer \
+            --set service.port=443 \
+            --set service.nodePort=30056 \
+            --set service.healthPort=444 \
+            --set "command[0]=webtransport_server" \
+            --set tlsSecret=webtransport-ascend-tls \
+            --set certificateDomain=webtransport.videocall.conceptcar7.com \
+            --set "env[0].name=JWT_SECRET" \
+            --set "env[0].valueFrom.secretKeyRef.name=jwt-secret" \
+            --set "env[0].valueFrom.secretKeyRef.key=secret" \
+            --set "env[1].name=RUST_LOG" \
+            --set "env[1].value=warn,quinn=warn,web-transport-quinn=warn,async_nats=warn" \
+            --set "env[2].name=NATS_URL" \
+            --set "env[2].value=nats:4222" \
+            --set "env[3].name=LISTEN_URL" \
+            --set "env[3].value=0.0.0.0:443" \
+            --set "env[4].name=HEALTH_LISTEN_URL" \
+            --set "env[4].value=0.0.0.0:444" \
+            --set "env[5].name=CERT_PATH" \
+            --set "env[5].value=/certs/tls.crt" \
+            --set "env[6].name=KEY_PATH" \
+            --set "env[6].value=/certs/tls.key" \
+            --set "env[7].name=REGION" \
+            --set "env[7].value=ascend" \
+            --set "env[8].name=SERVICE_TYPE" \
+            --set "env[8].value=webtransport" \
+            --set "env[9].name=SERVER_STATS_INTERVAL_SECS" \
+            --set-string "env[9].value=5" \
+            --set "env[10].name=TOKIO_WORKER_THREADS" \
+            --set-string "env[10].value=4" \
+            --set "env[11].name=TOKIO_BLOCKING_THREADS" \
+            --set-string "env[11].value=2" \
+            --set resources.requests.cpu=200m \
+            --set resources.requests.memory=256Mi \
+            --set resources.limits.cpu=2000m \
+            --set resources.limits.memory=2Gi \
+            --set ingress.enabled=false \
+            --timeout 5m
+
+          # Note: no --wait flag. The chart hardcodes service.type=LoadBalancer, and Ascend
+          # has no cloud LB controller, so EXTERNAL-IP stays <pending> indefinitely and
+          # helm --wait would timeout. HAProxy sends UDP directly to NodePort 30056 which
+          # is allocated the moment the service is created — external IP is irrelevant.
+          # Explicitly wait on the deployment instead.
+          kubectl rollout status deployment/videocall-webtransport -n ${NAMESPACE} --timeout=180s
+
+          echo "✅ WebTransport server deployed (NodePort 30056 for HAProxy UDP proxy)"
+
+      - name: Deploy WebSocket Server
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Deploying WebSocket server to ${NAMESPACE}..."
+
+          # On Ascend:
+          #  * TLS terminates at HAProxy edge. nginx-ingress sees HTTP.
+          #  * No cert-manager annotations on the ingress — HAProxy handles the cert.
+          #  * ssl-redirect disabled because HAProxy already redirects HTTP->HTTPS at edge.
+
+          helm upgrade --install videocall-websocket helm/rustlemania-websocket/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=${REGISTRY}/videocall-media-server \
+            --set image.tag=${TAG} \
+            --set imagePullSecrets[0].name=harbor-pull-secret \
+            --set fullnameOverride=videocall-websocket \
+            --set "env[0].name=NATS_URL" \
+            --set "env[0].value=nats://nats.${NAMESPACE}.svc.cluster.local:4222" \
+            --set "env[1].name=JWT_SECRET" \
+            --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
+            --set "env[1].valueFrom.secretKeyRef.key=secret" \
+            --set "env[2].name=ACTIX_PORT" \
+            --set-string "env[2].value=8080" \
+            --set "env[3].name=RUST_LOG" \
+            --set "env[3].value=info" \
+            --set "env[4].name=REGION" \
+            --set "env[4].value=ascend" \
+            --set "env[5].name=SERVICE_TYPE" \
+            --set "env[5].value=websocket" \
+            --set "env[6].name=SERVER_STATS_INTERVAL_SECS" \
+            --set-string "env[6].value=5" \
+            --set resources.requests.cpu=200m \
+            --set resources.requests.memory=256Mi \
+            --set resources.limits.cpu=2000m \
+            --set resources.limits.memory=2Gi \
+            --set ingress.enabled=true \
+            --set "ingress.hosts[0].host=websocket.videocall.conceptcar7.com" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.hosts[0].paths[0].service.name=videocall-websocket" \
+            --set "ingress.hosts[0].paths[0].service.port.number=8080" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/ssl-redirect=false" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --wait --timeout 5m
+
+          echo "✅ WebSocket server deployed"
+
+      - name: Deploy Metrics API
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Deploying Metrics API to ${NAMESPACE}..."
+
+          helm upgrade --install metrics-api helm/metrics-api/ \
+            --namespace ${NAMESPACE} \
+            --set metricsApi.image.repository=${REGISTRY}/videocall-media-server \
+            --set metricsApi.image.tag=${TAG} \
+            --set metricsApi.imagePullSecrets[0].name=harbor-pull-secret \
+            --set metricsApi.resources.requests.cpu=50m \
+            --set metricsApi.resources.requests.memory=64Mi \
+            --set metricsApi.resources.limits.cpu=200m \
+            --set metricsApi.resources.limits.memory=256Mi \
+            --set serverStats.image.repository=${REGISTRY}/videocall-media-server \
+            --set serverStats.image.tag=${TAG} \
+            --set serverStats.imagePullSecrets[0].name=harbor-pull-secret \
+            --set serverStats.resources.requests.cpu=50m \
+            --set serverStats.resources.requests.memory=64Mi \
+            --set serverStats.resources.limits.cpu=200m \
+            --set serverStats.resources.limits.memory=256Mi \
+            --wait --timeout 5m
+
+          echo "✅ Metrics API deployed"
+
+      - name: Deploy Meeting API
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          # Get postgres password
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n ${NAMESPACE} -o jsonpath='{.data.password}' | base64 -d)
+
+          # Get OAuth credentials
+          OAUTH_CLIENT_ID=$(kubectl get secret google-oauth-credentials -n ${NAMESPACE} -o jsonpath='{.data.client-id}' | base64 -d)
+          OAUTH_CLIENT_SECRET=$(kubectl get secret google-oauth-credentials -n ${NAMESPACE} -o jsonpath='{.data.client-secret}' | base64 -d)
+
+          echo "Deploying Meeting API to ${NAMESPACE} with OAuth enabled..."
+
+          # On Ascend:
+          #  * Postgres is the existing "postgres-postgresql" service, database "actix-api-db".
+          #  * TLS terminates at HAProxy; ingress uses plain HTTP.
+          #  * OAuth callback URL must be registered with Google for conceptcar7 domain.
+          #  * consoleLogs: 200Gi PVC (ebs-sc is now expandable in-place if needed).
+
+          helm upgrade --install videocall-api helm/meeting-api/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=${REGISTRY}/videocall-meeting-api \
+            --set image.tag=${TAG} \
+            --set imagePullSecrets[0].name=harbor-pull-secret \
+            --set fullnameOverride=videocall-api \
+            --set "env[0].name=DATABASE_URL" \
+            --set "env[0].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.${NAMESPACE}.svc.cluster.local:5432/actix-api-db?sslmode=disable" \
+            --set "env[1].name=JWT_SECRET" \
+            --set "env[1].valueFrom.secretKeyRef.name=jwt-secret" \
+            --set "env[1].valueFrom.secretKeyRef.key=secret" \
+            --set "env[2].name=CORS_ALLOWED_ORIGIN" \
+            --set "env[2].value=https://app.videocall.conceptcar7.com" \
+            --set "env[3].name=COOKIE_DOMAIN" \
+            --set "env[3].value=.videocall.conceptcar7.com" \
+            --set "env[4].name=OAUTH_ISSUER" \
+            --set "env[4].value=https://accounts.google.com" \
+            --set "env[5].name=OAUTH_CLIENT_ID" \
+            --set "env[5].value=${OAUTH_CLIENT_ID}" \
+            --set "env[6].name=OAUTH_SECRET" \
+            --set "env[6].value=${OAUTH_CLIENT_SECRET}" \
+            --set "env[7].name=OAUTH_REDIRECT_URL" \
+            --set "env[7].value=https://api.videocall.conceptcar7.com/login/callback" \
+            --set "env[8].name=AFTER_LOGIN_URL" \
+            --set "env[8].value=https://app.videocall.conceptcar7.com" \
+            --set "env[9].name=OAUTH_SCOPES" \
+            --set "env[9].value=openid email profile" \
+            --set "env[10].name=ALLOWED_REDIRECT_URLS" \
+            --set "env[10].value=https://app.videocall.conceptcar7.com" \
+            --set "env[11].name=LISTEN_ADDR" \
+            --set "env[11].value=0.0.0.0:8081" \
+            --set "env[12].name=RUST_LOG" \
+            --set "env[12].value=info" \
+            --set "env[13].name=COOKIE_NAME" \
+            --set "env[13].value=videocall-session" \
+            --set "env[14].name=COOKIE_SECURE" \
+            --set-string "env[14].value=true" \
+            --set "env[15].name=SERVICE_VERSION_URLS" \
+            --set "env[15].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
+            --set resources.requests.cpu=100m \
+            --set resources.requests.memory=128Mi \
+            --set resources.limits.cpu=500m \
+            --set resources.limits.memory=512Mi \
+            --set ingress.enabled=true \
+            --set "ingress.hosts[0].host=api.videocall.conceptcar7.com" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.hosts[0].paths[0].service.name=videocall-api" \
+            --set "ingress.hosts[0].paths[0].service.port.number=8081" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/ssl-redirect=false" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --set consoleLogs.enabled=true \
+            --set consoleLogs.storageSize=200Gi \
+            --set-string consoleLogs.retentionDays=14 \
+            --wait --timeout 5m
+
+          echo "✅ Meeting API deployed with OAuth and console log collection"
+
+      - name: Deploy Dioxus UI
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+          REGISTRY_VAR="${{ vars.DOCKER_REGISTRY }}"
+          REGISTRY="${REGISTRY_VAR:-hclcr.io/hcllabs}"
+
+          echo "Deploying Dioxus UI to ${NAMESPACE}..."
+
+          # On Ascend:
+          #  * TLS terminates at HAProxy. Ingress is plain HTTP.
+          #  * runtimeConfig.webTransportHost includes port :30056 (HAProxy's UDP proxy port).
+
+          helm upgrade --install videocall-dioxus-ui helm/videocall-ui/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=${REGISTRY}/videocall-dioxus-ui \
+            --set image.tag=${TAG} \
+            --set "imagePullSecrets[0].name=harbor-pull-secret" \
+            --set fullnameOverride=videocall-dioxus-ui \
+            --set "runtimeConfig.apiBaseUrl=https://api.videocall.conceptcar7.com" \
+            --set "runtimeConfig.meetingApiBaseUrl=https://api.videocall.conceptcar7.com" \
+            --set "runtimeConfig.wsUrl=wss://websocket.videocall.conceptcar7.com" \
+            --set "runtimeConfig.webTransportHost=https://webtransport.videocall.conceptcar7.com:30056" \
+            --set-string "runtimeConfig.webTransportEnabled=true" \
+            --set-string "runtimeConfig.oauthEnabled=true" \
+            --set-string "runtimeConfig.oauthProvider=google" \
+            --set-string "runtimeConfig.e2eeEnabled=false" \
+            --set-string "runtimeConfig.firefoxEnabled=false" \
+            --set "runtimeConfig.usersAllowedToStream=" \
+            --set "runtimeConfig.serverElectionPeriodMs=2000" \
+            --set "runtimeConfig.audioBitrateKbps=65" \
+            --set "runtimeConfig.videoBitrateKbps=1000" \
+            --set "runtimeConfig.screenBitrateKbps=1000" \
+            --set-string "runtimeConfig.consoleLogUploadEnabled=true" \
+            --set resources.requests.cpu=50m \
+            --set resources.requests.memory=32Mi \
+            --set resources.limits.cpu=100m \
+            --set resources.limits.memory=64Mi \
+            --set ingress.enabled=true \
+            --set "ingress.hosts[0].host=app.videocall.conceptcar7.com" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/ssl-redirect=false" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
+            --wait --timeout 5m
+
+          echo "✅ Dioxus UI deployed"
+
+      - name: Verify rollout status
+        run: |
+          echo "Verifying rollout status for all deployments..."
+
+          kubectl rollout status deployment/videocall-webtransport -n ${NAMESPACE} --timeout=180s
+          kubectl rollout status deployment/videocall-websocket -n ${NAMESPACE} --timeout=180s
+          kubectl rollout status deployment/client-metrics-api -n ${NAMESPACE} --timeout=180s
+          kubectl rollout status deployment/server-metrics-api -n ${NAMESPACE} --timeout=180s
+          kubectl rollout status deployment/videocall-api -n ${NAMESPACE} --timeout=180s
+          kubectl rollout status deployment/videocall-dioxus-ui -n ${NAMESPACE} --timeout=180s
+
+          echo "✅ All deployments rolled out successfully"
+
+      - name: Display deployment status
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+
+          echo "=================================================="
+          echo "✅ Ascend deployment completed successfully!"
+          echo "=================================================="
+          echo ""
+          echo "Deployed image tag: ${TAG}"
+          echo ""
+          echo "Ascend URLs:"
+          echo "  - Dioxus UI:     https://app.videocall.conceptcar7.com"
+          echo "  - API:           https://api.videocall.conceptcar7.com"
+          echo "  - WebSocket:     wss://websocket.videocall.conceptcar7.com"
+          echo "  - WebTransport:  https://webtransport.videocall.conceptcar7.com:30056"
+          echo ""
+          echo "Namespace: ${NAMESPACE}"
+          echo ""
+          echo "Deployment details:"
+          kubectl get deployments -n ${NAMESPACE}
+          echo ""
+          echo "Pod status:"
+          kubectl get pods -n ${NAMESPACE}
+          echo ""
+          echo "Service status:"
+          kubectl get services -n ${NAMESPACE}
+          echo ""
+          echo "Ingress status:"
+          kubectl get ingress -n ${NAMESPACE}
+          echo ""
+          echo "=================================================="
+
+      - name: Post deployment summary
+        if: always()
+        run: |
+          TAG=${{ steps.determine-tag.outputs.tag }}
+
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "::notice::Ascend deployment successful - tag: ${TAG}"
+          else
+            echo "::error::Ascend deployment failed - tag: ${TAG}"
+          fi

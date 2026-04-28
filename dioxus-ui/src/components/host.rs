@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::constants::*;
 use crate::context::{TransportPreferenceCtx, VideoCallClientCtx};
@@ -73,6 +74,7 @@ pub fn Host(
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let pre_acquired_stream = use_context::<PreAcquiredScreenStream>();
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -399,13 +401,26 @@ pub fn Host(
         if s.prev_share_screen != share_screen {
             s.prev_share_screen = share_screen;
             if share_screen {
-                s.screen.set_enabled(true);
-                log::info!("Start screen share encoder");
-                let state_clone = state.clone();
-                Timeout::new(1000, move || {
-                    state_clone.borrow_mut().screen.start();
-                })
-                .forget();
+                // Check if the onclick handler already acquired a MediaStream
+                // (required for Safari which mandates getDisplayMedia be called
+                // synchronously within a user gesture handler).
+                let maybe_stream = pre_acquired_stream.borrow_mut().take();
+                if let Some(stream) = maybe_stream {
+                    s.screen.set_enabled(true);
+                    log::info!("Start screen share encoder with pre-acquired stream");
+                    s.screen.start_with_stream(stream);
+                } else {
+                    // Fallback: let the encoder call getDisplayMedia itself.
+                    // This path works on Chrome/Firefox where the gesture
+                    // chain survives the timeout + spawn_local boundaries.
+                    s.screen.set_enabled(true);
+                    log::info!("Start screen share encoder (encoder-acquired stream)");
+                    let state_clone = state.clone();
+                    Timeout::new(1000, move || {
+                        state_clone.borrow_mut().screen.start();
+                    })
+                    .forget();
+                }
             } else {
                 s.screen.set_enabled(false);
                 s.screen.stop();

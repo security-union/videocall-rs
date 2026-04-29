@@ -227,14 +227,18 @@ pub async fn check_session() -> anyhow::Result<()> {
     // guest — but only when no OAuth session could exist.  When PKCE-based
     // OAuth is active and tokens are present the user has logged in *after*
     // a guest session; bail-out would incorrectly reject a valid session.
-    if get_guest_session_id().is_some() {
-        let has_oauth_tokens = crate::constants::is_pkce_flow()
-            && (get_stored_access_token().is_some() || get_stored_id_token().is_some());
+    if get_guest_session_id().is_some() && crate::constants::is_pkce_flow() {
+        let has_oauth_tokens =
+            get_stored_access_token().is_some() || get_stored_id_token().is_some();
         if !has_oauth_tokens {
             clear_guest_session_id();
             return Err(anyhow!("guest session; no OAuth session cookie"));
         }
         // If OAuth tokens exist, fall through to normal check
+        clear_guest_session_id();
+    } else if get_guest_session_id().is_some() {
+        // Server-side OAuth: a backend session cookie may still be valid;
+        // clear the stale guest marker and fall through to the network check.
         clear_guest_session_id();
     }
     if crate::constants::is_pkce_flow()

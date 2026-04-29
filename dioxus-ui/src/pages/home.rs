@@ -16,12 +16,15 @@
  * conditions.
  */
 
-use crate::auth::{check_session, get_user_profile, logout, UserProfile};
+use crate::auth::{
+    check_session, clear_access_token, clear_id_token, clear_user_profile, get_user_profile,
+    UserProfile,
+};
 use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::components::joined_meetings_list::JoinedMeetingsList;
 use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
-use crate::constants::{meeting_api_base_url, oauth_enabled};
+use crate::constants::{logout_url, meeting_api_base_url, oauth_enabled};
 use crate::context::{
     clear_display_name_from_storage, email_to_display_name, is_allowed_display_name_char,
     is_guid_like, is_valid_meeting_id, load_display_name_from_storage,
@@ -202,12 +205,12 @@ pub fn Home() -> Element {
             wasm_bindgen_futures::spawn_local(async move {
                 if check_session().await.is_ok() {
                     if let Ok(profile) = get_user_profile().await {
-                        if let Some(stored_name) = load_display_name_from_storage() {
-                            // Session confirmed — restore the previously saved name.
-                            username_value.set(stored_name.clone());
-                            display_name_ctx.0.set(Some(stored_name.clone()));
-                        } else {
-                            // No saved name yet — derive one from the provider profile.
+                        // Anonymous sessions have no real identity — skip them entirely.
+                        // The template also filters them so the sign-in button renders.
+                        if !profile.user_id.starts_with("anon-") {
+                            // For authenticated users, always derive the display name from
+                            // the OAuth profile so a real name takes precedence over any
+                            // stale guest-session name stored before the user signed in.
                             let display_name = if profile.name.contains('@') {
                                 email_to_display_name(&profile.name)
                             } else if is_guid_like(&profile.name) {
@@ -226,8 +229,8 @@ pub fn Home() -> Element {
                                     username_value.set(valid_name.clone());
                                 }
                             }
+                            user_profile.set(Some(profile));
                         }
-                        user_profile.set(Some(profile));
                     }
                     // Session valid but profile fetch failed → leave field empty.
                 }
@@ -259,22 +262,56 @@ pub fn Home() -> Element {
         }
     });
 
-    // Logout handler: clear local state first, then navigate the browser to
-    // the meeting-api /logout endpoint.  The server clears the session cookie
-    // and, when an OIDC end_session_endpoint is configured, redirects to the
-    // provider's logout page (RP-initiated logout).  Doing a browser
-    // navigation — rather than a fetch() — ensures the provider redirect is
-    // followed as a real page load.
+    // Logout handler: clear all local auth state (tokens, profile, display name)
+    // and reset the UI to the unauthenticated home state.
+    //
+    // DESIGN NOTE — why we do NOT navigate the browser to the backend /logout URL:
+    //
+    // The previous approach called `logout()` which redirected the browser to the
+    // backend /logout endpoint.  That endpoint in turn kicked off an OIDC
+    // end_session_endpoint redirect chain (RP-initiated logout), which is meant to
+    // clear the OAuth provider's own session.  In practice this was the root cause
+    // of the "can't re-sign-in after logout" regression: the redirect chain either
+    // navigated away before local state was cleaned up, or the provider's post-logout
+    // redirect landed the user in a broken intermediate state.
+    //
+    // Instead we now:
+    //   1. Clear all client-side auth state synchronously (tokens, profile, display
+    //      name signal, in-memory signals).
+    //   2. Navigate to Route::Home so the UI immediately shows the sign-in button.
+    //   3. Fire a background fetch (fire-and-forget) to the backend /logout endpoint
+    //      so the server-side session cookie is invalidated.
+    //
+    // Trade-off: the OAuth provider session (IdP side) may stay alive after this
+    // sign-out.  The next "Sign In" click could silently re-authenticate the same
+    // user without re-prompting for credentials, depending on how the IdP handles
+    // an active session with no active RP session.  If that becomes an issue, the
+    // long-term fix is to have the backend /logout endpoint perform the
+    // end_session_endpoint redirect *after* the client has already navigated away
+    // (e.g. via a post-logout redirect back to the SPA), rather than driving the
+    // full redirect chain from the client side.
     let on_logout = move |_| {
-        // Clear persisted display name before the page unloads so the user
-        // starts fresh after the OIDC provider redirects back.
+        // Clear all client-side auth state
+        clear_access_token();
+        clear_id_token();
+        clear_user_profile();
         clear_display_name_from_storage();
-        // Reset in-memory signals (best-effort; page unloads shortly after).
+
+        // Reset in-memory signals
         user_profile.set(None);
         display_name_ctx.0.set(None);
         username_value.set(String::new());
-        if let Err(e) = logout() {
-            log::error!("Logout navigation failed: {e}");
+
+        // Navigate to home route (unauthenticated state)
+        navigator.push(Route::Home {});
+
+        // Background fetch to invalidate the server-side session cookie.
+        // We deliberately do NOT await this or navigate to the URL — see the
+        // design note above for why we avoid the browser-redirect approach.
+        if let Ok(url) = logout_url() {
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = reqwest::get(&url).await;
+            });
         }
     };
 

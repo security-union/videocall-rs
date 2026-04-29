@@ -723,6 +723,15 @@ test.describe("Previously Joined meetings section", () => {
     await expect(page.locator(`${JOINED_SECTION} .meeting-state.state-active`)).toHaveCount(1);
     await expect(page.locator(`${JOINED_SECTION} .meeting-state.state-ended`)).toHaveCount(1);
 
+    // The state label is now title-cased in Rust before rendering ("Active",
+    // "Ended"), not lower-cased + CSS uppercase as before. We assert the
+    // exact DOM text so a regression that drops the title-case (or sneaks
+    // back to the raw lowercase enum string) fails this test loudly.
+    await expect(page.locator(`${JOINED_SECTION} .meeting-state.state-active`)).toHaveText(
+      "Active",
+    );
+    await expect(page.locator(`${JOINED_SECTION} .meeting-state.state-ended`)).toHaveText("Ended");
+
     // TODO: assert `state-idle` rendering. The owner-join API call always
     // transitions the meeting to `active`, and `list_joined_by_user` only
     // returns rows the user has been admitted into. To exercise this
@@ -925,6 +934,288 @@ test.describe("Previously Joined meetings section", () => {
     await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-delete-btn`)).toHaveCount(1);
 
     // Best-effort cleanup so this seed doesn't bleed into future runs.
+    await deleteAllOwnedMeetings(email, name);
+  });
+
+  test("Owner badge renders the literal 'Owner' text (not 'OWNER')", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    // The owner badge text is now literal "Owner" in the RSX (no CSS
+    // uppercase). Assert exact text — case-sensitive — so a regression that
+    // re-introduces the all-caps treatment fails here.
+    const email = `joined-owner-text-${Date.now()}@videocall.rs`;
+    const name = "JoinedOwnerTextUser";
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    const meetingId = `e2e_joined_owner_text_${Date.now()}`;
+    await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, meetingId, name);
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+    await waitForJoinedRowCount(page, 1);
+
+    const badge = page.locator(`${JOINED_LIST_ROWS} ${JOINED_OWNER_BADGE}`).first();
+    // The badge contains an SVG icon followed by the text "Owner". We
+    // assert the text content (Playwright's textContent strips child
+    // element text by default, so the SVG's whitespace doesn't pollute
+    // this match).
+    await expect(badge).toHaveText("Owner");
+
+    // Best-effort cleanup so this seed doesn't bleed into future runs.
+    await deleteAllOwnedMeetings(email, name);
+  });
+
+  test("inline meeting details (duration, time range, joined count) are NOT in the row", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    // Regression guard: the inline `.meeting-details` element used to render
+    // duration / time range / participant count / waiting / password lock
+    // as visible siblings of `.meeting-info`. Those moved to a body-level
+    // hover tooltip portal. The row should now contain ONLY the meeting id,
+    // state pill, and (when the user owns it) the owner badge — no
+    // `.meeting-details`, `.meeting-duration`, `.meeting-time`,
+    // `.meeting-participants`, `.meeting-waiting`, or `.meeting-password`.
+    const email = `joined-row-clean-${Date.now()}@videocall.rs`;
+    const name = "JoinedRowCleanUser";
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    // Seed one ACTIVE and one ENDED meeting so we exercise both branches
+    // of the old inline-details code path in a single check.
+    const activeId = `e2e_joined_row_active_${Date.now()}`;
+    await createMeeting(email, name, { meetingId: activeId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, activeId, name);
+
+    const endedId = `e2e_joined_row_ended_${Date.now()}`;
+    await createMeeting(email, name, { meetingId: endedId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, endedId, name);
+    await endMeeting(email, name, endedId);
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+    await waitForJoinedRowCount(page, 2);
+
+    // None of the inline detail elements should appear inside the rows.
+    for (const cls of [
+      ".meeting-details",
+      ".meeting-duration",
+      ".meeting-time",
+      ".meeting-time-separator",
+      ".meeting-participants",
+      ".meeting-waiting",
+      ".meeting-password",
+    ]) {
+      await expect(page.locator(`${JOINED_LIST_ROWS} ${cls}`)).toHaveCount(0);
+    }
+
+    // Best-effort cleanup.
+    await deleteAllOwnedMeetings(email, name);
+  });
+
+  test("hovering a joined row reveals the body-level meeting-info tooltip", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    // The tooltip is a portal — it lives on document.body, NOT inside the
+    // row's subtree. CSS classes:
+    //   - `.meeting-info-tooltip-portal` — base portal class
+    //   - `.is-visible` — added on hover, drives opacity + transform
+    // The id `#meeting-info-tooltip-global` is also stable.
+    const email = `joined-tooltip-${Date.now()}@videocall.rs`;
+    const name = "JoinedTooltipUser";
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    const meetingId = `e2e_joined_tooltip_${Date.now()}`;
+    await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, meetingId, name);
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+    await waitForJoinedRowCount(page, 1);
+
+    const tooltip = page.locator("#meeting-info-tooltip-global");
+
+    // Pre-hover: the tooltip element may not yet exist (it's lazily created
+    // on first hover). Either zero-count OR not-visible is acceptable.
+    expect(await tooltip.count()).toBeLessThanOrEqual(1);
+
+    // Hover the row's clickable content area to trigger onmouseenter.
+    await page.locator(`${JOINED_LIST_ROWS} .meeting-item-content`).first().hover();
+
+    // Tooltip becomes visible (the `.is-visible` class is added).
+    await expect(page.locator("#meeting-info-tooltip-global.is-visible")).toBeVisible({
+      timeout: 2_000,
+    });
+
+    // The active-branch tooltip for a joined meeting should at minimum
+    // surface the duration and attendees rows. We check label text — the
+    // values vary at runtime so substring matching keeps the test robust.
+    await expect(tooltip).toContainText("Started on");
+    await expect(tooltip).toContainText("Duration");
+    await expect(tooltip).toContainText("Attendees");
+
+    // Best-effort cleanup.
+    await deleteAllOwnedMeetings(email, name);
+  });
+});
+
+/**
+ * "My Meetings" list — single-line row layout + tooltip portal.
+ *
+ * The MeetingsList component shares the same single-line row design as the
+ * "Previously Joined" list: meeting id + state pill on the left, edit /
+ * delete buttons on the right, and ALL secondary detail (duration, time
+ * range, attendees, password lock) moved to a body-level hover tooltip
+ * portal. These tests cover the My Meetings side of that UI contract.
+ */
+test.describe("My Meetings list", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test("state pill text is title-cased (e.g. 'Active', 'Ended')", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    // The Rust component now title-cases the state string before rendering.
+    // Assert the literal DOM text — case-sensitive — so a regression that
+    // re-introduces the raw lowercase enum string (or an old CSS uppercase
+    // treatment) fails this test loudly.
+    const email = `my-state-text-${Date.now()}@videocall.rs`;
+    const name = "MyStateTextUser";
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    // Seed: one ACTIVE and one ENDED meeting owned by this user.
+    const activeId = `e2e_my_state_active_${Date.now()}`;
+    await createMeeting(email, name, { meetingId: activeId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, activeId, name);
+
+    const endedId = `e2e_my_state_ended_${Date.now()}`;
+    await createMeeting(email, name, { meetingId: endedId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, endedId, name);
+    await endMeeting(email, name, endedId);
+
+    await page.goto("/");
+    await page.waitForTimeout(2000);
+
+    // Wait for the My Meetings section to settle. A scoped loading-spinner
+    // gate is unnecessary here — the section is expanded by default and
+    // the rows are tied to the same fetch lifecycle as the joined list.
+    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-state.state-active`)).toHaveText(
+      "Active",
+      { timeout: 15_000 },
+    );
+    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-state.state-ended`)).toHaveText(
+      "Ended",
+    );
+
+    // Best-effort cleanup so this seed doesn't bleed into future runs.
+    await deleteAllOwnedMeetings(email, name);
+  });
+
+  test("inline meeting details are NOT in the row (moved to hover tooltip)", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    // Regression guard symmetric with the joined-list test above. The
+    // MeetingsList rows must contain ONLY meeting id + state pill (+
+    // edit/delete buttons on the right). Duration, time range, participant
+    // and waiting counts, and the password-lock icon all moved to the
+    // hover tooltip portal.
+    const email = `my-row-clean-${Date.now()}@videocall.rs`;
+    const name = "MyRowCleanUser";
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    const activeId = `e2e_my_row_active_${Date.now()}`;
+    await createMeeting(email, name, { meetingId: activeId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, activeId, name);
+
+    const endedId = `e2e_my_row_ended_${Date.now()}`;
+    await createMeeting(email, name, { meetingId: endedId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, endedId, name);
+    await endMeeting(email, name, endedId);
+
+    await page.goto("/");
+    await page.waitForTimeout(2000);
+
+    // Wait for at least one row to render.
+    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-item`)).toHaveCount(2, {
+      timeout: 15_000,
+    });
+
+    for (const cls of [
+      ".meeting-details",
+      ".meeting-duration",
+      ".meeting-time",
+      ".meeting-time-separator",
+      ".meeting-participants",
+      ".meeting-waiting",
+      ".meeting-password",
+    ]) {
+      await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-item ${cls}`)).toHaveCount(0);
+    }
+
+    await deleteAllOwnedMeetings(email, name);
+  });
+
+  test("hovering a My Meetings row reveals the body-level info tooltip with 'Created on'", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    // The MeetingsList tooltip variant always includes a "Created on" row
+    // (build_meeting_tooltip_html, irrespective of state). The active
+    // branch additionally surfaces "Started on", "Duration", "Attendees".
+    // We assert against the substrings that are stable across runs — the
+    // formatted datetime values vary, so we only check labels.
+    const email = `my-tooltip-${Date.now()}@videocall.rs`;
+    const name = "MyTooltipUser";
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    const meetingId = `e2e_my_tooltip_${Date.now()}`;
+    await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, meetingId, name);
+
+    await page.goto("/");
+    await page.waitForTimeout(2000);
+
+    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-item`)).toHaveCount(1, {
+      timeout: 15_000,
+    });
+
+    // Hover the row's clickable content to fire onmouseenter.
+    await page
+      .locator(`${MY_MEETINGS_SECTION} .meeting-item .meeting-item-content`)
+      .first()
+      .hover();
+
+    // Tooltip portal becomes visible.
+    const visibleTooltip = page.locator("#meeting-info-tooltip-global.is-visible");
+    await expect(visibleTooltip).toBeVisible({ timeout: 2_000 });
+
+    // The MeetingsList variant always renders "Created on" — that's the
+    // distinguishing label vs. the JoinedMeetings variant which only
+    // includes it when is_owner. The active branch also has "Started on"
+    // / "Duration" / "Attendees".
+    const tooltip = page.locator("#meeting-info-tooltip-global");
+    await expect(tooltip).toContainText("Created on");
+    await expect(tooltip).toContainText("Started on");
+    await expect(tooltip).toContainText("Duration");
+    await expect(tooltip).toContainText("Attendees");
+
+    // Move the pointer off the row — tooltip loses `.is-visible`.
+    await page.mouse.move(0, 0);
+    await expect(page.locator("#meeting-info-tooltip-global.is-visible")).toHaveCount(0, {
+      timeout: 2_000,
+    });
+
     await deleteAllOwnedMeetings(email, name);
   });
 });

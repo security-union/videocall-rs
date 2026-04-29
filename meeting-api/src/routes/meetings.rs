@@ -184,10 +184,10 @@ pub async fn list_meetings(
             host: row.creator_id.clone(),
             state: row.state.clone().unwrap_or_else(|| "idle".to_string()),
             has_password: row.password_hash.is_some(),
-            created_at: row.created_at.timestamp(),
+            created_at: row.created_at.timestamp_millis(),
             participant_count,
-            started_at: row.started_at.timestamp(),
-            ended_at: row.ended_at.map(|t| t.timestamp()),
+            started_at: row.started_at.timestamp_millis(),
+            ended_at: row.ended_at.map(|t| t.timestamp_millis()),
             waiting_count,
             waiting_room_enabled: row.waiting_room_enabled,
             admitted_can_admit: row.admitted_can_admit,
@@ -247,6 +247,7 @@ pub async fn list_joined_meetings(
             waiting_count,
             has_password: row.password_hash.is_some(),
             is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
+            created_at: row.created_at.timestamp_millis(),
             last_joined_at: row.last_joined_at.timestamp_millis(),
         });
     }

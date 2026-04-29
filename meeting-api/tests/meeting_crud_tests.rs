@@ -28,6 +28,9 @@ use videocall_meeting_types::{
     APIError,
 };
 
+const MS_LOWER_BOUND: i64 = 1_000_000_000_000;
+const MS_UPPER_BOUND: i64 = 10_000_000_000_000;
+
 // ── Create ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -58,6 +61,13 @@ async fn test_create_meeting_success() {
     assert!(body.success);
     assert_eq!(body.result.meeting_id, room_id);
     assert_eq!(body.result.host, "host@example.com");
+    assert!(
+        body.result.created_at > MS_LOWER_BOUND && body.result.created_at < MS_UPPER_BOUND,
+        "expected created_at to be Unix milliseconds ({}..{}), got {}",
+        MS_LOWER_BOUND,
+        MS_UPPER_BOUND,
+        body.result.created_at
+    );
     assert!(body.result.has_password);
     assert_eq!(body.result.attendees.len(), 2);
 
@@ -255,6 +265,34 @@ async fn test_list_meetings_success() {
     let body: APIResponse<ListMeetingsResponse> = response_json(resp).await;
     assert!(body.success);
     assert!(body.result.meetings.iter().any(|m| m.meeting_id == room_id));
+    for meeting in &body.result.meetings {
+        assert!(
+            meeting.created_at > MS_LOWER_BOUND && meeting.created_at < MS_UPPER_BOUND,
+            "expected created_at to be Unix milliseconds ({}..{}), got {} for meeting {}",
+            MS_LOWER_BOUND,
+            MS_UPPER_BOUND,
+            meeting.created_at,
+            meeting.meeting_id
+        );
+        assert!(
+            meeting.started_at > MS_LOWER_BOUND && meeting.started_at < MS_UPPER_BOUND,
+            "expected started_at to be Unix milliseconds ({}..{}), got {} for meeting {}",
+            MS_LOWER_BOUND,
+            MS_UPPER_BOUND,
+            meeting.started_at,
+            meeting.meeting_id
+        );
+        if let Some(ended_at) = meeting.ended_at {
+            assert!(
+                ended_at > MS_LOWER_BOUND && ended_at < MS_UPPER_BOUND,
+                "expected ended_at to be Unix milliseconds ({}..{}), got {} for meeting {}",
+                MS_LOWER_BOUND,
+                MS_UPPER_BOUND,
+                ended_at,
+                meeting.meeting_id
+            );
+        }
+    }
 
     cleanup_test_data(&pool, room_id).await;
 }

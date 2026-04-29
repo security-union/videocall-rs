@@ -361,8 +361,49 @@ impl ScreenEncoder {
     /// Start encoding and sending the data to the client connection (if it's currently connected).
     /// The user is prompted by the browser to select which window or screen to encode.
     ///
+    /// # Arguments
+    /// * `initial_tier` - Starting tier index into `SCREEN_QUALITY_TIERS` (0=high, 1=medium, 2=low).
+    ///   This allows the caller to select a conservative starting tier based on network signals
+    ///   (e.g., RTT, camera tier index) at the moment screen sharing starts, giving a readable
+    ///   first frame on constrained uplinks without waiting for the PID loop to ramp down.
+    ///
     /// This will toggle the enabled state of the encoder.
-    pub fn start(&mut self) {
+    pub fn start(&mut self, initial_tier: usize) {
+        // Clamp initial_tier to valid range
+        let clamped_tier = initial_tier.min(SCREEN_QUALITY_TIERS.len().saturating_sub(1));
+        if clamped_tier != initial_tier {
+            log::warn!(
+                "ScreenEncoder::start: initial_tier {} out of bounds, clamped to {}",
+                initial_tier,
+                clamped_tier
+            );
+        }
+
+        // Apply the initial tier to shared atomics BEFORE starting the encoding loop.
+        // The encoding loop reads these atomics to configure the encoder, so setting
+        // them here ensures the first frame is encoded at the chosen tier.
+        let tier = &SCREEN_QUALITY_TIERS[clamped_tier];
+        self.shared_screen_tier_index
+            .store(clamped_tier as u32, Ordering::Relaxed);
+        self.tier_max_width.store(tier.max_width, Ordering::Relaxed);
+        self.tier_max_height
+            .store(tier.max_height, Ordering::Relaxed);
+        self.tier_keyframe_interval
+            .store(tier.keyframe_interval_frames, Ordering::Relaxed);
+        self.current_bitrate
+            .store(tier.ideal_bitrate_kbps, Ordering::Relaxed);
+
+        log::info!(
+            "ScreenEncoder::start: initial tier {} '{}' ({}x{}, {}fps, kf={}, bitrate={}kbps)",
+            clamped_tier,
+            tier.label,
+            tier.max_width,
+            tier.max_height,
+            tier.target_fps,
+            tier.keyframe_interval_frames,
+            tier.ideal_bitrate_kbps,
+        );
+
         let EncoderState {
             enabled, switching, ..
         } = self.state.clone();

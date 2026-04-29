@@ -193,3 +193,83 @@ If >10K series, verify `metric_relabel_configs` are applied (check running confi
 
 ### Stale display names (session IDs in legends)
 Display names resolve within 5 seconds of a peer sending their first health packet. If session IDs persist, check that the peer's client is actually sending health packets.
+
+---
+
+## Screen Share Egress: Operator Callout
+
+> **⚠️ Capacity alert:** Screen sharing at the high tier (1920×1080, 2500 kbps steady /
+> 4000 kbps VBR peak) generates **approximately 4× the relay egress of a single
+> camera-only participant slot.** A 20-person meeting where one participant shares their
+> screen adds ~47.5 Mbps (steady) to ~76 Mbps (VBR peak) of relay egress. At high tier,
+> each active screen-share slot accounts for a **~67% fan-out increase** relative to a
+> camera-only participant at typical AQ-adapted bitrates.
+
+### Why this matters
+
+The relay is a stateless forwarder — it receives one inbound stream and copies it to
+every other participant's outbound queue. Screen share egress scales as:
+
+```
+relay_egress = (N - 1) × tier_bitrate
+```
+
+At N=20, high tier: 19 × 2500 kbps = **47.5 Mbps** steady, **76 Mbps** peak. A NIC
+sized for camera-only meetings may saturate under simultaneous screen share in large
+calls. See [server-sizing-guide.md](server-sizing-guide.md#screen-share-bandwidth) for
+the full per-tier, per-N table.
+
+### Prometheus query to monitor screen-share egress
+
+The relay does not currently label outbound bytes by media type. Use
+`relay_room_bytes_total` to monitor total room egress and compare against the
+camera-only baseline for the same N:
+
+```promql
+# Total relay egress rate for a specific room (bits/s)
+rate(relay_room_bytes_total{direction="outbound", room="<meeting-id>"}[1m]) * 8
+
+# Per-room egress across all meetings (top-10 by egress)
+topk(10,
+  sum by (room) (
+    rate(relay_room_bytes_total{direction="outbound"}[1m])
+  )
+) * 8
+```
+
+An unusually high rate for a single room (>10× the median) is a strong signal that
+at least one participant is screen-sharing at high tier.
+
+### Alert recommendation
+
+Add a room-level egress alert to catch NIC saturation before it affects other meetings:
+
+```yaml
+# In helm/global/us-east/prometheus/values.yaml alerting rules
+- alert: RoomEgressHigh
+  expr: |
+    sum by (room) (
+      rate(relay_room_bytes_total{direction="outbound"}[2m])
+    ) * 8 > 100e6
+  for: 1m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Room {{ $labels.room }} relay egress > 100 Mbps"
+    description: >
+      One or more participants may be screen-sharing at high tier.
+      At 100 Mbps per room, a NIC sized for camera-only meetings is near capacity.
+      Check the room participant count and reduce concurrent meetings or lower the
+      screen-share tier cap (SCREEN_QUALITY_TIERS in adaptive_quality_constants.rs).
+```
+
+Tune the threshold (100 Mbps) to your NIC capacity. A 1 GbE NIC is safe up to ~5
+simultaneous high-tier screen-share rooms (5 × 76 Mbps peak ≈ 380 Mbps, giving 60%
+headroom for camera + audio traffic).
+
+### Measurement status
+
+The per-tier model is derived from `SCREEN_QUALITY_TIERS` constants. Bot-based empirical
+validation (one screen-share producer, N−1 observer bots) has not yet been run. Update
+[server-sizing-guide.md](server-sizing-guide.md#measurement-status) with the measured
+`rate(relay_room_bytes_total...)` value once the bot screen-share producer is implemented.

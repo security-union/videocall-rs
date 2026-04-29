@@ -202,7 +202,11 @@ async fn join_as_attendee(
                 is_guest,
             )
             .await?
-            .expect("join_attendee with None host check never returns None");
+            .ok_or_else(|| {
+                AppError::internal(
+                    "join_attendee returned None despite no host-check — internal invariant violated",
+                )
+            })?;
             // New attendee row added — may be `admitted` or `waiting`,
             // both of which are indexed by `list_for_search`. Re-push.
             search::spawn_repush(state, meeting.id, meeting_id.to_string());

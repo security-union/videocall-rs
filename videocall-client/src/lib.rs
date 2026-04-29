@@ -193,8 +193,8 @@ pub mod adaptive_quality_constants;
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;
-mod client;
-mod connection;
+pub mod client;
+pub mod connection;
 pub mod constants;
 pub mod crypto;
 pub mod decode;
@@ -204,6 +204,7 @@ pub mod health_reporter;
 mod media_devices;
 pub mod utils;
 mod wrappers;
+pub use adaptive_quality_constants::initial_screen_tier;
 pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use connection::ConnectionState;
 pub use decode::{

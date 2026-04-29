@@ -21,8 +21,9 @@ use crate::constants::{
     actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled, webtransport_host_base,
 };
 use crate::context::{
-    get_or_create_local_user_id, load_display_name_from_storage, resolve_transport_config,
-    save_display_name_to_storage, validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
+    email_to_display_name, get_or_create_local_user_id, is_guid_like,
+    load_display_name_from_storage, resolve_transport_config, save_display_name_to_storage,
+    validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
 };
 use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
 use dioxus::prelude::*;
@@ -111,7 +112,31 @@ pub fn MeetingPage(id: String) -> Element {
         if auth_done && oauth_enabled().unwrap_or(false) {
             wasm_bindgen_futures::spawn_local(async move {
                 if let Ok(profile) = get_user_profile().await {
-                    user_profile.set(Some(profile));
+                    if !profile.user_id.starts_with("anon-") {
+                        // Pre-fill the display name from the OAuth profile when the
+                        // field is still empty (e.g. direct navigation to meeting URL).
+                        if input_value_state().is_empty() {
+                            let display_name = if profile.name.contains('@') {
+                                email_to_display_name(&profile.name)
+                            } else if is_guid_like(&profile.name) {
+                                if profile.user_id.contains('@') {
+                                    email_to_display_name(&profile.user_id)
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                profile.name.clone()
+                            };
+                            if !display_name.is_empty() {
+                                if let Ok(valid_name) = validate_display_name(&display_name) {
+                                    save_display_name_to_storage(&valid_name);
+                                    display_name_ctx.0.set(Some(valid_name.clone()));
+                                    input_value_state.set(valid_name);
+                                }
+                            }
+                        }
+                        user_profile.set(Some(profile));
+                    }
                 }
             });
         }

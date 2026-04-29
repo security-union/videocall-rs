@@ -207,10 +207,9 @@ impl AdaptiveQualityManager {
 
     /// Create a new manager for the given video tier array.
     ///
-    /// Starts at `DEFAULT_VIDEO_TIER_INDEX` (minimal/lowest). Starting at the
-    /// lowest tier ensures the system only ever upgrades, eliminating the
-    /// visible dimension-change oscillation that occurs when the PID controller
-    /// has not yet allocated enough bitrate for a higher tier.
+    /// Starts at `DEFAULT_VIDEO_TIER_INDEX` ("medium", 480p). The PID controller
+    /// steps up toward higher resolutions when bandwidth allows, or steps down
+    /// when the network is constrained.
     ///
     /// Use `VIDEO_QUALITY_TIERS` for camera, `SCREEN_QUALITY_TIERS` for screen share.
     ///
@@ -227,10 +226,11 @@ impl AdaptiveQualityManager {
 
     /// Create a new manager for screen share.
     ///
-    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` (medium/720p) to match the
-    /// camera strategy of only upgrading, never visibly downgrading. The
-    /// PID controller will quickly ramp up resolution once it measures
-    /// sufficient bandwidth.
+    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` ("medium", 720p/8fps — the midpoint
+    /// of the 3-tier screen-share ladder). Peers see an acceptable baseline
+    /// immediately and the PID controller adapts in either direction: stepping
+    /// up to 1080p when bandwidth is plentiful, or down to 720p/5fps when the
+    /// network is constrained.
     pub fn new_for_screen(video_tiers: &'static [VideoQualityTier]) -> Self {
         Self::new_with_warmup(
             video_tiers,
@@ -933,7 +933,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_screen_starts_at_lowest_tier() {
+    fn test_screen_starts_at_midpoint_tier() {
         let mgr = AdaptiveQualityManager::new_for_screen(SCREEN_QUALITY_TIERS);
         assert_eq!(mgr.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
         assert_eq!(mgr.audio_tier_index(), 0);
@@ -941,7 +941,7 @@ mod tests {
             mgr.current_video_tier().label,
             SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].label
         );
-        // Screen share starts at "medium" (720p) to avoid downgrade oscillation
+        // Screen share starts at the midpoint tier "medium" (720p/8fps)
         assert_eq!(mgr.current_video_tier().label, "medium");
     }
 

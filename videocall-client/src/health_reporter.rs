@@ -273,6 +273,18 @@ impl HealthReporter {
         *self.adaptive_audio_tier.borrow_mut() = audio_tier;
     }
 
+    /// Returns a clone of the video tier index atomic for external reads.
+    ///
+    /// Used by `VideoCallClient::camera_tier_index()` to expose the current
+    /// camera quality tier for adaptive screen-share tier selection.
+    pub fn video_tier_index(&self) -> Option<Rc<AtomicU32>> {
+        if let Ok(tier) = self.adaptive_video_tier.try_borrow() {
+            Some(tier.clone())
+        } else {
+            None
+        }
+    }
+
     /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder so the
     /// health reporter can include encoder decision inputs in each health packet.
     #[allow(clippy::too_many_arguments)]

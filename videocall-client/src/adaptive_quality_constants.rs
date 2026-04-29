@@ -498,6 +498,60 @@ pub const KEYFRAME_BACKOFF_DECAY_MS: u64 = 30_000;
 pub const ENCODER_PLI_COOLDOWN_MS: f64 = 2000.0;
 
 // ---------------------------------------------------------------------------
+// Screen Share Initial Tier Selection
+// ---------------------------------------------------------------------------
+
+/// Select the starting screen-share quality tier given the available network signals.
+///
+/// # Signals
+/// - `rtt_ms`: Most-recent average server RTT, or `None` if unknown (e.g. first meeting
+///   before any RTT probes have completed, or WebSocket-only deployment).
+/// - `camera_tier_index`: Current camera AQ tier index (0 = full-HD, higher = degraded).
+///   Pass `None` if camera is not started (screen-only share).
+///
+/// # Returns
+/// An index into `SCREEN_QUALITY_TIERS` (0 = high/1080p, 1 = medium/720p, 2 = low).
+///
+/// # Failure mode — cold start
+/// When `rtt_ms` is `None` (first meeting, no prior probes) and the camera has not yet
+/// been degraded, this function returns 0 (high/1080p).  The PID loop will ramp down
+/// within a few seconds if the uplink cannot sustain 2500 kbps.  The "readable
+/// first-frame within 3 s" guarantee only applies when at least one signal is present.
+pub fn initial_screen_tier(rtt_ms: Option<f64>, camera_tier_index: Option<usize>) -> usize {
+    // Cold start: no signals available, default to optimistic high tier
+    if rtt_ms.is_none() && camera_tier_index.is_none() {
+        return 0; // high
+    }
+
+    // RTT-based thresholds
+    let rtt_poor = rtt_ms.map(|rtt| rtt >= RTT_POOR_MS).unwrap_or(false);
+    let rtt_fair = rtt_ms.map(|rtt| rtt >= RTT_FAIR_MS).unwrap_or(false);
+
+    // Camera tier degradation indicators
+    // Camera tiers: 0=full_hd, 1=hd_plus, 2=hd, 3=standard, 4=medium, 5=low, 6=very_low, 7=minimal
+    // Threshold: ≥3 (sd/low) means camera is already degraded
+    let camera_degraded = camera_tier_index.map(|idx| idx >= 3).unwrap_or(false);
+
+    // Decision table:
+    // RTT >= POOR (400ms)     → low (2)
+    // RTT >= FAIR (200ms)     → medium (1)
+    // RTT < FAIR, camera ≥ sd → medium (1)  (camera already degraded)
+    // RTT < FAIR, camera < sd → high (0)    (good conditions)
+    // RTT None, camera ≥ sd   → medium (1)  (camera signal only)
+    // RTT None, camera < sd   → high (0)    (camera signal only, optimistic)
+
+    if rtt_poor {
+        return 2; // low
+    }
+
+    if rtt_fair || camera_degraded {
+        return 1; // medium
+    }
+
+    0 // high
+}
+
+// ---------------------------------------------------------------------------
 // Reconnection
 // ---------------------------------------------------------------------------
 
@@ -1048,6 +1102,84 @@ mod tests {
                     assert_ne!(label, other, "duplicate audio tier label: {}", label);
                 }
             }
+        }
+    }
+
+    // =====================================================================
+    // initial_screen_tier decision function
+    // =====================================================================
+
+    #[test]
+    fn initial_screen_tier_cold_start_returns_high() {
+        // No signals at all → optimistic high tier (existing behaviour unchanged).
+        assert_eq!(initial_screen_tier(None, None), 0);
+    }
+
+    #[test]
+    fn initial_screen_tier_good_rtt_good_camera_returns_high() {
+        // RTT well below FAIR threshold, camera not degraded → high tier.
+        assert_eq!(initial_screen_tier(Some(50.0), Some(1)), 0);
+        assert_eq!(initial_screen_tier(Some(RTT_GOOD_MS), Some(2)), 0);
+    }
+
+    #[test]
+    fn initial_screen_tier_fair_rtt_returns_medium() {
+        // RTT exactly at FAIR threshold → medium tier, regardless of camera.
+        assert_eq!(initial_screen_tier(Some(RTT_FAIR_MS), Some(0)), 1);
+        assert_eq!(initial_screen_tier(Some(RTT_FAIR_MS), None), 1);
+        // Above FAIR but below POOR → still medium.
+        assert_eq!(initial_screen_tier(Some(300.0), Some(1)), 1);
+    }
+
+    #[test]
+    fn initial_screen_tier_poor_rtt_returns_low() {
+        // RTT at or above POOR threshold → low tier regardless of camera.
+        assert_eq!(initial_screen_tier(Some(RTT_POOR_MS), Some(0)), 2);
+        assert_eq!(initial_screen_tier(Some(RTT_POOR_MS), None), 2);
+        assert_eq!(initial_screen_tier(Some(1000.0), Some(2)), 2);
+    }
+
+    #[test]
+    fn initial_screen_tier_degraded_camera_no_rtt_returns_medium() {
+        // Camera already at sd (3) or low (4) tier, RTT unknown → medium.
+        assert_eq!(initial_screen_tier(None, Some(3)), 1);
+        assert_eq!(initial_screen_tier(None, Some(4)), 1);
+    }
+
+    #[test]
+    fn initial_screen_tier_good_rtt_degraded_camera_returns_medium() {
+        // Good RTT but camera already degraded → conservative medium tier.
+        assert_eq!(initial_screen_tier(Some(50.0), Some(3)), 1);
+        assert_eq!(initial_screen_tier(Some(RTT_GOOD_MS), Some(4)), 1);
+    }
+
+    #[test]
+    fn initial_screen_tier_camera_only_not_degraded_returns_high() {
+        // Camera not degraded (tier ≤ 2), no RTT → high tier.
+        assert_eq!(initial_screen_tier(None, Some(0)), 0);
+        assert_eq!(initial_screen_tier(None, Some(2)), 0);
+    }
+
+    #[test]
+    fn initial_screen_tier_result_always_in_bounds() {
+        // Whatever inputs are given, result must be a valid SCREEN_QUALITY_TIERS index.
+        let cases = [
+            (None, None),
+            (Some(0.0), None),
+            (Some(RTT_FAIR_MS), Some(0)),
+            (Some(RTT_POOR_MS), Some(4)),
+            (Some(9999.0), Some(99)),
+        ];
+        for (rtt, cam) in cases {
+            let idx = initial_screen_tier(rtt, cam);
+            assert!(
+                idx < SCREEN_QUALITY_TIERS.len(),
+                "initial_screen_tier({:?}, {:?}) = {} is out of bounds (len={})",
+                rtt,
+                cam,
+                idx,
+                SCREEN_QUALITY_TIERS.len(),
+            );
         }
     }
 }

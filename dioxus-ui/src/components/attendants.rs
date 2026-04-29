@@ -101,6 +101,7 @@ impl DockPosition {
         }
     }
 
+    #[allow(dead_code)]
     fn next(self) -> Self {
         match self {
             DockPosition::Bottom => DockPosition::Left,

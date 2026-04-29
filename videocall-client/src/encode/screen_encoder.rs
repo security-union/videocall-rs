@@ -359,6 +359,42 @@ impl ScreenEncoder {
         }
     }
 
+    /// Apply the initial quality tier to shared atomics before starting the
+    /// encoding loop.  Called by both [`start`](Self::start) and
+    /// [`start_with_stream`](Self::start_with_stream).
+    fn apply_initial_tier(&mut self, initial_tier: usize) {
+        let clamped_tier = initial_tier.min(SCREEN_QUALITY_TIERS.len().saturating_sub(1));
+        if clamped_tier != initial_tier {
+            log::warn!(
+                "ScreenEncoder: initial_tier {} out of bounds, clamped to {}",
+                initial_tier,
+                clamped_tier
+            );
+        }
+
+        let tier = &SCREEN_QUALITY_TIERS[clamped_tier];
+        self.shared_screen_tier_index
+            .store(clamped_tier as u32, Ordering::Relaxed);
+        self.tier_max_width.store(tier.max_width, Ordering::Relaxed);
+        self.tier_max_height
+            .store(tier.max_height, Ordering::Relaxed);
+        self.tier_keyframe_interval
+            .store(tier.keyframe_interval_frames, Ordering::Relaxed);
+        self.current_bitrate
+            .store(tier.ideal_bitrate_kbps, Ordering::Relaxed);
+
+        log::info!(
+            "ScreenEncoder: initial tier {} '{}' ({}x{}, {}fps, kf={}, bitrate={}kbps)",
+            clamped_tier,
+            tier.label,
+            tier.max_width,
+            tier.max_height,
+            tier.target_fps,
+            tier.keyframe_interval_frames,
+            tier.ideal_bitrate_kbps,
+        );
+    }
+
     /// Start screen sharing with an already-acquired `MediaStream`.
     ///
     /// Safari requires `getDisplayMedia()` to be called synchronously within a
@@ -368,7 +404,9 @@ impl ScreenEncoder {
     ///
     /// The stream is consumed: this method takes ownership and will stop its
     /// tracks when encoding ends or `stop()` is called.
-    pub fn start_with_stream(&mut self, stream: MediaStream) {
+    pub fn start_with_stream(&mut self, stream: MediaStream, initial_tier: usize) {
+        self.apply_initial_tier(initial_tier);
+
         let EncoderState {
             enabled, switching, ..
         } = self.state.clone();
@@ -422,6 +460,12 @@ impl ScreenEncoder {
     /// Start encoding and sending the data to the client connection (if it's currently connected).
     /// The user is prompted by the browser to select which window or screen to encode.
     ///
+    /// # Arguments
+    /// * `initial_tier` - Starting tier index into `SCREEN_QUALITY_TIERS` (0=high, 1=medium, 2=low).
+    ///   This allows the caller to select a conservative starting tier based on network signals
+    ///   (e.g., RTT, camera tier index) at the moment screen sharing starts, giving a readable
+    ///   first frame on constrained uplinks without waiting for the PID loop to ramp down.
+    ///
     /// This will toggle the enabled state of the encoder.
     ///
     /// NOTE: On Safari, `getDisplayMedia()` must be called synchronously within a
@@ -429,7 +473,9 @@ impl ScreenEncoder {
     /// timeout or a re-render), Safari will reject the request.  In that case
     /// use [`start_with_stream`](Self::start_with_stream) instead, obtaining the
     /// stream directly in the click handler.
-    pub fn start(&mut self) {
+    pub fn start(&mut self, initial_tier: usize) {
+        self.apply_initial_tier(initial_tier);
+
         let EncoderState {
             enabled, switching, ..
         } = self.state.clone();
@@ -507,41 +553,41 @@ impl ScreenEncoder {
             let screen_to_share: MediaStream =
                 match media_devices.get_display_media_with_constraints(&constraints) {
                     Ok(promise) => match JsFuture::from(promise).await {
-                    Ok(stream) => stream.unchecked_into::<MediaStream>(),
-                    Err(e) => {
-                        // Check if user cancelled (NotAllowedError = permission denied/cancelled)
-                        let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
-                            .ok()
-                            .and_then(|v| v.as_string())
-                            .map(|name| name == "NotAllowedError")
-                            .unwrap_or(false);
+                        Ok(stream) => stream.unchecked_into::<MediaStream>(),
+                        Err(e) => {
+                            // Check if user cancelled (NotAllowedError = permission denied/cancelled)
+                            let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
+                                .ok()
+                                .and_then(|v| v.as_string())
+                                .map(|name| name == "NotAllowedError")
+                                .unwrap_or(false);
 
-                        if is_user_cancel {
-                            log::info!("User cancelled screen sharing");
-                            if let Some(ref callback) = on_state_change {
-                                callback.emit(ScreenShareEvent::Cancelled);
+                            if is_user_cancel {
+                                log::info!("User cancelled screen sharing");
+                                if let Some(ref callback) = on_state_change {
+                                    callback.emit(ScreenShareEvent::Cancelled);
+                                }
+                            } else {
+                                let error_msg = format!("{e:?}");
+                                error!("Screen sharing error: {error_msg}");
+                                if let Some(ref callback) = on_state_change {
+                                    callback.emit(ScreenShareEvent::Failed(error_msg));
+                                }
                             }
-                        } else {
-                            let error_msg = format!("{e:?}");
-                            error!("Screen sharing error: {error_msg}");
-                            if let Some(ref callback) = on_state_change {
-                                callback.emit(ScreenShareEvent::Failed(error_msg));
-                            }
+                            enabled.store(false, Ordering::Release);
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let error_msg = format!("{e:?}");
+                        error!("Failed to get display media: {error_msg}");
+                        if let Some(ref callback) = on_state_change {
+                            callback.emit(ScreenShareEvent::Failed(error_msg));
                         }
                         enabled.store(false, Ordering::Release);
                         return;
                     }
-                },
-                Err(e) => {
-                    let error_msg = format!("{e:?}");
-                    error!("Failed to get display media: {error_msg}");
-                    if let Some(ref callback) = on_state_change {
-                        callback.emit(ScreenShareEvent::Failed(error_msg));
-                    }
-                    enabled.store(false, Ordering::Release);
-                    return;
-                }
-            };
+                };
 
             log::info!("Screen to share: {screen_to_share:?}");
 
@@ -690,8 +736,7 @@ impl ScreenEncoder {
             error!("Screen encoder error: {e:?}");
         }) as Box<dyn FnMut(JsValue)>);
 
-        let screen_output_handler =
-            Closure::wrap(screen_output_handler as Box<dyn FnMut(JsValue)>);
+        let screen_output_handler = Closure::wrap(screen_output_handler as Box<dyn FnMut(JsValue)>);
 
         let screen_encoder_init = VideoEncoderInit::new(
             screen_error_handler.as_ref().unchecked_ref(),
@@ -775,17 +820,17 @@ impl ScreenEncoder {
             return;
         }
 
-        let screen_processor = match MediaStreamTrackProcessor::new(
-            &MediaStreamTrackProcessorInit::new(&media_track),
-        ) {
-            Ok(processor) => processor,
-            Err(e) => {
-                let msg = format!("Failed to create media stream track processor: {e:?}");
-                error!("{msg}");
-                cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
-                return;
-            }
-        };
+        let screen_processor =
+            match MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(&media_track))
+            {
+                Ok(processor) => processor,
+                Err(e) => {
+                    let msg = format!("Failed to create media stream track processor: {e:?}");
+                    error!("{msg}");
+                    cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
+                    return;
+                }
+            };
 
         // All setup complete - NOW emit Started event and notify peers
         client_for_state.set_screen_enabled(true);
@@ -933,9 +978,7 @@ impl ScreenEncoder {
                         new_config.set_latency_mode(LatencyMode::Realtime);
                         set_vbr_mode(&new_config);
                         if let Err(e) = screen_encoder.configure(&new_config) {
-                            error!(
-                                "Error reconfiguring screen encoder with new dimensions: {e:?}"
-                            );
+                            error!("Error reconfiguring screen encoder with new dimensions: {e:?}");
                         }
                     }
 
@@ -946,8 +989,7 @@ impl ScreenEncoder {
                         .performance()
                         .expect("Performance API not available")
                         .now();
-                    let pli_cooldown_ok =
-                        (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
+                    let pli_cooldown_ok = (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
                     let force_pli = pli_requested && pli_cooldown_ok;
                     if force_pli {
                         last_pli_keyframe_time = now;

@@ -4,12 +4,12 @@
  */
 
 use crate::components::login::{do_login, ProviderButton};
-use crate::components::meeting_format::{format_duration, format_time};
 use crate::constants::meeting_api_client;
 use crate::local_storage::{load_bool, save_bool};
 use crate::routing::Route;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::{ListMeetingsResponse, MeetingSummary};
+use wasm_bindgen::JsCast;
 
 /// `localStorage` key for the "My Meetings" section's expand/collapse state.
 /// Defaults to expanded (`true`) on first load.
@@ -180,10 +180,15 @@ fn MeetingItem(
         _ => "state-ended",
     };
 
-    let duration_ms = meeting
-        .ended_at
-        .map(|ended_at| ended_at - meeting.started_at)
-        .unwrap_or(0);
+    let duration_ms = if is_active {
+        let now_ms = js_sys::Date::now() as i64;
+        (now_ms - meeting.started_at).max(0)
+    } else {
+        meeting
+            .ended_at
+            .map(|ended_at| ended_at - meeting.started_at)
+            .unwrap_or(0)
+    };
 
     let meeting_id = meeting.meeting_id.clone();
     let meeting_id_click = meeting_id.clone();
@@ -221,85 +226,35 @@ fn MeetingItem(
         });
     };
 
+    let tooltip_html = build_meeting_tooltip_html(&meeting, is_active, is_ended, duration_ms);
+    let tooltip_html_for_show = tooltip_html.clone();
+
     rsx! {
-        li { class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" }, style: "flex-wrap: wrap;",
+        li {
+            class: if is_ended { "meeting-item meeting-ended" } else { "meeting-item" },
+            onmouseenter: move |e: MouseEvent| {
+                let coords = e.client_coordinates();
+                show_meeting_info_tooltip(coords.x, coords.y, &tooltip_html_for_show);
+            },
+            onmousemove: move |e: MouseEvent| {
+                let coords = e.client_coordinates();
+                position_meeting_info_tooltip(coords.x, coords.y);
+            },
+            onmouseleave: move |_| hide_meeting_info_tooltip(),
             div { class: "meeting-item-content", onclick: on_click,
                 div { class: "meeting-info",
                     span { class: "meeting-id", "{meeting.meeting_id}" }
-                    span { class: "meeting-state {state_class}", "{meeting.state}" }
-                }
-                div { class: "meeting-details",
-                    if is_active {
-                        span { class: "meeting-participants", title: "Participants in meeting",
-                            svg {
-                                xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                path { d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" }
-                                circle { cx: "9", cy: "7", r: "4" }
-                                path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
-                                path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
+                    {
+                        let state_label = {
+                            let s = &meeting.state;
+                            let mut c = s.chars();
+                            match c.next() {
+                                None => String::new(),
+                                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
                             }
-                            "{meeting.participant_count} joined"
-                        }
-                        if meeting.waiting_count > 0 {
-                            span { class: "meeting-waiting", title: "Waiting to join",
-                                svg {
-                                    xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                    circle { cx: "12", cy: "12", r: "10" }
-                                    line { x1: "12", y1: "8", x2: "12", y2: "12" }
-                                    line { x1: "12", y1: "16", x2: "12.01", y2: "16" }
-                                }
-                                "{meeting.waiting_count} waiting"
-                            }
-                        }
-                    }
-                    if is_ended {
-                        span { class: "meeting-duration", title: "Total duration",
-                            svg {
-                                xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                circle { cx: "12", cy: "12", r: "10" }
-                                polyline { points: "12 6 12 12 16 14" }
-                            }
-                            "{format_duration(duration_ms)}"
-                        }
-                        span { class: "meeting-time", title: "Started at {format_time(meeting.started_at)}",
-                            "{format_time(meeting.started_at)}"
-                        }
-                        span { class: "meeting-time-separator", "-" }
-                        if let Some(ended_at) = meeting.ended_at {
-                            span { class: "meeting-time", title: "Ended at {format_time(ended_at)}",
-                                "{format_time(ended_at)}"
-                            }
-                        }
-                    }
-                    if !is_active && !is_ended {
-                        span { class: "meeting-participants", title: "Participants",
-                            svg {
-                                xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                path { d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" }
-                                circle { cx: "9", cy: "7", r: "4" }
-                                path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
-                                path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
-                            }
-                            "{meeting.participant_count}"
-                        }
-                    }
-                    if meeting.has_password {
-                        span { class: "meeting-password", title: "Password protected",
-                            svg {
-                                xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                                view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                                stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                                rect { x: "3", y: "11", width: "18", height: "11", rx: "2", ry: "2" }
-                                path { d: "M7 11V7a5 5 0 0 1 10 0v4" }
-                            }
+                        };
+                        rsx! {
+                            span { class: "meeting-state {state_class}", "{state_label}" }
                         }
                     }
                 }
@@ -355,4 +310,119 @@ async fn do_delete_meeting(meeting_id: &str) -> Result<(), String> {
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))
+}
+
+/// Build the inner HTML for the meeting-info hover tooltip.
+fn build_meeting_tooltip_html(
+    meeting: &MeetingSummary,
+    is_active: bool,
+    is_ended: bool,
+    duration_ms: i64,
+) -> String {
+    use crate::components::meeting_format::{format_datetime, format_duration};
+    let mut rows: Vec<String> = Vec::new();
+    rows.push(tooltip_row(
+        "Created on",
+        &format_datetime(meeting.created_at),
+    ));
+    if is_active {
+        rows.push(tooltip_row(
+            "Started on",
+            &format_datetime(meeting.started_at),
+        ));
+        rows.push(tooltip_row("Duration", &format_duration(duration_ms)));
+        rows.push(tooltip_row(
+            "Attendees",
+            &meeting.participant_count.to_string(),
+        ));
+        if meeting.waiting_count > 0 {
+            rows.push(tooltip_row("Waiting", &meeting.waiting_count.to_string()));
+        }
+    } else if is_ended {
+        rows.push(tooltip_row(
+            "Last active on",
+            &format_datetime(meeting.started_at),
+        ));
+        rows.push(tooltip_row("Duration", &format_duration(duration_ms)));
+    } else {
+        rows.push(tooltip_row(
+            "Last active on",
+            &format_datetime(meeting.started_at),
+        ));
+    }
+    if meeting.has_password {
+        rows.push(tooltip_row("Password", "Protected"));
+    }
+    rows.join("")
+}
+
+fn tooltip_row(label: &str, value: &str) -> String {
+    format!(
+        "<div class=\"meeting-info-tooltip-row\">\
+         <span class=\"meeting-info-tooltip-label\">{label}</span>\
+         <span class=\"meeting-info-tooltip-value\">{value}</span>\
+         </div>"
+    )
+}
+
+/// Get-or-create the body-level tooltip element. Mirrors the pattern in `signal_quality.rs`.
+fn get_or_create_meeting_tooltip_el() -> web_sys::HtmlElement {
+    let doc = gloo_utils::document();
+    if let Some(el) = doc.get_element_by_id("meeting-info-tooltip-global") {
+        el.unchecked_into()
+    } else {
+        let el = doc.create_element("div").unwrap();
+        el.set_id("meeting-info-tooltip-global");
+        el.set_class_name("meeting-info-tooltip-portal");
+        let html_el: web_sys::HtmlElement = el.unchecked_into();
+        doc.body().unwrap().append_child(&html_el).unwrap();
+        html_el
+    }
+}
+
+fn show_meeting_info_tooltip(x: f64, y: f64, html: &str) {
+    let el = get_or_create_meeting_tooltip_el();
+    el.set_inner_html(html);
+    position_meeting_info_tooltip(x, y);
+    let _ = el.class_list().add_1("is-visible");
+}
+
+fn position_meeting_info_tooltip(x: f64, y: f64) {
+    if let Some(el) = gloo_utils::document().get_element_by_id("meeting-info-tooltip-global") {
+        let html_el: web_sys::HtmlElement = el.unchecked_into();
+        let rect = html_el.get_bounding_client_rect();
+        let win = gloo_utils::window();
+        let vw = win
+            .inner_width()
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let vh = win
+            .inner_height()
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let offset = 16.0;
+        let edge_margin = 8.0;
+        let tooltip_w = rect.width().max(192.0);
+        let tooltip_h = rect.height().max(40.0);
+        let mut left = x + offset;
+        let mut top = y + offset;
+        if left + tooltip_w + edge_margin > vw {
+            left = (x - tooltip_w - offset).max(edge_margin);
+        }
+        if top + tooltip_h + edge_margin > vh {
+            top = (y - tooltip_h - offset).max(edge_margin);
+        }
+        let style = html_el.style();
+        style.set_property("left", &format!("{left:.0}px")).unwrap();
+        style.set_property("top", &format!("{top:.0}px")).unwrap();
+    }
+}
+
+fn hide_meeting_info_tooltip() {
+    if let Some(el) = gloo_utils::document().get_element_by_id("meeting-info-tooltip-global") {
+        let html_el: web_sys::HtmlElement = el.unchecked_into();
+        let _ = html_el.class_list().remove_1("is-visible");
+    }
 }

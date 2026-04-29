@@ -247,6 +247,7 @@ pub async fn list_joined_meetings(
             waiting_count,
             has_password: row.password_hash.is_some(),
             is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
+            created_at: row.created_at.timestamp_millis(),
             last_joined_at: row.last_joined_at.timestamp_millis(),
         });
     }

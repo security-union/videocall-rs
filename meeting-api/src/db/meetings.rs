@@ -246,6 +246,7 @@ pub struct JoinedMeetingRow {
     pub room_id: String,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
     pub creator_id: Option<String>,
     pub password_hash: Option<String>,
     pub state: Option<String>,
@@ -272,6 +273,7 @@ pub async fn list_joined_by_user(
                m.room_id,
                m.started_at,
                m.ended_at,
+               m.created_at,
                m.creator_id,
                m.password_hash,
                m.state,
@@ -314,11 +316,24 @@ pub async fn soft_delete(
 }
 
 /// Activate a meeting (set state to 'active').
+///
+/// On a fresh activation (transitioning from `idle` or `ended`) this also
+/// refreshes `started_at = NOW()` and clears `ended_at = NULL` so the row
+/// reflects the most recent activation. When the meeting is already
+/// `active` the call is idempotent — no timestamps are touched.
 pub async fn activate(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE meetings SET state = 'active' WHERE id = $1")
-        .bind(meeting_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        r#"
+        UPDATE meetings
+        SET state = 'active',
+            started_at = CASE WHEN state IN ('idle', 'ended') THEN NOW() ELSE started_at END,
+            ended_at   = CASE WHEN state IN ('idle', 'ended') THEN NULL  ELSE ended_at   END
+        WHERE id = $1
+        "#,
+    )
+    .bind(meeting_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

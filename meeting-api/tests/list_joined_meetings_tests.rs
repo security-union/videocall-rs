@@ -41,6 +41,13 @@ use videocall_meeting_types::{
     APIError,
 };
 
+/// Lower bound for any Unix epoch timestamp emitted as **milliseconds**.
+///
+/// 1_000_000_000_000 ms = 2001-09-09. A timestamp at or above this floor is
+/// conclusively in milliseconds; one below it (but above 0) is almost
+/// certainly seconds — the regression these checks guard against.
+const MS_LOWER_BOUND: i64 = 1_000_000_000_000;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Build an Axum router with `allow_anonymous = false` so missing credentials
@@ -216,11 +223,34 @@ async fn test_list_joined_includes_owned_meeting_with_is_owner_true() {
     let m = &body.result.meetings[0];
     assert_eq!(m.meeting_id, room_id);
     assert!(m.is_owner, "host must be flagged as owner");
+    // All `JoinedMeetingSummary` timestamps are documented as Unix epoch
+    // milliseconds. A loose `> 0` check would silently accept a regression to
+    // seconds; the ms floor (~2001-09-09) catches that immediately.
     assert!(
-        m.last_joined_at > 0,
-        "last_joined_at must be a positive epoch ms"
+        m.last_joined_at >= MS_LOWER_BOUND,
+        "last_joined_at must be in milliseconds (>= {MS_LOWER_BOUND}), got {}",
+        m.last_joined_at
     );
-    assert!(m.started_at > 0, "started_at must be a positive epoch ms");
+    assert!(
+        m.started_at >= MS_LOWER_BOUND,
+        "started_at must be in milliseconds (>= {MS_LOWER_BOUND}), got {}",
+        m.started_at
+    );
+    assert!(
+        m.created_at >= MS_LOWER_BOUND,
+        "created_at must be in milliseconds (>= {MS_LOWER_BOUND}), got {}",
+        m.created_at
+    );
+    // `created_at` is immutable; `started_at` is set on creation and refreshed
+    // on every idle/ended -> active transition. So `created_at <= started_at`
+    // must always hold for any meeting that has been joined (joining drives
+    // activation, which refreshes `started_at` to >= the creation time).
+    assert!(
+        m.created_at <= m.started_at,
+        "created_at ({}) must be <= started_at ({}) — created precedes any activation",
+        m.created_at,
+        m.started_at
+    );
 
     cleanup_test_data(&pool, room_id).await;
 }
@@ -463,11 +493,116 @@ async fn test_list_joined_includes_ended_meetings() {
             m.ended_at.is_some(),
             "ended_at must be populated for an ended meeting"
         );
+        let ended_at = m.ended_at.unwrap();
         assert!(
-            m.ended_at.unwrap() >= m.started_at,
-            "ended_at must be >= started_at"
+            ended_at >= MS_LOWER_BOUND,
+            "ended_at must be in milliseconds (>= {MS_LOWER_BOUND}), got {ended_at}"
+        );
+        assert!(
+            ended_at >= m.started_at,
+            "ended_at ({ended_at}) must be >= started_at ({})",
+            m.started_at
+        );
+        // `created_at` is set at INSERT time and never moves; it must precede
+        // both `started_at` (which is refreshed on activation) and `ended_at`
+        // (set when the host ends the meeting).
+        assert!(
+            m.created_at >= MS_LOWER_BOUND,
+            "created_at must be in milliseconds (>= {MS_LOWER_BOUND}), got {}",
+            m.created_at
+        );
+        assert!(
+            m.created_at <= m.started_at,
+            "created_at ({}) must be <= started_at ({})",
+            m.created_at,
+            m.started_at
+        );
+        assert!(
+            m.created_at <= ended_at,
+            "created_at ({}) must be <= ended_at ({ended_at})",
+            m.created_at
         );
     }
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Scenario 8b: created_at is exposed and immutable across re-activation ────
+
+/// `JoinedMeetingSummary.created_at` is a new field. Lock in:
+/// 1. The field is present and emitted in **milliseconds** for every entry.
+/// 2. `created_at <= started_at` for every entry.
+/// 3. `created_at` is immutable across an end-and-rejoin cycle, even though
+///    `started_at` is refreshed by the new `activate()` semantics.
+#[tokio::test]
+#[serial]
+async fn test_list_joined_exposes_immutable_created_at_across_reactivation() {
+    let pool = get_test_pool().await;
+    let host = "joined-created-at-host@example.com";
+    let room_id = "joined-test-created-at-immutable";
+
+    create_meeting_wr_off(&pool, host, room_id).await;
+    // Join → activates the meeting (refreshing started_at to NOW()).
+    join_meeting(&pool, room_id, host).await;
+
+    let body = list_joined(&pool, host, None).await;
+    assert!(body.success);
+    let m_before = body
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("meeting must appear in joined list after first join")
+        .clone();
+    assert!(
+        m_before.created_at >= MS_LOWER_BOUND,
+        "created_at must be in milliseconds (>= {MS_LOWER_BOUND}), got {}",
+        m_before.created_at
+    );
+    assert!(
+        m_before.created_at <= m_before.started_at,
+        "created_at ({}) must be <= started_at ({}) on first activation",
+        m_before.created_at,
+        m_before.started_at
+    );
+
+    // End and re-activate via a second join. The activate() change refreshes
+    // started_at on the ended -> active transition, but created_at must stay
+    // pinned to the original INSERT time.
+    end_meeting(&pool, room_id, host).await;
+    // Wait long enough that NOW() advances past the original started_at, so a
+    // refresh of started_at is visibly forward-moving.
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    join_meeting(&pool, room_id, host).await;
+
+    let body = list_joined(&pool, host, None).await;
+    assert!(body.success);
+    let m_after = body
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("meeting must still appear in joined list after re-activation");
+
+    assert_eq!(
+        m_after.created_at, m_before.created_at,
+        "created_at must be immutable across an end-and-rejoin cycle; \
+         before={}, after={}",
+        m_before.created_at, m_after.created_at
+    );
+    assert!(
+        m_after.started_at > m_before.started_at,
+        "started_at must advance forward on re-activation; \
+         before={}, after={}",
+        m_before.started_at,
+        m_after.started_at
+    );
+    assert!(
+        m_after.created_at <= m_after.started_at,
+        "created_at ({}) must remain <= started_at ({}) post re-activation",
+        m_after.created_at,
+        m_after.started_at
+    );
 
     cleanup_test_data(&pool, room_id).await;
 }

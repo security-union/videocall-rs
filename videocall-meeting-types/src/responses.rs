@@ -74,7 +74,7 @@ impl APIResponse<crate::error::APIError> {
 pub struct CreateMeetingResponse {
     pub meeting_id: String,
     pub host: String,
-    /// Unix timestamp in seconds when the meeting was created.
+    /// Unix timestamp in milliseconds when the meeting was created.
     pub created_at: i64,
     pub state: String,
     pub attendees: Vec<String>,

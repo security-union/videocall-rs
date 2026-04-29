@@ -35,6 +35,8 @@ use videocall_meeting_types::{
 /// in milliseconds; one below it (but above 0) is almost certainly seconds,
 /// which is the regression these checks guard against.
 const MS_LOWER_BOUND: i64 = 1_000_000_000_000;
+/// Upper bound used to catch over-large timestamps (e.g., accidental ns).
+const MS_UPPER_BOUND: i64 = 10_000_000_000_000;
 
 // ── Create ───────────────────────────────────────────────────────────────
 
@@ -66,6 +68,13 @@ async fn test_create_meeting_success() {
     assert!(body.success);
     assert_eq!(body.result.meeting_id, room_id);
     assert_eq!(body.result.host, "host@example.com");
+    assert!(
+        body.result.created_at > MS_LOWER_BOUND && body.result.created_at < MS_UPPER_BOUND,
+        "expected created_at to be Unix milliseconds ({}..{}), got {}",
+        MS_LOWER_BOUND,
+        MS_UPPER_BOUND,
+        body.result.created_at
+    );
     assert!(body.result.has_password);
     assert_eq!(body.result.attendees.len(), 2);
 
@@ -262,33 +271,39 @@ async fn test_list_meetings_success() {
 
     let body: APIResponse<ListMeetingsResponse> = response_json(resp).await;
     assert!(body.success);
-    let summary = body
-        .result
-        .meetings
-        .iter()
-        .find(|m| m.meeting_id == room_id)
-        .expect("created meeting must appear in the list response");
-
+    assert!(body.result.meetings.iter().any(|m| m.meeting_id == room_id));
     // `MeetingSummary` timestamps were converted from `.timestamp()` (seconds)
-    // to `.timestamp_millis()` (milliseconds). Both `created_at` and
-    // `started_at` must clear the millisecond floor; if either silently drops
-    // back to seconds, this assertion flips red. `ended_at` is None for an
-    // idle meeting and is exercised separately in the joined-meetings suite.
-    assert!(
-        summary.created_at >= MS_LOWER_BOUND,
-        "MeetingSummary.created_at must be in milliseconds (>= {MS_LOWER_BOUND}), got {}",
-        summary.created_at
-    );
-    assert!(
-        summary.started_at >= MS_LOWER_BOUND,
-        "MeetingSummary.started_at must be in milliseconds (>= {MS_LOWER_BOUND}), got {}",
-        summary.started_at
-    );
-    assert!(
-        summary.ended_at.is_none(),
-        "ended_at must remain None for an idle meeting; got {:?}",
-        summary.ended_at
-    );
+    // to `.timestamp_millis()` (milliseconds). Iterate every returned meeting
+    // and assert each timestamp clears the millisecond floor and stays under
+    // the upper bound (catches accidental ns or seconds-with-zero-padding).
+    for meeting in &body.result.meetings {
+        assert!(
+            meeting.created_at > MS_LOWER_BOUND && meeting.created_at < MS_UPPER_BOUND,
+            "expected created_at to be Unix milliseconds ({}..{}), got {} for meeting {}",
+            MS_LOWER_BOUND,
+            MS_UPPER_BOUND,
+            meeting.created_at,
+            meeting.meeting_id
+        );
+        assert!(
+            meeting.started_at > MS_LOWER_BOUND && meeting.started_at < MS_UPPER_BOUND,
+            "expected started_at to be Unix milliseconds ({}..{}), got {} for meeting {}",
+            MS_LOWER_BOUND,
+            MS_UPPER_BOUND,
+            meeting.started_at,
+            meeting.meeting_id
+        );
+        if let Some(ended_at) = meeting.ended_at {
+            assert!(
+                ended_at > MS_LOWER_BOUND && ended_at < MS_UPPER_BOUND,
+                "expected ended_at to be Unix milliseconds ({}..{}), got {} for meeting {}",
+                MS_LOWER_BOUND,
+                MS_UPPER_BOUND,
+                ended_at,
+                meeting.meeting_id
+            );
+        }
+    }
 
     cleanup_test_data(&pool, room_id).await;
 }

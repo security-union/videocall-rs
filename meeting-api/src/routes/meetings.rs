@@ -136,7 +136,7 @@ pub async fn create_meeting(
     let response = CreateMeetingResponse {
         meeting_id: row.room_id,
         host: user_id,
-        created_at: row.created_at.timestamp(),
+        created_at: row.created_at.timestamp_millis(),
         state: row.state.unwrap_or_else(|| "idle".to_string()),
         attendees: body.attendees,
         has_password: password_hash.is_some(),

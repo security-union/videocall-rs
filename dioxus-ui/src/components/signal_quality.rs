@@ -340,7 +340,17 @@ fn get_or_create_tooltip_el() -> web_sys::HtmlElement {
 }
 
 /// Show the tooltip at viewport coordinates with metric content.
-fn show_body_tooltip(x: f64, y: f64, time_str: &str, sample: &SignalSample) {
+#[allow(clippy::too_many_arguments)]
+fn show_body_tooltip(
+    x: f64,
+    y: f64,
+    time_str: &str,
+    sample: &SignalSample,
+    show_video: bool,
+    show_audio: bool,
+    show_screen: bool,
+    show_latency: bool,
+) {
     let el = get_or_create_tooltip_el();
     let style = el.style();
     style.set_property("left", &format!("{x:.0}px")).unwrap();
@@ -348,47 +358,80 @@ fn show_body_tooltip(x: f64, y: f64, time_str: &str, sample: &SignalSample) {
     style.set_property("display", "block").unwrap();
 
     let video_tier = infer_video_tier(&sample.video_resolution);
-    let video_line = if sample.video_resolution.is_empty() {
+    let video_line = if show_video {
+        if sample.video_resolution.is_empty() {
+            format!(
+                "<span style='color:#81C784'>Video: {:.1} fps | {:.0} kbps</span>",
+                sample.video_fps, sample.video_bitrate_kbps
+            )
+        } else if video_tier.is_empty() {
+            format!(
+                "<span style='color:#81C784'>Video: {} | {:.1} fps | {:.0} kbps</span>",
+                sample.video_resolution, sample.video_fps, sample.video_bitrate_kbps
+            )
+        } else {
+            format!(
+                "<span style='color:#81C784'>Video: {} ({}) | {:.1} fps | {:.0} kbps</span>",
+                sample.video_resolution, video_tier, sample.video_fps, sample.video_bitrate_kbps
+            )
+        }
+    } else {
+        String::new()
+    };
+    let audio_line = if show_audio {
         format!(
-            "<span style='color:#81C784'>Video: {:.1} fps | {:.0} kbps</span>",
-            sample.video_fps, sample.video_bitrate_kbps
-        )
-    } else if video_tier.is_empty() {
-        format!(
-            "<span style='color:#81C784'>Video: {} | {:.1} fps | {:.0} kbps</span>",
-            sample.video_resolution, sample.video_fps, sample.video_bitrate_kbps
+            "<span style='color:#4FC3F7'>Audio: buf {:.0}ms | expand {:.0}\u{2030}</span>",
+            sample.audio_buffer_ms, sample.audio_expand_rate
         )
     } else {
-        format!(
-            "<span style='color:#81C784'>Video: {} ({}) | {:.1} fps | {:.0} kbps</span>",
-            sample.video_resolution, video_tier, sample.video_fps, sample.video_bitrate_kbps
-        )
+        String::new()
     };
-    let audio_line = format!(
-        "<span style='color:#4FC3F7'>Audio: buf {:.0}ms | expand {:.0}\u{2030}</span>",
-        sample.audio_buffer_ms, sample.audio_expand_rate
-    );
-    let screen_line = if sample.screen_enabled {
+    let screen_line = if show_screen && sample.screen_enabled {
         format!(
-            "<br><span style='color:#CE93D8'>Screen: {:.1} fps | {:.0} kbps</span>",
+            "<span style='color:#CE93D8'>Screen: {:.1} fps | {:.0} kbps</span>",
             sample.screen_fps, sample.screen_bitrate_kbps
         )
     } else {
         String::new()
     };
-    let latency_line = format!(
-        "<span style='color:#FF8A65'>Latency: {:.0} ms</span>",
-        sample.latency_ms
-    );
+    let latency_line = if show_latency {
+        format!(
+            "<span style='color:#FF8A65'>Server RTT: {:.0} ms</span>",
+            sample.latency_ms
+        )
+    } else {
+        String::new()
+    };
 
-    el.set_inner_html(&format!(
-        "<div>Time: {time_str}</div>\
-         <div style='border-bottom:1px solid rgba(255,255,255,0.15);margin:2px 0'></div>\
-         <div>{video_line}</div>\
-         <div>{audio_line}</div>\
-         {screen_line}\
-         <div>{latency_line}</div>"
-    ));
+    let lines: Vec<String> = [
+        Some(format!(
+            "<div>Time: {time_str}</div><div style='border-bottom:1px solid rgba(255,255,255,0.15);margin:2px 0'></div>"
+        )),
+        if video_line.is_empty() {
+            None
+        } else {
+            Some(format!("<div>{video_line}</div>"))
+        },
+        if audio_line.is_empty() {
+            None
+        } else {
+            Some(format!("<div>{audio_line}</div>"))
+        },
+        if screen_line.is_empty() {
+            None
+        } else {
+            Some(format!("<div>{screen_line}</div>"))
+        },
+        if latency_line.is_empty() {
+            None
+        } else {
+            Some(format!("<div>{latency_line}</div>"))
+        },
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    el.set_inner_html(&lines.join(""));
 }
 
 fn infer_video_tier(resolution: &str) -> &'static str {
@@ -609,6 +652,23 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                     class: "signal-chart-scroll",
                     id: "{scroll_id}",
                     style: "{visible_width_style}",
+                    onscroll: {
+                        let scroll_id = scroll_id.clone();
+                        move |_| {
+                            let doc = gloo_utils::document();
+                            if let Some(src) = doc.get_element_by_id(&scroll_id) {
+                                let scroll_left = src.scroll_left();
+                                let els = doc.get_elements_by_class_name("signal-chart-scroll");
+                                for i in 0..els.length() {
+                                    if let Some(el) = els.item(i) {
+                                        if el.id() != scroll_id {
+                                            el.set_scroll_left(scroll_left);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
                     svg {
                         xmlns: "http://www.w3.org/2000/svg",
                         width: "{chart_width_px}",
@@ -641,10 +701,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                                 rsx! {
                                     line {
                                         x1: "{x}",
-                                        y1: "{y_bottom}",
+                                        y1: "{padding_top}",
                                         x2: "{x}",
-                                        y2: "{y_bottom:.0}",
-                                        stroke: "rgba(255,255,255,0.15)",
+                                        y2: "{y_bottom}",
+                                        stroke: "rgba(255,255,255,0.07)",
                                         stroke_width: "0.5",
                                     }
                                     text {
@@ -693,10 +753,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             polyline {
                                 points: "{latency_points}",
                                 fill: "none",
-                                stroke: "#FF8A65",
-                                stroke_width: "1.5",
+                                stroke: "rgba(255,138,101,0.4)",
+                                stroke_width: "1",
                                 stroke_linejoin: "round",
-                                stroke_dasharray: "4 2",
+                                stroke_dasharray: "3 6",
                             }
                         }
                     }
@@ -714,6 +774,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             div {
                                 style: "{overlay_style}",
                                 onmousemove: move |evt: MouseEvent| {
+                                    let v_audio = show_audio();
+                                    let v_video = show_video();
+                                    let v_screen = show_screen();
+                                    let v_latency = show_latency();
                                     let client = evt.client_coordinates();
                                     let elem = evt.element_coordinates();
                                     let time_offset_sec = elem.x / px_per_sec;
@@ -742,6 +806,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                                             client.y - 10.0,
                                             &time_str,
                                             sample,
+                                            v_video,
+                                            v_audio,
+                                            v_screen,
+                                            v_latency,
                                         );
                                     }
                                 },
@@ -860,7 +928,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         onchange: move |_| show_latency.set(!show_latency()),
                     }
                     span { class: "dot", style: "background: #FF8A65;" }
-                    "Latency"
+                    "Server RTT"
                     button {
                         class: "legend-help-btn",
                         onclick: move |_| {
@@ -923,12 +991,13 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             }
                         },
                         "latency" => rsx! {
-                            strong { "Latency (RTT)" }
+                            strong { "Server RTT" }
                             p { "Round-trip time from your device to the relay server and back." }
+                            p { "This is the same value for all peers in your session — it measures your connection to the relay, not end-to-end latency to each peer." }
                             p {
                                 "Below 50ms is excellent. "
                                 "50\u{2013}150ms is acceptable. "
-                                "Above 200ms causes noticeable delay in the conversation."
+                                "Above 200ms causes noticeable delay."
                             }
                         },
                         _ => rsx! {},

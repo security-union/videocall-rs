@@ -970,6 +970,55 @@ impl VideoCallClient {
         None
     }
 
+    /// Returns the most-recent average RTT across all active connections, or None if unknown.
+    ///
+    /// Used for adaptive initial screen-share quality selection. Computes the
+    /// average over all connections that have at least one RTT measurement.
+    pub fn average_rtt_ms(&self) -> Option<f64> {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                let measurements = controller.get_rtt_measurements_clone();
+                let rtts: Vec<f64> = measurements
+                    .values()
+                    .filter_map(|m| m.average_rtt)
+                    .collect();
+                if rtts.is_empty() {
+                    return None;
+                }
+                let sum: f64 = rtts.iter().sum();
+                Some(sum / rtts.len() as f64)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Returns the current camera AQ tier index (0 = highest quality), or None if camera not active.
+    ///
+    /// Used for adaptive initial screen-share quality selection. The camera
+    /// encoder writes this atomic whenever the quality manager changes tiers.
+    pub fn camera_tier_index(&self) -> Option<usize> {
+        // The camera encoder updates `shared_video_tier_index` via its
+        // encoder control loop. This is only available after the encoder is
+        // created and wired up (via `set_adaptive_tier_sources`), which
+        // happens in the Host component before screen share can start.
+        // If the encoder hasn't been created yet, return None.
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(reporter) = hr.try_borrow() {
+                    if let Some(tier_atomic) = reporter.video_tier_index() {
+                        return Some(
+                            tier_atomic.load(std::sync::atomic::Ordering::Relaxed) as usize
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn send_rtt_probes(&self) -> anyhow::Result<()> {
         if let Ok(cc) = self.connection_controller.try_borrow() {
             if cc.is_some() {

@@ -25,7 +25,9 @@ use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
-use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
+use videocall_client::{
+    initial_screen_tier, CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use std::cell::RefCell;
@@ -400,10 +402,25 @@ pub fn Host(
             s.prev_share_screen = share_screen;
             if share_screen {
                 s.screen.set_enabled(true);
-                log::info!("Start screen share encoder");
+
+                // Adaptive initial tier selection: inspect network signals at
+                // the moment screen sharing starts to choose a conservative
+                // starting tier that gives a readable first frame on constrained
+                // uplinks without waiting for the PID loop to ramp down.
+                let rtt_ms = client.average_rtt_ms();
+                let camera_tier_index = client.camera_tier_index();
+                let initial_tier = initial_screen_tier(rtt_ms, camera_tier_index);
+
+                log::info!(
+                    "Start screen share encoder: rtt={:?}ms, camera_tier={:?}, initial_tier={}",
+                    rtt_ms,
+                    camera_tier_index,
+                    initial_tier
+                );
+
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
-                    state_clone.borrow_mut().screen.start();
+                    state_clone.borrow_mut().screen.start(initial_tier);
                 })
                 .forget();
             } else {

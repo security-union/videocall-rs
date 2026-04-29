@@ -167,7 +167,10 @@ sequenceDiagram
 
 ## Timestamps
 
-All timestamps in API responses are **Unix seconds** (not milliseconds). This applies to `created_at`, `started_at`, `ended_at`, `joined_at`, and `admitted_at`.
+Timestamps in API responses use two different units depending on the field:
+
+- **Meeting timestamps** (`created_at`, `started_at`, `ended_at`) are **Unix milliseconds**.
+- **Participant timestamps** (`joined_at`, `admitted_at`) are **Unix seconds**.
 
 ---
 
@@ -203,9 +206,9 @@ GET /api/v1/meetings
         "host": "host@example.com",
         "state": "active",
         "has_password": false,
-        "created_at": 1706918400,
+        "created_at": 1706918400000,
         "participant_count": 3,
-        "started_at": 1706918400,
+        "started_at": 1706918400000,
         "ended_at": null,
         "waiting_count": 1
       }
@@ -270,7 +273,7 @@ POST /api/v1/meetings
   "result": {
     "meeting_id": "my-meeting",
     "host": "host@example.com",
-    "created_at": 1706918400,
+    "created_at": 1706918400000,
     "state": "idle",
     "attendees": ["user@example.com"],
     "has_password": true
@@ -923,7 +926,7 @@ curl -X POST http://localhost:8081/api/v1/meetings \
 
 # Response:
 # {"success":true,"result":{"meeting_id":"standup-2024","host":"host@example.com",
-#   "created_at":1706918400,"state":"idle","attendees":[],"has_password":false}}
+#   "created_at":1706918400000,"state":"idle","attendees":[],"has_password":false}}
 
 # 2. Host joins meeting (activates it, receives room token)
 curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \

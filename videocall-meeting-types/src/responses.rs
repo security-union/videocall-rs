@@ -74,7 +74,7 @@ impl APIResponse<crate::error::APIError> {
 pub struct CreateMeetingResponse {
     pub meeting_id: String,
     pub host: String,
-    /// Unix timestamp in seconds when the meeting was created.
+    /// Unix timestamp in milliseconds when the meeting was created.
     pub created_at: i64,
     pub state: String,
     pub attendees: Vec<String>,
@@ -158,6 +158,9 @@ pub struct JoinedMeetingSummary {
     pub has_password: bool,
     /// `true` when the authenticated user is the meeting owner (creator).
     pub is_owner: bool,
+    /// Unix timestamp in milliseconds when the meeting was first created.
+    /// Immutable — set at INSERT and never updated.
+    pub created_at: i64,
     /// Unix timestamp in milliseconds — the timestamp used for ordering.
     /// Computed as `COALESCE(admitted_at, joined_at)` so re-admissions float
     /// to the top while legacy rows that were never re-admitted still sort
@@ -173,13 +176,16 @@ pub struct MeetingSummary {
     pub host: Option<String>,
     pub state: String,
     pub has_password: bool,
-    /// Unix timestamp in seconds when the meeting was created.
+    /// Unix timestamp in milliseconds when the meeting was created.
     pub created_at: i64,
     pub participant_count: i64,
-    /// Unix timestamp in seconds when the meeting started.
-    /// Same as `created_at` for meetings that were activated immediately.
+    /// Unix timestamp in milliseconds when the meeting most recently
+    /// transitioned to `active`. Refreshed on every `idle/ended -> active`
+    /// transition; equal to `created_at` for meetings that were activated
+    /// once on creation and never re-activated.
     pub started_at: i64,
-    /// Unix timestamp in seconds when the meeting ended, or `null` if still active/idle.
+    /// Unix timestamp in milliseconds when the meeting ended, or `null` if
+    /// still active/idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<i64>,
     /// Number of participants currently in the waiting room.

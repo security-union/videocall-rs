@@ -225,14 +225,14 @@ pub struct ParticipantStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observer_token: Option<String>,
     /// Meeting-level: whether the waiting room is enabled. Present in join/status responses.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub waiting_room_enabled: Option<bool>,
+    #[serde(default = "default_true")]
+    pub waiting_room_enabled: bool,
     /// Meeting-level: whether admitted participants can also admit others.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub admitted_can_admit: Option<bool>,
+    #[serde(default)]
+    pub admitted_can_admit: bool,
     /// Meeting-level: whether the meeting ends for all when the host leaves.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_on_host_leave: Option<bool>,
+    #[serde(default = "default_true")]
+    pub end_on_host_leave: bool,
     /// Meeting-level: the host's display name. Present in join/status responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_display_name: Option<String>,
@@ -240,8 +240,14 @@ pub struct ParticipantStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_user_id: Option<String>,
     /// Meeting-level: whether guests (unauthenticated users) are allowed to join.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allow_guests: Option<bool>,
+    #[serde(default)]
+    pub allow_guests: bool,
+}
+
+/// Returns `true`; used as the serde `default` for meeting-policy booleans
+/// that are true when absent from older API responses.
+fn default_true() -> bool {
+    true
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}/waiting`.

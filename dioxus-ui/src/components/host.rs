@@ -226,6 +226,7 @@ pub fn Host(
             prev_share_screen: false,
             prev_mic_enabled: false,
             prev_video_enabled: false,
+            prev_device_settings_open: false,
             initialized: false,
             last_reload_counter: 0,
         }))
@@ -387,10 +388,16 @@ pub fn Host(
     {
         let mut s = state.borrow_mut();
 
-        if s.last_reload_counter != reload_devices_counter {
+        let did_full_reload = s.last_reload_counter != reload_devices_counter;
+        if did_full_reload {
             s.media_devices.load();
             s.last_reload_counter = reload_devices_counter;
         }
+
+        if !did_full_reload && !s.prev_device_settings_open && device_settings_open {
+            s.media_devices.refresh_devices_safely();
+        }
+        s.prev_device_settings_open = device_settings_open;
 
         log::info!(
             "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
@@ -637,6 +644,7 @@ struct HostState {
     prev_share_screen: bool,
     prev_mic_enabled: bool,
     prev_video_enabled: bool,
+    prev_device_settings_open: bool,
     initialized: bool,
     last_reload_counter: u32,
 }

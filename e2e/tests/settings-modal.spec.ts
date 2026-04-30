@@ -103,6 +103,67 @@ test.describe("Device settings modal", () => {
     await expect(page.locator("#settings-panel-video")).toBeVisible();
   });
 
+  test("opening settings modal preserves current microphone and camera button states", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_settings_safe_refresh_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("safe-refresh-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    const micMuteButton = page.getByRole("button", { name: "Mute" });
+    const micUnmuteButton = page.getByRole("button", { name: "Unmute" });
+    const camStopButton = page.getByRole("button", { name: "Stop Video" });
+    const camStartButton = page.getByRole("button", { name: "Start Video" });
+
+    const micStateBefore = (await micMuteButton.count()) > 0 ? "enabled" : "disabled";
+    const camStateBefore = (await camStopButton.count()) > 0 ? "enabled" : "disabled";
+
+    await expect(
+      micStateBefore === "enabled" ? micMuteButton.first() : micUnmuteButton.first(),
+    ).toBeVisible({ timeout: 10_000 });
+    await expect(
+      camStateBefore === "enabled" ? camStopButton.first() : camStartButton.first(),
+    ).toBeVisible({ timeout: 10_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("#modal-audio-select")).toBeVisible({ timeout: 10_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeHidden({ timeout: 10_000 });
+
+    const micStateAfter = (await micMuteButton.count()) > 0 ? "enabled" : "disabled";
+    const camStateAfter = (await camStopButton.count()) > 0 ? "enabled" : "disabled";
+
+    await expect(
+      micStateAfter === "enabled" ? micMuteButton.first() : micUnmuteButton.first(),
+    ).toBeVisible({ timeout: 10_000 });
+    await expect(
+      camStateAfter === "enabled" ? camStopButton.first() : camStartButton.first(),
+    ).toBeVisible({ timeout: 10_000 });
+
+    expect(micStateAfter).toBe(micStateBefore);
+    expect(camStateAfter).toBe(camStateBefore);
+  });
+
   test("user can open the Appearance section and adjust local glow controls", async ({ page }) => {
     const meetingId = `e2e_settings_appearance_${Date.now()}`;
 

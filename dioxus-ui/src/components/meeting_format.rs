@@ -5,11 +5,9 @@
 
 //! Shared formatters for meeting list rows.
 //!
-//! Used by both [`crate::components::meetings_list`] (owned meetings) and
-//! [`crate::components::joined_meetings_list`] (previously-joined meetings).
+//! Used by [`crate::components::meetings_list`] (the merged home-feed list).
 //! Both functions are pure and operate on millisecond integers — no Dioxus
-//! signals, no DOM, no async. Kept here so the two list components share one
-//! definition rather than maintaining byte-identical copies.
+//! signals, no DOM, no async.
 
 /// Format a duration in milliseconds as a compact human-readable string.
 ///
@@ -33,6 +31,24 @@ pub fn format_duration(duration_ms: i64) -> String {
         format!("{minutes}m {seconds}s")
     } else {
         format!("{seconds}s")
+    }
+}
+
+/// Format a meeting state string (`"active"`, `"idle"`, `"ended"`) as a
+/// title-cased label suitable for the inline state badge.
+///
+/// Unknown values are passed through unchanged after a `log::warn!`, mirroring
+/// the prior inline behaviour in [`crate::components::meetings_list`] which
+/// rendered whatever the server sent rather than blanking the badge.
+pub fn format_meeting_state_label(state: &str) -> String {
+    match state {
+        "active" => "Active".to_string(),
+        "idle" => "Idle".to_string(),
+        "ended" => "Ended".to_string(),
+        other => {
+            log::warn!("format_meeting_state_label: unknown meeting state '{other}'");
+            other.to_string()
+        }
     }
 }
 
@@ -127,6 +143,37 @@ mod tests {
     fn format_duration_exact_two_days() {
         // 48h boundary — multi-day plural-style values still pad zero units.
         assert_eq!(format_duration(172_800_000), "2d 0h 0m 0s");
+    }
+
+    // -------------------------------------------------------------------------
+    // format_meeting_state_label tests
+    //
+    // Pure string match, no js_sys / web-sys, so these run as ordinary
+    // host-target unit tests via `cargo test -p videocall-ui`.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn state_label_active_titlecase() {
+        assert_eq!(format_meeting_state_label("active"), "Active");
+    }
+
+    #[test]
+    fn state_label_idle_titlecase() {
+        assert_eq!(format_meeting_state_label("idle"), "Idle");
+    }
+
+    #[test]
+    fn state_label_ended_titlecase() {
+        assert_eq!(format_meeting_state_label("ended"), "Ended");
+    }
+
+    #[test]
+    fn state_label_unknown_passes_through() {
+        // Unknown values fall back to the raw input (after a log::warn) so the
+        // badge keeps rendering something useful when the server adds a new
+        // state ahead of the UI.
+        assert_eq!(format_meeting_state_label("archived"), "archived");
+        assert_eq!(format_meeting_state_label(""), "");
     }
 
     // -------------------------------------------------------------------------

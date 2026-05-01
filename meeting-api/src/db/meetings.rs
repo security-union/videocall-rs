@@ -293,6 +293,127 @@ pub async fn list_joined_by_user(
     .await
 }
 
+/// Row returned from [`list_feed_for_user`] — the deduplicated home-feed
+/// entry that backs `GET /api/v1/meetings/feed`.
+///
+/// Carries the meeting's settings + counts plus the join-time metadata used
+/// for ordering. Counts are folded into the same SELECT (LEFT JOIN LATERAL)
+/// so the route handler does not need to issue per-row queries to assemble
+/// participant_count / waiting_count.
+///
+/// `last_active_at` is `COALESCE(p.last_admit, m.started_at, m.created_at)`
+/// and is therefore always non-null. `started_at` may be earlier than
+/// `last_active_at` when the user has joined a re-activated meeting since
+/// the most recent activation refreshed `started_at`.
+///
+/// `ever_admitted` is `true` when the user has at least one
+/// `meeting_participants` row with `admitted_at IS NOT NULL` — equivalent to
+/// `p.last_admit IS NOT NULL`. The route handler uses it for nothing today
+/// but it's exposed in case future call sites want a quick "has the user
+/// actually joined this meeting before" check without going back to the DB.
+#[derive(Debug, Clone, sqlx::FromRow)]
+#[allow(dead_code)]
+pub struct FeedMeetingRow {
+    pub id: i32,
+    pub room_id: String,
+    pub state: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub creator_id: Option<String>,
+    pub password_hash: Option<String>,
+    pub allow_guests: bool,
+    pub waiting_room_enabled: bool,
+    pub end_on_host_leave: bool,
+    pub admitted_can_admit: bool,
+    pub last_active_at: DateTime<Utc>,
+    pub ever_admitted: bool,
+    pub participant_count: i64,
+    pub waiting_count: i64,
+}
+
+/// List meetings the user owns OR has been admitted into, deduplicated to
+/// one row per meeting. Powers `GET /api/v1/meetings/feed`.
+///
+/// ## Membership predicate
+///
+/// A meeting `m` appears in the feed when either:
+///   - `m.creator_id = user_id` (the user owns it), regardless of whether
+///     they have ever joined; or
+///   - the user has at least one `meeting_participants` row for `m` with
+///     `admitted_at IS NOT NULL` — i.e. they were actually admitted at some
+///     point. Pure-`waiting` rows (`admitted_at IS NULL`) are excluded.
+///
+/// ## Ordering
+///
+/// `last_active_at = COALESCE(p.last_admit, m.started_at, m.created_at)`,
+/// descending. `m.id DESC` is the deterministic tiebreaker for rows that
+/// share the same `last_active_at` (e.g. two meetings activated in the same
+/// microsecond on a busy host).
+///
+/// ## Folded counts
+///
+/// `participant_count` (rows with `status = 'admitted'`) and `waiting_count`
+/// (rows with `status = 'waiting'`) are computed inside the same query via
+/// LEFT JOIN LATERAL subqueries so the route handler issues exactly one
+/// round-trip regardless of feed length. Status semantics match the legacy
+/// `db_participants::count_admitted` / `count_waiting` so the
+/// /feed counts are byte-for-byte identical to the per-row helpers.
+pub async fn list_feed_for_user(
+    pool: &PgPool,
+    user_id: &str,
+    limit: i64,
+) -> Result<Vec<FeedMeetingRow>, sqlx::Error> {
+    sqlx::query_as::<_, FeedMeetingRow>(
+        r#"
+        SELECT m.id,
+               m.room_id,
+               m.state,
+               m.created_at,
+               m.started_at,
+               m.ended_at,
+               m.creator_id,
+               m.password_hash,
+               m.allow_guests,
+               m.waiting_room_enabled,
+               m.end_on_host_leave,
+               m.admitted_can_admit,
+               COALESCE(p.last_admit, m.started_at, m.created_at) AS last_active_at,
+               (p.last_admit IS NOT NULL) AS ever_admitted,
+               COALESCE(pc.admitted_count, 0) AS participant_count,
+               COALESCE(wc.waiting_count, 0) AS waiting_count
+        FROM meetings m
+        LEFT JOIN LATERAL (
+            SELECT MAX(admitted_at) AS last_admit
+            FROM meeting_participants
+            WHERE meeting_id = m.id
+              AND user_id = $1
+              AND admitted_at IS NOT NULL
+        ) p ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS admitted_count
+            FROM meeting_participants
+            WHERE meeting_id = m.id
+              AND status = 'admitted'
+        ) pc ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS waiting_count
+            FROM meeting_participants
+            WHERE meeting_id = m.id
+              AND status = 'waiting'
+        ) wc ON TRUE
+        WHERE m.deleted_at IS NULL
+          AND (m.creator_id = $1 OR p.last_admit IS NOT NULL)
+        ORDER BY last_active_at DESC, m.id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Soft-delete a meeting (set `deleted_at`).
 pub async fn soft_delete(
     pool: &PgPool,

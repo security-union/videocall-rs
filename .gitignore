@@ -83,3 +83,4 @@ bot/assets/costumes/
 .claude/settings.local.json
 .claude/agent-memory/
 .claude/skills/
+.claude/hooks/

@@ -22,8 +22,8 @@
 //!
 //! # Key naming
 //!
-//! Keys should be stable, namespaced strings. The home-page collapsible
-//! sections use dot-namespaced keys like `home.previously-joined.expanded`.
+//! Keys should be stable, namespaced strings. The home-page meetings list
+//! uses dot-namespaced keys like `home.meetings.expanded`.
 
 /// Read a boolean preference from `localStorage`.
 ///

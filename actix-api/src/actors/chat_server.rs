@@ -64,6 +64,33 @@ struct ExecutePendingDeparture {
 /// NATS subject for cross-server stale session eviction.
 const EVICT_INSTANCE_SUBJECT: &str = "internal.evict_instance";
 
+/// NATS subject for fanout of per-meeting policy flag changes from
+/// `meeting-api`. Mirrors [`EVICT_INSTANCE_SUBJECT`]: JSON payload over a
+/// non-protobuf internal channel, consumed by every chat_server instance to
+/// keep the in-memory `room_policy` cache fresh after PATCH /meetings.
+///
+/// This is intentionally a **separate** subject from the client-facing
+/// `MEETING_SETTINGS_UPDATED` protobuf event published in
+/// `meeting-api/src/nats_events.rs`: that one tells clients to re-fetch
+/// settings via REST, this one tells servers to refresh their cached
+/// policy without a DB round-trip on host disconnect.
+const MEETING_SETTINGS_UPDATE_SUBJECT: &str = "internal.meeting_settings_updated";
+
+/// NATS subject for chat_server -> meeting-api notifications that a host
+/// just left a meeting whose `end_on_host_leave=true` policy fired. The
+/// meeting-api consumer writes `state='ended'` to the DB so the meetings
+/// list reflects the same authoritative outcome the clients see in their
+/// MEETING_ENDED broadcast.
+///
+/// This event ONLY fires on the legitimate broadcast path inside
+/// [`ChatServer::leave_rooms`] — never from the [`Disconnect`] handler
+/// directly, and never from the deferred-departure timer callback before
+/// it has actually decided to broadcast. The reconnect grace period is
+/// honored automatically: if the host reconnects within
+/// [`RECONNECT_GRACE_PERIOD`], `ExecutePendingDeparture` is cancelled
+/// before `leave_rooms` runs, so this event is never published.
+const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
+
 /// Payload published to NATS for cross-server stale session eviction.
 /// When a client reconnects (possibly to a different server), the new server
 /// broadcasts this so the old server can clean up silently.
@@ -75,10 +102,46 @@ struct EvictInstancePayload {
     new_session_id: SessionId,
 }
 
+/// Payload for [`MEETING_SETTINGS_UPDATE_SUBJECT`].
+///
+/// Carries the four per-meeting policy flags that determine server-side
+/// behavior (host-leave handling, waiting room admission gating, guest
+/// access). Each field is present so a single payload can refresh the
+/// full policy snapshot — the chat_server consumer overwrites all of
+/// them rather than merging field-by-field, so the meeting-api publisher
+/// must always send the post-update authoritative values.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct MeetingSettingsUpdatePayload {
+    room_id: String,
+    end_on_host_leave: bool,
+    admitted_can_admit: bool,
+    waiting_room_enabled: bool,
+    allow_guests: bool,
+}
+
+/// Payload for [`MEETING_ENDED_BY_HOST_SUBJECT`].
+///
+/// Sent from chat_server to meeting-api when a host leaves a meeting whose
+/// `end_on_host_leave=true` policy fired and `MEETING_ENDED` was broadcast
+/// to peers. The meeting-api consumer writes `state='ended'` for the
+/// matching `room_id` so the meetings list stays consistent with the
+/// clients' view of the meeting.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct MeetingEndedByHostPayload {
+    room_id: String,
+}
+
 /// Internal actix message delivered when a NATS eviction message is received.
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct EvictInstance(EvictInstancePayload);
+
+/// Internal actix message delivered when a `MEETING_SETTINGS_UPDATE_SUBJECT`
+/// payload is received. Updates the `room_policy` cache so the next host
+/// disconnect reads the freshest policy values without hitting the DB.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct UpdateRoomPolicy(MeetingSettingsUpdatePayload);
 
 /// Internal actix message to update a room member's display name.
 /// Sent from the per-session NATS subscription loop when a
@@ -116,7 +179,33 @@ struct RoomMemberInfo {
     user_id: String,
     display_name: String,
     is_host: bool,
+    /// **Note:** this field is captured from the JWT at JoinRoom time and is
+    /// retained for backward compatibility with [`Disconnect`] / [`Leave`]
+    /// handlers that still propagate the per-session value. It can become
+    /// stale if the host PATCHes meeting settings mid-call. The freshest
+    /// value lives in [`ChatServer::room_policy`] and is read at
+    /// host-disconnect time inside [`ChatServer::leave_rooms`].
     end_on_host_leave: bool,
+}
+
+/// Cached per-room policy flags. Populated at first JoinRoom for the room and
+/// refreshed on `MEETING_SETTINGS_UPDATE_SUBJECT` NATS events from
+/// `meeting-api`.
+///
+/// This cache exists so the host-disconnect path can read the current
+/// `end_on_host_leave` (and the other three flags, for future use) without a
+/// DB round-trip — `actix-api` has no `sqlx::PgPool` at runtime, all
+/// authoritative meeting state lives in `meeting-api`. See
+/// [`MEETING_SETTINGS_UPDATE_SUBJECT`].
+#[derive(Clone, Debug)]
+struct RoomPolicy {
+    end_on_host_leave: bool,
+    #[allow(dead_code)]
+    admitted_can_admit: bool,
+    #[allow(dead_code)]
+    waiting_room_enabled: bool,
+    #[allow(dead_code)]
+    allow_guests: bool,
 }
 
 pub struct ChatServer {
@@ -129,6 +218,12 @@ pub struct ChatServer {
     /// and host status. Used to send PARTICIPANT_JOINED for existing peers to
     /// new joiners and to determine host-leave behavior.
     room_members: HashMap<String, Vec<RoomMemberInfo>>,
+    /// Per-room policy flag cache. Refreshed by
+    /// [`MEETING_SETTINGS_UPDATE_SUBJECT`] events so toggles like
+    /// `end_on_host_leave` take effect mid-meeting without requiring a host
+    /// reconnect. Read by [`ChatServer::leave_rooms`] when deciding whether
+    /// to broadcast `MEETING_ENDED`. See [`RoomPolicy`].
+    room_policy: HashMap<String, RoomPolicy>,
     /// Pending departures keyed by `(room_id, user_id)`. When a session disconnects
     /// we defer the PARTICIPANT_LEFT broadcast by [`RECONNECT_GRACE_PERIOD`]. If the
     /// same user reconnects before the timer fires, the departure is cancelled
@@ -158,6 +253,7 @@ impl ChatServer {
             session_manager: SessionManager::new(),
             connection_states: HashMap::new(),
             room_members: HashMap::new(),
+            room_policy: HashMap::new(),
             pending_departures: HashMap::new(),
             suppress_join_broadcast: std::collections::HashSet::new(),
             instance_index: HashMap::new(),
@@ -191,13 +287,57 @@ impl ChatServer {
             }
         }
 
+        // Resolve the freshest `end_on_host_leave` value BEFORE we mutate
+        // `room_members`. Reading from `room_policy` here closes the
+        // cache-staleness window left open by the JoinRoom-time JWT capture:
+        // mid-meeting PATCH /meetings updates land via
+        // `MEETING_SETTINGS_UPDATE_SUBJECT` and refresh `room_policy`, so this
+        // lookup sees the post-toggle value even though the host's session
+        // still carries the old JWT-time flag in `Disconnect`.
+        //
+        // Falls back to the per-session parameter (which is itself set from
+        // the JWT) only when the cache has no entry — the cache is populated
+        // at first JoinRoom for the room, so the only realistic gap is the
+        // `Leave` handler in tests / synthetic flows where no policy has
+        // ever been pushed. The result is "no worse than today" in that
+        // window.
+        let effective_end_on_host_leave = match room {
+            Some(r) => self
+                .room_policy
+                .get(r)
+                .map(|p| p.end_on_host_leave)
+                .unwrap_or(end_on_host_leave),
+            None => end_on_host_leave,
+        };
+
         // Remove from room_members tracking
-        if let Some(room_id) = room {
+        let room_now_empty = if let Some(room_id) = room {
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|m| m.session != *session_id);
                 if members.is_empty() {
                     self.room_members.remove(room_id);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                // No tracked members for this room — treat as empty so we
+                // also drop the policy cache below, preventing a slow leak
+                // for rooms that were only ever observed (no real members).
+                true
+            }
+        } else {
+            false
+        };
+
+        // Drop the cached policy when the room has no members left. The
+        // next JoinRoom for this room repopulates the cache; in the
+        // meantime any stale `MEETING_SETTINGS_UPDATE_SUBJECT` event for
+        // an already-empty room is harmless (it just briefly re-creates
+        // an entry that the next leave will clear again).
+        if room_now_empty {
+            if let Some(room_id) = room {
+                self.room_policy.remove(room_id);
             }
         }
 
@@ -239,7 +379,7 @@ impl ChatServer {
             tokio::spawn(async move {
                 // Check host-leave behavior first: if the host is leaving and
                 // end_on_host_leave is set, end the meeting for all participants.
-                if is_host && end_on_host_leave {
+                if is_host && effective_end_on_host_leave {
                     info!(
                         "Host {} left room {} - ending meeting for all",
                         user_id, room_id
@@ -268,6 +408,35 @@ impl ChatServer {
                     }
                     if let Err(e) = session_manager.end_session(&room_id, &user_id).await {
                         error!("Error ending host session for room {}: {}", room_id, e);
+                    }
+                    // Notify meeting-api so it can transition the meeting's
+                    // DB row to `state='ended'`. This mirrors the REST
+                    // POST /leave flow's `db_meetings::end_meeting` call so
+                    // the meetings list stays consistent with the
+                    // MEETING_ENDED broadcast clients just received. We
+                    // only fire this on the legitimate broadcast path —
+                    // never when `effective_end_on_host_leave=false` —
+                    // and the reconnect grace period is already honored
+                    // because this code only runs from
+                    // `ExecutePendingDeparture` (or explicit `Leave`),
+                    // both of which are cancelled by a timely reconnect.
+                    let payload = MeetingEndedByHostPayload {
+                        room_id: room_id.clone(),
+                    };
+                    match serde_json::to_vec(&payload) {
+                        Ok(json) => {
+                            if let Err(e) =
+                                nc.publish(MEETING_ENDED_BY_HOST_SUBJECT, json.into()).await
+                            {
+                                error!(
+                                    "Failed to publish {} for room {}: {}",
+                                    MEETING_ENDED_BY_HOST_SUBJECT, room_id, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize MeetingEndedByHostPayload: {}", e);
+                        }
                     }
                 } else {
                     // Normal participant departure
@@ -405,21 +574,21 @@ impl Actor for ChatServer {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         info!(
-            "ChatServer started — subscribing to {}",
-            EVICT_INSTANCE_SUBJECT
+            "ChatServer started — subscribing to {} and {}",
+            EVICT_INSTANCE_SUBJECT, MEETING_SETTINGS_UPDATE_SUBJECT
         );
 
-        let nc = self.nats_connection.clone();
-        let addr = ctx.address();
-
+        // Subscribe to the cross-server eviction subject.
+        let nc_evict = self.nats_connection.clone();
+        let addr_evict = ctx.address();
         tokio::spawn(async move {
             loop {
-                match nc.subscribe(EVICT_INSTANCE_SUBJECT).await {
+                match nc_evict.subscribe(EVICT_INSTANCE_SUBJECT).await {
                     Ok(mut sub) => {
                         while let Some(msg) = sub.next().await {
                             match serde_json::from_slice::<EvictInstancePayload>(&msg.payload) {
                                 Ok(payload) => {
-                                    addr.do_send(EvictInstance(payload));
+                                    addr_evict.do_send(EvictInstance(payload));
                                 }
                                 Err(e) => {
                                     warn!("Failed to deserialize evict_instance payload: {}", e);
@@ -435,6 +604,49 @@ impl Actor for ChatServer {
                         error!(
                             "Failed to subscribe to {}: {}, retrying in 1s",
                             EVICT_INSTANCE_SUBJECT, e
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+
+        // Subscribe to per-meeting policy updates from meeting-api so the
+        // `room_policy` cache stays fresh after PATCH /meetings. Each
+        // chat_server instance subscribes independently (no queue group)
+        // because every server holds its own room_policy cache and must
+        // receive every update — this is the same fan-out semantics as
+        // EVICT_INSTANCE_SUBJECT.
+        let nc_settings = self.nats_connection.clone();
+        let addr_settings = ctx.address();
+        tokio::spawn(async move {
+            loop {
+                match nc_settings.subscribe(MEETING_SETTINGS_UPDATE_SUBJECT).await {
+                    Ok(mut sub) => {
+                        while let Some(msg) = sub.next().await {
+                            match serde_json::from_slice::<MeetingSettingsUpdatePayload>(
+                                &msg.payload,
+                            ) {
+                                Ok(payload) => {
+                                    addr_settings.do_send(UpdateRoomPolicy(payload));
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to deserialize {} payload: {}",
+                                        MEETING_SETTINGS_UPDATE_SUBJECT, e
+                                    );
+                                }
+                            }
+                        }
+                        warn!(
+                            "{} subscription stream ended, re-subscribing in 1s",
+                            MEETING_SETTINGS_UPDATE_SUBJECT
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to subscribe to {}: {}, retrying in 1s",
+                            MEETING_SETTINGS_UPDATE_SUBJECT, e
                         );
                     }
                 }
@@ -790,6 +1002,78 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
     }
 }
 
+/// Handle per-room policy updates fanned out by `meeting-api` over
+/// [`MEETING_SETTINGS_UPDATE_SUBJECT`].
+///
+/// Refreshes `room_policy[room_id]` so subsequent host disconnects read the
+/// post-toggle authoritative `end_on_host_leave` (and the other three flags)
+/// without a DB round-trip. We also mirror the new `end_on_host_leave` into
+/// every member's per-session `RoomMemberInfo.end_on_host_leave` so legacy
+/// code paths that still consult the per-member field (e.g. the `Disconnect`
+/// handler's lookup for a session that has already been removed from
+/// `connection_states`) see the fresh value too.
+///
+/// We accept the event even when no room members are currently tracked: a
+/// PATCH may arrive in the brief window between meeting creation and the
+/// first JoinRoom, and dropping it would re-introduce the very staleness
+/// this handler exists to fix once members do join. The cache entry is
+/// reaped lazily by [`ChatServer::leave_rooms`] when the room becomes empty.
+impl Handler<UpdateRoomPolicy> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: UpdateRoomPolicy, _ctx: &mut Self::Context) -> Self::Result {
+        let MeetingSettingsUpdatePayload {
+            room_id,
+            end_on_host_leave,
+            admitted_can_admit,
+            waiting_room_enabled,
+            allow_guests,
+        } = msg.0;
+
+        // Defensive bounds — payload comes off the NATS wire from meeting-api,
+        // which is trusted, but we still cap the room_id length to match
+        // the EvictInstance handler's posture and avoid accidental memory
+        // pressure from a misconfigured publisher.
+        if room_id.is_empty() || room_id.len() > 256 {
+            warn!(
+                "Ignoring {} with invalid room_id length: {}",
+                MEETING_SETTINGS_UPDATE_SUBJECT,
+                room_id.len()
+            );
+            return;
+        }
+
+        info!(
+            "Refreshing room_policy for {} (end_on_host_leave={}, admitted_can_admit={}, \
+             waiting_room_enabled={}, allow_guests={})",
+            room_id, end_on_host_leave, admitted_can_admit, waiting_room_enabled, allow_guests
+        );
+
+        self.room_policy.insert(
+            room_id.clone(),
+            RoomPolicy {
+                end_on_host_leave,
+                admitted_can_admit,
+                waiting_room_enabled,
+                allow_guests,
+            },
+        );
+
+        // Mirror the freshest `end_on_host_leave` onto every existing room
+        // member so callers that still read the per-member field (notably
+        // the `Leave` handler's `room_members` lookup at the bottom of the
+        // file) see the updated value too. This is belt-and-suspenders:
+        // `leave_rooms` itself reads `room_policy` first, but keeping the
+        // two views consistent prevents future regressions if someone
+        // adds a new code path that consults `RoomMemberInfo` directly.
+        if let Some(members) = self.room_members.get_mut(&room_id) {
+            for member in members.iter_mut() {
+                member.end_on_host_leave = end_on_host_leave;
+            }
+        }
+    }
+}
+
 /// Handle cross-server eviction requests received via NATS.
 impl Handler<EvictInstance> for ChatServer {
     type Result = ();
@@ -1126,6 +1410,31 @@ impl Handler<JoinRoom> for ChatServer {
                     display_name: display_name.clone(),
                     is_host,
                     end_on_host_leave,
+                });
+
+            // Seed the room_policy cache with the JWT-time `end_on_host_leave`
+            // if we have nothing fresher. A subsequent
+            // `MEETING_SETTINGS_UPDATE_SUBJECT` event from meeting-api
+            // overwrites this; until then the JWT value is the best
+            // approximation we have. The other three flags default to the
+            // `meetings` table defaults (waiting_room_enabled=true,
+            // admitted_can_admit=false, allow_guests=false) — these are not
+            // currently consulted by chat_server, but seeding them keeps the
+            // shape of the cache consistent so future readers don't see
+            // partially-populated entries.
+            //
+            // We use `entry().or_insert_with(...)` so a previously-pushed
+            // policy update is NOT clobbered by a later joiner whose JWT
+            // still carries the pre-update flag value. Without this, a
+            // toggle that landed before the second participant joined
+            // would silently regress.
+            self.room_policy
+                .entry(room.clone())
+                .or_insert_with(|| RoomPolicy {
+                    end_on_host_leave,
+                    admitted_can_admit: false,
+                    waiting_room_enabled: true,
+                    allow_guests: false,
                 });
         }
 
@@ -4103,5 +4412,732 @@ mod tests {
             .await
             .expect("Query should succeed");
         assert!(has, "Session should still exist (user_id mismatch)");
+    }
+
+    // ==========================================================================
+    // BUG FIX (#502): host disconnect + end_on_host_leave cache staleness
+    // ==========================================================================
+    //
+    // The chat_server caches `end_on_host_leave` at JoinRoom time from the JWT
+    // claim. Mid-meeting PATCH /meetings updates the DB but the cached value
+    // stayed stale until the host reconnected, so back-navigating after
+    // toggling to `false` still kicked everyone out.
+    //
+    // The fix introduces a per-room `room_policy` cache refreshed by the
+    // `internal.meeting_settings_updated` NATS event. The host-disconnect
+    // path now reads `room_policy[room]` instead of the per-session JWT
+    // capture. The legitimate broadcast path also publishes
+    // `internal.meeting_ended_by_host` so meeting-api can mark the DB
+    // `state='ended'` to mirror what clients see.
+    //
+    // The five tests below cover:
+    //   1. Stable end_on_host_leave=true, host disconnects -> MEETING_ENDED + DB event.
+    //   2. Stable end_on_host_leave=false, host disconnects -> no broadcast, no DB event.
+    //   3. Mid-meeting toggle (true -> false), host disconnects -> no broadcast.
+    //   4. Reconnect within grace period -> no broadcast, no DB event.
+    //   5. Mid-meeting toggle, non-host disconnects -> host's cached policy is fresh.
+    // ==========================================================================
+
+    /// Test fixture: dummy session actor that ignores all messages.
+    struct EohlDummySession;
+    impl Actor for EohlDummySession {
+        type Context = actix::Context<Self>;
+    }
+    impl Handler<Message> for EohlDummySession {
+        type Result = ();
+        fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+    }
+
+    /// Drain a NATS subscriber with a deadline, recording whether each
+    /// well-known event type arrived. Returns `(saw_meeting_ended,
+    /// saw_participant_left)`.
+    async fn collect_meeting_events(
+        sub: &mut async_nats::Subscriber,
+        deadline: tokio::time::Duration,
+    ) -> (bool, bool) {
+        use std::time::Instant;
+        use tokio::time::timeout;
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let start = Instant::now();
+        let mut saw_ended = false;
+        let mut saw_left = false;
+        while start.elapsed() < deadline {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match timeout(remaining, sub.next()).await {
+                Ok(Some(msg)) => {
+                    if let Ok(wrapper) =
+                        <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                    {
+                        if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                            if inner.event_type == MeetingEventType::MEETING_ENDED.into() {
+                                saw_ended = true;
+                            } else if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into()
+                            {
+                                saw_left = true;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        (saw_ended, saw_left)
+    }
+
+    /// Wait up to `deadline` for at least one message on `sub`. Returns
+    /// `Some(payload_bytes)` on the first hit, `None` on timeout.
+    async fn wait_for_first(
+        sub: &mut async_nats::Subscriber,
+        deadline: tokio::time::Duration,
+    ) -> Option<Vec<u8>> {
+        match tokio::time::timeout(deadline, sub.next()).await {
+            Ok(Some(msg)) => Some(msg.payload.to_vec()),
+            _ => None,
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // TEST 1: Stable end_on_host_leave=true, host disconnects ->
+    //         MEETING_ENDED broadcast AND internal.meeting_ended_by_host
+    //         payload. Verifies the legitimate broadcast path still works
+    //         after the refactor.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_host_disconnect_eohl_true_broadcasts_and_publishes_db_event() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let session_id = 9_500u64;
+        let room = "test-eohl-true-broadcast";
+
+        // Subscribe BEFORE the disconnect runs so we don't miss the publish.
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        let mut db_sub = nats_client
+            .subscribe(MEETING_ENDED_BY_HOST_SUBJECT)
+            .await
+            .expect("Failed to subscribe to internal subject");
+
+        // Connect + JoinRoom as host with end_on_host_leave=true.
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host-true@example.com".to_string(),
+                display_name: "host-true@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        // Disconnect the host. The broadcast happens after the grace period.
+        chat_server
+            .send(Disconnect {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host-true@example.com".to_string(),
+                display_name: "host-true@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Grace is 3s; allow 5s for publish to land on both subscribers.
+        let (saw_ended, _saw_left) =
+            collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
+        assert!(
+            saw_ended,
+            "MEETING_ENDED must be broadcast when end_on_host_leave=true and host disconnects"
+        );
+
+        let db_payload = wait_for_first(&mut db_sub, Duration::from_secs(2)).await;
+        let db_payload = db_payload.expect(
+            "internal.meeting_ended_by_host must be published when MEETING_ENDED is broadcast",
+        );
+        let parsed: MeetingEndedByHostPayload =
+            serde_json::from_slice(&db_payload).expect("Payload should deserialize");
+        assert_eq!(parsed.room_id, room);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // TEST 2: Stable end_on_host_leave=false, host disconnects ->
+    //         no MEETING_ENDED, no DB event. Verifies the policy gate
+    //         still suppresses the broadcast for hosts who never wanted
+    //         end-on-leave.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_host_disconnect_eohl_false_no_broadcast_no_db_event() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let session_id = 9_501u64;
+        let room = "test-eohl-false-no-broadcast";
+
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        let mut db_sub = nats_client
+            .subscribe(MEETING_ENDED_BY_HOST_SUBJECT)
+            .await
+            .expect("Failed to subscribe to internal subject");
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host-false@example.com".to_string(),
+                display_name: "host-false@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: false,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        chat_server
+            .send(Disconnect {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host-false@example.com".to_string(),
+                display_name: "host-false@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: true,
+                end_on_host_leave: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        let (saw_ended, _saw_left) =
+            collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
+        assert!(
+            !saw_ended,
+            "MEETING_ENDED must NOT be broadcast when end_on_host_leave=false"
+        );
+
+        let db_payload = wait_for_first(&mut db_sub, Duration::from_secs(1)).await;
+        assert!(
+            db_payload.is_none(),
+            "internal.meeting_ended_by_host must NOT be published when no broadcast fires"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // TEST 3: Mid-meeting toggle (true at JoinRoom, then NATS-pushed false)
+    //         + host disconnects -> no MEETING_ENDED. This is the actual
+    //         bug from discussion #502.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_mid_meeting_toggle_to_false_suppresses_broadcast() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let session_id = 9_502u64;
+        let room = "test-eohl-toggle-to-false";
+
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        let mut db_sub = nats_client
+            .subscribe(MEETING_ENDED_BY_HOST_SUBJECT)
+            .await
+            .expect("Failed to subscribe to internal subject");
+
+        // Host joins with end_on_host_leave=true (the JWT-time value).
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host-toggle@example.com".to_string(),
+                display_name: "host-toggle@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        // Simulate meeting-api publishing the post-toggle policy snapshot.
+        // The chat_server's `started()` task is already subscribed to this
+        // subject; we publish here and wait long enough for the actor to
+        // process the inbound NATS message and apply the UpdateRoomPolicy.
+        let toggle_payload = MeetingSettingsUpdatePayload {
+            room_id: room.to_string(),
+            end_on_host_leave: false,
+            admitted_can_admit: false,
+            waiting_room_enabled: true,
+            allow_guests: false,
+        };
+        let toggle_bytes =
+            serde_json::to_vec(&toggle_payload).expect("Should serialize toggle payload");
+        nats_client
+            .publish(MEETING_SETTINGS_UPDATE_SUBJECT, toggle_bytes.into())
+            .await
+            .expect("Should publish toggle");
+        // Allow time for the NATS message to be received by chat_server's
+        // subscription loop and for the UpdateRoomPolicy actor message to
+        // be handled. 800ms is well above NATS RTT on a healthy bus.
+        sleep(Duration::from_millis(800)).await;
+
+        // Now disconnect. The Disconnect message itself still carries
+        // end_on_host_leave=true (the stale JWT-time capture), but
+        // leave_rooms should consult the freshest room_policy entry
+        // and decide NOT to broadcast.
+        chat_server
+            .send(Disconnect {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host-toggle@example.com".to_string(),
+                display_name: "host-toggle@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: true,
+                end_on_host_leave: true, // STALE — must NOT win
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        let (saw_ended, _saw_left) =
+            collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
+        assert!(
+            !saw_ended,
+            "MEETING_ENDED must NOT be broadcast after mid-meeting toggle to end_on_host_leave=false"
+        );
+
+        let db_payload = wait_for_first(&mut db_sub, Duration::from_secs(1)).await;
+        assert!(
+            db_payload.is_none(),
+            "internal.meeting_ended_by_host must NOT fire when policy was toggled off"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // TEST 4: Reconnect within grace period -> no broadcast, no DB event.
+    //         The reconnect cancels the deferred ExecutePendingDeparture
+    //         before it can call leave_rooms, so neither the MEETING_ENDED
+    //         packet nor the internal DB-write event should be observed.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_reconnect_within_grace_skips_broadcast_and_db_event() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let session_id_1 = 9_503u64;
+        let session_id_2 = 9_504u64;
+        let room = "test-eohl-reconnect-grace";
+        let user = "host-reconnect@example.com";
+
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        let mut db_sub = nats_client
+            .subscribe(MEETING_ENDED_BY_HOST_SUBJECT)
+            .await
+            .expect("Failed to subscribe to internal subject");
+
+        // First session: connect + join + activate.
+        chat_server
+            .send(Connect {
+                id: session_id_1,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id_1,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id_1,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        // Disconnect — schedules ExecutePendingDeparture for grace period later.
+        chat_server
+            .send(Disconnect {
+                session: session_id_1,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Reconnect with the SAME (room, user_id) BEFORE the grace period
+        // elapses. Grace is 3s; we wait 1s to be safely inside the window.
+        sleep(Duration::from_secs(1)).await;
+        chat_server
+            .send(Connect {
+                id: session_id_2,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id_2,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id_2,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Wait beyond the grace period — even though it's elapsed by now,
+        // the reconnect should have cancelled ExecutePendingDeparture, so
+        // no broadcast and no DB event should arrive.
+        let (saw_ended, _saw_left) =
+            collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
+        assert!(
+            !saw_ended,
+            "Reconnect within grace period must cancel deferred MEETING_ENDED broadcast"
+        );
+
+        let db_payload = wait_for_first(&mut db_sub, Duration::from_secs(1)).await;
+        assert!(
+            db_payload.is_none(),
+            "Reconnect within grace period must cancel internal.meeting_ended_by_host"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // TEST 5: Mid-meeting toggle, NON-host disconnect -> the host's
+    //         RoomMemberInfo.end_on_host_leave field gets updated by the
+    //         settings-update consumer. Locks in the cache-update path
+    //         independently from the broadcast logic, so a future change
+    //         to the leave_rooms gate can't silently resurrect the bug.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_settings_update_refreshes_room_policy_for_existing_host() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let host_id = 9_505u64;
+        let other_id = 9_506u64;
+        let room = "test-eohl-toggle-other-leaves";
+
+        // Host joins with end_on_host_leave=true.
+        chat_server
+            .send(Connect {
+                id: host_id,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: host_id,
+                room: room.to_string(),
+                user_id: "host-multi@example.com".to_string(),
+                display_name: "host-multi@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection { session: host_id })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // A non-host participant joins.
+        chat_server
+            .send(Connect {
+                id: other_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: other_id,
+                room: room.to_string(),
+                user_id: "other-multi@example.com".to_string(),
+                display_name: "other-multi@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection { session: other_id })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        // Toggle end_on_host_leave to false via the internal NATS event.
+        let toggle = MeetingSettingsUpdatePayload {
+            room_id: room.to_string(),
+            end_on_host_leave: false,
+            admitted_can_admit: false,
+            waiting_room_enabled: true,
+            allow_guests: false,
+        };
+        nats_client
+            .publish(
+                MEETING_SETTINGS_UPDATE_SUBJECT,
+                serde_json::to_vec(&toggle).unwrap().into(),
+            )
+            .await
+            .expect("Should publish toggle");
+        sleep(Duration::from_millis(800)).await;
+
+        // Inspect the host's per-member end_on_host_leave field via a
+        // synthetic actor message we add only for tests below.
+        let observed = chat_server
+            .send(GetRoomMemberEndOnHostLeave {
+                room: room.to_string(),
+                session: host_id,
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(
+            observed,
+            Some(false),
+            "UpdateRoomPolicy must mirror end_on_host_leave onto every member of the room"
+        );
+
+        // Sanity: also the room_policy cache itself should reflect the toggle.
+        let policy = chat_server
+            .send(GetRoomPolicyEndOnHostLeave {
+                room: room.to_string(),
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(
+            policy,
+            Some(false),
+            "room_policy cache must hold the post-toggle end_on_host_leave value"
+        );
+
+        // Now disconnect the non-host. This exercises leave_rooms for a
+        // non-host (no MEETING_ENDED expected regardless of policy) and
+        // confirms the host's cache survives.
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        chat_server
+            .send(Disconnect {
+                session: other_id,
+                room: room.to_string(),
+                user_id: "other-multi@example.com".to_string(),
+                display_name: "other-multi@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        let (saw_ended, _saw_left) =
+            collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
+        assert!(
+            !saw_ended,
+            "Non-host disconnect must not broadcast MEETING_ENDED regardless of policy"
+        );
+
+        // Final sanity: the host's policy still reads false after the
+        // other participant left.
+        let still = chat_server
+            .send(GetRoomMemberEndOnHostLeave {
+                room: room.to_string(),
+                session: host_id,
+            })
+            .await
+            .expect("Query should succeed");
+        assert_eq!(
+            still,
+            Some(false),
+            "Host's cached end_on_host_leave must persist after a non-host departure"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Test-only actor messages used to peek at chat_server internals
+    // without exposing them in the production API surface.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[derive(ActixMessage)]
+    #[rtype(result = "Option<bool>")]
+    struct GetRoomMemberEndOnHostLeave {
+        room: String,
+        session: SessionId,
+    }
+
+    impl Handler<GetRoomMemberEndOnHostLeave> for ChatServer {
+        type Result = MessageResult<GetRoomMemberEndOnHostLeave>;
+        fn handle(
+            &mut self,
+            msg: GetRoomMemberEndOnHostLeave,
+            _ctx: &mut Self::Context,
+        ) -> Self::Result {
+            MessageResult(
+                self.room_members
+                    .get(&msg.room)
+                    .and_then(|members| members.iter().find(|m| m.session == msg.session))
+                    .map(|m| m.end_on_host_leave),
+            )
+        }
+    }
+
+    #[derive(ActixMessage)]
+    #[rtype(result = "Option<bool>")]
+    struct GetRoomPolicyEndOnHostLeave {
+        room: String,
+    }
+
+    impl Handler<GetRoomPolicyEndOnHostLeave> for ChatServer {
+        type Result = MessageResult<GetRoomPolicyEndOnHostLeave>;
+        fn handle(
+            &mut self,
+            msg: GetRoomPolicyEndOnHostLeave,
+            _ctx: &mut Self::Context,
+        ) -> Self::Result {
+            MessageResult(self.room_policy.get(&msg.room).map(|p| p.end_on_host_leave))
+        }
     }
 }

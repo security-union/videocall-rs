@@ -157,3 +157,29 @@ impl Default for ListJoinedMeetingsQuery {
         }
     }
 }
+
+/// Query parameters for `GET /api/v1/meetings/feed`.
+///
+/// `limit` defaults to and is clamped at 200. Negative values are rejected
+/// with `400 INVALID_INPUT`. The 200-row cap is intentional — datasets larger
+/// than that should be reached via the search modal
+/// (`GET /api/v1/meetings?q=...`) rather than expanding the home-feed payload.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ListFeedQuery {
+    /// Maximum number of meetings to return. Defaults to 200 when omitted.
+    /// Server clamps to a maximum of 200; negative values return 400 INVALID_INPUT.
+    #[serde(default = "default_feed_limit")]
+    pub limit: i64,
+}
+
+fn default_feed_limit() -> i64 {
+    200
+}
+
+impl Default for ListFeedQuery {
+    fn default() -> Self {
+        Self {
+            limit: default_feed_limit(),
+        }
+    }
+}

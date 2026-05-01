@@ -115,7 +115,7 @@ async fn test_host_display_name_preserved_on_rejoin() {
         ))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
     // First join: manually-typed name.
     let first = join_with_display_name(&pool, room_id, host_email, "Antonio").await;

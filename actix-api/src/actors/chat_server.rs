@@ -310,35 +310,17 @@ impl ChatServer {
             None => end_on_host_leave,
         };
 
-        // Remove from room_members tracking
-        let room_now_empty = if let Some(room_id) = room {
+        // Remove from room_members tracking, then defer the empty-room
+        // policy-cache cleanup to the shared helper. We deliberately do NOT
+        // treat "no entry in room_members" as room-empty-now: the cache may
+        // have been seeded by a `MEETING_SETTINGS_UPDATE_SUBJECT` event
+        // before the first JoinRoom, and a stale `Leave` / `Disconnect` for
+        // that room must not wipe the legitimately-cached policy.
+        if let Some(room_id) = room {
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|m| m.session != *session_id);
-                if members.is_empty() {
-                    self.room_members.remove(room_id);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                // No tracked members for this room — treat as empty so we
-                // also drop the policy cache below, preventing a slow leak
-                // for rooms that were only ever observed (no real members).
-                true
             }
-        } else {
-            false
-        };
-
-        // Drop the cached policy when the room has no members left. The
-        // next JoinRoom for this room repopulates the cache; in the
-        // meantime any stale `MEETING_SETTINGS_UPDATE_SUBJECT` event for
-        // an already-empty room is harmless (it just briefly re-creates
-        // an entry that the next leave will clear again).
-        if room_now_empty {
-            if let Some(room_id) = room {
-                self.room_policy.remove(room_id);
-            }
+            self.forget_room_if_empty(room_id);
         }
 
         // End session using SessionManager
@@ -609,6 +591,26 @@ impl ChatServer {
         self.forget_session(prev_sid, room, user_id, ctx);
 
         true
+    }
+
+    /// Drop the cached `room_policy` entry for `room` when the room has been
+    /// drained to empty. Centralises the empty-room cleanup rule shared by
+    /// `leave_rooms` and `ExecutePendingDeparture`'s `was_active=false` branch.
+    ///
+    /// Policy eviction fires only when `room_members.get(room)` exists and is
+    /// empty — i.e. we (or our caller) just removed the last member. If the
+    /// room has no `room_members` entry at all, that means the cache was
+    /// seeded by a `MEETING_SETTINGS_UPDATE_SUBJECT` event before any
+    /// JoinRoom (the `UpdateRoomPolicy` handler accepts events for empty
+    /// rooms). Wiping the legitimately-cached policy in that window would be
+    /// a regression, so the helper is a no-op for the "no entry" case.
+    fn forget_room_if_empty(&mut self, room: &str) {
+        if let Some(members) = self.room_members.get(room) {
+            if members.is_empty() {
+                self.room_members.remove(room);
+                self.room_policy.remove(room);
+            }
+        }
     }
 
     /// Tear down all per-session state for `session_id` and cancel any
@@ -1251,13 +1253,15 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                      skipping PARTICIPANT_LEFT (session was never activated)",
                     user_id, session, room
                 );
-                // Still clean up room_members and instance_index for the old session.
+                // Still clean up room_members and instance_index for the old
+                // session. Use the shared `forget_room_if_empty` helper so the
+                // empty-room policy-cache eviction rule stays in lockstep with
+                // the `leave_rooms` path (both paths must drop `room_policy`
+                // when, and only when, this removal drained the room to empty).
                 if let Some(members) = self.room_members.get_mut(&room) {
                     members.retain(|m| m.session != session);
-                    if members.is_empty() {
-                        self.room_members.remove(&room);
-                    }
                 }
+                self.forget_room_if_empty(&room);
                 if let Some(iid) = self.session_instance.remove(&session) {
                     if self.instance_index.get(&iid).copied() == Some(session) {
                         self.instance_index.remove(&iid);
@@ -1434,11 +1438,13 @@ impl Handler<JoinRoom> for ChatServer {
         // product requirement allows real multi-tab, relax this in
         // `evict_same_user_session`.
         //
-        // Runs even if `evict_stale_session` already evicted by
-        // instance_id — `evict_same_user_session` is a no-op when no
-        // remaining `(room, user_id)` duplicate exists, so the second call
-        // is cheap (one HashMap lookup + one Vec scan over the room).
-        if !observer {
+        // Skip this scan when `evict_stale_session` already evicted in this
+        // same call: instance_id-match eviction already cleaned up, and the
+        // same-user-id scan is only needed when instance_id didn't match
+        // (cross-tab / back-rejoin with a fresh instance_id). The guard
+        // saves one HashMap lookup + one Vec scan per JoinRoom on the
+        // happy reconnection path.
+        if !observer && !evicted_old_session {
             let evicted_by_user_id = self.evict_same_user_session(&room, &user_id, session, ctx);
             evicted_old_session = evicted_old_session || evicted_by_user_id;
         }
@@ -5501,12 +5507,11 @@ mod tests {
     // ------------------------------------------------------------------
     // TEST: Existing instance_id-match path still works after refactor
     // ------------------------------------------------------------------
-    // Regression check: even though `evict_same_user_session` runs
-    // unconditionally for non-observers, the in-tab transport-reconnect
-    // case (same instance_id, same user_id) must still be handled by
-    // `evict_stale_session` first — which is called before the new path.
-    // This test mirrors `test_eviction_basic_same_user` but re-asserts
-    // the invariants on the post-refactor code path.
+    // Regression check: when the same instance_id is presented again
+    // (in-tab transport reconnect), `evict_stale_session` evicts via
+    // the instance_index. The same-user-id fallthrough is short-circuited
+    // when instance-id eviction already ran, so this path must still
+    // collapse session A -> session B via the instance-id branch alone.
     #[actix_rt::test]
     #[serial]
     async fn test_instance_id_eviction_path_still_intact() {

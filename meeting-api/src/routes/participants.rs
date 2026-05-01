@@ -173,14 +173,14 @@ pub async fn join_meeting(
         resp.admitted_can_admit = Some(meeting.admitted_can_admit);
         resp.end_on_host_leave = Some(meeting.end_on_host_leave);
         resp.allow_guests = Some(meeting.allow_guests);
-        // Prefer the persisted cached host_display_name. Only fall through
-        // to the request's value if the cached value is missing or empty
-        // (legitimate first-time set).
-        resp.host_display_name = if existing_host_dn_nonempty {
-            meeting.host_display_name
-        } else {
-            display_name.map(String::from).or(meeting.host_display_name)
-        };
+        // Prefer the freshly-persisted display_name from the host upsert as
+        // the source of truth — same value the JWT was minted from above —
+        // so the response and JWT can never disagree. The local `meeting`
+        // snapshot is from before the upsert and may be stale relative to
+        // it; fall back to its cached `host_display_name` only when the
+        // upsert returned nothing (existing display_name was already empty
+        // and no display_name was supplied).
+        resp.host_display_name = persisted_dn.or(meeting.host_display_name);
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
     } else {

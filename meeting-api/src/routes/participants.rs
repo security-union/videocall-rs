@@ -127,8 +127,23 @@ pub async fn join_meeting(
             nats_events::publish_meeting_activated(state.nats.as_ref(), &meeting_id).await;
         }
 
+        // Display-name reconciliation on rejoin (issue #502): if the meeting
+        // already has a cached non-empty `host_display_name`, do NOT
+        // overwrite it from the request. This mirrors the
+        // `COALESCE(NULLIF(...), $3)` policy in
+        // [`db_participants::upsert_host`] so both the per-meeting cached
+        // host name AND the per-participant display name stay stable across
+        // back-then-rejoin. Mid-meeting renames go through the rate-limited
+        // `update_display_name` endpoint, never through `join`.
+        let existing_host_dn_nonempty = meeting
+            .host_display_name
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
         if let Some(dn) = display_name {
-            db_meetings::set_host_display_name(&state.db, meeting.id, dn).await?;
+            if !existing_host_dn_nonempty {
+                db_meetings::set_host_display_name(&state.db, meeting.id, dn).await?;
+            }
         }
 
         let row =
@@ -138,13 +153,17 @@ pub async fn join_meeting(
         // creator appears in acls/participants even on a fresh meeting.
         search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
+        // Token uses the persisted display_name (which reflects the
+        // reconciliation above) so the JWT carries the stable host name
+        // regardless of what the rejoin request claimed.
+        let persisted_dn = row.display_name.clone();
         let token = generate_room_token(
             &state.jwt_secret,
             state.token_ttl_secs,
             &user_id,
             &meeting_id,
             true,
-            display_name.unwrap_or(&user_id),
+            persisted_dn.as_deref().unwrap_or(&user_id),
             meeting.end_on_host_leave,
             false,
         )?;
@@ -154,7 +173,14 @@ pub async fn join_meeting(
         resp.admitted_can_admit = Some(meeting.admitted_can_admit);
         resp.end_on_host_leave = Some(meeting.end_on_host_leave);
         resp.allow_guests = Some(meeting.allow_guests);
-        resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
+        // Prefer the persisted cached host_display_name. Only fall through
+        // to the request's value if the cached value is missing or empty
+        // (legitimate first-time set).
+        resp.host_display_name = if existing_host_dn_nonempty {
+            meeting.host_display_name
+        } else {
+            display_name.map(String::from).or(meeting.host_display_name)
+        };
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
     } else {

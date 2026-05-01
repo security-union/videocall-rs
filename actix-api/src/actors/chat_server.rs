@@ -545,27 +545,122 @@ impl ChatServer {
             prev_sid, instance_id, user_id, room, skip_session_id
         );
 
+        self.forget_session(prev_sid, room, user_id, ctx);
+
+        true
+    }
+
+    /// Evict any prior session for the same `(room, user_id)` regardless of
+    /// `instance_id`.
+    ///
+    /// This is the fallthrough path for cases where the existing
+    /// [`Self::evict_stale_session`] (which keys on `instance_id`) found
+    /// nothing — typically because the rejoin landed across a page reload,
+    /// browser back-navigation, or in a fresh tab. Each of those generates a
+    /// new `instance_id` via [`generate_instance_id`] in the client, so the
+    /// `instance_id`-based path can't see the prior session even though the
+    /// same logical user is rejoining.
+    ///
+    /// Policy choice (see commit message and CLAUDE.md change-impact notes):
+    /// **latest joiner wins for the same `(room, user_id)`**. Two-tab use
+    /// from a single user collapses into a single session. We can't
+    /// distinguish "intentional multi-tab" from "stale-session-from-back-
+    /// navigation" with confidence on the server, and the duplicate-host
+    /// failure mode (two `is_host=true` entries for the same user) is the
+    /// worse outcome. If a future product requirement is to allow real
+    /// multi-tab, the policy lives in this function and can be relaxed.
+    ///
+    /// Returns `true` if a session was evicted.
+    /// `skip_session_id` is the new session's ID — used as a self-skip
+    /// guard so the new session doesn't evict itself if it has already
+    /// been pushed into `room_members` upstream of this call (it hasn't,
+    /// in the current call site, but the guard is defensive).
+    fn evict_same_user_session(
+        &mut self,
+        room: &str,
+        user_id: &str,
+        skip_session_id: SessionId,
+        ctx: &mut Context<Self>,
+    ) -> bool {
+        // Snapshot the prior session_id before mutating room_members. The
+        // typical room size is small (<100), and same-user duplicates are
+        // by construction at most one per user — there's no need to fan
+        // out to multiple evictions in a single call.
+        let prev_sid = match self.room_members.get(room) {
+            Some(members) => members
+                .iter()
+                .find(|m| m.user_id == user_id && m.session != skip_session_id)
+                .map(|m| m.session),
+            None => None,
+        };
+
+        let prev_sid = match prev_sid {
+            Some(sid) => sid,
+            None => return false,
+        };
+
+        info!(
+            "Evicting prior session {} for user {} in room {} (same-user dedup, \
+             new session {}). Policy: latest joiner wins; previous tab/instance \
+             collapsed.",
+            prev_sid, user_id, room, skip_session_id
+        );
+
+        self.forget_session(prev_sid, room, user_id, ctx);
+
+        true
+    }
+
+    /// Tear down all per-session state for `session_id` and cancel any
+    /// pending departure for `(room, user_id)`. Shared by both eviction
+    /// paths so the cleanup surface stays in lockstep — if a new
+    /// per-session HashMap is added to [`ChatServer`], it MUST be cleaned
+    /// up here.
+    ///
+    /// Does NOT broadcast `PARTICIPANT_LEFT` — both eviction paths are
+    /// silent (the new session that triggered the eviction will set
+    /// [`Self::suppress_join_broadcast`] for itself so peers see neither
+    /// a leave nor a redundant join — they see continuity).
+    fn forget_session(
+        &mut self,
+        session_id: SessionId,
+        room: &str,
+        user_id: &str,
+        ctx: &mut Context<Self>,
+    ) {
         if let Some(members) = self.room_members.get_mut(room) {
-            members.retain(|m| m.session != prev_sid);
+            members.retain(|m| m.session != session_id);
+            if members.is_empty() {
+                self.room_members.remove(room);
+            }
         }
 
-        if let Some(task) = self.active_subs.remove(&prev_sid) {
+        if let Some(task) = self.active_subs.remove(&session_id) {
             task.abort();
         }
 
-        let _ = self.sessions.remove(&prev_sid);
-        let _ = self.connection_states.remove(&prev_sid);
-        let _ = self.suppress_join_broadcast.remove(&prev_sid);
+        let _ = self.sessions.remove(&session_id);
+        let _ = self.connection_states.remove(&session_id);
+        let _ = self.suppress_join_broadcast.remove(&session_id);
+        let _ = self.session_is_guest.remove(&session_id);
 
+        // Cancel any deferred PARTICIPANT_LEFT for this user. If we evict
+        // them while a departure is pending, we want the new session to
+        // pick up cleanly without the old one's deferred broadcast firing.
         let departure_key = (room.to_string(), user_id.to_string());
         if let Some(pending) = self.pending_departures.remove(&departure_key) {
             ctx.cancel_future(pending.spawn_handle);
         }
 
-        self.instance_index.remove(instance_id);
-        self.session_instance.remove(&prev_sid);
-
-        true
+        // instance_index uses instance_id as the key, so we look it up via
+        // the reverse map and only delete the forward entry if it still
+        // points at this session (it may have been replaced concurrently
+        // by an eviction in flight).
+        if let Some(iid) = self.session_instance.remove(&session_id) {
+            if self.instance_index.get(&iid).copied() == Some(session_id) {
+                self.instance_index.remove(&iid);
+            }
+        }
     }
 }
 
@@ -1317,6 +1412,35 @@ impl Handler<JoinRoom> for ChatServer {
             // During RTT election, multiple connections (WS + WT) fire JoinRoom,
             // but only the winner activates. Publishing here would send 2-4
             // unnecessary NATS messages per connect.
+        }
+
+        // --- Anti-duplication eviction by (room, user_id) ---
+        // Catches the cross-page-reload / back-rejoin / multi-tab cases that
+        // the instance_id-based eviction above does NOT see. Each new
+        // `connect()` call in the client generates a fresh `instance_id`
+        // (videocall-client/src/client/video_call_client.rs::generate_instance_id),
+        // so a back-then-rejoin lands here with no entry in `instance_index`
+        // — but `room_members` may still contain the prior session if its
+        // grace-period departure is still pending OR if the prior session
+        // is actively connected from a duplicate tab.
+        //
+        // Without this fallthrough, BOTH sessions would coexist in
+        // `room_members` with `is_host=true`, producing the
+        // "two hosts visible to peers" symptom from issue #502.
+        //
+        // Policy: latest joiner wins. We can't tell "intentional multi-tab"
+        // from "back-button-then-rejoin" with confidence, and the
+        // duplicate-host failure mode is the worse outcome. If a future
+        // product requirement allows real multi-tab, relax this in
+        // `evict_same_user_session`.
+        //
+        // Runs even if `evict_stale_session` already evicted by
+        // instance_id — `evict_same_user_session` is a no-op when no
+        // remaining `(room, user_id)` duplicate exists, so the second call
+        // is cheap (one HashMap lookup + one Vec scan over the room).
+        if !observer {
+            let evicted_by_user_id = self.evict_same_user_session(&room, &user_id, session, ctx);
+            evicted_old_session = evicted_old_session || evicted_by_user_id;
         }
 
         // --- Reconnection grace period: cancel pending departure ---
@@ -5094,6 +5218,525 @@ mod tests {
             Some(false),
             "Host's cached end_on_host_leave must persist after a non-host departure"
         );
+    }
+
+    // ======================================================================
+    // Same-user-id anti-duplication eviction tests (issue #502)
+    // ======================================================================
+    //
+    // These exercise the [`ChatServer::evict_same_user_session`] fallthrough
+    // path that catches duplicate `(room, user_id)` entries when the
+    // instance_id-based eviction can't see them. The bug being prevented:
+    // back-navigate-then-rejoin produces a fresh `instance_id` (every
+    // client `connect()` call generates a new one), so the prior session
+    // remains in `room_members` AND the new session is added — both
+    // visible to peers, both flagged `is_host=true`.
+    //
+    // Policy decision (also documented at the helper):
+    // **latest joiner wins for the same `(room, user_id)`**. Multi-tab
+    // collapses into a single session. The duplicate-host failure mode
+    // (two `is_host=true` rows for one user) is the worse outcome.
+
+    // ------------------------------------------------------------------
+    // TEST: Cross-instance-id same-user rejoin — only one member remains
+    // ------------------------------------------------------------------
+    // Session A joins with instance_id="inst-A" as host. Session B joins
+    // the same room with the SAME user_id, FRESH instance_id="inst-B",
+    // also as host. The instance_id-based eviction can't match (different
+    // instance_ids), so the new same-user-id path must fire and evict
+    // session A. Verify:
+    //   - Only one RoomMemberInfo with that user_id remains (session B).
+    //   - Session A's per-session HashMaps are cleaned up.
+    //   - PARTICIPANT_JOINED is suppressed for session B (peers see continuity).
+    //   - No spurious PARTICIPANT_LEFT was broadcast for session A.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_cross_instance_id_same_user_rejoin_evicts_prior() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let session_a: SessionId = 9_700;
+        let session_b: SessionId = 9_701;
+        let room = "issue-502-cross-iid";
+        let user = "antonio@example.com";
+
+        // Subscribe to the system subject so we can confirm no spurious
+        // PARTICIPANT_LEFT is broadcast for session A.
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        // Session A: connect + join with instance_id="inst-A" as host.
+        chat_server
+            .send(Connect {
+                id: session_a,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_a,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("inst-A".to_string()),
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom A should return Ok");
+
+        // Activate so a (hypothetical) PARTICIPANT_LEFT could be broadcast
+        // if the eviction path failed to suppress it.
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(200)).await;
+
+        // Session B: connect + join with FRESH instance_id="inst-B", same user_id.
+        // The instance_id-based eviction cannot see session A; the new
+        // (room, user_id) eviction MUST fire.
+        chat_server
+            .send(Connect {
+                id: session_b,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_b,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("inst-B".to_string()),
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom B should return Ok");
+
+        sleep(Duration::from_millis(200)).await;
+
+        // Exactly one room member, and it's session B.
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(
+            members.len(),
+            1,
+            "After same-user rejoin only one room member should remain (got {})",
+            members.len()
+        );
+        assert_eq!(
+            members[0].session, session_b,
+            "Session B (latest joiner) should be the sole member"
+        );
+        assert_eq!(
+            members[0].user_id, user,
+            "Surviving member's user_id should match"
+        );
+        assert!(
+            members[0].is_host,
+            "Surviving member should still be flagged as host"
+        );
+
+        // Session A's per-session state should be gone.
+        let has_session_a = chat_server
+            .send(HasSession { session: session_a })
+            .await
+            .expect("HasSession should succeed");
+        assert!(
+            !has_session_a,
+            "Session A should be removed from sessions map"
+        );
+        let has_sub_a = chat_server
+            .send(HasActiveSub { session: session_a })
+            .await
+            .expect("HasActiveSub should succeed");
+        assert!(
+            !has_sub_a,
+            "Session A should have no active NATS subscription"
+        );
+
+        // Session B should be marked to suppress PARTICIPANT_JOINED so peers
+        // see a continuous "this user was already here" view, not a flicker.
+        let suppressed_b = chat_server
+            .send(IsSuppressedJoinBroadcast { session: session_b })
+            .await
+            .expect("IsSuppressedJoinBroadcast should succeed");
+        assert!(
+            suppressed_b,
+            "Session B should suppress PARTICIPANT_JOINED (same-user dedup)"
+        );
+
+        // Activate B and wait briefly to give any leftover broadcast a
+        // chance to land — none should arrive for session A's "departure".
+        chat_server
+            .send(ActivateConnection { session: session_b })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let (saw_ended, saw_left) =
+            collect_meeting_events(&mut system_sub, Duration::from_millis(800)).await;
+        assert!(
+            !saw_left,
+            "Same-user dedup must not broadcast PARTICIPANT_LEFT for the evicted session"
+        );
+        assert!(
+            !saw_ended,
+            "Same-user dedup must not broadcast MEETING_ENDED for the evicted host session"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TEST: Multi-tab dup with no instance_id — latest joiner wins
+    // ------------------------------------------------------------------
+    // Two distinct sessions, same user_id, same room, neither carries an
+    // instance_id (simulates two tabs that didn't get assigned one, or
+    // two clients that pre-date instance_id support). Verify the
+    // (room, user_id) eviction collapses them to a single member.
+    // Documents the explicit "multi-tab is NOT allowed for the same
+    // user in the same room" policy.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_multi_tab_dup_collapses_to_single_member() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let session_a: SessionId = 9_710;
+        let session_b: SessionId = 9_711;
+        let room = "issue-502-multi-tab";
+        let user = "carol@example.com";
+
+        // Tab A: no instance_id.
+        chat_server
+            .send(Connect {
+                id: session_a,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_a,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom A should return Ok");
+        sleep(Duration::from_millis(150)).await;
+
+        // Tab B: no instance_id, same user_id and room.
+        chat_server
+            .send(Connect {
+                id: session_b,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_b,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom B should return Ok");
+        sleep(Duration::from_millis(150)).await;
+
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(
+            members.len(),
+            1,
+            "Multi-tab dup with same user_id must collapse to one member"
+        );
+        assert_eq!(members[0].session, session_b, "Latest joiner (tab B) wins");
+    }
+
+    // ------------------------------------------------------------------
+    // TEST: Existing instance_id-match path still works after refactor
+    // ------------------------------------------------------------------
+    // Regression check: even though `evict_same_user_session` runs
+    // unconditionally for non-observers, the in-tab transport-reconnect
+    // case (same instance_id, same user_id) must still be handled by
+    // `evict_stale_session` first — which is called before the new path.
+    // This test mirrors `test_eviction_basic_same_user` but re-asserts
+    // the invariants on the post-refactor code path.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_instance_id_eviction_path_still_intact() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let session_a: SessionId = 9_720;
+        let session_b: SessionId = 9_721;
+        let room = "issue-502-iid-path";
+        let user = "dave@example.com";
+        let iid = "inst-stable".to_string();
+
+        // Session A with instance_id.
+        chat_server
+            .send(Connect {
+                id: session_a,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_a,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some(iid.clone()),
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom A should return Ok");
+        sleep(Duration::from_millis(150)).await;
+
+        // Session B with the SAME instance_id (in-tab transport reconnect).
+        chat_server
+            .send(Connect {
+                id: session_b,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_b,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some(iid),
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom B should return Ok");
+        sleep(Duration::from_millis(150)).await;
+
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(
+            members.len(),
+            1,
+            "In-tab reconnect (same instance_id) must still leave one member"
+        );
+        assert_eq!(members[0].session, session_b);
+
+        let suppressed = chat_server
+            .send(IsSuppressedJoinBroadcast { session: session_b })
+            .await
+            .expect("IsSuppressedJoinBroadcast should succeed");
+        assert!(
+            suppressed,
+            "In-tab reconnect should still suppress PARTICIPANT_JOINED"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TEST: Pending departure cancelled when same-user dedup fires
+    // ------------------------------------------------------------------
+    // Sequence: session A joins + activates as host, then disconnects
+    // (schedules ExecutePendingDeparture for the grace window), then
+    // session B joins as host with a FRESH instance_id BEFORE the grace
+    // expires. The new (room, user_id) eviction must cancel the pending
+    // departure so the deferred MEETING_ENDED + PARTICIPANT_LEFT
+    // broadcasts NEVER fire — peers should see a seamless host presence.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_same_user_dedup_cancels_pending_departure() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let session_a: SessionId = 9_730;
+        let session_b: SessionId = 9_731;
+        let room = "issue-502-cancel-departure";
+        let user = "erin-host@example.com";
+
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        let mut db_sub = nats_client
+            .subscribe(MEETING_ENDED_BY_HOST_SUBJECT)
+            .await
+            .expect("Failed to subscribe to internal subject");
+
+        // Session A: host, activates, then disconnects (defers departure).
+        chat_server
+            .send(Connect {
+                id: session_a,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_a,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("iid-A".to_string()),
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom A should return Ok");
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(250)).await;
+
+        chat_server
+            .send(Disconnect {
+                session: session_a,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Wait briefly inside the grace window, then session B rejoins
+        // with a FRESH instance_id (simulating back-navigation + rejoin).
+        sleep(Duration::from_millis(800)).await;
+        chat_server
+            .send(Connect {
+                id: session_b,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_b,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("iid-B-fresh".to_string()),
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom B should return Ok");
+        chat_server
+            .send(ActivateConnection { session: session_b })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Wait beyond the grace period. Even though it elapsed, the
+        // pending departure should have been cancelled by the
+        // (room, user_id) eviction during JoinRoom B — so no broadcast
+        // and no DB event should land.
+        let (saw_ended, saw_left) =
+            collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
+        assert!(
+            !saw_ended,
+            "Cross-iid rejoin within grace must cancel deferred MEETING_ENDED"
+        );
+        assert!(
+            !saw_left,
+            "Cross-iid rejoin within grace must cancel deferred PARTICIPANT_LEFT"
+        );
+
+        let db_payload = wait_for_first(&mut db_sub, Duration::from_secs(1)).await;
+        assert!(
+            db_payload.is_none(),
+            "Cross-iid rejoin within grace must cancel internal.meeting_ended_by_host"
+        );
+
+        // Single survivor in room_members — session B.
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].session, session_b);
     }
 
     // ──────────────────────────────────────────────────────────────────────

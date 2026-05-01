@@ -41,6 +41,21 @@ const PARTICIPANT_COLUMNS: &str = r#"
 "#;
 
 /// Insert or update a participant as host (admitted immediately).
+///
+/// **Display-name reconciliation policy on rejoin:** when a row already exists
+/// for `(meeting_id, user_id)` with a non-empty `display_name`, the existing
+/// value is preserved — the request's `display_name` does NOT overwrite it.
+/// This is intentional: rejoin must never silently rename a participant.
+/// Mid-meeting renames go through the rate-limited
+/// [`crate::routes::participants::update_display_name`] endpoint.
+///
+/// The `NULLIF(..., '')` rewrites an empty-string existing value to `NULL` so
+/// the `COALESCE` falls through to the request's value — empty-string is
+/// treated as "no name set yet" (the legitimate first-time case where a
+/// follow-up rejoin should be allowed to fill it in).
+///
+/// See issue #502 for the bug this prevents (manually-typed name "Antonio"
+/// being silently overwritten by an OAuth-derived "Tony" on back-then-rejoin).
 pub async fn upsert_host(
     pool: &PgPool,
     meeting_id: i32,
@@ -53,7 +68,7 @@ pub async fn upsert_host(
         VALUES ($1, $2, 'admitted', TRUE, FALSE, $3, NOW())
         ON CONFLICT (meeting_id, user_id)
         DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(), left_at = NULL,
-                      display_name = COALESCE($3, meeting_participants.display_name)
+                      display_name = COALESCE(NULLIF(meeting_participants.display_name, ''), $3)
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
@@ -115,6 +130,10 @@ pub async fn join_attendee(
         }
     }
 
+    // Display-name reconciliation policy on rejoin: see [`upsert_host`] for
+    // the rationale. The same `COALESCE(NULLIF(...), $3)` shape applies to
+    // both branches below — non-empty existing names beat the request's
+    // value so rejoin never silently renames a participant. Issue #502.
     let row = if waiting_room_enabled {
         let query = format!(
             r#"
@@ -122,7 +141,7 @@ pub async fn join_attendee(
             VALUES ($1, $2, 'waiting', FALSE, $4, $3)
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'waiting', left_at = NULL,
-                          display_name = COALESCE($3, meeting_participants.display_name)
+                          display_name = COALESCE(NULLIF(meeting_participants.display_name, ''), $3)
             RETURNING {PARTICIPANT_COLUMNS}
             "#
         );
@@ -140,7 +159,7 @@ pub async fn join_attendee(
             VALUES ($1, $2, 'admitted', FALSE, $4, $3, NOW())
             ON CONFLICT (meeting_id, user_id)
             DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
-                          display_name = COALESCE($3, meeting_participants.display_name)
+                          display_name = COALESCE(NULLIF(meeting_participants.display_name, ''), $3)
             RETURNING {PARTICIPANT_COLUMNS}
             "#
         );

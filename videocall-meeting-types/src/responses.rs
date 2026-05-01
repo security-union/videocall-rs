@@ -168,6 +168,84 @@ pub struct JoinedMeetingSummary {
     pub last_joined_at: i64,
 }
 
+/// Response payload for `GET /api/v1/meetings/feed`.
+///
+/// Returns the union of meetings the authenticated user owns or has been
+/// admitted into, deduplicated to one row per meeting and ordered by
+/// `last_active_at` descending. Powers the home page meeting list.
+///
+/// ## Why one endpoint instead of two
+///
+/// Earlier the home page called both `GET /api/v1/meetings` (owned + joined,
+/// but missing `is_owner` on each row) and `GET /api/v1/meetings/joined`
+/// (which carried `is_owner` correctly). The frontend assumed everything in
+/// the first list was owned and rendered the Owner pill plus edit/delete
+/// affordances unconditionally. This endpoint fixes that by returning a
+/// single deduplicated feed where every row has an authoritative,
+/// server-computed `is_owner` flag.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ListFeedResponse {
+    /// Meetings the user owns OR has been admitted into, ordered by
+    /// `last_active_at` descending. Capped at 200 rows — see
+    /// `MeetingFeedSummary::last_active_at` for ordering semantics.
+    pub meetings: Vec<MeetingFeedSummary>,
+}
+
+/// Single meeting entry inside [`ListFeedResponse`].
+///
+/// All timestamps are Unix epoch milliseconds. `is_owner` is set by the
+/// server: it compares `creator_id` against the authenticated user's id and
+/// is the only safe source of truth for ownership-gated UI affordances such
+/// as the Owner pill, edit, delete, and end-meeting controls.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct MeetingFeedSummary {
+    pub meeting_id: String,
+    /// Meeting state: `"active"`, `"idle"`, or `"ended"`.
+    pub state: String,
+    /// Unix timestamp in milliseconds — the timestamp used for ordering.
+    /// Computed server-side as
+    /// `COALESCE(p.admitted_at_max, m.started_at, m.created_at)` so:
+    /// - For meetings the user has been admitted into, this is the most
+    ///   recent admission time (so re-admissions float to the top).
+    /// - For owned-but-never-joined meetings this falls back to
+    ///   `started_at` (which the meeting-api refreshes on every
+    ///   `idle/ended -> active` transition).
+    /// - For idle meetings that have never been activated this falls back
+    ///   to `created_at`.
+    pub last_active_at: i64,
+    /// Unix timestamp in milliseconds when the meeting was first created.
+    /// Immutable — set at INSERT and never updated.
+    pub created_at: i64,
+    /// Unix timestamp in milliseconds when the meeting most recently
+    /// transitioned to `active`. `None` only when the meeting has never been
+    /// activated (still in `idle`); otherwise refreshed on each
+    /// `idle/ended -> active` transition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    /// Unix timestamp in milliseconds when the meeting ended, or `None` if
+    /// still active/idle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+    /// The meeting creator's `user_id` (display only). Use `is_owner` for
+    /// any ownership-based authorization decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// `true` when `creator_id == authenticated_user_id`.
+    ///
+    /// **Server-computed.** This is the authoritative trust signal the UI
+    /// must use to decide whether to render owner-only affordances
+    /// (Owner pill, edit, delete, end-meeting). Do not infer ownership from
+    /// any other field.
+    pub is_owner: bool,
+    pub participant_count: i64,
+    pub waiting_count: i64,
+    pub has_password: bool,
+    pub allow_guests: bool,
+    pub waiting_room_enabled: bool,
+    pub admitted_can_admit: bool,
+    pub end_on_host_leave: bool,
+}
+
 /// Single meeting entry inside [`ListMeetingsResponse`].
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct MeetingSummary {

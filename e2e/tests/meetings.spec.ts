@@ -24,31 +24,32 @@ const usernameInfoTooltipSelector = "#username-info-tip";
 const meetingIdInfoTriggerSelector = 'label[for="meeting-id"] .field-label__info';
 const meetingIdInfoTooltipSelector = "#meeting-id-info-tip";
 
-// Selectors for the "Previously Joined" section (rendered above MeetingsList).
-// Mirrors the helpers documented in the JoinedMeetingsList component — the
-// section reuses `meetings-list-container` for shared styling and adds
-// `joined-meetings-list-container` as the disambiguator. The "My Meetings"
-// section can therefore be selected with the negation form below.
-const JOINED_SECTION = ".joined-meetings-list-container";
-const JOINED_SECTION_HEADER = ".joined-meetings-list-container .meetings-list-toggle";
-const JOINED_LIST_ROWS = ".joined-meetings-list-container .meeting-item";
-const JOINED_OWNER_BADGE = ".meeting-owner-badge";
-const MY_MEETINGS_SECTION = ".meetings-list-container:not(.joined-meetings-list-container)";
+// Selectors for the merged "Meetings" section on the home page. The previous
+// design rendered two separate lists ("My Meetings" + "Previously Joined")
+// backed by two API endpoints; both have been collapsed into a single section
+// backed by `GET /api/v1/meetings/feed`, which returns the union of meetings
+// the authenticated user owns or has been admitted into. Each row carries a
+// server-supplied `is_owner` flag that gates the inline gold star icon, the
+// edit button, the delete button, and the tooltip's "Owner" line.
+const MEETINGS_SECTION = ".meetings-list-container";
+const MEETINGS_SECTION_HEADER = ".meetings-list-container .meetings-list-toggle";
+const MEETINGS_LIST_ROWS = ".meetings-list-container .meeting-item";
+const OWNER_ICON = ".meeting-owner-icon";
 
 /**
- * Wait until the joined-meetings list reports it has finished loading and
+ * Wait until the merged meetings list reports it has finished loading and
  * has rendered exactly `expected` rows. The component sets `loading=true`
  * on mount and only renders the `<ul class="meetings-list">` once the
  * fetch resolves, so we can't safely assert against row count without
  * gating on the loading spinner first.
  */
-async function waitForJoinedRowCount(page: Page, expected: number): Promise<void> {
-  // The loading state renders `.meetings-loading` inside the joined section.
+async function waitForMeetingsRowCount(page: Page, expected: number): Promise<void> {
+  // The loading state renders `.meetings-loading` inside the section.
   // We wait for that to disappear before counting list rows.
-  await expect(page.locator(`${JOINED_SECTION} .meetings-loading`)).toHaveCount(0, {
+  await expect(page.locator(`${MEETINGS_SECTION} .meetings-loading`)).toHaveCount(0, {
     timeout: 15_000,
   });
-  await expect(page.locator(JOINED_LIST_ROWS)).toHaveCount(expected, { timeout: 10_000 });
+  await expect(page.locator(MEETINGS_LIST_ROWS)).toHaveCount(expected, { timeout: 10_000 });
 }
 
 test.describe("Meetings", () => {
@@ -591,169 +592,157 @@ test.describe("Meetings", () => {
 });
 
 /**
- * "Previously Joined" meetings section.
+ * Merged "Meetings" section.
  *
- * The home page renders a new section (component:
- * `dioxus-ui/src/components/joined_meetings_list.rs`) above the existing
- * "My Meetings" list. It surfaces the last N meetings the authenticated
- * user has been admitted into — owned and non-owned alike — ordered by
- * most recent admission. The backend integration tests already cover query
- * correctness; these tests only verify the UI surfaces the data correctly.
+ * The home page renders a single `MeetingsList` section
+ * (`dioxus-ui/src/components/meetings_list.rs`) backed by
+ * `GET /api/v1/meetings/feed`. That endpoint returns the union of meetings
+ * the authenticated user owns or has been admitted into — owned and
+ * non-owned alike — ordered server-side by `last_active_at DESC, id DESC`,
+ * capped at 200 rows. Each row carries a server-supplied `is_owner` flag
+ * which is the **only** authoritative ownership signal in the UI; it gates
+ * the inline gold star icon (`.meeting-owner-icon`), the edit and delete
+ * buttons, and the "Owner" tooltip line. The two-section layout it replaced
+ * (separate "My Meetings" + "Previously Joined") is gone.
  *
  * Each test uses a unique-per-run user identity so multiple test workers
- * (and re-runs against a non-cleaned DB) don't pollute one another's joined
- * list. We seed via the meeting-api REST endpoints — much faster and more
+ * (and re-runs against a non-cleaned DB) don't pollute one another's feed.
+ * We seed via the meeting-api REST endpoints — much faster and more
  * deterministic than driving the UI flow.
- *
- * Limitation: an "idle" meeting where the test user is `admitted` is not
- * naturally reachable through the public API. The owner-join path activates
- * the meeting before inserting the participant row, and a non-owner cannot
- * be admitted until the meeting is active. The `state-idle` pill rendering
- * is therefore covered only via state-specific seeding TODOs below; the
- * `active` and `ended` states are exercised end-to-end.
  */
-test.describe("Previously Joined meetings section", () => {
+test.describe("Meetings list (merged feed)", () => {
   test.beforeAll(async () => {
     await waitForServices();
   });
 
-  test("section header is visible above My Meetings", async ({ context, baseURL, page }) => {
+  test("section header reads 'Meetings' with a count badge", async ({ context, baseURL, page }) => {
     // Use a dedicated user to keep the assertion stable regardless of any
     // residual seed data left over from earlier tests.
-    const email = `joined-header-${Date.now()}@videocall.rs`;
-    const name = "JoinedHeaderUser";
+    const email = `meetings-header-${Date.now()}@videocall.rs`;
+    const name = "MeetingsHeaderUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
     await page.goto("/");
     await page.waitForTimeout(1500);
 
-    const joinedSection = page.locator(JOINED_SECTION);
-    const myMeetingsSection = page.locator(MY_MEETINGS_SECTION);
+    // Exactly one merged section should be present.
+    await expect(page.locator(MEETINGS_SECTION)).toHaveCount(1);
 
-    // Both sections should be present in the DOM.
-    await expect(joinedSection).toHaveCount(1);
-    await expect(myMeetingsSection).toHaveCount(1);
+    // The literal section header text must be present in the toggle button
+    // (case-sensitive — this is the visible UI label).
+    await expect(page.locator(MEETINGS_SECTION_HEADER)).toContainText("Meetings");
 
-    // The literal section header text must be present inside the joined
-    // section (case-sensitive — this is the visible UI label).
-    await expect(page.locator(JOINED_SECTION_HEADER)).toContainText("Previously Joined");
-
-    // Positional sanity: the joined section sits ABOVE My Meetings on the
-    // page. We compare bounding-rect tops via evaluate() so the assertion
-    // is robust against zoom level / layout differences.
-    const tops = await page.evaluate(
-      ({ joinedSel, mySel }) => {
-        const j = document.querySelector(joinedSel) as HTMLElement | null;
-        const m = document.querySelector(mySel) as HTMLElement | null;
-        return {
-          joined: j?.getBoundingClientRect().top ?? null,
-          my: m?.getBoundingClientRect().top ?? null,
-        };
-      },
-      { joinedSel: JOINED_SECTION, mySel: MY_MEETINGS_SECTION },
-    );
-    expect(tops.joined).not.toBeNull();
-    expect(tops.my).not.toBeNull();
-    expect(tops.joined as number).toBeLessThan(tops.my as number);
+    // The previous design had a separate "Previously Joined" section above
+    // the merged list. Guard against the regression that re-introduces a
+    // second section (or the literal old header copy).
+    await expect(page.locator(".joined-meetings-list-container")).toHaveCount(0);
+    await expect(page.getByText("Previously Joined", { exact: false })).toHaveCount(0);
   });
 
-  test("empty state shows 'No previously joined meetings'", async ({ context, baseURL, page }) => {
+  test("empty state shows 'No meetings yet'", async ({ context, baseURL, page }) => {
     // Use a fresh user identity that has never participated in any meeting.
-    // The empty-state branch in JoinedMeetingsList renders a single
+    // The empty-state branch in MeetingsList renders a single
     // `.meetings-empty` div with the literal copy below.
-    const email = `joined-empty-${Date.now()}@videocall.rs`;
-    const name = "JoinedEmptyUser";
+    const email = `meetings-empty-${Date.now()}@videocall.rs`;
+    const name = "MeetingsEmptyUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
     await page.goto("/");
     await page.waitForTimeout(1500);
 
-    // Wait for the joined section to settle (loading spinner gone).
-    await expect(page.locator(`${JOINED_SECTION} .meetings-loading`)).toHaveCount(0, {
+    // Wait for the section to settle (loading spinner gone).
+    await expect(page.locator(`${MEETINGS_SECTION} .meetings-loading`)).toHaveCount(0, {
       timeout: 15_000,
     });
 
-    // Empty-state copy and shape — scope the locator to the joined section
-    // so leftover empty-state copy in MyMeetings ("No meetings yet") doesn't
-    // accidentally satisfy this assertion.
-    const empty = page.locator(`${JOINED_SECTION} .meetings-empty`);
+    // Empty-state copy — the merged component reuses the existing copy
+    // ("No meetings yet"), since it's now the sole list on the page.
+    const empty = page.locator(`${MEETINGS_SECTION} .meetings-empty`);
     await expect(empty).toBeVisible();
-    await expect(empty).toHaveText("No previously joined meetings");
+    await expect(empty).toHaveText("No meetings yet");
 
     // The list itself must NOT be rendered when empty.
-    await expect(page.locator(JOINED_LIST_ROWS)).toHaveCount(0);
+    await expect(page.locator(MEETINGS_LIST_ROWS)).toHaveCount(0);
 
     // The count badge in the section header should read "(0)".
-    await expect(page.locator(`${JOINED_SECTION_HEADER} .meeting-count`)).toHaveText("(0)");
+    await expect(page.locator(`${MEETINGS_SECTION_HEADER} .meeting-count`)).toHaveText("(0)");
   });
 
-  test("state pill renders for an active meeting (idle/ended TODO)", async ({
+  test("state pill renders for active and ended meetings (idle TODO)", async ({
     context,
     baseURL,
     page,
   }) => {
-    // The component reuses the existing `state-active` / `state-idle` /
-    // `state-ended` classes from MeetingsList. We can drive a meeting into
+    // The component renders `state-active` / `state-idle` / `state-ended`
+    // pills with title-cased Rust-side copy. We can drive a meeting into
     // the `active` state via the join-as-host path, and into `ended` via
     // POST /api/v1/meetings/{id}/end. The `idle` state is NOT reachable
-    // for a meeting the user has joined (owner-join always activates),
-    // so it's marked TODO below.
-    const email = `joined-states-${Date.now()}@videocall.rs`;
-    const name = "JoinedStatesUser";
+    // through the public API (owner-join always activates), so it's
+    // marked TODO below.
+    const email = `meetings-states-${Date.now()}@videocall.rs`;
+    const name = "MeetingsStatesUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
     // Seed: one ACTIVE meeting (host-join activates it).
-    const activeId = `e2e_joined_active_${Date.now()}`;
+    const activeId = `e2e_meetings_active_${Date.now()}`;
     await createMeeting(email, name, { meetingId: activeId, waitingRoomEnabled: false });
     await joinMeeting(email, name, activeId, name);
 
     // Seed: one ENDED meeting (host-join, then explicitly end).
-    const endedId = `e2e_joined_ended_${Date.now()}`;
+    const endedId = `e2e_meetings_ended_${Date.now()}`;
     await createMeeting(email, name, { meetingId: endedId, waitingRoomEnabled: false });
     await joinMeeting(email, name, endedId, name);
     await endMeeting(email, name, endedId);
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForJoinedRowCount(page, 2);
+    await waitForMeetingsRowCount(page, 2);
 
     // Both rows should render their state pill with the right CSS class.
-    // Scope these selectors to the joined section so MyMeetings rows can't
-    // satisfy the assertion.
-    await expect(page.locator(`${JOINED_SECTION} .meeting-state.state-active`)).toHaveCount(1);
-    await expect(page.locator(`${JOINED_SECTION} .meeting-state.state-ended`)).toHaveCount(1);
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-active`)).toHaveCount(1);
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-ended`)).toHaveCount(1);
 
-    // The state label is now title-cased in Rust before rendering ("Active",
-    // "Ended"), not lower-cased + CSS uppercase as before. We assert the
-    // exact DOM text so a regression that drops the title-case (or sneaks
-    // back to the raw lowercase enum string) fails this test loudly.
-    await expect(page.locator(`${JOINED_SECTION} .meeting-state.state-active`)).toHaveText(
+    // The state label is title-cased in Rust before rendering ("Active",
+    // "Ended"), not lower-cased + CSS uppercase. We assert the exact DOM
+    // text so a regression that drops the title-case (or sneaks back to
+    // the raw lowercase enum string) fails this test loudly.
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-active`)).toHaveText(
       "Active",
     );
-    await expect(page.locator(`${JOINED_SECTION} .meeting-state.state-ended`)).toHaveText("Ended");
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-ended`)).toHaveText(
+      "Ended",
+    );
+
+    await deleteAllOwnedMeetings(email, name);
 
     // TODO: assert `state-idle` rendering. The owner-join API call always
-    // transitions the meeting to `active`, and `list_joined_by_user` only
-    // returns rows the user has been admitted into. To exercise this
-    // branch we'd need either a DB-level seeding helper or a test-only
-    // endpoint that materialises an idle-meeting + admitted-participant
-    // pair. Tracking as a follow-up; the rendering code path is identical
-    // for all three states (single span with the matching class) so the
-    // active/ended coverage gives reasonable confidence.
+    // transitions the meeting to `active`, and a non-owner cannot be
+    // admitted before activation. Tracking as a follow-up; the rendering
+    // code path is identical for all three states (single span with the
+    // matching class) so the active/ended coverage gives reasonable
+    // confidence.
   });
 
-  test("Owner badge appears only on owned rows", async ({ context, baseURL, page }) => {
+  test("Owner icon appears only on owned rows (and never on guest rows)", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
     // Two meetings:
-    //   (a) one this test user owns + has joined → expect `.meeting-owner-badge`
-    //   (b) one a DIFFERENT user owns and our test user joined → expect NO badge
-    const userEmail = `joined-owner-self-${Date.now()}@videocall.rs`;
-    const userName = "JoinedOwnerSelf";
-    const otherEmail = `joined-owner-other-${Date.now()}@videocall.rs`;
-    const otherName = "JoinedOwnerOther";
+    //   (a) one this test user owns + has joined → expect `.meeting-owner-icon`
+    //   (b) one a DIFFERENT user owns and our test user joined → expect NO icon
+    // This is the canonical UI binding for the server-supplied `is_owner`
+    // flag, scoped to a single browser session. The cross-browser
+    // regression for the original bug (two identities seeing each other's
+    // ownership state) lives in `meetings-ownership.spec.ts`.
+    const userEmail = `meetings-owner-self-${Date.now()}@videocall.rs`;
+    const userName = "MeetingsOwnerSelf";
+    const otherEmail = `meetings-owner-other-${Date.now()}@videocall.rs`;
+    const otherName = "MeetingsOwnerOther";
     await injectSessionCookie(context, { baseURL, email: userEmail, name: userName });
 
     // (a) Owned-and-joined: create as test user, then join.
-    const ownedId = `e2e_joined_owned_${Date.now()}`;
+    const ownedId = `e2e_meetings_owned_${Date.now()}`;
     await createMeeting(userEmail, userName, {
       meetingId: ownedId,
       waitingRoomEnabled: false,
@@ -763,7 +752,7 @@ test.describe("Previously Joined meetings section", () => {
     // (b) Other-owned + joined: a different user creates the meeting (with
     // waiting_room disabled so our test user auto-admits on join), then
     // the test user joins to get an `admitted_at` row recorded.
-    const guestId = `e2e_joined_guest_${Date.now()}`;
+    const guestId = `e2e_meetings_guest_${Date.now()}`;
     await createMeeting(otherEmail, otherName, {
       meetingId: guestId,
       waitingRoomEnabled: false,
@@ -778,9 +767,9 @@ test.describe("Previously Joined meetings section", () => {
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForJoinedRowCount(page, 2);
+    await waitForMeetingsRowCount(page, 2);
 
-    const rows = page.locator(JOINED_LIST_ROWS);
+    const rows = page.locator(MEETINGS_LIST_ROWS);
 
     // Locate each row by its rendered meeting-id span. Filter `meeting-item`
     // li elements by the literal id text so we don't depend on row order.
@@ -789,29 +778,42 @@ test.describe("Previously Joined meetings section", () => {
     await expect(ownedRow).toHaveCount(1);
     await expect(guestRow).toHaveCount(1);
 
-    // Owned row: badge present + literal "Owner" copy.
-    const ownedBadge = ownedRow.locator(JOINED_OWNER_BADGE);
-    await expect(ownedBadge).toHaveCount(1);
-    await expect(ownedBadge).toBeVisible();
-    await expect(ownedBadge).toContainText("Owner");
+    // Owned row: gold-star icon present + accessible "Owner" label.
+    const ownedIcon = ownedRow.locator(OWNER_ICON);
+    await expect(ownedIcon).toHaveCount(1);
+    await expect(ownedIcon).toBeVisible();
+    await expect(ownedIcon).toHaveAttribute("aria-label", "Owner");
 
-    // Non-owned row: NO badge anywhere inside that <li>.
-    await expect(guestRow.locator(JOINED_OWNER_BADGE)).toHaveCount(0);
+    // Owned row: edit + delete buttons gated behind `is_owner` are present.
+    await expect(ownedRow.locator(".meeting-edit-btn")).toHaveCount(1);
+    await expect(ownedRow.locator(".meeting-delete-btn")).toHaveCount(1);
+
+    // Non-owned row: NO icon and NO owner-only buttons anywhere inside that <li>.
+    await expect(guestRow.locator(OWNER_ICON)).toHaveCount(0);
+    await expect(guestRow.locator(".meeting-edit-btn")).toHaveCount(0);
+    await expect(guestRow.locator(".meeting-delete-btn")).toHaveCount(0);
+
+    // Regression guard: the legacy "Owner" pill class must be gone from
+    // the DOM. The replacement is the inline icon above.
+    await expect(page.locator(".meeting-owner-badge")).toHaveCount(0);
+
+    await deleteAllOwnedMeetings(userEmail, userName);
+    await deleteAllOwnedMeetings(otherEmail, otherName);
   });
 
-  test("rows are ordered by most-recent admission first", async ({ context, baseURL, page }) => {
-    // Seed 3 owned meetings with staggered join calls. `last_joined_at` is
-    // computed server-side as `COALESCE(admitted_at, joined_at)` — and for a
-    // fresh host the admit timestamp is set in the same INSERT as the row.
+  test("rows are ordered by most-recent activity first", async ({ context, baseURL, page }) => {
+    // Seed 3 owned meetings with staggered join calls. The merged feed is
+    // ordered server-side by `last_active_at DESC, id DESC` where
+    // `last_active_at = COALESCE(p.last_admit, m.started_at, m.created_at)`.
     // Sleeping ~1s between joins guarantees distinct second-resolution
     // timestamps even on systems with coarse clock granularity.
-    const email = `joined-order-${Date.now()}@videocall.rs`;
-    const name = "JoinedOrderUser";
+    const email = `meetings-order-${Date.now()}@videocall.rs`;
+    const name = "MeetingsOrderUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
-    const oldestId = `e2e_joined_order_a_${Date.now()}`;
-    const middleId = `e2e_joined_order_b_${Date.now()}`;
-    const newestId = `e2e_joined_order_c_${Date.now()}`;
+    const oldestId = `e2e_meetings_order_a_${Date.now()}`;
+    const middleId = `e2e_meetings_order_b_${Date.now()}`;
+    const newestId = `e2e_meetings_order_c_${Date.now()}`;
 
     for (const id of [oldestId, middleId, newestId]) {
       await createMeeting(email, name, { meetingId: id, waitingRoomEnabled: false });
@@ -822,35 +824,30 @@ test.describe("Previously Joined meetings section", () => {
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForJoinedRowCount(page, 3);
+    await waitForMeetingsRowCount(page, 3);
 
     // Read the `.meeting-id` text of each row in DOM order.
-    const renderedIds = await page.locator(`${JOINED_LIST_ROWS} .meeting-id`).allTextContents();
+    const renderedIds = await page.locator(`${MEETINGS_LIST_ROWS} .meeting-id`).allTextContents();
 
-    // Expected ordering: most-recent admission first → newest, middle, oldest.
+    // Expected ordering: most-recent activity first → newest, middle, oldest.
     expect(renderedIds).toEqual([newestId, middleId, oldestId]);
+
+    await deleteAllOwnedMeetings(email, name);
   });
 
-  test("at most 5 rows render even when more meetings have been joined", async ({
-    context,
-    baseURL,
-    page,
-  }) => {
-    // The component requests `limit=5` from the backend, and the backend's
-    // `total` is computed as `meetings.len()` (i.e. it reflects the page
-    // size, not the unbounded count). Seed 7 joins and assert exactly 5
-    // rows render. We also assert the count badge — written against the
-    // ACTUAL backend semantic (`total = 5`), not the ideal "5 of 7".
-    const email = `joined-limit-${Date.now()}@videocall.rs`;
-    const name = "JoinedLimitUser";
+  test("more than 5 rows render (5-row limit was removed)", async ({ context, baseURL, page }) => {
+    // The previous "Previously Joined" list capped the UI at 5 rows. The
+    // merged feed inherits the server's 200-row default cap instead, so
+    // seeding 7 meetings should produce 7 rendered rows (and a "(7)"
+    // count badge).
+    const email = `meetings-limit-${Date.now()}@videocall.rs`;
+    const name = "MeetingsLimitUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
-    // 7 meetings, host-joined sequentially. No need to space them out for
-    // this test — we only care about row count, not order.
     const tsBase = Date.now();
     const ids: string[] = [];
     for (let i = 0; i < 7; i += 1) {
-      const id = `e2e_joined_limit_${tsBase}_${i}`;
+      const id = `e2e_meetings_limit_${tsBase}_${i}`;
       ids.push(id);
       await createMeeting(email, name, { meetingId: id, waitingRoomEnabled: false });
       await joinMeeting(email, name, id, name);
@@ -858,20 +855,21 @@ test.describe("Previously Joined meetings section", () => {
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForJoinedRowCount(page, 5);
+    await waitForMeetingsRowCount(page, 7);
 
-    // Backend returns `total = meetings.len()` = 5, so the count badge in
-    // the section header should read "(5)" even though the user has 7
-    // joined meetings. This is a UX gap worth flagging — see test report.
-    await expect(page.locator(`${JOINED_SECTION_HEADER} .meeting-count`)).toHaveText("(5)");
+    // The count badge should reflect the full row count, not a truncated
+    // page size.
+    await expect(page.locator(`${MEETINGS_SECTION_HEADER} .meeting-count`)).toHaveText("(7)");
+
+    await deleteAllOwnedMeetings(email, name);
   });
 
-  test("clicking a joined row navigates to the meeting page", async ({
+  test("clicking a row mirrors the meeting id into the form input", async ({
     context,
     baseURL,
     page,
   }) => {
-    // The JoinedMeetingItem onclick handler defaults to pushing the
+    // The MeetingItem onclick handler defaults to pushing the
     // `Route::Meeting { id }` route when no `on_select_meeting` callback
     // is provided. On the home page, however, the parent passes a callback
     // that mirrors the meeting id into the input field instead of
@@ -880,91 +878,26 @@ test.describe("Previously Joined meetings section", () => {
     //
     // Subsequent navigation requires the user to click "Start or Join
     // Meeting" — that path is already covered by other tests in this file.
-    const email = `joined-click-${Date.now()}@videocall.rs`;
-    const name = "JoinedClickUser";
+    const email = `meetings-click-${Date.now()}@videocall.rs`;
+    const name = "MeetingsClickUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
-    const meetingId = `e2e_joined_click_${Date.now()}`;
+    const meetingId = `e2e_meetings_click_${Date.now()}`;
     await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
     await joinMeeting(email, name, meetingId, name);
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForJoinedRowCount(page, 1);
+    await waitForMeetingsRowCount(page, 1);
 
     // Click the row's content (the `<div class="meeting-item-content">`
     // owns the onclick — the `<li>` itself does not).
-    await page.locator(`${JOINED_LIST_ROWS} .meeting-item-content`).first().click();
+    await page.locator(`${MEETINGS_LIST_ROWS} .meeting-item-content`).first().click();
 
     // The home page wires `on_select_meeting` to set the meeting-id input
     // value. Verify the input now holds the clicked meeting's id.
     await expect(page.locator("#meeting-id")).toHaveValue(meetingId, { timeout: 5_000 });
-  });
 
-  test("joined rows have no edit or delete buttons", async ({ context, baseURL, page }) => {
-    // The joined-meetings list intentionally omits the per-row edit and
-    // delete affordances rendered by MeetingsList. Users manage owned
-    // meetings from the My Meetings section. Assert neither button class
-    // appears inside the joined section, even when one of the rows is
-    // owned by the current user (which would otherwise be eligible for
-    // edit/delete in MyMeetings).
-    const email = `joined-no-ctrls-${Date.now()}@videocall.rs`;
-    const name = "JoinedNoCtrlsUser";
-    await injectSessionCookie(context, { baseURL, email, name });
-
-    const meetingId = `e2e_joined_no_ctrls_${Date.now()}`;
-    await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
-    await joinMeeting(email, name, meetingId, name);
-
-    await page.goto("/");
-    await page.waitForTimeout(1500);
-    await waitForJoinedRowCount(page, 1);
-
-    // Scoped locators — neither edit nor delete buttons should exist
-    // inside the joined section. They DO exist in MyMeetings (this same
-    // user owns the meeting), so a non-scoped assertion would fail.
-    await expect(page.locator(`${JOINED_SECTION} .meeting-edit-btn`)).toHaveCount(0);
-    await expect(page.locator(`${JOINED_SECTION} .meeting-delete-btn`)).toHaveCount(0);
-
-    // Sanity-check: the same meeting in MyMeetings DOES expose those
-    // controls, so the negative assertion above isn't vacuous (the
-    // selectors exist and work — they're just absent from the joined
-    // section by design).
-    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-edit-btn`)).toHaveCount(1);
-    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-delete-btn`)).toHaveCount(1);
-
-    // Best-effort cleanup so this seed doesn't bleed into future runs.
-    await deleteAllOwnedMeetings(email, name);
-  });
-
-  test("Owner badge renders the literal 'Owner' text (not 'OWNER')", async ({
-    context,
-    baseURL,
-    page,
-  }) => {
-    // The owner badge text is now literal "Owner" in the RSX (no CSS
-    // uppercase). Assert exact text — case-sensitive — so a regression that
-    // re-introduces the all-caps treatment fails here.
-    const email = `joined-owner-text-${Date.now()}@videocall.rs`;
-    const name = "JoinedOwnerTextUser";
-    await injectSessionCookie(context, { baseURL, email, name });
-
-    const meetingId = `e2e_joined_owner_text_${Date.now()}`;
-    await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
-    await joinMeeting(email, name, meetingId, name);
-
-    await page.goto("/");
-    await page.waitForTimeout(1500);
-    await waitForJoinedRowCount(page, 1);
-
-    const badge = page.locator(`${JOINED_LIST_ROWS} ${JOINED_OWNER_BADGE}`).first();
-    // The badge contains an SVG icon followed by the text "Owner". We
-    // assert the text content (Playwright's textContent strips child
-    // element text by default, so the SVG's whitespace doesn't pollute
-    // this match).
-    await expect(badge).toHaveText("Owner");
-
-    // Best-effort cleanup so this seed doesn't bleed into future runs.
     await deleteAllOwnedMeetings(email, name);
   });
 
@@ -977,27 +910,27 @@ test.describe("Previously Joined meetings section", () => {
     // duration / time range / participant count / waiting / password lock
     // as visible siblings of `.meeting-info`. Those moved to a body-level
     // hover tooltip portal. The row should now contain ONLY the meeting id,
-    // state pill, and (when the user owns it) the owner badge — no
+    // state pill, and (when the user owns it) the gold-star icon — no
     // `.meeting-details`, `.meeting-duration`, `.meeting-time`,
     // `.meeting-participants`, `.meeting-waiting`, or `.meeting-password`.
-    const email = `joined-row-clean-${Date.now()}@videocall.rs`;
-    const name = "JoinedRowCleanUser";
+    const email = `meetings-row-clean-${Date.now()}@videocall.rs`;
+    const name = "MeetingsRowCleanUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
     // Seed one ACTIVE and one ENDED meeting so we exercise both branches
     // of the old inline-details code path in a single check.
-    const activeId = `e2e_joined_row_active_${Date.now()}`;
+    const activeId = `e2e_meetings_row_active_${Date.now()}`;
     await createMeeting(email, name, { meetingId: activeId, waitingRoomEnabled: false });
     await joinMeeting(email, name, activeId, name);
 
-    const endedId = `e2e_joined_row_ended_${Date.now()}`;
+    const endedId = `e2e_meetings_row_ended_${Date.now()}`;
     await createMeeting(email, name, { meetingId: endedId, waitingRoomEnabled: false });
     await joinMeeting(email, name, endedId, name);
     await endMeeting(email, name, endedId);
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForJoinedRowCount(page, 2);
+    await waitForMeetingsRowCount(page, 2);
 
     // None of the inline detail elements should appear inside the rows.
     for (const cls of [
@@ -1009,14 +942,13 @@ test.describe("Previously Joined meetings section", () => {
       ".meeting-waiting",
       ".meeting-password",
     ]) {
-      await expect(page.locator(`${JOINED_LIST_ROWS} ${cls}`)).toHaveCount(0);
+      await expect(page.locator(`${MEETINGS_LIST_ROWS} ${cls}`)).toHaveCount(0);
     }
 
-    // Best-effort cleanup.
     await deleteAllOwnedMeetings(email, name);
   });
 
-  test("hovering a joined row reveals the body-level meeting-info tooltip", async ({
+  test("hovering an owned row reveals tooltip with 'Owner' line at the top", async ({
     context,
     baseURL,
     page,
@@ -1026,17 +958,21 @@ test.describe("Previously Joined meetings section", () => {
     //   - `.meeting-info-tooltip-portal` — base portal class
     //   - `.is-visible` — added on hover, drives opacity + transform
     // The id `#meeting-info-tooltip-global` is also stable.
-    const email = `joined-tooltip-${Date.now()}@videocall.rs`;
-    const name = "JoinedTooltipUser";
+    //
+    // For an owned meeting, `build_meeting_tooltip_html` injects an "Owner"
+    // row at the very top (with the gold-tinted modifier class) before
+    // any of the metadata rows.
+    const email = `meetings-tooltip-owned-${Date.now()}@videocall.rs`;
+    const name = "MeetingsTooltipOwnedUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
-    const meetingId = `e2e_joined_tooltip_${Date.now()}`;
+    const meetingId = `e2e_meetings_tooltip_${Date.now()}`;
     await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
     await joinMeeting(email, name, meetingId, name);
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForJoinedRowCount(page, 1);
+    await waitForMeetingsRowCount(page, 1);
 
     const tooltip = page.locator("#meeting-info-tooltip-global");
 
@@ -1045,395 +981,149 @@ test.describe("Previously Joined meetings section", () => {
     expect(await tooltip.count()).toBeLessThanOrEqual(1);
 
     // Hover the row's clickable content area to trigger onmouseenter.
-    await page.locator(`${JOINED_LIST_ROWS} .meeting-item-content`).first().hover();
+    await page.locator(`${MEETINGS_LIST_ROWS} .meeting-item-content`).first().hover();
 
     // Tooltip becomes visible (the `.is-visible` class is added).
     await expect(page.locator("#meeting-info-tooltip-global.is-visible")).toBeVisible({
       timeout: 2_000,
     });
 
-    // The active-branch tooltip for a joined meeting should at minimum
-    // surface the duration and attendees rows. We check label text — the
-    // values vary at runtime so substring matching keeps the test robust.
-    await expect(tooltip).toContainText("Started on");
-    await expect(tooltip).toContainText("Duration");
-    await expect(tooltip).toContainText("Attendees");
-
-    // Best-effort cleanup.
-    await deleteAllOwnedMeetings(email, name);
-  });
-});
-
-/**
- * "My Meetings" list — single-line row layout + tooltip portal.
- *
- * The MeetingsList component shares the same single-line row design as the
- * "Previously Joined" list: meeting id + state pill on the left, edit /
- * delete buttons on the right, and ALL secondary detail (duration, time
- * range, attendees, password lock) moved to a body-level hover tooltip
- * portal. These tests cover the My Meetings side of that UI contract.
- */
-test.describe("My Meetings list", () => {
-  test.beforeAll(async () => {
-    await waitForServices();
-  });
-
-  test("state pill text is title-cased (e.g. 'Active', 'Ended')", async ({
-    context,
-    baseURL,
-    page,
-  }) => {
-    // The Rust component now title-cases the state string before rendering.
-    // Assert the literal DOM text — case-sensitive — so a regression that
-    // re-introduces the raw lowercase enum string (or an old CSS uppercase
-    // treatment) fails this test loudly.
-    const email = `my-state-text-${Date.now()}@videocall.rs`;
-    const name = "MyStateTextUser";
-    await injectSessionCookie(context, { baseURL, email, name });
-
-    // Seed: one ACTIVE and one ENDED meeting owned by this user.
-    const activeId = `e2e_my_state_active_${Date.now()}`;
-    await createMeeting(email, name, { meetingId: activeId, waitingRoomEnabled: false });
-    await joinMeeting(email, name, activeId, name);
-
-    const endedId = `e2e_my_state_ended_${Date.now()}`;
-    await createMeeting(email, name, { meetingId: endedId, waitingRoomEnabled: false });
-    await joinMeeting(email, name, endedId, name);
-    await endMeeting(email, name, endedId);
-
-    await page.goto("/");
-    await page.waitForTimeout(2000);
-
-    // Wait for the My Meetings section to settle. A scoped loading-spinner
-    // gate is unnecessary here — the section is expanded by default and
-    // the rows are tied to the same fetch lifecycle as the joined list.
-    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-state.state-active`)).toHaveText(
-      "Active",
-      { timeout: 15_000 },
-    );
-    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-state.state-ended`)).toHaveText(
-      "Ended",
-    );
-
-    // Best-effort cleanup so this seed doesn't bleed into future runs.
-    await deleteAllOwnedMeetings(email, name);
-  });
-
-  test("inline meeting details are NOT in the row (moved to hover tooltip)", async ({
-    context,
-    baseURL,
-    page,
-  }) => {
-    // Regression guard symmetric with the joined-list test above. The
-    // MeetingsList rows must contain ONLY meeting id + state pill (+
-    // edit/delete buttons on the right). Duration, time range, participant
-    // and waiting counts, and the password-lock icon all moved to the
-    // hover tooltip portal.
-    const email = `my-row-clean-${Date.now()}@videocall.rs`;
-    const name = "MyRowCleanUser";
-    await injectSessionCookie(context, { baseURL, email, name });
-
-    const activeId = `e2e_my_row_active_${Date.now()}`;
-    await createMeeting(email, name, { meetingId: activeId, waitingRoomEnabled: false });
-    await joinMeeting(email, name, activeId, name);
-
-    const endedId = `e2e_my_row_ended_${Date.now()}`;
-    await createMeeting(email, name, { meetingId: endedId, waitingRoomEnabled: false });
-    await joinMeeting(email, name, endedId, name);
-    await endMeeting(email, name, endedId);
-
-    await page.goto("/");
-    await page.waitForTimeout(2000);
-
-    // Wait for at least one row to render.
-    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-item`)).toHaveCount(2, {
-      timeout: 15_000,
-    });
-
-    for (const cls of [
-      ".meeting-details",
-      ".meeting-duration",
-      ".meeting-time",
-      ".meeting-time-separator",
-      ".meeting-participants",
-      ".meeting-waiting",
-      ".meeting-password",
-    ]) {
-      await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-item ${cls}`)).toHaveCount(0);
-    }
-
-    await deleteAllOwnedMeetings(email, name);
-  });
-
-  test("hovering a My Meetings row reveals the body-level info tooltip with 'Created on'", async ({
-    context,
-    baseURL,
-    page,
-  }) => {
-    // The MeetingsList tooltip variant always includes a "Created on" row
-    // (build_meeting_tooltip_html, irrespective of state). The active
-    // branch additionally surfaces "Started on", "Duration", "Attendees".
-    // We assert against the substrings that are stable across runs — the
-    // formatted datetime values vary, so we only check labels.
-    const email = `my-tooltip-${Date.now()}@videocall.rs`;
-    const name = "MyTooltipUser";
-    await injectSessionCookie(context, { baseURL, email, name });
-
-    const meetingId = `e2e_my_tooltip_${Date.now()}`;
-    await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
-    await joinMeeting(email, name, meetingId, name);
-
-    await page.goto("/");
-    await page.waitForTimeout(2000);
-
-    await expect(page.locator(`${MY_MEETINGS_SECTION} .meeting-item`)).toHaveCount(1, {
-      timeout: 15_000,
-    });
-
-    // Hover the row's clickable content to fire onmouseenter.
-    await page
-      .locator(`${MY_MEETINGS_SECTION} .meeting-item .meeting-item-content`)
-      .first()
-      .hover();
-
-    // Tooltip portal becomes visible.
-    const visibleTooltip = page.locator("#meeting-info-tooltip-global.is-visible");
-    await expect(visibleTooltip).toBeVisible({ timeout: 2_000 });
-
-    // The MeetingsList variant always renders "Created on" — that's the
-    // distinguishing label vs. the JoinedMeetings variant which only
-    // includes it when is_owner. The active branch also has "Started on"
-    // / "Duration" / "Attendees".
-    const tooltip = page.locator("#meeting-info-tooltip-global");
+    // The active-branch tooltip for an owned meeting should surface the
+    // "Owner" line at the top followed by the standard metadata rows. We
+    // check label text — the values vary at runtime so substring matching
+    // keeps the test robust.
+    await expect(tooltip).toContainText("Owner");
     await expect(tooltip).toContainText("Created on");
     await expect(tooltip).toContainText("Started on");
     await expect(tooltip).toContainText("Duration");
     await expect(tooltip).toContainText("Attendees");
 
-    // Move the pointer off the row — tooltip loses `.is-visible`.
-    await page.mouse.move(0, 0);
-    await expect(page.locator("#meeting-info-tooltip-global.is-visible")).toHaveCount(0, {
-      timeout: 2_000,
-    });
+    // The Owner row uses a dedicated modifier class for its gold tint.
+    await expect(tooltip.locator(".meeting-info-tooltip-row--owner")).toHaveCount(1);
 
     await deleteAllOwnedMeetings(email, name);
   });
 });
 
+// The previous "My Meetings list" describe block lived here. With the home
+// page now rendering a single merged section backed by `/api/v1/meetings/feed`,
+// its tests have been folded into the "Meetings list (merged feed)" describe
+// above. Tooltip "Created on" and "Owner" coverage is provided by the
+// "hovering an owned row reveals tooltip with 'Owner' line at the top" test.
+
 /**
- * Home-page meeting-list section expand/collapse persistence.
+ * Merged "Meetings" section: expand/collapse persistence.
  *
- * Both home-page list sections persist their expand/collapse state to
- * `localStorage` so a user's preference survives a page reload:
- *
- *   - "Previously Joined" → key `home.previously-joined.expanded`
- *   - "My Meetings"       → key `home.my-meetings.expanded`
+ * The single home-page list section persists its expand/collapse state to
+ * `localStorage` under the key `home.meetings.expanded`. The frontend also
+ * migrates from the legacy two-key scheme (`home.my-meetings.expanded` +
+ * `home.previously-joined.expanded`) on first load: if the new key is
+ * absent and the legacy "My Meetings" key is set, its value is honored.
  *
  * Stored as the literal string `"true"` or `"false"` (any other value or a
  * missing key falls back to expanded == `true`). When the section is
- * collapsed, the entire `.meetings-list-content` div is removed from the DOM
- * (not visually hidden) — that's the visibility signal the tests assert on.
+ * collapsed, the entire `.meetings-list-content` div is removed from the
+ * DOM (not visually hidden) — that's the visibility signal the tests
+ * assert on.
  *
- * Playwright already gives each `test()` block a fresh browser context (no
- * `storageState` is configured in `playwright.config.ts`), so localStorage
- * starts empty for every test and the auth helper (which only sets a session
- * cookie) is independent of localStorage state.
+ * Playwright already gives each `test()` block a fresh browser context
+ * (no `storageState` is configured in `playwright.config.ts`), so
+ * localStorage starts empty for every test and the auth helper (which
+ * only sets a session cookie) is independent of localStorage state.
  */
 test.describe("Meeting-list section expand/collapse persistence", () => {
   test.beforeAll(async () => {
     await waitForServices();
   });
 
-  // Selectors scoped to a section. Both sections expose the same toggle
-  // button class and the same content wrapper class — we disambiguate via
-  // the parent container.
+  // Selectors scoped to the merged section.
   const TOGGLE = ".meetings-list-toggle";
   const CONTENT = ".meetings-list-content";
   const CHEVRON_EXPANDED = ".chevron-icon.expanded";
   const LOADING_SPINNER = ".meetings-loading";
+  const STORAGE_KEY = "home.meetings.expanded";
+  const LEGACY_MY_MEETINGS_KEY = "home.my-meetings.expanded";
 
   /**
-   * Wait for both home-page list sections to settle (loading spinners gone)
-   * before the test measures expand/collapse state. Each section's
-   * fetch-on-mount runs concurrently with the toggle render, so without
-   * this gate the assertions can race the spinner.
+   * Wait for the merged section to settle (loading spinner gone) before
+   * measuring expand/collapse state. The fetch-on-mount runs concurrently
+   * with the toggle render, so without this gate the assertions can race
+   * the spinner.
    *
-   * Only checks sections that are currently expanded — a collapsed section
-   * removes its `.meetings-list-content` (and therefore its spinner) from
-   * the DOM, so `toHaveCount(0)` would resolve immediately for the wrong
-   * reason. We resolve "currently expanded" by looking for the chevron's
-   * `.expanded` modifier class on each section.
+   * Only checks the section when it's currently expanded — a collapsed
+   * section removes its `.meetings-list-content` (and therefore its
+   * spinner) from the DOM, so `toHaveCount(0)` would resolve immediately
+   * for the wrong reason. We resolve "currently expanded" by looking for
+   * the chevron's `.expanded` modifier class.
    */
-  async function waitForSectionsReady(page: Page): Promise<void> {
-    for (const section of [JOINED_SECTION, MY_MEETINGS_SECTION]) {
-      const chevronExpanded = await page.locator(`${section} ${CHEVRON_EXPANDED}`).count();
-      if (chevronExpanded > 0) {
-        await expect(page.locator(`${section} ${LOADING_SPINNER}`)).toHaveCount(0, {
-          timeout: 15_000,
-        });
-      }
+  async function waitForSectionReady(page: Page): Promise<void> {
+    const chevronExpanded = await page.locator(`${MEETINGS_SECTION} ${CHEVRON_EXPANDED}`).count();
+    if (chevronExpanded > 0) {
+      await expect(page.locator(`${MEETINGS_SECTION} ${LOADING_SPINNER}`)).toHaveCount(0, {
+        timeout: 15_000,
+      });
     }
   }
 
-  test("Previously Joined: collapse persists across reload", async ({ context, baseURL, page }) => {
-    const email = `persist-joined-collapse-${Date.now()}@videocall.rs`;
-    const name = "PersistJoinedCollapseUser";
+  test("collapse persists across reload", async ({ context, baseURL, page }) => {
+    const email = `persist-collapse-${Date.now()}@videocall.rs`;
+    const name = "PersistCollapseUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
+    await waitForSectionReady(page);
 
     // Default state: section is expanded (chevron carries `.expanded`,
     // `.meetings-list-content` is in the DOM).
-    await expect(page.locator(`${JOINED_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toBeVisible();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
 
     // Click the toggle to collapse.
-    await page.locator(`${JOINED_SECTION} ${TOGGLE}`).click();
+    await page.locator(`${MEETINGS_SECTION} ${TOGGLE}`).click();
 
     // Content disappears from DOM, chevron loses `.expanded`.
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await expect(page.locator(`${JOINED_SECTION} ${CHEVRON_EXPANDED}`)).toHaveCount(0);
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
+    await expect(page.locator(`${MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toHaveCount(0);
 
     // Reload — the section must STILL be collapsed.
     await page.reload();
     await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
+    await waitForSectionReady(page);
 
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await expect(page.locator(`${JOINED_SECTION} ${CHEVRON_EXPANDED}`)).toHaveCount(0);
-
-    // My Meetings should be unaffected — still expanded by default.
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
+    await expect(page.locator(`${MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toHaveCount(0);
   });
 
-  test("Previously Joined: expand persists across reload", async ({ context, baseURL, page }) => {
-    const email = `persist-joined-expand-${Date.now()}@videocall.rs`;
-    const name = "PersistJoinedExpandUser";
+  test("expand persists across reload", async ({ context, baseURL, page }) => {
+    const email = `persist-expand-${Date.now()}@videocall.rs`;
+    const name = "PersistExpandUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
+    await waitForSectionReady(page);
 
     // Collapse first.
-    await page.locator(`${JOINED_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toHaveCount(0);
+    await page.locator(`${MEETINGS_SECTION} ${TOGGLE}`).click();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
 
     // Re-expand. Content reappears, chevron regains `.expanded`.
-    await page.locator(`${JOINED_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toBeVisible();
-    await expect(page.locator(`${JOINED_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
+    await page.locator(`${MEETINGS_SECTION} ${TOGGLE}`).click();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
 
     // Reload — the section must STILL be expanded (the localStorage value
     // was rewritten to `"true"` on the second click).
     await page.reload();
     await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
+    await waitForSectionReady(page);
 
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toBeVisible();
-    await expect(page.locator(`${JOINED_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
   });
 
-  test("My Meetings: collapse persists across reload", async ({ context, baseURL, page }) => {
-    const email = `persist-my-collapse-${Date.now()}@videocall.rs`;
-    const name = "PersistMyCollapseUser";
-    await injectSessionCookie(context, { baseURL, email, name });
-
-    await page.goto("/");
-    await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
-
-    // Default state: My Meetings is expanded.
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
-
-    // Collapse.
-    await page.locator(`${MY_MEETINGS_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toHaveCount(0);
-
-    // Reload — still collapsed.
-    await page.reload();
-    await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
-
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toHaveCount(0);
-
-    // Previously Joined should be unaffected.
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toBeVisible();
-    await expect(page.locator(`${JOINED_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
-  });
-
-  test("My Meetings: expand persists across reload", async ({ context, baseURL, page }) => {
-    const email = `persist-my-expand-${Date.now()}@videocall.rs`;
-    const name = "PersistMyExpandUser";
-    await injectSessionCookie(context, { baseURL, email, name });
-
-    await page.goto("/");
-    await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
-
-    // Collapse, then re-expand.
-    await page.locator(`${MY_MEETINGS_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await page.locator(`${MY_MEETINGS_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
-
-    // Reload — still expanded.
-    await page.reload();
-    await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
-
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
-  });
-
-  test("sections are independent: collapsing one does not collapse the other", async ({
-    context,
-    baseURL,
-    page,
-  }) => {
-    // Regression guard: each section must own its own localStorage key.
-    // Collapse Previously Joined, reload, then collapse My Meetings, reload,
-    // and assert the two states evolve independently across both reloads.
-    const email = `persist-independence-${Date.now()}@videocall.rs`;
-    const name = "PersistIndependenceUser";
-    await injectSessionCookie(context, { baseURL, email, name });
-
-    await page.goto("/");
-    await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
-
-    // Step 1: collapse Previously Joined only.
-    await page.locator(`${JOINED_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
-
-    // Reload — Previously Joined collapsed, My Meetings still expanded.
-    await page.reload();
-    await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
-
-    // Step 2: collapse My Meetings (Previously Joined remains collapsed).
-    await page.locator(`${MY_MEETINGS_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toHaveCount(0);
-
-    // Reload — both collapsed now.
-    await page.reload();
-    await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
-  });
-
-  test("fresh users see both sections expanded by default", async ({ context, baseURL, page }) => {
+  test("fresh users see the section expanded by default", async ({ context, baseURL, page }) => {
     // Regression guard for the "missing key → expanded default" branch in
     // `load_bool` (see `dioxus-ui/src/local_storage.rs`). Explicitly clear
     // localStorage after navigation in case any state from a previous test
@@ -1448,67 +1138,86 @@ test.describe("Meeting-list section expand/collapse persistence", () => {
     await page.evaluate(() => localStorage.clear());
     await page.reload();
     await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
+    await waitForSectionReady(page);
 
-    // Both sections render their content + the expanded-chevron variant.
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toBeVisible();
-    await expect(page.locator(`${JOINED_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
+    // The section renders its content + the expanded-chevron variant.
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toBeVisible();
 
-    // And neither localStorage key has been written yet (the default branch
+    // And the storage key has not been written yet (the default branch
     // is read-only — `save_bool` only fires on toggle).
-    const keys = await page.evaluate(() => ({
-      joined: localStorage.getItem("home.previously-joined.expanded"),
-      my: localStorage.getItem("home.my-meetings.expanded"),
-    }));
-    expect(keys.joined).toBeNull();
-    expect(keys.my).toBeNull();
+    const value = await page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
+    expect(value).toBeNull();
   });
 
-  test("clicking each toggle once writes the correct localStorage key", async ({
+  test("clicking the toggle writes 'home.meetings.expanded' as the literal string", async ({
     context,
     baseURL,
     page,
   }) => {
-    // Direct assertion against the storage contract documented in
-    // `dioxus-ui/src/local_storage.rs`: keys are written as the literal
-    // strings `"true"` / `"false"`. This catches a regression where the
-    // key name changes silently — the persistence tests above would still
-    // pass (an unread key + a never-written key both fall back to the
-    // default), so we need this explicit check too.
-    const email = `persist-storage-keys-${Date.now()}@videocall.rs`;
-    const name = "PersistStorageKeysUser";
+    // Direct assertion against the storage contract: the merged section
+    // owns a single key, written as the literal strings `"true"` / `"false"`.
+    // This catches a regression where the key name changes silently — the
+    // persistence tests above would still pass (an unread key + a
+    // never-written key both fall back to the default), so we need this
+    // explicit check too.
+    const email = `persist-storage-key-${Date.now()}@videocall.rs`;
+    const name = "PersistStorageKeyUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await waitForSectionsReady(page);
+    await waitForSectionReady(page);
 
-    // Collapse both sections.
-    await page.locator(`${JOINED_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toHaveCount(0);
-    await page.locator(`${MY_MEETINGS_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
+    // Collapse the section.
+    await page.locator(`${MEETINGS_SECTION} ${TOGGLE}`).click();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
 
-    const collapsed = await page.evaluate(() => ({
-      joined: localStorage.getItem("home.previously-joined.expanded"),
-      my: localStorage.getItem("home.my-meetings.expanded"),
-    }));
-    expect(collapsed.joined).toBe("false");
-    expect(collapsed.my).toBe("false");
+    const collapsed = await page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
+    expect(collapsed).toBe("false");
 
-    // Re-expand both sections — keys flip back to `"true"`.
-    await page.locator(`${JOINED_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${JOINED_SECTION} ${CONTENT}`)).toBeVisible();
-    await page.locator(`${MY_MEETINGS_SECTION} ${TOGGLE}`).click();
-    await expect(page.locator(`${MY_MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
+    // Re-expand — key flips back to `"true"`.
+    await page.locator(`${MEETINGS_SECTION} ${TOGGLE}`).click();
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toBeVisible();
 
-    const expanded = await page.evaluate(() => ({
-      joined: localStorage.getItem("home.previously-joined.expanded"),
-      my: localStorage.getItem("home.my-meetings.expanded"),
-    }));
-    expect(expanded.joined).toBe("true");
-    expect(expanded.my).toBe("true");
+    const expanded = await page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
+    expect(expanded).toBe("true");
+
+    // The legacy "My Meetings" key must NOT be written by the new code.
+    // It's read once on first load for migration but never persisted.
+    const legacy = await page.evaluate((key) => localStorage.getItem(key), LEGACY_MY_MEETINGS_KEY);
+    expect(legacy).toBeNull();
+  });
+
+  test("legacy 'home.my-meetings.expanded=false' migrates to the new section state", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    // Pre-load the LEGACY key with `false` (collapsed) before the app's
+    // scripts run. The merged component should honor that preference on
+    // first load even though the new key is absent. Once the user toggles
+    // the section the new key is written; the legacy key is intentionally
+    // left untouched (read-only migration).
+    const email = `persist-migrate-${Date.now()}@videocall.rs`;
+    const name = "PersistMigrateUser";
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    await page.addInitScript((key) => {
+      localStorage.setItem(key, "false");
+    }, LEGACY_MY_MEETINGS_KEY);
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    // Migration applied: the section starts collapsed (no `.meetings-list-content`,
+    // no expanded chevron) on first load even though the new key was never set.
+    await expect(page.locator(`${MEETINGS_SECTION} ${CONTENT}`)).toHaveCount(0);
+    await expect(page.locator(`${MEETINGS_SECTION} ${CHEVRON_EXPANDED}`)).toHaveCount(0);
+
+    // The new key has not been written by the migration path itself —
+    // `save_bool` only fires on user-initiated toggles, by design.
+    const newKeyBefore = await page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
+    expect(newKeyBefore).toBeNull();
   });
 });

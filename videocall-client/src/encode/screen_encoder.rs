@@ -799,11 +799,18 @@ impl ScreenEncoder {
                 ) {
                     Ok(processor) => processor,
                     Err(e) => {
-                        let msg = format!("Failed to create media stream track processor: {e:?}");
-                        error!("ScreenEncoder: {msg} (restart {restart_count})");
+                        let msg = format!("ScreenEncoder: failed to create track processor: {e:?}");
+                        error!("{msg}");
                         let _ = screen_encoder.close();
-                        restart_count += 1;
-                        continue 'restart;
+                        if restart_count > 0 {
+                            // On restart, a processor failure means the capture track is dead.
+                            // getDisplayMedia can't be re-called without a user gesture -- give up.
+                            cleanup_on_error(stream_ref, &enabled, &on_state_change, msg);
+                            return;
+                        }
+                        // On first attempt, treat as a normal init failure.
+                        cleanup_on_error(stream_ref, &enabled, &on_state_change, msg);
+                        return;
                     }
                 };
 
@@ -820,10 +827,22 @@ impl ScreenEncoder {
                     );
                 }
 
-                let screen_reader = screen_processor
+                let screen_reader = match screen_processor
                     .readable()
                     .get_reader()
-                    .unchecked_into::<ReadableStreamDefaultReader>();
+                    .dyn_into::<ReadableStreamDefaultReader>()
+                {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        let msg = format!(
+                            "ScreenEncoder: failed to acquire ReadableStreamDefaultReader: {e:?}"
+                        );
+                        error!("{msg}");
+                        let _ = screen_encoder.close();
+                        cleanup_on_error(stream_ref, &enabled, &on_state_change, msg);
+                        return;
+                    }
+                };
 
                 let mut screen_frame_counter: u32 = 0;
                 let mut last_pli_keyframe_time: f64 = 0.0;

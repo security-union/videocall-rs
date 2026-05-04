@@ -634,6 +634,11 @@ impl CameraEncoder {
                 video_encoder_config.set_latency_mode(LatencyMode::Realtime);
 
                 if let Err(e) = video_encoder.configure(&video_encoder_config) {
+                    if is_fatal_encode_error(&e) {
+                        error!("CameraEncoder: fatal configure error before encode loop, restarting: {e:?}");
+                        restart_count += 1;
+                        continue 'restart;
+                    }
                     error!("Error configuring video encoder: {e:?}");
                 }
 
@@ -729,6 +734,11 @@ impl CameraEncoder {
                         new_config.set_bitrate(local_bitrate as f64);
                         new_config.set_latency_mode(LatencyMode::Realtime);
                         if let Err(e) = video_encoder.configure(&new_config) {
+                            if is_fatal_encode_error(&e) {
+                                error!("CameraEncoder: fatal configure error, restarting: {e:?}");
+                                restart_count += 1;
+                                break 'encode;
+                            }
                             error!("Error reconfiguring camera encoder for tier change: {e:?}");
                         }
                     }
@@ -754,6 +764,11 @@ impl CameraEncoder {
                         local_bitrate = new_current_bitrate;
                         video_encoder_config.set_bitrate(local_bitrate as f64);
                         if let Err(e) = video_encoder.configure(&video_encoder_config) {
+                            if is_fatal_encode_error(&e) {
+                                error!("CameraEncoder: fatal configure error, restarting: {e:?}");
+                                restart_count += 1;
+                                break 'encode;
+                            }
                             error!("Error configuring video encoder: {e:?}");
                         }
                     } else if new_current_bitrate != local_bitrate {
@@ -808,6 +823,11 @@ impl CameraEncoder {
                                 new_config.set_bitrate(local_bitrate as f64);
                                 new_config.set_latency_mode(LatencyMode::Realtime);
                                 if let Err(e) = video_encoder.configure(&new_config) {
+                                    if is_fatal_encode_error(&e) {
+                                        error!("CameraEncoder: fatal configure error, restarting: {e:?}");
+                                        restart_count += 1;
+                                        break 'encode;
+                                    }
                                     error!(
                                         "Error reconfiguring camera encoder with new dimensions: {e:?}"
                                     );

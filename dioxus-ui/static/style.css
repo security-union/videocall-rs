@@ -676,8 +676,20 @@ select {
   flex-shrink: 0;
 }
 
+.crop-icon.active {
+  color: rgb(91, 207, 159);
+}
+
+.crop-icon.active svg {
+  stroke: currentColor;
+}
+
 .pin-icon:hover,
 .crop-icon:hover {
+  background-color: rgba(0, 0, 0, 0.8);
+}
+
+.crop-icon.active:hover {
   background-color: rgba(0, 0, 0, 0.8);
 }
 

@@ -42,8 +42,9 @@ use crate::constants::{
 use crate::context::{
     load_appearance_settings_from_storage, resolve_transport_config,
     save_appearance_settings_to_storage, save_display_name_to_storage, validate_display_name,
-    AppearanceSettingsCtx, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    AppearanceSettingsCtx, CroppedTilesCtx, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime,
+    PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -1254,6 +1255,10 @@ pub fn AttendantsComponent(
     // (or create) their history entry. This survives PeerTile remounts caused
     // by layout switches (grid -> split when screen sharing starts).
     use_context_provider(|| peer_signal_history_map);
+
+    // Per-tile crop state — persists across re-renders triggered by peer list changes.
+    let cropped_tiles_signal = use_signal(HashMap::new);
+    use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
 
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task

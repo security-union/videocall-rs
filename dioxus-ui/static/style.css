@@ -1745,9 +1745,15 @@ select {
 }
 
 .meeting-id {
-  font-weight: 500;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', ui-monospace, Menlo, monospace;
+  font-weight: 600;
+  font-size: 0.9375rem;
+  letter-spacing: 0.02em;
   color: var(--text-primary, #FFFFFF);
-  font-size: 0.875rem;
+  padding: 0.125rem 0.4375rem;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1872,23 +1878,45 @@ select {
 }
 
 /* ------------------------------------------------------------
-   Joined Meetings List (sibling of MeetingsList)
-   ------------------------------------------------------------ */
-.joined-meetings-list-container { margin-bottom: 1rem; }
+   Owner indicator (inline star + tooltip row)
 
-.meeting-owner-badge {
+   Replaces the previous .meeting-owner-badge pill: the star sits inline
+   next to the meeting ID with no background or border. The matching
+   tooltip row uses the same gold tint so the visual treatment is
+   consistent between row and tooltip.
+   ------------------------------------------------------------ */
+.meeting-owner-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #FFB400;
+  /* No background, no border, no padding — keeps the row layout tight. */
+  flex-shrink: 0;
+  line-height: 0;
+}
+.meeting-owner-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.meeting-info-tooltip-row--owner {
+  /* Slightly emphasised separator below the owner row so it reads as
+     a header for the rest of the metadata table. */
+  border-bottom: 1px solid rgba(255, 180, 0, 0.18);
+  padding-bottom: 0.1875rem;
+  margin-bottom: 0.125rem;
+}
+.meeting-info-tooltip-label--owner {
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
-  font-size: 0.625rem;
-  padding: 0.125rem 0.4375rem;
-  border-radius: var(--radius-pill, 9999px);
+  color: #FFB400;
   font-weight: 500;
-  background: rgba(255, 204, 0, 0.10);
-  color: rgba(255, 214, 51, 0.75);
-  border: 1px solid rgba(255, 204, 0, 0.18);
 }
-.meeting-owner-badge svg { width: 10px; height: 10px; }
+.meeting-info-tooltip-label--owner svg {
+  width: 10px;
+  height: 10px;
+}
 
 /* ============================================================
    Waiting Room

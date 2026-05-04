@@ -15,6 +15,7 @@ use crate::context::{
     TransportPreference, TransportPreferenceCtx, DISPLAY_NAME_MAX_LEN,
 };
 use crate::meeting_api::{join_meeting_as_guest, JoinMeetingResponse};
+use crate::theme::color as theme_color;
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -513,9 +514,9 @@ pub fn GuestJoinPage(id: String) -> Element {
             GuestStatus::Joining => {
                 let name = input_value();
                 rsx! {
-                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                         div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                        p { style: "color: white; font-size: 1rem;",
+                        p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
                             "Joining as guest: "
                             strong { "{name}" }
                             "..."
@@ -595,7 +596,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                                             if let Some(err) = input_error() {
                                                 p {
                                                     class: "text-sm mt-2 ml-1",
-                                                    style: "color: #ff6b6b;",
+                                                    style: "color: {theme_color::ERROR_TEXT};",
                                                     "{err}"
                                                 }
                                             }

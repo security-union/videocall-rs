@@ -2,7 +2,7 @@
 .glass-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0,0,0,0.35);
+  background: var(--overlay-backdrop);
   backdrop-filter: saturate(180%) blur(14px);
   -webkit-backdrop-filter: saturate(180%) blur(14px);
   z-index: 3000;
@@ -19,14 +19,14 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 9999px;
-  background: rgba(28,28,30,0.9);
-  border: 1px solid #48484A;
-  color: #FFFFFF;
-  box-shadow: 0 8px 20px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.05);
+  border-radius: var(--radius-pill);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-emphasis);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-overlay);
   z-index: 10;
 }
-.change-name-fab:hover { background:#2C2C2E; }
+.change-name-fab:hover { background: var(--surface-elevated); }
 .change-name-fab svg { width: 18px; height: 18px; }
 .top-bar a img { filter: grayscale(20%); opacity: 0.9; }
 .top-bar .w-8 svg { opacity: 0.9; }
@@ -50,8 +50,8 @@
 }
 /* Video placeholder styling to ensure consistent rounded corners */
 .video-placeholder {
-  background: #1C1C1E;
-  border: 1px solid #38383A;
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: 1rem;
   display: flex;
   align-items: center;
@@ -65,7 +65,7 @@
 .video-placeholder .placeholder-text {
   display: block;
   margin-top: 0.5rem;
-  color: #AEAEB2;
+  color: var(--text-secondary);
 }
 /* Prevent pinch zoom specifically */
 * {
@@ -77,8 +77,8 @@ html {
   font-size: 16px;
   line-height: 1.5;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, system-ui, sans-serif;
-  background-color: #000000;
-  color: #FFFFFF;
+  background-color: var(--bg);
+  color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -89,7 +89,7 @@ body {
   overflow-y: auto;
   margin: 0;
   padding: 0;
-  background-color: #000000;
+  background-color: var(--bg);
 }
 
 /* Design tokens — leptos-website dark palette + Liquid Glass material */
@@ -97,6 +97,7 @@ body {
   --bg: #000000;
   --surface: #1C1C1E;
   --surface-elevated: #2C2C2E;
+  --surface-overlay: rgba(28, 28, 30, 0.9);
   --border: #38383A;
   --border-emphasis: #48484A;
   --text-primary: #FFFFFF;
@@ -129,6 +130,62 @@ body {
   --glass-shadow: rgba(0, 0, 0, 0.4);
   --glass-blur: 20px;
   --glass-saturate: 180%;
+
+  /* v0 frozen core token aliases */
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-elevated: var(--surface-elevated);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-border: var(--border);
+  --color-border-emphasis: var(--border-emphasis);
+  --status-success: var(--success);
+  --status-warning: var(--warning);
+  --status-error: var(--error);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 8px 32px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+  --shadow-overlay: 0 8px 20px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+
+  --motion-fast: 0.15s;
+  --motion-base: 0.2s;
+  --motion-emphasized: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* v0.1 component/effect extension tokens */
+  --effect-blur-sm: 4px;
+  --effect-blur-md: 14px;
+  --effect-blur-lg: var(--glass-blur);
+  --overlay-backdrop: rgba(0, 0, 0, 0.35);
+  --overlay-strong: rgba(0, 0, 0, 0.5);
+  --overlay-heavy: rgba(0, 0, 0, 0.6);
+  --overlay-opaque: rgba(0, 0, 0, 0.8);
+  --field-bg: rgba(255, 255, 255, 0.05);
+  --field-bg-hover: rgba(255, 255, 255, 0.07);
+  --grid-item-border: rgba(100, 100, 100, 0.3);
+  --signal-popup-bg: rgba(26, 26, 46, 0.97);
+  --signal-popup-border: rgba(255, 255, 255, 0.12);
+  --signal-popup-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  --tooltip-bg: rgba(0, 0, 0, 0.92);
+  --tooltip-border: rgba(255, 255, 255, 0.15);
+  --tooltip-text: #ddd;
+  --search-modal-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+  --search-badge-active-bg: rgba(22, 163, 74, 0.15);
+  --search-badge-active-text: #4ade80;
+  --search-badge-ended-bg: rgba(75, 85, 99, 0.2);
+  --search-badge-ended-text: #9ca3af;
+  --search-badge-idle-bg: rgba(202, 138, 4, 0.15);
+  --search-badge-idle-text: #facc15;
 
   /* Concentric radius scale */
   --radius-outer: 24px;
@@ -170,7 +227,7 @@ body {
 }
 
 .btn-primary {
-  color: #fff;
+  color: var(--text-primary);
   background: var(--accent);
   border: 1px solid rgba(255, 255, 255, 0.12);
   box-shadow:
@@ -214,7 +271,7 @@ body {
   height: 44px;
   padding: 0 0.875rem;
   font-size: 0.9375rem;
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--field-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-input);
   color: var(--text-primary);
@@ -225,7 +282,7 @@ body {
 .input-apple::placeholder { color: var(--text-tertiary); }
 .input-apple:hover {
   border-color: var(--border-emphasis);
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--field-bg-hover);
 }
 .input-apple:focus {
   outline: none;

@@ -26,6 +26,7 @@ use crate::context::{
     validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
 };
 use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
+use crate::theme::color as theme_color;
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -349,8 +350,8 @@ pub fn MeetingPage(id: String) -> Element {
     // Early return for auth check
     if !auth_checked() && oauth_enabled().unwrap_or(false) {
         return rsx! {
-            div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
-                p { style: "color: white; font-size: 1rem;", "Checking authentication..." }
+            div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
+                p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;", "Checking authentication..." }
             }
         };
     }
@@ -644,9 +645,9 @@ pub fn MeetingPage(id: String) -> Element {
             (Some(_), MeetingStatus::Joining) => {
                 let display_name = maybe_username.as_deref().unwrap_or("...");
                 rsx! {
-                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                         div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                        p { style: "color: white; font-size: 1rem;",
+                        p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
                             "Joining as "
                             strong { "{display_name}" }
                             "..."
@@ -661,12 +662,12 @@ pub fn MeetingPage(id: String) -> Element {
                     // Show inline display name prompt instead of redirecting
                     rsx! {
                         div {
-                            style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                            style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                             div {
                                 class: "card-apple p-8",
                                 style: "max-width: 400px; width: 90%;",
                                 h2 {
-                                    style: "color: white; text-align: center; margin-bottom: 0.5rem;",
+                                    style: "color: {theme_color::TEXT_PRIMARY}; text-align: center; margin-bottom: 0.5rem;",
                                     "Enter your display name"
                                 }
                                 p {
@@ -714,9 +715,9 @@ pub fn MeetingPage(id: String) -> Element {
                     // Username is set; the auto-join effect will fire momentarily
                     let display_name = maybe_username.as_deref().unwrap_or("Unknown");
                     rsx! {
-                        div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                        div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                             div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                            p { style: "color: white; font-size: 1rem;",
+                            p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
                                 "Joining as "
                                 strong { "{display_name}" }
                                 "..."

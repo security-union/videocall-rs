@@ -1092,6 +1092,36 @@ pub fn AttendantsComponent(
         client
     });
 
+    // Tear the VideoCallClient down synchronously when this component
+    // unmounts (Hangup button, browser back-nav, route push, route replace,
+    // tab close — every path Dioxus surfaces as a scope drop).
+    //
+    // The client is `Clone` and shares state through `Rc` handles. Several
+    // internal callbacks captured during `VideoCallClient::new` hold strong
+    // clones of the client (peer_decode_manager.send_packet,
+    // diagnostics.packet_handler, health_reporter's spawn_local future),
+    // forming `Rc` cycles that prevent `Inner` from ever dropping on its
+    // own. Without this hook an in-tab SPA route swap on the meeting page
+    // leaks the entire `VideoCallClient` — transports, encoders, atomics
+    // — for tens of seconds, until the server eventually tears the
+    // session down. That leak caused the cc7tp meeting incident on
+    // 2026-05-01 (UI panics, dropped media packets, ghost participant,
+    // spurious MEETING_ENDED broadcast).
+    //
+    // `disconnect()` is idempotent and safe to call even when the client
+    // never connected, and it kicks off async transport teardown via
+    // `ConnectionController::disconnect` while returning synchronously,
+    // so the next mount cannot race a still-running predecessor.
+    {
+        let client_for_drop = client.clone();
+        use_drop(move || {
+            log::info!("DIOXUS-UI: AttendantsComponent unmounted - disconnecting VideoCallClient");
+            if let Err(e) = client_for_drop.disconnect() {
+                log::warn!("DIOXUS-UI: VideoCallClient disconnect on unmount failed: {e}");
+            }
+        });
+    }
+
     let mda = use_hook(|| {
         let mut mda = MediaDeviceAccess::new();
         let client_cell = RefCell::new(client.clone());

@@ -523,7 +523,6 @@ pub fn MeetingPage(id: String) -> Element {
                     user_id: current_user_id()
                         .or_else(|| user_profile().as_ref().map(|p| p.user_id.clone()))
                         .or_else(|| Some(get_or_create_local_user_id())),
-                    on_logout: Some(EventHandler::new(on_logout)),
                     host_display_name: host_display_name.clone(),
                     host_user_id: host_user_id.clone(),
                     auto_join: should_auto_join,

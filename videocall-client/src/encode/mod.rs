@@ -28,9 +28,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use crate::VideoCallClient;
 use videocall_types::Callback;
 
-pub use camera_encoder::CameraEncoder;
+pub use camera_encoder::{
+    camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
+    camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
+    camera_encoder_frames_emitted, CameraEncoder,
+};
 pub use microphone_encoder::MicrophoneEncoder;
-pub use screen_encoder::{ScreenEncoder, ScreenShareEvent};
+pub use screen_encoder::{
+    screen_encoder_errors_closed_codec, screen_encoder_errors_configure_fatal,
+    screen_encoder_errors_generic, screen_encoder_errors_vpx_mem_alloc,
+    screen_encoder_frames_emitted, ScreenEncoder, ScreenShareEvent,
+};
 
 /// Trait to abstract over different microphone encoder implementations
 pub trait MicrophoneEncoderTrait {

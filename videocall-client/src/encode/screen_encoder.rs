@@ -26,8 +26,33 @@ use log::error;
 use log::info;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+
+// ── Screen encoder error observability counters (cumulative, since page load) ─
+// Mirrors the camera encoder pattern. See camera_encoder.rs for design rationale.
+
+static SCREEN_ENCODER_ERRORS_CLOSED_CODEC: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_FRAMES_EMITTED: AtomicU64 = AtomicU64::new(0);
+
+pub fn screen_encoder_errors_closed_codec() -> u64 {
+    SCREEN_ENCODER_ERRORS_CLOSED_CODEC.load(Ordering::Relaxed)
+}
+pub fn screen_encoder_errors_vpx_mem_alloc() -> u64 {
+    SCREEN_ENCODER_ERRORS_VPX_MEM_ALLOC.load(Ordering::Relaxed)
+}
+pub fn screen_encoder_errors_configure_fatal() -> u64 {
+    SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.load(Ordering::Relaxed)
+}
+pub fn screen_encoder_errors_generic() -> u64 {
+    SCREEN_ENCODER_ERRORS_GENERIC.load(Ordering::Relaxed)
+}
+pub fn screen_encoder_frames_emitted() -> u64 {
+    SCREEN_ENCODER_FRAMES_EMITTED.load(Ordering::Relaxed)
+}
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -692,6 +717,7 @@ impl ScreenEncoder {
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             set_vbr_mode(&screen_encoder_config);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
+                SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                 let msg = format!("Error configuring screen encoder: {e:?}");
                 error!("{msg}");
                 cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
@@ -775,6 +801,7 @@ impl ScreenEncoder {
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     set_vbr_mode(&new_config);
                     if let Err(e) = screen_encoder.configure(&new_config) {
+                        SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                         error!("Error reconfiguring screen encoder for tier change: {e:?}");
                     }
                 }
@@ -801,6 +828,7 @@ impl ScreenEncoder {
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     set_vbr_mode(&new_config);
                     if let Err(e) = screen_encoder.configure(&new_config) {
+                        SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                         error!("Error configuring screen encoder: {e:?}");
                     }
                 } else if new_bitrate != local_bitrate {
@@ -856,6 +884,8 @@ impl ScreenEncoder {
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             set_vbr_mode(&new_config);
                             if let Err(e) = screen_encoder.configure(&new_config) {
+                                SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
+                                    .fetch_add(1, Ordering::Relaxed);
                                 error!(
                                     "Error reconfiguring screen encoder with new dimensions: {e:?}"
                                 );
@@ -895,8 +925,26 @@ impl ScreenEncoder {
                             );
                         }
 
-                        if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
-                            error!("Error encoding screen frame: {e:?}");
+                        match screen_encoder.encode_with_options(&video_frame, &opts) {
+                            Ok(_) => {
+                                SCREEN_ENCODER_FRAMES_EMITTED.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                let msg = format!("{e:?}");
+                                if msg.contains("closed codec") || msg.contains("InvalidStateError")
+                                {
+                                    SCREEN_ENCODER_ERRORS_CLOSED_CODEC
+                                        .fetch_add(1, Ordering::Relaxed);
+                                } else if msg.contains("Memory allocation error")
+                                    || msg.contains("Unable to find free frame buffer")
+                                {
+                                    SCREEN_ENCODER_ERRORS_VPX_MEM_ALLOC
+                                        .fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    SCREEN_ENCODER_ERRORS_GENERIC.fetch_add(1, Ordering::Relaxed);
+                                }
+                                error!("Error encoding screen frame: {e:?}");
+                            }
                         }
                         video_frame.close();
                         screen_frame_counter += 1;

@@ -19,6 +19,13 @@
 use crate::connection::ConnectionController;
 use crate::decode::peer_decode_manager::keyframe_requests_sent_count;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
+use crate::encode::{
+    camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
+    camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
+    camera_encoder_frames_emitted, screen_encoder_errors_closed_codec,
+    screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
+    screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_emitted,
+};
 use log::{debug, warn};
 use protobuf::Message;
 use serde_json::{json, Value};
@@ -882,6 +889,50 @@ impl HealthReporter {
             pb_d.tier = tier_label.clone();
             pb_d.dwell_ms = *dwell_ms;
             pb.tier_dwells.push(pb_d);
+        }
+
+        // Encoder error counters (cumulative, global statics — zero-cost to read).
+        // Only emit when non-zero to keep packet size small in the common (healthy) case.
+        let cam_closed = camera_encoder_errors_closed_codec();
+        let cam_vpx = camera_encoder_errors_vpx_mem_alloc();
+        let cam_configure = camera_encoder_errors_configure_fatal();
+        let cam_generic = camera_encoder_errors_generic();
+        let cam_frames = camera_encoder_frames_emitted();
+        let scr_closed = screen_encoder_errors_closed_codec();
+        let scr_vpx = screen_encoder_errors_vpx_mem_alloc();
+        let scr_configure = screen_encoder_errors_configure_fatal();
+        let scr_generic = screen_encoder_errors_generic();
+        let scr_frames = screen_encoder_frames_emitted();
+
+        if cam_closed > 0 {
+            pb.camera_encoder_errors_closed_codec = Some(cam_closed);
+        }
+        if cam_vpx > 0 {
+            pb.camera_encoder_errors_vpx_mem_alloc = Some(cam_vpx);
+        }
+        if cam_configure > 0 {
+            pb.camera_encoder_errors_configure_fatal = Some(cam_configure);
+        }
+        if cam_generic > 0 {
+            pb.camera_encoder_errors_generic = Some(cam_generic);
+        }
+        if cam_frames > 0 {
+            pb.camera_encoder_frames_emitted = Some(cam_frames);
+        }
+        if scr_closed > 0 {
+            pb.screen_encoder_errors_closed_codec = Some(scr_closed);
+        }
+        if scr_vpx > 0 {
+            pb.screen_encoder_errors_vpx_mem_alloc = Some(scr_vpx);
+        }
+        if scr_configure > 0 {
+            pb.screen_encoder_errors_configure_fatal = Some(scr_configure);
+        }
+        if scr_generic > 0 {
+            pb.screen_encoder_errors_generic = Some(scr_generic);
+        }
+        if scr_frames > 0 {
+            pb.screen_encoder_frames_emitted = Some(scr_frames);
         }
 
         // Tab visibility and throttling

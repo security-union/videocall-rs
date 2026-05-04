@@ -134,6 +134,19 @@ message HealthPacket {
   optional uint64 step_up_blocked_slowdown = 41;     // Cumulative blocks by recovery slowdown
   optional uint64 step_up_blocked_screen_share = 42; // Cumulative blocks by screen share ceiling
   repeated TierDwell tier_dwells = 43;               // Tier dwell samples since last packet
+
+  // Encoder error counters (cumulative, since page load).
+  // Server derives per-second rates via Prometheus rate().
+  optional uint64 camera_encoder_errors_closed_codec = 44;
+  optional uint64 camera_encoder_errors_vpx_mem_alloc = 45;
+  optional uint64 camera_encoder_errors_configure_fatal = 46;
+  optional uint64 camera_encoder_errors_generic = 47;
+  optional uint64 camera_encoder_frames_emitted = 48;
+  optional uint64 screen_encoder_errors_closed_codec = 49;
+  optional uint64 screen_encoder_errors_vpx_mem_alloc = 50;
+  optional uint64 screen_encoder_errors_configure_fatal = 51;
+  optional uint64 screen_encoder_errors_generic = 52;
+  optional uint64 screen_encoder_frames_emitted = 53;
 }
 
 message TierTransition {

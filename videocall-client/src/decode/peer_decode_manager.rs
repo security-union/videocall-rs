@@ -883,6 +883,7 @@ impl PeerDecodeManager {
     pub fn set_active_decode_set(&mut self, active_session_ids: &HashSet<u64>) {
         let session_ids = self.connected_peers.ordered_keys().clone();
         let mut screen_keyframe_requests: Vec<String> = Vec::new();
+        let mut video_keyframe_requests: Vec<String> = Vec::new();
         for session_id in session_ids {
             let visible = active_session_ids.contains(&session_id);
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
@@ -896,11 +897,22 @@ impl PeerDecodeManager {
                 if visible && peer.screen_enabled {
                     screen_keyframe_requests.push(peer.user_id.clone());
                 }
+                // Send a proactive video PLI when a video tile becomes visible
+                // so the decoder gets a keyframe immediately instead of waiting
+                // up to 5 s for the next periodic one (150 frames at 30 fps).
+                // Gated on video_enabled so we don't send spurious PLIs for
+                // peers that have their camera off.
+                if visible && peer.video_enabled {
+                    video_keyframe_requests.push(peer.user_id.clone());
+                }
                 peer.visible = visible;
             }
         }
         for user_id in &screen_keyframe_requests {
             self.send_keyframe_request(user_id, MediaType::SCREEN);
+        }
+        for user_id in &video_keyframe_requests {
+            self.send_keyframe_request(user_id, MediaType::VIDEO);
         }
     }
 
@@ -3165,5 +3177,277 @@ mod tests {
         assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MIN_INTERVAL_MS);
         assert_eq!(tracker.lost_count, 0);
         assert!(tracker.loss_detected_at_ms.is_none());
+    }
+
+    // -- Acceptance tests: keyframe-request routing correctness ------
+    //
+    // These tests verify the fix for the O(N) encoder amplification bug:
+    // `try_handle_keyframe_request` must only trigger a keyframe for the peer
+    // whose `user_id` matches the request target. This is tested at the
+    // `PeerDecodeManager` level by confirming that `send_keyframe_request`
+    // populates the `user_id` field of the outbound PLI correctly, and at the
+    // `set_active_decode_set` level by confirming that a proactive video PLI
+    // is sent exactly once per newly-visible video-enabled peer.
+
+    /// `send_keyframe_request` must set `media_packet.user_id` to the target
+    /// peer's user_id so the receiving client can apply the guard.
+    #[wasm_bindgen_test]
+    fn keyframe_request_packet_targets_correct_peer() {
+        use protobuf::Message as _;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let mut sent_packets: Vec<PacketWrapper> = Vec::new();
+        let collector = sent_packets.clone();
+        // Use a Cell to collect packets from the closure.
+        let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+
+        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+            collected_clone.borrow_mut().push(pkt);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_local_user_id("me@example.com".to_string());
+        manager.send_packet = Some(callback);
+
+        // Clear the send counter baseline.
+        let baseline = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
+
+        // Manually invoke send_keyframe_request for a specific peer.
+        manager.send_keyframe_request("alice@example.com", MediaType::VIDEO);
+
+        // One PLI should have been sent.
+        assert_eq!(
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed),
+            baseline + 1,
+            "Exactly one KEYFRAME_REQUEST should have been sent"
+        );
+
+        // Verify the packet targets the correct peer.
+        let pkts = collected.borrow();
+        assert_eq!(pkts.len(), 1, "Expected exactly one outbound packet");
+        let wrapper = &pkts[0];
+        assert_eq!(wrapper.packet_type.enum_value(), Ok(PacketType::MEDIA));
+
+        let inner = MediaPacket::parse_from_bytes(&wrapper.data)
+            .expect("Should deserialize inner MediaPacket");
+        assert_eq!(
+            inner.media_type.enum_value(),
+            Ok(MediaType::KEYFRAME_REQUEST),
+            "Inner packet should be KEYFRAME_REQUEST"
+        );
+        assert_eq!(
+            inner.user_id,
+            b"alice@example.com".to_vec(),
+            "PLI target user_id must be the requested peer, not the local user"
+        );
+        assert_ne!(
+            inner.user_id,
+            b"me@example.com".to_vec(),
+            "PLI must not target the local user"
+        );
+        drop(collector);
+    }
+
+    /// `set_active_decode_set` must send exactly one video PLI per newly-visible
+    /// video-enabled peer (Option 3 + Bug 2 fix acceptance test).
+    /// At N=1..4 each peer that transitions invisible→visible with video_enabled=true
+    /// should receive exactly one proactive VIDEO keyframe request.
+    #[wasm_bindgen_test]
+    fn set_active_decode_set_sends_video_pli_for_newly_visible_peers() {
+        let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+            collected_clone.borrow_mut().push(pkt);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_local_user_id("me@example.com".to_string());
+        manager.send_packet = Some(callback);
+
+        // Insert N=4 peers, all with video_enabled=true and currently invisible.
+        let peer_ids = [500u64, 501, 502, 503];
+        let peer_uids = ["peer0@x.com", "peer1@x.com", "peer2@x.com", "peer3@x.com"];
+        for (i, &sid) in peer_ids.iter().enumerate() {
+            let (mock_audio, _) = MockAudioDecoder::new();
+            let mut peer = Peer {
+                audio: Box::new(mock_audio),
+                video: VideoPeerDecoder::noop(),
+                screen: VideoPeerDecoder::noop(),
+                session_id: sid,
+                sid_str: sid.to_string(),
+                user_id: peer_uids[i].to_string(),
+                video_canvas_id: format!("video-{sid}"),
+                screen_canvas_id: format!("screen-{sid}"),
+                aes: None,
+                activity_count: 1,
+                missed_heartbeat_checks: 0,
+                video_enabled: true,
+                audio_enabled: false,
+                screen_enabled: false,
+                display_name: None,
+                is_guest: false,
+                visible: false,
+                context_initialized: false,
+                has_received_heartbeat: false,
+                is_speaking: false,
+                audio_level: 0.0,
+                vad_threshold: None,
+                video_seq_tracker: SequenceTracker::new(),
+                screen_seq_tracker: SequenceTracker::new(),
+            };
+            manager.connected_peers.insert(sid, peer);
+        }
+
+        let baseline = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
+
+        // Make all 4 peers visible at once (layout change).
+        manager.set_active_decode_set(&HashSet::from(peer_ids));
+
+        let pkts = collected.borrow();
+        // Each of the 4 peers should have received exactly one VIDEO PLI.
+        assert_eq!(
+            pkts.len(),
+            4,
+            "Exactly 4 video PLIs should be sent for 4 newly-visible video peers"
+        );
+        assert_eq!(
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed),
+            baseline + 4,
+            "KEYFRAME_REQUESTS_SENT counter should increase by 4"
+        );
+
+        // Verify each PLI targets a different peer and is a VIDEO request.
+        let mut target_ids: Vec<String> = pkts
+            .iter()
+            .map(|w| {
+                let inner = MediaPacket::parse_from_bytes(&w.data).expect("deserialize");
+                assert_eq!(
+                    inner.media_type.enum_value(),
+                    Ok(MediaType::VIDEO),
+                    "Proactive PLI for video peer should request VIDEO keyframe, not SCREEN"
+                );
+                String::from_utf8(inner.user_id).expect("user_id is valid utf8")
+            })
+            .collect();
+        target_ids.sort();
+        let mut expected: Vec<&str> = peer_uids.to_vec();
+        expected.sort();
+        assert_eq!(
+            target_ids,
+            expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "Each PLI should target a distinct peer"
+        );
+    }
+
+    /// Calling `set_active_decode_set` again with the same set must NOT send
+    /// duplicate PLIs (idempotency check — Option 3 acceptance).
+    #[wasm_bindgen_test]
+    fn set_active_decode_set_no_duplicate_plis_on_same_set() {
+        let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+            collected_clone.borrow_mut().push(pkt);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_local_user_id("me@example.com".to_string());
+        manager.send_packet = Some(callback);
+
+        let (mock_audio, _) = MockAudioDecoder::new();
+        let peer = Peer {
+            audio: Box::new(mock_audio),
+            video: VideoPeerDecoder::noop(),
+            screen: VideoPeerDecoder::noop(),
+            session_id: 510,
+            sid_str: "510".to_string(),
+            user_id: "peerX@x.com".to_string(),
+            video_canvas_id: "video-510".to_string(),
+            screen_canvas_id: "screen-510".to_string(),
+            aes: None,
+            activity_count: 1,
+            missed_heartbeat_checks: 0,
+            video_enabled: true,
+            audio_enabled: false,
+            screen_enabled: false,
+            display_name: None,
+            is_guest: false,
+            visible: false,
+            context_initialized: false,
+            has_received_heartbeat: false,
+            is_speaking: false,
+            audio_level: 0.0,
+            vad_threshold: None,
+            video_seq_tracker: SequenceTracker::new(),
+            screen_seq_tracker: SequenceTracker::new(),
+        };
+        manager.connected_peers.insert(510, peer);
+
+        // First call: peer becomes visible → 1 PLI.
+        manager.set_active_decode_set(&HashSet::from([510u64]));
+        assert_eq!(collected.borrow().len(), 1, "First call should send 1 PLI");
+
+        // Second call with same set: peer already visible → 0 PLIs.
+        manager.set_active_decode_set(&HashSet::from([510u64]));
+        assert_eq!(
+            collected.borrow().len(),
+            1,
+            "Second identical call should send no additional PLIs"
+        );
+    }
+
+    /// A peer with `video_enabled=false` becoming visible must NOT trigger a
+    /// video PLI (camera is off — there is nothing to unfreeze).
+    #[wasm_bindgen_test]
+    fn set_active_decode_set_no_pli_for_camera_off_peer() {
+        let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+            collected_clone.borrow_mut().push(pkt);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_local_user_id("me@example.com".to_string());
+        manager.send_packet = Some(callback);
+
+        let (mock_audio, _) = MockAudioDecoder::new();
+        let peer = Peer {
+            audio: Box::new(mock_audio),
+            video: VideoPeerDecoder::noop(),
+            screen: VideoPeerDecoder::noop(),
+            session_id: 520,
+            sid_str: "520".to_string(),
+            user_id: "peerY@x.com".to_string(),
+            video_canvas_id: "video-520".to_string(),
+            screen_canvas_id: "screen-520".to_string(),
+            aes: None,
+            activity_count: 1,
+            missed_heartbeat_checks: 0,
+            video_enabled: false, // camera off
+            audio_enabled: false,
+            screen_enabled: false,
+            display_name: None,
+            is_guest: false,
+            visible: false,
+            context_initialized: false,
+            has_received_heartbeat: false,
+            is_speaking: false,
+            audio_level: 0.0,
+            vad_threshold: None,
+            video_seq_tracker: SequenceTracker::new(),
+            screen_seq_tracker: SequenceTracker::new(),
+        };
+        manager.connected_peers.insert(520, peer);
+
+        manager.set_active_decode_set(&HashSet::from([520u64]));
+
+        assert_eq!(
+            collected.borrow().len(),
+            0,
+            "No PLI should be sent for a peer with camera off"
+        );
     }
 }

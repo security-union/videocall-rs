@@ -169,10 +169,10 @@ pub async fn join_meeting(
         )?;
 
         let mut resp = row.into_participant_status(Some(token));
-        resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
-        resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-        resp.end_on_host_leave = Some(meeting.end_on_host_leave);
-        resp.allow_guests = Some(meeting.allow_guests);
+        resp.waiting_room_enabled = meeting.waiting_room_enabled;
+        resp.admitted_can_admit = meeting.admitted_can_admit;
+        resp.end_on_host_leave = meeting.end_on_host_leave;
+        resp.allow_guests = meeting.allow_guests;
         // Prefer the freshly-persisted display_name from the host upsert as
         // the source of truth — same value the JWT was minted from above —
         // so the response and JWT can never disagree. The local `meeting`
@@ -264,10 +264,10 @@ async fn join_as_attendee(
             if !auto_admitted {
                 nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
             }
-            resp.waiting_room_enabled = Some(wr_enabled);
-            resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-            resp.end_on_host_leave = Some(meeting.end_on_host_leave);
-            resp.allow_guests = Some(meeting.allow_guests);
+            resp.waiting_room_enabled = wr_enabled;
+            resp.admitted_can_admit = meeting.admitted_can_admit;
+            resp.end_on_host_leave = meeting.end_on_host_leave;
+            resp.allow_guests = meeting.allow_guests;
             resp.host_display_name = meeting.host_display_name;
             resp.host_user_id = meeting.creator_id;
             return Ok(Json(APIResponse::ok(resp)));
@@ -289,17 +289,15 @@ async fn join_as_attendee(
             admitted_at: None,
             room_token: None,
             observer_token: Some(observer),
-            waiting_room_enabled: Some(meeting.waiting_room_enabled),
-            admitted_can_admit: Some(meeting.admitted_can_admit),
-            end_on_host_leave: Some(meeting.end_on_host_leave),
+            waiting_room_enabled: meeting.waiting_room_enabled,
+            admitted_can_admit: meeting.admitted_can_admit,
+            end_on_host_leave: meeting.end_on_host_leave,
             host_display_name: meeting.host_display_name,
             host_user_id: meeting.creator_id,
-            allow_guests: Some(meeting.allow_guests),
+            allow_guests: meeting.allow_guests,
         };
         return Ok(Json(APIResponse::ok(resp)));
     }
-
-    // Pass creator_id only when the host-gone check must be enforced.
     // Folding this check into the transaction closes the TOCTOU window where
     // concurrent requests could both pass an out-of-transaction host-status read.
     let check_creator = if !meeting.end_on_host_leave && !meeting.admitted_can_admit {
@@ -357,10 +355,10 @@ async fn join_as_attendee(
         // Notify the host that the waiting room list has changed.
         nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
     }
-    resp.waiting_room_enabled = Some(waiting_room_enabled);
-    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-    resp.end_on_host_leave = Some(meeting.end_on_host_leave);
-    resp.allow_guests = Some(meeting.allow_guests);
+    resp.waiting_room_enabled = waiting_room_enabled;
+    resp.admitted_can_admit = meeting.admitted_can_admit;
+    resp.end_on_host_leave = meeting.end_on_host_leave;
+    resp.allow_guests = meeting.allow_guests;
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -453,10 +451,10 @@ pub async fn get_my_status(
     };
 
     let mut resp = row.into_participant_status(token);
-    resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
-    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-    resp.end_on_host_leave = Some(meeting.end_on_host_leave);
-    resp.allow_guests = Some(meeting.allow_guests);
+    resp.waiting_room_enabled = meeting.waiting_room_enabled;
+    resp.admitted_can_admit = meeting.admitted_can_admit;
+    resp.end_on_host_leave = meeting.end_on_host_leave;
+    resp.allow_guests = meeting.allow_guests;
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -512,9 +510,9 @@ pub async fn get_guest_status(
     };
 
     let mut resp = row.into_participant_status(token);
-    resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
-    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-    resp.allow_guests = Some(meeting.allow_guests);
+    resp.waiting_room_enabled = meeting.waiting_room_enabled;
+    resp.admitted_can_admit = meeting.admitted_can_admit;
+    resp.allow_guests = meeting.allow_guests;
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))

@@ -422,12 +422,12 @@ impl ParticipantRow {
             admitted_at: self.admitted_at.map(|t| t.timestamp()),
             room_token,
             observer_token: None,
-            waiting_room_enabled: None,
-            admitted_can_admit: None,
-            end_on_host_leave: None,
+            waiting_room_enabled: false,
+            admitted_can_admit: false,
+            end_on_host_leave: true,
             host_display_name: None,
             host_user_id: None,
-            allow_guests: None,
+            allow_guests: false,
         }
     }
 }

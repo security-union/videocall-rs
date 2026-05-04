@@ -166,10 +166,6 @@ struct PendingDepartureState {
     /// sessions had their PARTICIPANT_JOINED broadcast. Testing sessions (e.g.,
     /// the losing connection during RTT election) never announced themselves.
     was_active: bool,
-    /// Whether the disconnecting session was the meeting host.
-    is_host: bool,
-    /// Whether the meeting should end when the host leaves.
-    end_on_host_leave: bool,
 }
 
 /// Information about a room member tracked by the ChatServer.
@@ -206,6 +202,20 @@ struct RoomPolicy {
     waiting_room_enabled: bool,
     #[allow(dead_code)]
     allow_guests: bool,
+}
+
+/// Context passed to [`ChatServer::leave_rooms`] describing the session that
+/// is departing and the policies that govern what side-effects should fire.
+/// Bundling these into a struct avoids a long positional argument list and
+/// makes each call site self-documenting.
+pub struct LeaveContext<'a> {
+    pub session_id: &'a SessionId,
+    pub room: Option<&'a str>,
+    pub user_id: Option<&'a str>,
+    pub display_name: Option<&'a str>,
+    pub observer: bool,
+    pub is_host: bool,
+    pub end_on_host_leave: bool,
 }
 
 pub struct ChatServer {
@@ -262,16 +272,16 @@ impl ChatServer {
         }
     }
 
-    pub fn leave_rooms(
-        &mut self,
-        session_id: &SessionId,
-        room: Option<&str>,
-        user_id: Option<&str>,
-        display_name: Option<&str>,
-        observer: bool,
-        is_host: bool,
-        end_on_host_leave: bool,
-    ) {
+    pub fn leave_rooms(&mut self, ctx: LeaveContext<'_>) {
+        let LeaveContext {
+            session_id,
+            room,
+            user_id,
+            display_name,
+            observer,
+            is_host,
+            end_on_host_leave,
+        } = ctx;
         // Remove the subscription task if it exists
         if let Some(task) = self.active_subs.remove(session_id) {
             task.abort();
@@ -811,15 +821,15 @@ impl Handler<Disconnect> for ChatServer {
         // Observers and non-active sessions bypass the grace period — they
         // never triggered PARTICIPANT_JOINED, so there is nothing to defer.
         if observer {
-            self.leave_rooms(
-                &session,
-                Some(&room),
-                Some(&user_id),
-                Some(&display_name),
-                true,
-                false,
-                true,
-            );
+            self.leave_rooms(LeaveContext {
+                session_id: &session,
+                room: Some(&room),
+                user_id: Some(&user_id),
+                display_name: Some(&display_name),
+                observer: true,
+                is_host: false,
+                end_on_host_leave: true,
+            });
             return;
         }
 
@@ -883,8 +893,6 @@ impl Handler<Disconnect> for ChatServer {
                 spawn_handle: handle,
                 old_session: session,
                 was_active,
-                is_host,
-                end_on_host_leave,
             },
         );
     }
@@ -927,15 +935,15 @@ impl Handler<Leave> for ChatServer {
             .unwrap_or((false, true, None));
 
         // Leave is always a real participant, never an observer.
-        self.leave_rooms(
-            &session,
-            Some(&room),
-            Some(&user_id),
-            display_name.as_deref(),
-            false,
+        self.leave_rooms(LeaveContext {
+            session_id: &session,
+            room: Some(&room),
+            user_id: Some(&user_id),
+            display_name: display_name.as_deref(),
+            observer: false,
             is_host,
             end_on_host_leave,
-        );
+        });
     }
 }
 
@@ -1277,15 +1285,15 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             );
             // Observer sessions bypass the grace period entirely (handled
             // directly in Disconnect), so this path is always non-observer.
-            self.leave_rooms(
-                &session,
-                Some(&room),
-                Some(&user_id),
-                Some(&display_name),
-                false,
+            self.leave_rooms(LeaveContext {
+                session_id: &session,
+                room: Some(&room),
+                user_id: Some(&user_id),
+                display_name: Some(&display_name),
+                observer: false,
                 is_host,
                 end_on_host_leave,
-            );
+            });
         } else {
             info!(
                 "Pending departure for user {} in room {} already cancelled (reconnected)",

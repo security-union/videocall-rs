@@ -18,6 +18,7 @@
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
+use gloo_timers::future::sleep;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::JsString;
@@ -28,6 +29,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -35,6 +37,7 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::CodecState;
 use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamTrack;
@@ -433,105 +436,32 @@ impl ScreenEncoder {
                 panic!("MediaDevices not available");
             });
 
-            // Build getDisplayMedia constraints requesting high-resolution capture.
-            // This tells the browser to prefer the source's native resolution rather
-            // than downscaling, which is critical for readable text and code.
-            // Use {ideal: N} dictionaries instead of bare numbers — bare numbers are
-            // treated as {exact: N} and will cause the browser to reject capture if
-            // the source (e.g. 1440p or 4K monitor) doesn't match exactly.
-            let width_constraint = js_sys::Object::new();
-            let _ = Reflect::set(
-                &width_constraint,
-                &JsValue::from_str("ideal"),
-                &JsValue::from_f64(1920.0),
-            );
-            let height_constraint = js_sys::Object::new();
-            let _ = Reflect::set(
-                &height_constraint,
-                &JsValue::from_str("ideal"),
-                &JsValue::from_f64(1080.0),
-            );
-            let framerate_constraint = js_sys::Object::new();
-            let _ = Reflect::set(
-                &framerate_constraint,
-                &JsValue::from_str("ideal"),
-                &JsValue::from_f64(10.0),
-            );
-            let video_constraints = js_sys::Object::new();
-            let _ = Reflect::set(
-                &video_constraints,
-                &JsValue::from_str("width"),
-                &width_constraint.into(),
-            );
-            let _ = Reflect::set(
-                &video_constraints,
-                &JsValue::from_str("height"),
-                &height_constraint.into(),
-            );
-            let _ = Reflect::set(
-                &video_constraints,
-                &JsValue::from_str("frameRate"),
-                &framerate_constraint.into(),
-            );
+            // --- Fatal encode error classifier ---
+            // These errors indicate the VideoEncoder is dead and must be re-created.
+            // Non-fatal errors (e.g. a single dropped frame) are logged and skipped.
+            let is_fatal_encode_error = |err: &JsValue| -> bool {
+                let msg = format!("{err:?}");
+                msg.contains("closed codec")
+                    || msg.contains("InvalidStateError")
+                    || msg.contains("Memory allocation error")
+                    || msg.contains("Unable to find free frame buffer")
+            };
 
-            let constraints = web_sys::DisplayMediaStreamConstraints::new();
-            constraints.set_video(&video_constraints.into());
-            constraints.set_audio(&JsValue::FALSE);
+            let mut restart_count: u32 = 0;
+            const MAX_RESTARTS: u32 = 5;
+            let mut media_acquired = false;
 
-            let screen_to_share: MediaStream =
-                match media_devices.get_display_media_with_constraints(&constraints) {
-                    Ok(promise) => match JsFuture::from(promise).await {
-                        Ok(stream) => stream.unchecked_into::<MediaStream>(),
-                        Err(e) => {
-                            // Check if user cancelled (NotAllowedError = permission denied/cancelled)
-                            let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
-                                .ok()
-                                .and_then(|v| v.as_string())
-                                .map(|name| name == "NotAllowedError")
-                                .unwrap_or(false);
+            // These variables are set during the first (media-acquisition) pass and
+            // reused across encoder restarts.  They live outside the restart loop
+            // because the MediaStream and track survive encoder teardown.
+            let mut screen_to_share: Option<MediaStream> = None;
+            let mut media_track: Option<MediaStreamTrack> = None;
+            let mut width: u32 = 0;
+            let mut height: u32 = 0;
 
-                            if is_user_cancel {
-                                log::info!("User cancelled screen sharing");
-                                if let Some(ref callback) = on_state_change {
-                                    callback.emit(ScreenShareEvent::Cancelled);
-                                }
-                            } else {
-                                let error_msg = format!("{e:?}");
-                                error!("Screen sharing error: {error_msg}");
-                                if let Some(ref callback) = on_state_change {
-                                    callback.emit(ScreenShareEvent::Failed(error_msg));
-                                }
-                            }
-                            enabled.store(false, Ordering::Release);
-                            return;
-                        }
-                    },
-                    Err(e) => {
-                        let error_msg = format!("{e:?}");
-                        error!("Failed to get display media: {error_msg}");
-                        if let Some(ref callback) = on_state_change {
-                            callback.emit(ScreenShareEvent::Failed(error_msg));
-                        }
-                        enabled.store(false, Ordering::Release);
-                        return;
-                    }
-                };
-
-            log::info!("Screen to share: {screen_to_share:?}");
-
-            // Signal camera encoder ASAP after capture is confirmed so it begins
-            // stepping down during encoder setup, not after encoding starts.
-            if let Some(ref flag) = screen_sharing_active {
-                flag.store(true, Ordering::Release);
-            } else {
-                log::warn!(
-                    "ScreenEncoder: screen_sharing_active flag not wired — \
-                     camera bandwidth coordination will not engage. \
-                     Ensure host.rs calls screen.set_screen_sharing_flag(camera.screen_sharing_flag())"
-                );
-            }
-
-            screen_stream.borrow_mut().replace(screen_to_share.clone());
+            // The onended handler closure must live as long as we use the media track.
+            // We store it here so it isn't dropped when the inner loop restarts.
+            let mut _onended_handler: Option<Closure<dyn FnMut()>> = None;
 
             // Helper to clean up stream on error - stops all tracks, clears flags, emits Failed event
             let cleanup_on_error = |screen_to_share: &MediaStream,
@@ -558,14 +488,10 @@ impl ScreenEncoder {
                 }
             };
 
-            let screen_track = Box::new(
-                screen_to_share
-                    .get_video_tracks()
-                    .find(&mut |_: JsValue, _: u32, _: Array| true)
-                    .unchecked_into::<VideoTrack>(),
-            );
-
-            // Setup FPS tracking and screen output handler
+            // Setup FPS tracking and screen output handler.
+            // These closures are created once and shared across encoder restarts
+            // because the VideoEncoderInit callbacks are wired to the same output
+            // pipeline regardless of which VideoEncoder instance is active.
             let screen_output_handler = {
                 let mut buffer: Vec<u8> = Vec::with_capacity(150_000);
                 let mut sequence_number = 0;
@@ -621,304 +547,587 @@ impl ScreenEncoder {
                 screen_output_handler.as_ref().unchecked_ref(),
             );
 
-            let screen_encoder = match VideoEncoder::new(&screen_encoder_init) {
-                Ok(encoder) => Box::new(encoder),
-                Err(e) => {
-                    let msg = format!("Failed to create video encoder: {e:?}");
-                    error!("{msg}");
-                    cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
-                    return;
-                }
-            };
-
-            let media_track = screen_track
-                .as_ref()
-                .clone()
-                .unchecked_into::<MediaStreamTrack>();
-
-            // Set contentHint = 'detail' so the encoder optimizes for sharp text
-            // and edges rather than smooth motion. This is critical for screen
-            // content readability — without it, the encoder treats the stream as
-            // camera video and applies aggressive motion-optimized quantization
-            // that makes text unreadable during scrolling.
-            //
-            // `contentHint` is a progressive enhancement (MediaStreamTrack Content Hints API,
-            // https://www.w3.org/TR/mst-content-hint/). Reflect::set silently succeeds even
-            // when the browser doesn't support the property, so this is intentionally best-effort.
-            // The `let _ =` is deliberate — swallowing the return value is correct here because
-            // a missing hint only degrades quality, it never breaks the stream.
-            let _ = Reflect::set(
-                &media_track,
-                &JsValue::from_str("contentHint"),
-                &JsValue::from_str("detail"),
-            );
-
-            // Store the original track so stop() can stop it synchronously, which
-            // is required to immediately dismiss the browser's capture indicator bar.
-            active_video_track.borrow_mut().replace(media_track.clone());
-
-            // Set up onended handler to detect when user clicks browser's "Stop sharing" button
-            // Keep the closure in scope until the encoding loop ends to avoid memory leak
-            let _onended_handler = {
-                let enabled_clone = enabled.clone();
-                let on_state_change_clone = on_state_change.clone();
-                let screen_sharing_flag_clone = screen_sharing_active.clone();
-                let handler = Closure::wrap(Box::new(move || {
-                    log::info!("Screen share track ended (user stopped sharing)");
-                    enabled_clone.store(false, Ordering::Release);
-                    // Clear the flag immediately so the camera encoder can begin recovery
-                    // without waiting for the async encoding loop to wind down.
-                    if let Some(ref flag) = screen_sharing_flag_clone {
-                        flag.store(false, Ordering::Release);
-                    }
-                    client_for_onended.set_screen_enabled(false);
-                    if let Some(ref callback) = on_state_change_clone {
-                        callback.emit(ScreenShareEvent::Stopped);
-                    }
-                }) as Box<dyn FnMut()>);
-                media_track.set_onended(Some(handler.as_ref().unchecked_ref()));
-                handler
-            };
-
-            let track_settings = media_track.get_settings();
-
-            let width = track_settings.get_width().expect("width is None");
-            let height = track_settings.get_height().expect("height is None");
-            // Cache the initial bitrate
-            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
-            let screen_encoder_config =
-                VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
-            screen_encoder_config.set_bitrate(local_bitrate as f64);
-            screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
-            set_vbr_mode(&screen_encoder_config);
-            if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
-                let msg = format!("Error configuring screen encoder: {e:?}");
-                error!("{msg}");
-                cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
-                return;
-            }
-
-            let screen_processor = match MediaStreamTrackProcessor::new(
-                &MediaStreamTrackProcessorInit::new(&media_track),
-            ) {
-                Ok(processor) => processor,
-                Err(e) => {
-                    let msg = format!("Failed to create media stream track processor: {e:?}");
-                    error!("{msg}");
-                    cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
-                    return;
-                }
-            };
-
-            // All setup complete - NOW emit Started event and notify peers
-            client_for_state.set_screen_enabled(true);
-            if let Some(ref callback) = on_state_change {
-                callback.emit(ScreenShareEvent::Started(screen_to_share.clone()));
-            }
-
-            let screen_reader = screen_processor
-                .readable()
-                .get_reader()
-                .unchecked_into::<ReadableStreamDefaultReader>();
-
-            let mut screen_frame_counter: u32 = 0;
-            let mut last_pli_keyframe_time: f64 = 0.0;
-            let mut current_encoder_width = width as u32;
-            let mut current_encoder_height = height as u32;
-
-            // Cache tier-controlled values
-            let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
-            let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
-            let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
-
-            loop {
-                // Check if we should stop encoding
-                if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
-                    switching.store(false, Ordering::Release);
-                    media_track.stop();
-                    if let Err(e) = screen_encoder.close() {
-                        error!("Error closing screen encoder: {e:?}");
-                    }
-                    break;
-                }
-
-                // Check for tier-driven dimension/keyframe changes.
-                let new_tier_w = tier_max_width.load(Ordering::Relaxed);
-                let new_tier_h = tier_max_height.load(Ordering::Relaxed);
-                let new_kf = tier_keyframe_interval.load(Ordering::Relaxed);
-
-                let tier_dims_changed =
-                    new_tier_w != local_tier_max_width || new_tier_h != local_tier_max_height;
-                if tier_dims_changed {
-                    local_tier_max_width = new_tier_w;
-                    local_tier_max_height = new_tier_h;
-
-                    let constrained_w = current_encoder_width.min(local_tier_max_width);
-                    let constrained_h = current_encoder_height.min(local_tier_max_height);
-
-                    log::info!(
-                        "ScreenEncoder: tier dimension change -> {}x{} (was {}x{})",
-                        constrained_w,
-                        constrained_h,
-                        current_encoder_width,
-                        current_encoder_height,
+            'restart: loop {
+                // --- Backoff + max-restart guard (skip on first iteration) ---
+                if restart_count > 0 {
+                    let delay_ms = 500u64.saturating_mul(restart_count.min(4) as u64);
+                    log::warn!(
+                        "ScreenEncoder: restarting encoder (attempt {restart_count}/{MAX_RESTARTS}), \
+                         backoff {delay_ms}ms"
                     );
-                    current_encoder_width = constrained_w;
-                    current_encoder_height = constrained_h;
-
-                    let new_config = VideoEncoderConfig::new(
-                        get_video_codec_string(),
-                        current_encoder_height,
-                        current_encoder_width,
-                    );
-                    new_config.set_bitrate(local_bitrate as f64);
-                    new_config.set_latency_mode(LatencyMode::Realtime);
-                    set_vbr_mode(&new_config);
-                    if let Err(e) = screen_encoder.configure(&new_config) {
-                        error!("Error reconfiguring screen encoder for tier change: {e:?}");
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    if restart_count >= MAX_RESTARTS {
+                        error!("ScreenEncoder: max restarts ({MAX_RESTARTS}) reached, giving up");
+                        if let Some(ref stream) = screen_to_share {
+                            cleanup_on_error(
+                                stream,
+                                &enabled,
+                                &on_state_change,
+                                "Screen encoder failed after repeated restarts".to_string(),
+                            );
+                        }
+                        return;
+                    }
+                    // Check if stop() was called or track ended during backoff
+                    if !enabled.load(Ordering::Acquire) {
+                        log::info!("ScreenEncoder: disabled during restart backoff, exiting");
+                        break 'restart;
                     }
                 }
 
-                if new_kf != local_keyframe_interval {
-                    local_keyframe_interval = new_kf;
-                    log::info!(
-                        "ScreenEncoder: keyframe interval changed to {}",
-                        local_keyframe_interval
+                // --- Media acquisition (first iteration only) ---
+                if !media_acquired {
+                    // Build getDisplayMedia constraints requesting high-resolution capture.
+                    // This tells the browser to prefer the source's native resolution rather
+                    // than downscaling, which is critical for readable text and code.
+                    // Use {ideal: N} dictionaries instead of bare numbers — bare numbers are
+                    // treated as {exact: N} and will cause the browser to reject capture if
+                    // the source (e.g. 1440p or 4K monitor) doesn't match exactly.
+                    let width_constraint = js_sys::Object::new();
+                    let _ = Reflect::set(
+                        &width_constraint,
+                        &JsValue::from_str("ideal"),
+                        &JsValue::from_f64(1920.0),
                     );
-                }
-
-                // Update the bitrate if it has changed from diagnostics system
-                let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                if new_bitrate != local_bitrate && !tier_dims_changed {
-                    info!("Updating screen bitrate to {new_bitrate}");
-                    local_bitrate = new_bitrate;
-                    let new_config = VideoEncoderConfig::new(
-                        get_video_codec_string(),
-                        current_encoder_height,
-                        current_encoder_width,
+                    let height_constraint = js_sys::Object::new();
+                    let _ = Reflect::set(
+                        &height_constraint,
+                        &JsValue::from_str("ideal"),
+                        &JsValue::from_f64(1080.0),
                     );
-                    new_config.set_bitrate(local_bitrate as f64);
-                    new_config.set_latency_mode(LatencyMode::Realtime);
-                    set_vbr_mode(&new_config);
-                    if let Err(e) = screen_encoder.configure(&new_config) {
-                        error!("Error configuring screen encoder: {e:?}");
-                    }
-                } else if new_bitrate != local_bitrate {
-                    local_bitrate = new_bitrate;
-                }
+                    let framerate_constraint = js_sys::Object::new();
+                    let _ = Reflect::set(
+                        &framerate_constraint,
+                        &JsValue::from_str("ideal"),
+                        &JsValue::from_f64(10.0),
+                    );
+                    let video_constraints = js_sys::Object::new();
+                    let _ = Reflect::set(
+                        &video_constraints,
+                        &JsValue::from_str("width"),
+                        &width_constraint.into(),
+                    );
+                    let _ = Reflect::set(
+                        &video_constraints,
+                        &JsValue::from_str("height"),
+                        &height_constraint.into(),
+                    );
+                    let _ = Reflect::set(
+                        &video_constraints,
+                        &JsValue::from_str("frameRate"),
+                        &framerate_constraint.into(),
+                    );
 
-                match JsFuture::from(screen_reader.read()).await {
-                    Ok(js_frame) => {
-                        let value = match Reflect::get(&js_frame, &JsString::from("value")) {
-                            Ok(v) => v,
+                    let constraints = web_sys::DisplayMediaStreamConstraints::new();
+                    constraints.set_video(&video_constraints.into());
+                    constraints.set_audio(&JsValue::FALSE);
+
+                    let acquired_stream: MediaStream =
+                        match media_devices.get_display_media_with_constraints(&constraints) {
+                            Ok(promise) => match JsFuture::from(promise).await {
+                                Ok(stream) => stream.unchecked_into::<MediaStream>(),
+                                Err(e) => {
+                                    // Check if user cancelled (NotAllowedError = permission denied/cancelled)
+                                    let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
+                                        .ok()
+                                        .and_then(|v| v.as_string())
+                                        .map(|name| name == "NotAllowedError")
+                                        .unwrap_or(false);
+
+                                    if is_user_cancel {
+                                        log::info!("User cancelled screen sharing");
+                                        if let Some(ref callback) = on_state_change {
+                                            callback.emit(ScreenShareEvent::Cancelled);
+                                        }
+                                    } else {
+                                        let error_msg = format!("{e:?}");
+                                        error!("Screen sharing error: {error_msg}");
+                                        if let Some(ref callback) = on_state_change {
+                                            callback.emit(ScreenShareEvent::Failed(error_msg));
+                                        }
+                                    }
+                                    enabled.store(false, Ordering::Release);
+                                    return;
+                                }
+                            },
                             Err(e) => {
-                                error!("Failed to get frame value: {e:?}");
-                                continue;
+                                let error_msg = format!("{e:?}");
+                                error!("Failed to get display media: {error_msg}");
+                                if let Some(ref callback) = on_state_change {
+                                    callback.emit(ScreenShareEvent::Failed(error_msg));
+                                }
+                                enabled.store(false, Ordering::Release);
+                                return;
                             }
                         };
 
-                        if value.is_undefined() {
-                            error!("Screen share stream ended");
-                            break;
-                        }
+                    log::info!("Screen to share: {acquired_stream:?}");
 
-                        let video_frame = value.unchecked_into::<VideoFrame>();
-                        let frame_width = video_frame.display_width();
-                        let frame_height = video_frame.display_height();
-                        // Constrain to tier max dimensions.
-                        let frame_width = if frame_width > 0 {
-                            (frame_width as u32).min(local_tier_max_width)
-                        } else {
-                            0
-                        };
-                        let frame_height = if frame_height > 0 {
-                            (frame_height as u32).min(local_tier_max_height)
-                        } else {
-                            0
-                        };
+                    // Signal camera encoder ASAP after capture is confirmed so it begins
+                    // stepping down during encoder setup, not after encoding starts.
+                    if let Some(ref flag) = screen_sharing_active {
+                        flag.store(true, Ordering::Release);
+                    } else {
+                        log::warn!(
+                            "ScreenEncoder: screen_sharing_active flag not wired — \
+                             camera bandwidth coordination will not engage. \
+                             Ensure host.rs calls screen.set_screen_sharing_flag(camera.screen_sharing_flag())"
+                        );
+                    }
 
-                        if frame_width > 0
-                            && frame_height > 0
-                            && (frame_width != current_encoder_width
-                                || frame_height != current_encoder_height)
-                        {
-                            info!("Frame dimensions changed from {current_encoder_width}x{current_encoder_height} to {frame_width}x{frame_height}, reconfiguring encoder");
+                    screen_stream.borrow_mut().replace(acquired_stream.clone());
 
-                            current_encoder_width = frame_width;
-                            current_encoder_height = frame_height;
+                    let screen_track = Box::new(
+                        acquired_stream
+                            .get_video_tracks()
+                            .find(&mut |_: JsValue, _: u32, _: Array| true)
+                            .unchecked_into::<VideoTrack>(),
+                    );
 
-                            let new_config = VideoEncoderConfig::new(
-                                get_video_codec_string(),
-                                current_encoder_height,
-                                current_encoder_width,
+                    let track = screen_track
+                        .as_ref()
+                        .clone()
+                        .unchecked_into::<MediaStreamTrack>();
+
+                    // Set contentHint = 'detail' so the encoder optimizes for sharp text
+                    // and edges rather than smooth motion. This is critical for screen
+                    // content readability — without it, the encoder treats the stream as
+                    // camera video and applies aggressive motion-optimized quantization
+                    // that makes text unreadable during scrolling.
+                    //
+                    // `contentHint` is a progressive enhancement (MediaStreamTrack Content Hints API,
+                    // https://www.w3.org/TR/mst-content-hint/). Reflect::set silently succeeds even
+                    // when the browser doesn't support the property, so this is intentionally best-effort.
+                    // The `let _ =` is deliberate — swallowing the return value is correct here because
+                    // a missing hint only degrades quality, it never breaks the stream.
+                    let _ = Reflect::set(
+                        &track,
+                        &JsValue::from_str("contentHint"),
+                        &JsValue::from_str("detail"),
+                    );
+
+                    // Store the original track so stop() can stop it synchronously, which
+                    // is required to immediately dismiss the browser's capture indicator bar.
+                    active_video_track.borrow_mut().replace(track.clone());
+
+                    // Set up onended handler to detect when user clicks browser's "Stop sharing" button
+                    _onended_handler = {
+                        let enabled_clone = enabled.clone();
+                        let on_state_change_clone = on_state_change.clone();
+                        let screen_sharing_flag_clone = screen_sharing_active.clone();
+                        let client_onended = client_for_onended.clone();
+                        let handler = Closure::wrap(Box::new(move || {
+                            log::info!("Screen share track ended (user stopped sharing)");
+                            enabled_clone.store(false, Ordering::Release);
+                            // Clear the flag immediately so the camera encoder can begin recovery
+                            // without waiting for the async encoding loop to wind down.
+                            if let Some(ref flag) = screen_sharing_flag_clone {
+                                flag.store(false, Ordering::Release);
+                            }
+                            client_onended.set_screen_enabled(false);
+                            if let Some(ref callback) = on_state_change_clone {
+                                callback.emit(ScreenShareEvent::Stopped);
+                            }
+                        }) as Box<dyn FnMut()>);
+                        track.set_onended(Some(handler.as_ref().unchecked_ref()));
+                        Some(handler)
+                    };
+
+                    let track_settings = track.get_settings();
+                    width = track_settings.get_width().expect("width is None") as u32;
+                    height = track_settings.get_height().expect("height is None") as u32;
+
+                    screen_to_share = Some(acquired_stream);
+                    media_track = Some(track);
+                    media_acquired = true;
+                } else {
+                    // On restart: verify the stream is still alive. If the user clicked
+                    // "Stop sharing" in the browser while we were backing off, the tracks
+                    // will be gone and we cannot recover without a new user gesture.
+                    if let Some(ref stream) = screen_to_share {
+                        if stream.get_tracks().length() == 0 {
+                            error!(
+                                "ScreenEncoder: stream ended during restart, cannot recover \
+                                 without user gesture"
                             );
-                            new_config.set_bitrate(local_bitrate as f64);
-                            new_config.set_latency_mode(LatencyMode::Realtime);
-                            set_vbr_mode(&new_config);
-                            if let Err(e) = screen_encoder.configure(&new_config) {
-                                error!(
-                                    "Error reconfiguring screen encoder with new dimensions: {e:?}"
+                            cleanup_on_error(
+                                stream,
+                                &enabled,
+                                &on_state_change,
+                                "Screen share stream ended".to_string(),
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                // Unwrap the media references — they are guaranteed to be Some after
+                // the first iteration sets media_acquired = true.
+                let stream_ref = screen_to_share.as_ref().expect("stream must exist");
+                let track_ref = media_track.as_ref().expect("track must exist");
+
+                // --- Create VideoEncoder (re-created on every restart) ---
+                let screen_encoder = match VideoEncoder::new(&screen_encoder_init) {
+                    Ok(encoder) => Box::new(encoder),
+                    Err(e) => {
+                        let msg = format!("Failed to create video encoder: {e:?}");
+                        error!("ScreenEncoder: {msg} (restart {restart_count})");
+                        restart_count += 1;
+                        continue 'restart;
+                    }
+                };
+
+                // --- Initial configure ---
+                let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
+                let screen_encoder_config =
+                    VideoEncoderConfig::new(get_video_codec_string(), height, width);
+                screen_encoder_config.set_bitrate(local_bitrate as f64);
+                screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
+                set_vbr_mode(&screen_encoder_config);
+                if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
+                    let msg = format!("Error configuring screen encoder: {e:?}");
+                    error!("ScreenEncoder: {msg} (restart {restart_count})");
+                    restart_count += 1;
+                    continue 'restart;
+                }
+
+                // --- Create MediaStreamTrackProcessor + reader ---
+                // These must be re-created each restart because the previous reader
+                // may be in an error state after the encoder died mid-read.
+                let screen_processor = match MediaStreamTrackProcessor::new(
+                    &MediaStreamTrackProcessorInit::new(track_ref),
+                ) {
+                    Ok(processor) => processor,
+                    Err(e) => {
+                        let msg = format!("Failed to create media stream track processor: {e:?}");
+                        error!("ScreenEncoder: {msg} (restart {restart_count})");
+                        let _ = screen_encoder.close();
+                        restart_count += 1;
+                        continue 'restart;
+                    }
+                };
+
+                // Emit Started event and notify peers on first successful setup.
+                // On restarts, the stream is already active — no need to re-emit.
+                if restart_count == 0 {
+                    client_for_state.set_screen_enabled(true);
+                    if let Some(ref callback) = on_state_change {
+                        callback.emit(ScreenShareEvent::Started(stream_ref.clone()));
+                    }
+                } else {
+                    log::info!(
+                        "ScreenEncoder: encoder restarted successfully (attempt {restart_count})"
+                    );
+                }
+
+                let screen_reader = screen_processor
+                    .readable()
+                    .get_reader()
+                    .unchecked_into::<ReadableStreamDefaultReader>();
+
+                let mut screen_frame_counter: u32 = 0;
+                let mut last_pli_keyframe_time: f64 = 0.0;
+                let mut current_encoder_width = width;
+                let mut current_encoder_height = height;
+
+                // Cache tier-controlled values
+                let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
+                let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
+                let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
+
+                // Track whether the inner loop exited due to a fatal encode error
+                // vs. a stream-read error or shutdown signal.
+                let mut fatal_encode_exit = false;
+
+                'encode: loop {
+                    // Check if we should stop encoding (user called stop() or
+                    // onended fired). This exits the function entirely — no restart.
+                    if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
+                        switching.store(false, Ordering::Release);
+                        track_ref.stop();
+                        if let Err(e) = screen_encoder.close() {
+                            error!("Error closing screen encoder: {e:?}");
+                        }
+                        // Break to final cleanup — not a restart.
+                        break 'restart;
+                    }
+
+                    // --- Guard: skip reconfigure if encoder is already closed ---
+                    if screen_encoder.state() == CodecState::Closed {
+                        log::warn!(
+                            "ScreenEncoder: encoder found in closed state, triggering restart"
+                        );
+                        restart_count += 1;
+                        break 'encode;
+                    }
+
+                    // Check for tier-driven dimension/keyframe changes.
+                    let new_tier_w = tier_max_width.load(Ordering::Relaxed);
+                    let new_tier_h = tier_max_height.load(Ordering::Relaxed);
+                    let new_kf = tier_keyframe_interval.load(Ordering::Relaxed);
+
+                    let tier_dims_changed =
+                        new_tier_w != local_tier_max_width || new_tier_h != local_tier_max_height;
+                    if tier_dims_changed {
+                        local_tier_max_width = new_tier_w;
+                        local_tier_max_height = new_tier_h;
+
+                        let constrained_w = current_encoder_width.min(local_tier_max_width);
+                        let constrained_h = current_encoder_height.min(local_tier_max_height);
+
+                        log::info!(
+                            "ScreenEncoder: tier dimension change -> {}x{} (was {}x{})",
+                            constrained_w,
+                            constrained_h,
+                            current_encoder_width,
+                            current_encoder_height,
+                        );
+                        current_encoder_width = constrained_w;
+                        current_encoder_height = constrained_h;
+
+                        // Guard: check encoder state before reconfigure
+                        if screen_encoder.state() == CodecState::Closed {
+                            log::warn!(
+                                "ScreenEncoder: encoder closed before tier reconfigure, restarting"
+                            );
+                            restart_count += 1;
+                            break 'encode;
+                        }
+                        let new_config = VideoEncoderConfig::new(
+                            get_video_codec_string(),
+                            current_encoder_height,
+                            current_encoder_width,
+                        );
+                        new_config.set_bitrate(local_bitrate as f64);
+                        new_config.set_latency_mode(LatencyMode::Realtime);
+                        set_vbr_mode(&new_config);
+                        if let Err(e) = screen_encoder.configure(&new_config) {
+                            error!("Error reconfiguring screen encoder for tier change: {e:?}");
+                            if is_fatal_encode_error(&e) {
+                                restart_count += 1;
+                                break 'encode;
+                            }
+                        }
+                    }
+
+                    if new_kf != local_keyframe_interval {
+                        local_keyframe_interval = new_kf;
+                        log::info!(
+                            "ScreenEncoder: keyframe interval changed to {}",
+                            local_keyframe_interval
+                        );
+                    }
+
+                    // Update the bitrate if it has changed from diagnostics system
+                    let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
+                    if new_bitrate != local_bitrate && !tier_dims_changed {
+                        info!("Updating screen bitrate to {new_bitrate}");
+                        local_bitrate = new_bitrate;
+                        // Guard: check encoder state before bitrate reconfigure
+                        if screen_encoder.state() == CodecState::Closed {
+                            log::warn!(
+                                "ScreenEncoder: encoder closed before bitrate reconfigure, restarting"
+                            );
+                            restart_count += 1;
+                            break 'encode;
+                        }
+                        let new_config = VideoEncoderConfig::new(
+                            get_video_codec_string(),
+                            current_encoder_height,
+                            current_encoder_width,
+                        );
+                        new_config.set_bitrate(local_bitrate as f64);
+                        new_config.set_latency_mode(LatencyMode::Realtime);
+                        set_vbr_mode(&new_config);
+                        if let Err(e) = screen_encoder.configure(&new_config) {
+                            error!("Error configuring screen encoder: {e:?}");
+                            if is_fatal_encode_error(&e) {
+                                restart_count += 1;
+                                break 'encode;
+                            }
+                        }
+                    } else if new_bitrate != local_bitrate {
+                        local_bitrate = new_bitrate;
+                    }
+
+                    match JsFuture::from(screen_reader.read()).await {
+                        Ok(js_frame) => {
+                            let value = match Reflect::get(&js_frame, &JsString::from("value")) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    error!("Failed to get frame value: {e:?}");
+                                    continue;
+                                }
+                            };
+
+                            if value.is_undefined() {
+                                error!("Screen share stream ended");
+                                break 'encode;
+                            }
+
+                            let video_frame = value.unchecked_into::<VideoFrame>();
+                            let frame_width = video_frame.display_width();
+                            let frame_height = video_frame.display_height();
+                            // Constrain to tier max dimensions.
+                            let frame_width = if frame_width > 0 {
+                                (frame_width as u32).min(local_tier_max_width)
+                            } else {
+                                0
+                            };
+                            let frame_height = if frame_height > 0 {
+                                (frame_height as u32).min(local_tier_max_height)
+                            } else {
+                                0
+                            };
+
+                            if frame_width > 0
+                                && frame_height > 0
+                                && (frame_width != current_encoder_width
+                                    || frame_height != current_encoder_height)
+                            {
+                                info!("Frame dimensions changed from {current_encoder_width}x{current_encoder_height} to {frame_width}x{frame_height}, reconfiguring encoder");
+
+                                current_encoder_width = frame_width;
+                                current_encoder_height = frame_height;
+
+                                // Guard: check encoder state before dimension reconfigure
+                                if screen_encoder.state() == CodecState::Closed {
+                                    log::warn!(
+                                        "ScreenEncoder: encoder closed before dimension reconfigure, restarting"
+                                    );
+                                    video_frame.close();
+                                    fatal_encode_exit = true;
+                                    restart_count += 1;
+                                    break 'encode;
+                                }
+                                let new_config = VideoEncoderConfig::new(
+                                    get_video_codec_string(),
+                                    current_encoder_height,
+                                    current_encoder_width,
+                                );
+                                new_config.set_bitrate(local_bitrate as f64);
+                                new_config.set_latency_mode(LatencyMode::Realtime);
+                                set_vbr_mode(&new_config);
+                                if let Err(e) = screen_encoder.configure(&new_config) {
+                                    error!(
+                                        "Error reconfiguring screen encoder with new dimensions: {e:?}"
+                                    );
+                                    if is_fatal_encode_error(&e) {
+                                        video_frame.close();
+                                        fatal_encode_exit = true;
+                                        restart_count += 1;
+                                        break 'encode;
+                                    }
+                                }
+                            }
+
+                            let opts = VideoEncoderEncodeOptions::new();
+                            // Check if a keyframe was requested via PLI.
+                            let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
+                            let now = window()
+                                .performance()
+                                .expect("Performance API not available")
+                                .now();
+                            let pli_cooldown_ok =
+                                (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
+                            let force_pli = pli_requested && pli_cooldown_ok;
+                            if force_pli {
+                                last_pli_keyframe_time = now;
+                            }
+                            // Use tier-controlled keyframe interval.
+                            // Using `%` instead of `.is_multiple_of()` for compatibility
+                            // with Rust toolchains older than 1.87.
+                            #[allow(clippy::manual_is_multiple_of)]
+                            let is_periodic_keyframe = local_keyframe_interval > 0
+                                && screen_frame_counter % local_keyframe_interval == 0;
+                            opts.set_key_frame(is_periodic_keyframe || force_pli);
+                            if force_pli {
+                                log::info!(
+                                    "ScreenEncoder: forcing keyframe at frame {} (PLI)",
+                                    screen_frame_counter
+                                );
+                            } else if pli_requested {
+                                log::info!(
+                                    "ScreenEncoder: PLI keyframe suppressed at frame {} (cooldown: {:.0}ms since last)",
+                                    screen_frame_counter,
+                                    now - last_pli_keyframe_time,
                                 );
                             }
-                        }
 
-                        let opts = VideoEncoderEncodeOptions::new();
-                        // Check if a keyframe was requested via PLI.
-                        let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
-                        let now = window()
-                            .performance()
-                            .expect("Performance API not available")
-                            .now();
-                        let pli_cooldown_ok =
-                            (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
-                        let force_pli = pli_requested && pli_cooldown_ok;
-                        if force_pli {
-                            last_pli_keyframe_time = now;
+                            if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts)
+                            {
+                                if is_fatal_encode_error(&e) {
+                                    error!(
+                                        "ScreenEncoder: fatal encode error (restart {restart_count}): {e:?}"
+                                    );
+                                    video_frame.close();
+                                    fatal_encode_exit = true;
+                                    restart_count += 1;
+                                    break 'encode;
+                                }
+                                error!("Error encoding screen frame: {e:?}");
+                            } else if restart_count > 0 {
+                                // First successful encode after a restart — reset the
+                                // counter so transient errors don't accumulate toward
+                                // the max-restart limit across unrelated incidents.
+                                log::info!(
+                                    "ScreenEncoder: first successful encode after restart, \
+                                     resetting restart counter"
+                                );
+                                restart_count = 0;
+                            }
+                            video_frame.close();
+                            screen_frame_counter += 1;
                         }
-                        // Use tier-controlled keyframe interval.
-                        // Using `%` instead of `.is_multiple_of()` for compatibility
-                        // with Rust toolchains older than 1.87.
-                        #[allow(clippy::manual_is_multiple_of)]
-                        let is_periodic_keyframe = local_keyframe_interval > 0
-                            && screen_frame_counter % local_keyframe_interval == 0;
-                        opts.set_key_frame(is_periodic_keyframe || force_pli);
-                        if force_pli {
-                            log::info!(
-                                "ScreenEncoder: forcing keyframe at frame {} (PLI)",
-                                screen_frame_counter
-                            );
-                        } else if pli_requested {
-                            log::info!(
-                                "ScreenEncoder: PLI keyframe suppressed at frame {} (cooldown: {:.0}ms since last)",
-                                screen_frame_counter,
-                                now - last_pli_keyframe_time,
-                            );
+                        Err(e) => {
+                            error!("Error reading screen frame: {e:?}");
+                            break 'encode;
                         }
+                    }
+                } // end 'encode
 
-                        if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
-                            error!("Error encoding screen frame: {e:?}");
-                        }
-                        video_frame.close();
-                        screen_frame_counter += 1;
-                    }
-                    Err(e) => {
-                        error!("Error reading screen frame: {e:?}");
-                        break;
-                    }
+                // --- Post-inner-loop: decide restart vs full exit ---
+                // Close the dead encoder before restarting (best-effort; it may
+                // already be closed).
+                let _ = screen_encoder.close();
+
+                if fatal_encode_exit {
+                    // Fatal encode error: the encoder died but the stream may be
+                    // alive.  Continue to the next restart iteration.
+                    continue 'restart;
                 }
-            }
 
-            // At the end of the loop, ensure proper cleanup
+                // Stream-read error or stream-ended: check if the stream is still
+                // alive. If tracks are gone, the user stopped sharing or the
+                // source disconnected — full cleanup and exit.
+                if stream_ref.get_tracks().length() == 0 {
+                    log::info!("ScreenEncoder: stream tracks gone after read error, full cleanup");
+                    break 'restart;
+                }
+
+                // Stream tracks are still alive but the reader errored (e.g.,
+                // transient ReadableStream glitch). Try to restart.
+                log::warn!("ScreenEncoder: reader error with live stream, attempting restart");
+                restart_count += 1;
+                continue 'restart;
+            } // end 'restart
+
+            // --- Final cleanup (reached on shutdown or unrecoverable failure) ---
             // Clear the active track reference so stop() doesn't try to stop it again.
             active_video_track.borrow_mut().take();
-            // Clear the onended handler before dropping the closure to avoid dangling reference
-            media_track.set_onended(None);
 
-            media_track.stop();
-            if let Some(tracks) = screen_to_share.get_tracks().dyn_ref::<Array>() {
-                for i in 0..tracks.length() {
-                    if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
-                        track.stop();
+            // Clear the onended handler before dropping the closure to avoid dangling reference
+            if let Some(ref track) = media_track {
+                track.set_onended(None);
+                track.stop();
+            }
+
+            if let Some(ref stream) = screen_to_share {
+                if let Some(tracks) = stream.get_tracks().dyn_ref::<Array>() {
+                    for i in 0..tracks.length() {
+                        if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
+                            track.stop();
+                        }
                     }
                 }
             }

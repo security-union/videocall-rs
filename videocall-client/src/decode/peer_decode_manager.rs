@@ -852,6 +852,24 @@ impl PeerDecodeManager {
         self.local_user_id = user_id;
     }
 
+    /// Clear the send-packet callback. Called from
+    /// [`VideoCallClient::disconnect()`](crate::VideoCallClient::disconnect)
+    /// to break the `client -> peer_decode_manager.send_packet -> client`
+    /// `Rc` cycle that otherwise keeps `Inner` alive after the UI scope
+    /// holding the client has unmounted (issue: cc7tp meeting incident
+    /// 2026-05-01, github01.hclpnp.com/labs-projects/videocall/discussions/502).
+    pub fn clear_send_packet_callback(&mut self) {
+        self.send_packet = None;
+    }
+
+    /// Test/observability helper: report whether the PLI send-packet
+    /// callback is currently set. Used by the disconnect regression
+    /// tests to assert that `clear_send_packet_callback` actually fired.
+    #[doc(hidden)]
+    pub fn has_send_packet_callback(&self) -> bool {
+        self.send_packet.is_some()
+    }
+
     pub fn set_vad_threshold(&mut self, threshold: Option<f32>) {
         self.vad_threshold = threshold;
     }

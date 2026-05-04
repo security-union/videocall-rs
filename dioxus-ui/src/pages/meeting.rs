@@ -261,7 +261,8 @@ pub fn MeetingPage(id: String) -> Element {
                                                     host_display_name: determined_host,
                                                     host_user_id: determined_host_uid,
                                                     room_token: token,
-                                                    waiting_room_enabled: response.waiting_room_enabled,
+                                                    waiting_room_enabled: response
+                                                        .waiting_room_enabled,
                                                     admitted_can_admit: response.admitted_can_admit,
                                                     end_on_host_leave: response.end_on_host_leave,
                                                     allow_guests: response.allow_guests,

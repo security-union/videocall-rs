@@ -17,11 +17,60 @@
 //! NATS is not configured (graceful degradation).
 
 use protobuf::Message;
+use serde::{Deserialize, Serialize};
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
+
+/// NATS subject for fanning out per-meeting policy flag changes to every
+/// `actix-api` chat_server instance. The chat_server caches these flags at
+/// JoinRoom time from the JWT, so without this fanout a mid-meeting PATCH
+/// would not take effect until the host reconnected.
+///
+/// Mirrors the public `MEETING_SETTINGS_UPDATED` protobuf event but uses
+/// JSON over a separate internal subject so the wire format for clients
+/// stays untouched. The corresponding consumer lives in
+/// `actix-api/src/actors/chat_server.rs` (search for
+/// `MEETING_SETTINGS_UPDATE_SUBJECT`).
+pub const MEETING_SETTINGS_UPDATE_SUBJECT: &str = "internal.meeting_settings_updated";
+
+/// NATS subject consumed by `meeting-api` to write `state='ended'` to the
+/// `meetings` table when `actix-api` broadcasts MEETING_ENDED on a host
+/// disconnect with `end_on_host_leave=true`. Mirrors the REST POST /leave
+/// flow's `db_meetings::end_meeting` call so the meetings list stays
+/// consistent with the broadcast clients receive.
+///
+/// The corresponding publisher lives in
+/// `actix-api/src/actors/chat_server.rs` (search for
+/// `MEETING_ENDED_BY_HOST_SUBJECT`).
+pub const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
+
+/// Payload published on [`MEETING_SETTINGS_UPDATE_SUBJECT`].
+///
+/// Carries the four per-meeting policy flags so chat_server can refresh
+/// its full `RoomPolicy` snapshot without a DB round-trip. All flags are
+/// always populated — the consumer overwrites the cache wholesale rather
+/// than merging field-by-field.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSettingsUpdatePayload {
+    pub room_id: String,
+    pub end_on_host_leave: bool,
+    pub admitted_can_admit: bool,
+    pub waiting_room_enabled: bool,
+    pub allow_guests: bool,
+}
+
+/// Payload consumed on [`MEETING_ENDED_BY_HOST_SUBJECT`].
+///
+/// Sent by chat_server when the host-leave broadcast fires. The `meeting-api`
+/// consumer looks up the meeting by `room_id` and transitions its DB row
+/// to `state='ended'`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingEndedByHostPayload {
+    pub room_id: String,
+}
 
 /// Build a `PacketWrapper` containing a serialized `MeetingPacket`.
 fn build_meeting_wrapper(meeting_packet: &MeetingPacket) -> Vec<u8> {
@@ -156,6 +205,53 @@ pub async fn publish_meeting_settings_updated(nats: Option<&async_nats::Client>,
     let bytes = build_meeting_wrapper(&packet);
     publish(nats, room_system_subject(room_id), bytes).await;
     tracing::debug!("Published MEETING_SETTINGS_UPDATED for room {room_id}");
+}
+
+/// Publish a server-internal [`MEETING_SETTINGS_UPDATE_SUBJECT`] event so
+/// every `actix-api` chat_server instance refreshes its in-memory
+/// `room_policy` cache. Caller passes the post-update authoritative flag
+/// values (typically the `MeetingRow` fields after a successful
+/// `update_meeting_settings` call).
+///
+/// Distinct from [`publish_meeting_settings_updated`]: that one tells
+/// **clients** to re-fetch settings via REST, this one tells **servers**
+/// to refresh their cache without any DB lookup.
+pub async fn publish_internal_meeting_settings_update(
+    nats: Option<&async_nats::Client>,
+    payload: &MeetingSettingsUpdatePayload,
+) {
+    let Some(nats) = nats else { return };
+    let bytes = match serde_json::to_vec(payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(
+                "Failed to serialize MeetingSettingsUpdatePayload for {}: {e}",
+                payload.room_id
+            );
+            return;
+        }
+    };
+    if let Err(e) = nats
+        .publish(MEETING_SETTINGS_UPDATE_SUBJECT, bytes.into())
+        .await
+    {
+        tracing::error!(
+            "Failed to publish {} for {}: {e}",
+            MEETING_SETTINGS_UPDATE_SUBJECT,
+            payload.room_id
+        );
+    } else {
+        tracing::debug!(
+            "Published {} for room {} (end_on_host_leave={}, admitted_can_admit={}, \
+             waiting_room_enabled={}, allow_guests={})",
+            MEETING_SETTINGS_UPDATE_SUBJECT,
+            payload.room_id,
+            payload.end_on_host_leave,
+            payload.admitted_can_admit,
+            payload.waiting_room_enabled,
+            payload.allow_guests
+        );
+    }
 }
 
 #[cfg(test)]

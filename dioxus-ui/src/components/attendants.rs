@@ -476,7 +476,6 @@ pub fn AttendantsComponent(
     e2ee_enabled: bool,
     #[props(default)] user_name: Option<String>,
     #[props(default)] user_id: Option<String>,
-    #[props(default)] on_logout: Option<EventHandler<()>>,
     #[props(default)] host_display_name: Option<String>,
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] auto_join: bool,
@@ -933,24 +932,20 @@ pub fn AttendantsComponent(
                     .await
                     {
                         Ok(status) => {
-                            let waiting_room_enabled = status.waiting_room_enabled.unwrap_or(true);
-                            if waiting_room_toggle() != waiting_room_enabled {
-                                waiting_room_toggle.set(waiting_room_enabled);
+                            if waiting_room_toggle() != status.waiting_room_enabled {
+                                waiting_room_toggle.set(status.waiting_room_enabled);
                             }
 
-                            let admitted_can_admit = status.admitted_can_admit.unwrap_or(false);
-                            if admitted_can_admit_toggle() != admitted_can_admit {
-                                admitted_can_admit_toggle.set(admitted_can_admit);
+                            if admitted_can_admit_toggle() != status.admitted_can_admit {
+                                admitted_can_admit_toggle.set(status.admitted_can_admit);
                             }
 
-                            let end_on_host_leave = status.end_on_host_leave.unwrap_or(true);
-                            if end_on_host_leave_toggle() != end_on_host_leave {
-                                end_on_host_leave_toggle.set(end_on_host_leave);
+                            if end_on_host_leave_toggle() != status.end_on_host_leave {
+                                end_on_host_leave_toggle.set(status.end_on_host_leave);
                             }
 
-                            let allow_guests = status.allow_guests.unwrap_or(false);
-                            if allow_guests_toggle() != allow_guests {
-                                allow_guests_toggle.set(allow_guests);
+                            if allow_guests_toggle() != status.allow_guests {
+                                allow_guests_toggle.set(status.allow_guests);
                             }
                         }
                         Err(e) => {

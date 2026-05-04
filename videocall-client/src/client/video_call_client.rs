@@ -1258,6 +1258,12 @@ impl Inner {
     /// A KEYFRAME_REQUEST is a MEDIA packet whose inner `MediaPacket` has
     /// `media_type == KEYFRAME_REQUEST`. The `data` field contains the stream
     /// type (`"VIDEO"` or `"SCREEN"`) that needs the keyframe.
+    ///
+    /// Only acts when the request is addressed to this client's own `user_id`.
+    /// Previously every encoder in the room would fire a forced keyframe for
+    /// every forwarded PLI (broadcast amplification). This guard ensures that
+    /// only the target peer forces a keyframe, eliminating the O(N) encoder
+    /// storm on low-bandwidth connections.
     fn try_handle_keyframe_request(&self, response: &PacketWrapper) -> bool {
         // Parse the inner MediaPacket to check its media_type.
         let media_packet = match MediaPacket::parse_from_bytes(&response.data) {
@@ -1267,6 +1273,13 @@ impl Inner {
 
         if media_packet.media_type.enum_value() != Ok(MediaType::KEYFRAME_REQUEST) {
             return false;
+        }
+
+        // Only the targeted encoder should produce a forced keyframe.
+        // `media_packet.user_id` is the target peer's user_id set by the requester
+        // (see `send_keyframe_request` in peer_decode_manager.rs).
+        if media_packet.user_id[..] != *self.options.user_id.as_bytes() {
+            return true; // it was a keyframe request, but not for us — consume it silently
         }
 
         let requested_stream = String::from_utf8_lossy(&media_packet.data);

@@ -1,47 +1,14 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
+import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
 
-const BROWSER_ARGS = [
-  "--ignore-certificate-errors",
-  "--origin-to-force-quic-on=127.0.0.1:4433",
-  "--use-fake-device-for-media-stream",
-  "--use-fake-ui-for-media-stream",
-  "--disable-gpu",
-];
-
 // ---------------------------------------------------------------------------
 // Helpers (same patterns as guest-join.spec.ts)
 // ---------------------------------------------------------------------------
-
-async function createAuthenticatedContext(
-  browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
-  email: string,
-  name: string,
-  uiURL: string,
-) {
-  const context = await browser.newContext({
-    baseURL: uiURL,
-    ignoreHTTPSErrors: true,
-  });
-  const token = generateSessionToken(email, name);
-  const url = new URL(uiURL);
-  await context.addCookies([
-    {
-      name: COOKIE_NAME,
-      value: token,
-      domain: url.hostname,
-      path: "/",
-      httpOnly: true,
-      secure: false,
-      sameSite: "Lax",
-    },
-  ]);
-  return context;
-}
 
 async function createMeetingViaApi(
   hostEmail: string,

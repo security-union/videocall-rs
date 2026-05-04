@@ -49,7 +49,7 @@
 //! (RP-initiated logout via `end_session_endpoint` when configured).
 
 use crate::constants::{
-    login_url, logout_url, meeting_api_client, oauth_auth_url, oauth_client_id, oauth_prompt,
+    login_url, meeting_api_client, oauth_auth_url, oauth_client_id, oauth_prompt,
     oauth_redirect_url, oauth_scopes,
 };
 use crate::pkce::{self};
@@ -526,28 +526,6 @@ pub fn redirect_not_authenticated(meeting_id: &str, allow_guests: bool) {
     } else {
         redirect_to_login();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Logout
-// ---------------------------------------------------------------------------
-
-/// Navigate the browser to the meeting-api `/logout` endpoint, clearing the
-/// stored id_token first.
-///
-/// Any `303` redirect to the OIDC provider's `end_session_endpoint` is
-/// followed as a real page load (terminating the provider session too).
-pub fn logout() -> Result<(), String> {
-    // Clear all session-scoped state before navigating away so subsequent
-    // requests are immediately unauthenticated, even if the navigation is slow.
-    clear_access_token();
-    clear_id_token();
-    clear_user_profile();
-    let url = logout_url()?;
-    window()
-        .location()
-        .set_href(&url)
-        .map_err(|e| format!("Navigation to logout URL failed: {e:?}"))
 }
 
 // ---------------------------------------------------------------------------

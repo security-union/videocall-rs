@@ -531,7 +531,25 @@ pub async fn update_meeting(
     search::spawn_repush(&state, row.id, row.room_id.clone());
 
     if settings_updated {
+        // Notify clients (REST refetch trigger).
         nats_events::publish_meeting_settings_updated(state.nats.as_ref(), &row.room_id).await;
+        // Notify every chat_server instance so its in-memory room_policy
+        // cache picks up the toggle without waiting for a host reconnect.
+        // This is the server-side counterpart that closes the
+        // cache-staleness bug where back-navigating after toggling
+        // `end_on_host_leave=false` still kicked everyone out.
+        let internal_payload = nats_events::MeetingSettingsUpdatePayload {
+            room_id: row.room_id.clone(),
+            end_on_host_leave: row.end_on_host_leave,
+            admitted_can_admit: row.admitted_can_admit,
+            waiting_room_enabled: row.waiting_room_enabled,
+            allow_guests: row.allow_guests,
+        };
+        nats_events::publish_internal_meeting_settings_update(
+            state.nats.as_ref(),
+            &internal_payload,
+        )
+        .await;
     }
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;

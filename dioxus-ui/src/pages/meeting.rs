@@ -12,7 +12,7 @@
  */
 
 use crate::auth::{
-    check_session, get_user_profile, handle_not_authenticated, logout, redirect_not_authenticated,
+    check_session, get_user_profile, handle_not_authenticated, redirect_not_authenticated,
     UserProfile,
 };
 use crate::components::attendants::AttendantsComponent;
@@ -251,10 +251,6 @@ pub fn MeetingPage(id: String) -> Element {
                                     current_user_id.set(Some(effective_user_id));
                                     let determined_host = response.host_display_name.clone();
                                     let determined_host_uid = response.host_user_id.clone();
-                                    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
-                                    let aca = response.admitted_can_admit.unwrap_or(false);
-                                    let eohl = response.end_on_host_leave.unwrap_or(true);
-                                    let ag = response.allow_guests.unwrap_or(false);
                                     host_display_name.set(determined_host.clone());
                                     host_user_id.set(determined_host_uid.clone());
                                     match response.status.as_str() {
@@ -265,10 +261,11 @@ pub fn MeetingPage(id: String) -> Element {
                                                     host_display_name: determined_host,
                                                     host_user_id: determined_host_uid,
                                                     room_token: token,
-                                                    waiting_room_enabled: wr_enabled,
-                                                    admitted_can_admit: aca,
-                                                    end_on_host_leave: eohl,
-                                                    allow_guests: ag,
+                                                    waiting_room_enabled: response
+                                                        .waiting_room_enabled,
+                                                    admitted_can_admit: response.admitted_can_admit,
+                                                    end_on_host_leave: response.end_on_host_leave,
+                                                    allow_guests: response.allow_guests,
                                                 });
                                             } else {
                                                 meeting_status.set(MeetingStatus::Error(
@@ -335,17 +332,6 @@ pub fn MeetingPage(id: String) -> Element {
         });
     }
 
-    // Logout handler: navigate the browser to the meeting-api /logout endpoint
-    // so the server can clear the session cookie and redirect to the OIDC
-    // provider's end_session_endpoint when configured.  The navigator.push()
-    // call that was here previously is no longer needed — the browser will
-    // unload the page as soon as the navigation starts.
-    let on_logout = move |_| {
-        if let Err(e) = logout() {
-            log::error!("Logout navigation failed: {e}");
-        }
-    };
-
     // Early return for auth check
     if !auth_checked() && oauth_enabled().unwrap_or(false) {
         return rsx! {
@@ -390,10 +376,6 @@ pub fn MeetingPage(id: String) -> Element {
                                 None
                             }
                         });
-                        let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
-                        let aca = response.admitted_can_admit.unwrap_or(false);
-                        let eohl = response.end_on_host_leave.unwrap_or(true);
-                        let ag = response.allow_guests.unwrap_or(false);
                         host_display_name.set(determined_host.clone());
                         host_user_id.set(determined_host_uid.clone());
                         match response.status.as_str() {
@@ -405,10 +387,10 @@ pub fn MeetingPage(id: String) -> Element {
                                         host_display_name: determined_host,
                                         host_user_id: determined_host_uid,
                                         room_token: token,
-                                        waiting_room_enabled: wr_enabled,
-                                        admitted_can_admit: aca,
-                                        end_on_host_leave: eohl,
-                                        allow_guests: ag,
+                                        waiting_room_enabled: response.waiting_room_enabled,
+                                        admitted_can_admit: response.admitted_can_admit,
+                                        end_on_host_leave: response.end_on_host_leave,
+                                        allow_guests: response.allow_guests,
                                     });
                                 } else {
                                     meeting_status.set(MeetingStatus::Error(
@@ -475,10 +457,6 @@ pub fn MeetingPage(id: String) -> Element {
         move |status: JoinMeetingResponse| {
             let determined_host = status.host_display_name.clone();
             let determined_host_uid = status.host_user_id.clone();
-            let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
-            let aca = status.admitted_can_admit.unwrap_or(false);
-            let eohl = status.end_on_host_leave.unwrap_or(true);
-            let ag = status.allow_guests.unwrap_or(false);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
             host_user_id.set(determined_host_uid.clone());
@@ -488,10 +466,10 @@ pub fn MeetingPage(id: String) -> Element {
                 host_display_name: determined_host,
                 host_user_id: determined_host_uid,
                 room_token: token,
-                waiting_room_enabled: wr_enabled,
-                admitted_can_admit: aca,
-                end_on_host_leave: eohl,
-                allow_guests: ag,
+                waiting_room_enabled: status.waiting_room_enabled,
+                admitted_can_admit: status.admitted_can_admit,
+                end_on_host_leave: status.end_on_host_leave,
+                allow_guests: status.allow_guests,
             });
         }
     };
@@ -546,7 +524,6 @@ pub fn MeetingPage(id: String) -> Element {
                     user_id: current_user_id()
                         .or_else(|| user_profile().as_ref().map(|p| p.user_id.clone()))
                         .or_else(|| Some(get_or_create_local_user_id())),
-                    on_logout: Some(EventHandler::new(on_logout)),
                     host_display_name: host_display_name.clone(),
                     host_user_id: host_user_id.clone(),
                     auto_join: should_auto_join,

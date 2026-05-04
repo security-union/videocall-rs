@@ -101,9 +101,8 @@ async fn test_attendee_joins_inactive_meeting_no_waiting_room_gets_admitted() {
         "Auto-admitted attendee should receive a room_token"
     );
     assert!(!body.result.is_host);
-    assert_eq!(
-        body.result.waiting_room_enabled,
-        Some(false),
+    assert!(
+        !body.result.waiting_room_enabled,
         "Response should reflect waiting_room_enabled=false"
     );
 

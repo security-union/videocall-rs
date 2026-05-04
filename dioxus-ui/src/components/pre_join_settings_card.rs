@@ -208,7 +208,7 @@ pub fn PreJoinSettingsCard(
                                 }
                             }
                         }
-                        div { class: "settings-option-row",
+                        div { class: "settings-option-row", style: "opacity: 1;",
                             span { class: "settings-option-label", "End meeting when host leaves" }
                             div { class: "settings-option-controls",
                                 span {
@@ -257,7 +257,7 @@ pub fn PreJoinSettingsCard(
                                 }
                             }
                         }
-                        div { class: "settings-option-row",
+                        div { class: "settings-option-row", style: "opacity: 1;",
                             span { class: "settings-option-label", "Allow guests" }
                             div { class: "settings-option-controls",
                                 span {

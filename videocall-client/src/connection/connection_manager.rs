@@ -177,6 +177,27 @@ pub struct ConnectionManager {
     degradation_counter: u32,
     /// Whether a re-election is currently in progress (prevents overlapping re-elections).
     reelection_in_progress: bool,
+    /// Monotonically incremented each time `start_reelection` runs. Used to
+    /// namespace candidate connection IDs (`wt_0_g1`, `ws_0_g1`, etc.) so that
+    /// they cannot collide with the still-active old connection's ID
+    /// (`wt_0` / `ws_0`) while the old connection is preserved in
+    /// `old_active_connection` for media continuity.
+    ///
+    /// Why this exists: during a re-election, the server-side session cache
+    /// rejects the candidate handshake because the candidate carries the same
+    /// `instance_id` as the live session. Without ID namespacing, the
+    /// candidate's failure callback would fire with the old active's
+    /// connection ID, and the misattribution check in
+    /// `create_connection_lost_callback` (which compares against
+    /// `active_connection_id`) would clear the active connection and trigger
+    /// the full reconnection loop — causing 29-second outages of the kind
+    /// observed in the cc7tp incident (see issue #503).
+    ///
+    /// Generation 0 is reserved for the initial election (preserves the
+    /// historical `wt_0` / `ws_0` IDs and keeps existing tests intact). Each
+    /// subsequent re-election bumps the generation so candidate IDs remain
+    /// unique across the entire connection-manager lifetime.
+    reelection_generation: u32,
     /// During re-election, the old active connection is kept alive here so it
     /// can continue carrying media traffic while new candidate connections are
     /// being tested. `complete_election` drops it after a winner is selected.
@@ -261,6 +282,7 @@ impl ConnectionManager {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
+            reelection_generation: 0,
             old_active_connection: None,
             old_active_rtt: None,
             old_active_url: None,
@@ -329,6 +351,10 @@ impl ConnectionManager {
         self.baseline_rtt = None;
         self.degradation_counter = 0;
         self.reelection_in_progress = false;
+        // Reset the candidate generation counter — a full reconnect drops the
+        // old active connection, so the next election starts from `wt_0`/`ws_0`
+        // (generation 0) without risk of ID collision.
+        self.reelection_generation = 0;
         self.old_active_rtt = None;
         self.old_active_url = None;
         self.old_active_rtt_measurement = None;
@@ -379,11 +405,42 @@ impl ConnectionManager {
         format!("{url}{separator}instance_id={}", self.options.instance_id)
     }
 
+    /// Build a candidate connection ID, applying the re-election generation
+    /// suffix when one is in flight.
+    ///
+    /// During the *initial* election (`reelection_generation == 0`) connections
+    /// keep their historical bare names (`wt_0`, `ws_0`) so existing tests and
+    /// log scrapers stay compatible. During a *re-election* (generation > 0)
+    /// the suffix `_g{N}` makes candidate IDs unique with respect to the
+    /// still-active old connection's ID, which is crucial because:
+    ///
+    ///   1. The old connection is preserved in `old_active_connection` for
+    ///      media continuity, and `active_connection_id` keeps pointing at its
+    ///      original ID (e.g. `wt_0`).
+    ///   2. The candidate's `on_connection_lost` callback bakes its
+    ///      `connection_id` at creation time (see
+    ///      `create_connection_lost_callback`).
+    ///   3. If the server rejects the candidate handshake (because it carries
+    ///      the live session's `instance_id`), the rejection routes through
+    ///      that callback. Without the suffix, `connection_id == "wt_0"` would
+    ///      match `active_connection_id` and clear it, triggering the
+    ///      reconnect storm seen in the cc7tp incident (issue #503).
+    ///
+    /// Returns `format!("{prefix}_{i}")` for generation 0,
+    /// `format!("{prefix}_{i}_g{N}")` otherwise.
+    fn make_connection_id(&self, prefix: &str, index: usize) -> String {
+        if self.reelection_generation == 0 {
+            format!("{prefix}_{index}")
+        } else {
+            format!("{prefix}_{index}_g{}", self.reelection_generation)
+        }
+    }
+
     /// Create connections to all configured servers
     fn create_all_connections(&mut self) -> Result<()> {
         // Create WebSocket connections
         for (i, base_url) in self.options.websocket_urls.iter().enumerate() {
-            let conn_id = format!("ws_{i}");
+            let conn_id = self.make_connection_id("ws", i);
             let url = self.append_instance_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: url.clone(),
@@ -420,7 +477,7 @@ impl ConnectionManager {
 
         // Create WebTransport connections
         for (i, base_url) in self.options.webtransport_urls.iter().enumerate() {
-            let conn_id = format!("wt_{i}");
+            let conn_id = self.make_connection_id("wt", i);
             let url = self.append_instance_id(base_url);
             let connect_options = ConnectOptions {
                 websocket_url: String::new(), // Not used for WebTransport
@@ -1465,6 +1522,17 @@ impl ConnectionManager {
 
         info!("Starting connection quality re-election (keeping old connection alive)");
         self.reelection_in_progress = true;
+        // Bump the candidate generation BEFORE we spawn new candidates so they
+        // get unique IDs (`wt_0_g{N}`, `ws_0_g{N}`) that cannot be confused with
+        // the still-active old connection's ID (`wt_0` / `ws_0`). See the
+        // doc-comment on `reelection_generation` for the cc7tp regression this
+        // prevents — and `create_all_connections` for where the suffix is
+        // applied.
+        self.reelection_generation = self.reelection_generation.saturating_add(1);
+        info!(
+            "Re-election generation {} — candidates will be tagged `_g{}`",
+            self.reelection_generation, self.reelection_generation
+        );
         self.degradation_counter = 0;
         self.baseline_rtt = None;
 
@@ -2227,6 +2295,7 @@ mod tests {
             baseline_rtt: None,
             degradation_counter: 0,
             reelection_in_progress: false,
+            reelection_generation: 0,
             old_active_connection: None,
             old_active_rtt: None,
             old_active_url: None,
@@ -3140,6 +3209,290 @@ mod tests {
             (mgr.old_active_rtt.unwrap() - 80.0).abs() < 0.01,
             "old_active_rtt should preserve the captured RTT"
         );
+    }
+
+    // ===================================================================
+    // 10b. Re-election candidate ID namespacing (cc7tp regression — #503)
+    //
+    // The cc7tp incident on 2026-05-01 surfaced a bug where, during
+    // re-election, new candidate connections were spawned with the SAME
+    // logical ID as the still-active old connection (`wt_0` / `ws_0`).
+    // When the server rejected the candidate handshake (because both
+    // sessions carried the same `instance_id`), the candidate's
+    // `on_connection_lost` callback would fire with `connection_id ==
+    // "wt_0"`, which matched `active_connection_id`, and the misattribution
+    // check inside `create_connection_lost_callback` would clear the active
+    // connection — triggering the full reconnect loop and ~29s outages.
+    //
+    // The fix namespaces candidate IDs with a generation suffix
+    // (`wt_0_g{N}`) so that:
+    //   - The candidate's connection-lost callback carries `wt_0_g{N}`,
+    //     which is NEVER equal to `active_connection_id` (which still
+    //     points at the old `wt_0`) — so the active connection is not
+    //     disturbed by candidate failures.
+    //   - The HashMap entries in `connections` and `rtt_measurements` for
+    //     the candidate slot do NOT collide with the (preserved) active
+    //     slot, so candidate cleanup via `close_unused_connections` cannot
+    //     accidentally evict the active.
+    // ===================================================================
+
+    #[test]
+    fn make_connection_id_uses_bare_name_at_generation_zero() {
+        // Initial election (no re-election yet) must use the historical
+        // `wt_0`/`ws_0` IDs to preserve diagnostic continuity and existing
+        // test compatibility.
+        let mgr = make_test_manager();
+        assert_eq!(mgr.reelection_generation, 0);
+        assert_eq!(mgr.make_connection_id("wt", 0), "wt_0");
+        assert_eq!(mgr.make_connection_id("ws", 0), "ws_0");
+        assert_eq!(mgr.make_connection_id("wt", 2), "wt_2");
+    }
+
+    #[test]
+    fn make_connection_id_appends_generation_suffix_after_reelection() {
+        // Once at least one re-election has bumped the counter, candidate
+        // IDs must be unique with respect to any previously-elected
+        // connection's ID. The suffix `_g{N}` is the namespacing mechanism.
+        let mut mgr = make_test_manager();
+        mgr.reelection_generation = 1;
+        assert_eq!(mgr.make_connection_id("wt", 0), "wt_0_g1");
+        assert_eq!(mgr.make_connection_id("ws", 0), "ws_0_g1");
+
+        mgr.reelection_generation = 7;
+        assert_eq!(mgr.make_connection_id("wt", 1), "wt_1_g7");
+    }
+
+    #[test]
+    fn candidate_id_does_not_collide_with_active_id_after_reelection() {
+        // The core invariant: after `start_reelection` bumps the
+        // generation, no candidate ID built via `make_connection_id` can
+        // ever equal an `active_connection_id` set during the *initial*
+        // election. This is the architectural guarantee that prevents the
+        // cc7tp misattribution bug.
+        let mut mgr = make_test_manager();
+
+        // Active connection from the initial election.
+        let active_id = "wt_0".to_string();
+        *mgr.active_connection_id.borrow_mut() = Some(active_id.clone());
+
+        // Simulate `start_reelection` bumping the generation. (We bump
+        // directly rather than calling `start_reelection` so this test
+        // can run on non-wasm targets — `start_reelection` calls
+        // `monotonic_now_ms` which requires `web_sys`.)
+        mgr.reelection_generation = 1;
+
+        // Every candidate ID derived for this re-election must differ
+        // from the live active ID.
+        for index in 0..3 {
+            let cand = mgr.make_connection_id("wt", index);
+            assert_ne!(
+                cand, active_id,
+                "WT candidate {cand} must not collide with active {active_id}"
+            );
+            let cand_ws = mgr.make_connection_id("ws", index);
+            assert_ne!(
+                cand_ws, active_id,
+                "WS candidate {cand_ws} must not collide with active {active_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn misattribution_check_correctly_skips_candidate_failure() {
+        // This is the smoking-gun regression check. Faithfully reproduce
+        // the comparison performed inside `create_connection_lost_callback`
+        // (line ~675 — `Some(connection_id.as_str()) !=
+        // active_connection_id.borrow().as_deref()`) and assert that a
+        // candidate's failure does NOT match the active. Before the fix,
+        // candidate `wt_0` and active `wt_0` would compare equal and clear
+        // the active; with the fix, candidate `wt_0_g1` and active `wt_0`
+        // are distinct, so the callback returns early at the
+        // "Non-active connection lost" branch.
+        let mut mgr = make_test_manager();
+        let active_id = "wt_0".to_string();
+        *mgr.active_connection_id.borrow_mut() = Some(active_id.clone());
+        mgr.reelection_generation = 1;
+
+        let candidate_id = mgr.make_connection_id("wt", 0);
+
+        // The exact comparison that lives inside the connection-lost
+        // callback. False here means "non-active — return early — do
+        // NOT clear the active connection".
+        let active_borrow = mgr.active_connection_id.borrow();
+        let candidate_matches_active = Some(candidate_id.as_str()) == active_borrow.as_deref();
+
+        assert!(
+            !candidate_matches_active,
+            "regression: candidate {candidate_id} matched active {:?}; \
+             this is the cc7tp misattribution bug",
+            active_borrow.as_deref(),
+        );
+    }
+
+    #[test]
+    fn reelection_generation_is_zero_on_fresh_manager() {
+        let mgr = make_test_manager();
+        assert_eq!(
+            mgr.reelection_generation, 0,
+            "fresh manager must start at generation 0 so initial election \
+             uses bare IDs"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn start_reelection_increments_generation() {
+        // start_reelection must bump the generation BEFORE
+        // create_all_connections runs, so any candidates spawned during
+        // this re-election cycle pick up the new suffix.
+        let mut mgr = make_test_manager();
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+
+        assert_eq!(mgr.reelection_generation, 0, "before re-election: gen 0");
+
+        mgr.start_reelection().unwrap();
+
+        assert_eq!(
+            mgr.reelection_generation, 1,
+            "after first re-election: gen must be 1"
+        );
+
+        // Reset the in-progress flag so a second re-election can run
+        // (mimics complete_election's bookkeeping at the end of an
+        // election cycle).
+        mgr.reelection_in_progress = false;
+        mgr.old_active_rtt = None;
+        mgr.old_active_url = None;
+        mgr.old_active_rtt_measurement = None;
+        mgr.old_active_is_webtransport = None;
+
+        // Second re-election: active is still "wt_0" (no winner picked
+        // because URL lists are empty in the test), so re-arm.
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+
+        mgr.start_reelection().unwrap();
+        assert_eq!(
+            mgr.reelection_generation, 2,
+            "after second re-election: gen must be 2 (monotonic)"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn reset_and_start_election_resets_generation() {
+        // A full reconnect (post-disconnect) drops the old active
+        // connection entirely — there is no live ID to collide with —
+        // so the generation can safely return to 0 and candidates use
+        // the bare names.
+        let mut mgr = make_test_manager();
+        mgr.reelection_generation = 5;
+
+        mgr.reset_and_start_election().unwrap();
+
+        assert_eq!(
+            mgr.reelection_generation, 0,
+            "reset_and_start_election should reset the generation counter"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn candidate_rejection_does_not_disturb_active_slot() {
+        // Analogous to `complete_election_abort_restores_measurement_from_snapshot`
+        // (line ~3511) but specifically targets the candidate-rejection
+        // path that caused the cc7tp regression.
+        //
+        // We cannot create a real `Connection` object in unit tests
+        // (requires browser APIs), so we reproduce the rejection at the
+        // level of the connection-lost callback's misattribution check
+        // and assert the active connection's invariants survive.
+        let mut mgr = make_test_manager();
+
+        // 1. Stand up an active connection at the canonical `wt_0` ID.
+        let active_id = "wt_0".to_string();
+        *mgr.active_connection_id.borrow_mut() = Some(active_id.clone());
+        insert_measurement(&mut mgr, "wt_0", true, Some(120.0), vec![120.0, 120.0]);
+
+        // Capture the pre-reelection state of the active slot — the
+        // bug manifested as this being mutated to None by a candidate
+        // failure.
+        let pre_active = mgr.active_connection_id.borrow().clone();
+        assert_eq!(pre_active, Some(active_id.clone()));
+
+        // 2. Enter re-election (start_reelection bumps generation to 1
+        //    and moves the old connection out of self.connections).
+        mgr.start_reelection().unwrap();
+        assert_eq!(mgr.reelection_generation, 1);
+
+        // The candidate ID that `create_all_connections` would have
+        // produced if URLs had been configured.
+        let candidate_id = mgr.make_connection_id("wt", 0);
+        assert_eq!(candidate_id, "wt_0_g1");
+
+        // 3. Simulate the server-rejection arriving on the candidate's
+        //    connection-lost path. The relevant misattribution check
+        //    is `Some(connection_id.as_str()) != active.as_deref()`.
+        //    Reproduce it here.
+        let active_borrow = mgr.active_connection_id.borrow();
+        let would_misattribute = Some(candidate_id.as_str()) == active_borrow.as_deref();
+        drop(active_borrow);
+
+        assert!(
+            !would_misattribute,
+            "candidate {candidate_id} must not be misattributed to active {:?}",
+            mgr.active_connection_id.borrow().as_deref(),
+        );
+
+        // 4. Assert the active connection slot is unchanged. Before the
+        //    fix, the cc7tp trace showed `*active_connection_id.borrow_mut()
+        //    = None` running here. After the fix, the active is
+        //    preserved verbatim.
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some(active_id),
+            "active_connection_id must survive a candidate rejection \
+             unchanged (cc7tp regression)",
+        );
+
+        // 5. Assert reelection state remains in-progress so that
+        //    complete_election (and the abort-restore path from PR #316)
+        //    can still drive to a clean conclusion.
+        assert!(
+            mgr.reelection_in_progress,
+            "re-election should remain in progress; only complete_election \
+             should clear this flag",
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn reelection_candidate_slot_does_not_overwrite_active_in_connections_map() {
+        // Verify the HashMap-keying invariant: in a synthetic re-election,
+        // a candidate's RTT-measurement entry does NOT replace any active
+        // entry that may live in the same map (the active is normally
+        // moved to old_active_connection by start_reelection, but the
+        // measurement map lookup invariant is what's tested here).
+        let mut mgr = make_test_manager();
+
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        // Re-insert a measurement at "wt_0" simulating the abort-restore
+        // path's restoration of the old active's measurement.
+        insert_measurement(&mut mgr, "wt_0", true, Some(120.0), vec![120.0]);
+
+        // Mid-re-election the candidate would receive RTT samples and
+        // an entry would be inserted under a SUFFIXED key.
+        mgr.reelection_generation = 1;
+        let candidate_id = mgr.make_connection_id("wt", 0);
+        insert_measurement(&mut mgr, &candidate_id, true, Some(200.0), vec![200.0]);
+
+        // Both entries coexist — they have distinct keys.
+        assert!(mgr.rtt_measurements.contains_key("wt_0"));
+        assert!(mgr.rtt_measurements.contains_key("wt_0_g1"));
+        // And the active's measurement is preserved verbatim.
+        let active_meas = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(active_meas.average_rtt, Some(120.0));
     }
 
     #[test]

@@ -467,9 +467,8 @@ async fn test_non_host_cannot_activate_meeting_with_wr_on() {
         "stranger must NOT receive a room_token"
     );
     // The response should reflect WR=on so the client knows WR is guarding the meeting.
-    assert_eq!(
+    assert!(
         body.result.waiting_room_enabled,
-        Some(true),
         "response must expose waiting_room_enabled=true"
     );
 

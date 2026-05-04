@@ -458,12 +458,23 @@ pub async fn activate(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error>
     Ok(())
 }
 
-/// End a meeting (set state to 'ended', set ended_at).
+/// End a meeting (set state to 'ended', set ended_at if not already set).
+///
+/// Idempotent at the SQL level: `state <> 'ended'` short-circuits zero-row
+/// UPDATEs on re-fire, and `COALESCE(ended_at, NOW())` preserves the original
+/// `ended_at` so the "when did this meeting end" signal is stable across
+/// duplicate triggers (e.g. NATS re-subscribe after disconnect, or multi-replica
+/// fan-out without a queue group). Callers do not inspect rows-affected, so the
+/// no-op second call is intentionally indistinguishable from a fresh end.
 pub async fn end_meeting(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE meetings SET state = 'ended', ended_at = NOW() WHERE id = $1")
-        .bind(meeting_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE meetings \
+         SET state = 'ended', ended_at = COALESCE(ended_at, NOW()) \
+         WHERE id = $1 AND state <> 'ended'",
+    )
+    .bind(meeting_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

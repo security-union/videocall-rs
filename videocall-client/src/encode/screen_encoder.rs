@@ -63,6 +63,32 @@ use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 
+fn is_fatal_encoder_error_message(msg: &str) -> bool {
+    msg.contains("closed codec")
+        || msg.contains("InvalidStateError")
+        || msg.contains("Memory allocation error")
+        || msg.contains("Unable to find free frame buffer")
+}
+
+fn is_fatal_encoder_error(err: &JsValue) -> bool {
+    let msg = format!("{err:?}");
+    is_fatal_encoder_error_message(&msg)
+}
+
+fn should_reacquire_screen_capture(media_acquired: bool, restart_count: u32) -> bool {
+    !media_acquired || restart_count > 0
+}
+
+fn stop_media_stream_tracks(stream: &MediaStream) {
+    if let Some(tracks) = stream.get_tracks().dyn_ref::<Array>() {
+        for i in 0..tracks.length() {
+            if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
+                track.stop();
+            }
+        }
+    }
+}
+
 /// Sets `bitrateMode = "variable"` on a [`VideoEncoderConfig`].
 ///
 /// Variable bitrate lets the encoder burst above the target during high-motion
@@ -436,17 +462,6 @@ impl ScreenEncoder {
                 panic!("MediaDevices not available");
             });
 
-            // --- Fatal encode error classifier ---
-            // These errors indicate the VideoEncoder is dead and must be re-created.
-            // Non-fatal errors (e.g. a single dropped frame) are logged and skipped.
-            let is_fatal_encode_error = |err: &JsValue| -> bool {
-                let msg = format!("{err:?}");
-                msg.contains("closed codec")
-                    || msg.contains("InvalidStateError")
-                    || msg.contains("Memory allocation error")
-                    || msg.contains("Unable to find free frame buffer")
-            };
-
             let mut restart_count: u32 = 0;
             const MAX_RESTARTS: u32 = 5;
             let mut media_acquired = false;
@@ -576,7 +591,18 @@ impl ScreenEncoder {
                 }
 
                 // --- Media acquisition (first iteration only) ---
-                if !media_acquired {
+                if should_reacquire_screen_capture(media_acquired, restart_count) {
+                    if let Some(track) = media_track.take() {
+                        track.set_onended(None);
+                        track.stop();
+                    }
+                    if let Some(stream) = screen_to_share.take() {
+                        stop_media_stream_tracks(&stream);
+                    }
+                    screen_stream.borrow_mut().take();
+                    active_video_track.borrow_mut().take();
+                    _onended_handler = None;
+
                     // Build getDisplayMedia constraints requesting high-resolution capture.
                     // This tells the browser to prefer the source's native resolution rather
                     // than downscaling, which is critical for readable text and code.
@@ -740,25 +766,6 @@ impl ScreenEncoder {
                     screen_to_share = Some(acquired_stream);
                     media_track = Some(track);
                     media_acquired = true;
-                } else {
-                    // On restart: verify the stream is still alive. If the user clicked
-                    // "Stop sharing" in the browser while we were backing off, the tracks
-                    // will be gone and we cannot recover without a new user gesture.
-                    if let Some(ref stream) = screen_to_share {
-                        if stream.get_tracks().length() == 0 {
-                            error!(
-                                "ScreenEncoder: stream ended during restart, cannot recover \
-                                 without user gesture"
-                            );
-                            cleanup_on_error(
-                                stream,
-                                &enabled,
-                                &on_state_change,
-                                "Screen share stream ended".to_string(),
-                            );
-                            return;
-                        }
-                    }
                 }
 
                 // Unwrap the media references — they are guaranteed to be Some after
@@ -814,17 +821,17 @@ impl ScreenEncoder {
                     }
                 };
 
-                // Emit Started event and notify peers on first successful setup.
-                // On restarts, the stream is already active — no need to re-emit.
+                // Emit Started on every successful acquisition so the preview can
+                // bind to the fresh stream after a restart.
                 if restart_count == 0 {
                     client_for_state.set_screen_enabled(true);
-                    if let Some(ref callback) = on_state_change {
-                        callback.emit(ScreenShareEvent::Started(stream_ref.clone()));
-                    }
                 } else {
                     log::info!(
                         "ScreenEncoder: encoder restarted successfully (attempt {restart_count})"
                     );
+                }
+                if let Some(ref callback) = on_state_change {
+                    callback.emit(ScreenShareEvent::Started(stream_ref.clone()));
                 }
 
                 let screen_reader = match screen_processor
@@ -922,7 +929,7 @@ impl ScreenEncoder {
                         set_vbr_mode(&new_config);
                         if let Err(e) = screen_encoder.configure(&new_config) {
                             error!("Error reconfiguring screen encoder for tier change: {e:?}");
-                            if is_fatal_encode_error(&e) {
+                            if is_fatal_encoder_error(&e) {
                                 restart_count += 1;
                                 break 'encode;
                             }
@@ -960,7 +967,7 @@ impl ScreenEncoder {
                         set_vbr_mode(&new_config);
                         if let Err(e) = screen_encoder.configure(&new_config) {
                             error!("Error configuring screen encoder: {e:?}");
-                            if is_fatal_encode_error(&e) {
+                            if is_fatal_encoder_error(&e) {
                                 restart_count += 1;
                                 break 'encode;
                             }
@@ -1031,7 +1038,7 @@ impl ScreenEncoder {
                                     error!(
                                         "Error reconfiguring screen encoder with new dimensions: {e:?}"
                                     );
-                                    if is_fatal_encode_error(&e) {
+                                    if is_fatal_encoder_error(&e) {
                                         video_frame.close();
                                         fatal_encode_exit = true;
                                         restart_count += 1;
@@ -1075,7 +1082,7 @@ impl ScreenEncoder {
 
                             if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts)
                             {
-                                if is_fatal_encode_error(&e) {
+                                if is_fatal_encoder_error(&e) {
                                     error!(
                                         "ScreenEncoder: fatal encode error (restart {restart_count}): {e:?}"
                                     );
@@ -1116,17 +1123,7 @@ impl ScreenEncoder {
                     continue 'restart;
                 }
 
-                // Stream-read error or stream-ended: check if the stream is still
-                // alive. If tracks are gone, the user stopped sharing or the
-                // source disconnected — full cleanup and exit.
-                if stream_ref.get_tracks().length() == 0 {
-                    log::info!("ScreenEncoder: stream tracks gone after read error, full cleanup");
-                    break 'restart;
-                }
-
-                // Stream tracks are still alive but the reader errored (e.g.,
-                // transient ReadableStream glitch). Try to restart.
-                log::warn!("ScreenEncoder: reader error with live stream, attempting restart");
+                log::warn!("ScreenEncoder: restarting with a fresh screen capture stream");
                 restart_count += 1;
                 continue 'restart;
             } // end 'restart
@@ -1165,5 +1162,31 @@ impl ScreenEncoder {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_fatal_encoder_error_message;
+    use super::should_reacquire_screen_capture;
+
+    #[test]
+    fn screen_capture_is_reacquired_after_any_restart() {
+        assert!(should_reacquire_screen_capture(false, 0));
+        assert!(should_reacquire_screen_capture(true, 1));
+        assert!(should_reacquire_screen_capture(true, 4));
+    }
+
+    #[test]
+    fn screen_encoder_fatal_errors_match_closed_codec_signatures() {
+        assert!(is_fatal_encoder_error_message(
+            "InvalidStateError: closed codec"
+        ));
+        assert!(is_fatal_encoder_error_message(
+            "Memory allocation error (Unable to find free frame buffer)"
+        ));
+        assert!(!is_fatal_encoder_error_message(
+            "EncodingError: transient frame drop"
+        ));
     }
 }

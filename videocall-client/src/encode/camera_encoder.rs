@@ -65,6 +65,28 @@ use crate::diagnostics::EncoderBitrateController;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 
+fn is_fatal_encoder_error_message(msg: &str) -> bool {
+    msg.contains("closed codec")
+        || msg.contains("InvalidStateError")
+        || msg.contains("Memory allocation error")
+        || msg.contains("Unable to find free frame buffer")
+}
+
+fn is_fatal_encoder_error(err: &JsValue) -> bool {
+    let msg = format!("{err:?}");
+    is_fatal_encoder_error_message(&msg)
+}
+
+fn stop_media_stream_tracks(stream: &MediaStream) {
+    if let Some(tracks) = stream.get_tracks().dyn_ref::<Array>() {
+        for i in 0..tracks.length() {
+            if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
+                track.stop();
+            }
+        }
+    }
+}
+
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
 /// To use this struct, the caller must first create an `HtmlVideoElement` DOM node, to which the
@@ -387,16 +409,6 @@ impl CameraEncoder {
             let mut restart_count: u32 = 0;
             const MAX_RESTARTS: u32 = 5;
 
-            // Classify encode errors that indicate an unrecoverable encoder
-            // state requiring a full teardown and restart.
-            let is_fatal_encode_error = |err: &JsValue| -> bool {
-                let msg = format!("{err:?}");
-                msg.contains("closed codec")
-                    || msg.contains("InvalidStateError")
-                    || msg.contains("Memory allocation error")
-                    || msg.contains("Unable to find free frame buffer")
-            };
-
             'restart: loop {
                 // Backoff + max-restart guard (skip on first iteration).
                 if restart_count > 0 {
@@ -609,6 +621,7 @@ impl CameraEncoder {
                     Err(e) => {
                         let msg = format!("Failed to create video encoder: {e:?}");
                         error!("{msg}");
+                        stop_media_stream_tracks(&device);
                         if let Some(cb) = &on_error {
                             cb.emit(msg);
                         }
@@ -634,8 +647,10 @@ impl CameraEncoder {
                 video_encoder_config.set_latency_mode(LatencyMode::Realtime);
 
                 if let Err(e) = video_encoder.configure(&video_encoder_config) {
-                    if is_fatal_encode_error(&e) {
+                    if is_fatal_encoder_error(&e) {
                         error!("CameraEncoder: fatal configure error before encode loop, restarting: {e:?}");
+                        let _ = video_encoder.close();
+                        stop_media_stream_tracks(&device);
                         restart_count += 1;
                         continue 'restart;
                     }
@@ -734,7 +749,7 @@ impl CameraEncoder {
                         new_config.set_bitrate(local_bitrate as f64);
                         new_config.set_latency_mode(LatencyMode::Realtime);
                         if let Err(e) = video_encoder.configure(&new_config) {
-                            if is_fatal_encode_error(&e) {
+                            if is_fatal_encoder_error(&e) {
                                 error!("CameraEncoder: fatal configure error, restarting: {e:?}");
                                 restart_count += 1;
                                 break 'encode;
@@ -764,7 +779,7 @@ impl CameraEncoder {
                         local_bitrate = new_current_bitrate;
                         video_encoder_config.set_bitrate(local_bitrate as f64);
                         if let Err(e) = video_encoder.configure(&video_encoder_config) {
-                            if is_fatal_encode_error(&e) {
+                            if is_fatal_encoder_error(&e) {
                                 error!("CameraEncoder: fatal configure error, restarting: {e:?}");
                                 restart_count += 1;
                                 break 'encode;
@@ -823,7 +838,7 @@ impl CameraEncoder {
                                 new_config.set_bitrate(local_bitrate as f64);
                                 new_config.set_latency_mode(LatencyMode::Realtime);
                                 if let Err(e) = video_encoder.configure(&new_config) {
-                                    if is_fatal_encode_error(&e) {
+                                    if is_fatal_encoder_error(&e) {
                                         error!("CameraEncoder: fatal configure error, restarting: {e:?}");
                                         restart_count += 1;
                                         break 'encode;
@@ -856,7 +871,7 @@ impl CameraEncoder {
                             if let Err(e) = video_encoder
                                 .encode_with_options(&video_frame, &video_encoder_encode_options)
                             {
-                                if is_fatal_encode_error(&e) {
+                                if is_fatal_encoder_error(&e) {
                                     error!(
                                         "CameraEncoder: fatal encode error (restart {restart_count}): {e:?}"
                                     );
@@ -902,5 +917,27 @@ impl CameraEncoder {
                 // Loop back to 'restart for backoff + re-acquisition.
             } // end 'restart
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_fatal_encoder_error_message;
+
+    #[test]
+    fn fatal_encoder_errors_match_closed_codec_signatures() {
+        assert!(is_fatal_encoder_error_message(
+            "InvalidStateError: closed codec"
+        ));
+        assert!(is_fatal_encoder_error_message(
+            "Memory allocation error (Unable to find free frame buffer)"
+        ));
+    }
+
+    #[test]
+    fn non_fatal_encoder_errors_do_not_trigger_restart() {
+        assert!(!is_fatal_encoder_error_message(
+            "EncodingError: dropped one frame"
+        ));
     }
 }

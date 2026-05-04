@@ -60,14 +60,30 @@ use videocall_client::{
     MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
     PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
-use wasm_bindgen::{closure::Closure, JsCast};
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
     Idle,
+    /// The browser's screen picker is open (getDisplayMedia Promise in flight).
+    /// The button is disabled but we have NOT yet told Host to start encoding.
     Requesting,
+    /// A MediaStream has been pre-acquired and stored in the shared
+    /// [`PreAcquiredScreenStream`] cell.  Host should consume the stream and
+    /// begin encoding via `ScreenEncoder::start_with_stream()`.
+    StreamReady,
     Active,
 }
+
+/// Shared cell that holds a pre-acquired `MediaStream` from `getDisplayMedia()`.
+///
+/// Safari requires `getDisplayMedia()` to be called synchronously within a
+/// user-gesture handler.  The onclick handler obtains the stream and stores it
+/// here; the `Host` component takes it out and passes it to
+/// `ScreenEncoder::start_with_stream()`.
+pub type PreAcquiredScreenStream = Rc<RefCell<Option<web_sys::MediaStream>>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DockPosition {
@@ -119,8 +135,16 @@ fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
 }
 
 impl ScreenShareState {
+    /// Returns `true` when a stream is ready or actively encoding -- i.e. when
+    /// the `Host` component should have `share_screen = true`.
+    ///
+    /// `Requesting` (picker dialog open) intentionally returns `false` so that
+    /// `Host` does not start the encoder before a stream is available.
     pub fn is_sharing(&self) -> bool {
-        !matches!(self, ScreenShareState::Idle)
+        matches!(
+            self,
+            ScreenShareState::StreamReady | ScreenShareState::Active
+        )
     }
 }
 
@@ -1246,6 +1270,14 @@ pub fn AttendantsComponent(
         }
     });
 
+    // Shared cell for passing a pre-acquired screen share MediaStream from
+    // the click handler to the Host component.  Safari requires getDisplayMedia()
+    // to be called synchronously inside a user gesture, so we obtain the stream
+    // in the button onclick and hand it off to the encoder via this cell.
+    let pre_acquired_screen_stream: PreAcquiredScreenStream =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    use_context_provider(|| pre_acquired_screen_stream.clone());
+
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
     use_context_provider(|| peer_status_map);
@@ -2250,16 +2282,114 @@ pub fn AttendantsComponent(
                                         if !is_ios() {
                                             {
                                                 let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting);
+                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting | ScreenShareState::StreamReady);
                                                 rsx! {
                                                     ScreenShareButton {
                                                         active: is_active,
                                                         disabled: is_disabled,
-                                                        onclick: move |_| {
-                                                            if matches!(screen_share_state(), ScreenShareState::Idle) {
-                                                                screen_share_state.set(ScreenShareState::Requesting);
-                                                            } else {
-                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                        onclick: {
+                                                            let stream_cell = pre_acquired_screen_stream.clone();
+                                                            move |_| {
+                                                                if matches!(screen_share_state(), ScreenShareState::Idle) {
+                                                                    // Call getDisplayMedia synchronously within the user
+                                                                    // gesture (click) handler.  Safari rejects the call if
+                                                                    // it crosses an async boundary (spawn_local / Timeout).
+                                                                    // Obtaining the Promise is synchronous and satisfies the
+                                                                    // gesture requirement; only the await happens later.
+                                                                    let navigator = gloo_utils::window().navigator();
+                                                                    let media_devices = match navigator.media_devices() {
+                                                                        Ok(md) => md,
+                                                                        Err(e) => {
+                                                                            log::error!("Failed to get media devices: {e:?}");
+                                                                            return;
+                                                                        }
+                                                                    };
+
+                                                                    // Build constraints identical to those in ScreenEncoder::start()
+                                                                    let width_constraint = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &width_constraint,
+                                                                        &JsValue::from_str("ideal"),
+                                                                        &JsValue::from_f64(1920.0),
+                                                                    );
+                                                                    let height_constraint = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &height_constraint,
+                                                                        &JsValue::from_str("ideal"),
+                                                                        &JsValue::from_f64(1080.0),
+                                                                    );
+                                                                    let framerate_constraint = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &framerate_constraint,
+                                                                        &JsValue::from_str("ideal"),
+                                                                        &JsValue::from_f64(10.0),
+                                                                    );
+                                                                    let video_constraints = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &video_constraints,
+                                                                        &JsValue::from_str("width"),
+                                                                        &width_constraint.into(),
+                                                                    );
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &video_constraints,
+                                                                        &JsValue::from_str("height"),
+                                                                        &height_constraint.into(),
+                                                                    );
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &video_constraints,
+                                                                        &JsValue::from_str("frameRate"),
+                                                                        &framerate_constraint.into(),
+                                                                    );
+
+                                                                    let constraints = web_sys::DisplayMediaStreamConstraints::new();
+                                                                    constraints.set_video(&video_constraints.into());
+                                                                    constraints.set_audio(&JsValue::FALSE);
+
+                                                                    // This call happens synchronously in the click handler --
+                                                                    // the browser returns a Promise without rejecting.
+                                                                    let promise = match media_devices.get_display_media_with_constraints(&constraints) {
+                                                                        Ok(p) => p,
+                                                                        Err(e) => {
+                                                                            log::error!("getDisplayMedia failed synchronously: {e:?}");
+                                                                            return;
+                                                                        }
+                                                                    };
+
+                                                                    // Mark as requesting immediately so the button shows disabled
+                                                                    screen_share_state.set(ScreenShareState::Requesting);
+
+                                                                    // Now await the promise asynchronously -- this is fine,
+                                                                    // the gesture requirement was satisfied above.
+                                                                    let cell = stream_cell.clone();
+                                                                    wasm_bindgen_futures::spawn_local(async move {
+                                                                        match JsFuture::from(promise).await {
+                                                                            Ok(stream) => {
+                                                                                let media_stream: web_sys::MediaStream = stream.unchecked_into();
+                                                                                cell.borrow_mut().replace(media_stream);
+                                                                                // StreamReady causes is_sharing() to return true,
+                                                                                // which gives Host share_screen=true so it picks
+                                                                                // up the pre-acquired stream and starts encoding.
+                                                                                screen_share_state.set(ScreenShareState::StreamReady);
+                                                                            }
+                                                                            Err(e) => {
+                                                                                // User cancelled or browser denied
+                                                                                let is_cancel = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+                                                                                    .ok()
+                                                                                    .and_then(|v| v.as_string())
+                                                                                    .map(|n| n == "NotAllowedError")
+                                                                                    .unwrap_or(false);
+                                                                                if is_cancel {
+                                                                                    log::info!("User cancelled screen sharing");
+                                                                                } else {
+                                                                                    log::error!("getDisplayMedia rejected: {e:?}");
+                                                                                }
+                                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                                            }
+                                                                        }
+                                                                    });
+                                                                } else {
+                                                                    screen_share_state.set(ScreenShareState::Idle);
+                                                                }
                                                             }
                                                         },
                                                     }

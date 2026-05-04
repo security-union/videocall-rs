@@ -12,7 +12,7 @@
  */
 
 use crate::auth::{
-    check_session, get_user_profile, handle_not_authenticated, logout, redirect_not_authenticated,
+    check_session, get_user_profile, handle_not_authenticated, redirect_not_authenticated,
     UserProfile,
 };
 use crate::components::attendants::AttendantsComponent;

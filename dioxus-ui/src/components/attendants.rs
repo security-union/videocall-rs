@@ -452,7 +452,6 @@ pub fn AttendantsComponent(
     e2ee_enabled: bool,
     #[props(default)] user_name: Option<String>,
     #[props(default)] user_id: Option<String>,
-    #[props(default)] on_logout: Option<EventHandler<()>>,
     #[props(default)] host_display_name: Option<String>,
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] auto_join: bool,

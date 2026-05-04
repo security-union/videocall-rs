@@ -301,9 +301,7 @@ test.describe("Screen share right panel layout", () => {
       // Verify the right panel has grid-template-columns with 2 columns (1fr 1fr)
       // The right panel is the second child of #grid-container with inline
       // style containing "grid-template-columns: 1fr 1fr"
-      const rightPanel = hostPage.locator(
-        "#grid-container > div:nth-child(2)",
-      );
+      const rightPanel = hostPage.locator("#grid-container > div:nth-child(2)");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
       const rightPanelStyle = await rightPanel.getAttribute("style");
@@ -364,7 +362,7 @@ test.describe("Screen share right panel layout", () => {
         test.skip(
           true,
           "Mock peers feature is not enabled. " +
-            "Set mockPeersEnabled: \"true\" in config.js to enable this test.",
+            'Set mockPeersEnabled: "true" in config.js to enable this test.',
         );
         return;
       }

@@ -167,6 +167,7 @@ test.describe("Screen-share state transitions", () => {
           el.closest(".video-controls-container") !== null
         );
       });
+      expect(isActive).toBe(true);
 
       // The screen share tile should render (our local share)
       // It may have class "screen-share" or id containing "screen-share"
@@ -176,6 +177,7 @@ test.describe("Screen-share state transitions", () => {
 
       // Give time for the encoder to start and render
       await page.waitForTimeout(2000);
+      await expect(screenTile).toBeVisible({ timeout: 5_000 });
 
       // Click again to stop sharing
       await page.mouse.move(400, 400); // ensure controls visible

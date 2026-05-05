@@ -1449,48 +1449,19 @@ body {
   font-size: 0.8125rem;
 }
 
-/* Pin & Crop Icon Fixes - High Specificity Override
-   Icons are now flex children of .tile-top-icons — no absolute positioning. */
-.grid-item .canvas-container .pin-icon,
-.grid-item .canvas-container .crop-icon {
-  opacity: 0.6 !important;
-  background-color: rgba(0, 0, 0, 0.6) !important;
-  border-radius: 50% !important;
-  padding: 6px !important;
-  text-align: center !important;
-  line-height: 1 !important;
-  cursor: pointer !important;
-  transition: opacity 0.2s ease !important;
-  border: none !important;
-  visibility: hidden !important;
-}
-
-.grid-item .canvas-container .pin-icon svg,
-.grid-item .canvas-container .crop-icon svg {
-  width: 20px !important;
-  height: 20px !important;
-  display: block !important;
-}
-
-/* Hide pin/crop by default on desktop, show on hover */
-@media (min-width: 768px) {
-  .grid-item .canvas-container .pin-icon,
-  .grid-item .canvas-container .crop-icon { opacity: 0 !important; }
-  .grid-item .canvas-container:hover .pin-icon,
-  .grid-item .canvas-container:hover .crop-icon {
-    visibility: visible !important;
-    opacity: 0.6 !important;
-  }
-}
-
 /* Hide pin/crop on mobile -- tap tile to pin instead */
 @media (max-width: 767px) {
-  .grid-item .canvas-container .pin-icon,
-  .grid-item .canvas-container .crop-icon { display: none !important; }
+  .pin-icon,
+  .crop-icon { display: none !important; }
 }
 
-.grid-item .canvas-container canvas.cropped { object-fit: cover !important; }
-.grid-item .canvas-container canvas.uncropped { object-fit: contain !important; }
+.grid-item .canvas-container canvas.cropped,
+.split-screen-tile .canvas-container canvas.cropped,
+.split-peer-tile .canvas-container canvas.cropped { object-fit: cover !important; }
+
+.grid-item .canvas-container canvas.uncropped,
+.split-screen-tile .canvas-container canvas.uncropped,
+.split-peer-tile .canvas-container canvas.uncropped { object-fit: contain !important; }
 
 /* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
 .copy-button {

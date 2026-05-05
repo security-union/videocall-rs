@@ -24,8 +24,9 @@ use crate::components::icons::push_pin::PushPinIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
 use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
 use crate::constants::users_allowed_to_stream;
-use crate::context::{AppearanceSettings, VideoCallClientCtx};
+use crate::context::{AppearanceSettings, CroppedTilesCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
+use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
 use wasm_bindgen::JsCast;
@@ -301,6 +302,8 @@ pub fn generate_for_peer(
     on_toggle_pin: EventHandler<String>,
     appearance: &AppearanceSettings,
 ) -> Element {
+    let cropped_tiles: Option<Signal<HashMap<String, bool>>> =
+        try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     let audio_level = audio_levels.raw;
     let mic_audio_level = audio_levels.mic;
     let signal_level = signal_info.level;
@@ -395,10 +398,15 @@ pub fn generate_for_peer(
                             class: "pin-icon",
                             PushPinIcon {}
                         }
-                        button {
-                            onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
-                            class: "crop-icon",
-                            CropIcon {}
+                        {
+                            let ss_crop_class = ss_canvas_crop.clone();
+                            rsx! {
+                                button {
+                                    onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
+                                    class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                    CropIcon {}
+                                }
+                            }
                         }
                     }
                 }
@@ -491,11 +499,18 @@ pub fn generate_for_peer(
                             class: "pin-icon",
                             PushPinIcon {}
                         }
-                        // Crop (visible on hover only)
-                        button {
-                            onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
-                            class: "crop-icon",
-                            CropIcon {}
+                        // Crop (visible on hover only, hidden when video disabled)
+                        if is_video_enabled_for_peer {
+                            {
+                                let pv_crop_class = pv_canvas_crop.clone();
+                                rsx! {
+                                    button {
+                                        onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
+                                        class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                        CropIcon {}
+                                    }
+                                }
+                            }
                         }
                     }
                     if show_signal_popup() {
@@ -603,10 +618,17 @@ pub fn generate_for_peer(
                             class: "pin-icon",
                             PushPinIcon {}
                         }
-                        button {
-                            onclick: move |_| toggle_canvas_crop(&canvas_id_crop),
-                            class: "crop-icon",
-                            CropIcon {}
+                        if is_video_enabled_for_peer {
+                            {
+                                let crop_class = canvas_id_crop.clone();
+                                rsx! {
+                                    button {
+                                        onclick: move |_| toggle_canvas_crop(&canvas_id_crop, cropped_tiles),
+                                        class: if is_canvas_cropped(&crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                        CropIcon {}
+                                    }
+                                }
+                            }
                         }
                     }
                     if show_signal_popup() {
@@ -684,10 +706,15 @@ pub fn generate_for_peer(
                             span { class: "guest-badge", "Guest" }
                         }
                     }
-                    button {
-                        onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
-                        class: "crop-icon",
-                        CropIcon {}
+                    {
+                        let ss_crop_class = ss_canvas_crop.clone();
+                        rsx! {
+                            button {
+                                onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
+                                class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                CropIcon {}
+                            }
+                        }
                     }
                     button {
                         onclick: move |_| {
@@ -771,10 +798,17 @@ pub fn generate_for_peer(
                                 class: "pin-icon",
                                 PushPinIcon {}
                             }
-                            button {
-                                onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
-                                class: "crop-icon",
-                                CropIcon {}
+                            if is_video_enabled_for_peer {
+                                {
+                                    let pv_crop_class = pv_canvas_crop.clone();
+                                    rsx! {
+                                        button {
+                                            onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
+                                            class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                            CropIcon {}
+                                        }
+                                    }
+                                }
                             }
                         }
                         if show_signal_popup() {
@@ -803,7 +837,9 @@ pub fn generate_for_peer(
 #[component]
 fn UserVideo(id: String, hidden: bool) -> Element {
     let client = use_context::<VideoCallClientCtx>();
+    let cropped_tiles = try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     let id_for_effect = id.clone();
+    let id_for_class = id.clone();
 
     use_effect(move || {
         if let Some(elem) = gloo_utils::document().get_element_by_id(&id_for_effect) {
@@ -817,11 +853,17 @@ fn UserVideo(id: String, hidden: bool) -> Element {
         }
     });
 
+    let crop_class = if is_canvas_cropped(&id_for_class, &cropped_tiles) {
+        "cropped"
+    } else {
+        "uncropped"
+    };
+
     rsx! {
         canvas {
             id: "{id}",
             hidden: hidden,
-            class: "uncropped",
+            class: crop_class,
         }
     }
 }
@@ -829,8 +871,10 @@ fn UserVideo(id: String, hidden: bool) -> Element {
 #[component]
 fn ScreenCanvas(peer_id: String) -> Element {
     let client = use_context::<VideoCallClientCtx>();
+    let cropped_tiles = try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     let canvas_id = format!("screen-share-{}", peer_id);
     let canvas_id_for_effect = canvas_id.clone();
+    let canvas_id_for_class = canvas_id.clone();
     let peer_id_for_effect = peer_id.clone();
 
     use_effect(move || {
@@ -845,10 +889,16 @@ fn ScreenCanvas(peer_id: String) -> Element {
         }
     });
 
+    let crop_class = if is_canvas_cropped(&canvas_id_for_class, &cropped_tiles) {
+        "cropped"
+    } else {
+        "uncropped"
+    };
+
     rsx! {
         canvas {
             id: "{canvas_id}",
-            class: "uncropped",
+            class: crop_class,
         }
     }
 }
@@ -876,21 +926,24 @@ fn is_mobile_viewport() -> bool {
     false
 }
 
-fn toggle_canvas_crop(canvas_id: &str) {
-    if let Some(canvas) = window()
-        .and_then(|w| w.document())
-        .and_then(|doc| doc.get_element_by_id(canvas_id))
-    {
-        let class_list = canvas.class_list();
-        let is_cropped = class_list.contains("cropped");
-        if is_cropped {
-            let _ = class_list.remove_1("cropped");
-            let _ = class_list.add_1("uncropped");
-        } else {
-            let _ = class_list.remove_1("uncropped");
-            let _ = class_list.add_1("cropped");
-        }
+fn toggle_canvas_crop(canvas_id: &str, cropped_tiles: Option<Signal<HashMap<String, bool>>>) {
+    if let Some(mut ct) = cropped_tiles {
+        ct.with_mut(|map| {
+            let entry = map.entry(canvas_id.to_string()).or_insert(false);
+            *entry = !*entry;
+        });
     }
+}
+
+/// Returns whether the given canvas is currently in cropped mode.
+fn is_canvas_cropped(
+    canvas_id: &str,
+    cropped_tiles: &Option<Signal<HashMap<String, bool>>>,
+) -> bool {
+    cropped_tiles
+        .as_ref()
+        .and_then(|ct| ct.read().get(canvas_id).copied())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,5 +1080,55 @@ mod tests {
 
         assert!(style.contains("box-shadow: none;"));
         assert!(style.contains(DEFAULT_TILE_BORDER_COLOR));
+    }
+
+    // -- Crop state: HashMap toggle/lookup logic ---------------------------------
+
+    #[test]
+    fn crop_toggle_roundtrip() {
+        let mut map = HashMap::<String, bool>::new();
+        let id = "peer-abc";
+
+        // Initially not cropped
+        assert!(!map.get(id).copied().unwrap_or(false));
+
+        // First toggle → cropped
+        let entry = map.entry(id.to_string()).or_insert(false);
+        *entry = !*entry;
+        assert!(map.get(id).copied().unwrap_or(false));
+
+        // Second toggle → uncropped
+        let entry = map.entry(id.to_string()).or_insert(false);
+        *entry = !*entry;
+        assert!(!map.get(id).copied().unwrap_or(false));
+    }
+
+    #[test]
+    fn crop_cleanup_on_peer_removal() {
+        let mut map = HashMap::<String, bool>::new();
+        let peer_id = "session-123";
+
+        // Set crop state for both video and screen-share canvases
+        map.insert(peer_id.to_string(), true);
+        map.insert(format!("screen-share-{peer_id}"), true);
+        assert_eq!(map.len(), 2);
+
+        // Simulate on_peer_removed cleanup
+        map.remove(peer_id);
+        map.remove(&format!("screen-share-{peer_id}"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn crop_missing_id_returns_false() {
+        let map = HashMap::<String, bool>::new();
+        assert!(!map.get("nonexistent").copied().unwrap_or(false));
+    }
+
+    #[test]
+    fn crop_none_context_returns_false() {
+        let ct: Option<&HashMap<String, bool>> = None;
+        let result = ct.and_then(|m| m.get("any-id").copied()).unwrap_or(false);
+        assert!(!result);
     }
 }

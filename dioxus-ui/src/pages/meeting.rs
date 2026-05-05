@@ -323,6 +323,9 @@ pub fn MeetingPage(id: String) -> Element {
                 // Users waiting for the meeting to start must not hear audio
                 // from the active call.
                 decode_media: false,
+                // Observer client: short-lived, recovery is via meeting
+                // activation push, not re-election. No post-rebase retry.
+                allow_post_rebase_retry: false,
             };
 
             let mut client = VideoCallClient::new(opts);

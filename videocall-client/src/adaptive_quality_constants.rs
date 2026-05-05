@@ -638,6 +638,30 @@ pub const REELECTION_CATASTROPHIC_RTT_MS: f64 = 5000.0;
 /// recover before users perceive the connection as dead.
 pub const REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD: u32 = 10;
 
+/// Delay (milliseconds) before checking whether a post-rebase re-election
+/// retry should fire.
+///
+/// When RTT has degraded but only one server is configured at the connection
+/// manager's level, the rebase path silently adapts the baseline to the new
+/// RTT instead of triggering re-election (because the only candidate would
+/// be the same already-degraded server). This timer schedules a re-evaluation
+/// 30 seconds later: if by then the URL list has expanded (e.g. the UI
+/// refilled it via `update_server_urls`) so a meaningful election is
+/// possible, the standard election machinery is invoked. The 30-second value
+/// is long enough to absorb transient relay-availability blips without
+/// cascading into a per-second retry storm on real-world networks.
+pub const POST_REBASE_RETRY_DELAY_MS: u64 = 30_000;
+
+/// Maximum number of consecutive post-rebase retry attempts before giving up.
+///
+/// Each attempt that finds the URL list still single-server schedules another
+/// retry at `POST_REBASE_RETRY_DELAY_MS`. Capping at 3 means total wall-clock
+/// retry coverage is ~90 seconds before the system stops polling — preventing
+/// unbounded background timers if the server-side condition never resolves.
+/// The counter is reset whenever a successful election or a manual
+/// reconnection lands so a fresh meeting session gets a fresh retry budget.
+pub const POST_REBASE_RETRY_MAX_ATTEMPTS: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // Heartbeat & Polling
 // ---------------------------------------------------------------------------

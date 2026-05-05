@@ -240,6 +240,9 @@ fn start_observer_connection(
         on_peer_joined: None,
         on_display_name_changed: None,
         decode_media: false,
+        // Guest observer client: short-lived, recovery is via meeting
+        // activation push, not re-election. No post-rebase retry.
+        allow_post_rebase_retry: false,
     };
 
     let mut client = VideoCallClient::new(opts);

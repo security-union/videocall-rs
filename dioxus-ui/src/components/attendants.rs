@@ -118,6 +118,9 @@ pub enum MediaErrorState {
     Other,
 }
 
+const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
+const SUBTLE_FOOTNOTE_TEXT_STYLE: &str = "font-size: 0.8rem; opacity: 0.7;";
+
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
     match err {
         MediaErrorState::NoDevice => rsx! {
@@ -128,7 +131,7 @@ fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
         },
         MediaErrorState::PermissionDenied => rsx! {
             p { " {device} is blocked in your browser." }
-            p { style: "front-size: 0.9rem; opacity: 0.8;",
+            p { style: "{SUBTLE_HELP_TEXT_STYLE}",
                 "Please click the lock icon in your browser's address bar and allow access if you want to use it."
             }
         },
@@ -2171,7 +2174,7 @@ pub fn AttendantsComponent(
                                 class: "card-apple",
                                 style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
                                 h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                                p { style: "font-size: 0.9rem; opacity: 0.8;",
+                                p { style: "{SUBTLE_HELP_TEXT_STYLE}",
                                     "Share this meeting link with others you want in the meeting"
                                 }
                                 div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
@@ -2219,7 +2222,7 @@ pub fn AttendantsComponent(
                                         }
                                     }
                                 }
-                                p { style: "font-size: 0.8rem; opacity: 0.7;",
+                                p { style: "{SUBTLE_FOOTNOTE_TEXT_STYLE}",
                                     "People who use this meeting link must get your permission before they can join."
                                 }
                                 div {

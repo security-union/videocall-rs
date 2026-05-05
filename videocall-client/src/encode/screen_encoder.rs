@@ -792,8 +792,7 @@ impl ScreenEncoder {
             error!("Screen encoder error: {e:?}");
         }) as Box<dyn FnMut(JsValue)>);
 
-        let screen_output_handler =
-            Closure::wrap(screen_output_handler as Box<dyn FnMut(JsValue)>);
+        let screen_output_handler = Closure::wrap(screen_output_handler as Box<dyn FnMut(JsValue)>);
 
         let screen_encoder_init = VideoEncoderInit::new(
             screen_error_handler.as_ref().unchecked_ref(),
@@ -1074,8 +1073,7 @@ impl ScreenEncoder {
             ) {
                 Ok(processor) => processor,
                 Err(e) => {
-                    let msg =
-                        format!("ScreenEncoder: failed to create track processor: {e:?}");
+                    let msg = format!("ScreenEncoder: failed to create track processor: {e:?}");
                     error!("{msg}");
                     let _ = screen_encoder.close();
                     if restart_count > 0 {
@@ -1149,9 +1147,7 @@ impl ScreenEncoder {
 
                 // --- Guard: skip reconfigure if encoder is already closed ---
                 if screen_encoder.state() == CodecState::Closed {
-                    log::warn!(
-                        "ScreenEncoder: encoder found in closed state, triggering restart"
-                    );
+                    log::warn!("ScreenEncoder: encoder found in closed state, triggering restart");
                     restart_count += 1;
                     break 'encode;
                 }
@@ -1349,8 +1345,7 @@ impl ScreenEncoder {
                             );
                         }
 
-                        if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts)
-                        {
+                        if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
                             if is_fatal_encoder_error(&e) {
                                 error!(
                                     "ScreenEncoder: fatal encode error (restart {restart_count}): {e:?}"

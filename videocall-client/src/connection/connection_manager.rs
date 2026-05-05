@@ -2245,6 +2245,35 @@ impl ConnectionManager {
         debug!("Set own_session_id to {session_id}");
     }
 
+    /// Replace the WebSocket and WebTransport server URLs the manager uses
+    /// when evaluating candidate availability (e.g. via [`Self::total_server_count`]
+    /// from the post-rebase retry path).
+    ///
+    /// This does NOT tear down or rebuild any live `Connection`s — it only
+    /// updates the URL lists the next election / retry will read. It is safe
+    /// to call on a manager whose election has already completed; the new
+    /// URLs become visible to the next `start_reelection`, the post-rebase
+    /// retry's `decide_post_rebase_retry_action`, and any other code reading
+    /// `options.websocket_urls` / `options.webtransport_urls`.
+    ///
+    /// Callers should typically reach this method through
+    /// [`crate::VideoCallClient::update_server_urls`] (which also keeps the
+    /// outer client options in sync) rather than touching the manager
+    /// directly.
+    pub fn update_server_urls(
+        &mut self,
+        websocket_urls: Vec<String>,
+        webtransport_urls: Vec<String>,
+    ) {
+        info!(
+            "ConnectionManager: updating server URLs (ws_count={}, wt_count={})",
+            websocket_urls.len(),
+            webtransport_urls.len(),
+        );
+        self.options.websocket_urls = websocket_urls;
+        self.options.webtransport_urls = webtransport_urls;
+    }
+
     /// Check if manager has an active connection
     pub fn is_connected(&self) -> bool {
         self.active_connection_id.borrow().is_some()
@@ -3194,6 +3223,71 @@ mod tests {
         // as a regular u32 so the production path can clear it safely.
         mgr.post_rebase_retry_count = 0;
         assert_eq!(mgr.post_rebase_retry_count, 0);
+    }
+
+    // ===================================================================
+    // 3b-ter. update_server_urls propagation (Finding 1 from PR #542 review)
+    //
+    // The post-rebase retry's decision is gated on `total_server_count()`,
+    // which reads `self.options.{websocket_urls,webtransport_urls}` on the
+    // ConnectionManager itself — NOT on the outer `VideoCallClient.options`.
+    // If the public `update_server_urls` path doesn't propagate into the
+    // manager's own options, the retry timer keeps seeing a stale URL list
+    // and never fires re-election even after the URL list grows. These
+    // tests lock in the propagation invariant so the bug class doesn't
+    // regress on a future refactor.
+    // ===================================================================
+
+    #[test]
+    fn update_server_urls_propagates_into_total_server_count() {
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec![];
+        assert_eq!(
+            mgr.total_server_count(),
+            1,
+            "baseline: single-server config means total_server_count() == 1"
+        );
+
+        mgr.update_server_urls(vec!["ws://a".into()], vec!["https://b".into()]);
+
+        assert_eq!(
+            mgr.total_server_count(),
+            2,
+            "after update_server_urls, the manager's view of candidate count \
+             must reflect the new URLs"
+        );
+    }
+
+    #[test]
+    fn post_rebase_retry_decision_fires_after_url_propagation() {
+        // End-to-end invariant: a manager that was rebased while
+        // single-server must transition to FireElection once
+        // update_server_urls has propagated a second URL.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec![];
+        mgr.options.allow_post_rebase_retry = true;
+        mgr.baseline_rtt = Some(200.0);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+
+        // Single server: rebase should reschedule rather than fire.
+        assert_eq!(
+            mgr.decide_post_rebase_retry_action(),
+            PostRebaseRetryAction::Reschedule,
+            "single-server rebase must reschedule while the URL list is unchanged"
+        );
+
+        // Now the URL list grows via the propagation path — exactly what
+        // dioxus-ui does after refreshing the room token.
+        mgr.update_server_urls(vec!["ws://a".into()], vec!["https://b".into()]);
+
+        assert_eq!(
+            mgr.decide_post_rebase_retry_action(),
+            PostRebaseRetryAction::FireElection,
+            "after propagation grew the URL list, the retry decision must flip \
+             to FireElection — this is the bug Finding 1 of PR #542 was filed against"
+        );
     }
 
     // ===================================================================

@@ -18,6 +18,7 @@
 
 use axum::http;
 use meeting_api::config::Config;
+use meeting_api::nats_consumers;
 use meeting_api::routes;
 use meeting_api::state::AppState;
 use sqlx::postgres::PgPoolOptions;
@@ -114,6 +115,13 @@ async fn main() {
             dev_user.email
         );
     }
+
+    // Spawn the cross-service NATS consumers BEFORE constructing the AppState
+    // (so AppState retains its own clone of `nats`). Each consumer is a
+    // long-lived task that re-subscribes on disconnect; we hold the JoinHandle
+    // implicitly by leaking it (the task survives until process exit).
+    let _ended_consumer =
+        nats_consumers::spawn_meeting_ended_by_host_consumer(nats.clone(), pool.clone());
 
     let state = AppState::new(pool, &config, nats);
     let app = routes::router().layer(cors).with_state(state);

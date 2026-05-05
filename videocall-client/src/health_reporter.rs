@@ -178,6 +178,16 @@ pub struct HealthReporter {
     /// Dwell time samples buffer, drained each health packet.
     /// Double-wrapped for the same late-binding reason as `climb_limiter_snapshot`.
     dwell_samples: SharedDwellSamples,
+    /// Shutdown flag set by [`shutdown()`](Self::shutdown). The
+    /// `start_health_reporting` future captures a `Weak<AtomicBool>` clone of
+    /// this and exits as soon as the flag is observed `true`. Required because
+    /// that future also clones the send-packet callback (an `Rc` strong
+    /// reference back into the `VideoCallClient`), creating a cycle that
+    /// otherwise prevents `Inner` from dropping after a meeting page unmount.
+    /// Without this flag the leaked `VideoCallClient` would keep running until
+    /// the server eventually tore down its WebTransport session — the bug
+    /// reproduced in the cc7tp meeting incident on 2026-05-01.
+    shutdown: Rc<AtomicBool>,
 }
 
 impl HealthReporter {
@@ -213,6 +223,22 @@ impl HealthReporter {
                 ClimbLimiterSnapshot::default(),
             )))),
             dwell_samples: Rc::new(RefCell::new(Rc::new(RefCell::new(Vec::new())))),
+            shutdown: Rc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Signal the health-reporting future to exit on its next tick. Sets the
+    /// shutdown flag and clears the send-packet callback so that future ticks
+    /// after this call cannot publish further packets even if a tick races
+    /// the flag. Called from [`VideoCallClient::disconnect()`](
+    /// crate::VideoCallClient::disconnect).
+    pub fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.send_packet_callback = None;
+        // Drop the strong reference to the connection controller so we don't
+        // keep it alive past the explicit disconnect.
+        if let Ok(mut cc) = self.connection_controller.try_borrow_mut() {
+            *cc = None;
         }
     }
 
@@ -591,6 +617,12 @@ impl HealthReporter {
         let display_name = self.display_name.clone();
         let send_callback = self.send_packet_callback.clone().unwrap();
         let interval_ms = self.health_interval_ms;
+        // Weak ref to the shutdown flag. We never need the strong reference
+        // here — `Rc::downgrade` keeps the future from holding the
+        // `Rc<AtomicBool>` past the HealthReporter's own lifetime, but the
+        // flag itself can also be observed `true` directly via `shutdown()`
+        // for prompt teardown without waiting for a tick.
+        let shutdown = Rc::downgrade(&self.shutdown);
         let audio_enabled = Rc::downgrade(&self.reporting_audio_enabled);
         let video_enabled = Rc::downgrade(&self.reporting_video_enabled);
         let active_server_url = Rc::downgrade(&self.active_server_url);
@@ -616,6 +648,23 @@ impl HealthReporter {
             loop {
                 // Wait for the interval
                 gloo_timers::future::TimeoutFuture::new(interval_ms as u32).await;
+
+                // Honour an explicit shutdown signal (e.g. UI unmount) without
+                // waiting for the HealthReporter's `Rc` count to fall to zero.
+                // `send_callback` is an `Rc` strong reference back into
+                // `VideoCallClient`, so without this exit the reporter loop
+                // would keep the entire client alive until the server tore the
+                // session down on its own — the leak observed in cc7tp.
+                if let Some(flag) = Weak::upgrade(&shutdown) {
+                    if flag.load(Ordering::Acquire) {
+                        debug!("HealthReporter shutdown signalled, stopping health reporting");
+                        break;
+                    }
+                } else {
+                    // The HealthReporter (and its shutdown flag) have been
+                    // dropped already — nothing to report against.
+                    break;
+                }
 
                 // Upgrade session_id Weak ref; if the HealthReporter was dropped, stop.
                 let session_id_val = match Weak::upgrade(&session_id) {

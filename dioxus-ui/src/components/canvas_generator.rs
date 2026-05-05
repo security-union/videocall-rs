@@ -302,9 +302,8 @@ pub fn generate_for_peer(
     on_toggle_pin: EventHandler<String>,
     appearance: &AppearanceSettings,
 ) -> Element {
-    let cropped_tiles = try_use_context::<CroppedTilesCtx>()
-        .map(|c| c.0)
-        .unwrap_or_else(|| Signal::new(HashMap::new()));
+    let cropped_tiles: Option<Signal<HashMap<String, bool>>> =
+        try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     let audio_level = audio_levels.raw;
     let mic_audio_level = audio_levels.mic;
     let signal_level = signal_info.level;
@@ -854,9 +853,10 @@ fn UserVideo(id: String, hidden: bool) -> Element {
         }
     });
 
-    let crop_class = match &cropped_tiles {
-        Some(ct) if is_canvas_cropped(&id_for_class, ct) => "cropped",
-        _ => "uncropped",
+    let crop_class = if is_canvas_cropped(&id_for_class, &cropped_tiles) {
+        "cropped"
+    } else {
+        "uncropped"
     };
 
     rsx! {
@@ -889,9 +889,10 @@ fn ScreenCanvas(peer_id: String) -> Element {
         }
     });
 
-    let crop_class = match &cropped_tiles {
-        Some(ct) if is_canvas_cropped(&canvas_id_for_class, ct) => "cropped",
-        _ => "uncropped",
+    let crop_class = if is_canvas_cropped(&canvas_id_for_class, &cropped_tiles) {
+        "cropped"
+    } else {
+        "uncropped"
     };
 
     rsx! {
@@ -925,19 +926,23 @@ fn is_mobile_viewport() -> bool {
     false
 }
 
-fn toggle_canvas_crop(canvas_id: &str, mut cropped_tiles: Signal<HashMap<String, bool>>) {
-    cropped_tiles.with_mut(|map| {
-        let entry = map.entry(canvas_id.to_string()).or_insert(false);
-        *entry = !*entry;
-    });
+fn toggle_canvas_crop(canvas_id: &str, cropped_tiles: Option<Signal<HashMap<String, bool>>>) {
+    if let Some(mut ct) = cropped_tiles {
+        ct.with_mut(|map| {
+            let entry = map.entry(canvas_id.to_string()).or_insert(false);
+            *entry = !*entry;
+        });
+    }
 }
 
 /// Returns whether the given canvas is currently in cropped mode.
-fn is_canvas_cropped(canvas_id: &str, cropped_tiles: &Signal<HashMap<String, bool>>) -> bool {
+fn is_canvas_cropped(
+    canvas_id: &str,
+    cropped_tiles: &Option<Signal<HashMap<String, bool>>>,
+) -> bool {
     cropped_tiles
-        .read()
-        .get(canvas_id)
-        .copied()
+        .as_ref()
+        .and_then(|ct| ct.read().get(canvas_id).copied())
         .unwrap_or(false)
 }
 
@@ -1075,5 +1080,55 @@ mod tests {
 
         assert!(style.contains("box-shadow: none;"));
         assert!(style.contains(DEFAULT_TILE_BORDER_COLOR));
+    }
+
+    // -- Crop state: HashMap toggle/lookup logic ---------------------------------
+
+    #[test]
+    fn crop_toggle_roundtrip() {
+        let mut map = HashMap::<String, bool>::new();
+        let id = "peer-abc";
+
+        // Initially not cropped
+        assert!(!map.get(id).copied().unwrap_or(false));
+
+        // First toggle → cropped
+        let entry = map.entry(id.to_string()).or_insert(false);
+        *entry = !*entry;
+        assert!(map.get(id).copied().unwrap_or(false));
+
+        // Second toggle → uncropped
+        let entry = map.entry(id.to_string()).or_insert(false);
+        *entry = !*entry;
+        assert!(!map.get(id).copied().unwrap_or(false));
+    }
+
+    #[test]
+    fn crop_cleanup_on_peer_removal() {
+        let mut map = HashMap::<String, bool>::new();
+        let peer_id = "session-123";
+
+        // Set crop state for both video and screen-share canvases
+        map.insert(peer_id.to_string(), true);
+        map.insert(format!("screen-share-{peer_id}"), true);
+        assert_eq!(map.len(), 2);
+
+        // Simulate on_peer_removed cleanup
+        map.remove(peer_id);
+        map.remove(&format!("screen-share-{peer_id}"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn crop_missing_id_returns_false() {
+        let map = HashMap::<String, bool>::new();
+        assert!(!map.get("nonexistent").copied().unwrap_or(false));
+    }
+
+    #[test]
+    fn crop_none_context_returns_false() {
+        let ct: Option<&HashMap<String, bool>> = None;
+        let result = ct.and_then(|m| m.get("any-id").copied()).unwrap_or(false);
+        assert!(!result);
     }
 }

@@ -691,6 +691,9 @@ pub fn AttendantsComponent(
     // up departed peers' histories. Provided as context alongside PeerStatusMap.
     let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
 
+    // Per-tile crop state — created early so on_peer_removed can clean up.
+    let cropped_tiles_signal: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
+
     // Read transport preference from context BEFORE use_hook (hooks must not
     // be called inside the hook closure).
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
@@ -853,6 +856,9 @@ pub fn AttendantsComponent(
                 speech_map.write().remove(&peer_id);
                 let mut jt_map = peer_join_time;
                 jt_map.write().remove(&peer_id);
+                let mut ct_map = cropped_tiles_signal;
+                ct_map.write().remove(&peer_id);
+                ct_map.write().remove(&format!("screen-share-{peer_id}"));
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
@@ -1256,8 +1262,8 @@ pub fn AttendantsComponent(
     // by layout switches (grid -> split when screen sharing starts).
     use_context_provider(|| peer_signal_history_map);
 
-    // Per-tile crop state — persists across re-renders triggered by peer list changes.
-    let cropped_tiles_signal = use_signal(HashMap::new);
+    // Per-tile crop state — signal created early (near peer_status_map) so
+    // on_peer_removed can clean up; context provided here for child access.
     use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
 
     // Single diagnostics subscriber shared by all PeerTile components.

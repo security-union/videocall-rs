@@ -57,8 +57,9 @@ use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
-    MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
-    PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+    ConnectionLostReason, MediaAccessKind, MediaDeviceAccess, MediaPermission,
+    MediaPermissionsErrorState, PermissionState, ScreenShareEvent, VideoCallClient,
+    VideoCallClientOptions,
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -814,9 +815,12 @@ pub fn AttendantsComponent(
             on_connection_lost: {
                 let id = id.clone();
                 let client_cell = client_for_reconnect.clone();
-                VcCallback::from(move |reason: wasm_bindgen::JsValue| {
-                    let reason_str = reason.as_string().unwrap_or_else(|| format!("{reason:?}"));
-                    log::warn!("DIOXUS-UI: Connection lost — reason: {reason_str}");
+                VcCallback::from(move |reason: ConnectionLostReason| {
+                    log::warn!(
+                        "DIOXUS-UI: Connection lost ({}): {}",
+                        reason.label(),
+                        reason.message()
+                    );
                     let mut connection_error = connection_error;
                     let meeting_ended_message = meeting_ended_message;
                     connection_error.set(Some("Connection lost, reconnecting...".to_string()));

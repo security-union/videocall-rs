@@ -147,6 +147,10 @@ message HealthPacket {
   optional uint64 screen_encoder_errors_configure_fatal = 51;
   optional uint64 screen_encoder_errors_generic = 52;
   optional uint64 screen_encoder_frames_submitted_ok = 53;
+
+  // Connection-loss reason counters (cumulative since process start)
+  optional uint64 connection_handshake_failures_total = 54;
+  optional uint64 connection_session_drops_total = 55;
 }
 
 message TierTransition {

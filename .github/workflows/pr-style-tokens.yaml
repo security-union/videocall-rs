@@ -3,9 +3,6 @@ name: Style token guardrails
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    branches:
-      - main
-      - master
 
 permissions:
   contents: read

@@ -105,7 +105,7 @@ services:
       # Local-dev fallback so unauthenticated requests resolve to a stable
       # anonymous user identity instead of 401. Production (Helm) never sets
       # this env var and therefore defaults to false.
-      - ALLOW_ANONYMOUS=${ALLOW_ANONYMOUS:-true}
+      - ALLOW_ANONYMOUS=${ALLOW_ANONYMOUS:-false}
       - NATS_URL=nats:4222
       - DEV_USER=${DEV_USER:-}
       - RUST_LOG=debug

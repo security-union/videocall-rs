@@ -16,7 +16,9 @@
  * conditions.
  */
 
-use super::super::connection::{ConnectionController, ConnectionManagerOptions, ConnectionState};
+use super::super::connection::{
+    ConnectionController, ConnectionLostReason, ConnectionManagerOptions, ConnectionState,
+};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
@@ -98,7 +100,7 @@ pub struct VideoCallClientOptions {
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
     pub on_connected: Callback<()>,
-    pub on_connection_lost: Callback<JsValue>,
+    pub on_connection_lost: Callback<ConnectionLostReason>,
     pub enable_diagnostics: bool,
     pub diagnostics_update_interval_ms: Option<u64>,
     pub enable_health_reporting: bool,
@@ -495,7 +497,7 @@ impl VideoCallClient {
                             on_connected.emit(());
                         }
                         ConnectionState::Failed { error, .. } => {
-                            on_connection_lost.emit(JsValue::from_str(&error));
+                            on_connection_lost.emit(ConnectionLostReason::HandshakeFailed(error));
                         }
                         _ => {}
                     }

@@ -206,7 +206,7 @@ pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;
 pub use client::{VideoCallClient, VideoCallClientOptions};
-pub use connection::ConnectionState;
+pub use connection::{ConnectionLostReason, ConnectionState};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };

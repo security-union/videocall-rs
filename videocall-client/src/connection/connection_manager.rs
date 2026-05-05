@@ -35,14 +35,15 @@ use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
-use wasm_bindgen::JsValue;
+
+use super::connection_lost_reason::ConnectionLostReason;
 
 /// Maximum plausible RTT in milliseconds. Measurements exceeding this are
 /// discarded as they likely result from clock anomalies or extreme outliers.
@@ -60,6 +61,22 @@ fn monotonic_now_ms() -> f64 {
         .and_then(|w| w.performance())
         .map(|p| p.now())
         .unwrap_or_else(js_sys::Date::now)
+}
+
+/// Cumulative count of connections lost during the handshake phase.
+static CONNECTION_HANDSHAKE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of connections lost after the session was established.
+static CONNECTION_SESSION_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the cumulative number of handshake failures since process start.
+pub fn connection_handshake_failures() -> u64 {
+    CONNECTION_HANDSHAKE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of session drops since process start.
+pub fn connection_session_drops() -> u64 {
+    CONNECTION_SESSION_DROPS.load(Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -654,7 +671,7 @@ impl ConnectionManager {
         &self,
         connection_id: String,
         server_url: String,
-    ) -> Callback<JsValue> {
+    ) -> Callback<ConnectionLostReason> {
         let on_state_changed = self.options.on_state_changed.clone();
         let active_connection_id = self.active_connection_id.clone();
         let reconnection_phase = self.reconnection_phase.clone();
@@ -662,9 +679,7 @@ impl ConnectionManager {
         let election_period_ms = self.options.election_period_ms;
         let intentionally_disconnected = self.intentionally_disconnected.clone();
 
-        Callback::from(move |error| {
-            warn!("Connection {connection_id} lost: {error:?}");
-
+        Callback::from(move |reason: ConnectionLostReason| {
             // If the user explicitly called disconnect(), do not attempt reconnection.
             if *intentionally_disconnected.borrow() {
                 info!("Connection lost after intentional disconnect — not reconnecting");
@@ -674,10 +689,23 @@ impl ConnectionManager {
             // Only react if this was the active connection.
             if Some(connection_id.as_str()) != active_connection_id.borrow().as_deref() {
                 info!(
-                    "Non-active connection lost: {connection_id}, current active: {:?}",
+                    "Non-active connection lost: {connection_id} [{}], current active: {:?}",
+                    reason.label(),
                     active_connection_id.borrow()
                 );
                 return;
+            }
+
+            // Classify and count the loss reason.
+            match &reason {
+                ConnectionLostReason::HandshakeFailed(msg) => {
+                    warn!("Active connection {connection_id} lost [HANDSHAKE FAILED]: {msg}");
+                    CONNECTION_HANDSHAKE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+                ConnectionLostReason::SessionDropped(msg) => {
+                    warn!("Active connection {connection_id} lost [SESSION DROPPED]: {msg}");
+                    CONNECTION_SESSION_DROPS.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
             // Clear the active connection so is_connected() returns false immediately.

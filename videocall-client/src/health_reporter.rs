@@ -17,6 +17,7 @@
  */
 
 use crate::connection::ConnectionController;
+use crate::connection::{connection_handshake_failures, connection_session_drops};
 use crate::decode::peer_decode_manager::keyframe_requests_sent_count;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use log::{debug, warn};
@@ -786,6 +787,8 @@ impl HealthReporter {
                             drained_transitions,
                             limiter_snap,
                             drained_dwells,
+                            connection_handshake_failures(),
+                            connection_session_drops(),
                         );
 
                         if let Some(packet) = health_packet {
@@ -832,6 +835,8 @@ impl HealthReporter {
         tier_transitions: Vec<TierTransitionRecord>,
         climb_limiter: ClimbLimiterSnapshot,
         dwell_samples: Vec<(String, f64)>,
+        handshake_failures_total: u64,
+        session_drops_total: u64,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -931,6 +936,14 @@ impl HealthReporter {
             pb_d.tier = tier_label.clone();
             pb_d.dwell_ms = *dwell_ms;
             pb.tier_dwells.push(pb_d);
+        }
+
+        // Connection-loss reason counters
+        if handshake_failures_total > 0 {
+            pb.connection_handshake_failures_total = Some(handshake_failures_total);
+        }
+        if session_drops_total > 0 {
+            pb.connection_session_drops_total = Some(session_drops_total);
         }
 
         // Tab visibility and throttling

@@ -13,6 +13,7 @@ mod pages;
 mod pkce;
 mod provider_config;
 mod routing;
+mod theme;
 mod types;
 
 use crate::components::search_modal::SearchVisibleCtx;

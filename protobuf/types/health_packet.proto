@@ -141,12 +141,12 @@ message HealthPacket {
   optional uint64 camera_encoder_errors_vpx_mem_alloc = 45;
   optional uint64 camera_encoder_errors_configure_fatal = 46;
   optional uint64 camera_encoder_errors_generic = 47;
-  optional uint64 camera_encoder_frames_emitted = 48;
+  optional uint64 camera_encoder_frames_submitted_ok = 48;
   optional uint64 screen_encoder_errors_closed_codec = 49;
   optional uint64 screen_encoder_errors_vpx_mem_alloc = 50;
   optional uint64 screen_encoder_errors_configure_fatal = 51;
   optional uint64 screen_encoder_errors_generic = 52;
-  optional uint64 screen_encoder_frames_emitted = 53;
+  optional uint64 screen_encoder_frames_submitted_ok = 53;
 }
 
 message TierTransition {

@@ -42,7 +42,7 @@ static CAMERA_ENCODER_ERRORS_CLOSED_CODEC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
-static CAMERA_ENCODER_FRAMES_EMITTED: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
 
 pub fn camera_encoder_errors_closed_codec() -> u64 {
     CAMERA_ENCODER_ERRORS_CLOSED_CODEC.load(Ordering::Relaxed)
@@ -56,8 +56,8 @@ pub fn camera_encoder_errors_configure_fatal() -> u64 {
 pub fn camera_encoder_errors_generic() -> u64 {
     CAMERA_ENCODER_ERRORS_GENERIC.load(Ordering::Relaxed)
 }
-pub fn camera_encoder_frames_emitted() -> u64 {
-    CAMERA_ENCODER_FRAMES_EMITTED.load(Ordering::Relaxed)
+pub fn camera_encoder_frames_submitted_ok() -> u64 {
+    CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
 }
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -1029,21 +1029,23 @@ impl CameraEncoder {
                             .encode_with_options(&video_frame, &video_encoder_encode_options)
                         {
                             Ok(_) => {
-                                CAMERA_ENCODER_FRAMES_EMITTED.fetch_add(1, Ordering::Relaxed);
+                                CAMERA_ENCODER_FRAMES_SUBMITTED_OK.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(e) => {
                                 let msg = format!("{e:?}");
-                                if msg.contains("closed codec") || msg.contains("InvalidStateError")
-                                {
-                                    CAMERA_ENCODER_ERRORS_CLOSED_CODEC
-                                        .fetch_add(1, Ordering::Relaxed);
-                                } else if msg.contains("Memory allocation error")
-                                    || msg.contains("Unable to find free frame buffer")
-                                {
-                                    CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC
-                                        .fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    CAMERA_ENCODER_ERRORS_GENERIC.fetch_add(1, Ordering::Relaxed);
+                                match super::classify_encode_error::classify_encode_error(&msg) {
+                                    super::classify_encode_error::EncodeErrorBucket::ClosedCodec => {
+                                        CAMERA_ENCODER_ERRORS_CLOSED_CODEC
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    super::classify_encode_error::EncodeErrorBucket::VpxMemAlloc => {
+                                        CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    super::classify_encode_error::EncodeErrorBucket::Generic => {
+                                        CAMERA_ENCODER_ERRORS_GENERIC
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                                 error!("Error encoding video frame: {e:?}");
                             }

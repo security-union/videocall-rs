@@ -1260,8 +1260,8 @@ pub struct HealthPacket {
     pub camera_encoder_errors_configure_fatal: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:health_packet.HealthPacket.camera_encoder_errors_generic)
     pub camera_encoder_errors_generic: ::std::option::Option<u64>,
-    // @@protoc_insertion_point(field:health_packet.HealthPacket.camera_encoder_frames_emitted)
-    pub camera_encoder_frames_emitted: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.camera_encoder_frames_submitted_ok)
+    pub camera_encoder_frames_submitted_ok: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_errors_closed_codec)
     pub screen_encoder_errors_closed_codec: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_errors_vpx_mem_alloc)
@@ -1270,8 +1270,8 @@ pub struct HealthPacket {
     pub screen_encoder_errors_configure_fatal: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_errors_generic)
     pub screen_encoder_errors_generic: ::std::option::Option<u64>,
-    // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_frames_emitted)
-    pub screen_encoder_frames_emitted: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_frames_submitted_ok)
+    pub screen_encoder_frames_submitted_ok: ::std::option::Option<u64>,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.HealthPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1507,9 +1507,9 @@ impl HealthPacket {
             |m: &mut HealthPacket| { &mut m.camera_encoder_errors_generic },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "camera_encoder_frames_emitted",
-            |m: &HealthPacket| { &m.camera_encoder_frames_emitted },
-            |m: &mut HealthPacket| { &mut m.camera_encoder_frames_emitted },
+            "camera_encoder_frames_submitted_ok",
+            |m: &HealthPacket| { &m.camera_encoder_frames_submitted_ok },
+            |m: &mut HealthPacket| { &mut m.camera_encoder_frames_submitted_ok },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
             "screen_encoder_errors_closed_codec",
@@ -1532,9 +1532,9 @@ impl HealthPacket {
             |m: &mut HealthPacket| { &mut m.screen_encoder_errors_generic },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "screen_encoder_frames_emitted",
-            |m: &HealthPacket| { &m.screen_encoder_frames_emitted },
-            |m: &mut HealthPacket| { &mut m.screen_encoder_frames_emitted },
+            "screen_encoder_frames_submitted_ok",
+            |m: &HealthPacket| { &m.screen_encoder_frames_submitted_ok },
+            |m: &mut HealthPacket| { &mut m.screen_encoder_frames_submitted_ok },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HealthPacket>(
             "HealthPacket",
@@ -1696,7 +1696,7 @@ impl ::protobuf::Message for HealthPacket {
                     self.camera_encoder_errors_generic = ::std::option::Option::Some(is.read_uint64()?);
                 },
                 384 => {
-                    self.camera_encoder_frames_emitted = ::std::option::Option::Some(is.read_uint64()?);
+                    self.camera_encoder_frames_submitted_ok = ::std::option::Option::Some(is.read_uint64()?);
                 },
                 392 => {
                     self.screen_encoder_errors_closed_codec = ::std::option::Option::Some(is.read_uint64()?);
@@ -1711,7 +1711,7 @@ impl ::protobuf::Message for HealthPacket {
                     self.screen_encoder_errors_generic = ::std::option::Option::Some(is.read_uint64()?);
                 },
                 424 => {
-                    self.screen_encoder_frames_emitted = ::std::option::Option::Some(is.read_uint64()?);
+                    self.screen_encoder_frames_submitted_ok = ::std::option::Option::Some(is.read_uint64()?);
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -1860,7 +1860,7 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.camera_encoder_errors_generic {
             my_size += ::protobuf::rt::uint64_size(47, v);
         }
-        if let Some(v) = self.camera_encoder_frames_emitted {
+        if let Some(v) = self.camera_encoder_frames_submitted_ok {
             my_size += ::protobuf::rt::uint64_size(48, v);
         }
         if let Some(v) = self.screen_encoder_errors_closed_codec {
@@ -1875,7 +1875,7 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.screen_encoder_errors_generic {
             my_size += ::protobuf::rt::uint64_size(52, v);
         }
-        if let Some(v) = self.screen_encoder_frames_emitted {
+        if let Some(v) = self.screen_encoder_frames_submitted_ok {
             my_size += ::protobuf::rt::uint64_size(53, v);
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
@@ -2020,7 +2020,7 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.camera_encoder_errors_generic {
             os.write_uint64(47, v)?;
         }
-        if let Some(v) = self.camera_encoder_frames_emitted {
+        if let Some(v) = self.camera_encoder_frames_submitted_ok {
             os.write_uint64(48, v)?;
         }
         if let Some(v) = self.screen_encoder_errors_closed_codec {
@@ -2035,7 +2035,7 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.screen_encoder_errors_generic {
             os.write_uint64(52, v)?;
         }
-        if let Some(v) = self.screen_encoder_frames_emitted {
+        if let Some(v) = self.screen_encoder_frames_submitted_ok {
             os.write_uint64(53, v)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
@@ -2098,12 +2098,12 @@ impl ::protobuf::Message for HealthPacket {
         self.camera_encoder_errors_vpx_mem_alloc = ::std::option::Option::None;
         self.camera_encoder_errors_configure_fatal = ::std::option::Option::None;
         self.camera_encoder_errors_generic = ::std::option::Option::None;
-        self.camera_encoder_frames_emitted = ::std::option::Option::None;
+        self.camera_encoder_frames_submitted_ok = ::std::option::Option::None;
         self.screen_encoder_errors_closed_codec = ::std::option::Option::None;
         self.screen_encoder_errors_vpx_mem_alloc = ::std::option::Option::None;
         self.screen_encoder_errors_configure_fatal = ::std::option::Option::None;
         self.screen_encoder_errors_generic = ::std::option::Option::None;
-        self.screen_encoder_frames_emitted = ::std::option::Option::None;
+        self.screen_encoder_frames_submitted_ok = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -2503,7 +2503,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     sTotal\x88\x01\x01\x12G\n\x12screen_video_stats\x18\x0e\x20\x01(\x0b2\
     \x19.health_packet.VideoStatsR\x10screenVideoStatsB\x18\n\x16_avg_decode\
     _latency_msB\x16\n\x14_audio_quality_scoreB\x16\n\x14_video_quality_scor\
-    eB\x15\n\x13_call_quality_scoreB\x17\n\x15_decoder_errors_total\"\x83\
+    eB\x15\n\x13_call_quality_scoreB\x17\n\x15_decoder_errors_total\"\x9f\
     \x20\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\x01(\tR\tsessio\
     nId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tmeetingId\x12*\n\x11repor\
     ting_user_id\x18\x03\x20\x01(\x0cR\x0freportingUserId\x12!\n\x0ctimestam\
@@ -2556,52 +2556,52 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x04H\x1aR\x1ecameraEncoderErrorsVpxMemAlloc\x88\x01\x01\x12U\n%camera_e\
     ncoder_errors_configure_fatal\x18.\x20\x01(\x04H\x1bR!cameraEncoderError\
     sConfigureFatal\x88\x01\x01\x12F\n\x1dcamera_encoder_errors_generic\x18/\
-    \x20\x01(\x04H\x1cR\x1acameraEncoderErrorsGeneric\x88\x01\x01\x12F\n\x1d\
-    camera_encoder_frames_emitted\x180\x20\x01(\x04H\x1dR\x1acameraEncoderFr\
-    amesEmitted\x88\x01\x01\x12O\n\"screen_encoder_errors_closed_codec\x181\
-    \x20\x01(\x04H\x1eR\x1escreenEncoderErrorsClosedCodec\x88\x01\x01\x12P\n\
-    #screen_encoder_errors_vpx_mem_alloc\x182\x20\x01(\x04H\x1fR\x1escreenEn\
-    coderErrorsVpxMemAlloc\x88\x01\x01\x12U\n%screen_encoder_errors_configur\
-    e_fatal\x183\x20\x01(\x04H\x20R!screenEncoderErrorsConfigureFatal\x88\
-    \x01\x01\x12F\n\x1dscreen_encoder_errors_generic\x184\x20\x01(\x04H!R\
-    \x1ascreenEncoderErrorsGeneric\x88\x01\x01\x12F\n\x1dscreen_encoder_fram\
-    es_emitted\x185\x20\x01(\x04H\"R\x1ascreenEncoderFramesEmitted\x88\x01\
-    \x01\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03key\x18\x01\x20\x01(\tR\x03ke\
-    y\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.health_packet.PeerStatsR\x05\
-    value:\x028\x01B\x14\n\x12_memory_used_bytesB\x15\n\x13_memory_total_byt\
-    esB\x18\n\x16_avg_encode_latency_msB\x13\n\x11_send_queue_bytesB\x1b\n\
-    \x19_packets_received_per_secB\x17\n\x15_packets_sent_per_secB\x0f\n\r_d\
-    isplay_nameB\x16\n\x14_adaptive_video_tierB\x16\n\x14_adaptive_audio_tie\
-    rB\x17\n\x15_datagram_drops_totalB\x1f\n\x1d_keyframe_requests_sent_tota\
-    lB\x18\n\x16_websocket_drops_totalB\x14\n\x12_encoder_fps_ratioB\x19\n\
-    \x17_encoder_worst_peer_fpsB\x17\n\x15_adaptive_screen_tierB\x18\n\x16_s\
-    creen_sharing_activeB\x15\n\x13_encoder_output_fpsB\x1e\n\x1c_encoder_ta\
-    rget_bitrate_kbpsB\x18\n\x16_encoder_bitrate_ratioB\x17\n\x15_crash_ceil\
-    ing_activeB\x1b\n\x19_crash_ceiling_tier_indexB\x19\n\x17_crash_ceiling_\
-    decay_msB\x1a\n\x18_step_up_blocked_ceilingB\x1b\n\x19_step_up_blocked_s\
-    lowdownB\x1f\n\x1d_step_up_blocked_screen_shareB%\n#_camera_encoder_erro\
-    rs_closed_codecB&\n$_camera_encoder_errors_vpx_mem_allocB(\n&_camera_enc\
-    oder_errors_configure_fatalB\x20\n\x1e_camera_encoder_errors_genericB\
-    \x20\n\x1e_camera_encoder_frames_emittedB%\n#_screen_encoder_errors_clos\
-    ed_codecB&\n$_screen_encoder_errors_vpx_mem_allocB(\n&_screen_encoder_er\
-    rors_configure_fatalB\x20\n\x1e_screen_encoder_errors_genericB\x20\n\x1e\
-    _screen_encoder_frames_emittedJ\x04\x08!\x10\"J\x04\x08\"\x10#J\x04\x08#\
-    \x10$J\x04\x08$\x10%R\x13join_bandwidth_kbpsR\x0bjoin_rtt_msR\x0ejoin_ji\
-    tter_msR\x14join_packet_loss_pct\"\x96\x01\n\x0eTierTransition\x12\x1c\n\
-    \tdirection\x18\x01\x20\x01(\tR\tdirection\x12\x16\n\x06stream\x18\x02\
-    \x20\x01(\tR\x06stream\x12\x1b\n\tfrom_tier\x18\x03\x20\x01(\tR\x08fromT\
-    ier\x12\x17\n\x07to_tier\x18\x04\x20\x01(\tR\x06toTier\x12\x18\n\x07trig\
-    ger\x18\x05\x20\x01(\tR\x07trigger\":\n\tTierDwell\x12\x12\n\x04tier\x18\
-    \x01\x20\x01(\tR\x04tier\x12\x19\n\x08dwell_ms\x18\x02\x20\x01(\x01R\x07\
-    dwellMsJ\xdfK\n\x07\x12\x05\0\0\xa2\x01\x01\n\x08\n\x01\x0c\x12\x03\0\0\
-    \x12\n\x08\n\x01\x02\x12\x03\x02\0\x16\n\n\n\x02\x04\0\x12\x04\x04\0\x0e\
-    \x01\n\n\n\x03\x04\0\x01\x12\x03\x04\x08\x1e\n\x0b\n\x04\x04\0\x02\0\x12\
-    \x03\x05\x02\x1c\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x05\x02\x08\n\x0c\n\
-    \x05\x04\0\x02\0\x01\x12\x03\x05\t\x17\n\x0c\n\x05\x04\0\x02\0\x03\x12\
-    \x03\x05\x1a\x1b\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x06\x02\x1c\n\x0c\n\
-    \x05\x04\0\x02\x01\x05\x12\x03\x06\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\
-    \x12\x03\x06\t\x17\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x06\x1a\x1b\n\
-    \x0b\n\x04\x04\0\x02\x02\x12\x03\x07\x02\x20\n\x0c\n\x05\x04\0\x02\x02\
+    \x20\x01(\x04H\x1cR\x1acameraEncoderErrorsGeneric\x88\x01\x01\x12O\n\"ca\
+    mera_encoder_frames_submitted_ok\x180\x20\x01(\x04H\x1dR\x1ecameraEncode\
+    rFramesSubmittedOk\x88\x01\x01\x12O\n\"screen_encoder_errors_closed_code\
+    c\x181\x20\x01(\x04H\x1eR\x1escreenEncoderErrorsClosedCodec\x88\x01\x01\
+    \x12P\n#screen_encoder_errors_vpx_mem_alloc\x182\x20\x01(\x04H\x1fR\x1es\
+    creenEncoderErrorsVpxMemAlloc\x88\x01\x01\x12U\n%screen_encoder_errors_c\
+    onfigure_fatal\x183\x20\x01(\x04H\x20R!screenEncoderErrorsConfigureFatal\
+    \x88\x01\x01\x12F\n\x1dscreen_encoder_errors_generic\x184\x20\x01(\x04H!\
+    R\x1ascreenEncoderErrorsGeneric\x88\x01\x01\x12O\n\"screen_encoder_frame\
+    s_submitted_ok\x185\x20\x01(\x04H\"R\x1escreenEncoderFramesSubmittedOk\
+    \x88\x01\x01\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03key\x18\x01\x20\x01(\
+    \tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.health_packet.PeerS\
+    tatsR\x05value:\x028\x01B\x14\n\x12_memory_used_bytesB\x15\n\x13_memory_\
+    total_bytesB\x18\n\x16_avg_encode_latency_msB\x13\n\x11_send_queue_bytes\
+    B\x1b\n\x19_packets_received_per_secB\x17\n\x15_packets_sent_per_secB\
+    \x0f\n\r_display_nameB\x16\n\x14_adaptive_video_tierB\x16\n\x14_adaptive\
+    _audio_tierB\x17\n\x15_datagram_drops_totalB\x1f\n\x1d_keyframe_requests\
+    _sent_totalB\x18\n\x16_websocket_drops_totalB\x14\n\x12_encoder_fps_rati\
+    oB\x19\n\x17_encoder_worst_peer_fpsB\x17\n\x15_adaptive_screen_tierB\x18\
+    \n\x16_screen_sharing_activeB\x15\n\x13_encoder_output_fpsB\x1e\n\x1c_en\
+    coder_target_bitrate_kbpsB\x18\n\x16_encoder_bitrate_ratioB\x17\n\x15_cr\
+    ash_ceiling_activeB\x1b\n\x19_crash_ceiling_tier_indexB\x19\n\x17_crash_\
+    ceiling_decay_msB\x1a\n\x18_step_up_blocked_ceilingB\x1b\n\x19_step_up_b\
+    locked_slowdownB\x1f\n\x1d_step_up_blocked_screen_shareB%\n#_camera_enco\
+    der_errors_closed_codecB&\n$_camera_encoder_errors_vpx_mem_allocB(\n&_ca\
+    mera_encoder_errors_configure_fatalB\x20\n\x1e_camera_encoder_errors_gen\
+    ericB%\n#_camera_encoder_frames_submitted_okB%\n#_screen_encoder_errors_\
+    closed_codecB&\n$_screen_encoder_errors_vpx_mem_allocB(\n&_screen_encode\
+    r_errors_configure_fatalB\x20\n\x1e_screen_encoder_errors_genericB%\n#_s\
+    creen_encoder_frames_submitted_okJ\x04\x08!\x10\"J\x04\x08\"\x10#J\x04\
+    \x08#\x10$J\x04\x08$\x10%R\x13join_bandwidth_kbpsR\x0bjoin_rtt_msR\x0ejo\
+    in_jitter_msR\x14join_packet_loss_pct\"\x96\x01\n\x0eTierTransition\x12\
+    \x1c\n\tdirection\x18\x01\x20\x01(\tR\tdirection\x12\x16\n\x06stream\x18\
+    \x02\x20\x01(\tR\x06stream\x12\x1b\n\tfrom_tier\x18\x03\x20\x01(\tR\x08f\
+    romTier\x12\x17\n\x07to_tier\x18\x04\x20\x01(\tR\x06toTier\x12\x18\n\x07\
+    trigger\x18\x05\x20\x01(\tR\x07trigger\":\n\tTierDwell\x12\x12\n\x04tier\
+    \x18\x01\x20\x01(\tR\x04tier\x12\x19\n\x08dwell_ms\x18\x02\x20\x01(\x01R\
+    \x07dwellMsJ\xdfK\n\x07\x12\x05\0\0\xa2\x01\x01\n\x08\n\x01\x0c\x12\x03\
+    \0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\x16\n\n\n\x02\x04\0\x12\x04\x04\0\
+    \x0e\x01\n\n\n\x03\x04\0\x01\x12\x03\x04\x08\x1e\n\x0b\n\x04\x04\0\x02\0\
+    \x12\x03\x05\x02\x1c\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x05\x02\x08\n\
+    \x0c\n\x05\x04\0\x02\0\x01\x12\x03\x05\t\x17\n\x0c\n\x05\x04\0\x02\0\x03\
+    \x12\x03\x05\x1a\x1b\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x06\x02\x1c\n\x0c\
+    \n\x05\x04\0\x02\x01\x05\x12\x03\x06\x02\x08\n\x0c\n\x05\x04\0\x02\x01\
+    \x01\x12\x03\x06\t\x17\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x06\x1a\x1b\
+    \n\x0b\n\x04\x04\0\x02\x02\x12\x03\x07\x02\x20\n\x0c\n\x05\x04\0\x02\x02\
     \x05\x12\x03\x07\x02\x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x07\t\x1b\
     \n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x07\x1e\x1f\n\x0b\n\x04\x04\0\x02\
     \x03\x12\x03\x08\x02%\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x08\x02\x08\
@@ -2905,9 +2905,9 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x05\x04\x05\x02*\x04\x12\x04\x8e\x01\x02\n\n\r\n\x05\x04\x05\x02*\x05\
     \x12\x04\x8e\x01\x0b\x11\n\r\n\x05\x04\x05\x02*\x01\x12\x04\x8e\x01\x12/\
     \n\r\n\x05\x04\x05\x02*\x03\x12\x04\x8e\x0124\n\x0c\n\x04\x04\x05\x02+\
-    \x12\x04\x8f\x01\x025\n\r\n\x05\x04\x05\x02+\x04\x12\x04\x8f\x01\x02\n\n\
+    \x12\x04\x8f\x01\x02:\n\r\n\x05\x04\x05\x02+\x04\x12\x04\x8f\x01\x02\n\n\
     \r\n\x05\x04\x05\x02+\x05\x12\x04\x8f\x01\x0b\x11\n\r\n\x05\x04\x05\x02+\
-    \x01\x12\x04\x8f\x01\x12/\n\r\n\x05\x04\x05\x02+\x03\x12\x04\x8f\x0124\n\
+    \x01\x12\x04\x8f\x01\x124\n\r\n\x05\x04\x05\x02+\x03\x12\x04\x8f\x0179\n\
     \x0c\n\x04\x04\x05\x02,\x12\x04\x90\x01\x02:\n\r\n\x05\x04\x05\x02,\x04\
     \x12\x04\x90\x01\x02\n\n\r\n\x05\x04\x05\x02,\x05\x12\x04\x90\x01\x0b\
     \x11\n\r\n\x05\x04\x05\x02,\x01\x12\x04\x90\x01\x124\n\r\n\x05\x04\x05\
@@ -2922,9 +2922,9 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x05\x02/\x04\x12\x04\x93\x01\x02\n\n\r\n\x05\x04\x05\x02/\x05\x12\x04\
     \x93\x01\x0b\x11\n\r\n\x05\x04\x05\x02/\x01\x12\x04\x93\x01\x12/\n\r\n\
     \x05\x04\x05\x02/\x03\x12\x04\x93\x0124\n\x0c\n\x04\x04\x05\x020\x12\x04\
-    \x94\x01\x025\n\r\n\x05\x04\x05\x020\x04\x12\x04\x94\x01\x02\n\n\r\n\x05\
+    \x94\x01\x02:\n\r\n\x05\x04\x05\x020\x04\x12\x04\x94\x01\x02\n\n\r\n\x05\
     \x04\x05\x020\x05\x12\x04\x94\x01\x0b\x11\n\r\n\x05\x04\x05\x020\x01\x12\
-    \x04\x94\x01\x12/\n\r\n\x05\x04\x05\x020\x03\x12\x04\x94\x0124\n\x0c\n\
+    \x04\x94\x01\x124\n\r\n\x05\x04\x05\x020\x03\x12\x04\x94\x0179\n\x0c\n\
     \x02\x04\x06\x12\x06\x97\x01\0\x9d\x01\x01\n\x0b\n\x03\x04\x06\x01\x12\
     \x04\x97\x01\x08\x16\n\x1e\n\x04\x04\x06\x02\0\x12\x04\x98\x01\x02\x17\"\
     \x10\x20\"up\"\x20or\x20\"down\"\n\n\r\n\x05\x04\x06\x02\0\x05\x12\x04\

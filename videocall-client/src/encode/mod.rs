@@ -17,6 +17,7 @@
  */
 
 mod camera_encoder;
+pub(crate) mod classify_encode_error;
 mod encoder_state;
 mod microphone_encoder;
 mod screen_encoder;
@@ -31,13 +32,13 @@ use videocall_types::Callback;
 pub use camera_encoder::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
-    camera_encoder_frames_emitted, CameraEncoder,
+    camera_encoder_frames_submitted_ok, CameraEncoder,
 };
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{
     screen_encoder_errors_closed_codec, screen_encoder_errors_configure_fatal,
     screen_encoder_errors_generic, screen_encoder_errors_vpx_mem_alloc,
-    screen_encoder_frames_emitted, ScreenEncoder, ScreenShareEvent,
+    screen_encoder_frames_submitted_ok, ScreenEncoder, ScreenShareEvent,
 };
 
 /// Trait to abstract over different microphone encoder implementations

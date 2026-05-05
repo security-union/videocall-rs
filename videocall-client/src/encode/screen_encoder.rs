@@ -1379,8 +1379,7 @@ impl ScreenEncoder {
 
                         match screen_encoder.encode_with_options(&video_frame, &opts) {
                             Ok(_) => {
-                                SCREEN_ENCODER_FRAMES_SUBMITTED_OK
-                                    .fetch_add(1, Ordering::Relaxed);
+                                SCREEN_ENCODER_FRAMES_SUBMITTED_OK.fetch_add(1, Ordering::Relaxed);
                                 if restart_count > 0 {
                                     // First successful encode after a restart — reset the
                                     // counter so transient errors don't accumulate toward

@@ -25,7 +25,8 @@ use crate::adaptive_quality_constants::{
     POST_REBASE_RETRY_MAX_ATTEMPTS, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT,
     RECONNECT_INITIAL_DELAY_MS, RECONNECT_MAX_DELAY_PHASE1_MS, RECONNECT_MAX_DELAY_PHASE2_MS,
     RECONNECT_MAX_DELAY_PHASE3_MS, RECONNECT_PHASE1_MAX_ATTEMPTS, RECONNECT_PHASE2_MAX_ATTEMPTS,
-    REELECTION_CATASTROPHIC_RTT_MS, REELECTION_CONSECUTIVE_SAMPLES, REELECTION_MIN_IMPROVEMENT_MS,
+    REELECTION_CATASTROPHIC_RTT_MS, REELECTION_CONSECUTIVE_SAMPLES,
+    REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD, REELECTION_MIN_IMPROVEMENT_MS,
     REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
 };
 use crate::crypto::aes::Aes128State;
@@ -111,6 +112,14 @@ pub struct ServerRttMeasurement {
     pub connection_id: String,
     pub active: bool,
     pub connected: bool,
+    /// Number of *consecutive* RTT measurements rejected by the plausibility
+    /// filter on this connection. Reset to 0 by the next plausible
+    /// measurement. The watchdog (`check_rtt_degradation`) consults this on
+    /// the active connection: when it crosses
+    /// `REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD`, sustained discards are
+    /// treated as a re-election signal so the user is not silently stuck on
+    /// a broken connection (see discussion #539).
+    pub consecutive_implausible_discards: u32,
 }
 
 #[derive(Debug)]
@@ -533,6 +542,7 @@ impl ConnectionManager {
                             connection_id: conn_id.clone(),
                             active: false,
                             connected: false,
+                            consecutive_implausible_discards: 0,
                         },
                     );
                     debug!("Created WebSocket connection {conn_id}: {url}");
@@ -570,6 +580,7 @@ impl ConnectionManager {
                             connection_id: conn_id.clone(),
                             active: false,
                             connected: false,
+                            consecutive_implausible_discards: 0,
                         },
                     );
                     debug!("Created WebTransport connection {conn_id}: {url}");
@@ -859,7 +870,10 @@ impl ConnectionManager {
     /// Handle RTT response and calculate round-trip time.
     ///
     /// Measurements that are negative (clock anomaly) or exceed
-    /// `RTT_SANITY_MAX_MS` (extreme outlier) are silently discarded.
+    /// `RTT_SANITY_MAX_MS` (extreme outlier) are discarded from the rolling
+    /// average, but a *streak* of such discards is recorded on the connection's
+    /// `consecutive_implausible_discards` counter so the watchdog can react
+    /// to sustained brokenness (see discussion #539).
     fn handle_rtt_response(
         &mut self,
         connection_id: &str,
@@ -868,17 +882,28 @@ impl ConnectionManager {
     ) {
         let sent_timestamp = media_packet.timestamp;
         let rtt = reception_time - sent_timestamp;
+        let plausible = (0.0..=RTT_SANITY_MAX_MS).contains(&rtt);
 
-        // Discard implausible RTT measurements.
-        if !(0.0..=RTT_SANITY_MAX_MS).contains(&rtt) {
+        // Discard implausible RTT measurements but bump the per-connection
+        // streak counter so a sustained discard pattern becomes actionable
+        // (rather than silently starving the RTT-degradation watchdog).
+        if !plausible {
             warn!(
                 "Discarding implausible RTT measurement on {}: {:.1}ms (sent={}, recv={})",
                 connection_id, rtt, sent_timestamp, reception_time
             );
+            if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
+                measurement.consecutive_implausible_discards = measurement
+                    .consecutive_implausible_discards
+                    .saturating_add(1);
+            }
             return;
         }
 
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
+            // Reset the discard streak — we just got a usable measurement.
+            measurement.consecutive_implausible_discards = 0;
+
             measurement.measurements.push_back(rtt);
 
             // Keep only recent measurements (last 10)
@@ -1026,6 +1051,7 @@ impl ConnectionManager {
                                             connection_id: old_id.clone(),
                                             active: true,
                                             connected: true,
+                                            consecutive_implausible_discards: 0,
                                         },
                                     );
                                 }
@@ -1507,14 +1533,13 @@ impl ConnectionManager {
     /// Called at 1 Hz (from ConnectionController) after election, to check whether
     /// the active connection's RTT has degraded enough to warrant a new election.
     ///
-    /// Returns `true` if a re-election should be triggered.
+    /// Returns `true` if a re-election should be triggered. In addition to the
+    /// classic "elevated RTT" path, this also fires when the plausibility
+    /// filter has been silently discarding measurements on the active
+    /// connection for more than `REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD`
+    /// consecutive samples — defense-in-depth against a broken time base
+    /// starving the elevated-RTT detector of data (see discussion #539).
     pub fn check_rtt_degradation(&mut self) -> bool {
-        // Only check when we have a baseline and are in Elected state.
-        let baseline = match self.baseline_rtt {
-            Some(b) if b > 0.0 => b,
-            _ => return false,
-        };
-
         if self.reelection_in_progress {
             return false;
         }
@@ -1522,6 +1547,49 @@ impl ConnectionManager {
         let active_id = match self.active_connection_id.borrow().clone() {
             Some(id) => id,
             None => return false,
+        };
+
+        // --- Sustained-implausible-RTT watchdog -----------------------------
+        // Independent of the elevated-RTT path: if the plausibility filter has
+        // been rejecting measurements consecutively on the active connection,
+        // the detector below would never see a usable sample and silently
+        // wait forever. Treat a sustained streak as an actionable signal.
+        let discard_streak = self
+            .rtt_measurements
+            .get(&active_id)
+            .map(|m| m.consecutive_implausible_discards)
+            .unwrap_or(0);
+        if discard_streak > REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD {
+            // Re-electing to the only server is pointless (would just produce
+            // the same brokenness). Reset the streak so we do not log every
+            // tick, and surrender — there is nothing else to swap to.
+            if self.total_server_count() <= 1 {
+                warn!(
+                    "Sustained implausible RTT on {} ({} consecutive discards) but \
+                     only {} server configured — cannot re-elect; resetting streak",
+                    active_id,
+                    discard_streak,
+                    self.total_server_count(),
+                );
+                if let Some(m) = self.rtt_measurements.get_mut(&active_id) {
+                    m.consecutive_implausible_discards = 0;
+                }
+                return false;
+            }
+
+            warn!(
+                "Sustained implausible RTT on {} ({} consecutive discards exceeds \
+                 threshold {}) — triggering re-election",
+                active_id, discard_streak, REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD,
+            );
+            return true;
+        }
+
+        // --- Elevated-RTT watchdog (existing) -------------------------------
+        // Only check when we have a baseline and are in Elected state.
+        let baseline = match self.baseline_rtt {
+            Some(b) if b > 0.0 => b,
+            _ => return false,
         };
 
         let current_rtt = self
@@ -2623,6 +2691,7 @@ mod tests {
                 connection_id: conn_id.to_string(),
                 active: false,
                 connected: true,
+                consecutive_implausible_discards: 0,
             },
         );
     }
@@ -3506,6 +3575,211 @@ mod tests {
         let m = mgr.rtt_measurements.get("wt_0").unwrap();
         assert_eq!(m.measurements.len(), 1);
         assert!((m.average_rtt.unwrap() - 0.0).abs() < 0.01);
+    }
+
+    // ===================================================================
+    // 3b. Sustained-implausible-RTT watchdog (PR-B / discussion #539)
+    // ===================================================================
+
+    /// Helper: feed an implausible RTT measurement into the active connection.
+    fn feed_implausible(mgr: &mut ConnectionManager, conn_id: &str) {
+        let pkt = MediaPacket {
+            timestamp: 1000.0,
+            ..Default::default()
+        };
+        // recv - sent = 16000ms, exceeds RTT_SANITY_MAX_MS -> discarded.
+        mgr.handle_rtt_response(conn_id, &pkt, 17000.0);
+    }
+
+    /// Helper: feed a plausible RTT measurement into the active connection.
+    fn feed_plausible(mgr: &mut ConnectionManager, conn_id: &str) {
+        let pkt = MediaPacket {
+            timestamp: 1000.0,
+            ..Default::default()
+        };
+        // recv - sent = 50ms.
+        mgr.handle_rtt_response(conn_id, &pkt, 1050.0);
+    }
+
+    #[test]
+    fn implausible_discards_increment_streak_counter() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        for _ in 0..3 {
+            feed_implausible(&mut mgr, "wt_0");
+        }
+
+        let m = mgr.rtt_measurements.get("wt_0").unwrap();
+        assert_eq!(m.consecutive_implausible_discards, 3);
+    }
+
+    #[test]
+    fn plausible_measurement_resets_streak_counter() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        // Build up a streak then break it.
+        feed_implausible(&mut mgr, "wt_0");
+        feed_implausible(&mut mgr, "wt_0");
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_implausible_discards,
+            2
+        );
+
+        feed_plausible(&mut mgr, "wt_0");
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_implausible_discards,
+            0,
+            "a single plausible measurement must reset the discard streak"
+        );
+    }
+
+    #[test]
+    fn sustained_implausible_rtt_triggers_reelection() {
+        // 11 consecutive implausible measurements must trip the watchdog.
+        let mut mgr = make_test_manager();
+        // Need >= 2 servers so re-election is not skipped as "only one server".
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec!["https://b".into()];
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        // Feed REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 1 (=11) discards.
+        for _ in 0..(REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 1) {
+            feed_implausible(&mut mgr, "wt_0");
+        }
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_implausible_discards,
+            REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 1
+        );
+
+        assert!(
+            mgr.check_rtt_degradation(),
+            "11 consecutive implausible measurements must trigger re-election"
+        );
+    }
+
+    #[test]
+    fn implausible_streak_at_threshold_does_not_trigger() {
+        // Exactly THRESHOLD discards (=10) must NOT yet trigger — boundary is
+        // strict inequality (count > THRESHOLD).
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec!["https://b".into()];
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        for _ in 0..REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD {
+            feed_implausible(&mut mgr, "wt_0");
+        }
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_implausible_discards,
+            REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD
+        );
+
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "exactly THRESHOLD ({}) discards must not yet trigger re-election",
+            REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn intermittent_implausible_does_not_trigger_reelection() {
+        // 1 implausible + 1 plausible + 1 implausible — the plausible
+        // measurement must reset the streak so the watchdog stays silent.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec!["https://b".into()];
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        feed_implausible(&mut mgr, "wt_0");
+        feed_plausible(&mut mgr, "wt_0");
+        feed_implausible(&mut mgr, "wt_0");
+
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_implausible_discards,
+            1,
+            "streak should be 1 (only the trailing implausible measurement)"
+        );
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "intermittent discards must not trigger re-election"
+        );
+    }
+
+    #[test]
+    fn implausible_streak_skips_reelection_with_single_server() {
+        // With only one server configured, re-election would be pointless —
+        // the watchdog must not fire and must reset the streak so we stop
+        // logging once per tick.
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://only-server".into()];
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        for _ in 0..(REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 5) {
+            feed_implausible(&mut mgr, "wt_0");
+        }
+
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "with only one server, sustained discards must not trigger re-election"
+        );
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_implausible_discards,
+            0,
+            "streak must be reset on the surrender path so we do not log every tick"
+        );
+    }
+
+    #[test]
+    fn implausible_streak_does_not_trigger_during_reelection() {
+        // While a re-election is already in progress, the watchdog must
+        // short-circuit — same guard as the elevated-RTT path.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec!["https://b".into()];
+        mgr.reelection_in_progress = true;
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        for _ in 0..(REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 5) {
+            feed_implausible(&mut mgr, "wt_0");
+        }
+
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "watchdog must not re-trigger while a re-election is in progress"
+        );
+    }
+
+    #[test]
+    fn implausible_discards_threshold_constant_is_reasonable() {
+        // Sanity check: at 1Hz probe rate, 10 means ~10s before the watchdog
+        // fires. Less than 5 would over-trigger on transient anomalies; more
+        // than 30 would let the user sit on a broken connection too long.
+        assert!((5..=30).contains(&REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD));
     }
 
     #[test]
@@ -4412,6 +4686,7 @@ mod tests {
             connection_id: "wt_old".to_string(),
             active: true,
             connected: true,
+            consecutive_implausible_discards: 0,
         });
         mgr.old_active_is_webtransport = Some(true);
         // old_active_connection is None (no real Connection object).
@@ -4494,6 +4769,7 @@ mod tests {
             connection_id: "custom_id".to_string(),
             active: true,
             connected: true,
+            consecutive_implausible_discards: 0,
         });
         *mgr.active_connection_id.borrow_mut() = Some("custom_id".to_string());
 
@@ -4522,6 +4798,7 @@ mod tests {
             connection_id: "wt_0".to_string(),
             active: false,
             connected: false,
+            consecutive_implausible_discards: 0,
         });
         mgr.old_active_is_webtransport = Some(true);
 

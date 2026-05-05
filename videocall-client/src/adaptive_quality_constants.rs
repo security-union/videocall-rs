@@ -622,6 +622,22 @@ pub const REELECTION_MIN_IMPROVEMENT_MS: f64 = 20.0;
 /// alternative is worth trying.
 pub const REELECTION_CATASTROPHIC_RTT_MS: f64 = 5000.0;
 
+/// Number of *consecutive* implausible-RTT discards on the active connection
+/// before treating sustained discards as a re-election trigger.
+///
+/// The plausibility filter (`RTT_SANITY_MAX_MS`) silently drops measurements
+/// when `recv - sent` is outside `[0, 10s]`. Without this watchdog the
+/// existing RTT-degradation detector is starved of samples, leaving the user
+/// stuck on a broken connection (see discussion #539, JRG_dirs incident:
+/// 255 implausible discards over 6 minutes due to server-side clock drift).
+///
+/// 10 is chosen so that, at the 1Hz post-election RTT probe rate, sustained
+/// discards trigger re-election after roughly 10 seconds of clock-drift /
+/// time-base brokenness — long enough to ride out transient one-shot anomalies
+/// (such as a single late ACK or a one-off NTP slew) but short enough to
+/// recover before users perceive the connection as dead.
+pub const REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD: u32 = 10;
+
 /// Delay (milliseconds) before checking whether a post-rebase re-election
 /// retry should fire.
 ///

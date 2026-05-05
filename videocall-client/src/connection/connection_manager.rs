@@ -1080,8 +1080,11 @@ impl ConnectionManager {
                             self.old_active_is_webtransport = None;
                             // The cycle reached an orderly conclusion — clear
                             // the preservation guard so a subsequent
-                            // candidate-failure event can preserve again.
+                            // candidate-failure event can preserve again. Also
+                            // cancel any pending preservation-retry timer; the
+                            // new cycle has superseded it.
                             self.reelection_preserved_once = false;
+                            *self.reelection_retry_pending.borrow_mut() = false;
                             self.pending_session_ids.borrow_mut().clear();
 
                             // Signal re-election completion so the camera encoder
@@ -1186,8 +1189,11 @@ impl ConnectionManager {
                 self.old_active_is_webtransport = None;
                 // A clean Elected outcome closes out the cycle. Reset the
                 // preservation guard so the *next* re-election cycle can
-                // preserve once if its candidates flame out.
+                // preserve once if its candidates flame out. Also cancel any
+                // pending preservation-retry timer so it cannot wake on the
+                // just-elected healthy connection.
                 self.reelection_preserved_once = false;
+                *self.reelection_retry_pending.borrow_mut() = false;
 
                 if let Some(rtt) = self.baseline_rtt {
                     info!("Baseline RTT for re-election monitoring: {rtt:.1}ms");
@@ -1909,6 +1915,12 @@ impl ConnectionManager {
             info!("Re-election already in progress, skipping");
             return Ok(());
         }
+
+        // Clear any pending preservation-retry — a fresh re-election supersedes
+        // the cancelled timer's claim to the manager. Without this clear, a 30s
+        // retry armed by a prior preservation event could fire on the new
+        // cycle's just-elected healthy connection (spurious churn).
+        *self.reelection_retry_pending.borrow_mut() = false;
 
         info!("Starting connection quality re-election (keeping old connection alive)");
         self.reelection_in_progress = true;
@@ -5033,6 +5045,124 @@ mod tests {
 
         assert!(!mgr.reelection_preserved_once);
         assert!(!*mgr.reelection_retry_pending.borrow());
+    }
+
+    // -------------------------------------------------------------------
+    // Regression tests for the cleanup invariant on the preservation-retry
+    // flag (reelection_retry_pending). These lock in the fix from the
+    // @jay-boyd / @antonio-estrada review of PR #544: when a re-election
+    // is started or completes (Elected or aborted), any pending 30 s
+    // preservation-retry timer must be cancelled by clearing the flag —
+    // otherwise the timer can wake on a just-elected healthy connection
+    // and trigger spurious churn. The clear matches the existing pattern
+    // already in `reset_and_start_election` and `disconnect`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn start_reelection_clears_pending_preservation_retry() {
+        // A fresh re-election cycle must cancel any pending preservation
+        // retry — the new cycle supersedes the timer's claim. Without
+        // this clear, a 30 s retry armed by a prior preservation event
+        // could fire on the new cycle's just-elected connection.
+        let mut mgr = make_test_manager();
+        // Active connection so start_reelection has something to capture.
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0, 80.0]);
+
+        // Pre-arm the preservation retry as if a prior candidate-failure
+        // event had scheduled the 30 s timer.
+        *mgr.reelection_retry_pending.borrow_mut() = true;
+
+        mgr.start_reelection().unwrap();
+
+        assert!(
+            !*mgr.reelection_retry_pending.borrow(),
+            "reelection_retry_pending must be cleared by start_reelection so a \
+             pending timer cannot fire on the new cycle's just-elected connection"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_elected_branch_clears_pending_preservation_retry() {
+        // The Elected success branch completes a re-election cleanly. The
+        // preservation-retry flag must be cleared alongside the existing
+        // `reelection_preserved_once` reset so the spawned 30 s timer
+        // cannot wake on the just-elected healthy connection.
+        let mut mgr = make_test_manager();
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(300.0);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Strictly-better candidate forces the Elected branch.
+        insert_measurement(&mut mgr, "wt_0", true, Some(50.0), vec![50.0, 50.0]);
+
+        // Pre-arm the preservation retry.
+        *mgr.reelection_retry_pending.borrow_mut() = true;
+
+        mgr.complete_election();
+
+        assert!(
+            !mgr.reelection_in_progress,
+            "Elected branch must conclude the cycle"
+        );
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_0".to_string()),
+            "Elected branch must promote the better candidate"
+        );
+        assert!(
+            !mgr.reelection_preserved_once,
+            "Elected branch must clear preservation guard (existing invariant)"
+        );
+        assert!(
+            !*mgr.reelection_retry_pending.borrow(),
+            "Elected branch must also clear reelection_retry_pending so a \
+             pending preservation-retry timer cannot wake on a healthy \
+             connection"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn complete_election_abort_no_improvement_branch_clears_pending_preservation_retry() {
+        // The abort-on-no-improvement branch concludes the cycle by
+        // keeping the old active connection. The preservation-retry flag
+        // must be cleared alongside the existing `reelection_preserved_once`
+        // reset; otherwise a stale 30 s timer survives a clean cycle end.
+        let mut mgr = make_test_manager();
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(100.0);
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // Worse candidate forces the abort-on-no-improvement branch.
+        insert_measurement(&mut mgr, "wt_0", true, Some(200.0), vec![200.0, 200.0]);
+
+        // Pre-arm the preservation retry.
+        *mgr.reelection_retry_pending.borrow_mut() = true;
+
+        mgr.complete_election();
+
+        assert!(
+            !mgr.reelection_in_progress,
+            "abort path must conclude the cycle"
+        );
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_old".to_string()),
+            "abort path must keep the old active connection"
+        );
+        assert!(
+            !mgr.reelection_preserved_once,
+            "abort path must clear preservation guard (existing invariant)"
+        );
+        assert!(
+            !*mgr.reelection_retry_pending.borrow(),
+            "abort path must also clear reelection_retry_pending so a \
+             pending preservation-retry timer cannot wake after the cycle \
+             cleanly concluded on the old connection"
+        );
     }
 
     // ===================================================================

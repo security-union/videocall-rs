@@ -638,6 +638,37 @@ pub const REELECTION_CATASTROPHIC_RTT_MS: f64 = 5000.0;
 /// recover before users perceive the connection as dead.
 pub const REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD: u32 = 10;
 
+/// Freshness window (ms) for the old active connection when deciding whether
+/// to preserve it after total candidate failure.
+///
+/// When a re-election starts and ALL candidates fail before producing valid
+/// RTT measurements, we check whether the old active connection has had any
+/// inbound traffic (media packet, RTT echo, heartbeat ACK, or session-assigned
+/// frame) within this window. If yes, the candidates' failure is taken to be
+/// a transient relay-side outage and the old connection is preserved. If no,
+/// the old connection is presumed dead and the user is disconnected through
+/// the existing path.
+///
+/// 5 s is chosen because:
+/// - it is long enough to span a few server heartbeat intervals (the server
+///   sends data at >= 1 Hz when the call is active), so a healthy old
+///   connection is virtually guaranteed to register inbound traffic inside it
+/// - it is short enough that genuinely silent connections (server crash, NAT
+///   rebind, route flap on the live path) do NOT get preserved as ghosts
+/// - it matches the connection-lost callback's typical detection lag of
+///   1-3 s on degraded networks, leaving headroom for jitter
+pub const REELECTION_PRESERVATION_FRESHNESS_MS: f64 = 5_000.0;
+
+/// Delay (ms) before retrying a re-election after the old active connection
+/// has been preserved due to total candidate failure.
+///
+/// 30 s gives the relay time to recover from the kind of brief outage that
+/// caused both candidates to fail (the JRG_dirs Tony S1 incident on
+/// 2026-05-05 saw both candidates flame out in 14 ms, suggesting a
+/// short-lived relay-side event). Retrying too soon risks hitting the same
+/// outage; waiting too long delays moving off a degraded baseline.
+pub const REELECTION_PRESERVATION_RETRY_MS: u64 = 30_000;
+
 // ---------------------------------------------------------------------------
 // Heartbeat & Polling
 // ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ use log::error;
 use log::info;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -52,6 +52,8 @@ use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
+use super::classify_encode_error::classify_encode_error;
+use super::classify_encode_error::EncodeErrorBucket;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 use crate::crypto::aes::Aes128State;
@@ -63,6 +65,31 @@ use crate::adaptive_quality_constants::{
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
+
+// ── Screen encoder error observability counters (cumulative, since page load) ─
+// Mirrors the camera encoder pattern. See camera_encoder.rs for design rationale.
+
+static SCREEN_ENCODER_ERRORS_CLOSED_CODEC: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
+
+pub fn screen_encoder_errors_closed_codec() -> u64 {
+    SCREEN_ENCODER_ERRORS_CLOSED_CODEC.load(Ordering::Relaxed)
+}
+pub fn screen_encoder_errors_vpx_mem_alloc() -> u64 {
+    SCREEN_ENCODER_ERRORS_VPX_MEM_ALLOC.load(Ordering::Relaxed)
+}
+pub fn screen_encoder_errors_configure_fatal() -> u64 {
+    SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.load(Ordering::Relaxed)
+}
+pub fn screen_encoder_errors_generic() -> u64 {
+    SCREEN_ENCODER_ERRORS_GENERIC.load(Ordering::Relaxed)
+}
+pub fn screen_encoder_frames_submitted_ok() -> u64 {
+    SCREEN_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
+}
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
     msg.contains("closed codec")
@@ -1059,6 +1086,7 @@ impl ScreenEncoder {
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             set_vbr_mode(&screen_encoder_config);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
+                SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                 let msg = format!("Error configuring screen encoder: {e:?}");
                 error!("ScreenEncoder: {msg} (restart {restart_count})");
                 restart_count += 1;
@@ -1193,6 +1221,7 @@ impl ScreenEncoder {
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     set_vbr_mode(&new_config);
                     if let Err(e) = screen_encoder.configure(&new_config) {
+                        SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                         error!("Error reconfiguring screen encoder for tier change: {e:?}");
                         if is_fatal_encoder_error(&e) {
                             restart_count += 1;
@@ -1231,6 +1260,7 @@ impl ScreenEncoder {
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     set_vbr_mode(&new_config);
                     if let Err(e) = screen_encoder.configure(&new_config) {
+                        SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                         error!("Error configuring screen encoder: {e:?}");
                         if is_fatal_encoder_error(&e) {
                             restart_count += 1;
@@ -1300,6 +1330,8 @@ impl ScreenEncoder {
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             set_vbr_mode(&new_config);
                             if let Err(e) = screen_encoder.configure(&new_config) {
+                                SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
+                                    .fetch_add(1, Ordering::Relaxed);
                                 error!(
                                     "Error reconfiguring screen encoder with new dimensions: {e:?}"
                                 );
@@ -1345,26 +1377,47 @@ impl ScreenEncoder {
                             );
                         }
 
-                        if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
-                            if is_fatal_encoder_error(&e) {
-                                error!(
-                                    "ScreenEncoder: fatal encode error (restart {restart_count}): {e:?}"
-                                );
-                                video_frame.close();
-                                fatal_encode_exit = true;
-                                restart_count += 1;
-                                break 'encode;
+                        match screen_encoder.encode_with_options(&video_frame, &opts) {
+                            Ok(_) => {
+                                SCREEN_ENCODER_FRAMES_SUBMITTED_OK.fetch_add(1, Ordering::Relaxed);
+                                if restart_count > 0 {
+                                    // First successful encode after a restart — reset the
+                                    // counter so transient errors don't accumulate toward
+                                    // the max-restart limit across unrelated incidents.
+                                    log::info!(
+                                        "ScreenEncoder: first successful encode after restart, \
+                                         resetting restart counter"
+                                    );
+                                    restart_count = 0;
+                                }
                             }
-                            error!("Error encoding screen frame: {e:?}");
-                        } else if restart_count > 0 {
-                            // First successful encode after a restart — reset the
-                            // counter so transient errors don't accumulate toward
-                            // the max-restart limit across unrelated incidents.
-                            log::info!(
-                                "ScreenEncoder: first successful encode after restart, \
-                                 resetting restart counter"
-                            );
-                            restart_count = 0;
+                            Err(e) => {
+                                let msg = format!("{e:?}");
+                                match classify_encode_error(&msg) {
+                                    EncodeErrorBucket::ClosedCodec => {
+                                        SCREEN_ENCODER_ERRORS_CLOSED_CODEC
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    EncodeErrorBucket::VpxMemAlloc => {
+                                        SCREEN_ENCODER_ERRORS_VPX_MEM_ALLOC
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    EncodeErrorBucket::Generic => {
+                                        SCREEN_ENCODER_ERRORS_GENERIC
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                if is_fatal_encoder_error(&e) {
+                                    error!(
+                                        "ScreenEncoder: fatal encode error (restart {restart_count}): {e:?}"
+                                    );
+                                    video_frame.close();
+                                    fatal_encode_exit = true;
+                                    restart_count += 1;
+                                    break 'encode;
+                                }
+                                error!("Error encoding screen frame: {e:?}");
+                            }
                         }
                         video_frame.close();
                         screen_frame_counter += 1;

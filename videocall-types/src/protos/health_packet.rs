@@ -18,7 +18,7 @@
 #![allow(unused_results)]
 #![allow(unused_mut)]
 
-//! Generated file from `types/health_packet.proto`
+//! Generated file from `health_packet.proto`
 
 /// Generated files are compatible only with the same version
 /// of protobuf runtime.
@@ -1250,6 +1250,28 @@ pub struct HealthPacket {
     pub step_up_blocked_screen_share: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:health_packet.HealthPacket.tier_dwells)
     pub tier_dwells: ::std::vec::Vec<TierDwell>,
+    ///  Encoder error counters (cumulative, since page load).
+    ///  Server derives per-second rates via Prometheus rate().
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.camera_encoder_errors_closed_codec)
+    pub camera_encoder_errors_closed_codec: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.camera_encoder_errors_vpx_mem_alloc)
+    pub camera_encoder_errors_vpx_mem_alloc: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.camera_encoder_errors_configure_fatal)
+    pub camera_encoder_errors_configure_fatal: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.camera_encoder_errors_generic)
+    pub camera_encoder_errors_generic: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.camera_encoder_frames_submitted_ok)
+    pub camera_encoder_frames_submitted_ok: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_errors_closed_codec)
+    pub screen_encoder_errors_closed_codec: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_errors_vpx_mem_alloc)
+    pub screen_encoder_errors_vpx_mem_alloc: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_errors_configure_fatal)
+    pub screen_encoder_errors_configure_fatal: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_errors_generic)
+    pub screen_encoder_errors_generic: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_frames_submitted_ok)
+    pub screen_encoder_frames_submitted_ok: ::std::option::Option<u64>,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.HealthPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1267,7 +1289,7 @@ impl HealthPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(39);
+        let mut fields = ::std::vec::Vec::with_capacity(49);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "session_id",
@@ -1464,6 +1486,56 @@ impl HealthPacket {
             |m: &HealthPacket| { &m.tier_dwells },
             |m: &mut HealthPacket| { &mut m.tier_dwells },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "camera_encoder_errors_closed_codec",
+            |m: &HealthPacket| { &m.camera_encoder_errors_closed_codec },
+            |m: &mut HealthPacket| { &mut m.camera_encoder_errors_closed_codec },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "camera_encoder_errors_vpx_mem_alloc",
+            |m: &HealthPacket| { &m.camera_encoder_errors_vpx_mem_alloc },
+            |m: &mut HealthPacket| { &mut m.camera_encoder_errors_vpx_mem_alloc },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "camera_encoder_errors_configure_fatal",
+            |m: &HealthPacket| { &m.camera_encoder_errors_configure_fatal },
+            |m: &mut HealthPacket| { &mut m.camera_encoder_errors_configure_fatal },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "camera_encoder_errors_generic",
+            |m: &HealthPacket| { &m.camera_encoder_errors_generic },
+            |m: &mut HealthPacket| { &mut m.camera_encoder_errors_generic },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "camera_encoder_frames_submitted_ok",
+            |m: &HealthPacket| { &m.camera_encoder_frames_submitted_ok },
+            |m: &mut HealthPacket| { &mut m.camera_encoder_frames_submitted_ok },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "screen_encoder_errors_closed_codec",
+            |m: &HealthPacket| { &m.screen_encoder_errors_closed_codec },
+            |m: &mut HealthPacket| { &mut m.screen_encoder_errors_closed_codec },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "screen_encoder_errors_vpx_mem_alloc",
+            |m: &HealthPacket| { &m.screen_encoder_errors_vpx_mem_alloc },
+            |m: &mut HealthPacket| { &mut m.screen_encoder_errors_vpx_mem_alloc },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "screen_encoder_errors_configure_fatal",
+            |m: &HealthPacket| { &m.screen_encoder_errors_configure_fatal },
+            |m: &mut HealthPacket| { &mut m.screen_encoder_errors_configure_fatal },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "screen_encoder_errors_generic",
+            |m: &HealthPacket| { &m.screen_encoder_errors_generic },
+            |m: &mut HealthPacket| { &mut m.screen_encoder_errors_generic },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "screen_encoder_frames_submitted_ok",
+            |m: &HealthPacket| { &m.screen_encoder_frames_submitted_ok },
+            |m: &mut HealthPacket| { &mut m.screen_encoder_frames_submitted_ok },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HealthPacket>(
             "HealthPacket",
             fields,
@@ -1611,6 +1683,36 @@ impl ::protobuf::Message for HealthPacket {
                 346 => {
                     self.tier_dwells.push(is.read_message()?);
                 },
+                352 => {
+                    self.camera_encoder_errors_closed_codec = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                360 => {
+                    self.camera_encoder_errors_vpx_mem_alloc = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                368 => {
+                    self.camera_encoder_errors_configure_fatal = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                376 => {
+                    self.camera_encoder_errors_generic = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                384 => {
+                    self.camera_encoder_frames_submitted_ok = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                392 => {
+                    self.screen_encoder_errors_closed_codec = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                400 => {
+                    self.screen_encoder_errors_vpx_mem_alloc = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                408 => {
+                    self.screen_encoder_errors_configure_fatal = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                416 => {
+                    self.screen_encoder_errors_generic = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                424 => {
+                    self.screen_encoder_frames_submitted_ok = ::std::option::Option::Some(is.read_uint64()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -1746,6 +1848,36 @@ impl ::protobuf::Message for HealthPacket {
             let len = value.compute_size();
             my_size += 2 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         };
+        if let Some(v) = self.camera_encoder_errors_closed_codec {
+            my_size += ::protobuf::rt::uint64_size(44, v);
+        }
+        if let Some(v) = self.camera_encoder_errors_vpx_mem_alloc {
+            my_size += ::protobuf::rt::uint64_size(45, v);
+        }
+        if let Some(v) = self.camera_encoder_errors_configure_fatal {
+            my_size += ::protobuf::rt::uint64_size(46, v);
+        }
+        if let Some(v) = self.camera_encoder_errors_generic {
+            my_size += ::protobuf::rt::uint64_size(47, v);
+        }
+        if let Some(v) = self.camera_encoder_frames_submitted_ok {
+            my_size += ::protobuf::rt::uint64_size(48, v);
+        }
+        if let Some(v) = self.screen_encoder_errors_closed_codec {
+            my_size += ::protobuf::rt::uint64_size(49, v);
+        }
+        if let Some(v) = self.screen_encoder_errors_vpx_mem_alloc {
+            my_size += ::protobuf::rt::uint64_size(50, v);
+        }
+        if let Some(v) = self.screen_encoder_errors_configure_fatal {
+            my_size += ::protobuf::rt::uint64_size(51, v);
+        }
+        if let Some(v) = self.screen_encoder_errors_generic {
+            my_size += ::protobuf::rt::uint64_size(52, v);
+        }
+        if let Some(v) = self.screen_encoder_frames_submitted_ok {
+            my_size += ::protobuf::rt::uint64_size(53, v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -1876,6 +2008,36 @@ impl ::protobuf::Message for HealthPacket {
         for v in &self.tier_dwells {
             ::protobuf::rt::write_message_field_with_cached_size(43, v, os)?;
         };
+        if let Some(v) = self.camera_encoder_errors_closed_codec {
+            os.write_uint64(44, v)?;
+        }
+        if let Some(v) = self.camera_encoder_errors_vpx_mem_alloc {
+            os.write_uint64(45, v)?;
+        }
+        if let Some(v) = self.camera_encoder_errors_configure_fatal {
+            os.write_uint64(46, v)?;
+        }
+        if let Some(v) = self.camera_encoder_errors_generic {
+            os.write_uint64(47, v)?;
+        }
+        if let Some(v) = self.camera_encoder_frames_submitted_ok {
+            os.write_uint64(48, v)?;
+        }
+        if let Some(v) = self.screen_encoder_errors_closed_codec {
+            os.write_uint64(49, v)?;
+        }
+        if let Some(v) = self.screen_encoder_errors_vpx_mem_alloc {
+            os.write_uint64(50, v)?;
+        }
+        if let Some(v) = self.screen_encoder_errors_configure_fatal {
+            os.write_uint64(51, v)?;
+        }
+        if let Some(v) = self.screen_encoder_errors_generic {
+            os.write_uint64(52, v)?;
+        }
+        if let Some(v) = self.screen_encoder_frames_submitted_ok {
+            os.write_uint64(53, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -1932,6 +2094,16 @@ impl ::protobuf::Message for HealthPacket {
         self.step_up_blocked_slowdown = ::std::option::Option::None;
         self.step_up_blocked_screen_share = ::std::option::Option::None;
         self.tier_dwells.clear();
+        self.camera_encoder_errors_closed_codec = ::std::option::Option::None;
+        self.camera_encoder_errors_vpx_mem_alloc = ::std::option::Option::None;
+        self.camera_encoder_errors_configure_fatal = ::std::option::Option::None;
+        self.camera_encoder_errors_generic = ::std::option::Option::None;
+        self.camera_encoder_frames_submitted_ok = ::std::option::Option::None;
+        self.screen_encoder_errors_closed_codec = ::std::option::Option::None;
+        self.screen_encoder_errors_vpx_mem_alloc = ::std::option::Option::None;
+        self.screen_encoder_errors_configure_fatal = ::std::option::Option::None;
+        self.screen_encoder_errors_generic = ::std::option::Option::None;
+        self.screen_encoder_frames_submitted_ok = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -2293,106 +2465,127 @@ impl ::protobuf::reflect::ProtobufValue for TierDwell {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x19types/health_packet.proto\x12\rhealth_packet\"\xa9\x03\n\x16NetEqO\
-    perationCounters\x12$\n\x0enormal_per_sec\x18\x01\x20\x01(\x01R\x0cnorma\
-    lPerSec\x12$\n\x0eexpand_per_sec\x18\x02\x20\x01(\x01R\x0cexpandPerSec\
-    \x12,\n\x12accelerate_per_sec\x18\x03\x20\x01(\x01R\x10acceleratePerSec\
-    \x125\n\x17fast_accelerate_per_sec\x18\x04\x20\x01(\x01R\x14fastAccelera\
-    tePerSec\x129\n\x19preemptive_expand_per_sec\x18\x05\x20\x01(\x01R\x16pr\
-    eemptiveExpandPerSec\x12\"\n\rmerge_per_sec\x18\x06\x20\x01(\x01R\x0bmer\
-    gePerSec\x121\n\x15comfort_noise_per_sec\x18\x07\x20\x01(\x01R\x12comfor\
-    tNoisePerSec\x12\x20\n\x0cdtmf_per_sec\x18\x08\x20\x01(\x01R\ndtmfPerSec\
-    \x12*\n\x11undefined_per_sec\x18\t\x20\x01(\x01R\x0fundefinedPerSec\"d\n\
-    \x0cNetEqNetwork\x12T\n\x12operation_counters\x18\x01\x20\x01(\x0b2%.hea\
-    lth_packet.NetEqOperationCountersR\x11operationCounters\"\x80\x02\n\nNet\
-    EqStats\x123\n\x16current_buffer_size_ms\x18\x01\x20\x01(\x01R\x13curren\
-    tBufferSizeMs\x126\n\x17packets_awaiting_decode\x18\x02\x20\x01(\x01R\
-    \x15packetsAwaitingDecode\x125\n\x07network\x18\x03\x20\x01(\x0b2\x1b.he\
-    alth_packet.NetEqNetworkR\x07network\x12&\n\x0fpackets_per_sec\x18\x04\
-    \x20\x01(\x01R\rpacketsPerSec\x12&\n\x0ftarget_delay_ms\x18\x05\x20\x01(\
-    \x01R\rtargetDelayMs\"\xa2\x01\n\nVideoStats\x12!\n\x0cfps_received\x18\
-    \x01\x20\x01(\x01R\x0bfpsReceived\x12'\n\x0fframes_buffered\x18\x02\x20\
-    \x01(\x01R\x0eframesBuffered\x12%\n\x0eframes_decoded\x18\x03\x20\x01(\
-    \x04R\rframesDecoded\x12!\n\x0cbitrate_kbps\x18\x04\x20\x01(\x04R\x0bbit\
-    rateKbps\"\xbd\x06\n\tPeerStats\x12\x1d\n\ncan_listen\x18\x01\x20\x01(\
-    \x08R\tcanListen\x12\x17\n\x07can_see\x18\x02\x20\x01(\x08R\x06canSee\
-    \x12#\n\raudio_enabled\x18\x03\x20\x01(\x08R\x0caudioEnabled\x12#\n\rvid\
-    eo_enabled\x18\x04\x20\x01(\x08R\x0cvideoEnabled\x12:\n\x0bneteq_stats\
-    \x18\x05\x20\x01(\x0b2\x19.health_packet.NetEqStatsR\nneteqStats\x12:\n\
-    \x0bvideo_stats\x18\x06\x20\x01(\x0b2\x19.health_packet.VideoStatsR\nvid\
-    eoStats\x123\n\x16frames_dropped_per_sec\x18\x07\x20\x01(\x01R\x13frames\
-    DroppedPerSec\x122\n\x15audio_concealment_pct\x18\x08\x20\x01(\x01R\x13a\
-    udioConcealmentPct\x126\n\x15avg_decode_latency_ms\x18\t\x20\x01(\x01H\0\
-    R\x12avgDecodeLatencyMs\x88\x01\x01\x123\n\x13audio_quality_score\x18\n\
-    \x20\x01(\x01H\x01R\x11audioQualityScore\x88\x01\x01\x123\n\x13video_qua\
-    lity_score\x18\x0b\x20\x01(\x01H\x02R\x11videoQualityScore\x88\x01\x01\
-    \x121\n\x12call_quality_score\x18\x0c\x20\x01(\x01H\x03R\x10callQualityS\
-    core\x88\x01\x01\x125\n\x14decoder_errors_total\x18\r\x20\x01(\x04H\x04R\
-    \x12decoderErrorsTotal\x88\x01\x01\x12G\n\x12screen_video_stats\x18\x0e\
-    \x20\x01(\x0b2\x19.health_packet.VideoStatsR\x10screenVideoStatsB\x18\n\
-    \x16_avg_decode_latency_msB\x16\n\x14_audio_quality_scoreB\x16\n\x14_vid\
-    eo_quality_scoreB\x15\n\x13_call_quality_scoreB\x17\n\x15_decoder_errors\
-    _total\"\xf5\x16\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\x01\
-    (\tR\tsessionId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tmeetingId\x12\
-    *\n\x11reporting_user_id\x18\x03\x20\x01(\x0cR\x0freportingUserId\x12!\n\
-    \x0ctimestamp_ms\x18\x04\x20\x01(\x04R\x0btimestampMs\x126\n\x17reportin\
-    g_audio_enabled\x18\x05\x20\x01(\x08R\x15reportingAudioEnabled\x126\n\
-    \x17reporting_video_enabled\x18\x06\x20\x01(\x08R\x15reportingVideoEnabl\
-    ed\x12I\n\npeer_stats\x18\x07\x20\x03(\x0b2*.health_packet.HealthPacket.\
-    PeerStatsEntryR\tpeerStats\x12*\n\x11active_server_url\x18\x08\x20\x01(\
-    \tR\x0factiveServerUrl\x12,\n\x12active_server_type\x18\t\x20\x01(\tR\
-    \x10activeServerType\x12/\n\x14active_server_rtt_ms\x18\n\x20\x01(\x01R\
-    \x11activeServerRttMs\x12$\n\x0eis_tab_visible\x18\x0b\x20\x01(\x08R\x0c\
-    isTabVisible\x12/\n\x11memory_used_bytes\x18\x0c\x20\x01(\x04H\0R\x0fmem\
-    oryUsedBytes\x88\x01\x01\x121\n\x12memory_total_bytes\x18\r\x20\x01(\x04\
-    H\x01R\x10memoryTotalBytes\x88\x01\x01\x126\n\x15avg_encode_latency_ms\
-    \x18\x0e\x20\x01(\x01H\x02R\x12avgEncodeLatencyMs\x88\x01\x01\x12(\n\x10\
-    is_tab_throttled\x18\x0f\x20\x01(\x08R\x0eisTabThrottled\x12-\n\x10send_\
-    queue_bytes\x18\x10\x20\x01(\x04H\x03R\x0esendQueueBytes\x88\x01\x01\x12\
-    <\n\x18packets_received_per_sec\x18\x11\x20\x01(\x01H\x04R\x15packetsRec\
-    eivedPerSec\x88\x01\x01\x124\n\x14packets_sent_per_sec\x18\x12\x20\x01(\
-    \x01H\x05R\x11packetsSentPerSec\x88\x01\x01\x12&\n\x0cdisplay_name\x18\
-    \x13\x20\x01(\tH\x06R\x0bdisplayName\x88\x01\x01\x123\n\x13adaptive_vide\
-    o_tier\x18\x14\x20\x01(\rH\x07R\x11adaptiveVideoTier\x88\x01\x01\x123\n\
-    \x13adaptive_audio_tier\x18\x15\x20\x01(\rH\x08R\x11adaptiveAudioTier\
-    \x88\x01\x01\x125\n\x14datagram_drops_total\x18\x16\x20\x01(\x04H\tR\x12\
-    datagramDropsTotal\x88\x01\x01\x12D\n\x1ckeyframe_requests_sent_total\
-    \x18\x17\x20\x01(\x04H\nR\x19keyframeRequestsSentTotal\x88\x01\x01\x127\
-    \n\x15websocket_drops_total\x18\x18\x20\x01(\x04H\x0bR\x13websocketDrops\
-    Total\x88\x01\x01\x12/\n\x11encoder_fps_ratio\x18\x19\x20\x01(\x01H\x0cR\
-    \x0fencoderFpsRatio\x88\x01\x01\x128\n\x16encoder_worst_peer_fps\x18\x1a\
-    \x20\x01(\x01H\rR\x13encoderWorstPeerFps\x88\x01\x01\x125\n\x14adaptive_\
-    screen_tier\x18\x1b\x20\x01(\rH\x0eR\x12adaptiveScreenTier\x88\x01\x01\
-    \x127\n\x15screen_sharing_active\x18\x1c\x20\x01(\x08H\x0fR\x13screenSha\
-    ringActive\x88\x01\x01\x121\n\x12encoder_output_fps\x18\x1d\x20\x01(\rH\
-    \x10R\x10encoderOutputFps\x88\x01\x01\x12B\n\x1bencoder_target_bitrate_k\
-    bps\x18\x1e\x20\x01(\x01H\x11R\x18encoderTargetBitrateKbps\x88\x01\x01\
-    \x127\n\x15encoder_bitrate_ratio\x18\x1f\x20\x01(\x01H\x12R\x13encoderBi\
-    trateRatio\x88\x01\x01\x12H\n\x10tier_transitions\x18\x20\x20\x03(\x0b2\
-    \x1d.health_packet.TierTransitionR\x0ftierTransitions\x125\n\x14crash_ce\
-    iling_active\x18%\x20\x01(\x08H\x13R\x12crashCeilingActive\x88\x01\x01\
-    \x12<\n\x18crash_ceiling_tier_index\x18&\x20\x01(\rH\x14R\x15crashCeilin\
-    gTierIndex\x88\x01\x01\x128\n\x16crash_ceiling_decay_ms\x18'\x20\x01(\
-    \x01H\x15R\x13crashCeilingDecayMs\x88\x01\x01\x12:\n\x17step_up_blocked_\
-    ceiling\x18(\x20\x01(\x04H\x16R\x14stepUpBlockedCeiling\x88\x01\x01\x12<\
-    \n\x18step_up_blocked_slowdown\x18)\x20\x01(\x04H\x17R\x15stepUpBlockedS\
-    lowdown\x88\x01\x01\x12C\n\x1cstep_up_blocked_screen_share\x18*\x20\x01(\
-    \x04H\x18R\x18stepUpBlockedScreenShare\x88\x01\x01\x129\n\x0btier_dwells\
-    \x18+\x20\x03(\x0b2\x18.health_packet.TierDwellR\ntierDwells\x1aV\n\x0eP\
-    eerStatsEntry\x12\x10\n\x03key\x18\x01\x20\x01(\tR\x03key\x12.\n\x05valu\
-    e\x18\x02\x20\x01(\x0b2\x18.health_packet.PeerStatsR\x05value:\x028\x01B\
-    \x14\n\x12_memory_used_bytesB\x15\n\x13_memory_total_bytesB\x18\n\x16_av\
-    g_encode_latency_msB\x13\n\x11_send_queue_bytesB\x1b\n\x19_packets_recei\
-    ved_per_secB\x17\n\x15_packets_sent_per_secB\x0f\n\r_display_nameB\x16\n\
-    \x14_adaptive_video_tierB\x16\n\x14_adaptive_audio_tierB\x17\n\x15_datag\
-    ram_drops_totalB\x1f\n\x1d_keyframe_requests_sent_totalB\x18\n\x16_webso\
-    cket_drops_totalB\x14\n\x12_encoder_fps_ratioB\x19\n\x17_encoder_worst_p\
-    eer_fpsB\x17\n\x15_adaptive_screen_tierB\x18\n\x16_screen_sharing_active\
-    B\x15\n\x13_encoder_output_fpsB\x1e\n\x1c_encoder_target_bitrate_kbpsB\
-    \x18\n\x16_encoder_bitrate_ratioB\x17\n\x15_crash_ceiling_activeB\x1b\n\
-    \x19_crash_ceiling_tier_indexB\x19\n\x17_crash_ceiling_decay_msB\x1a\n\
-    \x18_step_up_blocked_ceilingB\x1b\n\x19_step_up_blocked_slowdownB\x1f\n\
-    \x1d_step_up_blocked_screen_shareJ\x04\x08!\x10\"J\x04\x08\"\x10#J\x04\
+    \n\x13health_packet.proto\x12\rhealth_packet\"\xa9\x03\n\x16NetEqOperati\
+    onCounters\x12$\n\x0enormal_per_sec\x18\x01\x20\x01(\x01R\x0cnormalPerSe\
+    c\x12$\n\x0eexpand_per_sec\x18\x02\x20\x01(\x01R\x0cexpandPerSec\x12,\n\
+    \x12accelerate_per_sec\x18\x03\x20\x01(\x01R\x10acceleratePerSec\x125\n\
+    \x17fast_accelerate_per_sec\x18\x04\x20\x01(\x01R\x14fastAcceleratePerSe\
+    c\x129\n\x19preemptive_expand_per_sec\x18\x05\x20\x01(\x01R\x16preemptiv\
+    eExpandPerSec\x12\"\n\rmerge_per_sec\x18\x06\x20\x01(\x01R\x0bmergePerSe\
+    c\x121\n\x15comfort_noise_per_sec\x18\x07\x20\x01(\x01R\x12comfortNoiseP\
+    erSec\x12\x20\n\x0cdtmf_per_sec\x18\x08\x20\x01(\x01R\ndtmfPerSec\x12*\n\
+    \x11undefined_per_sec\x18\t\x20\x01(\x01R\x0fundefinedPerSec\"d\n\x0cNet\
+    EqNetwork\x12T\n\x12operation_counters\x18\x01\x20\x01(\x0b2%.health_pac\
+    ket.NetEqOperationCountersR\x11operationCounters\"\x80\x02\n\nNetEqStats\
+    \x123\n\x16current_buffer_size_ms\x18\x01\x20\x01(\x01R\x13currentBuffer\
+    SizeMs\x126\n\x17packets_awaiting_decode\x18\x02\x20\x01(\x01R\x15packet\
+    sAwaitingDecode\x125\n\x07network\x18\x03\x20\x01(\x0b2\x1b.health_packe\
+    t.NetEqNetworkR\x07network\x12&\n\x0fpackets_per_sec\x18\x04\x20\x01(\
+    \x01R\rpacketsPerSec\x12&\n\x0ftarget_delay_ms\x18\x05\x20\x01(\x01R\rta\
+    rgetDelayMs\"\xa2\x01\n\nVideoStats\x12!\n\x0cfps_received\x18\x01\x20\
+    \x01(\x01R\x0bfpsReceived\x12'\n\x0fframes_buffered\x18\x02\x20\x01(\x01\
+    R\x0eframesBuffered\x12%\n\x0eframes_decoded\x18\x03\x20\x01(\x04R\rfram\
+    esDecoded\x12!\n\x0cbitrate_kbps\x18\x04\x20\x01(\x04R\x0bbitrateKbps\"\
+    \xbd\x06\n\tPeerStats\x12\x1d\n\ncan_listen\x18\x01\x20\x01(\x08R\tcanLi\
+    sten\x12\x17\n\x07can_see\x18\x02\x20\x01(\x08R\x06canSee\x12#\n\raudio_\
+    enabled\x18\x03\x20\x01(\x08R\x0caudioEnabled\x12#\n\rvideo_enabled\x18\
+    \x04\x20\x01(\x08R\x0cvideoEnabled\x12:\n\x0bneteq_stats\x18\x05\x20\x01\
+    (\x0b2\x19.health_packet.NetEqStatsR\nneteqStats\x12:\n\x0bvideo_stats\
+    \x18\x06\x20\x01(\x0b2\x19.health_packet.VideoStatsR\nvideoStats\x123\n\
+    \x16frames_dropped_per_sec\x18\x07\x20\x01(\x01R\x13framesDroppedPerSec\
+    \x122\n\x15audio_concealment_pct\x18\x08\x20\x01(\x01R\x13audioConcealme\
+    ntPct\x126\n\x15avg_decode_latency_ms\x18\t\x20\x01(\x01H\0R\x12avgDecod\
+    eLatencyMs\x88\x01\x01\x123\n\x13audio_quality_score\x18\n\x20\x01(\x01H\
+    \x01R\x11audioQualityScore\x88\x01\x01\x123\n\x13video_quality_score\x18\
+    \x0b\x20\x01(\x01H\x02R\x11videoQualityScore\x88\x01\x01\x121\n\x12call_\
+    quality_score\x18\x0c\x20\x01(\x01H\x03R\x10callQualityScore\x88\x01\x01\
+    \x125\n\x14decoder_errors_total\x18\r\x20\x01(\x04H\x04R\x12decoderError\
+    sTotal\x88\x01\x01\x12G\n\x12screen_video_stats\x18\x0e\x20\x01(\x0b2\
+    \x19.health_packet.VideoStatsR\x10screenVideoStatsB\x18\n\x16_avg_decode\
+    _latency_msB\x16\n\x14_audio_quality_scoreB\x16\n\x14_video_quality_scor\
+    eB\x15\n\x13_call_quality_scoreB\x17\n\x15_decoder_errors_total\"\x9f\
+    \x20\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\x01(\tR\tsessio\
+    nId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tmeetingId\x12*\n\x11repor\
+    ting_user_id\x18\x03\x20\x01(\x0cR\x0freportingUserId\x12!\n\x0ctimestam\
+    p_ms\x18\x04\x20\x01(\x04R\x0btimestampMs\x126\n\x17reporting_audio_enab\
+    led\x18\x05\x20\x01(\x08R\x15reportingAudioEnabled\x126\n\x17reporting_v\
+    ideo_enabled\x18\x06\x20\x01(\x08R\x15reportingVideoEnabled\x12I\n\npeer\
+    _stats\x18\x07\x20\x03(\x0b2*.health_packet.HealthPacket.PeerStatsEntryR\
+    \tpeerStats\x12*\n\x11active_server_url\x18\x08\x20\x01(\tR\x0factiveSer\
+    verUrl\x12,\n\x12active_server_type\x18\t\x20\x01(\tR\x10activeServerTyp\
+    e\x12/\n\x14active_server_rtt_ms\x18\n\x20\x01(\x01R\x11activeServerRttM\
+    s\x12$\n\x0eis_tab_visible\x18\x0b\x20\x01(\x08R\x0cisTabVisible\x12/\n\
+    \x11memory_used_bytes\x18\x0c\x20\x01(\x04H\0R\x0fmemoryUsedBytes\x88\
+    \x01\x01\x121\n\x12memory_total_bytes\x18\r\x20\x01(\x04H\x01R\x10memory\
+    TotalBytes\x88\x01\x01\x126\n\x15avg_encode_latency_ms\x18\x0e\x20\x01(\
+    \x01H\x02R\x12avgEncodeLatencyMs\x88\x01\x01\x12(\n\x10is_tab_throttled\
+    \x18\x0f\x20\x01(\x08R\x0eisTabThrottled\x12-\n\x10send_queue_bytes\x18\
+    \x10\x20\x01(\x04H\x03R\x0esendQueueBytes\x88\x01\x01\x12<\n\x18packets_\
+    received_per_sec\x18\x11\x20\x01(\x01H\x04R\x15packetsReceivedPerSec\x88\
+    \x01\x01\x124\n\x14packets_sent_per_sec\x18\x12\x20\x01(\x01H\x05R\x11pa\
+    cketsSentPerSec\x88\x01\x01\x12&\n\x0cdisplay_name\x18\x13\x20\x01(\tH\
+    \x06R\x0bdisplayName\x88\x01\x01\x123\n\x13adaptive_video_tier\x18\x14\
+    \x20\x01(\rH\x07R\x11adaptiveVideoTier\x88\x01\x01\x123\n\x13adaptive_au\
+    dio_tier\x18\x15\x20\x01(\rH\x08R\x11adaptiveAudioTier\x88\x01\x01\x125\
+    \n\x14datagram_drops_total\x18\x16\x20\x01(\x04H\tR\x12datagramDropsTota\
+    l\x88\x01\x01\x12D\n\x1ckeyframe_requests_sent_total\x18\x17\x20\x01(\
+    \x04H\nR\x19keyframeRequestsSentTotal\x88\x01\x01\x127\n\x15websocket_dr\
+    ops_total\x18\x18\x20\x01(\x04H\x0bR\x13websocketDropsTotal\x88\x01\x01\
+    \x12/\n\x11encoder_fps_ratio\x18\x19\x20\x01(\x01H\x0cR\x0fencoderFpsRat\
+    io\x88\x01\x01\x128\n\x16encoder_worst_peer_fps\x18\x1a\x20\x01(\x01H\rR\
+    \x13encoderWorstPeerFps\x88\x01\x01\x125\n\x14adaptive_screen_tier\x18\
+    \x1b\x20\x01(\rH\x0eR\x12adaptiveScreenTier\x88\x01\x01\x127\n\x15screen\
+    _sharing_active\x18\x1c\x20\x01(\x08H\x0fR\x13screenSharingActive\x88\
+    \x01\x01\x121\n\x12encoder_output_fps\x18\x1d\x20\x01(\rH\x10R\x10encode\
+    rOutputFps\x88\x01\x01\x12B\n\x1bencoder_target_bitrate_kbps\x18\x1e\x20\
+    \x01(\x01H\x11R\x18encoderTargetBitrateKbps\x88\x01\x01\x127\n\x15encode\
+    r_bitrate_ratio\x18\x1f\x20\x01(\x01H\x12R\x13encoderBitrateRatio\x88\
+    \x01\x01\x12H\n\x10tier_transitions\x18\x20\x20\x03(\x0b2\x1d.health_pac\
+    ket.TierTransitionR\x0ftierTransitions\x125\n\x14crash_ceiling_active\
+    \x18%\x20\x01(\x08H\x13R\x12crashCeilingActive\x88\x01\x01\x12<\n\x18cra\
+    sh_ceiling_tier_index\x18&\x20\x01(\rH\x14R\x15crashCeilingTierIndex\x88\
+    \x01\x01\x128\n\x16crash_ceiling_decay_ms\x18'\x20\x01(\x01H\x15R\x13cra\
+    shCeilingDecayMs\x88\x01\x01\x12:\n\x17step_up_blocked_ceiling\x18(\x20\
+    \x01(\x04H\x16R\x14stepUpBlockedCeiling\x88\x01\x01\x12<\n\x18step_up_bl\
+    ocked_slowdown\x18)\x20\x01(\x04H\x17R\x15stepUpBlockedSlowdown\x88\x01\
+    \x01\x12C\n\x1cstep_up_blocked_screen_share\x18*\x20\x01(\x04H\x18R\x18s\
+    tepUpBlockedScreenShare\x88\x01\x01\x129\n\x0btier_dwells\x18+\x20\x03(\
+    \x0b2\x18.health_packet.TierDwellR\ntierDwells\x12O\n\"camera_encoder_er\
+    rors_closed_codec\x18,\x20\x01(\x04H\x19R\x1ecameraEncoderErrorsClosedCo\
+    dec\x88\x01\x01\x12P\n#camera_encoder_errors_vpx_mem_alloc\x18-\x20\x01(\
+    \x04H\x1aR\x1ecameraEncoderErrorsVpxMemAlloc\x88\x01\x01\x12U\n%camera_e\
+    ncoder_errors_configure_fatal\x18.\x20\x01(\x04H\x1bR!cameraEncoderError\
+    sConfigureFatal\x88\x01\x01\x12F\n\x1dcamera_encoder_errors_generic\x18/\
+    \x20\x01(\x04H\x1cR\x1acameraEncoderErrorsGeneric\x88\x01\x01\x12O\n\"ca\
+    mera_encoder_frames_submitted_ok\x180\x20\x01(\x04H\x1dR\x1ecameraEncode\
+    rFramesSubmittedOk\x88\x01\x01\x12O\n\"screen_encoder_errors_closed_code\
+    c\x181\x20\x01(\x04H\x1eR\x1escreenEncoderErrorsClosedCodec\x88\x01\x01\
+    \x12P\n#screen_encoder_errors_vpx_mem_alloc\x182\x20\x01(\x04H\x1fR\x1es\
+    creenEncoderErrorsVpxMemAlloc\x88\x01\x01\x12U\n%screen_encoder_errors_c\
+    onfigure_fatal\x183\x20\x01(\x04H\x20R!screenEncoderErrorsConfigureFatal\
+    \x88\x01\x01\x12F\n\x1dscreen_encoder_errors_generic\x184\x20\x01(\x04H!\
+    R\x1ascreenEncoderErrorsGeneric\x88\x01\x01\x12O\n\"screen_encoder_frame\
+    s_submitted_ok\x185\x20\x01(\x04H\"R\x1escreenEncoderFramesSubmittedOk\
+    \x88\x01\x01\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03key\x18\x01\x20\x01(\
+    \tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.health_packet.PeerS\
+    tatsR\x05value:\x028\x01B\x14\n\x12_memory_used_bytesB\x15\n\x13_memory_\
+    total_bytesB\x18\n\x16_avg_encode_latency_msB\x13\n\x11_send_queue_bytes\
+    B\x1b\n\x19_packets_received_per_secB\x17\n\x15_packets_sent_per_secB\
+    \x0f\n\r_display_nameB\x16\n\x14_adaptive_video_tierB\x16\n\x14_adaptive\
+    _audio_tierB\x17\n\x15_datagram_drops_totalB\x1f\n\x1d_keyframe_requests\
+    _sent_totalB\x18\n\x16_websocket_drops_totalB\x14\n\x12_encoder_fps_rati\
+    oB\x19\n\x17_encoder_worst_peer_fpsB\x17\n\x15_adaptive_screen_tierB\x18\
+    \n\x16_screen_sharing_activeB\x15\n\x13_encoder_output_fpsB\x1e\n\x1c_en\
+    coder_target_bitrate_kbpsB\x18\n\x16_encoder_bitrate_ratioB\x17\n\x15_cr\
+    ash_ceiling_activeB\x1b\n\x19_crash_ceiling_tier_indexB\x19\n\x17_crash_\
+    ceiling_decay_msB\x1a\n\x18_step_up_blocked_ceilingB\x1b\n\x19_step_up_b\
+    locked_slowdownB\x1f\n\x1d_step_up_blocked_screen_shareB%\n#_camera_enco\
+    der_errors_closed_codecB&\n$_camera_encoder_errors_vpx_mem_allocB(\n&_ca\
+    mera_encoder_errors_configure_fatalB\x20\n\x1e_camera_encoder_errors_gen\
+    ericB%\n#_camera_encoder_frames_submitted_okB%\n#_screen_encoder_errors_\
+    closed_codecB&\n$_screen_encoder_errors_vpx_mem_allocB(\n&_screen_encode\
+    r_errors_configure_fatalB\x20\n\x1e_screen_encoder_errors_genericB%\n#_s\
+    creen_encoder_frames_submitted_okJ\x04\x08!\x10\"J\x04\x08\"\x10#J\x04\
     \x08#\x10$J\x04\x08$\x10%R\x13join_bandwidth_kbpsR\x0bjoin_rtt_msR\x0ejo\
     in_jitter_msR\x14join_packet_loss_pct\"\x96\x01\n\x0eTierTransition\x12\
     \x1c\n\tdirection\x18\x01\x20\x01(\tR\tdirection\x12\x16\n\x06stream\x18\
@@ -2400,7 +2593,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     romTier\x12\x17\n\x07to_tier\x18\x04\x20\x01(\tR\x06toTier\x12\x18\n\x07\
     trigger\x18\x05\x20\x01(\tR\x07trigger\":\n\tTierDwell\x12\x12\n\x04tier\
     \x18\x01\x20\x01(\tR\x04tier\x12\x19\n\x08dwell_ms\x18\x02\x20\x01(\x01R\
-    \x07dwellMsJ\x8aE\n\x07\x12\x05\0\0\x95\x01\x01\n\x08\n\x01\x0c\x12\x03\
+    \x07dwellMsJ\xdfK\n\x07\x12\x05\0\0\xa2\x01\x01\n\x08\n\x01\x0c\x12\x03\
     \0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\x16\n\n\n\x02\x04\0\x12\x04\x04\0\
     \x0e\x01\n\n\n\x03\x04\0\x01\x12\x03\x04\x08\x1e\n\x0b\n\x04\x04\0\x02\0\
     \x12\x03\x05\x02\x1c\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x05\x02\x08\n\
@@ -2524,7 +2717,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x20(separate\x20from\x20camera\x20video_stats\x20field\x206)\n\n\x0c\n\
     \x05\x04\x04\x02\r\x06\x12\x03D\x02\x0c\n\x0c\n\x05\x04\x04\x02\r\x01\
     \x12\x03D\r\x1f\n\x0c\n\x05\x04\x04\x02\r\x03\x12\x03D\"$\n\x0b\n\x02\
-    \x04\x05\x12\x05G\0\x88\x01\x01\n\n\n\x03\x04\x05\x01\x12\x03G\x08\x14\n\
+    \x04\x05\x12\x05G\0\x95\x01\x01\n\n\n\x03\x04\x05\x01\x12\x03G\x08\x14\n\
     \x0b\n\x04\x04\x05\x02\0\x12\x03H\x02\x18\n\x0c\n\x05\x04\x05\x02\0\x05\
     \x12\x03H\x02\x08\n\x0c\n\x05\x04\x05\x02\0\x01\x12\x03H\t\x13\n\x0c\n\
     \x05\x04\x05\x02\0\x03\x12\x03H\x16\x17\n\x0b\n\x04\x04\x05\x02\x01\x12\
@@ -2695,36 +2888,72 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x02&\x12\x04\x87\x01\x02&\"&\x20Tier\x20dwell\x20samples\x20since\x20la\
     st\x20packet\n\n\r\n\x05\x04\x05\x02&\x04\x12\x04\x87\x01\x02\n\n\r\n\
     \x05\x04\x05\x02&\x06\x12\x04\x87\x01\x0b\x14\n\r\n\x05\x04\x05\x02&\x01\
-    \x12\x04\x87\x01\x15\x20\n\r\n\x05\x04\x05\x02&\x03\x12\x04\x87\x01#%\n\
-    \x0c\n\x02\x04\x06\x12\x06\x8a\x01\0\x90\x01\x01\n\x0b\n\x03\x04\x06\x01\
-    \x12\x04\x8a\x01\x08\x16\n\x1e\n\x04\x04\x06\x02\0\x12\x04\x8b\x01\x02\
-    \x17\"\x10\x20\"up\"\x20or\x20\"down\"\n\n\r\n\x05\x04\x06\x02\0\x05\x12\
-    \x04\x8b\x01\x02\x08\n\r\n\x05\x04\x06\x02\0\x01\x12\x04\x8b\x01\t\x12\n\
-    \r\n\x05\x04\x06\x02\0\x03\x12\x04\x8b\x01\x15\x16\n*\n\x04\x04\x06\x02\
-    \x01\x12\x04\x8c\x01\x02\x14\"\x1c\x20\"video\",\x20\"audio\",\x20\"scre\
-    en\"\n\n\r\n\x05\x04\x06\x02\x01\x05\x12\x04\x8c\x01\x02\x08\n\r\n\x05\
-    \x04\x06\x02\x01\x01\x12\x04\x8c\x01\t\x0f\n\r\n\x05\x04\x06\x02\x01\x03\
-    \x12\x04\x8c\x01\x12\x13\n9\n\x04\x04\x06\x02\x02\x12\x04\x8d\x01\x02\
-    \x17\"+\x20tier\x20label\x20e.g.\x20\"hd_1080p\",\x20\"medium_480p\"\n\n\
-    \r\n\x05\x04\x06\x02\x02\x05\x12\x04\x8d\x01\x02\x08\n\r\n\x05\x04\x06\
-    \x02\x02\x01\x12\x04\x8d\x01\t\x12\n\r\n\x05\x04\x06\x02\x02\x03\x12\x04\
-    \x8d\x01\x15\x16\n\x1a\n\x04\x04\x06\x02\x03\x12\x04\x8e\x01\x02\x15\"\
-    \x0c\x20tier\x20label\n\n\r\n\x05\x04\x06\x02\x03\x05\x12\x04\x8e\x01\
-    \x02\x08\n\r\n\x05\x04\x06\x02\x03\x01\x12\x04\x8e\x01\t\x10\n\r\n\x05\
-    \x04\x06\x02\x03\x03\x12\x04\x8e\x01\x13\x14\n>\n\x04\x04\x06\x02\x04\
-    \x12\x04\x8f\x01\x02\x15\"0\x20\"fps\",\x20\"bitrate\",\x20\"congestion\
-    \",\x20\"coordination\"\n\n\r\n\x05\x04\x06\x02\x04\x05\x12\x04\x8f\x01\
-    \x02\x08\n\r\n\x05\x04\x06\x02\x04\x01\x12\x04\x8f\x01\t\x10\n\r\n\x05\
-    \x04\x06\x02\x04\x03\x12\x04\x8f\x01\x13\x14\n\x0c\n\x02\x04\x07\x12\x06\
-    \x92\x01\0\x95\x01\x01\n\x0b\n\x03\x04\x07\x01\x12\x04\x92\x01\x08\x11\n\
-    ,\n\x04\x04\x07\x02\0\x12\x04\x93\x01\x02\x12\"\x1e\x20Tier\x20label\x20\
-    (e.g.\x20\"hd_1080p\")\n\n\r\n\x05\x04\x07\x02\0\x05\x12\x04\x93\x01\x02\
-    \x08\n\r\n\x05\x04\x07\x02\0\x01\x12\x04\x93\x01\t\r\n\r\n\x05\x04\x07\
-    \x02\0\x03\x12\x04\x93\x01\x10\x11\n<\n\x04\x04\x07\x02\x01\x12\x04\x94\
+    \x12\x04\x87\x01\x15\x20\n\r\n\x05\x04\x05\x02&\x03\x12\x04\x87\x01#%\n}\
+    \n\x04\x04\x05\x02'\x12\x04\x8b\x01\x02:\x1ao\x20Encoder\x20error\x20cou\
+    nters\x20(cumulative,\x20since\x20page\x20load).\n\x20Server\x20derives\
+    \x20per-second\x20rates\x20via\x20Prometheus\x20rate().\n\n\r\n\x05\x04\
+    \x05\x02'\x04\x12\x04\x8b\x01\x02\n\n\r\n\x05\x04\x05\x02'\x05\x12\x04\
+    \x8b\x01\x0b\x11\n\r\n\x05\x04\x05\x02'\x01\x12\x04\x8b\x01\x124\n\r\n\
+    \x05\x04\x05\x02'\x03\x12\x04\x8b\x0179\n\x0c\n\x04\x04\x05\x02(\x12\x04\
+    \x8c\x01\x02;\n\r\n\x05\x04\x05\x02(\x04\x12\x04\x8c\x01\x02\n\n\r\n\x05\
+    \x04\x05\x02(\x05\x12\x04\x8c\x01\x0b\x11\n\r\n\x05\x04\x05\x02(\x01\x12\
+    \x04\x8c\x01\x125\n\r\n\x05\x04\x05\x02(\x03\x12\x04\x8c\x018:\n\x0c\n\
+    \x04\x04\x05\x02)\x12\x04\x8d\x01\x02=\n\r\n\x05\x04\x05\x02)\x04\x12\
+    \x04\x8d\x01\x02\n\n\r\n\x05\x04\x05\x02)\x05\x12\x04\x8d\x01\x0b\x11\n\
+    \r\n\x05\x04\x05\x02)\x01\x12\x04\x8d\x01\x127\n\r\n\x05\x04\x05\x02)\
+    \x03\x12\x04\x8d\x01:<\n\x0c\n\x04\x04\x05\x02*\x12\x04\x8e\x01\x025\n\r\
+    \n\x05\x04\x05\x02*\x04\x12\x04\x8e\x01\x02\n\n\r\n\x05\x04\x05\x02*\x05\
+    \x12\x04\x8e\x01\x0b\x11\n\r\n\x05\x04\x05\x02*\x01\x12\x04\x8e\x01\x12/\
+    \n\r\n\x05\x04\x05\x02*\x03\x12\x04\x8e\x0124\n\x0c\n\x04\x04\x05\x02+\
+    \x12\x04\x8f\x01\x02:\n\r\n\x05\x04\x05\x02+\x04\x12\x04\x8f\x01\x02\n\n\
+    \r\n\x05\x04\x05\x02+\x05\x12\x04\x8f\x01\x0b\x11\n\r\n\x05\x04\x05\x02+\
+    \x01\x12\x04\x8f\x01\x124\n\r\n\x05\x04\x05\x02+\x03\x12\x04\x8f\x0179\n\
+    \x0c\n\x04\x04\x05\x02,\x12\x04\x90\x01\x02:\n\r\n\x05\x04\x05\x02,\x04\
+    \x12\x04\x90\x01\x02\n\n\r\n\x05\x04\x05\x02,\x05\x12\x04\x90\x01\x0b\
+    \x11\n\r\n\x05\x04\x05\x02,\x01\x12\x04\x90\x01\x124\n\r\n\x05\x04\x05\
+    \x02,\x03\x12\x04\x90\x0179\n\x0c\n\x04\x04\x05\x02-\x12\x04\x91\x01\x02\
+    ;\n\r\n\x05\x04\x05\x02-\x04\x12\x04\x91\x01\x02\n\n\r\n\x05\x04\x05\x02\
+    -\x05\x12\x04\x91\x01\x0b\x11\n\r\n\x05\x04\x05\x02-\x01\x12\x04\x91\x01\
+    \x125\n\r\n\x05\x04\x05\x02-\x03\x12\x04\x91\x018:\n\x0c\n\x04\x04\x05\
+    \x02.\x12\x04\x92\x01\x02=\n\r\n\x05\x04\x05\x02.\x04\x12\x04\x92\x01\
+    \x02\n\n\r\n\x05\x04\x05\x02.\x05\x12\x04\x92\x01\x0b\x11\n\r\n\x05\x04\
+    \x05\x02.\x01\x12\x04\x92\x01\x127\n\r\n\x05\x04\x05\x02.\x03\x12\x04\
+    \x92\x01:<\n\x0c\n\x04\x04\x05\x02/\x12\x04\x93\x01\x025\n\r\n\x05\x04\
+    \x05\x02/\x04\x12\x04\x93\x01\x02\n\n\r\n\x05\x04\x05\x02/\x05\x12\x04\
+    \x93\x01\x0b\x11\n\r\n\x05\x04\x05\x02/\x01\x12\x04\x93\x01\x12/\n\r\n\
+    \x05\x04\x05\x02/\x03\x12\x04\x93\x0124\n\x0c\n\x04\x04\x05\x020\x12\x04\
+    \x94\x01\x02:\n\r\n\x05\x04\x05\x020\x04\x12\x04\x94\x01\x02\n\n\r\n\x05\
+    \x04\x05\x020\x05\x12\x04\x94\x01\x0b\x11\n\r\n\x05\x04\x05\x020\x01\x12\
+    \x04\x94\x01\x124\n\r\n\x05\x04\x05\x020\x03\x12\x04\x94\x0179\n\x0c\n\
+    \x02\x04\x06\x12\x06\x97\x01\0\x9d\x01\x01\n\x0b\n\x03\x04\x06\x01\x12\
+    \x04\x97\x01\x08\x16\n\x1e\n\x04\x04\x06\x02\0\x12\x04\x98\x01\x02\x17\"\
+    \x10\x20\"up\"\x20or\x20\"down\"\n\n\r\n\x05\x04\x06\x02\0\x05\x12\x04\
+    \x98\x01\x02\x08\n\r\n\x05\x04\x06\x02\0\x01\x12\x04\x98\x01\t\x12\n\r\n\
+    \x05\x04\x06\x02\0\x03\x12\x04\x98\x01\x15\x16\n*\n\x04\x04\x06\x02\x01\
+    \x12\x04\x99\x01\x02\x14\"\x1c\x20\"video\",\x20\"audio\",\x20\"screen\"\
+    \n\n\r\n\x05\x04\x06\x02\x01\x05\x12\x04\x99\x01\x02\x08\n\r\n\x05\x04\
+    \x06\x02\x01\x01\x12\x04\x99\x01\t\x0f\n\r\n\x05\x04\x06\x02\x01\x03\x12\
+    \x04\x99\x01\x12\x13\n9\n\x04\x04\x06\x02\x02\x12\x04\x9a\x01\x02\x17\"+\
+    \x20tier\x20label\x20e.g.\x20\"hd_1080p\",\x20\"medium_480p\"\n\n\r\n\
+    \x05\x04\x06\x02\x02\x05\x12\x04\x9a\x01\x02\x08\n\r\n\x05\x04\x06\x02\
+    \x02\x01\x12\x04\x9a\x01\t\x12\n\r\n\x05\x04\x06\x02\x02\x03\x12\x04\x9a\
+    \x01\x15\x16\n\x1a\n\x04\x04\x06\x02\x03\x12\x04\x9b\x01\x02\x15\"\x0c\
+    \x20tier\x20label\n\n\r\n\x05\x04\x06\x02\x03\x05\x12\x04\x9b\x01\x02\
+    \x08\n\r\n\x05\x04\x06\x02\x03\x01\x12\x04\x9b\x01\t\x10\n\r\n\x05\x04\
+    \x06\x02\x03\x03\x12\x04\x9b\x01\x13\x14\n>\n\x04\x04\x06\x02\x04\x12\
+    \x04\x9c\x01\x02\x15\"0\x20\"fps\",\x20\"bitrate\",\x20\"congestion\",\
+    \x20\"coordination\"\n\n\r\n\x05\x04\x06\x02\x04\x05\x12\x04\x9c\x01\x02\
+    \x08\n\r\n\x05\x04\x06\x02\x04\x01\x12\x04\x9c\x01\t\x10\n\r\n\x05\x04\
+    \x06\x02\x04\x03\x12\x04\x9c\x01\x13\x14\n\x0c\n\x02\x04\x07\x12\x06\x9f\
+    \x01\0\xa2\x01\x01\n\x0b\n\x03\x04\x07\x01\x12\x04\x9f\x01\x08\x11\n,\n\
+    \x04\x04\x07\x02\0\x12\x04\xa0\x01\x02\x12\"\x1e\x20Tier\x20label\x20(e.\
+    g.\x20\"hd_1080p\")\n\n\r\n\x05\x04\x07\x02\0\x05\x12\x04\xa0\x01\x02\
+    \x08\n\r\n\x05\x04\x07\x02\0\x01\x12\x04\xa0\x01\t\r\n\r\n\x05\x04\x07\
+    \x02\0\x03\x12\x04\xa0\x01\x10\x11\n<\n\x04\x04\x07\x02\x01\x12\x04\xa1\
     \x01\x02\x16\".\x20Time\x20spent\x20in\x20this\x20tier\x20before\x20tran\
-    sitioning\n\n\r\n\x05\x04\x07\x02\x01\x05\x12\x04\x94\x01\x02\x08\n\r\n\
-    \x05\x04\x07\x02\x01\x01\x12\x04\x94\x01\t\x11\n\r\n\x05\x04\x07\x02\x01\
-    \x03\x12\x04\x94\x01\x14\x15b\x06proto3\
+    sitioning\n\n\r\n\x05\x04\x07\x02\x01\x05\x12\x04\xa1\x01\x02\x08\n\r\n\
+    \x05\x04\x07\x02\x01\x01\x12\x04\xa1\x01\t\x11\n\r\n\x05\x04\x07\x02\x01\
+    \x03\x12\x04\xa1\x01\x14\x15b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

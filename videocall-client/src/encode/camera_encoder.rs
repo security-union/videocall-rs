@@ -26,9 +26,38 @@ use log::error;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+
+// ── Encoder error observability counters (cumulative, since page load) ───────
+// These use the same global-static pattern as `keyframe_requests_sent_count` in
+// peer_decode_manager.rs: global AtomicU64 + public getter. The health reporter
+// reads these each tick and includes them in the protobuf health packet so
+// Prometheus/Grafana can derive per-second rates via `rate()`.
+
+static CAMERA_ENCODER_ERRORS_CLOSED_CODEC: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
+
+pub fn camera_encoder_errors_closed_codec() -> u64 {
+    CAMERA_ENCODER_ERRORS_CLOSED_CODEC.load(Ordering::Relaxed)
+}
+pub fn camera_encoder_errors_vpx_mem_alloc() -> u64 {
+    CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC.load(Ordering::Relaxed)
+}
+pub fn camera_encoder_errors_configure_fatal() -> u64 {
+    CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.load(Ordering::Relaxed)
+}
+pub fn camera_encoder_errors_generic() -> u64 {
+    CAMERA_ENCODER_ERRORS_GENERIC.load(Ordering::Relaxed)
+}
+pub fn camera_encoder_frames_submitted_ok() -> u64 {
+    CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
+}
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -53,6 +82,7 @@ use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
+use super::classify_encode_error::{classify_encode_error, EncodeErrorBucket};
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
@@ -647,6 +677,7 @@ impl CameraEncoder {
                 video_encoder_config.set_latency_mode(LatencyMode::Realtime);
 
                 if let Err(e) = video_encoder.configure(&video_encoder_config) {
+                    CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                     if is_fatal_encoder_error(&e) {
                         error!("CameraEncoder: fatal configure error before encode loop, restarting: {e:?}");
                         let _ = video_encoder.close();
@@ -749,6 +780,7 @@ impl CameraEncoder {
                         new_config.set_bitrate(local_bitrate as f64);
                         new_config.set_latency_mode(LatencyMode::Realtime);
                         if let Err(e) = video_encoder.configure(&new_config) {
+                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                             if is_fatal_encoder_error(&e) {
                                 error!("CameraEncoder: fatal configure error, restarting: {e:?}");
                                 restart_count += 1;
@@ -779,6 +811,7 @@ impl CameraEncoder {
                         local_bitrate = new_current_bitrate;
                         video_encoder_config.set_bitrate(local_bitrate as f64);
                         if let Err(e) = video_encoder.configure(&video_encoder_config) {
+                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                             if is_fatal_encoder_error(&e) {
                                 error!("CameraEncoder: fatal configure error, restarting: {e:?}");
                                 restart_count += 1;
@@ -838,6 +871,8 @@ impl CameraEncoder {
                                 new_config.set_bitrate(local_bitrate as f64);
                                 new_config.set_latency_mode(LatencyMode::Realtime);
                                 if let Err(e) = video_encoder.configure(&new_config) {
+                                    CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                        .fetch_add(1, Ordering::Relaxed);
                                     if is_fatal_encoder_error(&e) {
                                         error!("CameraEncoder: fatal configure error, restarting: {e:?}");
                                         restart_count += 1;
@@ -868,29 +903,49 @@ impl CameraEncoder {
                                     video_frame_counter
                                 );
                             }
-                            if let Err(e) = video_encoder
+                            match video_encoder
                                 .encode_with_options(&video_frame, &video_encoder_encode_options)
                             {
-                                if is_fatal_encoder_error(&e) {
-                                    error!(
-                                        "CameraEncoder: fatal encode error (restart {restart_count}): {e:?}"
-                                    );
-                                    video_frame.close();
-                                    restart_count += 1;
-                                    break 'encode;
+                                Ok(_) => {
+                                    CAMERA_ENCODER_FRAMES_SUBMITTED_OK
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    // First successful encode after a restart resets the
+                                    // restart counter so transient errors don't accumulate
+                                    // toward MAX_RESTARTS across long-lived sessions.
+                                    if !encoded_ok_this_cycle && restart_count > 0 {
+                                        log::info!(
+                                            "CameraEncoder: encode succeeded after restart, resetting restart counter"
+                                        );
+                                        restart_count = 0;
+                                    }
+                                    encoded_ok_this_cycle = true;
                                 }
-                                error!("Error encoding video frame: {e:?}");
-                            } else {
-                                // First successful encode after a restart resets the
-                                // restart counter so transient errors don't accumulate
-                                // toward MAX_RESTARTS across long-lived sessions.
-                                if !encoded_ok_this_cycle && restart_count > 0 {
-                                    log::info!(
-                                        "CameraEncoder: encode succeeded after restart, resetting restart counter"
-                                    );
-                                    restart_count = 0;
+                                Err(e) => {
+                                    let msg = format!("{e:?}");
+                                    match classify_encode_error(&msg) {
+                                        EncodeErrorBucket::ClosedCodec => {
+                                            CAMERA_ENCODER_ERRORS_CLOSED_CODEC
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        EncodeErrorBucket::VpxMemAlloc => {
+                                            CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        EncodeErrorBucket::Generic => {
+                                            CAMERA_ENCODER_ERRORS_GENERIC
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    if is_fatal_encoder_error(&e) {
+                                        error!(
+                                            "CameraEncoder: fatal encode error (restart {restart_count}): {e:?}"
+                                        );
+                                        video_frame.close();
+                                        restart_count += 1;
+                                        break 'encode;
+                                    }
+                                    error!("Error encoding video frame: {e:?}");
                                 }
-                                encoded_ok_this_cycle = true;
                             }
                             video_frame.close();
                             video_frame_counter += 1;

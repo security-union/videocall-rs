@@ -353,6 +353,7 @@ mod tests {
             election_period_ms: 1000,
             instance_id: "test-instance-id".to_string(),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
+            allow_post_rebase_retry: true,
         }
     }
 

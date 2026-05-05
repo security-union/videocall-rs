@@ -167,6 +167,22 @@ pub struct VideoCallClientOptions {
 
     /// Whether the local user joined as an unauthenticated guest.
     pub is_guest: bool,
+
+    /// Whether the connection manager is allowed to schedule a 30-second
+    /// post-rebase re-election retry when the RTT-degradation watchdog hits a
+    /// "only 1 server configured" rebase.
+    ///
+    /// Set to `true` for users on the default `Auto` transport preference —
+    /// the single-candidate state is system-side (e.g. relay-availability
+    /// blip) and recovery via re-evaluation is desirable.
+    ///
+    /// Set to `false` for users who explicitly chose `WebTransportOnly` or
+    /// `WebSocketOnly` — the single-candidate state is the user's deliberate
+    /// choice and the retry must not override it.
+    ///
+    /// Defaults to `true`. The dioxus-ui derives the value from the user's
+    /// `TransportPreference` context signal.
+    pub allow_post_rebase_retry: bool,
 }
 
 #[derive(Debug)]
@@ -538,6 +554,7 @@ impl VideoCallClient {
             election_period_ms,
             instance_id: generate_instance_id(),
             reelection_completed_signal: self.inner.borrow().reelection_completed_signal.clone(),
+            allow_post_rebase_retry: self.options.allow_post_rebase_retry,
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -1963,6 +1980,7 @@ mod disconnect_tests {
             on_peer_joined: None,
             on_display_name_changed: None,
             decode_media: true,
+            allow_post_rebase_retry: true,
         }
     }
 

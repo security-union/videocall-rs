@@ -1258,11 +1258,18 @@ impl PeerDecodeManager {
     }
 
     /// Get the display name for a peer by session_id string.
+    ///
+    /// Checks the live peer entry first, then falls back to the persistent
+    /// `display_name_cache` (populated by PARTICIPANT_JOINED events that may
+    /// arrive before the first media packet creates the peer entry).
     pub fn get_peer_display_name(&self, session_id_str: &str) -> Option<String> {
         let sid: u64 = session_id_str.parse().ok()?;
-        self.connected_peers
-            .get(&sid)
-            .and_then(|peer| peer.display_name.clone())
+        if let Some(peer) = self.connected_peers.get(&sid) {
+            if peer.display_name.is_some() {
+                return peer.display_name.clone();
+            }
+        }
+        self.display_name_cache.get(&sid).cloned()
     }
 
     /// Get the server-vouched guest status for a peer by session_id string.
@@ -3468,5 +3475,86 @@ mod tests {
             0,
             "No PLI should be sent for a peer with camera off"
         );
+    }
+
+    // -- display_name_cache fallback tests ------------------------------------
+
+    /// When PARTICIPANT_JOINED seeds the cache before the first media packet
+    /// creates the peer entry, `get_peer_display_name` should return the
+    /// cached value via `display_name_cache` fallback.
+    #[wasm_bindgen_test]
+    fn display_name_cache_fallback_when_no_peer_entry() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 200;
+
+        // No peer entry exists yet — simulates PARTICIPANT_JOINED arriving
+        // before the first media packet.
+        manager.set_peer_display_name(session_id, "Alice".to_string());
+
+        // get_peer_display_name should find the name in the cache fallback.
+        let name = manager.get_peer_display_name(&session_id.to_string());
+        assert_eq!(
+            name,
+            Some("Alice".to_string()),
+            "should fall back to display_name_cache when peer entry is missing"
+        );
+    }
+
+    /// When a peer entry exists WITH a display_name, the peer entry value
+    /// takes priority over the cache.
+    #[wasm_bindgen_test]
+    fn display_name_peer_entry_takes_priority_over_cache() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 201;
+
+        // Seed cache with one name.
+        manager.set_peer_display_name(session_id, "OldName".to_string());
+
+        // Manually insert a peer entry with a different display name.
+        let (mut peer, _muted) = make_test_peer(session_id);
+        peer.display_name = Some("NewName".to_string());
+        manager.connected_peers.insert(session_id, peer);
+
+        let name = manager.get_peer_display_name(&session_id.to_string());
+        assert_eq!(
+            name,
+            Some("NewName".to_string()),
+            "peer entry display_name should take priority over cache"
+        );
+    }
+
+    /// When a peer entry exists but display_name is None, the cache fallback
+    /// should be used. This is the key scenario for the host display-name bug:
+    /// media packets create the peer entry, but PARTICIPANT_JOINED (which
+    /// populates display_name) never fires for the local user.
+    #[wasm_bindgen_test]
+    fn display_name_cache_fallback_when_peer_has_no_name() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 202;
+
+        // Seed cache (e.g. from SESSION_ASSIGNED or earlier PARTICIPANT_JOINED).
+        manager.set_peer_display_name(session_id, "HostUser".to_string());
+
+        // Insert a peer entry WITHOUT display_name (simulates add_peer called
+        // before cache was populated, or cache was populated for a different
+        // reason).
+        let (peer, _muted) = make_test_peer(session_id);
+        assert!(peer.display_name.is_none());
+        manager.connected_peers.insert(session_id, peer);
+
+        let name = manager.get_peer_display_name(&session_id.to_string());
+        assert_eq!(
+            name,
+            Some("HostUser".to_string()),
+            "should fall back to cache when peer entry has no display_name"
+        );
+    }
+
+    /// No peer entry and no cache → should return None.
+    #[wasm_bindgen_test]
+    fn display_name_returns_none_when_completely_unknown() {
+        let manager = PeerDecodeManager::new();
+        let name = manager.get_peer_display_name("999");
+        assert_eq!(name, None, "should return None for unknown session_id");
     }
 }

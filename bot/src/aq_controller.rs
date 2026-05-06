@@ -43,6 +43,9 @@ use videocall_aq::constants::{AUDIO_QUALITY_TIERS, DEFAULT_VIDEO_TIER_INDEX, VID
 use videocall_aq::{default_clock, Clock, EncoderBitrateController};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 
+#[cfg(feature = "metrics")]
+use crate::metrics_server::BotMetrics;
+
 /// Snapshot of video encoder settings derived from the current AQ tier.
 #[derive(Clone, Copy, Debug)]
 pub struct VideoEncodeSettings {
@@ -108,6 +111,24 @@ pub struct BotAq {
     last_fps_ratio_bits: AtomicU32,
     /// bitrate_ratio = pid_clamped / tier_ideal, f32 bits.
     last_bitrate_ratio_bits: AtomicU32,
+
+    /// Optional Prometheus metrics handle + pre-built label pair.
+    ///
+    /// When set, every [`Self::process_diagnostics`] call refreshes the
+    /// `bot_aq_*` gauges. Kept behind the `metrics` feature so non-metrics
+    /// builds do not pay the extra field or any storage for the labels.
+    #[cfg(feature = "metrics")]
+    metrics: Mutex<Option<MetricsBinding>>,
+}
+
+/// Glue struct tying a [`BotMetrics`] handle to the pre-computed label
+/// values (`bot`, `meeting`) used by every AQ metric on this bot. Avoids
+/// re-materializing the label slices on the hot path.
+#[cfg(feature = "metrics")]
+struct MetricsBinding {
+    metrics: Arc<BotMetrics>,
+    bot: String,
+    meeting: String,
 }
 
 impl BotAq {
@@ -156,9 +177,30 @@ impl BotAq {
             last_worst_peer_fps_bits: AtomicU32::new(0),
             last_fps_ratio_bits: AtomicU32::new(0),
             last_bitrate_ratio_bits: AtomicU32::new(0),
+            #[cfg(feature = "metrics")]
+            metrics: Mutex::new(None),
         };
 
         Arc::new(bot_aq)
+    }
+
+    /// Attach (or clear) the Prometheus metrics handle for this bot.
+    ///
+    /// Called once at construction time from [`main::run_client`] when the
+    /// `metrics` feature is enabled. Updates published to `bot_aq_*` use the
+    /// supplied `bot` (user_id) and `meeting` labels so dashboards can
+    /// filter per-bot / per-meeting.
+    #[cfg(feature = "metrics")]
+    pub fn set_metrics(&self, metrics: Arc<BotMetrics>, bot: String, meeting: String) {
+        // We take the mutex once here and never again — this is an
+        // initialization-time call, not a hot-path operation.
+        if let Ok(mut guard) = self.metrics.lock() {
+            *guard = Some(MetricsBinding {
+                metrics,
+                bot,
+                meeting,
+            });
+        }
     }
 
     /// Convenience constructor that uses the native default clock.
@@ -195,6 +237,19 @@ impl BotAq {
             .store(fps_ratio.to_bits(), Ordering::Relaxed);
         self.last_bitrate_ratio_bits
             .store(bitrate_ratio.to_bits(), Ordering::Relaxed);
+
+        // Refresh per-scrape Prometheus gauges. Done on every packet so that
+        // even without a tier change, the dashboard sees live fps_ratio /
+        // bitrate_ratio / target_bitrate values.
+        #[cfg(feature = "metrics")]
+        self.publish_live_metrics(
+            target_bitrate,
+            worst_fps,
+            fps_ratio,
+            bitrate_ratio,
+            ctrl.video_tier_index() as i64,
+            ctrl.audio_tier_index() as i64,
+        );
 
         // Tier changes are rare — only republish the full tier snapshot when
         // `take_tier_changed()` returns true.
@@ -241,6 +296,57 @@ impl BotAq {
                 audio.enable_dtx,
             );
         }
+    }
+
+    /// Push the latest AQ telemetry into the Prometheus gauges. No-op when
+    /// no metrics handle has been installed.
+    #[cfg(feature = "metrics")]
+    fn publish_live_metrics(
+        &self,
+        target_bitrate_kbps: f32,
+        worst_peer_fps: f32,
+        fps_ratio: f32,
+        bitrate_ratio: f32,
+        video_tier_index: i64,
+        audio_tier_index: i64,
+    ) {
+        let Ok(guard) = self.metrics.lock() else {
+            return;
+        };
+        let Some(binding) = guard.as_ref() else {
+            return;
+        };
+        let labels: [&str; 2] = [binding.bot.as_str(), binding.meeting.as_str()];
+        binding
+            .metrics
+            .aq_target_bitrate_kbps
+            .with_label_values(&labels)
+            .set(target_bitrate_kbps as f64);
+        binding
+            .metrics
+            .aq_worst_peer_fps
+            .with_label_values(&labels)
+            .set(worst_peer_fps as f64);
+        binding
+            .metrics
+            .aq_fps_ratio
+            .with_label_values(&labels)
+            .set(fps_ratio as f64);
+        binding
+            .metrics
+            .aq_bitrate_ratio
+            .with_label_values(&labels)
+            .set(bitrate_ratio as f64);
+        binding
+            .metrics
+            .aq_video_tier_index
+            .with_label_values(&labels)
+            .set(video_tier_index);
+        binding
+            .metrics
+            .aq_audio_tier_index
+            .with_label_values(&labels)
+            .set(audio_tier_index);
     }
 
     /// Cheap lock-free read of the current video tier settings.

@@ -88,6 +88,11 @@ pub struct BotConfig {
     /// precedence of the impairment knobs.
     #[serde(default, skip)]
     pub no_impair: bool,
+    /// CLI-only: HTTP port for the Prometheus `/metrics` endpoint. `None`
+    /// (the default) disables the endpoint entirely. Only honored when the
+    /// crate is built with `--features metrics`.
+    #[serde(default, skip)]
+    pub metrics_port: Option<u16>,
 }
 
 /// Minimal client identity -- used only by the transport layer.
@@ -128,6 +133,7 @@ impl BotConfig {
         let mut impair_all: Option<String> = None;
         let mut impair_name: HashMap<String, String> = HashMap::new();
         let mut no_impair = false;
+        let mut metrics_port: Option<u16> = None;
 
         let mut i = 1; // skip argv[0]
         while i < args.len() {
@@ -190,6 +196,17 @@ impl BotConfig {
                     no_impair = true;
                     i += 1;
                 }
+                "--metrics-port" => {
+                    if i + 1 < args.len() {
+                        metrics_port =
+                            Some(args[i + 1].parse().map_err(|_| {
+                                anyhow!("--metrics-port requires a u16 port number")
+                            })?);
+                        i += 2;
+                    } else {
+                        return Err(anyhow!("--metrics-port requires a port argument"));
+                    }
+                }
                 "--help" | "-h" => {
                     println!("{}", help_text());
                     std::process::exit(0);
@@ -215,6 +232,7 @@ impl BotConfig {
         config.impair_all = impair_all;
         config.impair_name = impair_name;
         config.no_impair = no_impair;
+        config.metrics_port = metrics_port;
 
         Ok((config, num_users))
     }
@@ -492,6 +510,10 @@ fn help_text() -> String {
          \x20 --impair-name <name>=<preset> Strict override of one participant's network\n\
          \x20                               settings. Repeatable.\n\
          \x20 --no-impair                   Force-disable all impairment. Highest precedence.\n\
+         \n\
+         Observability (requires `--features metrics` at build time):\n\
+         \x20 --metrics-port <port>         Start a Prometheus `/metrics` HTTP endpoint on the\n\
+         \x20                               given port (off by default).\n\
          \n\
          Impairment precedence (highest to lowest):\n\
          \x20 --no-impair > --impair-name > manifest `network:` > --impair-all > passthrough\n\

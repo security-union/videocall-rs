@@ -42,6 +42,12 @@ use rand::{Rng, SeedableRng};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "metrics")]
+use std::sync::Arc;
+
+#[cfg(feature = "metrics")]
+use crate::metrics_server::BotMetrics;
+
 /// Per-direction network shaping parameters.
 ///
 /// Jitter convention: the shim adds a **uniform** random delay drawn from
@@ -168,6 +174,19 @@ pub struct NetSimShim {
     direction: Direction,
     rng: Mutex<StdRng>,
     bucket: Mutex<Option<TokenBucket>>,
+    /// Optional metrics hook. Set via [`Self::set_metrics`] to publish
+    /// drop / delay observations to Prometheus. Absent by default to keep
+    /// the shim usable from unit tests without any metrics plumbing.
+    #[cfg(feature = "metrics")]
+    metrics: Option<NetsimMetrics>,
+}
+
+/// Pre-computed Prometheus metric handles for a single netsim shim.
+#[cfg(feature = "metrics")]
+struct NetsimMetrics {
+    metrics: Arc<BotMetrics>,
+    bot: String,
+    direction_label: &'static str,
 }
 
 impl NetSimShim {
@@ -199,7 +218,25 @@ impl NetSimShim {
             direction,
             rng: Mutex::new(rng),
             bucket: Mutex::new(bucket),
+            #[cfg(feature = "metrics")]
+            metrics: None,
         }
+    }
+
+    /// Install a metrics hook on this shim. Returns the same shim so the
+    /// caller can chain the call when building an `Arc<NetSimShim>`.
+    #[cfg(feature = "metrics")]
+    pub fn with_metrics(mut self, metrics: Arc<BotMetrics>, bot: String) -> Self {
+        let direction_label = match self.direction {
+            Direction::Up => "up",
+            Direction::Down => "down",
+        };
+        self.metrics = Some(NetsimMetrics {
+            metrics,
+            bot,
+            direction_label,
+        });
+        self
     }
 
     /// `true` when the underlying profile is passthrough.
@@ -227,6 +264,8 @@ impl NetSimShim {
         if self.profile.loss_pct > 0.0 {
             let roll: f32 = rng.gen::<f32>() * 100.0;
             if roll < self.profile.loss_pct {
+                #[cfg(feature = "metrics")]
+                self.record_drop("loss");
                 return Admission::Drop;
             }
         }
@@ -288,7 +327,33 @@ impl NetSimShim {
         if total_delay.is_zero() {
             Admission::Pass
         } else {
+            #[cfg(feature = "metrics")]
+            self.record_delay(total_delay);
             Admission::Delay(total_delay)
+        }
+    }
+
+    /// Increment the per-direction drop counter with the supplied reason.
+    /// No-op when metrics are off or unbound.
+    #[cfg(feature = "metrics")]
+    fn record_drop(&self, reason: &str) {
+        if let Some(m) = &self.metrics {
+            m.metrics
+                .netsim_dropped_total
+                .with_label_values(&[m.bot.as_str(), m.direction_label, reason])
+                .inc();
+        }
+    }
+
+    /// Observe an injected delay (in milliseconds) on the per-direction
+    /// histogram. No-op when metrics are off or unbound.
+    #[cfg(feature = "metrics")]
+    fn record_delay(&self, delay: Duration) {
+        if let Some(m) = &self.metrics {
+            m.metrics
+                .netsim_delay_ms
+                .with_label_values(&[m.bot.as_str(), m.direction_label])
+                .observe(delay.as_secs_f64() * 1000.0);
         }
     }
 }

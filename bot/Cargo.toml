@@ -12,6 +12,15 @@ authors = [
 keywords = ["quic", "webtransport", "zoom", "webrtc"]
 categories = ["network-programming", "multimedia"]
 
+[features]
+default = []
+# Enable the Prometheus metrics HTTP endpoint (`--metrics-port`). When this
+# feature is off, all metric-update call sites compile away: the metrics
+# struct is gated behind `#[cfg(feature = "metrics")]` and is referenced
+# through a feature-gated type alias, so there is no runtime cost for bots
+# that don't opt in.
+metrics = ["dep:prometheus", "dep:hyper"]
+
 [dependencies]
 tokio = { version = "1.28.1", features = ["full"] }
 futures = "0.3.16"
@@ -54,3 +63,10 @@ anyhow = "1.0"
 # other direct consumers in the workspace and to keep the `StdRng` / `SeedableRng`
 # API stable; upgrading to 0.9 would flip several item names.
 rand = "0.8"
+
+# Prometheus metrics (feature-gated; see `[features]`). Kept pinned to the same
+# 0.13 line actix-api uses so a single Prometheus version is used across the
+# workspace.
+prometheus = { version = "0.13", optional = true }
+# Minimal hyper server for the `/metrics` endpoint. Feature-gated.
+hyper = { version = "0.14", features = ["server", "http1", "tcp"], optional = true }

@@ -16,30 +16,21 @@
  * conditions.
  */
 
-mod aq_controller;
-mod audio_producer;
-mod config;
-mod costume_renderer;
-mod ekg_renderer;
-mod health_reporter;
-mod inbound_stats;
-mod netsim;
-mod netsim_profiles;
-mod token;
-mod transport;
-mod video_encoder;
-mod video_producer;
-mod websocket_client;
-mod webtransport_client;
-
-use aq_controller::BotAq;
-use audio_producer::AudioProducer;
-use config::{BotConfig, ClientConfig, Manifest, Transport, VideoMode};
-use costume_renderer::CostumeRenderer;
-use ekg_renderer::EkgRenderer;
-use health_reporter::{spawn_health_reporter, HealthReporterConfig};
-use inbound_stats::InboundStats;
-use netsim::{Admission, Direction, NetSimShim, NetworkProfile};
+// All modules live in `src/lib.rs` so integration tests under `tests/`
+// can share code with the binary. The binary only pulls in what it needs.
+use bot::aq_controller::BotAq;
+use bot::audio_producer::AudioProducer;
+use bot::config::{self, BotConfig, ClientConfig, Manifest, Transport, VideoMode};
+use bot::costume_renderer::CostumeRenderer;
+use bot::ekg_renderer::{self, EkgRenderer};
+use bot::health_reporter::{spawn_health_reporter, HealthReporterConfig};
+use bot::inbound_stats::InboundStats;
+#[cfg(feature = "metrics")]
+use bot::metrics_server::{self, BotMetrics};
+use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
+use bot::transport::{self, TransportClient};
+use bot::video_producer::VideoProducer;
+use bot::websocket_client::spawn_heartbeat_producer;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,9 +39,35 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{debug, error, info, warn};
-use transport::TransportClient;
-use video_producer::VideoProducer;
-use websocket_client::spawn_heartbeat_producer;
+
+/// Classify a serialized `PacketWrapper` into a stable `media_type` label
+/// used by the bot_packets_* counters. Falls back to "unknown" on any parse
+/// failure; we never fail a send because of this helper.
+#[cfg(feature = "metrics")]
+fn classify_outbound(payload: &[u8]) -> &'static str {
+    use protobuf::Message;
+    use videocall_types::protos::media_packet::media_packet::MediaType;
+    use videocall_types::protos::media_packet::MediaPacket;
+    use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+    use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+    let Ok(wrapper) = PacketWrapper::parse_from_bytes(payload) else {
+        return "unknown";
+    };
+    match wrapper.packet_type.enum_value() {
+        Ok(PacketType::DIAGNOSTICS) => "diagnostics",
+        Ok(PacketType::MEDIA) => match MediaPacket::parse_from_bytes(&wrapper.data) {
+            Ok(m) => match m.media_type.enum_value() {
+                Ok(MediaType::AUDIO) => "audio",
+                Ok(MediaType::VIDEO) => "video",
+                Ok(MediaType::HEARTBEAT) => "health",
+                _ => "other",
+            },
+            Err(_) => "unknown",
+        },
+        _ => "other",
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -68,6 +85,37 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting videocall synthetic client bot");
 
     let (config, num_users) = BotConfig::from_args()?;
+
+    // Bring up the Prometheus metrics endpoint first so bots coming online
+    // can publish their labels before the server starts accepting scrapes.
+    // Zero-cost compile-out when the `metrics` feature is off.
+    #[cfg(feature = "metrics")]
+    let metrics_handle: Option<Arc<BotMetrics>> = match config.metrics_port {
+        Some(port) => {
+            let registry = Arc::new(prometheus::Registry::new());
+            match BotMetrics::new(Arc::clone(&registry)) {
+                Ok(handle) => {
+                    metrics_server::start_server(Arc::clone(&registry), port);
+                    info!("Prometheus metrics listening on :{port}/metrics");
+                    Some(handle)
+                }
+                Err(e) => {
+                    warn!("Failed to register bot metrics: {e} — metrics disabled");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "metrics"))]
+    {
+        if config.metrics_port.is_some() {
+            warn!(
+                "--metrics-port specified but the bot was built without `--features metrics`; \
+                 the endpoint will NOT be started"
+            );
+        }
+    }
     info!(
         "Config: ws_url={:?}, wt_url={:?}, wt_ratio={:?}, video_mode={:?}, \
          warmup={}s, broadcasters={}, JWT auth={}",
@@ -279,6 +327,8 @@ async fn main() -> anyhow::Result<()> {
         let ld = loop_duration;
         let total_bots = n;
         let netprof = network_profile;
+        #[cfg(feature = "metrics")]
+        let metrics_for_bot = metrics_handle.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_client(
@@ -295,6 +345,8 @@ async fn main() -> anyhow::Result<()> {
                 total_bots,
                 is_broadcaster,
                 netprof,
+                #[cfg(feature = "metrics")]
+                metrics_for_bot,
             )
             .await
             {
@@ -350,6 +402,7 @@ async fn run_client(
     total_bots: usize,
     is_broadcaster: bool,
     network_profile: NetworkProfile,
+    #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
 ) -> anyhow::Result<()> {
     info!(
         "Initializing client: {} (broadcaster={})",
@@ -395,6 +448,14 @@ async fn run_client(
     // Adaptive-quality controller, created before any producers so they can
     // read the initial tier snapshot on start.
     let aq = BotAq::with_default_clock();
+    #[cfg(feature = "metrics")]
+    if let Some(ref m) = metrics {
+        aq.set_metrics(
+            Arc::clone(m),
+            user_id.clone(),
+            client_config.meeting_id.clone(),
+        );
+    }
 
     // Shared inbound stats -- used by both the transport's inbound consumer
     // and the health reporter for per-sender packet rate tracking. We also
@@ -404,6 +465,14 @@ async fn run_client(
     {
         let mut s = stats.lock().unwrap();
         s.set_aq(aq.clone());
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = metrics {
+            s.set_metrics(
+                Arc::clone(m),
+                user_id.clone(),
+                client_config.meeting_id.clone(),
+            );
+        }
     }
 
     // Shared is_speaking flag -- audio producer sets, heartbeat/video reads
@@ -414,7 +483,13 @@ async fn run_client(
     let (inbound_hook, inbound_shim_task) = if network_profile.is_passthrough() {
         (None, None)
     } else {
-        let shim = Arc::new(NetSimShim::new(network_profile.clone(), Direction::Down));
+        let shim = NetSimShim::new(network_profile.clone(), Direction::Down);
+        #[cfg(feature = "metrics")]
+        let shim = match metrics.as_ref() {
+            Some(m) => shim.with_metrics(Arc::clone(m), user_id.clone()),
+            None => shim,
+        };
+        let shim = Arc::new(shim);
         // Buffer of 2048 matches order-of-magnitude sizing used elsewhere —
         // at 100 pkts/sec with up to a few seconds of queuing, this is safe
         // without being large enough to cause unbounded memory growth.
@@ -454,16 +529,61 @@ async fn run_client(
     // Outbound impairment: insert a shim task between producers and the
     // transport sender. Passthrough bots get the transport sender directly.
     let (packet_tx, outbound_shim_task) = if network_profile.is_passthrough() {
-        (transport_tx, None)
+        #[cfg(feature = "metrics")]
+        {
+            // In passthrough mode, we still want per-media-type send counters.
+            // Splice in a counting task so the transport sender sees every
+            // packet once, labeled by type.
+            if let Some(m) = metrics.clone() {
+                let (counter_tx, mut counter_rx) = mpsc::channel::<Vec<u8>>(500);
+                let user_id_ctr = user_id.clone();
+                let meeting_ctr = client_config.meeting_id.clone();
+                let transport_tx_inner = transport_tx.clone();
+                let metrics_for_task = m;
+                let handle = tokio::spawn(async move {
+                    while let Some(payload) = counter_rx.recv().await {
+                        let mt = classify_outbound(&payload);
+                        metrics_for_task
+                            .packets_sent_total
+                            .with_label_values(&[user_id_ctr.as_str(), meeting_ctr.as_str(), mt])
+                            .inc();
+                        if transport_tx_inner.send(payload).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                (counter_tx, Some(handle))
+            } else {
+                (transport_tx, None)
+            }
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            (transport_tx, None)
+        }
     } else {
         let (producer_tx, producer_rx) = mpsc::channel::<Vec<u8>>(500);
-        let shim = Arc::new(NetSimShim::new(network_profile.clone(), Direction::Up));
+        let shim = NetSimShim::new(network_profile.clone(), Direction::Up);
+        #[cfg(feature = "metrics")]
+        let shim = match metrics.as_ref() {
+            Some(m) => shim.with_metrics(Arc::clone(m), user_id.clone()),
+            None => shim,
+        };
+        let shim = Arc::new(shim);
         let user_id_up = user_id.clone();
+        #[cfg(feature = "metrics")]
+        let metrics_up = metrics.clone();
+        #[cfg(feature = "metrics")]
+        let meeting_up = client_config.meeting_id.clone();
         let handle = tokio::spawn(run_outbound_shim(
             producer_rx,
             transport_tx,
             shim,
             user_id_up,
+            #[cfg(feature = "metrics")]
+            metrics_up,
+            #[cfg(feature = "metrics")]
+            meeting_up,
         ));
         (producer_tx, Some(handle))
     };
@@ -622,13 +742,28 @@ async fn run_client(
 /// Outbound network-impairment task. Reads raw wire-formatted frames from
 /// producers, applies the uplink [`NetSimShim`], and forwards to the
 /// transport sender. Terminates when the producer side closes.
+///
+/// When the `metrics` feature is enabled, `bot_packets_sent_total` is
+/// incremented *before* the netsim shim makes its admission decision — the
+/// counter reflects what producers offered to the uplink, not what actually
+/// left the bot (drops are separately visible via `bot_netsim_dropped_total`).
+#[allow(clippy::too_many_arguments)]
 async fn run_outbound_shim(
     mut rx: mpsc::Receiver<Vec<u8>>,
     tx: mpsc::Sender<Vec<u8>>,
     shim: Arc<NetSimShim>,
     user_id: String,
+    #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
+    #[cfg(feature = "metrics")] meeting_id: String,
 ) {
     while let Some(payload) = rx.recv().await {
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = metrics {
+            let mt = classify_outbound(&payload);
+            m.packets_sent_total
+                .with_label_values(&[user_id.as_str(), meeting_id.as_str(), mt])
+                .inc();
+        }
         let decision = shim.admit(payload.len());
         match decision {
             Admission::Pass => {

@@ -30,6 +30,9 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::aq_controller::BotAq;
 
+#[cfg(feature = "metrics")]
+use crate::metrics_server::BotMetrics;
+
 /// Per-sender counters accumulated between health report drains.
 #[derive(Default, Clone)]
 pub struct SenderHealthCounters {
@@ -76,6 +79,19 @@ pub struct InboundStats {
     aq: Option<Arc<BotAq>>,
     /// Number of DIAGNOSTICS packets that failed to parse since the last reset.
     diagnostics_parse_errors: u64,
+    /// Optional Prometheus metrics handle. When set, every inbound packet
+    /// increments `bot_packets_received_total` (labeled by media_type) and
+    /// parse failures increment `bot_packets_parsed_error_total`.
+    #[cfg(feature = "metrics")]
+    metrics: Option<InboundMetrics>,
+}
+
+/// Label bundle for inbound packet metrics.
+#[cfg(feature = "metrics")]
+struct InboundMetrics {
+    metrics: Arc<BotMetrics>,
+    bot: String,
+    meeting: String,
 }
 
 impl InboundStats {
@@ -83,6 +99,41 @@ impl InboundStats {
     /// DIAGNOSTICS packet is forwarded to it so the bot's encoders can adapt.
     pub fn set_aq(&mut self, aq: Arc<BotAq>) {
         self.aq = Some(aq);
+    }
+
+    /// Install (or replace) the Prometheus metrics handle. Calls made before
+    /// `set_metrics` are uncounted — we intentionally do not buffer on the
+    /// hot path.
+    #[cfg(feature = "metrics")]
+    pub fn set_metrics(&mut self, metrics: Arc<BotMetrics>, bot: String, meeting: String) {
+        self.metrics = Some(InboundMetrics {
+            metrics,
+            bot,
+            meeting,
+        });
+    }
+
+    /// Increment `bot_packets_received_total{media_type=…}`. No-op when
+    /// metrics are off or unbound.
+    #[cfg(feature = "metrics")]
+    fn bump_received(&self, media_type: &str) {
+        if let Some(m) = &self.metrics {
+            m.metrics
+                .packets_received_total
+                .with_label_values(&[m.bot.as_str(), m.meeting.as_str(), media_type])
+                .inc();
+        }
+    }
+
+    /// Increment `bot_packets_parsed_error_total{stage=…}`.
+    #[cfg(feature = "metrics")]
+    fn bump_parse_error(&self, stage: &str) {
+        if let Some(m) = &self.metrics {
+            m.metrics
+                .packets_parsed_error_total
+                .with_label_values(&[m.bot.as_str(), m.meeting.as_str(), stage])
+                .inc();
+        }
     }
 
     pub fn record_packet(&mut self, _my_user_id: &str, data: &[u8]) {
@@ -95,6 +146,8 @@ impl InboundStats {
 
         let Ok(wrapper) = PacketWrapper::parse_from_bytes(data) else {
             self.parse_errors += 1;
+            #[cfg(feature = "metrics")]
+            self.bump_parse_error("wrapper");
             return;
         };
 
@@ -111,6 +164,8 @@ impl InboundStats {
                 }
                 Err(e) => {
                     self.diagnostics_parse_errors += 1;
+                    #[cfg(feature = "metrics")]
+                    self.bump_parse_error("diagnostics");
                     // Rate-limit so a malformed peer cannot spam the log.
                     if self.diagnostics_parse_errors.is_multiple_of(100) {
                         warn!(
@@ -121,16 +176,22 @@ impl InboundStats {
                 }
             }
             self.other_packets += 1;
+            #[cfg(feature = "metrics")]
+            self.bump_received("diagnostics");
             return;
         }
 
         if wrapper.packet_type.enum_value() != Ok(PacketType::MEDIA) {
             self.other_packets += 1;
+            #[cfg(feature = "metrics")]
+            self.bump_received("other");
             return;
         }
 
         let Ok(media) = MediaPacket::parse_from_bytes(&wrapper.data) else {
             self.parse_errors += 1;
+            #[cfg(feature = "metrics")]
+            self.bump_parse_error("media");
             return;
         };
 
@@ -143,6 +204,8 @@ impl InboundStats {
 
         match media.media_type.enum_value() {
             Ok(MediaType::AUDIO) => {
+                #[cfg(feature = "metrics")]
+                self.bump_received("audio");
                 self.audio_packets += 1;
                 self.audio_bytes += media.data.len() as u64;
                 self.audio_arrivals.push(now_ms);
@@ -177,6 +240,8 @@ impl InboundStats {
                 }
             }
             Ok(MediaType::VIDEO) => {
+                #[cfg(feature = "metrics")]
+                self.bump_received("video");
                 self.video_packets += 1;
                 self.video_bytes += media.data.len() as u64;
                 self.video_arrivals.push(now_ms);
@@ -215,9 +280,13 @@ impl InboundStats {
                 }
             }
             Ok(MediaType::HEARTBEAT) => {
+                #[cfg(feature = "metrics")]
+                self.bump_received("health");
                 self.heartbeat_packets += 1;
             }
             _ => {
+                #[cfg(feature = "metrics")]
+                self.bump_received("other");
                 self.other_packets += 1;
             }
         }
@@ -280,6 +349,8 @@ impl InboundStats {
         let last_video_ts = std::mem::take(&mut self.last_video_ts);
         let sender_names = std::mem::take(&mut self.sender_names);
         let aq = self.aq.take();
+        #[cfg(feature = "metrics")]
+        let metrics = self.metrics.take();
         *self = Self::default();
         self.health_counters = health_counters;
         self.health_total_packets = health_total;
@@ -290,6 +361,10 @@ impl InboundStats {
         self.last_video_ts = last_video_ts;
         self.sender_names = sender_names;
         self.aq = aq;
+        #[cfg(feature = "metrics")]
+        {
+            self.metrics = metrics;
+        }
     }
 
     /// Remove entries from ALL per-sender maps for senders not seen within `max_age`.

@@ -116,6 +116,16 @@ impl NetworkProfile {
         if self.latency_ms > 5_000 {
             return Err(format!("latency_ms={} exceeds max 5000", self.latency_ms));
         }
+        // Cap jitter at the same ceiling as latency. The admit path uses
+        // `2 * jitter_ms` and `4 * jitter_ms`, so this also serves as
+        // defense in depth against integer overflow (see the
+        // `saturating_mul` calls in `admit`). Unreachable via the normal
+        // YAML/CLI path today because no preset sets this above a few
+        // hundred ms, but test-only callers can construct a profile
+        // directly so we check here too.
+        if self.jitter_ms > 5_000 {
+            return Err(format!("jitter_ms={} exceeds max 5000", self.jitter_ms));
+        }
         for (name, v) in [
             ("loss_pct", self.loss_pct),
             ("duplicate_pct", self.duplicate_pct),
@@ -289,8 +299,11 @@ impl NetSimShim {
         // Step 3: base latency + jitter.
         //
         // Uniform jitter in [0, 2*jitter_ms]. See `NetworkProfile` struct doc.
+        // `saturating_mul` guards against overflow if a future caller skips
+        // `validate()` — jitter is capped at 5000ms there, but keeping the
+        // hot path safe by construction is cheap defense-in-depth.
         let jitter_ms = if self.profile.jitter_ms > 0 {
-            rng.gen_range(0..=(2 * self.profile.jitter_ms))
+            rng.gen_range(0..=self.profile.jitter_ms.saturating_mul(2))
         } else {
             0
         };
@@ -306,9 +319,10 @@ impl NetSimShim {
             let roll: f32 = rng.gen::<f32>() * 100.0;
             if roll < self.profile.reorder_pct {
                 // Draw a second uniform delay from [0, 4*jitter_ms] or a
-                // fixed 20ms floor when jitter_ms is 0.
+                // fixed 20ms floor when jitter_ms is 0. `saturating_mul`
+                // mirrors the guard above on the jitter term.
                 let bump = if self.profile.jitter_ms > 0 {
-                    rng.gen_range(0..=(4 * self.profile.jitter_ms))
+                    rng.gen_range(0..=self.profile.jitter_ms.saturating_mul(4))
                 } else {
                     rng.gen_range(0..=20)
                 };
@@ -576,6 +590,43 @@ mod tests {
             ..Default::default()
         };
         assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_jitter_above_5000() {
+        let mut p = NetworkProfile::passthrough();
+        p.jitter_ms = 5_001;
+        let err = p
+            .validate()
+            .expect_err("jitter_ms > 5000 must fail validation");
+        assert!(
+            err.contains("jitter_ms"),
+            "error message should mention jitter_ms: {}",
+            err
+        );
+
+        // Exactly 5000 is accepted.
+        p.jitter_ms = 5_000;
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn admit_saturating_mul_survives_large_jitter() {
+        // Construct a profile that bypasses `validate()` with a jitter value
+        // large enough that naive `2 * jitter_ms` / `4 * jitter_ms` would
+        // overflow u32. `admit()` must still return a sane Admission.
+        let p = NetworkProfile {
+            latency_ms: 0,
+            jitter_ms: u32::MAX,
+            loss_pct: 0.0,
+            reorder_pct: 100.0, // force the 4*jitter_ms branch
+            seed: Some(1),
+            ..Default::default()
+        };
+        let shim = NetSimShim::new(p, Direction::Up);
+        // Any admission variant is acceptable; the assertion is that we
+        // don't panic on overflow.
+        let _ = shim.admit(100);
     }
 
     #[test]

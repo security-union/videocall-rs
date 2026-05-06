@@ -19,6 +19,7 @@
 use crate::aq_controller::BotAq;
 use crate::costume_renderer::CostumeRenderer;
 use crate::ekg_renderer::EkgRenderer;
+use crate::transport::{MediaTypeLabel, OutboundFrame};
 use crate::video_encoder::VideoEncoderBuilder;
 use image::{ImageBuffer, Rgb};
 use protobuf::Message;
@@ -51,7 +52,7 @@ impl VideoProducer {
         renderer: EkgRenderer,
         rms: Vec<f32>,
         max_rms: f32,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         media_start: Instant,
         loop_duration: Duration,
         aq: Arc<BotAq>,
@@ -90,7 +91,7 @@ impl VideoProducer {
     pub fn from_costume(
         user_id: String,
         renderer: CostumeRenderer,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
@@ -128,7 +129,7 @@ impl VideoProducer {
         renderer: EkgRenderer,
         rms: Vec<f32>,
         max_rms: f32,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
@@ -324,7 +325,8 @@ impl VideoProducer {
                 };
 
                 let packet_data = packet_wrapper.write_to_bytes()?;
-                if let Err(_e) = packet_sender.try_send(packet_data) {
+                let out_frame = OutboundFrame::new(MediaTypeLabel::Video, packet_data);
+                if let Err(_e) = packet_sender.try_send(out_frame) {
                     static VIDEO_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                     let count = VIDEO_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                     if count % 100 == 1 {
@@ -369,7 +371,7 @@ impl VideoProducer {
     fn costume_video_loop(
         user_id: String,
         renderer: CostumeRenderer,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
@@ -556,7 +558,8 @@ impl VideoProducer {
                 };
 
                 let packet_data = packet_wrapper.write_to_bytes()?;
-                if let Err(_e) = packet_sender.try_send(packet_data) {
+                let out_frame = OutboundFrame::new(MediaTypeLabel::Video, packet_data);
+                if let Err(_e) = packet_sender.try_send(out_frame) {
                     static COSTUME_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                     let count = COSTUME_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                     if count % 100 == 1 {

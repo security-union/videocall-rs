@@ -32,9 +32,13 @@
 //!    changes so producers can cheaply detect "my encoder config is stale"
 //!    without paying for a lock on every iteration.
 //!
-//! The producers read `tier_epoch()` each iteration (one atomic load), compare
-//! it to a local `last_epoch`, and only re-snapshot when the value changed.
-//! Steady-state cost is one relaxed load per frame.
+//! The producers read `tier_epoch()` each iteration (one `Acquire` load),
+//! compare it to a local `last_epoch`, and only re-snapshot when the value
+//! changed. The writer performs `Release` stores on every snapshot field and
+//! then a `Release` fetch-add on `tier_epoch`, so the Acquire-load on the
+//! reader synchronizes-with the Release-store on the writer and the reader
+//! is guaranteed to observe every snapshot field written before the epoch
+//! bump. Steady-state cost on the reader is one acquire load per frame.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -71,11 +75,15 @@ pub struct AudioEncodeSettings {
 /// - The inner controller is protected by a single `Mutex`. Only one writer
 ///   task (the one feeding it diagnostics packets) ever takes the lock.
 /// - All snapshot fields (`video_bitrate_kbps`, `audio_bitrate_kbps`, …) are
-///   written under the mutex whenever a tier change fires and read with
-///   relaxed atomics everywhere else. This keeps the producer hot paths lock
-///   free.
+///   written under the mutex with `Ordering::Release` whenever a tier change
+///   fires. Producers then see them via an `Acquire` load of `tier_epoch`
+///   followed by `Relaxed` loads of the snapshot fields — the Acquire on
+///   the epoch synchronizes-with the `Release` fetch-add on the writer and
+///   establishes happens-before over all prior writes. This keeps the
+///   producer hot paths lock-free while remaining sound on architectures
+///   with weaker memory models (aarch64, Power, RISC-V).
 /// - [`tier_epoch`](Self::tier_epoch) is incremented on every tier change and
-///   lets producers detect a tier change with a single relaxed load.
+///   lets producers detect a tier change with a single Acquire load.
 pub struct BotAq {
     inner: Mutex<EncoderBitrateController>,
     /// Target FPS shared with the inner PID controller. The bot currently
@@ -257,30 +265,37 @@ impl BotAq {
             let video = ctrl.current_video_tier();
             let audio = ctrl.current_audio_tier();
 
+            // Release-store every snapshot field, then bump `tier_epoch` with
+            // a Release fetch-add. Readers on the producer threads do an
+            // Acquire load on `tier_epoch` (see `tier_epoch()`), so the
+            // Release/Acquire pair establishes happens-before over all the
+            // stores below. Relaxed loads of the snapshot fields on the
+            // reader are safe because they are sequenced-after the Acquire
+            // load of the epoch.
             self.video_bitrate_kbps
-                .store(video.ideal_bitrate_kbps, Ordering::Relaxed);
+                .store(video.ideal_bitrate_kbps, Ordering::Release);
             self.video_max_width
-                .store(video.max_width, Ordering::Relaxed);
+                .store(video.max_width, Ordering::Release);
             self.video_max_height
-                .store(video.max_height, Ordering::Relaxed);
+                .store(video.max_height, Ordering::Release);
             self.video_target_fps
-                .store(video.target_fps, Ordering::Relaxed);
+                .store(video.target_fps, Ordering::Release);
             self.video_keyframe_interval
-                .store(video.keyframe_interval_frames, Ordering::Relaxed);
+                .store(video.keyframe_interval_frames, Ordering::Release);
 
             self.audio_bitrate_kbps
-                .store(audio.bitrate_kbps, Ordering::Relaxed);
-            self.audio_fec.store(audio.enable_fec, Ordering::Relaxed);
-            self.audio_dtx.store(audio.enable_dtx, Ordering::Relaxed);
+                .store(audio.bitrate_kbps, Ordering::Release);
+            self.audio_fec.store(audio.enable_fec, Ordering::Release);
+            self.audio_dtx.store(audio.enable_dtx, Ordering::Release);
 
             self.video_tier_index
-                .store(ctrl.video_tier_index() as u32, Ordering::Relaxed);
+                .store(ctrl.video_tier_index() as u32, Ordering::Release);
             self.audio_tier_index
-                .store(ctrl.audio_tier_index() as u32, Ordering::Relaxed);
+                .store(ctrl.audio_tier_index() as u32, Ordering::Release);
 
-            // Release-store so a Relaxed load on the epoch + subsequent
-            // Relaxed loads on the snapshot fields see consistent values.
-            self.tier_epoch.fetch_add(1, Ordering::SeqCst);
+            // Release fetch-add to publish every prior Release store to any
+            // reader that subsequently does an Acquire load on `tier_epoch`.
+            self.tier_epoch.fetch_add(1, Ordering::Release);
 
             info!(
                 "BotAq: tier change -> video='{}' ({}kbps, {}x{}@{}fps, kf={}), audio='{}' ({}kbps, fec={}, dtx={})",
@@ -381,8 +396,14 @@ impl BotAq {
 
     /// Monotonically-increasing counter. Producers compare this against a
     /// local value to decide whether to re-snapshot encoder settings.
+    ///
+    /// Uses `Acquire` ordering so that once a reader observes an epoch value
+    /// greater than N, every snapshot field written before the writer's
+    /// `Release` fetch-add that produced that epoch is guaranteed to be
+    /// visible via subsequent `Relaxed` loads on `video_*` / `audio_*`
+    /// atomics.
     pub fn tier_epoch(&self) -> u64 {
-        self.tier_epoch.load(Ordering::Relaxed)
+        self.tier_epoch.load(Ordering::Acquire)
     }
 
     /// PID-adjusted target bitrate in kbps (for health reporting).

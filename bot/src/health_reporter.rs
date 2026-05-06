@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 use crate::aq_controller::BotAq;
 use crate::config::{ClientConfig, Transport};
 use crate::inbound_stats::InboundStats;
+use crate::transport::{MediaTypeLabel, OutboundFrame};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOpCounters, NetEqStats as PbNetEqStats,
@@ -52,7 +53,7 @@ pub struct HealthReporterConfig {
 pub fn spawn_health_reporter(
     config: HealthReporterConfig,
     stats: Arc<Mutex<InboundStats>>,
-    packet_sender: Sender<Vec<u8>>,
+    packet_sender: Sender<OutboundFrame>,
     quit: Arc<AtomicBool>,
     aq: Arc<BotAq>,
 ) {
@@ -93,7 +94,8 @@ pub fn spawn_health_reporter(
                     }
                 };
 
-            if let Err(_e) = packet_sender.try_send(packet_bytes) {
+            let frame = OutboundFrame::new(MediaTypeLabel::Health, packet_bytes);
+            if let Err(_e) = packet_sender.try_send(frame) {
                 static HEALTH_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                 let count = HEALTH_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if count % 100 == 1 {

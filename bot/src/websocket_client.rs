@@ -37,7 +37,7 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use crate::inbound_stats::InboundStats;
 
 use crate::config::ClientConfig;
-use crate::transport::InboundHook;
+use crate::transport::{InboundHook, MediaTypeLabel, OutboundFrame};
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -300,7 +300,7 @@ pub fn spawn_heartbeat_producer(
     user_id: String,
     audio_enabled: bool,
     video_enabled: bool,
-    packet_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    packet_sender: tokio::sync::mpsc::Sender<OutboundFrame>,
     quit: Arc<AtomicBool>,
     is_speaking: Arc<AtomicBool>,
 ) {
@@ -316,7 +316,8 @@ pub fn spawn_heartbeat_producer(
             let speaking = is_speaking.load(Ordering::Relaxed);
             match build_heartbeat_packet(&user_id, audio_enabled, video_enabled, speaking) {
                 Ok(data) => {
-                    if let Err(_e) = packet_sender.try_send(data) {
+                    let frame = OutboundFrame::new(MediaTypeLabel::Heartbeat, data);
+                    if let Err(_e) = packet_sender.try_send(frame) {
                         let count = HB_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                         if count % 100 == 1 {
                             warn!(

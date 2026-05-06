@@ -93,6 +93,14 @@ pub struct BotConfig {
     /// crate is built with `--features metrics`.
     #[serde(default, skip)]
     pub metrics_port: Option<u16>,
+    /// CLI-only: bind address for the Prometheus `/metrics` endpoint.
+    /// Defaults to `127.0.0.1` so the endpoint — which exposes meeting and
+    /// user identifiers as Prometheus label values — is not reachable from
+    /// the network. Operators who need fleet-wide scraping can pass
+    /// `0.0.0.0` (or a specific NIC IP) via `--metrics-bind`. Only honored
+    /// when the crate is built with `--features metrics`.
+    #[serde(default, skip)]
+    pub metrics_bind: Option<std::net::IpAddr>,
 }
 
 /// Minimal client identity -- used only by the transport layer.
@@ -134,6 +142,7 @@ impl BotConfig {
         let mut impair_name: HashMap<String, String> = HashMap::new();
         let mut no_impair = false;
         let mut metrics_port: Option<u16> = None;
+        let mut metrics_bind: Option<std::net::IpAddr> = None;
 
         let mut i = 1; // skip argv[0]
         while i < args.len() {
@@ -207,6 +216,18 @@ impl BotConfig {
                         return Err(anyhow!("--metrics-port requires a port argument"));
                     }
                 }
+                "--metrics-bind" => {
+                    if i + 1 < args.len() {
+                        metrics_bind = Some(args[i + 1].parse().map_err(|_| {
+                            anyhow!(
+                                "--metrics-bind requires an IP address (e.g. 127.0.0.1 or 0.0.0.0)"
+                            )
+                        })?);
+                        i += 2;
+                    } else {
+                        return Err(anyhow!("--metrics-bind requires an IP address argument"));
+                    }
+                }
                 "--help" | "-h" => {
                     println!("{}", help_text());
                     std::process::exit(0);
@@ -233,6 +254,7 @@ impl BotConfig {
         config.impair_name = impair_name;
         config.no_impair = no_impair;
         config.metrics_port = metrics_port;
+        config.metrics_bind = metrics_bind;
 
         Ok((config, num_users))
     }
@@ -372,6 +394,7 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Participant {
     pub name: String,
     #[allow(dead_code)]
@@ -514,6 +537,9 @@ fn help_text() -> String {
          Observability (requires `--features metrics` at build time):\n\
          \x20 --metrics-port <port>         Start a Prometheus `/metrics` HTTP endpoint on the\n\
          \x20                               given port (off by default).\n\
+         \x20 --metrics-bind <addr>         Bind address for the metrics endpoint. Defaults to\n\
+         \x20                               127.0.0.1 so meeting/user labels are not exposed to\n\
+         \x20                               the network. Pass 0.0.0.0 for fleet-wide scraping.\n\
          \n\
          Impairment precedence (highest to lowest):\n\
          \x20 --no-impair > --impair-name > manifest `network:` > --impair-all > passthrough\n\

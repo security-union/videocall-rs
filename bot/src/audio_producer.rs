@@ -17,6 +17,7 @@
  */
 
 use crate::aq_controller::BotAq;
+use crate::transport::{MediaTypeLabel, OutboundFrame};
 use opus::{
     Application as OpusApp, Bitrate as OpusBitrate, Channels as OpusChannels,
     Encoder as OpusEncoder,
@@ -55,7 +56,7 @@ impl AudioProducer {
     pub fn new(
         user_id: String,
         audio_data: Vec<f32>,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
@@ -92,7 +93,7 @@ impl AudioProducer {
     pub fn from_wav_file(
         user_id: String,
         wav_path: &str,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
@@ -156,7 +157,7 @@ impl AudioProducer {
     fn audio_loop(
         user_id: String,
         audio_data: Vec<f32>,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
@@ -334,9 +335,11 @@ impl AudioProducer {
                         ..Default::default()
                     };
 
-                    // Send packet
+                    // Send packet — tagged `Audio` so the outbound shim can
+                    // label metrics without re-parsing the wrapper.
                     let packet_data = packet_wrapper.write_to_bytes()?;
-                    if let Err(_e) = packet_sender.try_send(packet_data) {
+                    let frame = OutboundFrame::new(MediaTypeLabel::Audio, packet_data);
+                    if let Err(_e) = packet_sender.try_send(frame) {
                         static AUDIO_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                         let count = AUDIO_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                         if count % 100 == 1 {

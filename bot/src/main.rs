@@ -28,46 +28,17 @@ use bot::inbound_stats::InboundStats;
 #[cfg(feature = "metrics")]
 use bot::metrics_server::{self, BotMetrics};
 use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
-use bot::transport::{self, TransportClient};
+use bot::transport::{self, OutboundFrame, TransportClient};
 use bot::video_producer::VideoProducer;
 use bot::websocket_client::spawn_heartbeat_producer;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{debug, error, info, warn};
-
-/// Classify a serialized `PacketWrapper` into a stable `media_type` label
-/// used by the bot_packets_* counters. Falls back to "unknown" on any parse
-/// failure; we never fail a send because of this helper.
-#[cfg(feature = "metrics")]
-fn classify_outbound(payload: &[u8]) -> &'static str {
-    use protobuf::Message;
-    use videocall_types::protos::media_packet::media_packet::MediaType;
-    use videocall_types::protos::media_packet::MediaPacket;
-    use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-    use videocall_types::protos::packet_wrapper::PacketWrapper;
-
-    let Ok(wrapper) = PacketWrapper::parse_from_bytes(payload) else {
-        return "unknown";
-    };
-    match wrapper.packet_type.enum_value() {
-        Ok(PacketType::DIAGNOSTICS) => "diagnostics",
-        Ok(PacketType::MEDIA) => match MediaPacket::parse_from_bytes(&wrapper.data) {
-            Ok(m) => match m.media_type.enum_value() {
-                Ok(MediaType::AUDIO) => "audio",
-                Ok(MediaType::VIDEO) => "video",
-                Ok(MediaType::HEARTBEAT) => "health",
-                _ => "other",
-            },
-            Err(_) => "unknown",
-        },
-        _ => "other",
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -95,8 +66,14 @@ async fn main() -> anyhow::Result<()> {
             let registry = Arc::new(prometheus::Registry::new());
             match BotMetrics::new(Arc::clone(&registry)) {
                 Ok(handle) => {
-                    metrics_server::start_server(Arc::clone(&registry), port);
-                    info!("Prometheus metrics listening on :{port}/metrics");
+                    // Default bind is loopback. Operators must pass
+                    // `--metrics-bind 0.0.0.0` (or a specific NIC IP)
+                    // explicitly to expose the endpoint on the network.
+                    let bind = config
+                        .metrics_bind
+                        .unwrap_or(metrics_server::DEFAULT_METRICS_BIND);
+                    metrics_server::start_server(Arc::clone(&registry), bind, port);
+                    info!("Prometheus metrics listening on {bind}:{port}/metrics");
                     Some(handle)
                 }
                 Err(e) => {
@@ -113,6 +90,12 @@ async fn main() -> anyhow::Result<()> {
             warn!(
                 "--metrics-port specified but the bot was built without `--features metrics`; \
                  the endpoint will NOT be started"
+            );
+        }
+        if config.metrics_bind.is_some() {
+            warn!(
+                "--metrics-bind specified but the bot was built without `--features metrics`; \
+                 the flag has no effect"
             );
         }
     }
@@ -498,11 +481,31 @@ async fn run_client(
         let stats_dn = stats.clone();
         let shim_dn = shim.clone();
         let handle = tokio::spawn(run_inbound_shim(inbound_rx, shim_dn, stats_dn, user_id_dn));
+        let user_id_hook = user_id.clone();
+        #[cfg(feature = "metrics")]
+        let metrics_hook = metrics.clone();
         let hook: transport::InboundHook = Arc::new(move |payload| {
             if inbound_tx.try_send(payload).is_err() {
                 // Overflow means the shim task is behind; degrade to drop so
-                // we don't block the transport reader.
-                debug!("netsim inbound queue full; dropping payload");
+                // we don't block the transport reader (that would create
+                // head-of-line blocking back into the transport read loop).
+                // Count the drop on a dedicated metric so silent inbound
+                // loss can't compound the netsim loss model, and rate-limit
+                // the warn! to avoid log-flooding under sustained overflow.
+                static INBOUND_QUEUE_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
+                let count = INBOUND_QUEUE_FULL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count.is_multiple_of(100) || count == 1 {
+                    warn!(
+                        "[{}] netsim inbound queue full; dropping payload (total: {})",
+                        user_id_hook, count
+                    );
+                }
+                #[cfg(feature = "metrics")]
+                if let Some(ref m) = metrics_hook {
+                    m.netsim_dropped_total
+                        .with_label_values(&[user_id_hook.as_str(), "down", "queue_full"])
+                        .inc();
+                }
             }
         });
         (Some(hook), Some(handle))
@@ -519,50 +522,43 @@ async fn run_client(
         )
         .await?;
 
-    // The transport-facing packet channel. Its sender is either handed
-    // directly to producers (passthrough) or fed by the uplink shim task.
+    // The transport-facing packet channel. This carries raw wire bytes ready
+    // to hand to the WebSocket/WebTransport sender. Producers upstream send
+    // `OutboundFrame`s (bytes + media-type tag); the shim/counting task
+    // below unwraps them and forwards `frame.bytes` here.
     let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(500);
 
     // Start packet sender task.
     client.start_packet_sender(transport_rx).await;
 
-    // Outbound impairment: insert a shim task between producers and the
-    // transport sender. Passthrough bots get the transport sender directly.
-    let (packet_tx, outbound_shim_task) = if network_profile.is_passthrough() {
+    // Outbound shim/counter task. We always splice in one task between
+    // producers (which emit `OutboundFrame`) and the transport sender
+    // (which consumes raw bytes), so the channel types don't need to be
+    // conditional on feature / passthrough state.
+    //
+    // In passthrough + no-metrics the task body is a tiny forward loop;
+    // with netsim enabled it applies the uplink impairment; with metrics
+    // enabled it also labels Prometheus counters using the pre-tagged
+    // `frame.kind` — no protobuf re-parse on the hot path.
+    let (packet_tx, packet_rx) = mpsc::channel::<OutboundFrame>(500);
+    let outbound_shim_task = if network_profile.is_passthrough() {
+        let user_id_out = user_id.clone();
+        let transport_tx_inner = transport_tx.clone();
         #[cfg(feature = "metrics")]
-        {
-            // In passthrough mode, we still want per-media-type send counters.
-            // Splice in a counting task so the transport sender sees every
-            // packet once, labeled by type.
-            if let Some(m) = metrics.clone() {
-                let (counter_tx, mut counter_rx) = mpsc::channel::<Vec<u8>>(500);
-                let user_id_ctr = user_id.clone();
-                let meeting_ctr = client_config.meeting_id.clone();
-                let transport_tx_inner = transport_tx.clone();
-                let metrics_for_task = m;
-                let handle = tokio::spawn(async move {
-                    while let Some(payload) = counter_rx.recv().await {
-                        let mt = classify_outbound(&payload);
-                        metrics_for_task
-                            .packets_sent_total
-                            .with_label_values(&[user_id_ctr.as_str(), meeting_ctr.as_str(), mt])
-                            .inc();
-                        if transport_tx_inner.send(payload).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-                (counter_tx, Some(handle))
-            } else {
-                (transport_tx, None)
-            }
-        }
-        #[cfg(not(feature = "metrics"))]
-        {
-            (transport_tx, None)
-        }
+        let metrics_out = metrics.clone();
+        #[cfg(feature = "metrics")]
+        let meeting_out = client_config.meeting_id.clone();
+        let handle = tokio::spawn(run_outbound_passthrough(
+            packet_rx,
+            transport_tx_inner,
+            user_id_out,
+            #[cfg(feature = "metrics")]
+            metrics_out,
+            #[cfg(feature = "metrics")]
+            meeting_out,
+        ));
+        Some(handle)
     } else {
-        let (producer_tx, producer_rx) = mpsc::channel::<Vec<u8>>(500);
         let shim = NetSimShim::new(network_profile.clone(), Direction::Up);
         #[cfg(feature = "metrics")]
         let shim = match metrics.as_ref() {
@@ -576,7 +572,7 @@ async fn run_client(
         #[cfg(feature = "metrics")]
         let meeting_up = client_config.meeting_id.clone();
         let handle = tokio::spawn(run_outbound_shim(
-            producer_rx,
+            packet_rx,
             transport_tx,
             shim,
             user_id_up,
@@ -585,7 +581,7 @@ async fn run_client(
             #[cfg(feature = "metrics")]
             meeting_up,
         ));
-        (producer_tx, Some(handle))
+        Some(handle)
     };
 
     // For WebSocket transport, heartbeats go through the shared mpsc channel
@@ -739,31 +735,35 @@ async fn run_client(
     Ok(())
 }
 
-/// Outbound network-impairment task. Reads raw wire-formatted frames from
-/// producers, applies the uplink [`NetSimShim`], and forwards to the
-/// transport sender. Terminates when the producer side closes.
+/// Outbound network-impairment task. Reads tagged [`OutboundFrame`]s from
+/// producers, applies the uplink [`NetSimShim`] to the underlying bytes, and
+/// forwards the bytes to the transport sender. Terminates when the producer
+/// side closes.
 ///
 /// When the `metrics` feature is enabled, `bot_packets_sent_total` is
 /// incremented *before* the netsim shim makes its admission decision — the
 /// counter reflects what producers offered to the uplink, not what actually
 /// left the bot (drops are separately visible via `bot_netsim_dropped_total`).
+///
+/// The `media_type` Prometheus label comes directly from `frame.kind` — no
+/// protobuf re-parse, just a `&'static str` lookup.
 #[allow(clippy::too_many_arguments)]
 async fn run_outbound_shim(
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<OutboundFrame>,
     tx: mpsc::Sender<Vec<u8>>,
     shim: Arc<NetSimShim>,
     user_id: String,
     #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
     #[cfg(feature = "metrics")] meeting_id: String,
 ) {
-    while let Some(payload) = rx.recv().await {
+    while let Some(frame) = rx.recv().await {
         #[cfg(feature = "metrics")]
         if let Some(ref m) = metrics {
-            let mt = classify_outbound(&payload);
             m.packets_sent_total
-                .with_label_values(&[user_id.as_str(), meeting_id.as_str(), mt])
+                .with_label_values(&[user_id.as_str(), meeting_id.as_str(), frame.kind.as_str()])
                 .inc();
         }
+        let payload = frame.bytes;
         let decision = shim.admit(payload.len());
         match decision {
             Admission::Pass => {
@@ -772,7 +772,7 @@ async fn run_outbound_shim(
                 }
             }
             Admission::Drop => {
-                debug!("[{}] netsim-up: dropped {}B", user_id, 0);
+                debug!("[{}] netsim-up: dropped {}B", user_id, payload.len());
             }
             Admission::Delay(d) => {
                 let tx = tx.clone();
@@ -803,6 +803,35 @@ async fn run_outbound_shim(
         }
     }
     info!("Outbound netsim shim stopped for {}", user_id);
+}
+
+/// Outbound passthrough task used when network impairment is disabled.
+/// Unwraps each [`OutboundFrame`] into raw bytes and forwards them to the
+/// transport sender. When the `metrics` feature is enabled and a metrics
+/// handle is present, it also increments `bot_packets_sent_total` using the
+/// frame's pre-tagged media-type label.
+#[allow(clippy::too_many_arguments)]
+async fn run_outbound_passthrough(
+    mut rx: mpsc::Receiver<OutboundFrame>,
+    tx: mpsc::Sender<Vec<u8>>,
+    user_id: String,
+    #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
+    #[cfg(feature = "metrics")] meeting_id: String,
+) {
+    // `user_id` is used by the final info! log line; on metrics builds it's
+    // also used as a Prometheus label. No dead-code warning either way.
+    while let Some(frame) = rx.recv().await {
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = metrics {
+            m.packets_sent_total
+                .with_label_values(&[user_id.as_str(), meeting_id.as_str(), frame.kind.as_str()])
+                .inc();
+        }
+        if tx.send(frame.bytes).await.is_err() {
+            break;
+        }
+    }
+    info!("Outbound passthrough stopped for {}", user_id);
 }
 
 /// Inbound network-impairment task. Receives payloads the transport readers

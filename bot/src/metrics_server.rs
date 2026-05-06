@@ -68,7 +68,7 @@ pub use stub::BotMetrics;
 #[cfg(feature = "metrics")]
 use std::convert::Infallible;
 #[cfg(feature = "metrics")]
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(feature = "metrics")]
 use std::sync::Arc;
 
@@ -244,16 +244,28 @@ impl BotMetrics {
     }
 }
 
+/// Default metrics bind address. Loopback-only so the `/metrics` endpoint,
+/// which exposes meeting IDs / user IDs as label values, is not reachable
+/// over the network unless the operator explicitly opts in via
+/// `--metrics-bind`.
+#[cfg(feature = "metrics")]
+pub const DEFAULT_METRICS_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
 /// Spawn a minimal hyper server that exposes `/metrics` (Prometheus text
-/// format) on the supplied port.
+/// format) on the supplied address and port.
 ///
 /// The server runs until the surrounding tokio runtime shuts down. We
 /// deliberately do not expose a graceful-shutdown handle because the bot is
 /// typically terminated with `SIGINT` and `SIGKILL` cleanup is sufficient
 /// for a load-test tool — no state is persisted across the server.
+///
+/// `bind` defaults to [`DEFAULT_METRICS_BIND`] (127.0.0.1). Operators who
+/// need fleet-wide scraping can pass `0.0.0.0` (or a specific NIC IP) via
+/// the `--metrics-bind` CLI flag — this is an explicit opt-in because the
+/// endpoint exposes meeting/user identifiers as Prometheus labels.
 #[cfg(feature = "metrics")]
-pub fn start_server(registry: Arc<Registry>, port: u16) {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+pub fn start_server(registry: Arc<Registry>, bind: IpAddr, port: u16) {
+    let addr = SocketAddr::new(bind, port);
     let registry_for_service = Arc::clone(&registry);
 
     let make_svc = make_service_fn(move |_| {

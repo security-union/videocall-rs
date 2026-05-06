@@ -300,6 +300,12 @@ pub struct SignalInfo {
     pub history: Vec<SignalSample>,
     /// Meeting start time (Unix ms) for the chart X-axis reference.
     pub meeting_start_ms: f64,
+    /// Current transport string for this peer (`"webtransport"` |
+    /// `"websocket"` | `"unknown"`), as reported via the `peer_status`
+    /// diagnostics metric. `None` when no `peer_status` event has been
+    /// observed yet. Renders as a header badge in [`SignalQualityPopup`];
+    /// not part of the time-series chart.
+    pub transport: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +325,12 @@ pub struct SignalQualityPopupProps {
     /// Meeting start time (Unix ms). The X-axis is relative to this so all
     /// peers share the same time reference for easy comparison.
     meeting_start_ms: f64,
+    /// Current transport string (`"webtransport"` | `"websocket"` |
+    /// `"unknown"`) sourced from the `peer_status` diagnostics metric.
+    /// Rendered as a small WT/WS/em-dash badge in the popup header.
+    /// `None` is treated like `"unknown"` (em-dash).
+    #[props(default)]
+    transport: Option<String>,
     /// Called when the user dismisses the popup.
     on_close: EventHandler<()>,
 }
@@ -487,6 +499,15 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     let on_close = props.on_close;
     let popup_title = format!("Signal Quality - {}", props.peer_name);
 
+    // Derive the transport badge tuple once, before rsx, so we don't pay
+    // for repeated `String::as_str` / match work inside the rsx! macro
+    // during re-renders. Mirrors the diagnostics popup pattern.
+    let (transport_label, transport_class, transport_title) = match props.transport.as_deref() {
+        Some("webtransport") => ("WT", "connection-type type-webtransport", "WebTransport"),
+        Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
+        _ => ("\u{2014}", "connection-type", "Transport unknown"),
+    };
+
     // No Dioxus signal for tooltip — we manipulate a <body>-level DOM element
     // directly to escape all stacking contexts from grid-items.
     // Hide tooltip when this popup component unmounts.
@@ -519,10 +540,17 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                 class: "signal-quality-popup",
                 div { class: "popup-header",
                     span { class: "popup-title", "{popup_title}" }
-                    button {
-                        class: "popup-close",
-                        onclick: move |_| on_close.call(()),
-                        "X"
+                    div { class: "popup-header-actions",
+                        span {
+                            class: "{transport_class}",
+                            title: "{transport_title}",
+                            "{transport_label}"
+                        }
+                        button {
+                            class: "popup-close",
+                            onclick: move |_| on_close.call(()),
+                            "X"
+                        }
                     }
                 }
                 p { style: "color: {theme_color::TEXT_SUBTLE}; font-size: 12px;", "No data yet." }
@@ -639,10 +667,17 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
             onclick: move |e| e.stop_propagation(),
             div { class: "popup-header",
                 span { class: "popup-title", "{popup_title}" }
-                button {
-                    class: "popup-close",
-                    onclick: move |_| on_close.call(()),
-                    "X"
+                div { class: "popup-header-actions",
+                    span {
+                        class: "{transport_class}",
+                        title: "{transport_title}",
+                        "{transport_label}"
+                    }
+                    button {
+                        class: "popup-close",
+                        onclick: move |_| on_close.call(()),
+                        "X"
+                    }
                 }
             }
             div { class: "signal-chart-wrapper",

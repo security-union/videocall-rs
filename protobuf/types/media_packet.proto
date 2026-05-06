@@ -54,9 +54,20 @@ enum VideoCodec {
   // AV1_MAIN_LEVEL21_8BIT = 30;  // av01.0.01M.08 - Main, Level 2.1, 8-bit
 }
 
+// Transport over which a peer is connected to the SFU.
+// Sent passively as part of HeartbeatMetadata so other peers can
+// surface this in diagnostics. Default value 0 = unknown keeps older
+// clients (which never set the field) forward/backward compatible.
+enum TransportType {
+  TRANSPORT_UNKNOWN = 0;
+  TRANSPORT_WEBTRANSPORT = 1;
+  TRANSPORT_WEBSOCKET = 2;
+}
+
 message HeartbeatMetadata {
   bool video_enabled = 1;
   bool audio_enabled = 2;
   bool screen_enabled = 3;
   bool is_speaking = 4;
+  TransportType transport_type = 5;
 }

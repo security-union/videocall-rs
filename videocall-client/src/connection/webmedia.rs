@@ -21,6 +21,7 @@
 //
 // Implemented both for WebSockets (websocket.rs) and WebTransport (webtransport.rs)
 //
+use super::connection_lost_reason::ConnectionLostReason;
 use log::error;
 use protobuf::Message;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -33,7 +34,7 @@ pub struct ConnectOptions {
     pub webtransport_url: String,
     pub on_inbound_media: Callback<PacketWrapper>,
     pub on_connected: Callback<()>,
-    pub on_connection_lost: Callback<JsValue>,
+    pub on_connection_lost: Callback<ConnectionLostReason>,
     pub peer_monitor: Callback<()>,
 }
 

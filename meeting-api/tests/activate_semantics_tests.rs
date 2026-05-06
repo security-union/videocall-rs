@@ -312,3 +312,73 @@ async fn test_started_at_monotonically_advances_past_created_at() {
 
     cleanup_test_data(&pool, room_id).await;
 }
+
+// ── Scenario 5: end_meeting is idempotent — ended_at is stamped once ───────
+
+/// Calling [`db_meetings::end_meeting`] more than once for the same meeting
+/// must NOT re-stamp `ended_at`. The NATS host-leave consumer can fire the
+/// `MEETING_ENDED_BY_HOST` event multiple times in pathological conditions
+/// (stream re-subscribe after disconnect, multi-replica fan-out without a
+/// queue group), and downstream consumers (search indexer, meeting-history)
+/// rely on `ended_at` being the first-end timestamp.
+///
+/// The SQL guard is `state <> 'ended'` (the WHERE clause short-circuits the
+/// second UPDATE entirely) reinforced by `COALESCE(ended_at, NOW())` (so
+/// even if the WHERE were ever loosened, the original timestamp would still
+/// be preserved).
+#[tokio::test]
+#[serial]
+async fn test_end_meeting_is_idempotent_does_not_restamp_ended_at() {
+    let pool = get_test_pool().await;
+    let room_id = "end-meeting-idempotent-ended-at";
+    let row = create_idle_meeting(&pool, room_id, "host@example.com").await;
+
+    db_meetings::activate(&pool, row.id)
+        .await
+        .expect("activate must succeed");
+
+    // First end_meeting: stamps ended_at.
+    db_meetings::end_meeting(&pool, row.id)
+        .await
+        .expect("first end_meeting must succeed");
+
+    let after_first = refetch(&pool, room_id).await;
+    assert_eq!(
+        after_first.state.as_deref(),
+        Some("ended"),
+        "row must transition to 'ended' on the first end_meeting"
+    );
+    let ended_at_first = after_first
+        .ended_at
+        .expect("first end_meeting must populate ended_at");
+
+    // Sleep so that *if* a second end_meeting were to refresh `ended_at = NOW()`
+    // we'd see a clear forward jump — without this the same-microsecond NOW()
+    // could mask a regression on fast hardware.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // Second end_meeting (simulates a duplicate NATS host-leave fan-out).
+    db_meetings::end_meeting(&pool, row.id)
+        .await
+        .expect("idempotent end_meeting must not error");
+
+    let after_second = refetch(&pool, room_id).await;
+    assert_eq!(
+        after_second.state.as_deref(),
+        Some("ended"),
+        "row must remain 'ended' after a duplicate end_meeting"
+    );
+    assert!(
+        ts_eq(
+            after_second
+                .ended_at
+                .expect("ended_at must remain populated after duplicate end"),
+            ended_at_first
+        ),
+        "ended_at must NOT change on a duplicate end_meeting; \
+         first={ended_at_first}, second={:?}",
+        after_second.ended_at
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}

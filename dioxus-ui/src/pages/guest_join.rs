@@ -15,6 +15,7 @@ use crate::context::{
     TransportPreference, TransportPreferenceCtx, DISPLAY_NAME_MAX_LEN,
 };
 use crate::meeting_api::{join_meeting_as_guest, JoinMeetingResponse};
+use crate::theme::color as theme_color;
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -57,9 +58,6 @@ fn guest_status_from_join_response(
 ) -> GuestStatus {
     let host_display_name = response.host_display_name.clone();
     let host_user_id = response.host_user_id.clone();
-    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
-    let aca = response.admitted_can_admit.unwrap_or(false);
-    let ag = response.allow_guests.unwrap_or(false);
 
     match response.status.as_str() {
         "admitted" => {
@@ -72,9 +70,9 @@ fn guest_status_from_join_response(
                         response.observer_token.clone(),
                         fallback_status_observer_token,
                     ),
-                    waiting_room_enabled: wr_enabled,
-                    admitted_can_admit: aca,
-                    allow_guests: ag,
+                    waiting_room_enabled: response.waiting_room_enabled,
+                    admitted_can_admit: response.admitted_can_admit,
+                    allow_guests: response.allow_guests,
                 }
             } else {
                 GuestStatus::Error("Admitted but no room token".to_string())
@@ -114,9 +112,6 @@ fn handle_admitted(
 ) {
     let determined_host = response.host_display_name.clone();
     let determined_host_uid = response.host_user_id.clone();
-    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
-    let aca = response.admitted_can_admit.unwrap_or(false);
-    let ag = response.allow_guests.unwrap_or(false);
     let token = response.room_token.unwrap_or_default();
     let status_observer_token = resolve_status_observer_token(
         response.observer_token,
@@ -130,9 +125,9 @@ fn handle_admitted(
         host_user_id: determined_host_uid,
         room_token: token,
         status_observer_token,
-        waiting_room_enabled: wr_enabled,
-        admitted_can_admit: aca,
-        allow_guests: ag,
+        waiting_room_enabled: response.waiting_room_enabled,
+        admitted_can_admit: response.admitted_can_admit,
+        allow_guests: response.allow_guests,
     });
 }
 
@@ -245,6 +240,9 @@ fn start_observer_connection(
         on_peer_joined: None,
         on_display_name_changed: None,
         decode_media: false,
+        // Guest observer client: short-lived, recovery is via meeting
+        // activation push, not re-election. No post-rebase retry.
+        allow_post_rebase_retry: false,
     };
 
     let mut client = VideoCallClient::new(opts);
@@ -513,9 +511,9 @@ pub fn GuestJoinPage(id: String) -> Element {
             GuestStatus::Joining => {
                 let name = input_value();
                 rsx! {
-                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                         div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                        p { style: "color: white; font-size: 1rem;",
+                        p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
                             "Joining as guest: "
                             strong { "{name}" }
                             "..."
@@ -595,7 +593,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                                             if let Some(err) = input_error() {
                                                 p {
                                                     class: "text-sm mt-2 ml-1",
-                                                    style: "color: #ff6b6b;",
+                                                    style: "color: {theme_color::ERROR_TEXT};",
                                                     "{err}"
                                                 }
                                             }
@@ -643,12 +641,12 @@ mod tests {
             admitted_at: None,
             room_token: room_token.map(ToString::to_string),
             observer_token: observer_token.map(ToString::to_string),
-            waiting_room_enabled: Some(true),
-            admitted_can_admit: Some(false),
-            end_on_host_leave: Some(true),
+            waiting_room_enabled: true,
+            admitted_can_admit: false,
+            end_on_host_leave: true,
             host_display_name: Some("Host".to_string()),
             host_user_id: Some("host-1".to_string()),
-            allow_guests: Some(true),
+            allow_guests: true,
         }
     }
 

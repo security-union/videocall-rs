@@ -79,6 +79,8 @@
 //!     on_peer_joined: None,  // Option<Callback<(String, String)>> -- (display_name, user_id)
 //!     on_display_name_changed: None,
 //!     decode_media: true,
+//!     is_guest: false,
+//!     allow_post_rebase_retry: true,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -114,6 +116,8 @@
 //! #     on_peer_joined: None,
 //! #     on_display_name_changed: None,
 //! #     decode_media: true,
+//! #     is_guest: false,
+//! #     allow_post_rebase_retry: true,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(
@@ -193,8 +197,8 @@ pub mod adaptive_quality_constants;
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;
-pub mod client;
-pub mod connection;
+mod client;
+mod connection;
 pub mod constants;
 pub mod crypto;
 pub mod decode;
@@ -206,7 +210,7 @@ pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;
 pub use client::{VideoCallClient, VideoCallClientOptions};
-pub use connection::ConnectionState;
+pub use connection::{ConnectionLostReason, ConnectionState};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };

@@ -23,7 +23,7 @@ pub fn ToggleSwitch(
     let disabled_style = if disabled {
         " opacity: 0.5; cursor: not-allowed;"
     } else {
-        ""
+        " opacity: 1;"
     };
 
     rsx! {

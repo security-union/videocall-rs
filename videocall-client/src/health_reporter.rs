@@ -34,6 +34,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
@@ -175,7 +176,7 @@ pub struct HealthReporter {
     /// Screen sharing active flag.
     screen_sharing_active: Rc<RefCell<Rc<AtomicBool>>>,
     /// Encoder output FPS (camera).
-    encoder_output_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    encoder_output_fps: Rc<RefCell<Arc<AtomicU32>>>,
     /// Shared tier transition buffers (camera + screen, drained each health packet).
     tier_transitions: TierTransitionBuffers,
     /// Climb-rate limiter snapshot, updated by the encoder each tick.
@@ -225,7 +226,7 @@ impl HealthReporter {
             encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
-            encoder_output_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_output_fps: Rc::new(RefCell::new(Arc::new(AtomicU32::new(0)))),
             tier_transitions: Rc::new(RefCell::new(Vec::new())),
             climb_limiter_snapshot: Rc::new(RefCell::new(Rc::new(RefCell::new(
                 ClimbLimiterSnapshot::default(),
@@ -330,7 +331,7 @@ impl HealthReporter {
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
-        output_fps: Rc<AtomicU32>,
+        output_fps: Arc<AtomicU32>,
         camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,

@@ -17,7 +17,6 @@
  */
 
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -266,7 +265,7 @@ pub struct EncoderBitrateController {
     pid: pidgeon::PidController,
     last_update: f64,
     ideal_bitrate_kbps: u32,
-    target_fps: Rc<AtomicU32>,
+    target_fps: Arc<AtomicU32>,
     fps_history: std::collections::VecDeque<f64>,
     max_history_size: usize,
     initialization_complete: bool,
@@ -304,7 +303,7 @@ pub struct EncoderBitrateController {
 
 impl EncoderBitrateController {
     /// Create a new bitrate controller using the default `VIDEO_QUALITY_TIERS`.
-    pub fn new(ideal_bitrate_kbps: u32, target_fps: Rc<AtomicU32>) -> Self {
+    pub fn new(ideal_bitrate_kbps: u32, target_fps: Arc<AtomicU32>) -> Self {
         Self::with_clock(ideal_bitrate_kbps, target_fps, default_clock())
     }
 
@@ -317,7 +316,7 @@ impl EncoderBitrateController {
     /// [`TestClock`]: crate::clock::TestClock
     pub fn with_clock(
         ideal_bitrate_kbps: u32,
-        target_fps: Rc<AtomicU32>,
+        target_fps: Arc<AtomicU32>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         let quality_manager =
@@ -333,7 +332,7 @@ impl EncoderBitrateController {
     /// PID controller does not make an unnecessary correction on the first
     /// update.
     pub fn new_for_screen(
-        target_fps: Rc<AtomicU32>,
+        target_fps: Arc<AtomicU32>,
         video_tiers: &'static [VideoQualityTier],
     ) -> Self {
         Self::new_for_screen_with_clock(target_fps, video_tiers, default_clock())
@@ -341,7 +340,7 @@ impl EncoderBitrateController {
 
     /// Create a new screen-share bitrate controller with an injected [`Clock`].
     pub fn new_for_screen_with_clock(
-        target_fps: Rc<AtomicU32>,
+        target_fps: Arc<AtomicU32>,
         video_tiers: &'static [VideoQualityTier],
         clock: Arc<dyn Clock>,
     ) -> Self {
@@ -354,7 +353,7 @@ impl EncoderBitrateController {
     /// Internal constructor shared by `new` and `new_for_screen`.
     fn build(
         ideal_bitrate_kbps: u32,
-        target_fps: Rc<AtomicU32>,
+        target_fps: Arc<AtomicU32>,
         quality_manager: AdaptiveQualityManager,
         clock: Arc<dyn Clock>,
     ) -> Self {
@@ -764,8 +763,8 @@ impl EncoderBitrateController {
 mod tests {
     use super::*;
     use crate::clock::default_clock;
-    use std::rc::Rc;
     use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
     use videocall_types::protos::diagnostics_packet::{
         AudioMetrics, DiagnosticsPacket, VideoMetrics,
     };
@@ -831,7 +830,7 @@ mod tests {
     #[test]
     fn test_happy_path() {
         // Setup
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         // Use 500 kbps as the ideal bitrate
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
@@ -875,7 +874,7 @@ mod tests {
     #[test]
     fn test_multiple_peers() {
         // Setup
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
@@ -930,7 +929,7 @@ mod tests {
     #[test]
     fn test_peer_cleanup() {
         // Setup
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
@@ -1037,7 +1036,7 @@ mod tests {
     #[test]
     fn test_different_media_types() {
         // Setup
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
@@ -1075,7 +1074,7 @@ mod tests {
     #[test]
     fn test_bandwidth_drop() {
         // Setup with a target of 30 FPS
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         // Use 500 kbps as the ideal bitrate
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
@@ -1132,7 +1131,7 @@ mod tests {
 
     #[test]
     fn test_calculate_jitter() {
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(500, target_fps);
 
         // Test empty history
@@ -1197,7 +1196,7 @@ mod tests {
     #[test]
     fn test_throttling_basic() {
         // Setup
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
@@ -1236,7 +1235,7 @@ mod tests {
 
     #[test]
     fn test_bitrate_recovery_after_fps_improves() {
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
@@ -1292,7 +1291,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_target_fps_change() {
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
@@ -1353,7 +1352,7 @@ mod tests {
 
     #[test]
     fn test_progressive_integral_accumulation() {
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
@@ -1400,7 +1399,7 @@ mod tests {
 
     #[test]
     fn test_pid_and_jitter_combined_clamp_to_min() {
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
@@ -1444,7 +1443,7 @@ mod tests {
 
     #[test]
     fn test_same_timestamp_dt_zero() {
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
@@ -1496,7 +1495,7 @@ mod tests {
     fn test_new_for_screen_starts_at_midpoint_tier() {
         use crate::constants::{DEFAULT_SCREEN_TIER_INDEX, SCREEN_QUALITY_TIERS};
 
-        let target_fps = Rc::new(AtomicU32::new(15));
+        let target_fps = Arc::new(AtomicU32::new(15));
         let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
 
         // Should start at DEFAULT_SCREEN_TIER_INDEX (index 1, "medium" — midpoint of 3-tier ladder)
@@ -1519,7 +1518,7 @@ mod tests {
     fn test_notify_screen_sharing_active_forces_ceiling() {
         use crate::constants::screen_share_camera_ceiling_index;
 
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(1500, target_fps);
 
         // Camera starts at DEFAULT_VIDEO_TIER_INDEX (the "medium" tier, 480p).
@@ -1559,7 +1558,7 @@ mod tests {
     fn test_notify_screen_sharing_deactivate_removes_ceiling() {
         use crate::constants::screen_share_camera_ceiling_index;
 
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(1500, target_fps);
 
         let ceiling = screen_share_camera_ceiling_index();
@@ -1610,7 +1609,7 @@ mod tests {
     fn test_notify_screen_sharing_double_activation_is_idempotent() {
         use crate::constants::screen_share_camera_ceiling_index;
 
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(1500, target_fps);
 
         let ceiling = screen_share_camera_ceiling_index();
@@ -1830,7 +1829,7 @@ mod tests {
         // Feed p75 = 28 fps (very close to target 30) for ~30 iterations.
         // The PID should converge near ideal_bitrate (500 kbps) since there
         // is very little error. This proves the PID is stable with the p75 signal.
-        let target_fps = Rc::new(AtomicU32::new(30));
+        let target_fps = Arc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500u32;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 

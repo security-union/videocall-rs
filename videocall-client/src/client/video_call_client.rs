@@ -1007,7 +1007,7 @@ impl VideoCallClient {
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
-        output_fps: Rc<AtomicU32>,
+        output_fps: Arc<AtomicU32>,
         camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,

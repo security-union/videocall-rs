@@ -188,6 +188,7 @@ pub struct ConnectionManagerOptions {
 /// so we can't observe `reelection_in_progress` after `start_reelection` has
 /// been called. The pure decision function lets tests assert exactly which
 /// branch the policy would take without invoking the wasm-only side effects.
+#[cfg(any(target_arch = "wasm32", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostRebaseRetryAction {
     /// Drop this retry without rescheduling. Either re-election is already in
@@ -2198,6 +2199,7 @@ impl ConnectionManager {
     /// Pure decision function: given the current state, determines what the
     /// fired retry timer should do. Has no side effects so it is host-test
     /// safe and trivially unit-testable.
+    #[cfg(any(target_arch = "wasm32", test))]
     fn decide_post_rebase_retry_action(&self) -> PostRebaseRetryAction {
         if self.reelection_in_progress {
             return PostRebaseRetryAction::Skip;
@@ -2224,6 +2226,7 @@ impl ConnectionManager {
     /// Delegates the policy decision to
     /// [`Self::decide_post_rebase_retry_action`] and applies the
     /// corresponding side effect.
+    #[cfg(any(target_arch = "wasm32", test))]
     fn run_post_rebase_retry(&mut self, attempt: u32) {
         match self.decide_post_rebase_retry_action() {
             PostRebaseRetryAction::Skip => {
@@ -5270,6 +5273,7 @@ mod tests {
             connection_id: old_id.to_string(),
             active: true,
             connected: true,
+            consecutive_implausible_discards: 0,
         });
         *mgr.active_connection_id.borrow_mut() = Some(old_id.to_string());
         // Synthesise the moved-out old connection slot. We cannot build

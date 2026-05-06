@@ -1446,6 +1446,7 @@ mod tests {
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
@@ -3224,13 +3225,12 @@ mod tests {
         let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
         let collected_clone = collected.clone();
 
-        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
             collected_clone.borrow_mut().push(pkt);
         });
 
         let mut manager = PeerDecodeManager::new();
-        manager.set_local_user_id("me@example.com".to_string());
-        manager.send_packet = Some(callback);
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
 
         // Clear the send counter baseline.
         let baseline = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
@@ -3279,13 +3279,12 @@ mod tests {
     fn set_active_decode_set_sends_video_pli_for_newly_visible_peers() {
         let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
         let collected_clone = collected.clone();
-        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
             collected_clone.borrow_mut().push(pkt);
         });
 
         let mut manager = PeerDecodeManager::new();
-        manager.set_local_user_id("me@example.com".to_string());
-        manager.send_packet = Some(callback);
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
 
         // Insert N=4 peers, all with video_enabled=true and currently invisible.
         let peer_ids = [500u64, 501, 502, 503];
@@ -3314,6 +3313,7 @@ mod tests {
                 has_received_heartbeat: false,
                 is_speaking: false,
                 audio_level: 0.0,
+                transport_type: TransportType::TRANSPORT_UNKNOWN,
                 vad_threshold: None,
                 video_seq_tracker: SequenceTracker::new(),
                 screen_seq_tracker: SequenceTracker::new(),
@@ -3368,13 +3368,12 @@ mod tests {
     fn set_active_decode_set_no_duplicate_plis_on_same_set() {
         let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
         let collected_clone = collected.clone();
-        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
             collected_clone.borrow_mut().push(pkt);
         });
 
         let mut manager = PeerDecodeManager::new();
-        manager.set_local_user_id("me@example.com".to_string());
-        manager.send_packet = Some(callback);
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
 
         let (mock_audio, _) = MockAudioDecoder::new();
         let peer = Peer {
@@ -3399,6 +3398,7 @@ mod tests {
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
@@ -3424,13 +3424,12 @@ mod tests {
     fn set_active_decode_set_no_pli_for_camera_off_peer() {
         let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
         let collected_clone = collected.clone();
-        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
             collected_clone.borrow_mut().push(pkt);
         });
 
         let mut manager = PeerDecodeManager::new();
-        manager.set_local_user_id("me@example.com".to_string());
-        manager.send_packet = Some(callback);
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
 
         let (mock_audio, _) = MockAudioDecoder::new();
         let peer = Peer {
@@ -3455,6 +3454,7 @@ mod tests {
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),

@@ -21,6 +21,7 @@ fi
 # Requires: python3 (available in the project's nix dev shell and most CI images)
 python3 - "$JSON_FILE" "$CSS_FILE" <<'PYEOF'
 import sys, json, re
+from typing import Optional
 
 json_file, css_file = sys.argv[1], sys.argv[2]
 
@@ -47,7 +48,7 @@ raw_tokens: dict[str, str] = {}
 for token, value in token_re.findall(root_css):
     raw_tokens[token] = value.strip()
 
-def resolve(token: str, seen: set | None = None) -> str | None:
+def resolve(token: str, seen: Optional[set] = None) -> Optional[str]:
     """Resolve one level of var(--x) alias."""
     if seen is None:
         seen = set()

@@ -1,0 +1,50 @@
+name: Backend Tests (HCL)
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    paths:
+      - 'actix-api/**'
+      - 'meeting-api/**'
+      - 'videocall-types/**'
+      - 'videocall-meeting-types/**'
+      - 'protobuf/**'
+      - 'dbmate/**'
+      - 'docker/docker-compose.integration.yaml'
+      - 'docker/Dockerfile.actix.dev'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Makefile'
+
+concurrency:
+  group: pr-check-backend-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  CARGO_HOME: /var/lib/ci/cargo
+  RUSTUP_HOME: /var/lib/ci/rustup
+  CARGO_INCREMENTAL: "0"
+  PATH: /var/lib/ci/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+jobs:
+  test:
+    name: cargo tests
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clean stale Docker resources
+        run: docker system prune -f --volumes || true
+
+      - name: Run backend tests
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: make tests_run
+
+      - name: Teardown
+        if: always()
+        run: make tests_down

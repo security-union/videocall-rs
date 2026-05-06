@@ -141,6 +141,9 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when meeting settings are updated (optional)
     pub on_meeting_settings_updated: Option<Callback<()>>,
 
+    /// Callback triggered when the host requests this client mute its mic.
+    pub on_host_mute: Option<Callback<()>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
     pub on_peer_left: Option<Callback<(String, String)>>,
@@ -197,6 +200,7 @@ struct InnerOptions {
     on_participant_rejected: Option<Callback<()>>,
     on_waiting_room_updated: Option<Callback<()>>,
     on_meeting_settings_updated: Option<Callback<()>>,
+    on_host_mute: Option<Callback<()>>,
     on_peer_left: Option<Callback<(String, String)>>,
     on_peer_joined: Option<Callback<(String, String)>>,
     on_display_name_changed: Option<Callback<(String, String)>>,
@@ -347,6 +351,7 @@ impl VideoCallClient {
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
                     on_meeting_settings_updated: options.on_meeting_settings_updated.clone(),
+                    on_host_mute: options.on_host_mute.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -1789,6 +1794,24 @@ impl Inner {
                                 callback.emit(());
                             }
                         }
+                        Ok(MeetingEventType::HOST_MUTE_PARTICIPANT) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_mute_all = target.is_empty();
+                            let is_targeted_at_self = !is_mute_all
+                                && target.as_slice() == self.options.user_id.as_bytes();
+                            info!(
+                                "Received HOST_MUTE_PARTICIPANT: room={}, target=\"{}\", is_mute_all={}, is_targeted_at_self={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(target),
+                                is_mute_all,
+                                is_targeted_at_self
+                            );
+                            if is_mute_all || is_targeted_at_self {
+                                if let Some(cb) = &self.options.on_host_mute {
+                                    cb.emit(());
+                                }
+                            }
+                        }
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
@@ -2015,6 +2038,7 @@ mod disconnect_tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_display_name_changed: None,
+            on_host_mute: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }

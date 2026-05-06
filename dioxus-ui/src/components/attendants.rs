@@ -708,6 +708,8 @@ pub fn AttendantsComponent(
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
+    let show_muted_toast: Signal<bool> = use_signal(|| false);
+    let toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
     let peer_display_name_version = use_signal(|| 0u32);
 
     // Create the peer status map signal early so it can be captured by the
@@ -968,6 +970,28 @@ pub fn AttendantsComponent(
                     }
                 });
             })),
+            // The host's own client must NOT mute itself on mute-all — guard here
+            // by skipping the callback entirely when is_owner is true.
+            on_host_mute: if is_owner {
+                None
+            } else {
+                Some(VcCallback::from(move |_: ()| {
+                    log::info!("HOST_MUTE: muting local microphone on host request");
+                    let mut mic_enabled = mic_enabled;
+                    let mut show_muted_toast = show_muted_toast;
+                    let mut toast_timer = toast_timer;
+                    mic_enabled.set(false);
+                    show_muted_toast.set(true);
+                    // Cancel any pending dismiss timer before scheduling a new one.
+                    toast_timer.set(None);
+                    toast_timer.set(Some(Timeout::new(6_000, move || {
+                        let mut show_muted_toast = show_muted_toast;
+                        let mut toast_timer = toast_timer;
+                        show_muted_toast.set(false);
+                        toast_timer.set(None);
+                    })));
+                }))
+            },
             on_peer_left: {
                 Some(VcCallback::from(
                     move |(display_name, user_id): (String, String)| {
@@ -1949,8 +1973,34 @@ pub fn AttendantsComponent(
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
-                if !peer_toasts().is_empty() {
+                if !peer_toasts().is_empty() || show_muted_toast() {
                     div { class: "peer-toasts",
+                        if show_muted_toast() {
+                            div { class: "peer-toast toast-left",
+                                span { class: "toast-icon",
+                                    svg {
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                        path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                        path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                        line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                        line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                    }
+                                }
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Host muted your microphone" }
+                                    br {}
+                                    span { class: "toast-action", "Click the mic button to unmute." }
+                                }
+                            }
+                        }
                         for (id , display_name , _ , is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined {

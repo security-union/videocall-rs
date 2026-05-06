@@ -194,6 +194,29 @@ pub async fn publish_participant_display_name_changed(
     );
 }
 
+/// Publish `HOST_MUTE_PARTICIPANT` for one participant — or, with an empty
+/// `target_user_id`, for every participant in the room (mute-all).
+pub async fn publish_host_mute(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(nats) = nats else { return Ok(()) };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::HOST_MUTE_PARTICIPANT.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    nats.publish(room_system_subject(room_id), bytes.into())
+        .await?;
+    tracing::debug!(
+        "Published HOST_MUTE_PARTICIPANT for room {room_id} target=\"{target_user_id}\""
+    );
+    Ok(())
+}
+
 /// Publish `MEETING_SETTINGS_UPDATED` when meeting settings change.
 pub async fn publish_meeting_settings_updated(nats: Option<&async_nats::Client>, room_id: &str) {
     let Some(nats) = nats else { return };
@@ -335,6 +358,49 @@ mod tests {
     }
 
     #[test]
+    fn test_build_host_mute_packet_targeted() {
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::HOST_MUTE_PARTICIPANT.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: "carol@example.com".as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::HOST_MUTE_PARTICIPANT.into()
+        );
+        assert_eq!(
+            inner.target_user_id,
+            "carol@example.com".as_bytes().to_vec()
+        );
+        assert_eq!(inner.room_id, "test-room");
+    }
+
+    #[test]
+    fn test_build_host_mute_packet_all_participants() {
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::HOST_MUTE_PARTICIPANT.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: Vec::new(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::HOST_MUTE_PARTICIPANT.into()
+        );
+        assert!(
+            inner.target_user_id.is_empty(),
+            "mute-all uses empty target_user_id as the broadcast marker"
+        );
+    }
+
+    #[test]
     fn test_build_meeting_settings_updated_packet() {
         let packet = MeetingPacket {
             event_type: MeetingEventType::MEETING_SETTINGS_UPDATED.into(),
@@ -378,5 +444,7 @@ mod tests {
         publish_participant_rejected(None, "room", "user@test.com").await;
         publish_waiting_room_updated(None, "room").await;
         publish_meeting_settings_updated(None, "room").await;
+        publish_host_mute(None, "room", "user@test.com").await;
+        publish_host_mute(None, "room", "").await;
     }
 }

@@ -39,7 +39,7 @@ pub enum PacketKind {
     Health,
     /// Normal data packet - should be forwarded to ChatServer
     Data,
-    /// Packet that should be silently dropped (e.g., client-originated CONGESTION)
+    /// Packet that should be silently dropped (e.g., client-originated CONGESTION or MEETING)
     Dropped,
     /// KEYFRAME_REQUEST packet - subject to per-session rate limiting
     KeyframeRequest,
@@ -68,6 +68,16 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
     // never from clients. A malicious client could craft a CONGESTION packet with
     // a victim's session_id to force them to degrade video quality.
     if packet_wrapper.packet_type == PacketType::CONGESTION.into() {
+        return PacketKind::Dropped;
+    }
+
+    // Drop client-originated MEETING packets.
+    // MEETING events (HOST_MUTE_PARTICIPANT, MEETING_ENDED, etc.) are
+    // server-authoritative: they are published exclusively by meeting-api
+    // via NATS on the room.{id}.system subject.  A client-originated
+    // MEETING packet is always forged and must be dropped to prevent
+    // participants from broadcasting fake host actions.
+    if packet_wrapper.packet_type == PacketType::MEETING.into() {
         return PacketKind::Dropped;
     }
 

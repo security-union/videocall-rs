@@ -80,6 +80,7 @@
 //!     on_display_name_changed: None,
 //!     decode_media: true,
 //!     is_guest: false,
+//!     allow_post_rebase_retry: true,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -116,6 +117,7 @@
 //! #     on_display_name_changed: None,
 //! #     decode_media: true,
 //! #     is_guest: false,
+//! #     allow_post_rebase_retry: true,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(

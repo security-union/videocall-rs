@@ -309,6 +309,10 @@ pub fn generate_for_peer(
     let signal_level = signal_info.level;
     let signal_history = signal_info.history;
     let meeting_start_ms = signal_info.meeting_start_ms;
+    // Pulled out once before rsx so the three SignalQualityPopup call
+    // sites below can each pass an `Option<String>` clone without
+    // hunting through the bundle.
+    let signal_transport = signal_info.transport;
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
     let peer_display_name = client
         .get_peer_display_name(key)
@@ -518,12 +522,14 @@ pub fn generate_for_peer(
                             let h = signal_history.clone();
                             let popup_peer_id = key.clone();
                             let popup_peer_name = peer_display_name.clone();
+                            let popup_transport = signal_transport.clone();
                             rsx! {
                                 SignalQualityPopup {
                                     peer_id: popup_peer_id,
                                     peer_name: popup_peer_name,
                                     history: h,
                                     meeting_start_ms,
+                                    transport: popup_transport,
                                     on_close: move |_| show_signal_popup.set(false),
                                 }
                             }
@@ -636,12 +642,14 @@ pub fn generate_for_peer(
                             let h = signal_history.clone();
                             let popup_peer_id = key.clone();
                             let popup_peer_name = peer_display_name.clone();
+                            let popup_transport = signal_transport.clone();
                             rsx! {
                                 SignalQualityPopup {
                                     peer_id: popup_peer_id,
                                     peer_name: popup_peer_name,
                                     history: h,
                                     meeting_start_ms,
+                                    transport: popup_transport,
                                     on_close: move |_| show_signal_popup.set(false),
                                 }
                             }
@@ -816,12 +824,14 @@ pub fn generate_for_peer(
                                 let h = signal_history.clone();
                                 let popup_peer_id = key.clone();
                                 let popup_peer_name = peer_display_name.clone();
+                                let popup_transport = signal_transport.clone();
                                 rsx! {
                                     SignalQualityPopup {
                                         peer_id: popup_peer_id,
                                         peer_name: popup_peer_name,
                                         history: h,
                                         meeting_start_ms,
+                                        transport: popup_transport,
                                         on_close: move |_| show_signal_popup.set(false),
                                     }
                                 }

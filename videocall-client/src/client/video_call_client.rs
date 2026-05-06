@@ -167,6 +167,22 @@ pub struct VideoCallClientOptions {
 
     /// Whether the local user joined as an unauthenticated guest.
     pub is_guest: bool,
+
+    /// Whether the connection manager is allowed to schedule a 30-second
+    /// post-rebase re-election retry when the RTT-degradation watchdog hits a
+    /// "only 1 server configured" rebase.
+    ///
+    /// Set to `true` for users on the default `Auto` transport preference —
+    /// the single-candidate state is system-side (e.g. relay-availability
+    /// blip) and recovery via re-evaluation is desirable.
+    ///
+    /// Set to `false` for users who explicitly chose `WebTransportOnly` or
+    /// `WebSocketOnly` — the single-candidate state is the user's deliberate
+    /// choice and the retry must not override it.
+    ///
+    /// Defaults to `true`. The dioxus-ui derives the value from the user's
+    /// `TransportPreference` context signal.
+    pub allow_post_rebase_retry: bool,
 }
 
 #[derive(Debug)]
@@ -538,6 +554,7 @@ impl VideoCallClient {
             election_period_ms,
             instance_id: generate_instance_id(),
             reelection_completed_signal: self.inner.borrow().reelection_completed_signal.clone(),
+            allow_post_rebase_retry: self.options.allow_post_rebase_retry,
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -572,6 +589,17 @@ impl VideoCallClient {
     /// Call this before [`connect()`][Self::connect] when you have a fresh room
     /// access token and need to reconnect. The existing media pipeline
     /// (encoders, decoders, peer state) is preserved.
+    ///
+    /// The new URLs are propagated end-to-end:
+    /// - the outer `VideoCallClient::options` copy is updated immediately, and
+    /// - if a `ConnectionController` already exists (i.e. `connect()` has been
+    ///   called), the underlying `ConnectionManager`'s own options are
+    ///   updated as well so the post-rebase re-election retry's
+    ///   `total_server_count()` sees the refreshed candidate set.
+    ///
+    /// If the controller does not yet exist (caller is updating URLs before
+    /// the first `connect()`), only the outer copy is updated; the manager
+    /// will pick up the new URLs when it is constructed at connect time.
     pub fn update_server_urls(
         &mut self,
         websocket_urls: Vec<String>,
@@ -581,8 +609,33 @@ impl VideoCallClient {
             "Updating server URLs: ws={:?}, wt={:?}",
             websocket_urls, webtransport_urls
         );
-        self.options.websocket_urls = websocket_urls;
-        self.options.webtransport_urls = webtransport_urls;
+        self.options.websocket_urls = websocket_urls.clone();
+        self.options.webtransport_urls = webtransport_urls.clone();
+
+        // Propagate into the running ConnectionManager so the post-rebase
+        // retry and any future re-elections see the refreshed URL list.
+        // Borrow failure here is non-fatal — the next call will retry.
+        match self.connection_controller.try_borrow() {
+            Ok(cc) => {
+                if let Some(controller) = cc.as_ref() {
+                    if let Err(e) = controller.update_server_urls(websocket_urls, webtransport_urls)
+                    {
+                        warn!("update_server_urls: controller propagation failed: {e}");
+                    }
+                } else {
+                    debug!(
+                        "update_server_urls: no ConnectionController yet (pre-connect); \
+                         outer options updated, manager will read them at connect time"
+                    );
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "update_server_urls: connection_controller already borrowed, \
+                     manager-side URL list NOT updated this call"
+                );
+            }
+        }
     }
 
     fn create_peer_decoder_manager(
@@ -1963,6 +2016,7 @@ mod disconnect_tests {
             on_peer_joined: None,
             on_display_name_changed: None,
             decode_media: true,
+            allow_post_rebase_retry: true,
         }
     }
 

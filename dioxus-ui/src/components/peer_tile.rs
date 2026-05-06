@@ -64,6 +64,13 @@ pub fn PeerTile(
     let mut screen_bitrate = use_signal(|| 0.0_f64);
     let mut latency_ms = use_signal(|| 0.0_f64);
     let mut video_resolution = use_signal(String::new);
+    // Current transport for this peer ("webtransport" / "websocket" /
+    // "unknown"), sourced from the `peer_status` diagnostics metric. Stored
+    // as a per-tile signal because each `PeerTile` only renders its own
+    // peer's badge — no shared map needed. The diagnostics handler guards
+    // .set() so the signal updates only when the value actually changes,
+    // since `peer_status` fires every heartbeat (~1Hz per peer).
+    let mut peer_transport = use_signal(|| None::<String>);
     // Look up or create this peer's signal history in the shared context.
     // The history lives in a context-provided map so it survives PeerTile
     // remounts caused by layout switches (e.g., grid -> split on screen share).
@@ -135,6 +142,7 @@ pub fn PeerTile(
                     &mut screen_bitrate,
                     &mut latency_ms,
                     &mut video_resolution,
+                    &mut peer_transport,
                 );
                 // Push a signal quality sample at most once per second,
                 // piggybacking on the diagnostics event stream.
@@ -202,6 +210,17 @@ pub fn PeerTile(
     };
     drop(sig_history);
 
+    // Only read the transport signal when the popup is visible — avoids
+    // subscribing every PeerTile to transport-change re-renders when no
+    // popup is even open. The .set() call is already gated on actual
+    // change in handle_diagnostics_event, so this is purely a
+    // re-render-scope optimization.
+    let sig_transport = if show_signal_popup() {
+        peer_transport()
+    } else {
+        None
+    };
+
     let appearance = use_context::<AppearanceSettingsCtx>().0();
 
     generate_for_peer(
@@ -222,6 +241,7 @@ pub fn PeerTile(
                 let mt = use_context::<MeetingTimeCtx>();
                 mt().meeting_start_time.unwrap_or_else(js_sys::Date::now)
             },
+            transport: sig_transport,
         },
         show_signal_popup,
         pinned_peer_id.as_deref(),
@@ -259,6 +279,7 @@ fn handle_diagnostics_event(
     screen_bitrate: &mut Signal<f64>,
     latency_ms: &mut Signal<f64>,
     video_resolution: &mut Signal<String>,
+    peer_transport: &mut Signal<Option<String>>,
 ) {
     match evt.subsystem {
         "peer_status" => {
@@ -268,6 +289,7 @@ fn handle_diagnostics_event(
             let mut screen: Option<bool> = None;
             let mut audio_lvl: Option<f32> = None;
             let mut speaking: Option<bool> = None;
+            let mut transport: Option<String> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
                     ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
@@ -276,6 +298,7 @@ fn handle_diagnostics_event(
                     ("screen_enabled", MetricValue::U64(v)) => screen = Some(*v != 0),
                     ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v as f32),
                     ("is_speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                    ("peer_transport", MetricValue::Text(t)) => transport = Some(t.clone()),
                     _ => {}
                 }
             }
@@ -305,6 +328,21 @@ fn handle_diagnostics_event(
                     audio_level.set(lvl);
                 }
                 update_mic_audio_level(lvl, mic_audio_level, mic_hold_timeout);
+            }
+            // Update the transport signal only when the value actually
+            // changes — `peer_status` fires once per heartbeat, so a
+            // naive `.set()` here would wake every PeerTile subscriber
+            // every second even though transport rarely changes.
+            if let Some(t) = transport {
+                let prev = peer_transport.peek();
+                let changed = match prev.as_deref() {
+                    Some(p) => p != t.as_str(),
+                    None => true,
+                };
+                drop(prev);
+                if changed {
+                    peer_transport.set(Some(t));
+                }
             }
         }
         "peer_speaking" => {

@@ -201,6 +201,28 @@ impl ConnectionController {
         Ok(())
     }
 
+    /// Replace the WebSocket / WebTransport server URLs that the underlying
+    /// `ConnectionManager` will consider on the next election or post-rebase
+    /// retry.
+    ///
+    /// Without this hop, `VideoCallClient::update_server_urls` would only
+    /// update the outer client's options copy and the manager would keep
+    /// reading its stale URL list, defeating the post-rebase retry's whole
+    /// reason for existing (re-evaluating candidate availability after a
+    /// token refresh).
+    pub fn update_server_urls(
+        &self,
+        websocket_urls: Vec<String>,
+        webtransport_urls: Vec<String>,
+    ) -> Result<()> {
+        let mut mgr = self
+            .manager
+            .try_borrow_mut()
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.update_server_urls(websocket_urls, webtransport_urls);
+        Ok(())
+    }
+
     /// Check if manager has an active connection
     pub fn is_connected(&self) -> bool {
         if let Ok(mgr) = self.manager.try_borrow() {
@@ -353,6 +375,7 @@ mod tests {
             election_period_ms: 1000,
             instance_id: "test-instance-id".to_string(),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
+            allow_post_rebase_retry: true,
         }
     }
 

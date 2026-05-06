@@ -26,6 +26,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::time;
 use tracing::{debug, info, warn};
 
+use crate::aq_controller::BotAq;
 use crate::config::{ClientConfig, Transport};
 use crate::inbound_stats::InboundStats;
 use videocall_types::protos::health_packet::{
@@ -53,6 +54,7 @@ pub fn spawn_health_reporter(
     stats: Arc<Mutex<InboundStats>>,
     packet_sender: Sender<Vec<u8>>,
     quit: Arc<AtomicBool>,
+    aq: Arc<BotAq>,
 ) {
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(1));
@@ -79,16 +81,17 @@ pub fn spawn_health_reporter(
             };
 
             // Build HealthPacket proto.
-            let packet_bytes = match build_health_packet(&config, &sender_counters, total_packets) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    warn!(
-                        "Failed to build health packet for {}: {}",
-                        config.client_config.user_id, e
-                    );
-                    continue;
-                }
-            };
+            let packet_bytes =
+                match build_health_packet(&config, &sender_counters, total_packets, &aq) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        warn!(
+                            "Failed to build health packet for {}: {}",
+                            config.client_config.user_id, e
+                        );
+                        continue;
+                    }
+                };
 
             if let Err(_e) = packet_sender.try_send(packet_bytes) {
                 static HEALTH_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -121,6 +124,7 @@ fn build_health_packet(
     config: &HealthReporterConfig,
     sender_counters: &std::collections::HashMap<String, crate::inbound_stats::SenderHealthCounters>,
     total_packets: u64,
+    aq: &BotAq,
 ) -> anyhow::Result<Vec<u8>> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -149,14 +153,40 @@ fn build_health_packet(
     hp.is_tab_visible = true;
     hp.is_tab_throttled = false;
 
-    // Bot does not adapt -- report tier 0 (best)
-    hp.adaptive_video_tier = Some(0);
-    hp.adaptive_audio_tier = Some(0);
+    // Real current tier, driven by the adaptive-quality controller. This
+    // used to be hard-coded to 0 which poisoned peer AQ decisions; now we
+    // report the actual tier the bot is encoding at so senders see a truthful
+    // signal.
+    hp.adaptive_video_tier = Some(aq.video_tier_index());
+    hp.adaptive_audio_tier = Some(aq.audio_tier_index());
     hp.screen_sharing_active = Some(false);
+
+    // Encoder-decision telemetry, matching what the browser CameraEncoder
+    // publishes (camera_encoder.rs: shared_encoder_*_bits). These fields
+    // feed the Grafana AQ dashboards so bot-populated calls show the same
+    // diagnostics as browser-populated ones.
+    let fps_ratio = aq.last_fps_ratio();
+    let worst_peer_fps = aq.last_worst_peer_fps();
+    let bitrate_ratio = aq.last_bitrate_ratio();
+    let target_bitrate = aq.last_target_bitrate_kbps();
+    if fps_ratio.is_finite() && fps_ratio > 0.0 {
+        hp.encoder_fps_ratio = Some(fps_ratio as f64);
+    }
+    if worst_peer_fps.is_finite() && worst_peer_fps > 0.0 {
+        hp.encoder_worst_peer_fps = Some(worst_peer_fps as f64);
+    }
+    if bitrate_ratio.is_finite() && bitrate_ratio > 0.0 {
+        hp.encoder_bitrate_ratio = Some(bitrate_ratio as f64);
+    }
+    if target_bitrate.is_finite() && target_bitrate > 0.0 {
+        hp.encoder_target_bitrate_kbps = Some(target_bitrate as f64);
+    }
 
     // Overall inbound packet rate (all senders, all types)
     // The drain window is ~1 second, so count ~ rate.
     hp.packets_received_per_sec = Some(total_packets as f64);
+    // TODO(bot-aq): compute actual send rate instead of the 80 pkt/s
+    // approximation. Needs a counter incremented by the packet sender task.
     hp.packets_sent_per_sec = Some(80.0);
 
     // Per-sender peer stats -- this is the critical part for AQ.

@@ -16,6 +16,7 @@
  * conditions.
  */
 
+mod aq_controller;
 mod audio_producer;
 mod config;
 mod costume_renderer;
@@ -29,6 +30,7 @@ mod video_producer;
 mod websocket_client;
 mod webtransport_client;
 
+use aq_controller::BotAq;
 use audio_producer::AudioProducer;
 use config::{BotConfig, ClientConfig, Manifest, Transport, VideoMode};
 use costume_renderer::CostumeRenderer;
@@ -52,6 +54,13 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    // Bridge the `log` crate (used by videocall-aq and other upstream crates)
+    // into the tracing subscriber so AQ_STATUS / AQ_BITRATE_CHANGE / etc. show
+    // up in the bot's log output alongside tracing events.
+    if let Err(e) = tracing_log::LogTracer::init() {
+        warn!("tracing_log::LogTracer::init failed: {} — log::* events from dependencies will not appear", e);
+    }
 
     info!("Starting videocall synthetic client bot");
 
@@ -362,9 +371,19 @@ async fn run_client(
         }
     );
 
+    // Adaptive-quality controller, created before any producers so they can
+    // read the initial tier snapshot on start.
+    let aq = BotAq::with_default_clock();
+
     // Shared inbound stats -- used by both the transport's inbound consumer
-    // and the health reporter for per-sender packet rate tracking.
+    // and the health reporter for per-sender packet rate tracking. We also
+    // wire the AQ controller here so incoming DIAGNOSTICS packets get fed
+    // straight into the PID loop.
     let stats = Arc::new(Mutex::new(InboundStats::default()));
+    {
+        let mut s = stats.lock().unwrap();
+        s.set_aq(aq.clone());
+    }
 
     // Shared is_speaking flag -- audio producer sets, heartbeat/video reads
     let is_speaking = Arc::new(AtomicBool::new(false));
@@ -410,6 +429,7 @@ async fn run_client(
         stats,
         packet_tx.clone(),
         quit.clone(),
+        aq.clone(),
     );
 
     // Wait for media start signal from main
@@ -434,10 +454,17 @@ async fn run_client(
             media_start,
             loop_duration,
             is_speaking.clone(),
+            aq.clone(),
         )?);
         info!("Audio producer started for {}", user_id);
 
-        // Start video producer
+        // Start video producer. The initial snapshot from `aq` already
+        // reflects the default tier; producers poll `aq.tier_epoch()` each
+        // iteration and re-snapshot on change.
+        let v0 = aq.snapshot_video();
+        let ekg_width = v0.max_width;
+        let ekg_height = v0.max_height;
+        let ekg_fps = v0.target_fps.max(1);
         let video_mode = &bot_config.video_mode;
         if *video_mode == VideoMode::Costume {
             if let Some(ref dir) = costume_dir {
@@ -449,17 +476,18 @@ async fn run_client(
                     media_start,
                     loop_duration,
                     is_speaking.clone(),
+                    aq.clone(),
                 )?);
                 info!("Costume video producer started for {} ({})", user_id, dir);
             } else {
-                // Costume mode but no costume_dir -- fall back to EKG
+                // Costume mode but no costume_dir -- fall back to EKG.
                 warn!(
                     "[{}] video_mode=costume but no costume_dir set, falling back to EKG",
                     user_id
                 );
-                let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, 15);
+                let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, ekg_fps);
                 let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
-                let renderer = EkgRenderer::new(ekg_color, 1280, 720);
+                let renderer = EkgRenderer::new(ekg_color, ekg_width, ekg_height);
                 _video_producer = Some(VideoProducer::from_ekg(
                     user_id.clone(),
                     renderer,
@@ -468,14 +496,15 @@ async fn run_client(
                     packet_tx.clone(),
                     media_start,
                     loop_duration,
+                    aq.clone(),
                 )?);
                 info!("EKG video producer started for {} (fallback)", user_id);
             }
         } else {
             // EKG mode
-            let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, 15);
+            let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, ekg_fps);
             let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
-            let renderer = EkgRenderer::new(ekg_color, 1280, 720);
+            let renderer = EkgRenderer::new(ekg_color, ekg_width, ekg_height);
             _video_producer = Some(VideoProducer::from_ekg(
                 user_id.clone(),
                 renderer,
@@ -484,6 +513,7 @@ async fn run_client(
                 packet_tx.clone(),
                 media_start,
                 loop_duration,
+                aq.clone(),
             )?);
             info!("EKG video producer started for {}", user_id);
         }

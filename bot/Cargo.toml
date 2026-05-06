@@ -16,6 +16,7 @@ categories = ["network-programming", "multimedia"]
 tokio = { version = "1.28.1", features = ["full"] }
 futures = "0.3.16"
 videocall-types = { path= "../videocall-types", version = "5.0.0" }
+videocall-aq = { path = "../videocall-aq", version = "0.1.0" }
 protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"
@@ -44,6 +45,7 @@ serde_yaml = "0.9"
 # Logging
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+tracing-log = "0.2"
 
 # Error handling
 anyhow = "1.0"

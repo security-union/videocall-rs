@@ -19,12 +19,16 @@
 
 use protobuf::Message;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+use crate::aq_controller::BotAq;
 
 /// Per-sender counters accumulated between health report drains.
 #[derive(Default, Clone)]
@@ -67,9 +71,20 @@ pub struct InboundStats {
     last_seen: HashMap<String, Instant>,
     /// Intern map: raw user_id bytes → owned String to avoid per-packet allocation.
     sender_names: HashMap<Vec<u8>, String>,
+    /// Optional adaptive-quality controller. When set, inbound DIAGNOSTICS
+    /// packets are forwarded here so the bot's encoders can adapt.
+    aq: Option<Arc<BotAq>>,
+    /// Number of DIAGNOSTICS packets that failed to parse since the last reset.
+    diagnostics_parse_errors: u64,
 }
 
 impl InboundStats {
+    /// Attach an adaptive-quality controller. Once set, every inbound
+    /// DIAGNOSTICS packet is forwarded to it so the bot's encoders can adapt.
+    pub fn set_aq(&mut self, aq: Arc<BotAq>) {
+        self.aq = Some(aq);
+    }
+
     pub fn record_packet(&mut self, _my_user_id: &str, data: &[u8]) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -82,6 +97,32 @@ impl InboundStats {
             self.parse_errors += 1;
             return;
         };
+
+        // DIAGNOSTICS packets are fed to the AQ controller so the bot can
+        // react to downstream quality signals like a real browser client.
+        // We deliberately intercept this before the MEDIA early-return so the
+        // relay's diagnostic broadcasts stop being silently dropped.
+        if wrapper.packet_type.enum_value() == Ok(PacketType::DIAGNOSTICS) {
+            match DiagnosticsPacket::parse_from_bytes(&wrapper.data) {
+                Ok(diag) => {
+                    if let Some(ref aq) = self.aq {
+                        aq.process_diagnostics(diag);
+                    }
+                }
+                Err(e) => {
+                    self.diagnostics_parse_errors += 1;
+                    // Rate-limit so a malformed peer cannot spam the log.
+                    if self.diagnostics_parse_errors.is_multiple_of(100) {
+                        warn!(
+                            "Failed to parse DIAGNOSTICS packet (total: {}): {}",
+                            self.diagnostics_parse_errors, e
+                        );
+                    }
+                }
+            }
+            self.other_packets += 1;
+            return;
+        }
 
         if wrapper.packet_type.enum_value() != Ok(PacketType::MEDIA) {
             self.other_packets += 1;
@@ -238,6 +279,7 @@ impl InboundStats {
         let last_audio_ts = std::mem::take(&mut self.last_audio_ts);
         let last_video_ts = std::mem::take(&mut self.last_video_ts);
         let sender_names = std::mem::take(&mut self.sender_names);
+        let aq = self.aq.take();
         *self = Self::default();
         self.health_counters = health_counters;
         self.health_total_packets = health_total;
@@ -247,6 +289,7 @@ impl InboundStats {
         self.last_audio_ts = last_audio_ts;
         self.last_video_ts = last_video_ts;
         self.sender_names = sender_names;
+        self.aq = aq;
     }
 
     /// Remove entries from ALL per-sender maps for senders not seen within `max_age`.

@@ -1051,8 +1051,10 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "url",
+ "videocall-aq",
  "videocall-types",
  "web-transport-quinn",
 ]

@@ -143,7 +143,18 @@ impl WebTransportClient {
         }
     }
 
-    /// Start a task to consume all inbound unistreams and track quality stats
+    /// Start a task to consume all inbound unistreams and track quality stats.
+    ///
+    /// We spawn three tasks here:
+    ///
+    /// 1. A periodic reporter that flushes `InboundStats` every 10s.
+    /// 2. A unistream-accept loop that reads length-prefixed frames off the
+    ///    session's inbound unidirectional QUIC streams.
+    /// 3. A datagram-read loop that reads unreliable QUIC datagrams. Without
+    ///    this the bot ignored every server-sent datagram (e.g. DIAGNOSTICS
+    ///    packets the relay broadcasts via `session.send_datagram`), which
+    ///    starved the AQ controller and made bots look like they had infinite
+    ///    perfect quality.
     async fn start_inbound_consumer(&self, stats: Arc<Mutex<InboundStats>>) {
         if let Some(session) = &self.session {
             let session = session.clone();
@@ -170,6 +181,39 @@ impl WebTransportClient {
                 }
             });
 
+            // --- Datagram reader ---------------------------------------------
+            // Runs in parallel with the uni-stream acceptor so we don't starve
+            // one path while blocked on the other. Each payload is delivered
+            // straight into `InboundStats::record_packet`, which dispatches
+            // MEDIA/DIAGNOSTICS/etc. the same way the unistream path does.
+            {
+                let session_dg = session.clone();
+                let stats_dg = stats.clone();
+                let user_id_dg = user_id.clone();
+                let quit_dg = quit.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if quit_dg.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match session_dg.read_datagram().await {
+                            Ok(bytes) => {
+                                let mut s = stats_dg.lock().unwrap();
+                                s.record_packet(&user_id_dg, &bytes);
+                            }
+                            Err(e) => {
+                                // Datagram channel closes when the session ends
+                                // — fall out cleanly rather than spinning.
+                                debug!("Datagram reader ended for {}: {}", user_id_dg, e);
+                                break;
+                            }
+                        }
+                    }
+                    info!("Datagram reader stopped for {}", user_id_dg);
+                });
+            }
+
+            // --- Unistream acceptor ------------------------------------------
             tokio::spawn(async move {
                 loop {
                     if quit.load(Ordering::Relaxed) {

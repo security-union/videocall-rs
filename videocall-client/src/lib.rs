@@ -193,7 +193,16 @@
 //!
 //! ```
 
-pub mod adaptive_quality_constants;
+/// Re-export shim for the centralized adaptive-quality constants.
+///
+/// The constants themselves now live in the `videocall-aq` crate so they can
+/// be shared between the browser client and native consumers (e.g. the
+/// load-test bot). Browser code that previously imported from
+/// `videocall_client::adaptive_quality_constants::*` continues to resolve
+/// unchanged.
+pub mod adaptive_quality_constants {
+    pub use videocall_aq::constants::*;
+}
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;

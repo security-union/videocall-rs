@@ -19,15 +19,15 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
-use js_sys::Date;
-
-use crate::adaptive_quality_constants::{
+use crate::clock::{default_clock, Clock};
+use crate::constants::{
     screen_share_camera_ceiling_index, AudioQualityTier, VideoQualityTier,
     PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
     PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
-use crate::diagnostics::adaptive_quality_manager::{AdaptiveQualityManager, TierTransitionRecord};
+use crate::manager::{AdaptiveQualityManager, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -291,13 +291,38 @@ pub struct EncoderBitrateController {
     last_aq_summary_ms: f64,
     /// Timestamp (ms) when PID output first hit PID_OUTPUT_MAX.
     pid_saturated_since_ms: Option<f64>,
+    /// Clock used for all internal wall-clock reads (e.g. `last_update`,
+    /// congestion-throttle timestamps, force-step-down timings). The browser
+    /// path uses [`JsDateClock`], native callers use [`SystemClock`], and
+    /// tests can inject a [`TestClock`] for determinism.
+    ///
+    /// [`JsDateClock`]: crate::clock::JsDateClock
+    /// [`SystemClock`]: crate::clock::SystemClock
+    /// [`TestClock`]: crate::clock::TestClock
+    clock: Arc<dyn Clock>,
 }
 
 impl EncoderBitrateController {
     /// Create a new bitrate controller using the default `VIDEO_QUALITY_TIERS`.
     pub fn new(ideal_bitrate_kbps: u32, target_fps: Rc<AtomicU32>) -> Self {
-        let quality_manager = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager)
+        Self::with_clock(ideal_bitrate_kbps, target_fps, default_clock())
+    }
+
+    /// Create a new bitrate controller with an injected [`Clock`].
+    ///
+    /// Native callers (e.g. the load-test bot) can pass a [`SystemClock`];
+    /// tests can pass a [`TestClock`] for deterministic timestamps.
+    ///
+    /// [`SystemClock`]: crate::clock::SystemClock
+    /// [`TestClock`]: crate::clock::TestClock
+    pub fn with_clock(
+        ideal_bitrate_kbps: u32,
+        target_fps: Rc<AtomicU32>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let quality_manager =
+            AdaptiveQualityManager::with_clock(VIDEO_QUALITY_TIERS, Arc::clone(&clock));
+        Self::build(ideal_bitrate_kbps, target_fps, quality_manager, clock)
     }
 
     /// Create a new bitrate controller for screen share.
@@ -311,9 +336,19 @@ impl EncoderBitrateController {
         target_fps: Rc<AtomicU32>,
         video_tiers: &'static [VideoQualityTier],
     ) -> Self {
-        let quality_manager = AdaptiveQualityManager::new_for_screen(video_tiers);
+        Self::new_for_screen_with_clock(target_fps, video_tiers, default_clock())
+    }
+
+    /// Create a new screen-share bitrate controller with an injected [`Clock`].
+    pub fn new_for_screen_with_clock(
+        target_fps: Rc<AtomicU32>,
+        video_tiers: &'static [VideoQualityTier],
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let quality_manager =
+            AdaptiveQualityManager::new_for_screen_with_clock(video_tiers, Arc::clone(&clock));
         let tier_ideal = quality_manager.current_video_tier().ideal_bitrate_kbps;
-        Self::build(tier_ideal, target_fps, quality_manager)
+        Self::build(tier_ideal, target_fps, quality_manager, clock)
     }
 
     /// Internal constructor shared by `new` and `new_for_screen`.
@@ -321,6 +356,7 @@ impl EncoderBitrateController {
         ideal_bitrate_kbps: u32,
         target_fps: Rc<AtomicU32>,
         quality_manager: AdaptiveQualityManager,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         let initial_target = target_fps.load(Ordering::Relaxed) as f64;
 
@@ -340,9 +376,10 @@ impl EncoderBitrateController {
         let pid = pidgeon::PidController::new(controller_config);
         let diagnostic_packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
 
+        let now = clock.now_ms();
         Self {
             pid,
-            last_update: Date::now(),
+            last_update: now,
             ideal_bitrate_kbps,
             target_fps,
             fps_history: std::collections::VecDeque::with_capacity(PID_FPS_HISTORY_SIZE),
@@ -359,6 +396,7 @@ impl EncoderBitrateController {
             last_target_bitrate_kbps: 0.0,
             last_aq_summary_ms: 0.0,
             pid_saturated_since_ms: None,
+            clock,
         }
     }
 
@@ -579,7 +617,7 @@ impl EncoderBitrateController {
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
-        self.process_diagnostics_packet_with_time(packet, Date::now())
+        self.process_diagnostics_packet_with_time(packet, self.clock.now_ms())
     }
 
     // Get the count of active peers
@@ -644,7 +682,7 @@ impl EncoderBitrateController {
     /// Delegates to [`AdaptiveQualityManager::force_video_step_down`].
     /// Returns `true` if the tier actually changed.
     pub fn force_video_step_down(&mut self) -> bool {
-        let now = Date::now();
+        let now = self.clock.now_ms();
         let changed = self.quality_manager.force_video_step_down(now);
         if changed {
             self.tier_changed = true;
@@ -671,7 +709,7 @@ impl EncoderBitrateController {
     pub fn notify_screen_sharing(&mut self, active: bool) {
         if active {
             let ceiling = screen_share_camera_ceiling_index();
-            let now = Date::now();
+            let now = self.clock.now_ms();
             let changed = self.quality_manager.force_video_step_to(ceiling, now);
             self.quality_manager.set_quality_ceiling(Some(ceiling));
             if changed {
@@ -701,7 +739,7 @@ impl EncoderBitrateController {
     /// Wired through: ConnectionManager → shared AtomicBool signal → CameraEncoder
     /// control loop (checks/clears each tick) → this method.
     pub fn notify_reelection_completed(&mut self) {
-        let now = Date::now();
+        let now = self.clock.now_ms();
         self.quality_manager.notify_reelection_completed(now);
     }
 
@@ -725,15 +763,28 @@ impl EncoderBitrateController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::default_clock;
     use std::rc::Rc;
     use std::sync::atomic::AtomicU32;
     use videocall_types::protos::diagnostics_packet::{
         AudioMetrics, DiagnosticsPacket, VideoMetrics,
     };
-    use wasm_bindgen_test::*;
+
+    // Dual-target: on Wasm this delegates to `wasm-bindgen-test`; on native
+    // the `#[test]` attribute is already correct.
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
 
     // Remove browser-only configuration and make tests run in any environment
     // wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Portable "current time" for test packet timestamps. The exact value
+    /// does not matter — production code only compares packet timestamps to
+    /// each other — so we read through the default clock, which picks the
+    /// correct backend (`Date::now` on Wasm, `SystemTime` on native).
+    fn test_now_ms() -> f64 {
+        default_clock().now_ms()
+    }
 
     fn create_test_packet(
         sender_id: &str,
@@ -744,7 +795,7 @@ mod tests {
         let mut packet = DiagnosticsPacket::new();
         packet.sender_id = sender_id.to_string();
         packet.target_id = target_id.to_string();
-        packet.timestamp_ms = js_sys::Date::now() as u64;
+        packet.timestamp_ms = test_now_ms() as u64;
         packet.media_type =
             videocall_types::protos::media_packet::media_packet::MediaType::VIDEO.into();
 
@@ -765,7 +816,7 @@ mod tests {
         let mut packet = DiagnosticsPacket::new();
         packet.sender_id = sender_id.to_string();
         packet.target_id = target_id.to_string();
-        packet.timestamp_ms = js_sys::Date::now() as u64;
+        packet.timestamp_ms = test_now_ms() as u64;
         packet.media_type =
             videocall_types::protos::media_packet::media_packet::MediaType::AUDIO.into();
 
@@ -777,7 +828,7 @@ mod tests {
         packet
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_happy_path() {
         // Setup
         let target_fps = Rc::new(AtomicU32::new(30));
@@ -821,7 +872,7 @@ mod tests {
         assert_eq!(controller.peer_ids(), vec!["self"]);
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_multiple_peers() {
         // Setup
         let target_fps = Rc::new(AtomicU32::new(30));
@@ -876,7 +927,7 @@ mod tests {
         }
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_peer_cleanup() {
         // Setup
         let target_fps = Rc::new(AtomicU32::new(30));
@@ -943,7 +994,7 @@ mod tests {
         assert!(controller.peer_ids().contains(&"peer1".to_string()));
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_diagnostic_packet_window() {
         // Create a window with 10-second duration
         let mut window = DiagnosticPacketWindow::new(10);
@@ -983,7 +1034,7 @@ mod tests {
         assert_eq!(window.avg_fps(), None);
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_different_media_types() {
         // Setup
         let target_fps = Rc::new(AtomicU32::new(30));
@@ -1021,7 +1072,7 @@ mod tests {
         assert!(result3.is_some(), "Third packet should return a bitrate");
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_bandwidth_drop() {
         // Setup with a target of 30 FPS
         let target_fps = Rc::new(AtomicU32::new(30));
@@ -1079,7 +1130,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_calculate_jitter() {
         let target_fps = Rc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(500, target_fps);
@@ -1143,7 +1194,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_throttling_basic() {
         // Setup
         let target_fps = Rc::new(AtomicU32::new(30));
@@ -1183,7 +1234,7 @@ mod tests {
         assert_eq!(controller.peer_count(), 3);
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_bitrate_recovery_after_fps_improves() {
         let target_fps = Rc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
@@ -1239,7 +1290,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_dynamic_target_fps_change() {
         let target_fps = Rc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
@@ -1300,7 +1351,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_progressive_integral_accumulation() {
         let target_fps = Rc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
@@ -1347,7 +1398,7 @@ mod tests {
         }
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_pid_and_jitter_combined_clamp_to_min() {
         let target_fps = Rc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
@@ -1391,7 +1442,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_same_timestamp_dt_zero() {
         let target_fps = Rc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
@@ -1441,9 +1492,9 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_new_for_screen_starts_at_midpoint_tier() {
-        use crate::adaptive_quality_constants::{DEFAULT_SCREEN_TIER_INDEX, SCREEN_QUALITY_TIERS};
+        use crate::constants::{DEFAULT_SCREEN_TIER_INDEX, SCREEN_QUALITY_TIERS};
 
         let target_fps = Rc::new(AtomicU32::new(15));
         let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
@@ -1464,9 +1515,9 @@ mod tests {
     // Screen sharing coordination (notify_screen_sharing)
     // =====================================================================
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_notify_screen_sharing_active_forces_ceiling() {
-        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+        use crate::constants::screen_share_camera_ceiling_index;
 
         let target_fps = Rc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(1500, target_fps);
@@ -1504,9 +1555,9 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_notify_screen_sharing_deactivate_removes_ceiling() {
-        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+        use crate::constants::screen_share_camera_ceiling_index;
 
         let target_fps = Rc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(1500, target_fps);
@@ -1536,11 +1587,11 @@ mod tests {
         // Feed good conditions — the camera should eventually step up past the
         // old ceiling, proving the ceiling was actually removed.
         //
-        // Use Date::now() as the base so timestamps are consistent with the
-        // quality manager's Date::now()-based created_at_ms and
-        // last_transition_time_ms. The +10_000 offset ensures warmup (5s) and
-        // min-transition-interval (3s) are both satisfied from the start.
-        let base = Date::now() + 10_000.0;
+        // Use the default clock as the base so timestamps are consistent with
+        // the quality manager's clock-based `created_at_ms` and
+        // `last_transition_time_ms`. The +10_000 offset ensures warmup (5s)
+        // and min-transition-interval (3s) are both satisfied from the start.
+        let base = test_now_ms() + 10_000.0;
         for i in 0..15 {
             let t = base + (i as f64 * 1100.0);
             let packet = create_test_packet("s", "peer1", 29.0, 1400);
@@ -1555,9 +1606,9 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_notify_screen_sharing_double_activation_is_idempotent() {
-        use crate::adaptive_quality_constants::screen_share_camera_ceiling_index;
+        use crate::constants::screen_share_camera_ceiling_index;
 
         let target_fps = Rc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(1500, target_fps);
@@ -1597,7 +1648,7 @@ mod tests {
     // P75 aggregation and avg_fps tests
     // =====================================================================
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_avg_fps_window() {
         let mut window = DiagnosticPacketWindow::new(10);
         let base_time = 1000.0;
@@ -1615,7 +1666,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_p75_aggregation_filters_outlier() {
         // 5 peers: 4 at 28fps, 1 at 0fps. The p75 should be ~28, not 0.
         let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
@@ -1643,7 +1694,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_p75_aggregation_with_widespread_degradation() {
         // 5 peers: 4 at 5fps, 1 at 28fps. The p75 should be ~5.
         let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
@@ -1669,7 +1720,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_single_peer_p75_returns_that_peer() {
         // With 1 peer, get_p75_fps should return that peer's avg_fps directly.
         let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
@@ -1687,7 +1738,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_two_peers_p75_returns_minimum() {
         // With 2 peers, get_p75_fps should return the minimum of the two.
         let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
@@ -1707,7 +1758,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_three_peers_p75_filters_outlier() {
         // With 3 peers, p75 kicks in (no longer minimum fallback).
         // Sorted: [5, 25, 30] -> p75_index = floor(2 * 0.75) = 1 -> value = 25.
@@ -1734,7 +1785,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_p75_effective_count_excludes_non_fps_peers() {
         // 3 registered peers, but one has no usable FPS (media_type=VIDEO,
         // video_metrics=None — simulates a peer that just joined and hasn't
@@ -1774,7 +1825,7 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
+    #[test]
     fn test_pid_converges_near_target_fps() {
         // Feed p75 = 28 fps (very close to target 30) for ~30 iterations.
         // The PID should converge near ideal_bitrate (500 kbps) since there

@@ -172,7 +172,12 @@ impl Config {
     ///
     /// # Optional
     /// - `LISTEN_ADDR` (default: `"0.0.0.0:8081"`)
-    /// - `TOKEN_TTL_SECS` (default: `"60"`)
+    /// - `TOKEN_TTL_SECS` (default: `"86400"`) — room access token lifetime in seconds.
+    ///   MUST be long enough to cover the duration of any meeting a client might join
+    ///   plus connection re-election. Setting this too short causes cached tokens in
+    ///   WT/WS URLs to expire before a re-election can complete, stranding users with
+    ///   "No valid connections". See
+    ///   [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
     /// - `COOKIE_DOMAIN`
     /// - `COOKIE_NAME` (default: `"session"`) — set to a unique value (e.g. `"pr-session"`)
     ///   in PR preview environments to avoid collision with the production cookie
@@ -197,8 +202,11 @@ impl Config {
             env::var("JWT_SECRET").map_err(|_| "JWT_SECRET environment variable is required")?;
 
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
+        // Default: 24 hours. Must exceed both the longest expected meeting and
+        // the client's connection re-election window, or cached tokens in WT/WS
+        // URLs expire mid-meeting and re-election fails. See discussion #562.
         let token_ttl_secs = env::var("TOKEN_TTL_SECS")
-            .unwrap_or_else(|_| "60".to_string())
+            .unwrap_or_else(|_| "86400".to_string())
             .parse::<i64>()
             .map_err(|_| "TOKEN_TTL_SECS must be a valid integer")?;
         let session_ttl_secs = env::var("SESSION_TTL_SECS")

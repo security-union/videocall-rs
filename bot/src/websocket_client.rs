@@ -37,6 +37,7 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use crate::inbound_stats::InboundStats;
 
 use crate::config::ClientConfig;
+use crate::transport::InboundHook;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -74,6 +75,7 @@ impl WebSocketClient {
         &mut self,
         lobby_url: &Url,
         stats: Arc<Mutex<InboundStats>>,
+        inbound_hook: Option<InboundHook>,
     ) -> anyhow::Result<()> {
         info!("Connecting client {} to {}", self.config.user_id, lobby_url);
 
@@ -87,7 +89,7 @@ impl WebSocketClient {
         self.write = Some(write);
 
         // Start inbound consumer (drain incoming frames, forward pongs)
-        let handle = self.start_inbound_consumer(read, stats.clone());
+        let handle = self.start_inbound_consumer(read, stats.clone(), inbound_hook);
         self.task_handles.push(handle);
 
         // Start dedicated 10s stats reporting task (fix #2: separate from read loop)
@@ -103,6 +105,7 @@ impl WebSocketClient {
         &self,
         mut read: futures_util::stream::SplitStream<WsStream>,
         stats: Arc<Mutex<InboundStats>>,
+        inbound_hook: Option<InboundHook>,
     ) -> JoinHandle<()> {
         let user_id = self.config.user_id.clone();
         let quit = self.quit.clone();
@@ -115,10 +118,13 @@ impl WebSocketClient {
                 }
 
                 match read.next().await {
-                    Some(Ok(WsMessage::Binary(data))) => {
-                        let mut s = stats.lock().unwrap();
-                        s.record_packet(&user_id, &data);
-                    }
+                    Some(Ok(WsMessage::Binary(data))) => match &inbound_hook {
+                        Some(h) => h(data),
+                        None => {
+                            let mut s = stats.lock().unwrap();
+                            s.record_packet(&user_id, &data);
+                        }
+                    },
                     Some(Ok(WsMessage::Ping(data))) => {
                         debug!("Received WS ping for {}", user_id);
                         let _ = pong_tx.try_send(data);

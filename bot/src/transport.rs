@@ -28,6 +28,14 @@ use crate::token;
 use crate::websocket_client::WebSocketClient;
 use crate::webtransport_client::WebTransportClient;
 
+/// Hook installed by the netsim shim. When present, inbound readers hand
+/// each raw payload to the hook instead of calling `InboundStats::record_packet`
+/// directly — the hook typically posts the payload to a `NetSimInbound` task
+/// that applies the downlink profile and then records it after the delay.
+///
+/// Left `None` for passthrough bots so the hot path is a direct method call.
+pub type InboundHook = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
+
 #[allow(clippy::large_enum_variant)]
 pub enum TransportClient {
     WebSocket(WebSocketClient),
@@ -80,16 +88,18 @@ impl TransportClient {
         insecure: bool,
         stats: Arc<Mutex<InboundStats>>,
         is_speaking: Arc<AtomicBool>,
+        inbound_hook: Option<InboundHook>,
     ) -> anyhow::Result<()> {
         match self {
             TransportClient::WebSocket(c) => {
                 if insecure {
                     info!("Note: --insecure flag has no effect on WebSocket (TLS handled by tokio-tungstenite with system roots)");
                 }
-                c.connect(lobby_url, stats).await
+                c.connect(lobby_url, stats, inbound_hook).await
             }
             TransportClient::WebTransport(c) => {
-                c.connect(lobby_url, insecure, stats, is_speaking).await
+                c.connect(lobby_url, insecure, stats, is_speaking, inbound_hook)
+                    .await
             }
         }
     }

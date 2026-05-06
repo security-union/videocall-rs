@@ -49,3 +49,8 @@ tracing-log = "0.2"
 
 # Error handling
 anyhow = "1.0"
+
+# Deterministic RNG for the network-impairment shim. 0.8 is chosen to match
+# other direct consumers in the workspace and to keep the `StdRng` / `SeedableRng`
+# API stable; upgrading to 0.9 would flip several item names.
+rand = "0.8"

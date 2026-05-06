@@ -23,6 +23,8 @@ mod costume_renderer;
 mod ekg_renderer;
 mod health_reporter;
 mod inbound_stats;
+mod netsim;
+mod netsim_profiles;
 mod token;
 mod transport;
 mod video_encoder;
@@ -37,6 +39,7 @@ use costume_renderer::CostumeRenderer;
 use ekg_renderer::EkgRenderer;
 use health_reporter::{spawn_health_reporter, HealthReporterConfig};
 use inbound_stats::InboundStats;
+use netsim::{Admission, Direction, NetSimShim, NetworkProfile};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use transport::TransportClient;
 use video_producer::VideoProducer;
 use websocket_client::spawn_heartbeat_producer;
@@ -244,6 +247,21 @@ async fn main() -> anyhow::Result<()> {
         let audio_data = participant_audio.remove(&p.name).unwrap();
         let is_broadcaster = broadcaster_names.contains(p.name.as_str());
 
+        // Resolve network profile for this participant once, upfront, so
+        // invalid configs fail the whole run before we spawn transports.
+        let network_profile = config.resolve_network(p)?;
+        if !network_profile.is_passthrough() {
+            info!(
+                "[{}] network impairment: latency={}ms jitter={}ms loss={}% up={:?}kbps down={:?}kbps",
+                p.name,
+                network_profile.latency_ms,
+                network_profile.jitter_ms,
+                network_profile.loss_pct,
+                network_profile.uplink_kbps,
+                network_profile.downlink_kbps,
+            );
+        }
+
         info!(
             "Starting client {} ({}) - audio: {} samples, broadcaster: {}",
             index,
@@ -260,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
         let cell = media_start_cell.clone();
         let ld = loop_duration;
         let total_bots = n;
+        let netprof = network_profile;
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_client(
@@ -275,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
                 index,
                 total_bots,
                 is_broadcaster,
+                netprof,
             )
             .await
             {
@@ -329,6 +349,7 @@ async fn run_client(
     bot_index: usize,
     total_bots: usize,
     is_broadcaster: bool,
+    network_profile: NetworkProfile,
 ) -> anyhow::Result<()> {
     info!(
         "Initializing client: {} (broadcaster={})",
@@ -388,16 +409,64 @@ async fn run_client(
     // Shared is_speaking flag -- audio producer sets, heartbeat/video reads
     let is_speaking = Arc::new(AtomicBool::new(false));
 
+    // Construct the inbound shim (if any) before connecting, so the hook is
+    // installed as the transport comes up and we don't race the first packet.
+    let (inbound_hook, inbound_shim_task) = if network_profile.is_passthrough() {
+        (None, None)
+    } else {
+        let shim = Arc::new(NetSimShim::new(network_profile.clone(), Direction::Down));
+        // Buffer of 2048 matches order-of-magnitude sizing used elsewhere —
+        // at 100 pkts/sec with up to a few seconds of queuing, this is safe
+        // without being large enough to cause unbounded memory growth.
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(2048);
+        let user_id_dn = user_id.clone();
+        let stats_dn = stats.clone();
+        let shim_dn = shim.clone();
+        let handle = tokio::spawn(run_inbound_shim(inbound_rx, shim_dn, stats_dn, user_id_dn));
+        let hook: transport::InboundHook = Arc::new(move |payload| {
+            if inbound_tx.try_send(payload).is_err() {
+                // Overflow means the shim task is behind; degrade to drop so
+                // we don't block the transport reader.
+                debug!("netsim inbound queue full; dropping payload");
+            }
+        });
+        (Some(hook), Some(handle))
+    };
+
     let mut client = TransportClient::new(&resolved_transport, client_config.clone());
     client
-        .connect(&lobby_url, insecure, stats.clone(), is_speaking.clone())
+        .connect(
+            &lobby_url,
+            insecure,
+            stats.clone(),
+            is_speaking.clone(),
+            inbound_hook,
+        )
         .await?;
 
-    // Create packet channel for media + heartbeat + health producers
-    let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(500);
+    // The transport-facing packet channel. Its sender is either handed
+    // directly to producers (passthrough) or fed by the uplink shim task.
+    let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(500);
 
-    // Start packet sender task
-    client.start_packet_sender(packet_rx).await;
+    // Start packet sender task.
+    client.start_packet_sender(transport_rx).await;
+
+    // Outbound impairment: insert a shim task between producers and the
+    // transport sender. Passthrough bots get the transport sender directly.
+    let (packet_tx, outbound_shim_task) = if network_profile.is_passthrough() {
+        (transport_tx, None)
+    } else {
+        let (producer_tx, producer_rx) = mpsc::channel::<Vec<u8>>(500);
+        let shim = Arc::new(NetSimShim::new(network_profile.clone(), Direction::Up));
+        let user_id_up = user_id.clone();
+        let handle = tokio::spawn(run_outbound_shim(
+            producer_rx,
+            transport_tx,
+            shim,
+            user_id_up,
+        ));
+        (producer_tx, Some(handle))
+    };
 
     // For WebSocket transport, heartbeats go through the shared mpsc channel
     let quit = Arc::new(AtomicBool::new(false));
@@ -535,8 +604,126 @@ async fn run_client(
     drop(_audio_producer);
     drop(_video_producer);
 
+    // Let shim tasks drain. They terminate when their input channel closes,
+    // which happens when the producer side is dropped (outbound) or the
+    // hook is dropped (inbound). A short timeout prevents hangs if a sleep
+    // is still in flight.
+    if let Some(h) = outbound_shim_task {
+        let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+    }
+    if let Some(h) = inbound_shim_task {
+        let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+    }
+
     info!("Client {} shut down cleanly", user_id);
     Ok(())
+}
+
+/// Outbound network-impairment task. Reads raw wire-formatted frames from
+/// producers, applies the uplink [`NetSimShim`], and forwards to the
+/// transport sender. Terminates when the producer side closes.
+async fn run_outbound_shim(
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
+    shim: Arc<NetSimShim>,
+    user_id: String,
+) {
+    while let Some(payload) = rx.recv().await {
+        let decision = shim.admit(payload.len());
+        match decision {
+            Admission::Pass => {
+                if tx.send(payload).await.is_err() {
+                    break;
+                }
+            }
+            Admission::Drop => {
+                debug!("[{}] netsim-up: dropped {}B", user_id, 0);
+            }
+            Admission::Delay(d) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let _ = tx.send(payload).await;
+                });
+            }
+            Admission::DelayAndDuplicate(d) => {
+                let tx_a = tx.clone();
+                let tx_b = tx.clone();
+                let p_copy = payload.clone();
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let _ = tx_a.send(payload).await;
+                });
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let _ = tx_b.send(p_copy).await;
+                });
+            }
+        }
+    }
+    info!("Outbound netsim shim stopped for {}", user_id);
+}
+
+/// Inbound network-impairment task. Receives payloads the transport readers
+/// delivered via the `InboundHook`, applies the downlink [`NetSimShim`], and
+/// (after any delay) hands the bytes to [`InboundStats::record_packet`].
+async fn run_inbound_shim(
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    shim: Arc<NetSimShim>,
+    stats: Arc<Mutex<InboundStats>>,
+    user_id: String,
+) {
+    while let Some(payload) = rx.recv().await {
+        let decision = shim.admit(payload.len());
+        match decision {
+            Admission::Pass => {
+                let mut s = stats.lock().unwrap();
+                s.record_packet(&user_id, &payload);
+            }
+            Admission::Drop => {
+                debug!("[{}] netsim-down: dropped {}B", user_id, payload.len());
+            }
+            Admission::Delay(d) => {
+                let stats = stats.clone();
+                let user_id = user_id.clone();
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let mut s = stats.lock().unwrap();
+                    s.record_packet(&user_id, &payload);
+                });
+            }
+            Admission::DelayAndDuplicate(d) => {
+                let stats_a = stats.clone();
+                let user_id_a = user_id.clone();
+                let stats_b = stats.clone();
+                let user_id_b = user_id.clone();
+                let p_copy = payload.clone();
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let mut s = stats_a.lock().unwrap();
+                    s.record_packet(&user_id_a, &payload);
+                });
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let mut s = stats_b.lock().unwrap();
+                    s.record_packet(&user_id_b, &p_copy);
+                });
+            }
+        }
+    }
+    info!("Inbound netsim shim stopped for {}", user_id);
 }
 
 /// Load WAV file samples as normalized f32 PCM.

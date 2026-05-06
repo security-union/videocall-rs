@@ -20,7 +20,6 @@ use axum::http;
 use meeting_api::config::Config;
 use meeting_api::routes;
 use meeting_api::state::AppState;
-use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
@@ -38,13 +37,38 @@ async fn main() {
         .await
         .expect("OIDC discovery failed");
 
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&config.database_url)
-        .await
-        .expect("failed to connect to PostgreSQL");
+    #[cfg(feature = "postgres")]
+    let pool = {
+        use sqlx::postgres::PgPoolOptions;
+        let pool = PgPoolOptions::new()
+            .max_connections(20)
+            .connect(&config.database_url)
+            .await
+            .expect("failed to connect to PostgreSQL");
+        tracing::info!("Connected to PostgreSQL");
+        pool
+    };
 
-    tracing::info!("Connected to PostgreSQL");
+    #[cfg(feature = "sqlite")]
+    let pool = {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&config.database_url)
+            .await
+            .expect("failed to connect to SQLite");
+        // Enable WAL mode for better concurrent read performance.
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await
+            .expect("failed to set WAL mode");
+        sqlx::query("PRAGMA busy_timeout=5000")
+            .execute(&pool)
+            .await
+            .expect("failed to set busy timeout");
+        tracing::info!("Connected to SQLite");
+        pool
+    };
 
     // Connect to NATS if configured. The server works without NATS (graceful degradation).
     let nats = match &config.nats_url {

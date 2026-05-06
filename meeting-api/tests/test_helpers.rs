@@ -19,40 +19,47 @@ use axum::http;
 use axum::response::Response;
 use axum::Router;
 use http_body_util::BodyExt;
+use meeting_api::db::DbPool;
 use meeting_api::{routes, state::AppState, token::generate_session_token};
 use serde::de::DeserializeOwned;
-use sqlx::PgPool;
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TEST_TOKEN_TTL: i64 = 600;
 const TEST_SESSION_TTL: i64 = 3600;
 
 /// Connect to the test database using `DATABASE_URL`.
-pub async fn get_test_pool() -> PgPool {
+pub async fn get_test_pool() -> DbPool {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
-    PgPool::connect(&url)
+    DbPool::connect(&url)
         .await
         .expect("Failed to connect to test database")
 }
 
 /// Delete all test data for a given `room_id` (participants first due to FK).
-pub async fn cleanup_test_data(pool: &PgPool, room_id: &str) {
-    let _ = sqlx::query(
-        "DELETE FROM meeting_participants WHERE meeting_id IN \
-         (SELECT id FROM meetings WHERE room_id = $1)",
-    )
-    .bind(room_id)
-    .execute(pool)
-    .await;
+pub async fn cleanup_test_data(pool: &DbPool, room_id: &str) {
+    #[cfg(feature = "postgres")]
+    const PARAM: &str = "$1";
+    #[cfg(feature = "sqlite")]
+    const PARAM: &str = "?1";
 
-    let _ = sqlx::query("DELETE FROM meetings WHERE room_id = $1")
+    let delete_participants = format!(
+        "DELETE FROM meeting_participants WHERE meeting_id IN \
+         (SELECT id FROM meetings WHERE room_id = {PARAM})"
+    );
+    let _ = sqlx::query(&delete_participants)
+        .bind(room_id)
+        .execute(pool)
+        .await;
+
+    let delete_meetings = format!("DELETE FROM meetings WHERE room_id = {PARAM}");
+    let _ = sqlx::query(&delete_meetings)
         .bind(room_id)
         .execute(pool)
         .await;
 }
 
 /// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
-pub fn build_app(pool: PgPool) -> Router {
+pub fn build_app(pool: DbPool) -> Router {
     let state = AppState {
         db: pool,
         jwt_secret: TEST_JWT_SECRET.to_string(),

@@ -83,12 +83,46 @@ pub async fn yield_now() {
 }
 
 // ---------------------------------------------------------------------------
+// Router wait helper
+// ---------------------------------------------------------------------------
+
+/// Poll the given mount element until the specified CSS selector matches at
+/// least one child node, or until the timeout (in milliseconds) expires.
+///
+/// The Dioxus Router uses async route resolution internally.  Unlike simple
+/// component tests that stabilise in 2 rAF ticks, a Router-based component
+/// needs multiple event-loop iterations before its output appears in the DOM.
+/// This helper avoids brittle fixed `sleep` durations by polling at short
+/// intervals.
+///
+/// Returns `true` if the selector was found before the timeout, `false`
+/// otherwise.
+pub async fn wait_for_selector(mount: &web_sys::Element, selector: &str, timeout_ms: u32) -> bool {
+    let interval_ms: u32 = 20;
+    let mut elapsed: u32 = 0;
+    loop {
+        if mount.query_selector(selector).ok().flatten().is_some() {
+            return true;
+        }
+        if elapsed >= timeout_ms {
+            return false;
+        }
+        // Sleep for a short interval using setTimeout.
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            gloo_utils::window()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, interval_ms as i32)
+                .unwrap();
+        });
+        JsFuture::from(promise).await.unwrap();
+        elapsed += interval_ms;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runtime config injection (integration tests)
 // ---------------------------------------------------------------------------
 
-/// Inject a `window.__APP_CONFIG` object with OAuth disabled and all
-/// required `RuntimeConfig` fields.
-pub fn inject_app_config() {
+fn inject_app_config_with_oauth_enabled(oauth_enabled: bool) {
     let config = js_sys::Object::new();
     let set = |key: &str, val: &wasm_bindgen::JsValue| {
         js_sys::Reflect::set(&config, &key.into(), val).unwrap();
@@ -96,7 +130,10 @@ pub fn inject_app_config() {
     set("apiBaseUrl", &"http://test:8080".into());
     set("wsUrl", &"ws://test:8080".into());
     set("webTransportHost", &"https://test:4433".into());
-    set("oauthEnabled", &"false".into());
+    set(
+        "oauthEnabled",
+        &(if oauth_enabled { "true" } else { "false" }).into(),
+    );
     set("e2eeEnabled", &"false".into());
     set("webTransportEnabled", &"false".into());
     set("firefoxEnabled", &"false".into());
@@ -110,6 +147,36 @@ pub fn inject_app_config() {
     let frozen = js_sys::Object::freeze(&config);
     let window = gloo_utils::window();
     js_sys::Reflect::set(&window, &"__APP_CONFIG".into(), &frozen).unwrap();
+    mock_browser_compatibility_features();
+}
+
+/// Inject a `window.__APP_CONFIG` object with OAuth disabled and all
+/// required `RuntimeConfig` fields.
+pub fn inject_app_config() {
+    inject_app_config_with_oauth_enabled(false);
+}
+
+/// Inject a `window.__APP_CONFIG` object with OAuth enabled.
+pub fn inject_app_config_oauth_enabled() {
+    inject_app_config_with_oauth_enabled(true);
+}
+
+/// Provide the minimal browser globals that `BrowserCompatibility` checks on
+/// Home mount so headless Chrome in CI doesn't get blocked by feature gating.
+pub fn mock_browser_compatibility_features() {
+    js_sys::eval(
+        r#"
+        window.MediaStreamTrackProcessor =
+            window.MediaStreamTrackProcessor || function MediaStreamTrackProcessor() {};
+        window.VideoEncoder =
+            window.VideoEncoder || function VideoEncoder() {};
+        window.VideoDecoder =
+            window.VideoDecoder || function VideoDecoder() {};
+        window.OffscreenCanvas =
+            window.OffscreenCanvas || function OffscreenCanvas() {};
+        "#,
+    )
+    .expect("failed to mock browser compatibility features");
 }
 
 /// Inject a `window.__APP_CONFIG` with a custom VAD threshold.
@@ -135,12 +202,34 @@ pub fn inject_app_config_with_vad_threshold(threshold: f32) {
     let frozen = js_sys::Object::freeze(&config);
     let window = gloo_utils::window();
     js_sys::Reflect::set(&window, &"__APP_CONFIG".into(), &frozen).unwrap();
+    mock_browser_compatibility_features();
 }
 
 /// Remove `window.__APP_CONFIG` so tests don't leak state.
 pub fn remove_app_config() {
     let window = gloo_utils::window();
     let _ = js_sys::Reflect::delete_property(&window.into(), &"__APP_CONFIG".into());
+}
+
+/// Reset browser-global state that commonly leaks between wasm tests.
+///
+/// `wasm-bindgen-test` runs the whole test binary in a single browser session,
+/// so `localStorage`, `sessionStorage`, `window.fetch`, and router history can
+/// survive across individual test cases unless we clear them explicitly.
+pub fn reset_test_browser_state() {
+    restore_fetch();
+    remove_app_config();
+
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.clear();
+    }
+    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+        let _ = storage.clear();
+    }
+
+    let _ = gloo_utils::window()
+        .history()
+        .and_then(|h| h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some("/")));
 }
 
 // ---------------------------------------------------------------------------
@@ -195,12 +284,100 @@ pub fn mock_fetch_meetings_empty() {
     js_sys::eval(
         r#"
         window.__original_fetch = window.__original_fetch || window.fetch;
-        window.fetch = function(input) {
+        window.fetch = function(input, init) {
             var url = typeof input === 'string' ? input : input.url;
-            var resp = new Response(JSON.stringify({
-                success: true,
-                result: { meetings: [], total: 0, limit: 20, offset: 0 }
-            }), {
+            var method = (init && init.method) ||
+                         (typeof input === 'object' && input && input.method) ||
+                         'GET';
+            method = String(method).toUpperCase();
+
+            var body;
+            if (url.includes('/api/v1/meetings/feed')) {
+                body = {
+                    success: true,
+                    result: { meetings: [] }
+                };
+            } else if (url.match(/\/api\/v1\/meetings\/[^/]+\/join$/)) {
+                body = {
+                    success: true,
+                    result: {
+                        user_id: 'test-user@example.com',
+                        display_name: 'Test User',
+                        status: 'waiting_for_meeting',
+                        is_host: false,
+                        is_guest: false,
+                        joined_at: 1714323000,
+                        admitted_at: null,
+                        room_token: null,
+                        observer_token: null,
+                        waiting_room_enabled: true,
+                        admitted_can_admit: false,
+                        end_on_host_leave: true,
+                        host_display_name: 'Host User',
+                        host_user_id: 'host@example.com',
+                        allow_guests: false
+                    }
+                };
+            } else if (url.match(/\/api\/v1\/meetings\/[^/]+\/status$/)) {
+                body = {
+                    success: true,
+                    result: {
+                        user_id: 'test-user@example.com',
+                        display_name: 'Test User',
+                        status: 'waiting_for_meeting',
+                        is_host: false,
+                        is_guest: false,
+                        joined_at: 1714323000,
+                        admitted_at: null,
+                        room_token: null,
+                        observer_token: null,
+                        waiting_room_enabled: true,
+                        admitted_can_admit: false,
+                        end_on_host_leave: true,
+                        host_display_name: 'Host User',
+                        host_user_id: 'host@example.com',
+                        allow_guests: false
+                    }
+                };
+            } else if (url.match(/\/api\/v1\/meetings\/[^/]+\/guest-info$/)) {
+                body = {
+                    success: true,
+                    result: {
+                        allow_guests: false
+                    }
+                };
+            } else if (url.match(/\/api\/v1\/meetings$/) && method === 'POST') {
+                body = {
+                    success: true,
+                    result: {
+                        meeting_id: 'generated_test_meeting',
+                        host: 'test-user@example.com',
+                        created_at: 1714323000000,
+                        state: 'idle',
+                        attendees: [],
+                        has_password: false,
+                        waiting_room_enabled: true,
+                        admitted_can_admit: false,
+                        end_on_host_leave: true,
+                        allow_guests: false
+                    }
+                };
+            } else if (url.match(/\/profile$/)) {
+                body = {
+                    success: true,
+                    result: {
+                        user_id: 'test-user@example.com',
+                        name: 'Test User'
+                    }
+                };
+            } else {
+                body = {
+                    success: true,
+                    result: {}
+                };
+            }
+
+            var resp = new Response(JSON.stringify(body), {
                 status: 200,
                 headers: { 'Content-Type': 'application/json' }
             });

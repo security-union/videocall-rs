@@ -28,6 +28,7 @@ use crate::token;
 use crate::websocket_client::WebSocketClient;
 use crate::webtransport_client::WebTransportClient;
 
+#[allow(clippy::large_enum_variant)]
 pub enum TransportClient {
     WebSocket(WebSocketClient),
     WebTransport(WebTransportClient),

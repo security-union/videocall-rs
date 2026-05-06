@@ -79,6 +79,7 @@
 //!     on_peer_joined: None,  // Option<Callback<(String, String)>> -- (display_name, user_id)
 //!     on_display_name_changed: None,
 //!     decode_media: true,
+//!     is_guest: false,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -114,6 +115,7 @@
 //! #     on_peer_joined: None,
 //! #     on_display_name_changed: None,
 //! #     decode_media: true,
+//! #     is_guest: false,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(

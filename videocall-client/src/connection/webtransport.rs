@@ -21,6 +21,7 @@
 // Sets up all the stream handling to support the callbacks on_connected, on_connection_lost, and
 // on_inbound_media
 //
+use super::connection_lost_reason::ConnectionLostReason;
 use super::webmedia::{ConnectOptions, WebMedia};
 use js_sys::Boolean;
 use js_sys::JsString;
@@ -83,8 +84,22 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             let connection_lost_callback = options.on_connection_lost.clone();
             Callback::from(move |status| match status {
                 WebTransportStatus::Opened => connected_callback.emit(()),
-                WebTransportStatus::Closed(error) => connection_lost_callback.emit(error),
-                WebTransportStatus::Error(error) => connection_lost_callback.emit(error),
+                WebTransportStatus::ClosedBeforeReady(msg) => {
+                    connection_lost_callback.emit(ConnectionLostReason::HandshakeFailed(msg));
+                }
+                WebTransportStatus::ClosedAfterReady(msg) => {
+                    connection_lost_callback.emit(ConnectionLostReason::SessionDropped(msg));
+                }
+                // Legacy variants — these should no longer fire with the updated
+                // transport, but keep them as a defensive fallback.
+                WebTransportStatus::Closed(e) => {
+                    let msg = format!("{e:?}");
+                    connection_lost_callback.emit(ConnectionLostReason::SessionDropped(msg));
+                }
+                WebTransportStatus::Error(e) => {
+                    let msg = format!("{e:?}");
+                    connection_lost_callback.emit(ConnectionLostReason::SessionDropped(msg));
+                }
             })
         };
         info!("WebTransport connecting to {}", &options.webtransport_url);

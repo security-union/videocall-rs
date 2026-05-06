@@ -622,6 +622,77 @@ pub const REELECTION_MIN_IMPROVEMENT_MS: f64 = 20.0;
 /// alternative is worth trying.
 pub const REELECTION_CATASTROPHIC_RTT_MS: f64 = 5000.0;
 
+/// Number of *consecutive* implausible-RTT discards on the active connection
+/// before treating sustained discards as a re-election trigger.
+///
+/// The plausibility filter (`RTT_SANITY_MAX_MS`) silently drops measurements
+/// when `recv - sent` is outside `[0, 10s]`. Without this watchdog the
+/// existing RTT-degradation detector is starved of samples, leaving the user
+/// stuck on a broken connection (see discussion #539, JRG_dirs incident:
+/// 255 implausible discards over 6 minutes due to server-side clock drift).
+///
+/// 10 is chosen so that, at the 1Hz post-election RTT probe rate, sustained
+/// discards trigger re-election after roughly 10 seconds of clock-drift /
+/// time-base brokenness — long enough to ride out transient one-shot anomalies
+/// (such as a single late ACK or a one-off NTP slew) but short enough to
+/// recover before users perceive the connection as dead.
+pub const REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD: u32 = 10;
+
+/// Freshness window (ms) for the old active connection when deciding whether
+/// to preserve it after total candidate failure.
+///
+/// When a re-election starts and ALL candidates fail before producing valid
+/// RTT measurements, we check whether the old active connection has had any
+/// inbound traffic (media packet, RTT echo, heartbeat ACK, or session-assigned
+/// frame) within this window. If yes, the candidates' failure is taken to be
+/// a transient relay-side outage and the old connection is preserved. If no,
+/// the old connection is presumed dead and the user is disconnected through
+/// the existing path.
+///
+/// 5 s is chosen because:
+/// - it is long enough to span a few server heartbeat intervals (the server
+///   sends data at >= 1 Hz when the call is active), so a healthy old
+///   connection is virtually guaranteed to register inbound traffic inside it
+/// - it is short enough that genuinely silent connections (server crash, NAT
+///   rebind, route flap on the live path) do NOT get preserved as ghosts
+/// - it matches the connection-lost callback's typical detection lag of
+///   1-3 s on degraded networks, leaving headroom for jitter
+pub const REELECTION_PRESERVATION_FRESHNESS_MS: f64 = 5_000.0;
+
+/// Delay (ms) before retrying a re-election after the old active connection
+/// has been preserved due to total candidate failure.
+///
+/// 30 s gives the relay time to recover from the kind of brief outage that
+/// caused both candidates to fail (the JRG_dirs Tony S1 incident on
+/// 2026-05-05 saw both candidates flame out in 14 ms, suggesting a
+/// short-lived relay-side event). Retrying too soon risks hitting the same
+/// outage; waiting too long delays moving off a degraded baseline.
+pub const REELECTION_PRESERVATION_RETRY_MS: u64 = 30_000;
+
+/// Delay (milliseconds) before checking whether a post-rebase re-election
+/// retry should fire.
+///
+/// When RTT has degraded but only one server is configured at the connection
+/// manager's level, the rebase path silently adapts the baseline to the new
+/// RTT instead of triggering re-election (because the only candidate would
+/// be the same already-degraded server). This timer schedules a re-evaluation
+/// 30 seconds later: if by then the URL list has expanded (e.g. the UI
+/// refilled it via `update_server_urls`) so a meaningful election is
+/// possible, the standard election machinery is invoked. The 30-second value
+/// is long enough to absorb transient relay-availability blips without
+/// cascading into a per-second retry storm on real-world networks.
+pub const POST_REBASE_RETRY_DELAY_MS: u64 = 30_000;
+
+/// Maximum number of consecutive post-rebase retry attempts before giving up.
+///
+/// Each attempt that finds the URL list still single-server schedules another
+/// retry at `POST_REBASE_RETRY_DELAY_MS`. Capping at 3 means total wall-clock
+/// retry coverage is ~90 seconds before the system stops polling — preventing
+/// unbounded background timers if the server-side condition never resolves.
+/// The counter is reset whenever a successful election or a manual
+/// reconnection lands so a fresh meeting session gets a fresh retry budget.
+pub const POST_REBASE_RETRY_MAX_ATTEMPTS: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // Heartbeat & Polling
 // ---------------------------------------------------------------------------

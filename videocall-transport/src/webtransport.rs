@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, Error};
 use futures::channel::oneshot::channel;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, rc::Rc};
 use thiserror::Error as ThisError;
@@ -54,6 +55,10 @@ pub enum WebTransportStatus {
     Closed(JsValue),
     /// Fired when a WebTransport connection has failed.
     Error(JsValue),
+    /// Closed/errored before `ready()` resolved — handshake never completed.
+    ClosedBeforeReady(String),
+    /// Closed/errored after `ready()` resolved — session was established first.
+    ClosedAfterReady(String),
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -288,20 +293,40 @@ impl WebTransportService {
             WebTransportError::CreationError(format!("Failed to create WebTransport: {e:?}"))
         })?;
 
+        // Track whether the handshake (`ready()`) has completed, so that
+        // subsequent close/error events can be classified correctly.
+        let handshake_complete = Rc::new(Cell::new(false));
+        // Guard against emitting connection-lost more than once per connection
+        // (browser may fire both `closed` and `ready.catch` for the same failure).
+        let fired = Rc::new(Cell::new(false));
+
         let notify = notification.clone();
+        let hs_flag = handshake_complete.clone();
 
         // Both closures are stored in the WebTransportTask struct so they are
         // dropped when the task is dropped, instead of being leaked via
         // `forget()`. Previously, every reconnection/re-election cycle would
         // permanently leak two closures into WASM linear memory.
         let opened_closure = Closure::wrap(Box::new(move |_: JsValue| {
+            hs_flag.set(true);
             notify.emit(WebTransportStatus::Opened);
         }) as Box<dyn FnMut(JsValue)>);
+
         let notify = notification.clone();
+        let hs_flag_closed = handshake_complete.clone();
+        let fired_closed = fired.clone();
         // `closed_closure` is shared via `Rc` because it is referenced by
         // multiple promise chains (`ready.catch`, `closed.then`, `closed.catch`).
         let closed_closure = Rc::new(Closure::wrap(Box::new(move |e: JsValue| {
-            notify.emit(WebTransportStatus::Closed(e));
+            if fired_closed.replace(true) {
+                return; // already emitted
+            }
+            let msg = e.as_string().unwrap_or_else(|| format!("{e:?}"));
+            if hs_flag_closed.get() {
+                notify.emit(WebTransportStatus::ClosedAfterReady(msg));
+            } else {
+                notify.emit(WebTransportStatus::ClosedBeforeReady(msg));
+            }
         }) as Box<dyn FnMut(JsValue)>));
         let ready = transport
             .ready()

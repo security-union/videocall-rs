@@ -27,9 +27,38 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+
+// ── Encoder error observability counters (cumulative, since page load) ───────
+// These use the same global-static pattern as `keyframe_requests_sent_count` in
+// peer_decode_manager.rs: global AtomicU64 + public getter. The health reporter
+// reads these each tick and includes them in the protobuf health packet so
+// Prometheus/Grafana can derive per-second rates via `rate()`.
+
+static CAMERA_ENCODER_ERRORS_CLOSED_CODEC: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
+
+pub fn camera_encoder_errors_closed_codec() -> u64 {
+    CAMERA_ENCODER_ERRORS_CLOSED_CODEC.load(Ordering::Relaxed)
+}
+pub fn camera_encoder_errors_vpx_mem_alloc() -> u64 {
+    CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC.load(Ordering::Relaxed)
+}
+pub fn camera_encoder_errors_configure_fatal() -> u64 {
+    CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.load(Ordering::Relaxed)
+}
+pub fn camera_encoder_errors_generic() -> u64 {
+    CAMERA_ENCODER_ERRORS_GENERIC.load(Ordering::Relaxed)
+}
+pub fn camera_encoder_frames_submitted_ok() -> u64 {
+    CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
+}
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -37,6 +66,7 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::CodecState;
 use web_sys::HtmlVideoElement;
 use web_sys::LatencyMode;
 use web_sys::MediaStream;
@@ -53,11 +83,12 @@ use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
+use super::classify_encode_error::{classify_encode_error, EncodeErrorBucket};
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, ENCODER_PLI_COOLDOWN_MS, VIDEO_QUALITY_TIERS,
+    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -66,6 +97,28 @@ use crate::health_reporter::ClimbLimiterSnapshot;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
+
+fn is_fatal_encoder_error_message(msg: &str) -> bool {
+    msg.contains("closed codec")
+        || msg.contains("InvalidStateError")
+        || msg.contains("Memory allocation error")
+        || msg.contains("Unable to find free frame buffer")
+}
+
+fn is_fatal_encoder_error(err: &JsValue) -> bool {
+    let msg = format!("{err:?}");
+    is_fatal_encoder_error_message(&msg)
+}
+
+fn stop_media_stream_tracks(stream: &MediaStream) {
+    if let Some(tracks) = stream.get_tracks().dyn_ref::<Array>() {
+        for i in 0..tracks.length() {
+            if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
+                track.stop();
+            }
+        }
+    }
+}
 
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
@@ -383,10 +436,10 @@ impl CameraEncoder {
                     // encoder picks up the new audio quality settings without
                     // needing its own EncoderBitrateController.
                     let audio_tier = encoder_control.current_audio_tier();
-                    shared_audio_bitrate.store(audio_tier.bitrate_kbps * 1000, Ordering::Relaxed);
-                    shared_audio_fec.store(audio_tier.enable_fec, Ordering::Relaxed);
                     shared_audio_tier_idx
                         .store(encoder_control.audio_tier_index() as u32, Ordering::Relaxed);
+                    shared_audio_bitrate.store(audio_tier.bitrate_kbps * 1000, Ordering::Relaxed);
+                    shared_audio_fec.store(audio_tier.enable_fec, Ordering::Relaxed);
                     log::info!(
                         "CameraEncoder: audio tier updated to '{}' ({}kbps, fec={})",
                         audio_tier.label,
@@ -571,43 +624,6 @@ impl CameraEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
-        let video_output_handler = {
-            let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
-            let mut sequence_number = 0;
-            let mut last_chunk_time = window().performance().unwrap().now();
-            let mut chunks_in_last_second = 0;
-
-            Box::new(move |chunk: JsValue| {
-                let now = window().performance().unwrap().now();
-                let chunk = web_sys::EncodedVideoChunk::from(chunk);
-
-                // Update FPS calculation
-                chunks_in_last_second += 1;
-                if now - last_chunk_time >= 1000.0 {
-                    let fps = chunks_in_last_second;
-                    current_fps.store(fps, Ordering::Relaxed);
-                    log::debug!("Encoder output FPS: {fps}");
-                    chunks_in_last_second = 0;
-                    last_chunk_time = now;
-                }
-
-                // Ensure the backing buffer is large enough for this chunk
-                let byte_length = chunk.byte_length() as usize;
-                if buffer.len() < byte_length {
-                    buffer.resize(byte_length, 0);
-                }
-
-                let packet: PacketWrapper = transform_video_chunk(
-                    chunk,
-                    sequence_number,
-                    buffer.as_mut_slice(),
-                    &userid,
-                    aes.clone(),
-                );
-                client.send_media_packet(packet);
-                sequence_number += 1;
-            })
-        };
         let device_id = if let Some(vid) = &self.state.selected {
             vid.to_string()
         } else {
@@ -655,355 +671,567 @@ impl CameraEncoder {
                 }
             };
 
-            let media_devices = match navigator.media_devices() {
-                Ok(d) => d,
-                Err(e) => {
-                    let msg = format!("Failed to access media devices: {e:?}");
-                    error!("{msg}");
-                    if let Some(cb) = &on_error {
-                        cb.emit(msg);
+            // Sequence number persists across restarts so the receiving side
+            // never sees duplicate or regressed sequence numbers.
+            let mut sequence_number: u64 = 0;
+
+            let mut restart_count: u32 = 0;
+            const MAX_RESTARTS: u32 = 5;
+
+            'restart: loop {
+                // Backoff + max-restart guard (skip on first iteration).
+                if restart_count > 0 {
+                    let delay_ms = 500u64.saturating_mul(restart_count.min(4) as u64);
+                    log::warn!(
+                        "CameraEncoder: restarting (attempt {}/{}), backoff {}ms",
+                        restart_count,
+                        MAX_RESTARTS,
+                        delay_ms,
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    if restart_count >= MAX_RESTARTS {
+                        error!("CameraEncoder: max restarts ({MAX_RESTARTS}) reached, giving up");
+                        if let Some(cb) = &on_error {
+                            cb.emit("Camera encoder failed after repeated restarts".into());
+                        }
+                        return;
                     }
-                    return;
                 }
-            };
-            let constraints = MediaStreamConstraints::new();
-            let media_info = web_sys::MediaTrackConstraints::new();
 
-            // Force exact deviceId match (avoids partial/ideal matching surprises).
-            if device_id.is_empty() {
-                log::warn!("Camera device_id is empty, using default constraint");
-                constraints.set_video(&JsValue::TRUE);
-            } else {
-                let exact = js_sys::Object::new();
-                js_sys::Reflect::set(
-                    &exact,
-                    &JsValue::from_str("exact"),
-                    &JsValue::from_str(&device_id),
-                )
-                .unwrap();
+                // --- getUserMedia ---
 
-                log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
-                media_info.set_device_id(&exact.into());
-                constraints.set_video(&media_info.into());
-            }
-
-            constraints.set_audio(&Boolean::from(false));
-
-            let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
-                Ok(p) => p,
-                Err(e) => {
-                    let msg = format!("Camera access failed: {e:?}");
-                    error!("{msg}");
-                    if let Some(cb) = &on_error {
-                        cb.emit(msg);
+                let media_devices = match navigator.media_devices() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let msg = format!("Failed to access media devices: {e:?}");
+                        error!("{msg}");
+                        if let Some(cb) = &on_error {
+                            cb.emit(msg);
+                        }
+                        restart_count += 1;
+                        continue 'restart;
                     }
-                    return;
+                };
+                let constraints = MediaStreamConstraints::new();
+                let media_info = web_sys::MediaTrackConstraints::new();
+
+                // Force exact deviceId match (avoids partial/ideal matching surprises).
+                if device_id.is_empty() {
+                    log::warn!("Camera device_id is empty, using default constraint");
+                    constraints.set_video(&JsValue::TRUE);
+                } else {
+                    let exact = js_sys::Object::new();
+                    js_sys::Reflect::set(
+                        &exact,
+                        &JsValue::from_str("exact"),
+                        &JsValue::from_str(&device_id),
+                    )
+                    .unwrap();
+
+                    log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
+                    media_info.set_device_id(&exact.into());
+                    constraints.set_video(&media_info.into());
                 }
-            };
 
-            let device = match JsFuture::from(devices_query).await {
-                Ok(s) => s.unchecked_into::<MediaStream>(),
-                Err(e) => {
-                    let msg = format!("Failed to get camera stream: {e:?}");
-                    error!("{msg}");
-                    if let Some(cb) = &on_error {
-                        cb.emit(msg);
-                    }
-                    return;
-                }
-            };
+                constraints.set_audio(&Boolean::from(false));
 
-            log::info!(
-                "CameraEncoder: getUserMedia OK, stream id={:?}, tracks={}",
-                device.id(),
-                device.get_tracks().length()
-            );
-            // Configure the local preview element
-            // Muted must be set before calling play() to avoid autoplay restrictions
-            video_element.set_muted(true);
-            video_element.set_attribute("playsinline", "true").unwrap();
-            video_element.set_src_object(None);
-            video_element.set_src_object(Some(&device));
-
-            // play() returns a Promise; await it so Safari's rejection doesn't
-            // become an unhandled Promise rejection.  If the first attempt fails
-            // (e.g. autoplay policy), retry once after a short delay.
-            match video_element.play() {
-                Ok(promise) => {
-                    if let Err(e) = JsFuture::from(promise).await {
-                        log::warn!(
-                            "VIDEO PLAY promise rejected on '{}': {:?}  — retrying in 200ms",
-                            video_elem_id,
-                            e
-                        );
-                        sleep(Duration::from_millis(200)).await;
-                        if let Ok(p2) = video_element.play() {
-                            if let Err(e2) = JsFuture::from(p2).await {
-                                log::warn!(
-                                    "VIDEO PLAY retry also rejected on '{}': {:?}",
-                                    video_elem_id,
-                                    e2
-                                );
-                            } else {
-                                log::info!("VIDEO PLAY retry succeeded on {}", video_elem_id);
+                let devices_query =
+                    match media_devices.get_user_media_with_constraints(&constraints) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let msg = format!("Camera access failed: {e:?}");
+                            error!("{msg}");
+                            if let Some(cb) = &on_error {
+                                cb.emit(msg);
                             }
+                            restart_count += 1;
+                            continue 'restart;
                         }
-                    } else {
-                        log::info!(
-                            "VIDEO PLAY started successfully on element {}",
-                            video_elem_id
-                        );
+                    };
+
+                let device = match JsFuture::from(devices_query).await {
+                    Ok(s) => s.unchecked_into::<MediaStream>(),
+                    Err(e) => {
+                        let msg = format!("Failed to get camera stream: {e:?}");
+                        error!("{msg}");
+                        if let Some(cb) = &on_error {
+                            cb.emit(msg);
+                        }
+                        restart_count += 1;
+                        continue 'restart;
                     }
-                }
-                Err(e) => {
-                    error!("VIDEO PLAY method call failed: {:?}", e);
-                }
-            }
+                };
 
-            let video_track = Box::new(
-                device
-                    .get_video_tracks()
-                    .find(&mut |_: JsValue, _: u32, _: Array| true)
-                    .unchecked_into::<VideoTrack>(),
-            );
+                log::info!(
+                    "CameraEncoder: getUserMedia OK, stream id={:?}, tracks={}",
+                    device.id(),
+                    device.get_tracks().length()
+                );
+                // Configure the local preview element
+                // Muted must be set before calling play() to avoid autoplay restrictions
+                video_element.set_muted(true);
+                video_element.set_attribute("playsinline", "true").unwrap();
+                video_element.set_src_object(None);
+                video_element.set_src_object(Some(&device));
 
-            // Setup video encoder
-            let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                error!("error_handler error {e:?}");
-            }) as Box<dyn FnMut(JsValue)>);
-
-            let video_output_handler =
-                Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue)>);
-
-            let video_encoder_init = VideoEncoderInit::new(
-                video_error_handler.as_ref().unchecked_ref(),
-                video_output_handler.as_ref().unchecked_ref(),
-            );
-
-            let video_encoder = match VideoEncoder::new(&video_encoder_init) {
-                Ok(enc) => Box::new(enc),
-                Err(e) => {
-                    let msg = format!("Failed to create video encoder: {e:?}");
-                    error!("{msg}");
-                    if let Some(cb) = &on_error {
-                        cb.emit(msg);
-                    }
-                    return;
-                }
-            };
-
-            // Get track settings to get actual width and height
-            let media_track = video_track
-                .as_ref()
-                .clone()
-                .unchecked_into::<MediaStreamTrack>();
-            let track_settings = media_track.get_settings();
-
-            let width = track_settings.get_width().expect("width is None");
-            let height = track_settings.get_height().expect("height is None");
-
-            let video_encoder_config =
-                VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
-            video_encoder_config
-                .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
-            video_encoder_config.set_latency_mode(LatencyMode::Realtime);
-
-            if let Err(e) = video_encoder.configure(&video_encoder_config) {
-                error!("Error configuring video encoder: {e:?}");
-            }
-
-            let video_processor =
-                MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
-                    &video_track.clone().unchecked_into::<MediaStreamTrack>(),
-                ))
-                .unwrap();
-            let video_reader = video_processor
-                .readable()
-                .get_reader()
-                .unchecked_into::<ReadableStreamDefaultReader>();
-
-            // Start encoding video and audio.
-            let mut video_frame_counter: u32 = 0;
-            let mut last_pli_keyframe_time: f64 = 0.0;
-
-            // Cache the initial bitrate
-            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
-
-            // Track current encoder dimensions for dynamic reconfiguration
-            let mut current_encoder_width = width as u32;
-            let mut current_encoder_height = height as u32;
-
-            // Cache tier-controlled values
-            let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
-            let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
-            let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
-
-            loop {
-                if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
-                    switching.store(false, Ordering::Release);
-                    let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
-                    video_track.stop();
-                    log::info!("CameraEncoder: stopped");
-                    if let Err(e) = video_encoder.close() {
-                        error!("Error closing video encoder: {e:?}");
-                    }
-                    return;
-                }
-
-                // Check for tier-driven dimension changes (adaptive quality).
-                // When the tier changes max_width/max_height, we reconfigure
-                // the encoder to downscale (WebCodecs handles the scaling).
-                let new_tier_w = tier_max_width.load(Ordering::Relaxed);
-                let new_tier_h = tier_max_height.load(Ordering::Relaxed);
-                let new_kf = tier_keyframe_interval.load(Ordering::Relaxed);
-
-                let tier_dims_changed =
-                    new_tier_w != local_tier_max_width || new_tier_h != local_tier_max_height;
-                if tier_dims_changed {
-                    local_tier_max_width = new_tier_w;
-                    local_tier_max_height = new_tier_h;
-
-                    // Constrain current encoder dimensions to the tier max.
-                    let constrained_w = current_encoder_width.min(local_tier_max_width);
-                    let constrained_h = current_encoder_height.min(local_tier_max_height);
-
-                    log::info!(
-                        "CameraEncoder: tier dimension change -> {}x{} (was {}x{})",
-                        constrained_w,
-                        constrained_h,
-                        current_encoder_width,
-                        current_encoder_height,
-                    );
-                    current_encoder_width = constrained_w;
-                    current_encoder_height = constrained_h;
-
-                    let new_config = VideoEncoderConfig::new(
-                        get_video_codec_string(),
-                        current_encoder_height,
-                        current_encoder_width,
-                    );
-                    new_config.set_bitrate(local_bitrate as f64);
-                    new_config.set_latency_mode(LatencyMode::Realtime);
-                    if let Err(e) = video_encoder.configure(&new_config) {
-                        error!("Error reconfiguring camera encoder for tier change: {e:?}");
-                    }
-                }
-
-                if new_kf != local_keyframe_interval {
-                    local_keyframe_interval = new_kf;
-                    log::info!(
-                        "CameraEncoder: keyframe interval changed to {}",
-                        local_keyframe_interval
-                    );
-                }
-
-                // Update the bitrate if it has changed more than the threshold percentage
-                let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                if new_current_bitrate != local_bitrate && !tier_dims_changed {
-                    log::info!("Updating video bitrate to {new_current_bitrate}");
-                    local_bitrate = new_current_bitrate;
-                    video_encoder_config.set_bitrate(local_bitrate as f64);
-                    if let Err(e) = video_encoder.configure(&video_encoder_config) {
-                        error!("Error configuring video encoder: {e:?}");
-                    }
-                } else if new_current_bitrate != local_bitrate {
-                    // Bitrate also changed alongside tier dims -- already applied above.
-                    local_bitrate = new_current_bitrate;
-                }
-
-                match JsFuture::from(video_reader.read()).await {
-                    Ok(js_frame) => {
-                        let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
-                            .unwrap()
-                            .unchecked_into::<VideoFrame>();
-
-                        // Check for dimension changes (rotation, camera switch).
-                        // Also constrain to current tier max dimensions.
-                        let frame_width = video_frame.display_width();
-                        let frame_height = video_frame.display_height();
-                        let clamped_width = if frame_width > 0 {
-                            frame_width.min(local_tier_max_width)
-                        } else {
-                            frame_width
-                        };
-                        let clamped_height = if frame_height > 0 {
-                            frame_height.min(local_tier_max_height)
-                        } else {
-                            frame_height
-                        };
-
-                        if clamped_width > 0
-                            && clamped_height > 0
-                            && (clamped_width != current_encoder_width
-                                || clamped_height != current_encoder_height)
-                        {
-                            log::info!("Camera dimensions changed from {current_encoder_width}x{current_encoder_height} to {clamped_width}x{clamped_height}, reconfiguring encoder");
-
-                            current_encoder_width = clamped_width;
-                            current_encoder_height = clamped_height;
-
-                            let new_config = VideoEncoderConfig::new(
-                                get_video_codec_string(),
-                                current_encoder_height,
-                                current_encoder_width,
+                // play() returns a Promise; await it so Safari's rejection doesn't
+                // become an unhandled Promise rejection.  If the first attempt fails
+                // (e.g. autoplay policy), retry once after a short delay.
+                match video_element.play() {
+                    Ok(promise) => {
+                        if let Err(e) = JsFuture::from(promise).await {
+                            log::warn!(
+                                "VIDEO PLAY promise rejected on '{}': {:?}  — retrying in 200ms",
+                                video_elem_id,
+                                e
                             );
-                            new_config.set_bitrate(local_bitrate as f64);
-                            new_config.set_latency_mode(LatencyMode::Realtime);
-                            if let Err(e) = video_encoder.configure(&new_config) {
-                                error!(
-                                    "Error reconfiguring camera encoder with new dimensions: {e:?}"
-                                );
+                            sleep(Duration::from_millis(200)).await;
+                            if let Ok(p2) = video_element.play() {
+                                if let Err(e2) = JsFuture::from(p2).await {
+                                    log::warn!(
+                                        "VIDEO PLAY retry also rejected on '{}': {:?}",
+                                        video_elem_id,
+                                        e2
+                                    );
+                                } else {
+                                    log::info!("VIDEO PLAY retry succeeded on {}", video_elem_id);
+                                }
                             }
-                        }
-
-                        let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
-                        // Check if a keyframe was requested via PLI (Picture Loss Indication).
-                        // The flag is cleared after producing the keyframe.
-                        let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
-                        let now = window()
-                            .performance()
-                            .expect("Performance API not available")
-                            .now();
-                        let pli_cooldown_ok =
-                            (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
-                        let force_pli = pli_requested && pli_cooldown_ok;
-                        if force_pli {
-                            last_pli_keyframe_time = now;
-                        }
-                        // Use tier-controlled keyframe interval instead of the
-                        // static constant, allowing adaptive quality to adjust it.
-                        // Using `%` instead of `.is_multiple_of()` for compatibility
-                        // with Rust toolchains older than 1.87.
-                        #[allow(clippy::manual_is_multiple_of)]
-                        let is_periodic_keyframe = local_keyframe_interval > 0
-                            && video_frame_counter % local_keyframe_interval == 0;
-                        video_encoder_encode_options
-                            .set_key_frame(is_periodic_keyframe || force_pli);
-                        if force_pli {
+                        } else {
                             log::info!(
-                                "CameraEncoder: forcing keyframe at frame {} (PLI)",
-                                video_frame_counter
-                            );
-                        } else if pli_requested {
-                            log::info!(
-                                "CameraEncoder: PLI keyframe suppressed at frame {} (cooldown: {:.0}ms since last)",
-                                video_frame_counter,
-                                now - last_pli_keyframe_time,
+                                "VIDEO PLAY started successfully on element {}",
+                                video_elem_id
                             );
                         }
-                        if let Err(e) = video_encoder
-                            .encode_with_options(&video_frame, &video_encoder_encode_options)
-                        {
-                            error!("Error encoding video frame: {e:?}");
-                        }
-                        video_frame.close();
-                        video_frame_counter += 1;
                     }
                     Err(e) => {
-                        error!("error {e:?}");
+                        error!("VIDEO PLAY method call failed: {:?}", e);
                     }
                 }
-            }
+
+                let video_track = Box::new(
+                    device
+                        .get_video_tracks()
+                        .find(&mut |_: JsValue, _: u32, _: Array| true)
+                        .unchecked_into::<VideoTrack>(),
+                );
+
+                // --- Setup video encoder ---
+                // The output handler and error handler closures must be re-created
+                // on each restart because Closure::wrap consumes them and the new
+                // VideoEncoder needs fresh JS function references.
+
+                let video_output_handler = {
+                    let client = client.clone();
+                    let userid = userid.clone();
+                    let aes = aes.clone();
+                    let current_fps = current_fps.clone();
+                    let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
+                    // Capture the current sequence_number by value; we will read
+                    // the updated value back after the encode loop exits.
+                    let mut local_seq = sequence_number;
+                    let seq_out = Rc::new(std::cell::Cell::new(sequence_number));
+                    let seq_out_inner = seq_out.clone();
+                    let mut last_chunk_time = window().performance().unwrap().now();
+                    let mut chunks_in_last_second = 0;
+
+                    (
+                        Box::new(move |chunk: JsValue| {
+                            let now = window().performance().unwrap().now();
+                            let chunk = web_sys::EncodedVideoChunk::from(chunk);
+
+                            // Update FPS calculation
+                            chunks_in_last_second += 1;
+                            if now - last_chunk_time >= 1000.0 {
+                                let fps = chunks_in_last_second;
+                                current_fps.store(fps, Ordering::Relaxed);
+                                log::debug!("Encoder output FPS: {fps}");
+                                chunks_in_last_second = 0;
+                                last_chunk_time = now;
+                            }
+
+                            // Ensure the backing buffer is large enough for this chunk
+                            let byte_length = chunk.byte_length() as usize;
+                            if buffer.len() < byte_length {
+                                buffer.resize(byte_length, 0);
+                            }
+
+                            let packet: PacketWrapper = transform_video_chunk(
+                                chunk,
+                                local_seq,
+                                buffer.as_mut_slice(),
+                                &userid,
+                                aes.clone(),
+                            );
+                            client.send_media_packet(packet);
+                            local_seq += 1;
+                            seq_out_inner.set(local_seq);
+                        }) as Box<dyn FnMut(JsValue)>,
+                        seq_out,
+                    )
+                };
+
+                let (video_output_box, seq_out_cell) = video_output_handler;
+
+                let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
+                    error!("error_handler error {e:?}");
+                })
+                    as Box<dyn FnMut(JsValue)>);
+
+                let video_output_closure = Closure::wrap(video_output_box);
+
+                let video_encoder_init = VideoEncoderInit::new(
+                    video_error_handler.as_ref().unchecked_ref(),
+                    video_output_closure.as_ref().unchecked_ref(),
+                );
+
+                let video_encoder = match VideoEncoder::new(&video_encoder_init) {
+                    Ok(enc) => Box::new(enc),
+                    Err(e) => {
+                        let msg = format!("Failed to create video encoder: {e:?}");
+                        error!("{msg}");
+                        stop_media_stream_tracks(&device);
+                        if let Some(cb) = &on_error {
+                            cb.emit(msg);
+                        }
+                        restart_count += 1;
+                        continue 'restart;
+                    }
+                };
+
+                // Get track settings to get actual width and height
+                let media_track = video_track
+                    .as_ref()
+                    .clone()
+                    .unchecked_into::<MediaStreamTrack>();
+                let track_settings = media_track.get_settings();
+
+                let width = track_settings.get_width().expect("width is None");
+                let height = track_settings.get_height().expect("height is None");
+
+                let video_encoder_config =
+                    VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
+                video_encoder_config
+                    .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
+                video_encoder_config.set_latency_mode(LatencyMode::Realtime);
+
+                if let Err(e) = video_encoder.configure(&video_encoder_config) {
+                    CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
+                    if is_fatal_encoder_error(&e) {
+                        error!("CameraEncoder: fatal configure error before encode loop, restarting: {e:?}");
+                        let _ = video_encoder.close();
+                        stop_media_stream_tracks(&device);
+                        restart_count += 1;
+                        continue 'restart;
+                    }
+                    error!("Error configuring video encoder: {e:?}");
+                }
+
+                let video_processor =
+                    MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
+                        &video_track.clone().unchecked_into::<MediaStreamTrack>(),
+                    ))
+                    .unwrap();
+                let video_reader = video_processor
+                    .readable()
+                    .get_reader()
+                    .unchecked_into::<ReadableStreamDefaultReader>();
+
+                // Start encoding video and audio.
+                let mut video_frame_counter: u32 = 0;
+
+                // Cache the initial bitrate
+                let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
+
+                // Track current encoder dimensions for dynamic reconfiguration
+                let mut current_encoder_width = width as u32;
+                let mut current_encoder_height = height as u32;
+
+                // Cache tier-controlled values
+                let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
+                let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
+                let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
+
+                // Track whether we have successfully encoded at least one frame
+                // in this restart cycle. Used to reset restart_count on success.
+                let mut encoded_ok_this_cycle = false;
+
+                'encode: loop {
+                    if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
+                        switching.store(false, Ordering::Release);
+                        let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
+                        video_track.stop();
+                        log::info!("CameraEncoder: stopped");
+                        if let Err(e) = video_encoder.close() {
+                            error!("Error closing video encoder: {e:?}");
+                        }
+                        return;
+                    }
+
+                    // --- Guard: check if the encoder has been closed externally ---
+                    // This can happen if the browser closes the codec (e.g. due to
+                    // GPU process crash, OOM, or an error callback we didn't intercept).
+                    if video_encoder.state() == CodecState::Closed {
+                        log::warn!("CameraEncoder: encoder state is Closed, triggering restart");
+                        restart_count += 1;
+                        break 'encode;
+                    }
+
+                    // Check for tier-driven dimension changes (adaptive quality).
+                    // When the tier changes max_width/max_height, we reconfigure
+                    // the encoder to downscale (WebCodecs handles the scaling).
+                    let new_tier_w = tier_max_width.load(Ordering::Relaxed);
+                    let new_tier_h = tier_max_height.load(Ordering::Relaxed);
+                    let new_kf = tier_keyframe_interval.load(Ordering::Relaxed);
+
+                    let tier_dims_changed =
+                        new_tier_w != local_tier_max_width || new_tier_h != local_tier_max_height;
+                    if tier_dims_changed {
+                        // Guard: do not configure a closed encoder.
+                        if video_encoder.state() == CodecState::Closed {
+                            log::warn!("CameraEncoder: encoder closed before tier reconfigure");
+                            restart_count += 1;
+                            break 'encode;
+                        }
+
+                        local_tier_max_width = new_tier_w;
+                        local_tier_max_height = new_tier_h;
+
+                        // Constrain current encoder dimensions to the tier max.
+                        let constrained_w = current_encoder_width.min(local_tier_max_width);
+                        let constrained_h = current_encoder_height.min(local_tier_max_height);
+
+                        log::info!(
+                            "CameraEncoder: tier dimension change -> {}x{} (was {}x{})",
+                            constrained_w,
+                            constrained_h,
+                            current_encoder_width,
+                            current_encoder_height,
+                        );
+                        current_encoder_width = constrained_w;
+                        current_encoder_height = constrained_h;
+
+                        let new_config = VideoEncoderConfig::new(
+                            get_video_codec_string(),
+                            current_encoder_height,
+                            current_encoder_width,
+                        );
+                        new_config.set_bitrate(local_bitrate as f64);
+                        new_config.set_latency_mode(LatencyMode::Realtime);
+                        if let Err(e) = video_encoder.configure(&new_config) {
+                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
+                            if is_fatal_encoder_error(&e) {
+                                error!("CameraEncoder: fatal configure error, restarting: {e:?}");
+                                restart_count += 1;
+                                break 'encode;
+                            }
+                            error!("Error reconfiguring camera encoder for tier change: {e:?}");
+                        }
+                    }
+
+                    if new_kf != local_keyframe_interval {
+                        local_keyframe_interval = new_kf;
+                        log::info!(
+                            "CameraEncoder: keyframe interval changed to {}",
+                            local_keyframe_interval
+                        );
+                    }
+
+                    // Update the bitrate if it has changed more than the threshold percentage
+                    let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
+                    if new_current_bitrate != local_bitrate && !tier_dims_changed {
+                        // Guard: do not configure a closed encoder.
+                        if video_encoder.state() == CodecState::Closed {
+                            log::warn!("CameraEncoder: encoder closed before bitrate reconfigure");
+                            restart_count += 1;
+                            break 'encode;
+                        }
+                        log::info!("Updating video bitrate to {new_current_bitrate}");
+                        local_bitrate = new_current_bitrate;
+                        video_encoder_config.set_bitrate(local_bitrate as f64);
+                        if let Err(e) = video_encoder.configure(&video_encoder_config) {
+                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
+                            if is_fatal_encoder_error(&e) {
+                                error!("CameraEncoder: fatal configure error, restarting: {e:?}");
+                                restart_count += 1;
+                                break 'encode;
+                            }
+                            error!("Error configuring video encoder: {e:?}");
+                        }
+                    } else if new_current_bitrate != local_bitrate {
+                        // Bitrate also changed alongside tier dims -- already applied above.
+                        local_bitrate = new_current_bitrate;
+                    }
+
+                    match JsFuture::from(video_reader.read()).await {
+                        Ok(js_frame) => {
+                            let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
+                                .unwrap()
+                                .unchecked_into::<VideoFrame>();
+
+                            // Check for dimension changes (rotation, camera switch).
+                            // Also constrain to current tier max dimensions.
+                            let frame_width = video_frame.display_width();
+                            let frame_height = video_frame.display_height();
+                            let clamped_width = if frame_width > 0 {
+                                frame_width.min(local_tier_max_width)
+                            } else {
+                                frame_width
+                            };
+                            let clamped_height = if frame_height > 0 {
+                                frame_height.min(local_tier_max_height)
+                            } else {
+                                frame_height
+                            };
+
+                            if clamped_width > 0
+                                && clamped_height > 0
+                                && (clamped_width != current_encoder_width
+                                    || clamped_height != current_encoder_height)
+                            {
+                                // Guard: do not configure a closed encoder.
+                                if video_encoder.state() == CodecState::Closed {
+                                    log::warn!("CameraEncoder: encoder closed before dimension reconfigure");
+                                    video_frame.close();
+                                    restart_count += 1;
+                                    break 'encode;
+                                }
+
+                                log::info!("Camera dimensions changed from {current_encoder_width}x{current_encoder_height} to {clamped_width}x{clamped_height}, reconfiguring encoder");
+
+                                current_encoder_width = clamped_width;
+                                current_encoder_height = clamped_height;
+
+                                let new_config = VideoEncoderConfig::new(
+                                    get_video_codec_string(),
+                                    current_encoder_height,
+                                    current_encoder_width,
+                                );
+                                new_config.set_bitrate(local_bitrate as f64);
+                                new_config.set_latency_mode(LatencyMode::Realtime);
+                                if let Err(e) = video_encoder.configure(&new_config) {
+                                    CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if is_fatal_encoder_error(&e) {
+                                        error!("CameraEncoder: fatal configure error, restarting: {e:?}");
+                                        restart_count += 1;
+                                        break 'encode;
+                                    }
+                                    error!(
+                                        "Error reconfiguring camera encoder with new dimensions: {e:?}"
+                                    );
+                                }
+                            }
+
+                            let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
+                            // Check if a keyframe was requested via PLI (Picture Loss Indication).
+                            // The flag is cleared after producing the keyframe.
+                            let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
+                            // Use tier-controlled keyframe interval instead of the
+                            // static constant, allowing adaptive quality to adjust it.
+                            // Using `%` instead of `.is_multiple_of()` for compatibility
+                            // with Rust toolchains older than 1.87.
+                            #[allow(clippy::manual_is_multiple_of)]
+                            let is_periodic_keyframe = local_keyframe_interval > 0
+                                && video_frame_counter % local_keyframe_interval == 0;
+                            video_encoder_encode_options
+                                .set_key_frame(is_periodic_keyframe || pli_requested);
+                            if pli_requested {
+                                log::info!(
+                                    "CameraEncoder: forcing keyframe at frame {} (PLI)",
+                                    video_frame_counter
+                                );
+                            }
+                            match video_encoder
+                                .encode_with_options(&video_frame, &video_encoder_encode_options)
+                            {
+                                Ok(_) => {
+                                    CAMERA_ENCODER_FRAMES_SUBMITTED_OK
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    // First successful encode after a restart resets the
+                                    // restart counter so transient errors don't accumulate
+                                    // toward MAX_RESTARTS across long-lived sessions.
+                                    if !encoded_ok_this_cycle && restart_count > 0 {
+                                        log::info!(
+                                            "CameraEncoder: encode succeeded after restart, resetting restart counter"
+                                        );
+                                        restart_count = 0;
+                                    }
+                                    encoded_ok_this_cycle = true;
+                                }
+                                Err(e) => {
+                                    let msg = format!("{e:?}");
+                                    match classify_encode_error(&msg) {
+                                        EncodeErrorBucket::ClosedCodec => {
+                                            CAMERA_ENCODER_ERRORS_CLOSED_CODEC
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        EncodeErrorBucket::VpxMemAlloc => {
+                                            CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        EncodeErrorBucket::Generic => {
+                                            CAMERA_ENCODER_ERRORS_GENERIC
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    if is_fatal_encoder_error(&e) {
+                                        error!(
+                                            "CameraEncoder: fatal encode error (restart {restart_count}): {e:?}"
+                                        );
+                                        video_frame.close();
+                                        restart_count += 1;
+                                        break 'encode;
+                                    }
+                                    error!("Error encoding video frame: {e:?}");
+                                }
+                            }
+                            video_frame.close();
+                            video_frame_counter += 1;
+                        }
+                        Err(e) => {
+                            error!("error {e:?}");
+                        }
+                    }
+                } // end 'encode
+
+                // --- Cleanup before restart ---
+                // Persist the sequence number from the output handler so the next
+                // restart cycle continues numbering where we left off.
+                sequence_number = seq_out_cell.get();
+
+                // Close the encoder (may already be closed; ignore errors).
+                let _ = video_encoder.close();
+
+                // Stop the media track to release the camera.
+                let vt = video_track.clone().unchecked_into::<MediaStreamTrack>();
+                vt.stop();
+
+                log::info!("CameraEncoder: cleaned up encoder and track, looping to restart");
+                // Loop back to 'restart for backoff + re-acquisition.
+            } // end 'restart
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_fatal_encoder_error_message;
+
+    #[test]
+    fn fatal_encoder_errors_match_closed_codec_signatures() {
+        assert!(is_fatal_encoder_error_message(
+            "InvalidStateError: closed codec"
+        ));
+        assert!(is_fatal_encoder_error_message(
+            "Memory allocation error (Unable to find free frame buffer)"
+        ));
+    }
+
+    #[test]
+    fn non_fatal_encoder_errors_do_not_trigger_restart() {
+        assert!(!is_fatal_encoder_error_message(
+            "EncodingError: dropped one frame"
+        ));
     }
 }

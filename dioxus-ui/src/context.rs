@@ -12,6 +12,11 @@ use dioxus::prelude::*;
 use dioxus_sdk_storage::{LocalStorage, StorageBacking};
 use videocall_client::VideoCallClient;
 
+/// Per-tile crop state: canvas ID → is-cropped.
+/// Survives re-renders caused by peer list changes so crop toggles persist.
+#[derive(Clone, Copy)]
+pub struct CroppedTilesCtx(pub Signal<std::collections::HashMap<String, bool>>);
+
 /// Wrapper for the display name signal used as context.
 #[derive(Clone, Copy)]
 pub struct DisplayNameCtx(pub Signal<Option<String>>);

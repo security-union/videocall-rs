@@ -42,8 +42,9 @@ use crate::constants::{
 use crate::context::{
     load_appearance_settings_from_storage, resolve_transport_config,
     save_appearance_settings_to_storage, save_display_name_to_storage, validate_display_name,
-    AppearanceSettingsCtx, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    AppearanceSettingsCtx, CroppedTilesCtx, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime,
+    PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -57,8 +58,9 @@ use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
-    MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
-    PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+    ConnectionLostReason, MediaAccessKind, MediaDeviceAccess, MediaPermission,
+    MediaPermissionsErrorState, PermissionState, ScreenShareEvent, VideoCallClient,
+    VideoCallClientOptions,
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -117,6 +119,9 @@ pub enum MediaErrorState {
     Other,
 }
 
+const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
+const SUBTLE_FOOTNOTE_TEXT_STYLE: &str = "font-size: 0.8rem; opacity: 0.7;";
+
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
     match err {
         MediaErrorState::NoDevice => rsx! {
@@ -127,7 +132,7 @@ fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
         },
         MediaErrorState::PermissionDenied => rsx! {
             p { " {device} is blocked in your browser." }
-            p { style: "front-size: 0.9rem; opacity: 0.8;",
+            p { style: "{SUBTLE_HELP_TEXT_STYLE}",
                 "Please click the lock icon in your browser's address bar and allow access if you want to use it."
             }
         },
@@ -713,6 +718,9 @@ pub fn AttendantsComponent(
     // up departed peers' histories. Provided as context alongside PeerStatusMap.
     let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
 
+    // Per-tile crop state — created early so on_peer_removed can clean up.
+    let cropped_tiles_signal: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
+
     // Read transport preference from context BEFORE use_hook (hooks must not
     // be called inside the hook closure).
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
@@ -811,9 +819,12 @@ pub fn AttendantsComponent(
             on_connection_lost: {
                 let id = id.clone();
                 let client_cell = client_for_reconnect.clone();
-                VcCallback::from(move |reason: wasm_bindgen::JsValue| {
-                    let reason_str = reason.as_string().unwrap_or_else(|| format!("{reason:?}"));
-                    log::warn!("DIOXUS-UI: Connection lost — reason: {reason_str}");
+                VcCallback::from(move |reason: ConnectionLostReason| {
+                    log::warn!(
+                        "DIOXUS-UI: Connection lost ({}): {}",
+                        reason.label(),
+                        reason.message()
+                    );
                     let mut connection_error = connection_error;
                     let meeting_ended_message = meeting_ended_message;
                     connection_error.set(Some("Connection lost, reconnecting...".to_string()));
@@ -875,6 +886,9 @@ pub fn AttendantsComponent(
                 speech_map.write().remove(&peer_id);
                 let mut jt_map = peer_join_time;
                 jt_map.write().remove(&peer_id);
+                let mut ct_map = cropped_tiles_signal;
+                ct_map.write().remove(&peer_id);
+                ct_map.write().remove(&format!("screen-share-{peer_id}"));
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
@@ -1104,6 +1118,13 @@ pub fn AttendantsComponent(
             )),
             // Full call participant: decode and play all inbound media.
             decode_media: true,
+            // Honour user transport preference: only allow the connection
+            // manager's post-rebase re-election retry when the user is on
+            // the default `Auto` mode. Manual `WebTransportOnly` /
+            // `WebSocketOnly` selections must not be overridden by an
+            // automatic retry — the single-candidate state in those modes is
+            // intentional, not a recoverable system condition.
+            allow_post_rebase_retry: transport_pref == TransportPreference::Auto,
         };
 
         let client = VideoCallClient::new(opts);
@@ -1311,6 +1332,10 @@ pub fn AttendantsComponent(
     // (or create) their history entry. This survives PeerTile remounts caused
     // by layout switches (grid -> split when screen sharing starts).
     use_context_provider(|| peer_signal_history_map);
+
+    // Per-tile crop state — signal created early (near peer_status_map) so
+    // on_peer_removed can clean up; context provided here for child access.
+    use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
 
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
@@ -2167,7 +2192,7 @@ pub fn AttendantsComponent(
                                 class: "card-apple",
                                 style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
                                 h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                                p { style: "font-size: 0.9rem; opacity: 0.8;",
+                                p { style: "{SUBTLE_HELP_TEXT_STYLE}",
                                     "Share this meeting link with others you want in the meeting"
                                 }
                                 div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
@@ -2215,7 +2240,7 @@ pub fn AttendantsComponent(
                                         }
                                     }
                                 }
-                                p { style: "font-size: 0.8rem; opacity: 0.7;",
+                                p { style: "{SUBTLE_FOOTNOTE_TEXT_STYLE}",
                                     "People who use this meeting link must get your permission before they can join."
                                 }
                                 div {

@@ -11,6 +11,7 @@ use crate::pages::home::Home;
 use crate::pages::meeting::MeetingPage;
 use crate::pages::meeting_settings::MeetingSettingsPage;
 use crate::pages::oauth_callback::OAuthCallback;
+use crate::theme::color as theme_color;
 
 #[derive(Clone, Routable, PartialEq, Debug)]
 #[rustfmt::skip]
@@ -71,7 +72,7 @@ fn MeetingPage2(id: String, webtransport_enabled: String) -> Element {
 #[component]
 fn NotFound() -> Element {
     rsx! {
-        div { style: "display: flex; align-items: center; justify-content: center; height: 100vh; background: #000; color: #fff;",
+        div { style: "display: flex; align-items: center; justify-content: center; height: 100vh; background: {theme_color::BG}; color: {theme_color::TEXT_PRIMARY};",
             div { style: "text-align: center;",
                 h1 { "404" }
                 p { "Page not found" }

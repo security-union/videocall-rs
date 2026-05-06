@@ -19,7 +19,7 @@ export COOKIE_SECURE=${COOKIE_SECURE:-false}
 # Local dev fallback: let meeting-api resolve unauthenticated requests to a
 # stable anonymous identity so you can exercise the API without an OAuth
 # provider. Production must leave this unset (or "false").
-export ALLOW_ANONYMOUS=${ALLOW_ANONYMOUS:-true}
+export ALLOW_ANONYMOUS=${ALLOW_ANONYMOUS:-false}
 
 server_command="$( ((WEBTRANSPORT_ENABLED)) && echo webtransport_server || echo websocket_server )"
 

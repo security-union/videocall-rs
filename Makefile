@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -48,6 +48,13 @@ fmt:
 
 check:
 		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo clippy --all -- --deny warnings && cargo fmt --all --check"
+
+check-style-tokens:
+		bash scripts/check-hardcoded-colors.sh
+		bash scripts/check-token-drift.sh
+
+check-token-drift:
+		bash scripts/check-token-drift.sh
 
 clean:
 		$(COMPOSE) down --remove-orphans \

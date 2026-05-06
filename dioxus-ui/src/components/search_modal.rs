@@ -356,14 +356,14 @@ pub fn SearchModal() -> Element {
 
     rsx! {
         div {
-            style: "position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,0.5); backdrop-filter:blur(4px);",
+            class: "search-modal-overlay",
             onclick: move |_| search_ctx.set_visible(false),
             div {
-                style: "width:100%; max-width:540px; overflow:hidden; border-radius:12px; border:1px solid #374151; background:#1c1c1e; box-shadow:0 25px 50px -12px rgba(0,0,0,0.5);",
+                class: "search-modal-card",
                 onclick: |evt| evt.stop_propagation(),
-                div { style: "display:flex; align-items:center; border-bottom:1px solid #374151; padding:12px 16px;",
+                div { class: "search-modal-header",
                     input {
-                        style: "width:100%; background:transparent; font-size:18px; color:#fff; outline:none; border:none;",
+                        class: "search-modal-input",
                         placeholder: "Search meetings...",
                         value: "{query}",
                         oninput: move |evt| query.set(evt.value()),
@@ -384,13 +384,13 @@ pub fn SearchModal() -> Element {
                         },
                     }
                 }
-                div { style: "max-height:60vh; overflow-y:auto; padding:8px;",
+                div { class: "search-modal-results",
                     if *is_loading.read() {
-                        div { style: "padding:16px 0; text-align:center; color:#6b7280;", "Searching..." }
+                        div { class: "search-modal-state", "Searching..." }
                     } else if let Some(err) = error.read().as_ref() {
-                        div { style: "padding:16px 0; text-align:center; color:#ef4444;", "{err}" }
+                        div { class: "search-modal-state search-modal-state-error", "{err}" }
                     } else if results.read().is_empty() && !query.read().is_empty() {
-                        div { style: "padding:16px 0; text-align:center; color:#6b7280;", "No meetings found" }
+                        div { class: "search-modal-state", "No meetings found" }
                     } else {
                         for result in results.read().iter() {
                             {
@@ -400,17 +400,17 @@ pub fn SearchModal() -> Element {
                                 let id = result.meeting_id.clone();
                                 let is_active = result.state == "active" || result.state == "idle" || result.state == "created";
                                 let is_ended = result.state == "ended";
-                                let row_style = if is_active {
-                                    "display:flex; align-items:center; justify-content:space-between; padding:10px 14px; margin-bottom:4px; border-radius:8px; cursor:pointer; transition:background 0.15s;"
+                                let row_class = if is_active {
+                                    "search-modal-row is-active"
                                 } else {
-                                    "display:flex; align-items:center; justify-content:space-between; padding:10px 14px; margin-bottom:4px; border-radius:8px; opacity:0.5;"
+                                    "search-modal-row is-disabled"
                                 };
-                                let badge_style = if is_active {
-                                    "margin-left:12px; flex-shrink:0; border-radius:9999px; background:rgba(22,163,74,0.15); padding:3px 10px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:#4ade80;"
+                                let badge_class = if is_active {
+                                    "search-modal-badge search-modal-badge-active"
                                 } else if is_ended {
-                                    "margin-left:12px; flex-shrink:0; border-radius:9999px; background:rgba(75,85,99,0.2); padding:3px 10px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:#9ca3af;"
+                                    "search-modal-badge search-modal-badge-ended"
                                 } else {
-                                    "margin-left:12px; flex-shrink:0; border-radius:9999px; background:rgba(202,138,4,0.15); padding:3px 10px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:#facc15;"
+                                    "search-modal-badge search-modal-badge-idle"
                                 };
                                 let badge_text: &str = if is_active {
                                     "Join"
@@ -423,7 +423,7 @@ pub fn SearchModal() -> Element {
                                     a {
                                         key: "{result.meeting_id}",
                                         href: "/meeting/{result.meeting_id}",
-                                        style: "{row_style} text-decoration:none; color:inherit;",
+                                        class: "{row_class}",
                                         onclick: move |evt| {
                                             if !is_active {
                                                 evt.prevent_default();
@@ -439,17 +439,17 @@ pub fn SearchModal() -> Element {
                                                 search_ctx.set_visible(false);
                                             }
                                         },
-                                        div { style: "display:flex; flex-direction:column; min-width:0; flex:1;",
-                                            span { style: "font-size:14px; font-weight:500; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                        div { class: "search-modal-row-main",
+                                            span { class: "search-modal-row-id",
                                                 "{result.meeting_id}"
                                             }
                                             if !result.host.is_empty() {
-                                                span { style: "font-size:12px; color:#9ca3af; margin-top:2px;",
+                                                span { class: "search-modal-row-host",
                                                     "Host: {result.host}"
                                                 }
                                             }
                                         }
-                                        span { style: "{badge_style}", "{badge_text}" }
+                                        span { class: "{badge_class}", "{badge_text}" }
                                     }
                                 }
                             }

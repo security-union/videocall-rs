@@ -19,6 +19,7 @@
 #[allow(clippy::module_inception)]
 mod connection;
 mod connection_controller;
+mod connection_lost_reason;
 mod connection_manager;
 mod task;
 mod webmedia;
@@ -26,7 +27,11 @@ mod websocket;
 mod webtransport;
 
 pub use connection_controller::ConnectionController;
+pub use connection_lost_reason::ConnectionLostReason;
 #[allow(unused_imports)]
 pub use connection_manager::ReconnectionPhase;
-pub use connection_manager::{ConnectionManagerOptions, ConnectionState};
+pub use connection_manager::{
+    connection_handshake_failures, connection_session_drops, ConnectionManagerOptions,
+    ConnectionState,
+};
 pub use webmedia::ConnectOptions;

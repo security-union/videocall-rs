@@ -1,0 +1,58 @@
+{
+  "version": "0.1.0",
+  "generated": "manual",
+  "notes": "Cleanup-first token contract. v0 core is intended to stay stable while v0.1 component tokens can evolve.",
+  "v0_core": {
+    "css": [
+      { "token": "--color-bg", "value": "#000000", "maps_from": ["#000", "#000000"] },
+      { "token": "--color-surface", "value": "#1C1C1E", "maps_from": ["#1c1c1c", "#1a1a1a"] },
+      { "token": "--color-surface-elevated", "value": "#2C2C2E", "maps_from": ["#242526", "#2d2d2d"] },
+      { "token": "--color-text-primary", "value": "#FFFFFF", "maps_from": ["#fff", "#ffffff"] },
+      { "token": "--color-text-secondary", "value": "#AEAEB2", "maps_from": ["#e4e6eb", "#aaa"] },
+      { "token": "--color-border", "value": "#38383A", "maps_from": ["dark border literals"] },
+      { "token": "--color-border-emphasis", "value": "#48484A", "maps_from": ["hover/strong border literals"] },
+      { "token": "--status-success", "value": "#30D158", "maps_from": ["#4ade80", "#10b981"] },
+      { "token": "--status-warning", "value": "#FF9F0A", "maps_from": ["#ff9800", "#FFC107"] },
+      { "token": "--status-error", "value": "#FF453A", "maps_from": ["#ef4444", "#ff6b6b"] },
+      { "token": "--space-1", "value": "0.25rem", "maps_from": ["4px"] },
+      { "token": "--space-2", "value": "0.5rem", "maps_from": ["8px"] },
+      { "token": "--space-3", "value": "0.75rem", "maps_from": ["12px"] },
+      { "token": "--space-4", "value": "1rem", "maps_from": ["16px"] },
+      { "token": "--space-5", "value": "1.25rem", "maps_from": ["20px"] },
+      { "token": "--radius-sm", "value": "6px", "maps_from": ["5px", "6px"] },
+      { "token": "--radius-md", "value": "8px", "maps_from": ["8px"] },
+      { "token": "--radius-lg", "value": "12px", "maps_from": ["12px"] },
+      { "token": "--motion-fast", "value": "0.15s", "maps_from": ["0.15s"] },
+      { "token": "--motion-base", "value": "0.2s", "maps_from": ["0.2s"] }
+    ]
+  },
+  "v0_1_component_extension": {
+    "css": [
+      { "token": "--effect-blur-sm", "value": "4px", "maps_from": ["blur(4px)"] },
+      { "token": "--effect-blur-md", "value": "14px", "maps_from": ["blur(14px)"] },
+      { "token": "--overlay-backdrop", "value": "rgba(0, 0, 0, 0.35)", "maps_from": ["modal backdrop overlays"] },
+      { "token": "--overlay-strong", "value": "rgba(0, 0, 0, 0.5)", "maps_from": ["strong overlays"] },
+      { "token": "--overlay-heavy", "value": "rgba(0, 0, 0, 0.6)", "maps_from": ["rgba(0, 0, 0, 0.6)"] },
+      { "token": "--overlay-opaque", "value": "rgba(0, 0, 0, 0.8)", "maps_from": ["rgba(0, 0, 0, 0.8)", "rgba(0, 0, 0, 0.9)"] },
+      { "token": "--field-bg", "value": "rgba(255, 255, 255, 0.05)", "maps_from": ["input/card frosted bg"] },
+      { "token": "--field-bg-hover", "value": "rgba(255, 255, 255, 0.07)", "maps_from": ["input/card hover bg"] },
+      { "token": "--signal-popup-bg", "value": "rgba(26, 26, 46, 0.97)", "maps_from": ["signal popup bg"] },
+      { "token": "--signal-popup-border", "value": "rgba(255, 255, 255, 0.12)", "maps_from": ["signal popup border"] },
+      { "token": "--tooltip-bg", "value": "rgba(0, 0, 0, 0.92)", "maps_from": ["tooltip bg"] },
+      { "token": "--tooltip-border", "value": "rgba(255, 255, 255, 0.15)", "maps_from": ["tooltip border"] },
+      { "token": "--search-badge-active-text", "value": "#4ade80", "maps_from": ["active badge text"] },
+      { "token": "--search-badge-ended-text", "value": "#9ca3af", "maps_from": ["ended badge text"] },
+      { "token": "--search-badge-idle-text", "value": "#facc15", "maps_from": ["idle badge text"] }
+    ],
+    "rust": [
+      { "token": "TEXT_PRIMARY", "value": "#fff", "maps_from": ["primary svg text"] },
+      { "token": "TEXT_MUTED", "value": "#aaa", "maps_from": ["muted chart labels"] },
+      { "token": "TEXT_SUBTLE", "value": "#888", "maps_from": ["subtle chart labels"] },
+      { "token": "AXIS", "value": "#666", "maps_from": ["axis strokes"] },
+      { "token": "SIGNAL_AUDIO", "value": "#4FC3F7", "maps_from": ["audio series"] },
+      { "token": "SIGNAL_VIDEO", "value": "#81C784", "maps_from": ["video series"] },
+      { "token": "SIGNAL_SCREEN", "value": "#CE93D8", "maps_from": ["screen series"] },
+      { "token": "SIGNAL_LATENCY", "value": "#FF8A65", "maps_from": ["latency series"] }
+    ]
+  }
+}

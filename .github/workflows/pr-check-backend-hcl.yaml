@@ -15,6 +15,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Makefile'
+      - '.github/workflows/pr-check-backend-hcl.yaml'
 
 concurrency:
   group: pr-check-backend-${{ github.event.pull_request.number }}

@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::constants::*;
 use crate::context::{TransportPreferenceCtx, VideoCallClientCtx};
@@ -25,7 +26,9 @@ use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
-use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
+use videocall_client::{
+    initial_screen_tier, CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use std::cell::RefCell;
@@ -73,6 +76,7 @@ pub fn Host(
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let pre_acquired_stream = use_context::<PreAcquiredScreenStream>();
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -224,6 +228,7 @@ pub fn Host(
             prev_share_screen: false,
             prev_mic_enabled: false,
             prev_video_enabled: false,
+            prev_device_settings_open: false,
             initialized: false,
             last_reload_counter: 0,
         }))
@@ -385,10 +390,16 @@ pub fn Host(
     {
         let mut s = state.borrow_mut();
 
-        if s.last_reload_counter != reload_devices_counter {
+        let did_full_reload = s.last_reload_counter != reload_devices_counter;
+        if did_full_reload {
             s.media_devices.load();
             s.last_reload_counter = reload_devices_counter;
         }
+
+        if !did_full_reload && !s.prev_device_settings_open && device_settings_open {
+            s.media_devices.refresh_devices_safely();
+        }
+        s.prev_device_settings_open = device_settings_open;
 
         log::info!(
             "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
@@ -400,12 +411,40 @@ pub fn Host(
             s.prev_share_screen = share_screen;
             if share_screen {
                 s.screen.set_enabled(true);
-                log::info!("Start screen share encoder");
-                let state_clone = state.clone();
-                Timeout::new(1000, move || {
-                    state_clone.borrow_mut().screen.start();
-                })
-                .forget();
+
+                // Adaptive initial tier selection: inspect network signals at
+                // the moment screen sharing starts to choose a conservative
+                // starting tier that gives a readable first frame on constrained
+                // uplinks without waiting for the PID loop to ramp down.
+                let rtt_ms = client.average_rtt_ms();
+                let camera_tier_index = client.camera_tier_index();
+                let initial_tier = initial_screen_tier(rtt_ms, camera_tier_index);
+
+                log::info!(
+                    "Start screen share encoder: rtt={:?}ms, camera_tier={:?}, initial_tier={}",
+                    rtt_ms,
+                    camera_tier_index,
+                    initial_tier
+                );
+
+                // Check if the onclick handler already acquired a MediaStream
+                // (required for Safari which mandates getDisplayMedia be called
+                // synchronously within a user gesture handler).
+                let maybe_stream = pre_acquired_stream.borrow_mut().take();
+                if let Some(stream) = maybe_stream {
+                    log::info!("Start screen share encoder with pre-acquired stream");
+                    s.screen.start_with_stream(stream, initial_tier);
+                } else {
+                    // Fallback: let the encoder call getDisplayMedia itself.
+                    // This path works on Chrome/Firefox where the gesture
+                    // chain survives the timeout + spawn_local boundaries.
+                    log::info!("Start screen share encoder (encoder-acquired stream)");
+                    let state_clone = state.clone();
+                    Timeout::new(1000, move || {
+                        state_clone.borrow_mut().screen.start(initial_tier);
+                    })
+                    .forget();
+                }
             } else {
                 s.screen.set_enabled(false);
                 s.screen.stop();
@@ -620,6 +659,7 @@ struct HostState {
     prev_share_screen: bool,
     prev_mic_enabled: bool,
     prev_video_enabled: bool,
+    prev_device_settings_open: bool,
     initialized: bool,
     last_reload_counter: u32,
 }

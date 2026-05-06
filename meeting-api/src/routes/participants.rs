@@ -127,8 +127,23 @@ pub async fn join_meeting(
             nats_events::publish_meeting_activated(state.nats.as_ref(), &meeting_id).await;
         }
 
+        // Display-name reconciliation on rejoin (issue #502): if the meeting
+        // already has a cached non-empty `host_display_name`, do NOT
+        // overwrite it from the request. This mirrors the
+        // `COALESCE(NULLIF(...), $3)` policy in
+        // [`db_participants::upsert_host`] so both the per-meeting cached
+        // host name AND the per-participant display name stay stable across
+        // back-then-rejoin. Mid-meeting renames go through the rate-limited
+        // `update_display_name` endpoint, never through `join`.
+        let existing_host_dn_nonempty = meeting
+            .host_display_name
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
         if let Some(dn) = display_name {
-            db_meetings::set_host_display_name(&state.db, meeting.id, dn).await?;
+            if !existing_host_dn_nonempty {
+                db_meetings::set_host_display_name(&state.db, meeting.id, dn).await?;
+            }
         }
 
         let row =
@@ -138,23 +153,34 @@ pub async fn join_meeting(
         // creator appears in acls/participants even on a fresh meeting.
         search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
+        // Token uses the persisted display_name (which reflects the
+        // reconciliation above) so the JWT carries the stable host name
+        // regardless of what the rejoin request claimed.
+        let persisted_dn = row.display_name.clone();
         let token = generate_room_token(
             &state.jwt_secret,
             state.token_ttl_secs,
             &user_id,
             &meeting_id,
             true,
-            display_name.unwrap_or(&user_id),
+            persisted_dn.as_deref().unwrap_or(&user_id),
             meeting.end_on_host_leave,
             false,
         )?;
 
         let mut resp = row.into_participant_status(Some(token));
-        resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
-        resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-        resp.end_on_host_leave = Some(meeting.end_on_host_leave);
-        resp.allow_guests = Some(meeting.allow_guests);
-        resp.host_display_name = display_name.map(String::from).or(meeting.host_display_name);
+        resp.waiting_room_enabled = meeting.waiting_room_enabled;
+        resp.admitted_can_admit = meeting.admitted_can_admit;
+        resp.end_on_host_leave = meeting.end_on_host_leave;
+        resp.allow_guests = meeting.allow_guests;
+        // Prefer the freshly-persisted display_name from the host upsert as
+        // the source of truth — same value the JWT was minted from above —
+        // so the response and JWT can never disagree. The local `meeting`
+        // snapshot is from before the upsert and may be stale relative to
+        // it; fall back to its cached `host_display_name` only when the
+        // upsert returned nothing (existing display_name was already empty
+        // and no display_name was supplied).
+        resp.host_display_name = persisted_dn.or(meeting.host_display_name);
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
     } else {
@@ -202,7 +228,11 @@ async fn join_as_attendee(
                 is_guest,
             )
             .await?
-            .expect("join_attendee with None host check never returns None");
+            .ok_or_else(|| {
+                AppError::internal(
+                    "join_attendee returned None despite no host-check — internal invariant violated",
+                )
+            })?;
             // New attendee row added — may be `admitted` or `waiting`,
             // both of which are indexed by `list_for_search`. Re-push.
             search::spawn_repush(state, meeting.id, meeting_id.to_string());
@@ -234,10 +264,10 @@ async fn join_as_attendee(
             if !auto_admitted {
                 nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
             }
-            resp.waiting_room_enabled = Some(wr_enabled);
-            resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-            resp.end_on_host_leave = Some(meeting.end_on_host_leave);
-            resp.allow_guests = Some(meeting.allow_guests);
+            resp.waiting_room_enabled = wr_enabled;
+            resp.admitted_can_admit = meeting.admitted_can_admit;
+            resp.end_on_host_leave = meeting.end_on_host_leave;
+            resp.allow_guests = meeting.allow_guests;
             resp.host_display_name = meeting.host_display_name;
             resp.host_user_id = meeting.creator_id;
             return Ok(Json(APIResponse::ok(resp)));
@@ -259,17 +289,15 @@ async fn join_as_attendee(
             admitted_at: None,
             room_token: None,
             observer_token: Some(observer),
-            waiting_room_enabled: Some(meeting.waiting_room_enabled),
-            admitted_can_admit: Some(meeting.admitted_can_admit),
-            end_on_host_leave: Some(meeting.end_on_host_leave),
+            waiting_room_enabled: meeting.waiting_room_enabled,
+            admitted_can_admit: meeting.admitted_can_admit,
+            end_on_host_leave: meeting.end_on_host_leave,
             host_display_name: meeting.host_display_name,
             host_user_id: meeting.creator_id,
-            allow_guests: Some(meeting.allow_guests),
+            allow_guests: meeting.allow_guests,
         };
         return Ok(Json(APIResponse::ok(resp)));
     }
-
-    // Pass creator_id only when the host-gone check must be enforced.
     // Folding this check into the transaction closes the TOCTOU window where
     // concurrent requests could both pass an out-of-transaction host-status read.
     let check_creator = if !meeting.end_on_host_leave && !meeting.admitted_can_admit {
@@ -327,10 +355,10 @@ async fn join_as_attendee(
         // Notify the host that the waiting room list has changed.
         nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
     }
-    resp.waiting_room_enabled = Some(waiting_room_enabled);
-    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-    resp.end_on_host_leave = Some(meeting.end_on_host_leave);
-    resp.allow_guests = Some(meeting.allow_guests);
+    resp.waiting_room_enabled = waiting_room_enabled;
+    resp.admitted_can_admit = meeting.admitted_can_admit;
+    resp.end_on_host_leave = meeting.end_on_host_leave;
+    resp.allow_guests = meeting.allow_guests;
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -423,10 +451,10 @@ pub async fn get_my_status(
     };
 
     let mut resp = row.into_participant_status(token);
-    resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
-    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-    resp.end_on_host_leave = Some(meeting.end_on_host_leave);
-    resp.allow_guests = Some(meeting.allow_guests);
+    resp.waiting_room_enabled = meeting.waiting_room_enabled;
+    resp.admitted_can_admit = meeting.admitted_can_admit;
+    resp.end_on_host_leave = meeting.end_on_host_leave;
+    resp.allow_guests = meeting.allow_guests;
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -482,9 +510,9 @@ pub async fn get_guest_status(
     };
 
     let mut resp = row.into_participant_status(token);
-    resp.waiting_room_enabled = Some(meeting.waiting_room_enabled);
-    resp.admitted_can_admit = Some(meeting.admitted_can_admit);
-    resp.allow_guests = Some(meeting.allow_guests);
+    resp.waiting_room_enabled = meeting.waiting_room_enabled;
+    resp.admitted_can_admit = meeting.admitted_can_admit;
+    resp.allow_guests = meeting.allow_guests;
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))

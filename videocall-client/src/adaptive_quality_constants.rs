@@ -158,11 +158,9 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 
 /// Index into `VIDEO_QUALITY_TIERS` for the default starting tier.
 ///
-/// Starting at "medium" (480p/25fps/600kbps) keeps initial bandwidth
-/// under 1 Mbps, avoiding buffer bloat on constrained connections during
-/// the 5s warmup period when tier transitions are suppressed. The PID
-/// controller steps up to 720p/1080p if bandwidth permits, or steps
-/// down to 360p/240p if constrained.
+/// Starting at "medium" (480p/25fps/600kbps). The PID controller steps up
+/// toward higher resolutions when bandwidth allows, or down toward lower
+/// resolutions when the network is constrained.
 pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 
 /// Label of the video quality tier to use as camera ceiling during screen sharing.
@@ -185,11 +183,12 @@ pub fn screen_share_camera_ceiling_index() -> usize {
 
 /// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
 ///
-/// Screen share starts at "high" (1080p/10fps) — preserves source
-/// resolution from the first frame for readable text. Steps down to
-/// 720p if network conditions degrade. The floor stays at 720p to
-/// keep text readable even at minimum quality.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0; // "high"
+/// Starting at "medium" (720p/8fps/1200kbps) — the midpoint of the 3-tier
+/// screen-share ladder (indices 0–2) — gives new screen shares an acceptable
+/// baseline immediately. The PID controller then adapts in either direction:
+/// stepping up to 1080p when bandwidth is plentiful, or stepping down to
+/// 720p/5fps when the network is constrained.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 1; // "medium"
 
 // ---------------------------------------------------------------------------
 // Screen Share Quality Tiers
@@ -499,6 +498,60 @@ pub const KEYFRAME_BACKOFF_DECAY_MS: u64 = 30_000;
 pub const ENCODER_PLI_COOLDOWN_MS: f64 = 2000.0;
 
 // ---------------------------------------------------------------------------
+// Screen Share Initial Tier Selection
+// ---------------------------------------------------------------------------
+
+/// Select the starting screen-share quality tier given the available network signals.
+///
+/// # Signals
+/// - `rtt_ms`: Most-recent average server RTT, or `None` if unknown (e.g. first meeting
+///   before any RTT probes have completed, or WebSocket-only deployment).
+/// - `camera_tier_index`: Current camera AQ tier index (0 = full-HD, higher = degraded).
+///   Pass `None` if camera is not started (screen-only share).
+///
+/// # Returns
+/// An index into `SCREEN_QUALITY_TIERS` (0 = high/1080p, 1 = medium/720p, 2 = low).
+///
+/// # Failure mode — cold start
+/// When `rtt_ms` is `None` (first meeting, no prior probes) and the camera has not yet
+/// been degraded, this function returns 0 (high/1080p).  The PID loop will ramp down
+/// within a few seconds if the uplink cannot sustain 2500 kbps.  The "readable
+/// first-frame within 3 s" guarantee only applies when at least one signal is present.
+pub fn initial_screen_tier(rtt_ms: Option<f64>, camera_tier_index: Option<usize>) -> usize {
+    // Cold start: no signals available, default to optimistic high tier
+    if rtt_ms.is_none() && camera_tier_index.is_none() {
+        return 0; // high
+    }
+
+    // RTT-based thresholds
+    let rtt_poor = rtt_ms.map(|rtt| rtt >= RTT_POOR_MS).unwrap_or(false);
+    let rtt_fair = rtt_ms.map(|rtt| rtt >= RTT_FAIR_MS).unwrap_or(false);
+
+    // Camera tier degradation indicators
+    // Camera tiers: 0=full_hd, 1=hd_plus, 2=hd, 3=standard, 4=medium, 5=low, 6=very_low, 7=minimal
+    // Threshold: ≥3 (sd/low) means camera is already degraded
+    let camera_degraded = camera_tier_index.map(|idx| idx >= 3).unwrap_or(false);
+
+    // Decision table:
+    // RTT >= POOR (400ms)     → low (2)
+    // RTT >= FAIR (200ms)     → medium (1)
+    // RTT < FAIR, camera ≥ sd → medium (1)  (camera already degraded)
+    // RTT < FAIR, camera < sd → high (0)    (good conditions)
+    // RTT None, camera ≥ sd   → medium (1)  (camera signal only)
+    // RTT None, camera < sd   → high (0)    (camera signal only, optimistic)
+
+    if rtt_poor {
+        return 2; // low
+    }
+
+    if rtt_fair || camera_degraded {
+        return 1; // medium
+    }
+
+    0 // high
+}
+
+// ---------------------------------------------------------------------------
 // Reconnection
 // ---------------------------------------------------------------------------
 
@@ -568,6 +621,77 @@ pub const REELECTION_MIN_IMPROVEMENT_MS: f64 = 20.0;
 /// regardless of whether it is better. The connection is so degraded that any
 /// alternative is worth trying.
 pub const REELECTION_CATASTROPHIC_RTT_MS: f64 = 5000.0;
+
+/// Number of *consecutive* implausible-RTT discards on the active connection
+/// before treating sustained discards as a re-election trigger.
+///
+/// The plausibility filter (`RTT_SANITY_MAX_MS`) silently drops measurements
+/// when `recv - sent` is outside `[0, 10s]`. Without this watchdog the
+/// existing RTT-degradation detector is starved of samples, leaving the user
+/// stuck on a broken connection (see discussion #539, JRG_dirs incident:
+/// 255 implausible discards over 6 minutes due to server-side clock drift).
+///
+/// 10 is chosen so that, at the 1Hz post-election RTT probe rate, sustained
+/// discards trigger re-election after roughly 10 seconds of clock-drift /
+/// time-base brokenness — long enough to ride out transient one-shot anomalies
+/// (such as a single late ACK or a one-off NTP slew) but short enough to
+/// recover before users perceive the connection as dead.
+pub const REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD: u32 = 10;
+
+/// Freshness window (ms) for the old active connection when deciding whether
+/// to preserve it after total candidate failure.
+///
+/// When a re-election starts and ALL candidates fail before producing valid
+/// RTT measurements, we check whether the old active connection has had any
+/// inbound traffic (media packet, RTT echo, heartbeat ACK, or session-assigned
+/// frame) within this window. If yes, the candidates' failure is taken to be
+/// a transient relay-side outage and the old connection is preserved. If no,
+/// the old connection is presumed dead and the user is disconnected through
+/// the existing path.
+///
+/// 5 s is chosen because:
+/// - it is long enough to span a few server heartbeat intervals (the server
+///   sends data at >= 1 Hz when the call is active), so a healthy old
+///   connection is virtually guaranteed to register inbound traffic inside it
+/// - it is short enough that genuinely silent connections (server crash, NAT
+///   rebind, route flap on the live path) do NOT get preserved as ghosts
+/// - it matches the connection-lost callback's typical detection lag of
+///   1-3 s on degraded networks, leaving headroom for jitter
+pub const REELECTION_PRESERVATION_FRESHNESS_MS: f64 = 5_000.0;
+
+/// Delay (ms) before retrying a re-election after the old active connection
+/// has been preserved due to total candidate failure.
+///
+/// 30 s gives the relay time to recover from the kind of brief outage that
+/// caused both candidates to fail (the JRG_dirs Tony S1 incident on
+/// 2026-05-05 saw both candidates flame out in 14 ms, suggesting a
+/// short-lived relay-side event). Retrying too soon risks hitting the same
+/// outage; waiting too long delays moving off a degraded baseline.
+pub const REELECTION_PRESERVATION_RETRY_MS: u64 = 30_000;
+
+/// Delay (milliseconds) before checking whether a post-rebase re-election
+/// retry should fire.
+///
+/// When RTT has degraded but only one server is configured at the connection
+/// manager's level, the rebase path silently adapts the baseline to the new
+/// RTT instead of triggering re-election (because the only candidate would
+/// be the same already-degraded server). This timer schedules a re-evaluation
+/// 30 seconds later: if by then the URL list has expanded (e.g. the UI
+/// refilled it via `update_server_urls`) so a meaningful election is
+/// possible, the standard election machinery is invoked. The 30-second value
+/// is long enough to absorb transient relay-availability blips without
+/// cascading into a per-second retry storm on real-world networks.
+pub const POST_REBASE_RETRY_DELAY_MS: u64 = 30_000;
+
+/// Maximum number of consecutive post-rebase retry attempts before giving up.
+///
+/// Each attempt that finds the URL list still single-server schedules another
+/// retry at `POST_REBASE_RETRY_DELAY_MS`. Capping at 3 means total wall-clock
+/// retry coverage is ~90 seconds before the system stops polling — preventing
+/// unbounded background timers if the server-side condition never resolves.
+/// The counter is reset whenever a successful election or a manual
+/// reconnection lands so a fresh meeting session gets a fresh retry budget.
+pub const POST_REBASE_RETRY_MAX_ATTEMPTS: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Heartbeat & Polling
@@ -1049,6 +1173,84 @@ mod tests {
                     assert_ne!(label, other, "duplicate audio tier label: {}", label);
                 }
             }
+        }
+    }
+
+    // =====================================================================
+    // initial_screen_tier decision function
+    // =====================================================================
+
+    #[test]
+    fn initial_screen_tier_cold_start_returns_high() {
+        // No signals at all → optimistic high tier (existing behaviour unchanged).
+        assert_eq!(initial_screen_tier(None, None), 0);
+    }
+
+    #[test]
+    fn initial_screen_tier_good_rtt_good_camera_returns_high() {
+        // RTT well below FAIR threshold, camera not degraded → high tier.
+        assert_eq!(initial_screen_tier(Some(50.0), Some(1)), 0);
+        assert_eq!(initial_screen_tier(Some(RTT_GOOD_MS), Some(2)), 0);
+    }
+
+    #[test]
+    fn initial_screen_tier_fair_rtt_returns_medium() {
+        // RTT exactly at FAIR threshold → medium tier, regardless of camera.
+        assert_eq!(initial_screen_tier(Some(RTT_FAIR_MS), Some(0)), 1);
+        assert_eq!(initial_screen_tier(Some(RTT_FAIR_MS), None), 1);
+        // Above FAIR but below POOR → still medium.
+        assert_eq!(initial_screen_tier(Some(300.0), Some(1)), 1);
+    }
+
+    #[test]
+    fn initial_screen_tier_poor_rtt_returns_low() {
+        // RTT at or above POOR threshold → low tier regardless of camera.
+        assert_eq!(initial_screen_tier(Some(RTT_POOR_MS), Some(0)), 2);
+        assert_eq!(initial_screen_tier(Some(RTT_POOR_MS), None), 2);
+        assert_eq!(initial_screen_tier(Some(1000.0), Some(2)), 2);
+    }
+
+    #[test]
+    fn initial_screen_tier_degraded_camera_no_rtt_returns_medium() {
+        // Camera already at sd (3) or low (4) tier, RTT unknown → medium.
+        assert_eq!(initial_screen_tier(None, Some(3)), 1);
+        assert_eq!(initial_screen_tier(None, Some(4)), 1);
+    }
+
+    #[test]
+    fn initial_screen_tier_good_rtt_degraded_camera_returns_medium() {
+        // Good RTT but camera already degraded → conservative medium tier.
+        assert_eq!(initial_screen_tier(Some(50.0), Some(3)), 1);
+        assert_eq!(initial_screen_tier(Some(RTT_GOOD_MS), Some(4)), 1);
+    }
+
+    #[test]
+    fn initial_screen_tier_camera_only_not_degraded_returns_high() {
+        // Camera not degraded (tier ≤ 2), no RTT → high tier.
+        assert_eq!(initial_screen_tier(None, Some(0)), 0);
+        assert_eq!(initial_screen_tier(None, Some(2)), 0);
+    }
+
+    #[test]
+    fn initial_screen_tier_result_always_in_bounds() {
+        // Whatever inputs are given, result must be a valid SCREEN_QUALITY_TIERS index.
+        let cases = [
+            (None, None),
+            (Some(0.0), None),
+            (Some(RTT_FAIR_MS), Some(0)),
+            (Some(RTT_POOR_MS), Some(4)),
+            (Some(9999.0), Some(99)),
+        ];
+        for (rtt, cam) in cases {
+            let idx = initial_screen_tier(rtt, cam);
+            assert!(
+                idx < SCREEN_QUALITY_TIERS.len(),
+                "initial_screen_tier({:?}, {:?}) = {} is out of bounds (len={})",
+                rtt,
+                cam,
+                idx,
+                SCREEN_QUALITY_TIERS.len(),
+            );
         }
     }
 }

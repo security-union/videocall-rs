@@ -1442,13 +1442,13 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_new_for_screen_starts_at_highest_tier() {
+    fn test_new_for_screen_starts_at_midpoint_tier() {
         use crate::adaptive_quality_constants::{DEFAULT_SCREEN_TIER_INDEX, SCREEN_QUALITY_TIERS};
 
         let target_fps = Rc::new(AtomicU32::new(15));
         let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
 
-        // Should start at DEFAULT_SCREEN_TIER_INDEX (index 1, "medium")
+        // Should start at DEFAULT_SCREEN_TIER_INDEX (index 1, "medium" — midpoint of 3-tier ladder)
         assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
         assert_eq!(controller.current_video_tier().label, "medium");
 
@@ -1471,7 +1471,7 @@ mod tests {
         let target_fps = Rc::new(AtomicU32::new(30));
         let mut controller = EncoderBitrateController::new(1500, target_fps);
 
-        // Camera starts at DEFAULT_VIDEO_TIER_INDEX (the lowest/minimal tier).
+        // Camera starts at DEFAULT_VIDEO_TIER_INDEX (the "medium" tier, 480p).
         let initial_index = controller.video_tier_index();
         let ceiling = screen_share_camera_ceiling_index();
 

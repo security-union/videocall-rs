@@ -84,9 +84,14 @@ pub fn PreJoinSettingsCard(
             if is_owner {
                 h3 { class: "settings-card-title", "Meeting Options" }
             } else {
-                h3 { class: "settings-card-title", "Ready to join the meeting?" }
-                p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.9rem; margin-top: -0.5rem; margin-bottom: 0.5rem;",
-                    "Click the button below to join and start listening to others."
+                div { class: "join-meeting-header",
+                    h2 { class: "join-meeting-title",
+                        span { class: "join-meeting-title-text", "Join Meeting" }
+                        span { class: "join-meeting-id", "{meeting_id}" }
+                    }
+                    p { class: "join-meeting-subtitle",
+                        "Click the button to participate in the meeting."
+                    }
                 }
             }
 
@@ -203,7 +208,7 @@ pub fn PreJoinSettingsCard(
                                 }
                             }
                         }
-                        div { class: "settings-option-row",
+                        div { class: "settings-option-row", style: "opacity: 1;",
                             span { class: "settings-option-label", "End meeting when host leaves" }
                             div { class: "settings-option-controls",
                                 span {
@@ -252,7 +257,7 @@ pub fn PreJoinSettingsCard(
                                 }
                             }
                         }
-                        div { class: "settings-option-row",
+                        div { class: "settings-option-row", style: "opacity: 1;",
                             span { class: "settings-option-label", "Allow guests" }
                             div { class: "settings-option-controls",
                                 span {

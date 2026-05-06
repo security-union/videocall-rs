@@ -12,7 +12,7 @@
  */
 
 use crate::auth::{
-    check_session, get_user_profile, handle_not_authenticated, logout, redirect_not_authenticated,
+    check_session, get_user_profile, handle_not_authenticated, redirect_not_authenticated,
     UserProfile,
 };
 use crate::components::attendants::AttendantsComponent;
@@ -21,10 +21,12 @@ use crate::constants::{
     actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled, webtransport_host_base,
 };
 use crate::context::{
-    get_or_create_local_user_id, load_display_name_from_storage, resolve_transport_config,
-    save_display_name_to_storage, validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
+    email_to_display_name, get_or_create_local_user_id, is_guid_like,
+    load_display_name_from_storage, resolve_transport_config, save_display_name_to_storage,
+    validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
 };
 use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
+use crate::theme::color as theme_color;
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{VideoCallClient, VideoCallClientOptions};
@@ -111,7 +113,31 @@ pub fn MeetingPage(id: String) -> Element {
         if auth_done && oauth_enabled().unwrap_or(false) {
             wasm_bindgen_futures::spawn_local(async move {
                 if let Ok(profile) = get_user_profile().await {
-                    user_profile.set(Some(profile));
+                    if !profile.user_id.starts_with("anon-") {
+                        // Pre-fill the display name from the OAuth profile when the
+                        // field is still empty (e.g. direct navigation to meeting URL).
+                        if input_value_state().is_empty() {
+                            let display_name = if profile.name.contains('@') {
+                                email_to_display_name(&profile.name)
+                            } else if is_guid_like(&profile.name) {
+                                if profile.user_id.contains('@') {
+                                    email_to_display_name(&profile.user_id)
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                profile.name.clone()
+                            };
+                            if !display_name.is_empty() {
+                                if let Ok(valid_name) = validate_display_name(&display_name) {
+                                    save_display_name_to_storage(&valid_name);
+                                    display_name_ctx.0.set(Some(valid_name.clone()));
+                                    input_value_state.set(valid_name);
+                                }
+                            }
+                        }
+                        user_profile.set(Some(profile));
+                    }
                 }
             });
         }
@@ -226,10 +252,6 @@ pub fn MeetingPage(id: String) -> Element {
                                     current_user_id.set(Some(effective_user_id));
                                     let determined_host = response.host_display_name.clone();
                                     let determined_host_uid = response.host_user_id.clone();
-                                    let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
-                                    let aca = response.admitted_can_admit.unwrap_or(false);
-                                    let eohl = response.end_on_host_leave.unwrap_or(true);
-                                    let ag = response.allow_guests.unwrap_or(false);
                                     host_display_name.set(determined_host.clone());
                                     host_user_id.set(determined_host_uid.clone());
                                     match response.status.as_str() {
@@ -240,10 +262,11 @@ pub fn MeetingPage(id: String) -> Element {
                                                     host_display_name: determined_host,
                                                     host_user_id: determined_host_uid,
                                                     room_token: token,
-                                                    waiting_room_enabled: wr_enabled,
-                                                    admitted_can_admit: aca,
-                                                    end_on_host_leave: eohl,
-                                                    allow_guests: ag,
+                                                    waiting_room_enabled: response
+                                                        .waiting_room_enabled,
+                                                    admitted_can_admit: response.admitted_can_admit,
+                                                    end_on_host_leave: response.end_on_host_leave,
+                                                    allow_guests: response.allow_guests,
                                                 });
                                             } else {
                                                 meeting_status.set(MeetingStatus::Error(
@@ -300,6 +323,9 @@ pub fn MeetingPage(id: String) -> Element {
                 // Users waiting for the meeting to start must not hear audio
                 // from the active call.
                 decode_media: false,
+                // Observer client: short-lived, recovery is via meeting
+                // activation push, not re-election. No post-rebase retry.
+                allow_post_rebase_retry: false,
             };
 
             let mut client = VideoCallClient::new(opts);
@@ -310,22 +336,11 @@ pub fn MeetingPage(id: String) -> Element {
         });
     }
 
-    // Logout handler: navigate the browser to the meeting-api /logout endpoint
-    // so the server can clear the session cookie and redirect to the OIDC
-    // provider's end_session_endpoint when configured.  The navigator.push()
-    // call that was here previously is no longer needed — the browser will
-    // unload the page as soon as the navigation starts.
-    let on_logout = move |_| {
-        if let Err(e) = logout() {
-            log::error!("Logout navigation failed: {e}");
-        }
-    };
-
     // Early return for auth check
     if !auth_checked() && oauth_enabled().unwrap_or(false) {
         return rsx! {
-            div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
-                p { style: "color: white; font-size: 1rem;", "Checking authentication..." }
+            div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
+                p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;", "Checking authentication..." }
             }
         };
     }
@@ -365,10 +380,6 @@ pub fn MeetingPage(id: String) -> Element {
                                 None
                             }
                         });
-                        let wr_enabled = response.waiting_room_enabled.unwrap_or(true);
-                        let aca = response.admitted_can_admit.unwrap_or(false);
-                        let eohl = response.end_on_host_leave.unwrap_or(true);
-                        let ag = response.allow_guests.unwrap_or(false);
                         host_display_name.set(determined_host.clone());
                         host_user_id.set(determined_host_uid.clone());
                         match response.status.as_str() {
@@ -380,10 +391,10 @@ pub fn MeetingPage(id: String) -> Element {
                                         host_display_name: determined_host,
                                         host_user_id: determined_host_uid,
                                         room_token: token,
-                                        waiting_room_enabled: wr_enabled,
-                                        admitted_can_admit: aca,
-                                        end_on_host_leave: eohl,
-                                        allow_guests: ag,
+                                        waiting_room_enabled: response.waiting_room_enabled,
+                                        admitted_can_admit: response.admitted_can_admit,
+                                        end_on_host_leave: response.end_on_host_leave,
+                                        allow_guests: response.allow_guests,
                                     });
                                 } else {
                                     meeting_status.set(MeetingStatus::Error(
@@ -450,10 +461,6 @@ pub fn MeetingPage(id: String) -> Element {
         move |status: JoinMeetingResponse| {
             let determined_host = status.host_display_name.clone();
             let determined_host_uid = status.host_user_id.clone();
-            let wr_enabled = status.waiting_room_enabled.unwrap_or(true);
-            let aca = status.admitted_can_admit.unwrap_or(false);
-            let eohl = status.end_on_host_leave.unwrap_or(true);
-            let ag = status.allow_guests.unwrap_or(false);
             let token = status.room_token.unwrap_or_default();
             host_display_name.set(determined_host.clone());
             host_user_id.set(determined_host_uid.clone());
@@ -463,10 +470,10 @@ pub fn MeetingPage(id: String) -> Element {
                 host_display_name: determined_host,
                 host_user_id: determined_host_uid,
                 room_token: token,
-                waiting_room_enabled: wr_enabled,
-                admitted_can_admit: aca,
-                end_on_host_leave: eohl,
-                allow_guests: ag,
+                waiting_room_enabled: status.waiting_room_enabled,
+                admitted_can_admit: status.admitted_can_admit,
+                end_on_host_leave: status.end_on_host_leave,
+                allow_guests: status.allow_guests,
             });
         }
     };
@@ -521,7 +528,6 @@ pub fn MeetingPage(id: String) -> Element {
                     user_id: current_user_id()
                         .or_else(|| user_profile().as_ref().map(|p| p.user_id.clone()))
                         .or_else(|| Some(get_or_create_local_user_id())),
-                    on_logout: Some(EventHandler::new(on_logout)),
                     host_display_name: host_display_name.clone(),
                     host_user_id: host_user_id.clone(),
                     auto_join: should_auto_join,
@@ -619,9 +625,9 @@ pub fn MeetingPage(id: String) -> Element {
             (Some(_), MeetingStatus::Joining) => {
                 let display_name = maybe_username.as_deref().unwrap_or("...");
                 rsx! {
-                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                    div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                         div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                        p { style: "color: white; font-size: 1rem;",
+                        p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
                             "Joining as "
                             strong { "{display_name}" }
                             "..."
@@ -636,12 +642,12 @@ pub fn MeetingPage(id: String) -> Element {
                     // Show inline display name prompt instead of redirecting
                     rsx! {
                         div {
-                            style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                            style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                             div {
                                 class: "card-apple p-8",
                                 style: "max-width: 400px; width: 90%;",
                                 h2 {
-                                    style: "color: white; text-align: center; margin-bottom: 0.5rem;",
+                                    style: "color: {theme_color::TEXT_PRIMARY}; text-align: center; margin-bottom: 0.5rem;",
                                     "Enter your display name"
                                 }
                                 p {
@@ -689,9 +695,9 @@ pub fn MeetingPage(id: String) -> Element {
                     // Username is set; the auto-join effect will fire momentarily
                     let display_name = maybe_username.as_deref().unwrap_or("Unknown");
                     rsx! {
-                        div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000;",
+                        div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                             div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                            p { style: "color: white; font-size: 1rem;",
+                            p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
                                 "Joining as "
                                 strong { "{display_name}" }
                                 "..."

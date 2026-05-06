@@ -42,8 +42,9 @@ use crate::constants::{
 use crate::context::{
     load_appearance_settings_from_storage, resolve_transport_config,
     save_appearance_settings_to_storage, save_display_name_to_storage, validate_display_name,
-    AppearanceSettingsCtx, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    AppearanceSettingsCtx, CroppedTilesCtx, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime,
+    PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -57,17 +58,34 @@ use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
-    MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
-    PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+    ConnectionLostReason, MediaAccessKind, MediaDeviceAccess, MediaPermission,
+    MediaPermissionsErrorState, PermissionState, ScreenShareEvent, VideoCallClient,
+    VideoCallClientOptions,
 };
-use wasm_bindgen::{closure::Closure, JsCast};
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
     Idle,
+    /// The browser's screen picker is open (getDisplayMedia Promise in flight).
+    /// The button is disabled but we have NOT yet told Host to start encoding.
     Requesting,
+    /// A MediaStream has been pre-acquired and stored in the shared
+    /// [`PreAcquiredScreenStream`] cell.  Host should consume the stream and
+    /// begin encoding via `ScreenEncoder::start_with_stream()`.
+    StreamReady,
     Active,
 }
+
+/// Shared cell that holds a pre-acquired `MediaStream` from `getDisplayMedia()`.
+///
+/// Safari requires `getDisplayMedia()` to be called synchronously within a
+/// user-gesture handler.  The onclick handler obtains the stream and stores it
+/// here; the `Host` component takes it out and passes it to
+/// `ScreenEncoder::start_with_stream()`.
+pub type PreAcquiredScreenStream = Rc<RefCell<Option<web_sys::MediaStream>>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DockPosition {
@@ -85,6 +103,7 @@ impl DockPosition {
         }
     }
 
+    #[allow(dead_code)]
     fn next(self) -> Self {
         match self {
             DockPosition::Bottom => DockPosition::Left,
@@ -100,6 +119,9 @@ pub enum MediaErrorState {
     Other,
 }
 
+const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
+const SUBTLE_FOOTNOTE_TEXT_STYLE: &str = "font-size: 0.8rem; opacity: 0.7;";
+
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
     match err {
         MediaErrorState::NoDevice => rsx! {
@@ -110,7 +132,7 @@ fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
         },
         MediaErrorState::PermissionDenied => rsx! {
             p { " {device} is blocked in your browser." }
-            p { style: "front-size: 0.9rem; opacity: 0.8;",
+            p { style: "{SUBTLE_HELP_TEXT_STYLE}",
                 "Please click the lock icon in your browser's address bar and allow access if you want to use it."
             }
         },
@@ -118,8 +140,16 @@ fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
 }
 
 impl ScreenShareState {
+    /// Returns `true` when a stream is ready or actively encoding -- i.e. when
+    /// the `Host` component should have `share_screen = true`.
+    ///
+    /// `Requesting` (picker dialog open) intentionally returns `false` so that
+    /// `Host` does not start the encoder before a stream is available.
     pub fn is_sharing(&self) -> bool {
-        !matches!(self, ScreenShareState::Idle)
+        matches!(
+            self,
+            ScreenShareState::StreamReady | ScreenShareState::Active
+        )
     }
 }
 
@@ -451,7 +481,6 @@ pub fn AttendantsComponent(
     e2ee_enabled: bool,
     #[props(default)] user_name: Option<String>,
     #[props(default)] user_id: Option<String>,
-    #[props(default)] on_logout: Option<EventHandler<()>>,
     #[props(default)] host_display_name: Option<String>,
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] auto_join: bool,
@@ -689,6 +718,9 @@ pub fn AttendantsComponent(
     // up departed peers' histories. Provided as context alongside PeerStatusMap.
     let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
 
+    // Per-tile crop state — created early so on_peer_removed can clean up.
+    let cropped_tiles_signal: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
+
     // Read transport preference from context BEFORE use_hook (hooks must not
     // be called inside the hook closure).
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
@@ -787,9 +819,12 @@ pub fn AttendantsComponent(
             on_connection_lost: {
                 let id = id.clone();
                 let client_cell = client_for_reconnect.clone();
-                VcCallback::from(move |reason: wasm_bindgen::JsValue| {
-                    let reason_str = reason.as_string().unwrap_or_else(|| format!("{reason:?}"));
-                    log::warn!("DIOXUS-UI: Connection lost — reason: {reason_str}");
+                VcCallback::from(move |reason: ConnectionLostReason| {
+                    log::warn!(
+                        "DIOXUS-UI: Connection lost ({}): {}",
+                        reason.label(),
+                        reason.message()
+                    );
                     let mut connection_error = connection_error;
                     let meeting_ended_message = meeting_ended_message;
                     connection_error.set(Some("Connection lost, reconnecting...".to_string()));
@@ -851,6 +886,9 @@ pub fn AttendantsComponent(
                 speech_map.write().remove(&peer_id);
                 let mut jt_map = peer_join_time;
                 jt_map.write().remove(&peer_id);
+                let mut ct_map = cropped_tiles_signal;
+                ct_map.write().remove(&peer_id);
+                ct_map.write().remove(&format!("screen-share-{peer_id}"));
                 let mut v = peer_list_version;
                 v.set(v() + 1);
             })),
@@ -908,24 +946,20 @@ pub fn AttendantsComponent(
                     .await
                     {
                         Ok(status) => {
-                            let waiting_room_enabled = status.waiting_room_enabled.unwrap_or(true);
-                            if waiting_room_toggle() != waiting_room_enabled {
-                                waiting_room_toggle.set(waiting_room_enabled);
+                            if waiting_room_toggle() != status.waiting_room_enabled {
+                                waiting_room_toggle.set(status.waiting_room_enabled);
                             }
 
-                            let admitted_can_admit = status.admitted_can_admit.unwrap_or(false);
-                            if admitted_can_admit_toggle() != admitted_can_admit {
-                                admitted_can_admit_toggle.set(admitted_can_admit);
+                            if admitted_can_admit_toggle() != status.admitted_can_admit {
+                                admitted_can_admit_toggle.set(status.admitted_can_admit);
                             }
 
-                            let end_on_host_leave = status.end_on_host_leave.unwrap_or(true);
-                            if end_on_host_leave_toggle() != end_on_host_leave {
-                                end_on_host_leave_toggle.set(end_on_host_leave);
+                            if end_on_host_leave_toggle() != status.end_on_host_leave {
+                                end_on_host_leave_toggle.set(status.end_on_host_leave);
                             }
 
-                            let allow_guests = status.allow_guests.unwrap_or(false);
-                            if allow_guests_toggle() != allow_guests {
-                                allow_guests_toggle.set(allow_guests);
+                            if allow_guests_toggle() != status.allow_guests {
+                                allow_guests_toggle.set(status.allow_guests);
                             }
                         }
                         Err(e) => {
@@ -1084,12 +1118,49 @@ pub fn AttendantsComponent(
             )),
             // Full call participant: decode and play all inbound media.
             decode_media: true,
+            // Honour user transport preference: only allow the connection
+            // manager's post-rebase re-election retry when the user is on
+            // the default `Auto` mode. Manual `WebTransportOnly` /
+            // `WebSocketOnly` selections must not be overridden by an
+            // automatic retry — the single-candidate state in those modes is
+            // intentional, not a recoverable system condition.
+            allow_post_rebase_retry: transport_pref == TransportPreference::Auto,
         };
 
         let client = VideoCallClient::new(opts);
         *client_for_reconnect.borrow_mut() = Some(client.clone());
         client
     });
+
+    // Tear the VideoCallClient down synchronously when this component
+    // unmounts (Hangup button, browser back-nav, route push, route replace,
+    // tab close — every path Dioxus surfaces as a scope drop).
+    //
+    // The client is `Clone` and shares state through `Rc` handles. Several
+    // internal callbacks captured during `VideoCallClient::new` hold strong
+    // clones of the client (peer_decode_manager.send_packet,
+    // diagnostics.packet_handler, health_reporter's spawn_local future),
+    // forming `Rc` cycles that prevent `Inner` from ever dropping on its
+    // own. Without this hook an in-tab SPA route swap on the meeting page
+    // leaks the entire `VideoCallClient` — transports, encoders, atomics
+    // — for tens of seconds, until the server eventually tears the
+    // session down. That leak caused the cc7tp meeting incident on
+    // 2026-05-01 (UI panics, dropped media packets, ghost participant,
+    // spurious MEETING_ENDED broadcast).
+    //
+    // `disconnect()` is idempotent and safe to call even when the client
+    // never connected, and it kicks off async transport teardown via
+    // `ConnectionController::disconnect` while returning synchronously,
+    // so the next mount cannot race a still-running predecessor.
+    {
+        let client_for_drop = client.clone();
+        use_drop(move || {
+            log::info!("DIOXUS-UI: AttendantsComponent unmounted - disconnecting VideoCallClient");
+            if let Err(e) = client_for_drop.disconnect() {
+                log::warn!("DIOXUS-UI: VideoCallClient disconnect on unmount failed: {e}");
+            }
+        });
+    }
 
     let mda = use_hook(|| {
         let mut mda = MediaDeviceAccess::new();
@@ -1245,6 +1316,14 @@ pub fn AttendantsComponent(
         }
     });
 
+    // Shared cell for passing a pre-acquired screen share MediaStream from
+    // the click handler to the Host component.  Safari requires getDisplayMedia()
+    // to be called synchronously inside a user gesture, so we obtain the stream
+    // in the button onclick and hand it off to the encoder via this cell.
+    let pre_acquired_screen_stream: PreAcquiredScreenStream =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    use_context_provider(|| pre_acquired_screen_stream.clone());
+
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
     use_context_provider(|| peer_status_map);
@@ -1253,6 +1332,10 @@ pub fn AttendantsComponent(
     // (or create) their history entry. This survives PeerTile remounts caused
     // by layout switches (grid -> split when screen sharing starts).
     use_context_provider(|| peer_signal_history_map);
+
+    // Per-tile crop state — signal created early (near peer_status_map) so
+    // on_peer_removed can clean up; context provided here for child access.
+    use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
 
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
@@ -2109,7 +2192,7 @@ pub fn AttendantsComponent(
                                 class: "card-apple",
                                 style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
                                 h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                                p { style: "font-size: 0.9rem; opacity: 0.8;",
+                                p { style: "{SUBTLE_HELP_TEXT_STYLE}",
                                     "Share this meeting link with others you want in the meeting"
                                 }
                                 div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
@@ -2157,7 +2240,7 @@ pub fn AttendantsComponent(
                                         }
                                     }
                                 }
-                                p { style: "font-size: 0.8rem; opacity: 0.7;",
+                                p { style: "{SUBTLE_FOOTNOTE_TEXT_STYLE}",
                                     "People who use this meeting link must get your permission before they can join."
                                 }
                                 div {
@@ -2249,16 +2332,114 @@ pub fn AttendantsComponent(
                                         if !is_ios() {
                                             {
                                                 let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting);
+                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting | ScreenShareState::StreamReady);
                                                 rsx! {
                                                     ScreenShareButton {
                                                         active: is_active,
                                                         disabled: is_disabled,
-                                                        onclick: move |_| {
-                                                            if matches!(screen_share_state(), ScreenShareState::Idle) {
-                                                                screen_share_state.set(ScreenShareState::Requesting);
-                                                            } else {
-                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                        onclick: {
+                                                            let stream_cell = pre_acquired_screen_stream.clone();
+                                                            move |_| {
+                                                                if matches!(screen_share_state(), ScreenShareState::Idle) {
+                                                                    // Call getDisplayMedia synchronously within the user
+                                                                    // gesture (click) handler.  Safari rejects the call if
+                                                                    // it crosses an async boundary (spawn_local / Timeout).
+                                                                    // Obtaining the Promise is synchronous and satisfies the
+                                                                    // gesture requirement; only the await happens later.
+                                                                    let navigator = gloo_utils::window().navigator();
+                                                                    let media_devices = match navigator.media_devices() {
+                                                                        Ok(md) => md,
+                                                                        Err(e) => {
+                                                                            log::error!("Failed to get media devices: {e:?}");
+                                                                            return;
+                                                                        }
+                                                                    };
+
+                                                                    // Build constraints identical to those in ScreenEncoder::start()
+                                                                    let width_constraint = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &width_constraint,
+                                                                        &JsValue::from_str("ideal"),
+                                                                        &JsValue::from_f64(1920.0),
+                                                                    );
+                                                                    let height_constraint = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &height_constraint,
+                                                                        &JsValue::from_str("ideal"),
+                                                                        &JsValue::from_f64(1080.0),
+                                                                    );
+                                                                    let framerate_constraint = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &framerate_constraint,
+                                                                        &JsValue::from_str("ideal"),
+                                                                        &JsValue::from_f64(10.0),
+                                                                    );
+                                                                    let video_constraints = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &video_constraints,
+                                                                        &JsValue::from_str("width"),
+                                                                        &width_constraint.into(),
+                                                                    );
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &video_constraints,
+                                                                        &JsValue::from_str("height"),
+                                                                        &height_constraint.into(),
+                                                                    );
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &video_constraints,
+                                                                        &JsValue::from_str("frameRate"),
+                                                                        &framerate_constraint.into(),
+                                                                    );
+
+                                                                    let constraints = web_sys::DisplayMediaStreamConstraints::new();
+                                                                    constraints.set_video(&video_constraints.into());
+                                                                    constraints.set_audio(&JsValue::FALSE);
+
+                                                                    // This call happens synchronously in the click handler --
+                                                                    // the browser returns a Promise without rejecting.
+                                                                    let promise = match media_devices.get_display_media_with_constraints(&constraints) {
+                                                                        Ok(p) => p,
+                                                                        Err(e) => {
+                                                                            log::error!("getDisplayMedia failed synchronously: {e:?}");
+                                                                            return;
+                                                                        }
+                                                                    };
+
+                                                                    // Mark as requesting immediately so the button shows disabled
+                                                                    screen_share_state.set(ScreenShareState::Requesting);
+
+                                                                    // Now await the promise asynchronously -- this is fine,
+                                                                    // the gesture requirement was satisfied above.
+                                                                    let cell = stream_cell.clone();
+                                                                    wasm_bindgen_futures::spawn_local(async move {
+                                                                        match JsFuture::from(promise).await {
+                                                                            Ok(stream) => {
+                                                                                let media_stream: web_sys::MediaStream = stream.unchecked_into();
+                                                                                cell.borrow_mut().replace(media_stream);
+                                                                                // StreamReady causes is_sharing() to return true,
+                                                                                // which gives Host share_screen=true so it picks
+                                                                                // up the pre-acquired stream and starts encoding.
+                                                                                screen_share_state.set(ScreenShareState::StreamReady);
+                                                                            }
+                                                                            Err(e) => {
+                                                                                // User cancelled or browser denied
+                                                                                let is_cancel = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+                                                                                    .ok()
+                                                                                    .and_then(|v| v.as_string())
+                                                                                    .map(|n| n == "NotAllowedError")
+                                                                                    .unwrap_or(false);
+                                                                                if is_cancel {
+                                                                                    log::info!("User cancelled screen sharing");
+                                                                                } else {
+                                                                                    log::error!("getDisplayMedia rejected: {e:?}");
+                                                                                }
+                                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                                            }
+                                                                        }
+                                                                    });
+                                                                } else {
+                                                                    screen_share_state.set(ScreenShareState::Idle);
+                                                                }
                                                             }
                                                         },
                                                     }

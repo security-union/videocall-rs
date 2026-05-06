@@ -12,6 +12,8 @@ use std::collections::VecDeque;
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 
+use crate::theme::color as theme_color;
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -298,6 +300,12 @@ pub struct SignalInfo {
     pub history: Vec<SignalSample>,
     /// Meeting start time (Unix ms) for the chart X-axis reference.
     pub meeting_start_ms: f64,
+    /// Current transport string for this peer (`"webtransport"` |
+    /// `"websocket"` | `"unknown"`), as reported via the `peer_status`
+    /// diagnostics metric. `None` when no `peer_status` event has been
+    /// observed yet. Renders as a header badge in [`SignalQualityPopup`];
+    /// not part of the time-series chart.
+    pub transport: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +325,12 @@ pub struct SignalQualityPopupProps {
     /// Meeting start time (Unix ms). The X-axis is relative to this so all
     /// peers share the same time reference for easy comparison.
     meeting_start_ms: f64,
+    /// Current transport string (`"webtransport"` | `"websocket"` |
+    /// `"unknown"`) sourced from the `peer_status` diagnostics metric.
+    /// Rendered as a small WT/WS/em-dash badge in the popup header.
+    /// `None` is treated like `"unknown"` (em-dash).
+    #[props(default)]
+    transport: Option<String>,
     /// Called when the user dismisses the popup.
     on_close: EventHandler<()>,
 }
@@ -340,7 +354,17 @@ fn get_or_create_tooltip_el() -> web_sys::HtmlElement {
 }
 
 /// Show the tooltip at viewport coordinates with metric content.
-fn show_body_tooltip(x: f64, y: f64, time_str: &str, sample: &SignalSample) {
+#[allow(clippy::too_many_arguments)]
+fn show_body_tooltip(
+    x: f64,
+    y: f64,
+    time_str: &str,
+    sample: &SignalSample,
+    show_video: bool,
+    show_audio: bool,
+    show_screen: bool,
+    show_latency: bool,
+) {
     let el = get_or_create_tooltip_el();
     let style = el.style();
     style.set_property("left", &format!("{x:.0}px")).unwrap();
@@ -348,47 +372,95 @@ fn show_body_tooltip(x: f64, y: f64, time_str: &str, sample: &SignalSample) {
     style.set_property("display", "block").unwrap();
 
     let video_tier = infer_video_tier(&sample.video_resolution);
-    let video_line = if sample.video_resolution.is_empty() {
-        format!(
-            "<span style='color:#81C784'>Video: {:.1} fps | {:.0} kbps</span>",
-            sample.video_fps, sample.video_bitrate_kbps
-        )
-    } else if video_tier.is_empty() {
-        format!(
-            "<span style='color:#81C784'>Video: {} | {:.1} fps | {:.0} kbps</span>",
-            sample.video_resolution, sample.video_fps, sample.video_bitrate_kbps
-        )
+    let video_line = if show_video {
+        if sample.video_resolution.is_empty() {
+            format!(
+                "<span style='color:{}'>Video: {:.1} fps | {:.0} kbps</span>",
+                theme_color::SIGNAL_VIDEO,
+                sample.video_fps,
+                sample.video_bitrate_kbps
+            )
+        } else if video_tier.is_empty() {
+            format!(
+                "<span style='color:{}'>Video: {} | {:.1} fps | {:.0} kbps</span>",
+                theme_color::SIGNAL_VIDEO,
+                sample.video_resolution,
+                sample.video_fps,
+                sample.video_bitrate_kbps
+            )
+        } else {
+            format!(
+                "<span style='color:{}'>Video: {} ({}) | {:.1} fps | {:.0} kbps</span>",
+                theme_color::SIGNAL_VIDEO,
+                sample.video_resolution,
+                video_tier,
+                sample.video_fps,
+                sample.video_bitrate_kbps
+            )
+        }
     } else {
-        format!(
-            "<span style='color:#81C784'>Video: {} ({}) | {:.1} fps | {:.0} kbps</span>",
-            sample.video_resolution, video_tier, sample.video_fps, sample.video_bitrate_kbps
-        )
+        String::new()
     };
-    let audio_line = format!(
-        "<span style='color:#4FC3F7'>Audio: buf {:.0}ms | expand {:.0}\u{2030}</span>",
-        sample.audio_buffer_ms, sample.audio_expand_rate
-    );
-    let screen_line = if sample.screen_enabled {
+    let audio_line = if show_audio {
         format!(
-            "<br><span style='color:#CE93D8'>Screen: {:.1} fps | {:.0} kbps</span>",
-            sample.screen_fps, sample.screen_bitrate_kbps
+            "<span style='color:{}'>Audio: buf {:.0}ms | expand {:.0}\u{2030}</span>",
+            theme_color::SIGNAL_AUDIO,
+            sample.audio_buffer_ms,
+            sample.audio_expand_rate
         )
     } else {
         String::new()
     };
-    let latency_line = format!(
-        "<span style='color:#FF8A65'>Latency: {:.0} ms</span>",
-        sample.latency_ms
-    );
+    let screen_line = if show_screen && sample.screen_enabled {
+        format!(
+            "<span style='color:{}'>Screen: {:.1} fps | {:.0} kbps</span>",
+            theme_color::SIGNAL_SCREEN,
+            sample.screen_fps,
+            sample.screen_bitrate_kbps
+        )
+    } else {
+        String::new()
+    };
+    let latency_line = if show_latency {
+        format!(
+            "<span style='color:{}'>Server RTT: {:.0} ms</span>",
+            theme_color::SIGNAL_LATENCY,
+            sample.latency_ms
+        )
+    } else {
+        String::new()
+    };
 
-    el.set_inner_html(&format!(
-        "<div>Time: {time_str}</div>\
-         <div style='border-bottom:1px solid rgba(255,255,255,0.15);margin:2px 0'></div>\
-         <div>{video_line}</div>\
-         <div>{audio_line}</div>\
-         {screen_line}\
-         <div>{latency_line}</div>"
-    ));
+    let lines: Vec<String> = [
+        Some(format!(
+            "<div>Time: {time_str}</div><div style='border-bottom:1px solid {};margin:2px 0'></div>",
+            theme_color::TOOLTIP_DIVIDER
+        )),
+        if video_line.is_empty() {
+            None
+        } else {
+            Some(format!("<div>{video_line}</div>"))
+        },
+        if audio_line.is_empty() {
+            None
+        } else {
+            Some(format!("<div>{audio_line}</div>"))
+        },
+        if screen_line.is_empty() {
+            None
+        } else {
+            Some(format!("<div>{screen_line}</div>"))
+        },
+        if latency_line.is_empty() {
+            None
+        } else {
+            Some(format!("<div>{latency_line}</div>"))
+        },
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    el.set_inner_html(&lines.join(""));
 }
 
 fn infer_video_tier(resolution: &str) -> &'static str {
@@ -427,6 +499,15 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     let on_close = props.on_close;
     let popup_title = format!("Signal Quality - {}", props.peer_name);
 
+    // Derive the transport badge tuple once, before rsx, so we don't pay
+    // for repeated `String::as_str` / match work inside the rsx! macro
+    // during re-renders. Mirrors the diagnostics popup pattern.
+    let (transport_label, transport_class, transport_title) = match props.transport.as_deref() {
+        Some("webtransport") => ("WT", "connection-type type-webtransport", "WebTransport"),
+        Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
+        _ => ("\u{2014}", "connection-type", "Transport unknown"),
+    };
+
     // No Dioxus signal for tooltip — we manipulate a <body>-level DOM element
     // directly to escape all stacking contexts from grid-items.
     // Hide tooltip when this popup component unmounts.
@@ -459,13 +540,20 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                 class: "signal-quality-popup",
                 div { class: "popup-header",
                     span { class: "popup-title", "{popup_title}" }
-                    button {
-                        class: "popup-close",
-                        onclick: move |_| on_close.call(()),
-                        "X"
+                    div { class: "popup-header-actions",
+                        span {
+                            class: "{transport_class}",
+                            title: "{transport_title}",
+                            "{transport_label}"
+                        }
+                        button {
+                            class: "popup-close",
+                            onclick: move |_| on_close.call(()),
+                            "X"
+                        }
                     }
                 }
-                p { style: "color: #888; font-size: 12px;", "No data yet." }
+                p { style: "color: {theme_color::TEXT_SUBTLE}; font-size: 12px;", "No data yet." }
             }
         };
     }
@@ -579,10 +667,17 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
             onclick: move |e| e.stop_propagation(),
             div { class: "popup-header",
                 span { class: "popup-title", "{popup_title}" }
-                button {
-                    class: "popup-close",
-                    onclick: move |_| on_close.call(()),
-                    "X"
+                div { class: "popup-header-actions",
+                    span {
+                        class: "{transport_class}",
+                        title: "{transport_title}",
+                        "{transport_label}"
+                    }
+                    button {
+                        class: "popup-close",
+                        onclick: move |_| on_close.call(()),
+                        "X"
+                    }
                 }
             }
             div { class: "signal-chart-wrapper",
@@ -596,7 +691,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         text {
                             x: "28",
                             y: "{y}",
-                            fill: "#888",
+                            fill: "{theme_color::TEXT_SUBTLE}",
                             font_size: "9",
                             text_anchor: "end",
                             dominant_baseline: "middle",
@@ -609,6 +704,23 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                     class: "signal-chart-scroll",
                     id: "{scroll_id}",
                     style: "{visible_width_style}",
+                    onscroll: {
+                        let scroll_id = scroll_id.clone();
+                        move |_| {
+                            let doc = gloo_utils::document();
+                            if let Some(src) = doc.get_element_by_id(&scroll_id) {
+                                let scroll_left = src.scroll_left();
+                                let els = doc.get_elements_by_class_name("signal-chart-scroll");
+                                for i in 0..els.length() {
+                                    if let Some(el) = els.item(i) {
+                                        if el.id() != scroll_id {
+                                            el.set_scroll_left(scroll_left);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
                     svg {
                         xmlns: "http://www.w3.org/2000/svg",
                         width: "{chart_width_px}",
@@ -621,7 +733,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                                 y1: "{grid_y}",
                                 x2: "{chart_width_str}",
                                 y2: "{grid_y}",
-                                stroke: "rgba(255,255,255,0.1)",
+                                stroke: "{theme_color::SIGNAL_GRID_MAJOR}",
                                 stroke_width: "0.5",
                             }
                         }
@@ -641,16 +753,16 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                                 rsx! {
                                     line {
                                         x1: "{x}",
-                                        y1: "{y_bottom}",
+                                        y1: "{padding_top}",
                                         x2: "{x}",
-                                        y2: "{y_bottom:.0}",
-                                        stroke: "rgba(255,255,255,0.15)",
+                                        y2: "{y_bottom}",
+                                        stroke: "{theme_color::SIGNAL_GRID_MINOR}",
                                         stroke_width: "0.5",
                                     }
                                     text {
                                         x: "{x}",
                                         y: "{chart_height_str}",
-                                        fill: "#888",
+                                        fill: "{theme_color::TEXT_SUBTLE}",
                                         font_size: "8",
                                         text_anchor: "middle",
                                         "{label}"
@@ -663,7 +775,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             polyline {
                                 points: "{audio_points}",
                                 fill: "none",
-                                stroke: "#4FC3F7",
+                                stroke: "{theme_color::SIGNAL_AUDIO}",
                                 stroke_width: "1.5",
                                 stroke_linejoin: "round",
                             }
@@ -673,7 +785,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             polyline {
                                 points: "{video_points}",
                                 fill: "none",
-                                stroke: "#81C784",
+                                stroke: "{theme_color::SIGNAL_VIDEO}",
                                 stroke_width: "1.5",
                                 stroke_linejoin: "round",
                             }
@@ -683,7 +795,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             polyline {
                                 points: "{screen_points}",
                                 fill: "none",
-                                stroke: "#CE93D8",
+                                stroke: "{theme_color::SIGNAL_SCREEN}",
                                 stroke_width: "1.5",
                                 stroke_linejoin: "round",
                             }
@@ -693,10 +805,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             polyline {
                                 points: "{latency_points}",
                                 fill: "none",
-                                stroke: "#FF8A65",
-                                stroke_width: "1.5",
+                                stroke: "{theme_color::SIGNAL_LATENCY_DIM}",
+                                stroke_width: "1",
                                 stroke_linejoin: "round",
-                                stroke_dasharray: "4 2",
+                                stroke_dasharray: "3 6",
                             }
                         }
                     }
@@ -714,6 +826,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             div {
                                 style: "{overlay_style}",
                                 onmousemove: move |evt: MouseEvent| {
+                                    let v_audio = show_audio();
+                                    let v_video = show_video();
+                                    let v_screen = show_screen();
+                                    let v_latency = show_latency();
                                     let client = evt.client_coordinates();
                                     let elem = evt.element_coordinates();
                                     let time_offset_sec = elem.x / px_per_sec;
@@ -742,6 +858,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                                             client.y - 10.0,
                                             &time_str,
                                             sample,
+                                            v_video,
+                                            v_audio,
+                                            v_screen,
+                                            v_latency,
                                         );
                                     }
                                 },
@@ -761,7 +881,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                     text {
                         x: "2",
                         y: "{padding_top}",
-                        fill: "#888",
+                        fill: "{theme_color::TEXT_SUBTLE}",
                         font_size: "9",
                         dominant_baseline: "middle",
                         "{max_latency_str}"
@@ -769,7 +889,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                     text {
                         x: "2",
                         y: "{mid_latency_y}",
-                        fill: "#888",
+                        fill: "{theme_color::TEXT_SUBTLE}",
                         font_size: "9",
                         dominant_baseline: "middle",
                         "{mid_latency_str}"
@@ -777,7 +897,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                     text {
                         x: "2",
                         y: "{bottom_latency_y}",
-                        fill: "#888",
+                        fill: "{theme_color::TEXT_SUBTLE}",
                         font_size: "9",
                         dominant_baseline: "middle",
                         "0ms"
@@ -794,7 +914,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         checked: show_audio(),
                         onchange: move |_| show_audio.set(!show_audio()),
                     }
-                    span { class: "dot", style: "background: #4FC3F7;" }
+                    span { class: "dot", style: "background: {theme_color::SIGNAL_AUDIO};" }
                     "Audio"
                     button {
                         class: "legend-help-btn",
@@ -815,7 +935,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         checked: show_video(),
                         onchange: move |_| show_video.set(!show_video()),
                     }
-                    span { class: "dot", style: "background: #81C784;" }
+                    span { class: "dot", style: "background: {theme_color::SIGNAL_VIDEO};" }
                     "Video"
                     button {
                         class: "legend-help-btn",
@@ -837,7 +957,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             checked: show_screen(),
                             onchange: move |_| show_screen.set(!show_screen()),
                         }
-                        span { class: "dot", style: "background: #CE93D8;" }
+                        span { class: "dot", style: "background: {theme_color::SIGNAL_SCREEN};" }
                         "Screen"
                         button {
                             class: "legend-help-btn",
@@ -859,8 +979,8 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         checked: show_latency(),
                         onchange: move |_| show_latency.set(!show_latency()),
                     }
-                    span { class: "dot", style: "background: #FF8A65;" }
-                    "Latency"
+                    span { class: "dot", style: "background: {theme_color::SIGNAL_LATENCY};" }
+                    "Server RTT"
                     button {
                         class: "legend-help-btn",
                         onclick: move |_| {
@@ -923,12 +1043,13 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             }
                         },
                         "latency" => rsx! {
-                            strong { "Latency (RTT)" }
+                            strong { "Server RTT" }
                             p { "Round-trip time from your device to the relay server and back." }
+                            p { "This is the same value for all peers in your session — it measures your connection to the relay, not end-to-end latency to each peer." }
                             p {
                                 "Below 50ms is excellent. "
                                 "50\u{2013}150ms is acceptable. "
-                                "Above 200ms causes noticeable delay in the conversation."
+                                "Above 200ms causes noticeable delay."
                             }
                         },
                         _ => rsx! {},

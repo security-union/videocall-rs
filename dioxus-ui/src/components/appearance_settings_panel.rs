@@ -8,6 +8,7 @@ use crate::context::{
     load_custom_colors_from_storage, save_custom_colors_to_storage, AppearanceSettings,
     AppearanceSettingsCtx, GlowColor, MAX_CUSTOM_COLORS,
 };
+use crate::theme::color as theme_color;
 use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -276,7 +277,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                     }
                                     if input_error() {
                                         p {
-                                            style: "color: #ff4444; font-size: 0.75rem; margin-top: 0.25rem;",
+                                            style: "color: {theme_color::INPUT_ERROR}; font-size: 0.75rem; margin-top: 0.25rem;",
                                             "Invalid format - use #RRGGBB (e.g. #FF5500)"
                                         }
                                     }
@@ -353,11 +354,11 @@ pub fn AppearanceSettingsPanel() -> Element {
                         height: "56",
                         style: "pointer-events: none; flex-shrink: 0;",
                         // Background circle
-                        circle { cx: "28", cy: "28", r: "28", fill: "rgba(0,0,0,0.62)" }
+                        circle { cx: "28", cy: "28", r: "28", fill: "{theme_color::PREVIEW_AVATAR_RING}" }
                         // Head
-                        circle { cx: "28", cy: "21", r: "9", fill: "#3a3a3a" }
+                        circle { cx: "28", cy: "21", r: "9", fill: "{theme_color::PREVIEW_AVATAR_BG}" }
                         // Body / shoulders
-                        ellipse { cx: "28", cy: "42", rx: "15", ry: "10", fill: "#3a3a3a" }
+                        ellipse { cx: "28", cy: "42", rx: "15", ry: "10", fill: "{theme_color::PREVIEW_AVATAR_BG}" }
                     }
                 }
             }

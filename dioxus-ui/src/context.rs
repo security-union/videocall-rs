@@ -12,6 +12,11 @@ use dioxus::prelude::*;
 use dioxus_sdk_storage::{LocalStorage, StorageBacking};
 use videocall_client::VideoCallClient;
 
+/// Per-tile crop state: canvas ID → is-cropped.
+/// Survives re-renders caused by peer list changes so crop toggles persist.
+#[derive(Clone, Copy)]
+pub struct CroppedTilesCtx(pub Signal<std::collections::HashMap<String, bool>>);
+
 /// Wrapper for the display name signal used as context.
 #[derive(Clone, Copy)]
 pub struct DisplayNameCtx(pub Signal<Option<String>>);
@@ -480,20 +485,101 @@ impl std::str::FromStr for TransportPreference {
 pub struct TransportPreferenceCtx(pub Signal<TransportPreference>);
 
 const TRANSPORT_PREF_KEY: &str = "vc_transport_preference";
+const TRANSPORT_STICKY_KEY: &str = "vc_transport_sticky";
+const TRANSPORT_SESSION_KEY: &str = "vc_transport_session";
 
-/// Load the persisted transport preference from `localStorage`.
+/// Load the persisted transport preference, honouring the sticky flag.
+///
+/// Resolution order:
+///
+/// 1. **Sticky enabled** (`vc_transport_sticky == "true"`): read the
+///    persistent preference from `localStorage`. This is the explicit
+///    "remember my choice" path the user opted into via the Network tab.
+/// 2. **Sticky disabled**: any leftover `vc_transport_preference` is treated
+///    as stale data from older releases that wrote unconditionally — clear
+///    it for backward compatibility, then fall back to `sessionStorage`. The
+///    session value is set when the user changes the protocol without ticking
+///    "remember", so the change survives the page reload triggered by the
+///    select but is forgotten on tab close.
+/// 3. Otherwise: `Auto`.
 pub fn load_transport_preference() -> TransportPreference {
-    web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|storage| storage.get_item(TRANSPORT_PREF_KEY).ok().flatten())
+    let local_storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+    let session_storage = web_sys::window().and_then(|w| w.session_storage().ok().flatten());
+
+    let sticky = local_storage
+        .as_ref()
+        .and_then(|s| s.get_item(TRANSPORT_STICKY_KEY).ok().flatten())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    if sticky {
+        return local_storage
+            .as_ref()
+            .and_then(|s| s.get_item(TRANSPORT_PREF_KEY).ok().flatten())
+            .and_then(|val| val.parse::<TransportPreference>().ok())
+            .unwrap_or_default();
+    }
+
+    // Backward-compat: silently drop a stale persistent preference left over
+    // from before the sticky checkbox existed, so previous explicit choices
+    // do not "stick" surprise-style after the upgrade.
+    if let Some(storage) = local_storage.as_ref() {
+        let _ = storage.remove_item(TRANSPORT_PREF_KEY);
+    }
+
+    session_storage
+        .and_then(|s| s.get_item(TRANSPORT_SESSION_KEY).ok().flatten())
         .and_then(|val| val.parse::<TransportPreference>().ok())
         .unwrap_or_default()
 }
 
-/// Persist the transport preference to `localStorage`.
+/// Persist the transport preference to `localStorage` (the sticky path).
 pub fn save_transport_preference(pref: TransportPreference) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item(TRANSPORT_PREF_KEY, &pref.to_string());
+    }
+}
+
+/// Persist the transport preference to `sessionStorage` (the non-sticky path).
+///
+/// Used when the user changes the protocol without enabling "remember
+/// protocol choice" — the value must survive the page reload triggered by
+/// the change but should be discarded once the browsing session ends.
+pub fn save_transport_preference_session(pref: TransportPreference) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+        let _ = storage.set_item(TRANSPORT_SESSION_KEY, &pref.to_string());
+    }
+}
+
+/// Read whether the user has opted to remember the transport choice.
+pub fn load_transport_sticky() -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(TRANSPORT_STICKY_KEY).ok().flatten())
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Persist the sticky flag.
+pub fn save_transport_sticky(sticky: bool) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(TRANSPORT_STICKY_KEY, if sticky { "true" } else { "false" });
+    }
+}
+
+/// Reset all transport-preference storage entries — both the persistent
+/// (`localStorage`) keys and the per-session (`sessionStorage`) value — so
+/// the next page load resolves to `Auto`.
+///
+/// This is the single source of truth for "go back to Auto" so callers
+/// don't have to know about the three keys involved.
+pub fn clear_transport_sticky_and_pref() {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(TRANSPORT_STICKY_KEY);
+        let _ = storage.remove_item(TRANSPORT_PREF_KEY);
+    }
+    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+        let _ = storage.remove_item(TRANSPORT_SESSION_KEY);
     }
 }
 
@@ -516,13 +602,28 @@ pub fn resolve_transport_config(
 
 /// Handle a transport preference change from transport selection controls.
 ///
-/// Shows a confirmation dialog. If the user confirms, saves the preference and
-/// reloads the page. If cancelled, attempts to reset a native `<select>`
-/// control (when present) back to the current value so it doesn't appear stale.
+/// Shows a confirmation dialog. If the user confirms, persists the preference
+/// (sticky vs session-only depending on `sticky`) and reloads the page. If
+/// cancelled, attempts to reset a native `<select>` control (when present)
+/// back to the current value so it doesn't appear stale.
 ///
-/// Custom controls (like the settings modal glass dropdown) are state-driven and
-/// naturally re-render with the current value when the user cancels.
-pub fn confirm_transport_change(new_value: &str, current: TransportPreference, select_id: &str) {
+/// Routing rules:
+///
+/// - `Auto` selected: clear every transport-preference storage key. Auto is
+///   the implicit default and never needs to be remembered.
+/// - Non-Auto, `sticky == true`: write to `localStorage` so the choice
+///   persists across browser sessions.
+/// - Non-Auto, `sticky == false`: write to `sessionStorage` so the choice
+///   survives the imminent page reload but evaporates when the tab closes.
+///
+/// Custom controls (like the settings modal glass dropdown) are state-driven
+/// and naturally re-render with the current value when the user cancels.
+pub fn confirm_transport_change(
+    new_value: &str,
+    current: TransportPreference,
+    select_id: &str,
+    sticky: bool,
+) {
     use wasm_bindgen::JsCast;
 
     let pref = new_value.parse::<TransportPreference>().unwrap_or_default();
@@ -539,7 +640,14 @@ pub fn confirm_transport_change(new_value: &str, current: TransportPreference, s
         })
         .unwrap_or(false);
     if confirmed {
-        save_transport_preference(pref);
+        match pref {
+            TransportPreference::Auto => clear_transport_sticky_and_pref(),
+            _ if sticky => {
+                save_transport_preference(pref);
+                save_transport_sticky(true);
+            }
+            _ => save_transport_preference_session(pref),
+        }
         if let Some(w) = web_sys::window() {
             let _ = w.location().reload();
         }

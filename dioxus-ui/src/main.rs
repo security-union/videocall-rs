@@ -7,11 +7,13 @@ mod console_log_collector;
 mod constants;
 mod context;
 mod id_token;
+mod local_storage;
 pub mod meeting_api;
 mod pages;
 mod pkce;
 mod provider_config;
 mod routing;
+mod theme;
 mod types;
 
 use crate::components::search_modal::SearchVisibleCtx;

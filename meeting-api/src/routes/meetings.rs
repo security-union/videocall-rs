@@ -22,9 +22,13 @@ use axum::{
 };
 use rand::Rng;
 use videocall_meeting_types::{
-    requests::{CreateMeetingRequest, ListMeetingsQuery, UpdateMeetingRequest},
+    requests::{
+        CreateMeetingRequest, ListFeedQuery, ListJoinedMeetingsQuery, ListMeetingsQuery,
+        UpdateMeetingRequest,
+    },
     responses::{
-        APIResponse, CreateMeetingResponse, DeleteMeetingResponse, ListMeetingsResponse,
+        APIResponse, CreateMeetingResponse, DeleteMeetingResponse, JoinedMeetingSummary,
+        ListFeedResponse, ListJoinedMeetingsResponse, ListMeetingsResponse, MeetingFeedSummary,
         MeetingGuestInfoResponse, MeetingInfoResponse, MeetingSummary,
     },
 };
@@ -37,6 +41,12 @@ use crate::state::AppState;
 
 const MAX_ATTENDEES: usize = 100;
 const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]+$";
+
+/// Hard cap for `GET /api/v1/meetings/feed`. Meeting counts above this should
+/// be reached via the search modal (`GET /api/v1/meetings?q=...`) rather than
+/// expanding the home-feed payload — that endpoint is paginated and indexed
+/// for arbitrary search.
+const MAX_FEED_LIMIT: i64 = 200;
 
 fn validate_meeting_id(meeting_id: &str) -> Result<(), AppError> {
     if meeting_id.is_empty() {
@@ -133,7 +143,7 @@ pub async fn create_meeting(
     let response = CreateMeetingResponse {
         meeting_id: row.room_id,
         host: user_id,
-        created_at: row.created_at.timestamp(),
+        created_at: row.created_at.timestamp_millis(),
         state: row.state.unwrap_or_else(|| "idle".to_string()),
         attendees: body.attendees,
         has_password: password_hash.is_some(),
@@ -181,10 +191,10 @@ pub async fn list_meetings(
             host: row.creator_id.clone(),
             state: row.state.clone().unwrap_or_else(|| "idle".to_string()),
             has_password: row.password_hash.is_some(),
-            created_at: row.created_at.timestamp(),
+            created_at: row.created_at.timestamp_millis(),
             participant_count,
-            started_at: row.started_at.timestamp(),
-            ended_at: row.ended_at.map(|t| t.timestamp()),
+            started_at: row.started_at.timestamp_millis(),
+            ended_at: row.ended_at.map(|t| t.timestamp_millis()),
             waiting_count,
             waiting_room_enabled: row.waiting_room_enabled,
             admitted_can_admit: row.admitted_can_admit,
@@ -199,6 +209,131 @@ pub async fn list_meetings(
         limit,
         offset,
     })))
+}
+
+/// GET /api/v1/meetings/joined
+///
+/// Returns the most recent meetings the authenticated user has been admitted
+/// into, ordered by their last admission time descending. Includes meetings
+/// the user owns (which they always have a participant row for once they
+/// host-join) as well as meetings owned by others.
+///
+/// Query parameters:
+/// - `limit` (default 5, max 50, must be positive): how many rows to return.
+pub async fn list_joined_meetings(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Query(params): Query<ListJoinedMeetingsQuery>,
+) -> Result<Json<APIResponse<ListJoinedMeetingsResponse>>, AppError> {
+    // Reject negatives explicitly (per the API contract). A positive limit
+    // greater than 50 is silently clamped — that's the standard "be generous
+    // with input" behaviour the existing list endpoint also follows.
+    if params.limit < 1 {
+        return Err(AppError::invalid_input(
+            "limit must be a positive integer between 1 and 50",
+        ));
+    }
+    let limit = params.limit.min(50);
+
+    let rows = db_meetings::list_joined_by_user(&state.db, &user_id, limit).await?;
+
+    let mut meetings = Vec::with_capacity(rows.len());
+    // Note: participant_count / waiting_count are read after the main SELECT
+    // in separate queries, so they may reflect a slightly newer DB snapshot
+    // than `last_joined_at`. Acceptable for this advisory home-page surface.
+    for row in &rows {
+        let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
+        let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
+
+        meetings.push(JoinedMeetingSummary {
+            meeting_id: row.room_id.clone(),
+            state: row.state.clone().unwrap_or_else(|| "idle".to_string()),
+            started_at: row.started_at.timestamp_millis(),
+            ended_at: row.ended_at.map(|t| t.timestamp_millis()),
+            participant_count,
+            waiting_count,
+            has_password: row.password_hash.is_some(),
+            is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
+            created_at: row.created_at.timestamp_millis(),
+            last_joined_at: row.last_joined_at.timestamp_millis(),
+        });
+    }
+
+    let total = meetings.len() as i64;
+    Ok(Json(APIResponse::ok(ListJoinedMeetingsResponse {
+        meetings,
+        total,
+    })))
+}
+
+/// GET /api/v1/meetings/feed
+///
+/// Home-page meeting feed: returns meetings the authenticated user owns OR
+/// has been admitted into, deduplicated to one row per meeting and ordered
+/// by `last_active_at` descending (`m.id DESC` as tiebreaker).
+///
+/// Replaces the home page's prior use of `GET /api/v1/meetings` (which
+/// returned owned-or-joined meetings without an `is_owner` flag) and
+/// `GET /api/v1/meetings/joined` (admitted-only). With both lists collapsed
+/// into one feed where every row carries server-computed `is_owner`, the UI
+/// no longer has to infer ownership.
+///
+/// Query parameters:
+/// - `limit` (default 200, max 200, must be positive): how many rows to
+///   return. Datasets larger than 200 should be reached via the search
+///   modal (`GET /api/v1/meetings?q=...`).
+pub async fn list_feed(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Query(params): Query<ListFeedQuery>,
+) -> Result<Json<APIResponse<ListFeedResponse>>, AppError> {
+    if params.limit < 1 {
+        return Err(AppError::invalid_input(
+            "limit must be a positive integer between 1 and 200",
+        ));
+    }
+    let limit = params.limit.min(MAX_FEED_LIMIT);
+
+    let rows = db_meetings::list_feed_for_user(&state.db, &user_id, limit).await?;
+
+    let meetings = rows
+        .into_iter()
+        .map(|row| {
+            let state_str = row.state.clone().unwrap_or_else(|| "idle".to_string());
+            // `started_at` is set to NOW() at INSERT even when the meeting is
+            // still `idle`, so the raw column is meaningless for never-
+            // activated meetings. Surface `Some(started_at)` only when the
+            // meeting has actually been activated at some point — i.e.
+            // state has moved out of idle, or the meeting has ended.
+            // This mirrors the spec: "None if never activated".
+            let was_activated = state_str != "idle" || row.ended_at.is_some();
+            let started_at = if was_activated {
+                Some(row.started_at.timestamp_millis())
+            } else {
+                None
+            };
+
+            MeetingFeedSummary {
+                meeting_id: row.room_id,
+                state: state_str,
+                last_active_at: row.last_active_at.timestamp_millis(),
+                created_at: row.created_at.timestamp_millis(),
+                started_at,
+                ended_at: row.ended_at.map(|t| t.timestamp_millis()),
+                host: row.creator_id.clone(),
+                is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
+                participant_count: row.participant_count,
+                waiting_count: row.waiting_count,
+                has_password: row.password_hash.is_some(),
+                allow_guests: row.allow_guests,
+                waiting_room_enabled: row.waiting_room_enabled,
+                admitted_can_admit: row.admitted_can_admit,
+                end_on_host_leave: row.end_on_host_leave,
+            }
+        })
+        .collect();
+
+    Ok(Json(APIResponse::ok(ListFeedResponse { meetings })))
 }
 
 /// GET /api/v1/meetings/{meeting_id}
@@ -396,7 +531,25 @@ pub async fn update_meeting(
     search::spawn_repush(&state, row.id, row.room_id.clone());
 
     if settings_updated {
+        // Notify clients (REST refetch trigger).
         nats_events::publish_meeting_settings_updated(state.nats.as_ref(), &row.room_id).await;
+        // Notify every chat_server instance so its in-memory room_policy
+        // cache picks up the toggle without waiting for a host reconnect.
+        // This is the server-side counterpart that closes the
+        // cache-staleness bug where back-navigating after toggling
+        // `end_on_host_leave=false` still kicked everyone out.
+        let internal_payload = nats_events::MeetingSettingsUpdatePayload {
+            room_id: row.room_id.clone(),
+            end_on_host_leave: row.end_on_host_leave,
+            admitted_can_admit: row.admitted_can_admit,
+            waiting_room_enabled: row.waiting_room_enabled,
+            allow_guests: row.allow_guests,
+        };
+        nats_events::publish_internal_meeting_settings_update(
+            state.nats.as_ref(),
+            &internal_payload,
+        )
+        .await;
     }
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;

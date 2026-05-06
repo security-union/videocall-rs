@@ -57,6 +57,10 @@ pub enum DiagnosticEvent {
     SetReportingInterval(u64),
     HeartbeatTick, // New event for heartbeat
     SetPacketHandler(Callback<DiagnosticsPacket>),
+    /// Clear the packet handler. Used at session teardown to break the
+    /// `client -> diagnostics.packet_handler -> client` `Rc` cycle so the
+    /// underlying `Inner` can drop after a meeting page unmount.
+    ClearPacketHandler,
 }
 
 // Stats for a peer's decoder
@@ -326,6 +330,21 @@ impl DiagnosticManager {
         }
     }
 
+    /// Clear the packet handler so the diagnostics manager no longer holds a
+    /// reference to the [`VideoCallClient`](crate::VideoCallClient) clone
+    /// passed to it. Called from `VideoCallClient::disconnect()` to break the
+    /// `Rc` cycle that keeps `Inner` alive after the UI scope has dropped its
+    /// own client clones.
+    pub fn clear_packet_handler(&self) {
+        if let Err(e) = self
+            .sender
+            .clone()
+            .try_send(DiagnosticEvent::ClearPacketHandler)
+        {
+            error!("Failed to clear packet handler: {e}");
+        }
+    }
+
     // Set how often stats should be reported to the UI (in milliseconds)
     pub fn set_reporting_interval(&mut self, interval_ms: u64) {
         self.report_interval_ms = interval_ms;
@@ -463,6 +482,9 @@ impl DiagnosticWorker {
             }
             DiagnosticEvent::SetPacketHandler(callback) => {
                 self.packet_handler = Some(callback);
+            }
+            DiagnosticEvent::ClearPacketHandler => {
+                self.packet_handler = None;
             }
         }
     }

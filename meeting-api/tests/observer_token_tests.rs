@@ -381,9 +381,12 @@ async fn test_waiting_for_meeting_includes_waiting_room_enabled() {
 
     let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
     assert_eq!(body.result.status, "waiting_for_meeting");
+    // After the Option<bool> -> bool migration, the field is always present;
+    // assert the meeting actually has waiting-room enabled (the server-side
+    // flag this fixture set up at meeting creation).
     assert!(
-        body.result.waiting_room_enabled.is_some(),
-        "waiting_for_meeting response should include waiting_room_enabled"
+        body.result.waiting_room_enabled,
+        "waiting_for_meeting response should reflect waiting_room_enabled=true"
     );
 
     cleanup_test_data(&pool, room_id).await;

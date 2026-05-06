@@ -20,9 +20,6 @@ services:
       dockerfile: docker/Dockerfile.actix.dev
       context: ../
     working_dir: /app/actix-api
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
       - RUST_LOG=info

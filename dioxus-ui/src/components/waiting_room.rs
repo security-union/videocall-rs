@@ -233,6 +233,11 @@ pub fn WaitingRoom(
                 // Participants in the waiting room must not hear audio from
                 // the active call.
                 decode_media: false,
+                // Observer client: re-election machinery is only meaningful
+                // for full participants. Disable the post-rebase retry — the
+                // observer is short-lived and the user transitions out of it
+                // via admission, not via re-election.
+                allow_post_rebase_retry: false,
             };
 
             let mut client = VideoCallClient::new(opts);

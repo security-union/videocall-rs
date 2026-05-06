@@ -1118,6 +1118,13 @@ pub fn AttendantsComponent(
             )),
             // Full call participant: decode and play all inbound media.
             decode_media: true,
+            // Honour user transport preference: only allow the connection
+            // manager's post-rebase re-election retry when the user is on
+            // the default `Auto` mode. Manual `WebTransportOnly` /
+            // `WebSocketOnly` selections must not be overridden by an
+            // automatic retry — the single-candidate state in those modes is
+            // intentional, not a recoverable system condition.
+            allow_post_rebase_retry: transport_pref == TransportPreference::Auto,
         };
 
         let client = VideoCallClient::new(opts);

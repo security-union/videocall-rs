@@ -396,6 +396,8 @@ jobs:
             --set "env[13].value=videocall-session" \
             --set "env[14].name=SERVICE_VERSION_URLS" \
             --set "env[14].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
+            --set "env[15].name=TOKEN_TTL_SECS" \
+            --set-string "env[15].value=86400" \
             --set ingress.enabled=true \
             --set "ingress.hosts[0].host=api.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \

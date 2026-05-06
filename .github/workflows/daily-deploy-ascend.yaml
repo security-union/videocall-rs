@@ -407,6 +407,8 @@ jobs:
             --set-string "env[14].value=true" \
             --set "env[15].name=SERVICE_VERSION_URLS" \
             --set "env[15].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
+            --set "env[16].name=TOKEN_TTL_SECS" \
+            --set-string "env[16].value=86400" \
             --set resources.requests.cpu=100m \
             --set resources.requests.memory=128Mi \
             --set resources.limits.cpu=500m \

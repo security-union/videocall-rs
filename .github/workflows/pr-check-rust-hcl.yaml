@@ -1,0 +1,88 @@
+name: Rust Check (HCL)
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    paths:
+      - 'videocall-client/**'
+      - 'videocall-codecs/**'
+      - 'videocall-types/**'
+      - 'videocall-meeting-types/**'
+      - 'videocall-transport/**'
+      - 'videocall-diagnostics/**'
+      - 'dioxus-ui/**'
+      - 'neteq/**'
+      - 'protobuf/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+concurrency:
+  group: pr-check-rust-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  CARGO_HOME: /var/lib/ci/cargo
+  RUSTUP_HOME: /var/lib/ci/rustup
+  CARGO_INCREMENTAL: "0"
+  PATH: /var/lib/ci/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo fmt check
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    steps:
+      - uses: actions/checkout@v4
+      - name: clippy (native targets)
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo clippy --all -- -D warnings
+
+  wasm-check:
+    name: wasm32 check
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo check videocall-client (default features)
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo check --target wasm32-unknown-unknown -p videocall-client
+      - name: cargo check videocall-client (no-default-features)
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo check --target wasm32-unknown-unknown --no-default-features -p videocall-client
+      - name: cargo check dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo check --target wasm32-unknown-unknown -p videocall-ui
+
+  wasm-test:
+    name: wasm-pack tests
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    steps:
+      - uses: actions/checkout@v4
+      - name: wasm-pack test videocall-client
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cd videocall-client && wasm-pack test --node
+      - name: cargo test videocall-codecs
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cd videocall-codecs && cargo test
+      - name: cargo test neteq
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cd neteq && cargo test --no-default-features --features web

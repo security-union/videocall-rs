@@ -864,10 +864,20 @@ impl HealthReporter {
             pb.display_name = Some(display_name.to_string());
         }
 
-        // Include active connection info if available
-        if let Some(url) = active_server_url {
-            pb.active_server_url = url;
-        }
+        // Include active connection info if available.
+        //
+        // SECURITY: do NOT copy `active_server_url` into the protobuf. The lobby
+        // URL carries the user's room JWT (`?token=<JWT>&instance_id=<UUID>`),
+        // and HealthPacket is republished by the relay onto the NATS telemetry
+        // topic `health.diagnostics.{region}.{service_type}.{server_id}` — any
+        // health-pipeline consumer would receive the credential in cleartext.
+        // The `active_server_type` and `active_server_rtt_ms` fields below are
+        // sufficient for downstream observability; transport identity is
+        // additionally available via `active_connection_id` on the diagnostic
+        // bus (UI side). The proto field is left at its default empty string
+        // and is slated for deprecation in a follow-up PR.
+        // The `active_server_url` argument is intentionally swallowed here.
+        let _ = active_server_url;
         if let Some(typ) = active_server_type {
             pb.active_server_type = typ;
         }
@@ -1308,5 +1318,98 @@ impl HealthReporter {
         } else {
             None
         }
+    }
+}
+
+// ===================================================================
+// Security: HealthPacket credential-leak guard
+// ===================================================================
+//
+// These tests guard the JWT-leak fix on branch
+// `fix/security-redact-jwt-active-server-url`. A regression here means the
+// user's room JWT escapes the client over the NATS health pipeline.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protobuf::Message;
+    use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
+
+    /// Construct a `HealthPacket` via the production `create_health_packet`
+    /// path, passing a `Some(...)` URL containing a JWT, and assert that the
+    /// resulting protobuf has an empty `active_server_url` field.
+    ///
+    /// This test fails if anyone reintroduces `pb.active_server_url = url;` —
+    /// preventing accidental regression of the credential leak.
+    #[test]
+    fn health_packet_does_not_carry_active_server_url() {
+        // Seed `health_map` with at least one entry so `create_health_packet`
+        // does not early-return `None`.
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            Some(dirty_url.clone()), // active_server_url — must be ignored
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        // Round-trip the wrapper through the protobuf so we are asserting on
+        // exactly what goes on the wire, not an in-memory builder field.
+        let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf");
+
+        assert!(
+            pb.active_server_url.is_empty(),
+            "HealthPacket.active_server_url must be empty (no JWT leak); got {:?}",
+            pb.active_server_url
+        );
+        assert!(
+            !pb.active_server_url.contains("eyJ"),
+            "HealthPacket.active_server_url must not contain JWT-prefix `eyJ`"
+        );
+        assert!(
+            !pb.active_server_url.contains("token="),
+            "HealthPacket.active_server_url must not contain `token=`"
+        );
+
+        // Sanity: `active_server_type` and `active_server_rtt_ms` are still
+        // populated — the security fix must not break observability of
+        // transport identity and RTT.
+        assert_eq!(pb.active_server_type, "webtransport");
+        assert_eq!(pb.active_server_rtt_ms, 42.0);
     }
 }

@@ -189,6 +189,7 @@ pub struct VideoCallClientOptions {
 struct InnerOptions {
     enable_e2ee: bool,
     user_id: String,
+    display_name: String,
     on_peer_added: Callback<String>,
     on_meeting_info: Option<Callback<f64>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
@@ -339,6 +340,7 @@ impl VideoCallClient {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
                     user_id: options.user_id.clone(),
+                    display_name: options.display_name.clone(),
                     on_peer_added: options.on_peer_added.clone(),
                     on_meeting_ended: options.on_meeting_ended.clone(),
                     on_meeting_info: options.on_meeting_info.clone(),
@@ -1614,6 +1616,16 @@ impl Inner {
                     if let Ok(mut reporter) = hr.try_borrow_mut() {
                         reporter.set_session_id(response.session_id.to_string());
                     }
+                }
+
+                // Seed the display name cache so the local user's tile
+                // shows their display name instead of their user_id/email.
+                // The host never receives a PARTICIPANT_JOINED for themselves.
+                if !self.options.display_name.is_empty() {
+                    self.peer_decode_manager.set_peer_display_name(
+                        response.session_id,
+                        self.options.display_name.clone(),
+                    );
                 }
             }
             Ok(PacketType::MEETING) => match MeetingPacket::parse_from_bytes(&response.data) {

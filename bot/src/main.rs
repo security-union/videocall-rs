@@ -16,36 +16,29 @@
  * conditions.
  */
 
-mod audio_producer;
-mod config;
-mod costume_renderer;
-mod ekg_renderer;
-mod health_reporter;
-mod inbound_stats;
-mod token;
-mod transport;
-mod video_encoder;
-mod video_producer;
-mod websocket_client;
-mod webtransport_client;
-
-use audio_producer::AudioProducer;
-use config::{BotConfig, ClientConfig, Manifest, Transport, VideoMode};
-use costume_renderer::CostumeRenderer;
-use ekg_renderer::EkgRenderer;
-use health_reporter::{spawn_health_reporter, HealthReporterConfig};
-use inbound_stats::InboundStats;
+// All modules live in `src/lib.rs` so integration tests under `tests/`
+// can share code with the binary. The binary only pulls in what it needs.
+use bot::aq_controller::BotAq;
+use bot::audio_producer::AudioProducer;
+use bot::config::{self, BotConfig, ClientConfig, Manifest, Transport, VideoMode};
+use bot::costume_renderer::CostumeRenderer;
+use bot::ekg_renderer::{self, EkgRenderer};
+use bot::health_reporter::{spawn_health_reporter, HealthReporterConfig};
+use bot::inbound_stats::InboundStats;
+#[cfg(feature = "metrics")]
+use bot::metrics_server::{self, BotMetrics};
+use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
+use bot::transport::{self, OutboundFrame, TransportClient};
+use bot::video_producer::VideoProducer;
+use bot::websocket_client::spawn_heartbeat_producer;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
-use tracing::{error, info, warn};
-use transport::TransportClient;
-use video_producer::VideoProducer;
-use websocket_client::spawn_heartbeat_producer;
+use tracing::{debug, error, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -53,9 +46,59 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Bridge the `log` crate (used by videocall-aq and other upstream crates)
+    // into the tracing subscriber so AQ_STATUS / AQ_BITRATE_CHANGE / etc. show
+    // up in the bot's log output alongside tracing events.
+    if let Err(e) = tracing_log::LogTracer::init() {
+        warn!("tracing_log::LogTracer::init failed: {} — log::* events from dependencies will not appear", e);
+    }
+
     info!("Starting videocall synthetic client bot");
 
     let (config, num_users) = BotConfig::from_args()?;
+
+    // Bring up the Prometheus metrics endpoint first so bots coming online
+    // can publish their labels before the server starts accepting scrapes.
+    // Zero-cost compile-out when the `metrics` feature is off.
+    #[cfg(feature = "metrics")]
+    let metrics_handle: Option<Arc<BotMetrics>> = match config.metrics_port {
+        Some(port) => {
+            let registry = Arc::new(prometheus::Registry::new());
+            match BotMetrics::new(Arc::clone(&registry)) {
+                Ok(handle) => {
+                    // Default bind is loopback. Operators must pass
+                    // `--metrics-bind 0.0.0.0` (or a specific NIC IP)
+                    // explicitly to expose the endpoint on the network.
+                    let bind = config
+                        .metrics_bind
+                        .unwrap_or(metrics_server::DEFAULT_METRICS_BIND);
+                    metrics_server::start_server(Arc::clone(&registry), bind, port);
+                    info!("Prometheus metrics listening on {bind}:{port}/metrics");
+                    Some(handle)
+                }
+                Err(e) => {
+                    warn!("Failed to register bot metrics: {e} — metrics disabled");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "metrics"))]
+    {
+        if config.metrics_port.is_some() {
+            warn!(
+                "--metrics-port specified but the bot was built without `--features metrics`; \
+                 the endpoint will NOT be started"
+            );
+        }
+        if config.metrics_bind.is_some() {
+            warn!(
+                "--metrics-bind specified but the bot was built without `--features metrics`; \
+                 the flag has no effect"
+            );
+        }
+    }
     info!(
         "Config: ws_url={:?}, wt_url={:?}, wt_ratio={:?}, video_mode={:?}, \
          warmup={}s, broadcasters={}, JWT auth={}",
@@ -235,6 +278,21 @@ async fn main() -> anyhow::Result<()> {
         let audio_data = participant_audio.remove(&p.name).unwrap();
         let is_broadcaster = broadcaster_names.contains(p.name.as_str());
 
+        // Resolve network profile for this participant once, upfront, so
+        // invalid configs fail the whole run before we spawn transports.
+        let network_profile = config.resolve_network(p)?;
+        if !network_profile.is_passthrough() {
+            info!(
+                "[{}] network impairment: latency={}ms jitter={}ms loss={}% up={:?}kbps down={:?}kbps",
+                p.name,
+                network_profile.latency_ms,
+                network_profile.jitter_ms,
+                network_profile.loss_pct,
+                network_profile.uplink_kbps,
+                network_profile.downlink_kbps,
+            );
+        }
+
         info!(
             "Starting client {} ({}) - audio: {} samples, broadcaster: {}",
             index,
@@ -251,6 +309,9 @@ async fn main() -> anyhow::Result<()> {
         let cell = media_start_cell.clone();
         let ld = loop_duration;
         let total_bots = n;
+        let netprof = network_profile;
+        #[cfg(feature = "metrics")]
+        let metrics_for_bot = metrics_handle.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_client(
@@ -266,6 +327,9 @@ async fn main() -> anyhow::Result<()> {
                 index,
                 total_bots,
                 is_broadcaster,
+                netprof,
+                #[cfg(feature = "metrics")]
+                metrics_for_bot,
             )
             .await
             {
@@ -320,6 +384,8 @@ async fn run_client(
     bot_index: usize,
     total_bots: usize,
     is_broadcaster: bool,
+    network_profile: NetworkProfile,
+    #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
 ) -> anyhow::Result<()> {
     info!(
         "Initializing client: {} (broadcaster={})",
@@ -362,23 +428,161 @@ async fn run_client(
         }
     );
 
+    // Adaptive-quality controller, created before any producers so they can
+    // read the initial tier snapshot on start.
+    let aq = BotAq::with_default_clock();
+    #[cfg(feature = "metrics")]
+    if let Some(ref m) = metrics {
+        aq.set_metrics(
+            Arc::clone(m),
+            user_id.clone(),
+            client_config.meeting_id.clone(),
+        );
+    }
+
     // Shared inbound stats -- used by both the transport's inbound consumer
-    // and the health reporter for per-sender packet rate tracking.
+    // and the health reporter for per-sender packet rate tracking. We also
+    // wire the AQ controller here so incoming DIAGNOSTICS packets get fed
+    // straight into the PID loop.
     let stats = Arc::new(Mutex::new(InboundStats::default()));
+    {
+        let mut s = stats.lock().unwrap();
+        s.set_aq(aq.clone());
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = metrics {
+            s.set_metrics(
+                Arc::clone(m),
+                user_id.clone(),
+                client_config.meeting_id.clone(),
+            );
+        }
+    }
 
     // Shared is_speaking flag -- audio producer sets, heartbeat/video reads
     let is_speaking = Arc::new(AtomicBool::new(false));
 
+    // Construct the inbound shim (if any) before connecting, so the hook is
+    // installed as the transport comes up and we don't race the first packet.
+    let (inbound_hook, inbound_shim_task) = if network_profile.is_passthrough() {
+        (None, None)
+    } else {
+        let shim = NetSimShim::new(network_profile.clone(), Direction::Down);
+        #[cfg(feature = "metrics")]
+        let shim = match metrics.as_ref() {
+            Some(m) => shim.with_metrics(Arc::clone(m), user_id.clone()),
+            None => shim,
+        };
+        let shim = Arc::new(shim);
+        // Buffer of 2048 matches order-of-magnitude sizing used elsewhere —
+        // at 100 pkts/sec with up to a few seconds of queuing, this is safe
+        // without being large enough to cause unbounded memory growth.
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(2048);
+        let user_id_dn = user_id.clone();
+        let stats_dn = stats.clone();
+        let shim_dn = shim.clone();
+        let handle = tokio::spawn(run_inbound_shim(inbound_rx, shim_dn, stats_dn, user_id_dn));
+        let user_id_hook = user_id.clone();
+        #[cfg(feature = "metrics")]
+        let metrics_hook = metrics.clone();
+        let hook: transport::InboundHook = Arc::new(move |payload| {
+            if inbound_tx.try_send(payload).is_err() {
+                // Overflow means the shim task is behind; degrade to drop so
+                // we don't block the transport reader (that would create
+                // head-of-line blocking back into the transport read loop).
+                // Count the drop on a dedicated metric so silent inbound
+                // loss can't compound the netsim loss model, and rate-limit
+                // the warn! to avoid log-flooding under sustained overflow.
+                static INBOUND_QUEUE_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
+                let count = INBOUND_QUEUE_FULL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count.is_multiple_of(100) || count == 1 {
+                    warn!(
+                        "[{}] netsim inbound queue full; dropping payload (total: {})",
+                        user_id_hook, count
+                    );
+                }
+                #[cfg(feature = "metrics")]
+                if let Some(ref m) = metrics_hook {
+                    m.netsim_dropped_total
+                        .with_label_values(&[user_id_hook.as_str(), "down", "queue_full"])
+                        .inc();
+                }
+            }
+        });
+        (Some(hook), Some(handle))
+    };
+
     let mut client = TransportClient::new(&resolved_transport, client_config.clone());
     client
-        .connect(&lobby_url, insecure, stats.clone(), is_speaking.clone())
+        .connect(
+            &lobby_url,
+            insecure,
+            stats.clone(),
+            is_speaking.clone(),
+            inbound_hook,
+        )
         .await?;
 
-    // Create packet channel for media + heartbeat + health producers
-    let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(500);
+    // The transport-facing packet channel. This carries raw wire bytes ready
+    // to hand to the WebSocket/WebTransport sender. Producers upstream send
+    // `OutboundFrame`s (bytes + media-type tag); the shim/counting task
+    // below unwraps them and forwards `frame.bytes` here.
+    let (transport_tx, transport_rx) = mpsc::channel::<Vec<u8>>(500);
 
-    // Start packet sender task
-    client.start_packet_sender(packet_rx).await;
+    // Start packet sender task.
+    client.start_packet_sender(transport_rx).await;
+
+    // Outbound shim/counter task. We always splice in one task between
+    // producers (which emit `OutboundFrame`) and the transport sender
+    // (which consumes raw bytes), so the channel types don't need to be
+    // conditional on feature / passthrough state.
+    //
+    // In passthrough + no-metrics the task body is a tiny forward loop;
+    // with netsim enabled it applies the uplink impairment; with metrics
+    // enabled it also labels Prometheus counters using the pre-tagged
+    // `frame.kind` — no protobuf re-parse on the hot path.
+    let (packet_tx, packet_rx) = mpsc::channel::<OutboundFrame>(500);
+    let outbound_shim_task = if network_profile.is_passthrough() {
+        let user_id_out = user_id.clone();
+        let transport_tx_inner = transport_tx.clone();
+        #[cfg(feature = "metrics")]
+        let metrics_out = metrics.clone();
+        #[cfg(feature = "metrics")]
+        let meeting_out = client_config.meeting_id.clone();
+        let handle = tokio::spawn(run_outbound_passthrough(
+            packet_rx,
+            transport_tx_inner,
+            user_id_out,
+            #[cfg(feature = "metrics")]
+            metrics_out,
+            #[cfg(feature = "metrics")]
+            meeting_out,
+        ));
+        Some(handle)
+    } else {
+        let shim = NetSimShim::new(network_profile.clone(), Direction::Up);
+        #[cfg(feature = "metrics")]
+        let shim = match metrics.as_ref() {
+            Some(m) => shim.with_metrics(Arc::clone(m), user_id.clone()),
+            None => shim,
+        };
+        let shim = Arc::new(shim);
+        let user_id_up = user_id.clone();
+        #[cfg(feature = "metrics")]
+        let metrics_up = metrics.clone();
+        #[cfg(feature = "metrics")]
+        let meeting_up = client_config.meeting_id.clone();
+        let handle = tokio::spawn(run_outbound_shim(
+            packet_rx,
+            transport_tx,
+            shim,
+            user_id_up,
+            #[cfg(feature = "metrics")]
+            metrics_up,
+            #[cfg(feature = "metrics")]
+            meeting_up,
+        ));
+        Some(handle)
+    };
 
     // For WebSocket transport, heartbeats go through the shared mpsc channel
     let quit = Arc::new(AtomicBool::new(false));
@@ -410,6 +614,7 @@ async fn run_client(
         stats,
         packet_tx.clone(),
         quit.clone(),
+        aq.clone(),
     );
 
     // Wait for media start signal from main
@@ -434,10 +639,17 @@ async fn run_client(
             media_start,
             loop_duration,
             is_speaking.clone(),
+            aq.clone(),
         )?);
         info!("Audio producer started for {}", user_id);
 
-        // Start video producer
+        // Start video producer. The initial snapshot from `aq` already
+        // reflects the default tier; producers poll `aq.tier_epoch()` each
+        // iteration and re-snapshot on change.
+        let v0 = aq.snapshot_video();
+        let ekg_width = v0.max_width;
+        let ekg_height = v0.max_height;
+        let ekg_fps = v0.target_fps.max(1);
         let video_mode = &bot_config.video_mode;
         if *video_mode == VideoMode::Costume {
             if let Some(ref dir) = costume_dir {
@@ -449,17 +661,18 @@ async fn run_client(
                     media_start,
                     loop_duration,
                     is_speaking.clone(),
+                    aq.clone(),
                 )?);
                 info!("Costume video producer started for {} ({})", user_id, dir);
             } else {
-                // Costume mode but no costume_dir -- fall back to EKG
+                // Costume mode but no costume_dir -- fall back to EKG.
                 warn!(
                     "[{}] video_mode=costume but no costume_dir set, falling back to EKG",
                     user_id
                 );
-                let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, 15);
+                let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, ekg_fps);
                 let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
-                let renderer = EkgRenderer::new(ekg_color, 1280, 720);
+                let renderer = EkgRenderer::new(ekg_color, ekg_width, ekg_height);
                 _video_producer = Some(VideoProducer::from_ekg(
                     user_id.clone(),
                     renderer,
@@ -468,14 +681,15 @@ async fn run_client(
                     packet_tx.clone(),
                     media_start,
                     loop_duration,
+                    aq.clone(),
                 )?);
                 info!("EKG video producer started for {} (fallback)", user_id);
             }
         } else {
             // EKG mode
-            let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, 15);
+            let rms = ekg_renderer::compute_rms_per_frame(&audio_data, 48000, ekg_fps);
             let max_rms = rms.iter().copied().fold(0.0f32, f32::max).max(0.01);
-            let renderer = EkgRenderer::new(ekg_color, 1280, 720);
+            let renderer = EkgRenderer::new(ekg_color, ekg_width, ekg_height);
             _video_producer = Some(VideoProducer::from_ekg(
                 user_id.clone(),
                 renderer,
@@ -484,6 +698,7 @@ async fn run_client(
                 packet_tx.clone(),
                 media_start,
                 loop_duration,
+                aq.clone(),
             )?);
             info!("EKG video producer started for {}", user_id);
         }
@@ -505,8 +720,174 @@ async fn run_client(
     drop(_audio_producer);
     drop(_video_producer);
 
+    // Let shim tasks drain. They terminate when their input channel closes,
+    // which happens when the producer side is dropped (outbound) or the
+    // hook is dropped (inbound). A short timeout prevents hangs if a sleep
+    // is still in flight.
+    if let Some(h) = outbound_shim_task {
+        let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+    }
+    if let Some(h) = inbound_shim_task {
+        let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+    }
+
     info!("Client {} shut down cleanly", user_id);
     Ok(())
+}
+
+/// Outbound network-impairment task. Reads tagged [`OutboundFrame`]s from
+/// producers, applies the uplink [`NetSimShim`] to the underlying bytes, and
+/// forwards the bytes to the transport sender. Terminates when the producer
+/// side closes.
+///
+/// When the `metrics` feature is enabled, `bot_packets_sent_total` is
+/// incremented *before* the netsim shim makes its admission decision — the
+/// counter reflects what producers offered to the uplink, not what actually
+/// left the bot (drops are separately visible via `bot_netsim_dropped_total`).
+///
+/// The `media_type` Prometheus label comes directly from `frame.kind` — no
+/// protobuf re-parse, just a `&'static str` lookup.
+#[allow(clippy::too_many_arguments)]
+async fn run_outbound_shim(
+    mut rx: mpsc::Receiver<OutboundFrame>,
+    tx: mpsc::Sender<Vec<u8>>,
+    shim: Arc<NetSimShim>,
+    user_id: String,
+    #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
+    #[cfg(feature = "metrics")] meeting_id: String,
+) {
+    while let Some(frame) = rx.recv().await {
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = metrics {
+            m.packets_sent_total
+                .with_label_values(&[user_id.as_str(), meeting_id.as_str(), frame.kind.as_str()])
+                .inc();
+        }
+        let payload = frame.bytes;
+        let decision = shim.admit(payload.len());
+        match decision {
+            Admission::Pass => {
+                if tx.send(payload).await.is_err() {
+                    break;
+                }
+            }
+            Admission::Drop => {
+                debug!("[{}] netsim-up: dropped {}B", user_id, payload.len());
+            }
+            Admission::Delay(d) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let _ = tx.send(payload).await;
+                });
+            }
+            Admission::DelayAndDuplicate(d) => {
+                let tx_a = tx.clone();
+                let tx_b = tx.clone();
+                let p_copy = payload.clone();
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let _ = tx_a.send(payload).await;
+                });
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let _ = tx_b.send(p_copy).await;
+                });
+            }
+        }
+    }
+    info!("Outbound netsim shim stopped for {}", user_id);
+}
+
+/// Outbound passthrough task used when network impairment is disabled.
+/// Unwraps each [`OutboundFrame`] into raw bytes and forwards them to the
+/// transport sender. When the `metrics` feature is enabled and a metrics
+/// handle is present, it also increments `bot_packets_sent_total` using the
+/// frame's pre-tagged media-type label.
+#[allow(clippy::too_many_arguments)]
+async fn run_outbound_passthrough(
+    mut rx: mpsc::Receiver<OutboundFrame>,
+    tx: mpsc::Sender<Vec<u8>>,
+    user_id: String,
+    #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
+    #[cfg(feature = "metrics")] meeting_id: String,
+) {
+    // `user_id` is used by the final info! log line; on metrics builds it's
+    // also used as a Prometheus label. No dead-code warning either way.
+    while let Some(frame) = rx.recv().await {
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = metrics {
+            m.packets_sent_total
+                .with_label_values(&[user_id.as_str(), meeting_id.as_str(), frame.kind.as_str()])
+                .inc();
+        }
+        if tx.send(frame.bytes).await.is_err() {
+            break;
+        }
+    }
+    info!("Outbound passthrough stopped for {}", user_id);
+}
+
+/// Inbound network-impairment task. Receives payloads the transport readers
+/// delivered via the `InboundHook`, applies the downlink [`NetSimShim`], and
+/// (after any delay) hands the bytes to [`InboundStats::record_packet`].
+async fn run_inbound_shim(
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    shim: Arc<NetSimShim>,
+    stats: Arc<Mutex<InboundStats>>,
+    user_id: String,
+) {
+    while let Some(payload) = rx.recv().await {
+        let decision = shim.admit(payload.len());
+        match decision {
+            Admission::Pass => {
+                let mut s = stats.lock().unwrap();
+                s.record_packet(&user_id, &payload);
+            }
+            Admission::Drop => {
+                debug!("[{}] netsim-down: dropped {}B", user_id, payload.len());
+            }
+            Admission::Delay(d) => {
+                let stats = stats.clone();
+                let user_id = user_id.clone();
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let mut s = stats.lock().unwrap();
+                    s.record_packet(&user_id, &payload);
+                });
+            }
+            Admission::DelayAndDuplicate(d) => {
+                let stats_a = stats.clone();
+                let user_id_a = user_id.clone();
+                let stats_b = stats.clone();
+                let user_id_b = user_id.clone();
+                let p_copy = payload.clone();
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let mut s = stats_a.lock().unwrap();
+                    s.record_packet(&user_id_a, &payload);
+                });
+                tokio::spawn(async move {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                    let mut s = stats_b.lock().unwrap();
+                    s.record_packet(&user_id_b, &p_copy);
+                });
+            }
+        }
+    }
+    info!("Inbound netsim shim stopped for {}", user_id);
 }
 
 /// Load WAV file samples as normalized f32 PCM.

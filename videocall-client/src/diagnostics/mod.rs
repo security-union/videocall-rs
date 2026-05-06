@@ -16,9 +16,21 @@
  * conditions.
  */
 
-pub mod adaptive_quality_manager;
+/// Re-export shim for [`videocall_aq::manager`].
+///
+/// Preserves the `videocall_client::diagnostics::adaptive_quality_manager`
+/// import path for existing browser callers even though the code now lives
+/// in the sibling `videocall-aq` crate.
+pub mod adaptive_quality_manager {
+    pub use videocall_aq::manager::*;
+}
+
 pub mod diagnostics_manager;
-pub mod encoder_bitrate_controller;
+
+/// Re-export shim for [`videocall_aq::controller`].
+pub mod encoder_bitrate_controller {
+    pub use videocall_aq::controller::*;
+}
 
 // Re-export the modules
 pub use adaptive_quality_manager::AdaptiveQualityManager;

@@ -134,7 +134,7 @@ pub struct CameraEncoder {
     video_elem_id: String,
     state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
-    current_fps: Rc<AtomicU32>,
+    current_fps: Arc<AtomicU32>,
     on_encoder_settings_update: Callback<String>,
     on_error: Option<Callback<String>>,
     /// Tier-controlled max width. The encoding loop checks this and reconfigures
@@ -216,7 +216,7 @@ impl CameraEncoder {
             video_elem_id: video_elem_id.to_string(),
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
-            current_fps: Rc::new(AtomicU32::new(0)),
+            current_fps: Arc::new(AtomicU32::new(0)),
             on_encoder_settings_update,
             on_error: Some(on_error),
             tier_max_width: Rc::new(AtomicU32::new(default_tier.max_width)),
@@ -491,7 +491,7 @@ impl CameraEncoder {
     }
 
     /// Returns the encoder output FPS atomic.
-    pub fn shared_encoder_output_fps(&self) -> Rc<AtomicU32> {
+    pub fn shared_encoder_output_fps(&self) -> Arc<AtomicU32> {
         self.current_fps.clone()
     }
 

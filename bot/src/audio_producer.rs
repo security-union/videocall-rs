@@ -16,7 +16,12 @@
  * conditions.
  */
 
-use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
+use crate::aq_controller::BotAq;
+use crate::transport::{MediaTypeLabel, OutboundFrame};
+use opus::{
+    Application as OpusApp, Bitrate as OpusBitrate, Channels as OpusChannels,
+    Encoder as OpusEncoder,
+};
 use protobuf::Message;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -47,13 +52,15 @@ impl AudioProducer {
         Ok(Duration::from_millis(duration_ms))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         user_id: String,
         audio_data: Vec<f32>,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
+        aq: Arc<BotAq>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -68,6 +75,7 @@ impl AudioProducer {
                 media_start,
                 loop_duration,
                 is_speaking,
+                aq,
             ) {
                 error!("Audio producer error: {}", e);
             }
@@ -81,13 +89,15 @@ impl AudioProducer {
     }
 
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_wav_file(
         user_id: String,
         wav_path: &str,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
+        aq: Arc<BotAq>,
     ) -> anyhow::Result<Self> {
         info!("Loading WAV file for {}: {}", user_id, wav_path);
 
@@ -139,6 +149,7 @@ impl AudioProducer {
             media_start,
             loop_duration,
             is_speaking,
+            aq,
         )
     }
 
@@ -146,11 +157,12 @@ impl AudioProducer {
     fn audio_loop(
         user_id: String,
         audio_data: Vec<f32>,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
+        aq: Arc<BotAq>,
     ) -> anyhow::Result<()> {
         if audio_data.is_empty() {
             warn!("Audio producer for {} has no audio data, exiting", user_id);
@@ -171,11 +183,41 @@ impl AudioProducer {
             return Ok(());
         }
 
-        // Create Opus encoder
+        // Create Opus encoder seeded from the AQ controller's current audio tier.
+        let mut a = aq.snapshot_audio();
+        let mut last_epoch: u64 = aq.tier_epoch();
+
         let mut opus_encoder = OpusEncoder::new(sample_rate, OpusChannels::Mono, OpusApp::Voip)?;
+        // Apply initial AQ-derived settings.
+        if let Err(e) = opus_encoder.set_bitrate(OpusBitrate::Bits((a.bitrate_kbps * 1000) as i32))
+        {
+            warn!(
+                "[{}] audio AQ: failed to set initial bitrate {}kbps: {}",
+                user_id, a.bitrate_kbps, e
+            );
+        }
+        if let Err(e) = opus_encoder.set_inband_fec(a.fec) {
+            warn!(
+                "[{}] audio AQ: failed to set initial FEC={}: {}",
+                user_id, a.fec, e
+            );
+        }
+        // NOTE: the `opus` 0.3 crate does not expose `set_dtx`. Opus defaults
+        // to DTX=off at the codec level, and the software VAD below (RMS <
+        // 0.005 skip) already produces DTX-like behavior at the frame layer.
+        // When/if we upgrade to an opus crate that exposes OPUS_SET_DTX, the
+        // `a.dtx` field is already plumbed through and ready to use.
+        // TODO(bot-aq): plumb set_dtx once the opus bindings expose it.
         info!(
-            "Audio producer started for {} ({}Hz, {}ch, {}ms packets, DTX enabled)",
-            user_id, sample_rate, channels, 20
+            "Audio producer started for {} ({}Hz, {}ch, {}ms packets, AQ tier={}, {}kbps, fec={}, dtx={} [software-only])",
+            user_id,
+            sample_rate,
+            channels,
+            20,
+            aq.audio_tier_index(),
+            a.bitrate_kbps,
+            a.fec,
+            a.dtx,
         );
 
         // Global monotonic counter -- packet metadata needs strictly increasing
@@ -187,6 +229,38 @@ impl AudioProducer {
             if quit.load(Ordering::Relaxed) {
                 info!("Audio producer stopping for {}", user_id);
                 break;
+            }
+
+            // Cheap lock-free poll: only re-snapshot on a tier change.
+            let current_epoch = aq.tier_epoch();
+            if current_epoch != last_epoch {
+                let new_a = aq.snapshot_audio();
+                last_epoch = current_epoch;
+
+                if new_a.bitrate_kbps != a.bitrate_kbps {
+                    if let Err(e) = opus_encoder
+                        .set_bitrate(OpusBitrate::Bits((new_a.bitrate_kbps * 1000) as i32))
+                    {
+                        warn!(
+                            "[{}] audio AQ: failed to update bitrate to {}kbps: {}",
+                            user_id, new_a.bitrate_kbps, e
+                        );
+                    }
+                }
+                if new_a.fec != a.fec {
+                    if let Err(e) = opus_encoder.set_inband_fec(new_a.fec) {
+                        warn!(
+                            "[{}] audio AQ: failed to update FEC to {}: {}",
+                            user_id, new_a.fec, e
+                        );
+                    }
+                }
+                // DTX flag tracked but not applied (see note above).
+                info!(
+                    "[{}] audio AQ: tier change bitrate {}->{}kbps, fec {}->{} (dtx {}->{})",
+                    user_id, a.bitrate_kbps, new_a.bitrate_kbps, a.fec, new_a.fec, a.dtx, new_a.dtx,
+                );
+                a = new_a;
             }
 
             // Position within the loop, derived from shared media clock.
@@ -261,9 +335,11 @@ impl AudioProducer {
                         ..Default::default()
                     };
 
-                    // Send packet
+                    // Send packet — tagged `Audio` so the outbound shim can
+                    // label metrics without re-parsing the wrapper.
                     let packet_data = packet_wrapper.write_to_bytes()?;
-                    if let Err(_e) = packet_sender.try_send(packet_data) {
+                    let frame = OutboundFrame::new(MediaTypeLabel::Audio, packet_data);
+                    if let Err(_e) = packet_sender.try_send(frame) {
                         static AUDIO_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                         let count = AUDIO_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                         if count % 100 == 1 {

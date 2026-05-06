@@ -15,6 +15,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Makefile'
+      - '.github/workflows/pr-check-backend-hcl.yaml'
 
 concurrency:
   group: pr-check-backend-${{ github.event.pull_request.number }}
@@ -37,8 +38,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clean stale Docker resources
-        run: docker system prune -f --volumes || true
+      # Isolate this runner's docker compose project from the other 3 runners
+      # on the same host. Without this, parallel jobs share the same
+      # `docker_default` network and `docker-postgres-1`/`docker-nats-1`
+      # containers, which causes "network docker_default not found" and
+      # "container name already in use" races.
+      #
+      # Set via $GITHUB_ENV (not job-level `env:`) because `${{ runner.name }}`
+      # isn't resolved at job-level — only after runner assignment, i.e. at
+      # step time. A job-level reference causes a workflow startup_failure.
+      - name: Set compose project name
+        run: echo "COMPOSE_PROJECT_NAME=vc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+
+      - name: Tear down any prior project state for this runner
+        # Scoped to this runner's project only — does NOT prune other runners'
+        # resources, which `docker system prune --volumes` used to do and which
+        # caused concurrent jobs to lose their networks mid-run.
+        run: docker compose -f docker/docker-compose.integration.yaml down -v --remove-orphans || true
 
       - name: Run backend tests
         env:

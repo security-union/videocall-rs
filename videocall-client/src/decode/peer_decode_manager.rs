@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Display, sync::Arc};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::media_packet::{MediaPacket, TransportType};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -283,6 +283,11 @@ pub struct Peer {
     pub screen_enabled: bool,
     pub is_speaking: bool,
     pub audio_level: f32,
+    /// Most recently observed transport this peer is connected over
+    /// (announced via HeartbeatMetadata). Defaults to UNKNOWN until the
+    /// first heartbeat arrives or if the peer is on an older client that
+    /// does not populate the field.
+    pub transport_type: TransportType,
     pub display_name: Option<String>,
     /// Server-vouched guest indicator, sourced from the authenticated JWT
     /// `is_guest` claim and broadcast on `PARTICIPANT_JOINED`.
@@ -348,6 +353,7 @@ impl Peer {
             screen_enabled: false,
             is_speaking: false,
             audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
             display_name: None,
             is_guest,
             visible: false,
@@ -429,6 +435,11 @@ impl Peer {
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
     /// can update peer tiles.
     fn broadcast_peer_status(&self) {
+        let transport_str = match self.transport_type {
+            TransportType::TRANSPORT_WEBTRANSPORT => "webtransport",
+            TransportType::TRANSPORT_WEBSOCKET => "websocket",
+            TransportType::TRANSPORT_UNKNOWN => "unknown",
+        };
         let evt = DiagEvent {
             subsystem: "peer_status",
             stream_id: None,
@@ -449,6 +460,7 @@ impl Peer {
                 ),
                 metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
                 metric!("audio_level", self.audio_level as f64),
+                metric!("peer_transport", transport_str.to_string()),
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -632,6 +644,13 @@ impl Peer {
                     if !metadata.is_speaking {
                         self.audio_level = 0.0;
                     }
+                    // Capture peer's announced transport. Unknown enum
+                    // values (e.g., from a future client) decay to
+                    // TRANSPORT_UNKNOWN rather than crashing.
+                    self.transport_type = metadata
+                        .transport_type
+                        .enum_value()
+                        .unwrap_or(TransportType::TRANSPORT_UNKNOWN);
 
                     // Flush video decoder when video is turned off
                     if video_turned_off {

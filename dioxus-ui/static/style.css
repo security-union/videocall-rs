@@ -4216,6 +4216,40 @@ select {
   font-size: 14px;
   font-weight: 600;
 }
+/* Right-aligned cluster: transport badge + close button. Splitting them out
+ * keeps the title-vs-controls layout intact (title left, controls right)
+ * regardless of badge width. */
+.signal-quality-popup .popup-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+/* Transport badge in the signal-quality popup header.
+ * Mirrors the diagnostics popup (`diagnostics_cm_styles.css`) so the WT/WS pill
+ * looks identical in both surfaces. The diagnostics popup ships its CSS as an
+ * inline `<style>` block scoped to that modal, so this duplicates the same
+ * three rules at global scope to make the classes available wherever the badge
+ * is reused. */
+.signal-quality-popup .connection-type {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+}
+.signal-quality-popup .type-websocket {
+  background: #1c1c1e;
+  color: #0a84ff;
+  border: 1px solid #38383a;
+}
+.signal-quality-popup .type-webtransport {
+  background: #1c1c1e;
+  color: #0a84ff;
+  border: 1px solid #38383a;
+}
 .signal-quality-popup .popup-close {
   background: none;
   border: none;

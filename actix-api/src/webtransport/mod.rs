@@ -1705,6 +1705,7 @@ mod tests {
             "wt-jwt-room-1",
             true,
             "Alice",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1729,6 +1730,7 @@ mod tests {
             "wt-jwt-room-2",
             false,
             "Alice",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1751,6 +1753,7 @@ mod tests {
             "wt-jwt-room-3",
             false,
             "Alice",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1784,6 +1787,7 @@ mod tests {
             "wt-special-room",
             false,
             "Bob",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1840,6 +1844,7 @@ mod tests {
             room,
             true,
             "Host",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate host token");
@@ -1851,6 +1856,7 @@ mod tests {
             room,
             false,
             "Attendee",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate attendee token");

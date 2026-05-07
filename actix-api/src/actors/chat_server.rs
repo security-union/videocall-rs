@@ -2211,6 +2211,8 @@ mod tests {
             false,
             None, // no instance_id
             "websocket",
+            false, // is_host
+            false, // end_on_host_leave
         );
 
         let session2 = SessionLogic::new(
@@ -2225,6 +2227,8 @@ mod tests {
             false,
             None, // no instance_id
             "websocket",
+            false, // is_host
+            false, // end_on_host_leave
         );
 
         // Verify they have different session IDs
@@ -4259,6 +4263,8 @@ mod tests {
                 is_guest: false,
                 observer: false,
                 instance_id: Some(instance_id.clone()),
+                is_host: false,
+                end_on_host_leave: false,
             })
             .await
             .expect("Message delivery should succeed");
@@ -4348,6 +4354,8 @@ mod tests {
                 is_guest: false,
                 observer: false,
                 instance_id: Some(instance_id.clone()),
+                is_host: false,
+                end_on_host_leave: false,
             })
             .await
             .expect("JoinRoom should succeed")
@@ -4431,6 +4439,8 @@ mod tests {
                 is_guest: false,
                 observer: false,
                 instance_id: Some(instance_id.clone()),
+                is_host: false,
+                end_on_host_leave: false,
             })
             .await
             .expect("JoinRoom should succeed")
@@ -4514,6 +4524,8 @@ mod tests {
                 is_guest: false,
                 observer: false,
                 instance_id: Some(instance_id.clone()),
+                is_host: false,
+                end_on_host_leave: false,
             })
             .await
             .expect("JoinRoom should succeed")

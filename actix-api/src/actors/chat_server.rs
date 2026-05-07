@@ -4095,15 +4095,8 @@ mod tests {
     // joins (user "alice", instance_id="inst-tab2"). Both should coexist
     // in room_members because different instance_ids mean different
     // browser tabs / devices.
-    //
-    // CURRENTLY FAILING — pre-existing runtime bug from PR #564 (bot AQ +
-    // netsim) surfaced once PR #573 unblocked the cargo test suite. See
-    // tracking issue 574 for the root-cause investigation. Marked
-    // `#[ignore]` so unrelated PRs (Phase 4 / F4 / Phase 5 / etc.) can
-    // pass CI; the test will be re-enabled by the issue 574 fix PR.
     #[actix_rt::test]
     #[serial]
-    #[ignore = "Pre-existing PR 564 fallout — tracking issue 574"]
     async fn test_multi_device_safe_coexistence() {
         // Policy: "latest joiner wins". Even with different instance_ids,
         // same (room, user_id) collapses to one session. The server cannot

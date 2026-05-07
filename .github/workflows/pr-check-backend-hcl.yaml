@@ -65,3 +65,7 @@ jobs:
       - name: Teardown
         if: always()
         run: make tests_down
+
+      - name: Fix workspace ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" . || true

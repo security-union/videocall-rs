@@ -214,7 +214,27 @@ async fn join_as_attendee(
     let is_host = meeting.creator_id.as_deref() == Some(user_id);
     let current_state = meeting.state.as_deref().unwrap_or("idle");
     if current_state != "active" {
-        if !meeting.waiting_room_enabled {
+        // Three independent gates must all pass before a non-host joiner may
+        // activate (or re-activate) the meeting:
+        //
+        // 1. !waiting_room_enabled — when a waiting room is present, only the
+        //    host may start the meeting; attendees queue up instead.
+        //
+        // 2. !is_guest — guests are unauthenticated callers who received their
+        //    `guest:{uuid}` identity from us at join time.  Allowing them to
+        //    activate meetings would let anyone manufacture an arbitrary number
+        //    of concurrent sessions without any account, bypassing rate limits
+        //    and usage controls (abuse / resource exhaustion vector).
+        //
+        // 3. current_state != "ended" || !end_on_host_leave — when the host
+        //    explicitly configured the session to end on their departure
+        //    (`end_on_host_leave=true`) we honour that policy by keeping the
+        //    meeting in the `ended` state.  Only meetings where the host opted
+        //    into "keep going after I leave" may be re-opened by a non-host.
+        let can_auto_activate = !meeting.waiting_room_enabled
+            && !is_guest
+            && (current_state != "ended" || !meeting.end_on_host_leave);
+        if can_auto_activate {
             // No waiting room: auto-activate the meeting and admit
             // a non-host joiner so they can wait inside the call.
             db_meetings::activate(&state.db, meeting.id).await?;
@@ -298,9 +318,32 @@ async fn join_as_attendee(
         };
         return Ok(Json(APIResponse::ok(resp)));
     }
-    // Folding this check into the transaction closes the TOCTOU window where
-    // concurrent requests could both pass an out-of-transaction host-status read.
-    let check_creator = if !meeting.end_on_host_leave && !meeting.admitted_can_admit {
+    // Build the optional host-presence guard that is forwarded into the
+    // join_attendee transaction.
+    //
+    // Rationale for the three conditions:
+    //
+    // • waiting_room_enabled — the host-presence check only makes sense when
+    //   there IS a waiting room.  When WR is off, admission is self-service:
+    //   a joiner is auto-admitted without any host interaction, so requiring
+    //   the host to be present would incorrectly block legitimate joins.  This
+    //   is the key change vs. the original guard, which did not account for
+    //   the self-service path.
+    //
+    // • !admitted_can_admit — if admitted participants can admit others then a
+    //   host substitute is available even when the host has left; no guard
+    //   needed.
+    //
+    // • !end_on_host_leave — when this flag is true the meeting should already
+    //   be in state='ended' before we reach this point (the host-leave handler
+    //   ends it); the guard is moot but included for defensive completeness.
+    //
+    // Folding this check inside join_attendee's transaction closes the TOCTOU
+    // window where concurrent requests could both pass a pre-transaction read.
+    let check_creator = if !meeting.end_on_host_leave
+        && !meeting.admitted_can_admit
+        && meeting.waiting_room_enabled
+    {
         meeting.creator_id.as_deref()
     } else {
         None
@@ -537,17 +580,33 @@ pub async fn leave_meeting(
     // drops their principal from the ACL set on the next push.
     search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
-    // End the meeting when the host leaves only if end_on_host_leave is set,
-    // otherwise continue until the last participant leaves.
+    // Three distinct termination rules, evaluated in priority order:
+    //
+    // a) Host leaves + end_on_host_leave=true → end immediately regardless of
+    //    remaining participant count (host's explicit policy).
+    //
+    // b) Host leaves + end_on_host_leave=false → do NOT end the meeting, even
+    //    if no other participants are currently admitted.  The host deliberately
+    //    opted into "keep the meeting alive after I leave"; ending on zero count
+    //    would silently violate that intent when the host happens to be the last
+    //    one out before others join.
+    //
+    // c) Non-host (attendee) leaves + no admitted participants remain → end the
+    //    meeting.  This "last-participant-out" invariant is enforced symmetrically
+    //    here (authenticated leave) and in leave_meeting_as_guest below — both
+    //    branches call count_admitted and end_meeting on zero.
     let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
     if is_host && meeting.end_on_host_leave {
+        // Rule (a).
         db_meetings::end_meeting(&state.db, meeting.id).await?;
-    } else {
+    } else if !is_host {
+        // Rule (c): host departure with eohl=false falls through without ending.
         let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
         if remaining == 0 {
             db_meetings::end_meeting(&state.db, meeting.id).await?;
         }
     }
+    // Rule (b): is_host && !end_on_host_leave — no action, meeting stays alive.
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }
@@ -579,6 +638,12 @@ pub async fn leave_meeting_as_guest(
         Some(r) => r,
         None => return Err(AppError::not_in_meeting()),
     };
+
+    // End the meeting if no admitted participants remain after the guest leaves.
+    let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
+    if remaining == 0 {
+        db_meetings::end_meeting(&state.db, meeting.id).await?;
+    }
 
     // Notify the host that the waiting room list changed.
     nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id).await;

@@ -48,6 +48,58 @@ use videocall_types::Callback;
 
 use super::connection_lost_reason::ConnectionLostReason;
 
+/// URL redaction helpers used at the diagnostic-bus boundary.
+///
+/// The lobby URL stored in `ServerRttMeasurement.url` carries the user's room JWT
+/// in `?token=<JWT>&instance_id=<UUID>`. That URL must never be emitted to the
+/// diagnostic bus: the health reporter republishes diagnostic values onto the
+/// NATS telemetry topic, and any connected health-pipeline consumer would
+/// otherwise receive the JWT in cleartext (P0 credential leak — fix branch
+/// `fix/security-redact-jwt-active-server-url`).
+mod url_redact {
+    /// Return the URL with its query string AND fragment stripped.
+    ///
+    /// - `https://wt:4433/lobby?token=eyJ...&instance_id=abc` → `https://wt:4433/lobby`
+    /// - `https://wt:4433/lobby#token=eyJ...`                 → `https://wt:4433/lobby`
+    /// - `https://wt:4433/lobby?a=1#token=eyJ...`             → `https://wt:4433/lobby`
+    /// - `https://wt:4433/lobby` → `https://wt:4433/lobby` (unchanged)
+    /// - `not-a-url`, `""` → `""` (defensive fallback; never emit a partial URL)
+    ///
+    /// Plain string ops only — no new dependency, no URL parser. We do not need
+    /// to canonicalise; we only need to guarantee that no part of the URL after
+    /// the path (query OR fragment) escapes the client process. Fragments are
+    /// included because some signaling shapes encode credentials in the
+    /// fragment to keep them out of server-side request logs (RFC 3986 §3.5
+    /// — fragments are not transmitted in HTTP requests, but ARE visible to
+    /// any in-process JavaScript / WASM logger and would still leak via this
+    /// diagnostic path).
+    pub(super) fn redact_for_diag(url: &str) -> String {
+        // Defensive: require a scheme separator. Anything else is malformed and we
+        // refuse to leak it to the diagnostic bus.
+        if !url.contains("://") {
+            return String::new();
+        }
+        // Cut at the first occurrence of either `?` or `#`, whichever comes
+        // first. This handles all four canonical orderings:
+        //   path
+        //   path?query
+        //   path#fragment
+        //   path?query#fragment
+        let q = url.find('?');
+        let f = url.find('#');
+        let cut = match (q, f) {
+            (Some(qi), Some(fi)) => Some(qi.min(fi)),
+            (Some(qi), None) => Some(qi),
+            (None, Some(fi)) => Some(fi),
+            (None, None) => None,
+        };
+        match cut {
+            Some(idx) => url[..idx].to_string(),
+            None => url.to_string(),
+        }
+    }
+}
+
 /// Maximum plausible RTT in milliseconds. Measurements exceeding this are
 /// discarded as they likely result from clock anomalies or extreme outliers.
 const RTT_SANITY_MAX_MS: f64 = 10_000.0;
@@ -836,7 +888,12 @@ impl ConnectionManager {
             };
 
             on_state_changed.emit(ConnectionState::Reconnecting {
-                server_url: server_url.clone(),
+                // SECURITY: redact — `server_url` here is the raw lobby URL
+                // captured at connection-creation time, including
+                // `?token=<JWT>&instance_id=<UUID>`. Subscribers in dioxus-ui
+                // may render or log this field; the callback contract must
+                // never carry a JWT.
+                server_url: url_redact::redact_for_diag(server_url.as_str()),
                 attempt: 1,
             });
 
@@ -1669,7 +1726,10 @@ impl ConnectionManager {
                 next_delay_ms: delay_ms,
             };
             on_state_changed.emit(ConnectionState::Reconnecting {
-                server_url: last_server_url.clone(),
+                // SECURITY: redact — `last_server_url` is the raw lobby URL
+                // (including `?token=<JWT>&instance_id=<UUID>`). See the
+                // identical redaction in `create_connection_lost_callback`.
+                server_url: url_redact::redact_for_diag(last_server_url.as_str()),
                 attempt,
             });
 
@@ -1701,7 +1761,10 @@ impl ConnectionManager {
                     *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
                     on_state_changed.emit(ConnectionState::Failed {
                         error: "Connection manager destroyed during reconnection".to_string(),
-                        last_known_server: Some(last_server_url),
+                        // SECURITY: redact — see sibling emission above.
+                        last_known_server: Some(url_redact::redact_for_diag(
+                            last_server_url.as_str(),
+                        )),
                     });
                     return;
                 }
@@ -1805,7 +1868,10 @@ impl ConnectionManager {
                         "Server rejected connection ({} consecutive failures — possible auth/session error)",
                         consecutive_zero_connections
                     ),
-                    last_known_server: Some(last_server_url),
+                    // SECURITY: redact — see sibling emission above.
+                    last_known_server: Some(url_redact::redact_for_diag(
+                        last_server_url.as_str(),
+                    )),
                 });
                 return;
             }
@@ -2348,7 +2414,12 @@ impl ConnectionManager {
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     if let Some(avg_rtt) = measurement.average_rtt {
                         metrics.push(metric!("active_server_rtt", avg_rtt));
-                        metrics.push(metric!("active_server_url", measurement.url.as_str()));
+                        // SECURITY: redact (strip query + fragment) before emitting
+                        // to the diagnostic bus. `measurement.url` carries the room
+                        // JWT in `?token=<JWT>&instance_id=<UUID>` — see
+                        // `url_redact` doc.
+                        let redacted_url = url_redact::redact_for_diag(measurement.url.as_str());
+                        metrics.push(metric!("active_server_url", redacted_url.as_str()));
                         metrics.push(metric!(
                             "active_server_type",
                             if measurement.is_webtransport {
@@ -2418,8 +2489,17 @@ impl ConnectionManager {
                 "connecting"
             };
 
+            // SECURITY: redact the per-server URL before emitting to the
+            // diagnostic bus. `measurement.url` carries the room JWT in its
+            // query string (`?token=<JWT>&instance_id=<UUID>`) — see
+            // `url_redact` doc. This metric is consumed by the dioxus-ui
+            // diagnostics popup (`div.server-url, "{server.url}"`) and would
+            // otherwise expose the JWT in screenshots, screen-shares, and
+            // DevTools captures. Same redaction shape as `active_server_url`
+            // above.
+            let redacted_server_url = url_redact::redact_for_diag(measurement.url.as_str());
             let server_metrics = vec![
-                metric!("server_url", measurement.url.as_str()),
+                metric!("server_url", redacted_server_url.as_str()),
                 metric!(
                     "server_type",
                     if measurement.is_webtransport {
@@ -2484,7 +2564,12 @@ impl ConnectionManager {
             ElectionState::Elected { connection_id, .. } => {
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     ConnectionState::Connected {
-                        server_url: measurement.url.clone(),
+                        // SECURITY: redact before handing the URL to the
+                        // `on_state_changed` callback. Subscribers in dioxus-ui
+                        // may render or log this field; the callback contract
+                        // must never carry a JWT regardless of who's
+                        // subscribing now or in the future.
+                        server_url: url_redact::redact_for_diag(measurement.url.as_str()),
                         rtt: measurement.average_rtt.unwrap_or(0.0),
                         is_webtransport: measurement.is_webtransport,
                     }
@@ -2497,12 +2582,13 @@ impl ConnectionManager {
             }
             ElectionState::Failed { reason, .. } => ConnectionState::Failed {
                 error: reason.clone(),
+                // SECURITY: redact — same rationale as the `Connected` branch above.
                 last_known_server: self
                     .active_connection_id
                     .borrow()
                     .as_deref()
                     .and_then(|id| self.rtt_measurements.get(id))
-                    .map(|m| m.url.clone()),
+                    .map(|m| url_redact::redact_for_diag(m.url.as_str())),
             },
         };
 
@@ -2790,7 +2876,11 @@ impl ConnectionManager {
             ElectionState::Elected { connection_id, .. } => {
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     ConnectionState::Connected {
-                        server_url: measurement.url.clone(),
+                        // SECURITY: redact — see `report_state` for rationale.
+                        // `get_connection_state` is invoked by the reconnection
+                        // loop (which then emits via `on_state_changed`) and may
+                        // be invoked directly by UI/diagnostic callers.
+                        server_url: url_redact::redact_for_diag(measurement.url.as_str()),
                         rtt: measurement.average_rtt.unwrap_or(0.0),
                         is_webtransport: measurement.is_webtransport,
                     }
@@ -2803,12 +2893,13 @@ impl ConnectionManager {
             }
             ElectionState::Failed { reason, .. } => ConnectionState::Failed {
                 error: reason.clone(),
+                // SECURITY: redact — see `Connected` branch above.
                 last_known_server: self
                     .active_connection_id
                     .borrow()
                     .as_deref()
                     .and_then(|id| self.rtt_measurements.get(id))
-                    .map(|m| m.url.clone()),
+                    .map(|m| url_redact::redact_for_diag(m.url.as_str())),
             },
         }
     }
@@ -5743,4 +5834,380 @@ mod tests {
     // - `create_connection_lost_callback` -> spawns reconnection loop
     //
     // These should be covered by wasm-bindgen-test integration tests or E2E tests.
+
+    // ===================================================================
+    // Security: URL redaction at the diagnostic-bus boundary
+    // ===================================================================
+    //
+    // These tests guard the JWT-leak fix on branch
+    // `fix/security-redact-jwt-active-server-url`. Regressions here mean the
+    // user's room JWT escapes the client over the NATS health pipeline.
+
+    mod url_redact_tests {
+        use super::super::url_redact::redact_for_diag;
+
+        #[test]
+        fn strips_query_string_with_jwt_and_instance_id() {
+            // Realistic shape: `token=<JWT>&instance_id=<UUID>` — both must go.
+            let input = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555";
+            let out = redact_for_diag(input);
+            assert_eq!(out, "https://webtransport.example.com:4433/lobby");
+            assert!(
+                !out.contains("token="),
+                "redaction must remove the token query parameter, got {out:?}"
+            );
+            assert!(
+                !out.contains("eyJ"),
+                "redaction must remove the JWT body (eyJ prefix), got {out:?}"
+            );
+            assert!(
+                !out.contains("instance_id="),
+                "redaction must remove the instance_id query parameter, got {out:?}"
+            );
+        }
+
+        #[test]
+        fn passes_through_url_without_query_string() {
+            let input = "https://webtransport.example.com/lobby";
+            assert_eq!(
+                redact_for_diag(input),
+                "https://webtransport.example.com/lobby"
+            );
+        }
+
+        #[test]
+        fn preserves_explicit_port() {
+            let input = "https://webtransport.example.com:4433/lobby?token=eyJabc";
+            assert_eq!(
+                redact_for_diag(input),
+                "https://webtransport.example.com:4433/lobby"
+            );
+        }
+
+        #[test]
+        fn malformed_input_falls_back_to_empty_string() {
+            // No scheme separator — refuse to emit anything rather than risk a
+            // partial credential reaching the diagnostic bus.
+            assert_eq!(redact_for_diag(""), "");
+            assert_eq!(redact_for_diag("not-a-url"), "");
+            assert_eq!(redact_for_diag("?token=eyJabc"), "");
+            assert_eq!(redact_for_diag("/lobby?token=eyJabc"), "");
+        }
+
+        #[test]
+        fn handles_websocket_scheme() {
+            // The same helper guards the WebSocket transport URL.
+            let input = "wss://ws.example.com/lobby?token=eyJabc.def.ghi";
+            assert_eq!(redact_for_diag(input), "wss://ws.example.com/lobby");
+        }
+
+        #[test]
+        fn strips_fragment_when_no_query_string() {
+            // Fragments can carry credentials too (some signaling shapes encode
+            // tokens after `#` to keep them out of server-side request logs).
+            // The diagnostic bus has full visibility into the in-process URL
+            // and would still leak the fragment; redact it.
+            let input = "https://webtransport.example.com:4433/lobby#token=eyJabc.def.ghi";
+            let out = redact_for_diag(input);
+            assert_eq!(out, "https://webtransport.example.com:4433/lobby");
+            assert!(
+                !out.contains('#'),
+                "redaction must remove the fragment delimiter, got {out:?}"
+            );
+            assert!(
+                !out.contains("eyJ"),
+                "redaction must remove the JWT body in the fragment, got {out:?}"
+            );
+        }
+
+        #[test]
+        fn strips_query_and_fragment_together() {
+            // Worst-case shape: `?` before `#`. We must cut at the earlier of
+            // the two delimiters and drop everything after.
+            let input = "https://webtransport.example.com:4433/lobby?a=1#token=eyJabc.def.ghi";
+            let out = redact_for_diag(input);
+            assert_eq!(out, "https://webtransport.example.com:4433/lobby");
+            assert!(
+                !out.contains('?'),
+                "redaction must remove the query delimiter, got {out:?}"
+            );
+            assert!(
+                !out.contains('#'),
+                "redaction must remove the fragment delimiter, got {out:?}"
+            );
+            assert!(
+                !out.contains("eyJ"),
+                "redaction must remove the JWT body, got {out:?}"
+            );
+        }
+
+        #[test]
+        fn strips_fragment_before_query_in_pathological_input() {
+            // Pathological (RFC-violating) shape: `#` before `?`. We still cut
+            // at the earlier delimiter — fragment, in this case — so neither
+            // half can leak. The "query" segment after the fragment would be
+            // semantically nonsense to a parser, but we don't want to special-
+            // case it: the contract is "everything after path is gone".
+            let input = "https://webtransport.example.com/lobby#frag?token=eyJabc";
+            let out = redact_for_diag(input);
+            assert_eq!(out, "https://webtransport.example.com/lobby");
+            assert!(
+                !out.contains("eyJ"),
+                "redaction must drop the JWT regardless of delimiter order, got {out:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Helper: assert the diagnostic-bus emission of `active_server_url`
+    // never contains `?token=` or the JWT-prefix `eyJ`. This is the
+    // contract that the NATS health pipeline depends on.
+    // -------------------------------------------------------------------
+    #[test]
+    fn report_diagnostics_does_not_emit_token_in_active_server_url() {
+        use videocall_diagnostics::MetricValue;
+
+        // Build a manager and seed an Elected state with an `rtt_measurements`
+        // entry whose URL embeds a JWT and instance_id — exactly what the live
+        // path produces.
+        let mut mgr = make_test_manager();
+        let conn_id = "wt_0".to_string();
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        // Seed an `rtt_measurements` entry whose URL embeds a JWT — exactly what
+        // the live path produces. `average_rtt = Some(_)` is required so the
+        // `Elected` branch emits the URL metric.
+        let measurement = ServerRttMeasurement {
+            url: dirty_url.clone(),
+            is_webtransport: true,
+            measurements: VecDeque::new(),
+            average_rtt: Some(42.0),
+            connection_id: conn_id.clone(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+        };
+        mgr.rtt_measurements.insert(conn_id.clone(), measurement);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: conn_id.clone(),
+            elected_at: 0.0,
+        };
+
+        // Re-implement the metric construction inline (cannot drive
+        // `report_diagnostics` directly without a live diagnostics broadcaster
+        // in the test runtime). This mirrors the production path at the call
+        // site we just patched.
+        let measurement = mgr.rtt_measurements.get(&conn_id).unwrap();
+        let redacted_url = url_redact::redact_for_diag(measurement.url.as_str());
+        let m = metric!("active_server_url", redacted_url.as_str());
+
+        let value = match m.value {
+            MetricValue::Text(s) => s,
+            other => panic!("expected Text metric, got {other:?}"),
+        };
+
+        assert!(
+            !value.contains("?token="),
+            "active_server_url metric must not contain `?token=`, got {value:?}"
+        );
+        assert!(
+            !value.contains("eyJ"),
+            "active_server_url metric must not contain JWT-prefix `eyJ`, got {value:?}"
+        );
+        assert!(
+            !value.contains("instance_id="),
+            "active_server_url metric must not contain `instance_id=`, got {value:?}"
+        );
+        assert_eq!(
+            value, "https://webtransport.example.com:4433/lobby",
+            "redacted URL must equal scheme://host:port/path with no query"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // F1 regression: the per-server `server_url` metric (the one consumed
+    // by the dioxus-ui diagnostics popup, `div.server-url`) must NOT
+    // contain the JWT, instance_id, or any query/fragment delimiter.
+    // -------------------------------------------------------------------
+    #[test]
+    fn report_diagnostics_does_not_emit_token_in_per_server_url() {
+        use videocall_diagnostics::MetricValue;
+
+        // Mirror the live path: an `rtt_measurements` entry whose URL embeds
+        // the JWT exactly as `append_instance_id` produces.
+        let mut mgr = make_test_manager();
+        let conn_id = "wt_0".to_string();
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        let measurement = ServerRttMeasurement {
+            url: dirty_url.clone(),
+            is_webtransport: true,
+            measurements: VecDeque::new(),
+            average_rtt: Some(42.0),
+            connection_id: conn_id.clone(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+        };
+        mgr.rtt_measurements.insert(conn_id.clone(), measurement);
+
+        // Re-implement the per-server metric construction inline. This mirrors
+        // production exactly: same input, same redaction call, same metric
+        // name. Driving `report_diagnostics` end-to-end would require a live
+        // diagnostics broadcaster (not available in the unit-test runtime).
+        let measurement = mgr.rtt_measurements.get(&conn_id).unwrap();
+        let redacted_server_url = url_redact::redact_for_diag(measurement.url.as_str());
+        let m = metric!("server_url", redacted_server_url.as_str());
+
+        let value = match m.value {
+            MetricValue::Text(s) => s,
+            other => panic!("expected Text metric, got {other:?}"),
+        };
+
+        assert!(
+            !value.contains("eyJ"),
+            "server_url metric must not contain JWT-prefix `eyJ`, got {value:?}"
+        );
+        assert!(
+            !value.contains("?token="),
+            "server_url metric must not contain `?token=`, got {value:?}"
+        );
+        assert!(
+            !value.contains("instance_id="),
+            "server_url metric must not contain `instance_id=`, got {value:?}"
+        );
+        assert!(
+            !value.contains('#'),
+            "server_url metric must not contain a fragment delimiter, got {value:?}"
+        );
+        assert_eq!(
+            value, "https://webtransport.example.com:4433/lobby",
+            "redacted per-server URL must equal scheme://host:port/path with no query/fragment"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // F3 regression: the `ConnectionState::Connected.server_url` field
+    // emitted via the `on_state_changed` callback must NOT contain the
+    // JWT. Subscribers in dioxus-ui may render or log this field.
+    //
+    // Driving the full state-machine transition (Election -> Elected ->
+    // emit) requires async timer plumbing not available in the host
+    // unit-test runtime. We mirror the production line inline using the
+    // exact same redacted-input contract — same shape as the
+    // `active_server_url` test above.
+    // -------------------------------------------------------------------
+    #[test]
+    fn connected_state_server_url_is_redacted() {
+        let mut mgr = make_test_manager();
+        let conn_id = "wt_0".to_string();
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        let measurement = ServerRttMeasurement {
+            url: dirty_url.clone(),
+            is_webtransport: true,
+            measurements: VecDeque::new(),
+            average_rtt: Some(42.0),
+            connection_id: conn_id.clone(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+        };
+        mgr.rtt_measurements.insert(conn_id.clone(), measurement);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: conn_id.clone(),
+            elected_at: 0.0,
+        };
+
+        // Drive the production `get_connection_state` accessor — this is the
+        // exact code path that constructs `ConnectionState::Connected` for
+        // the reconnection loop and for any UI poll.
+        let state = mgr.get_connection_state();
+
+        let server_url = match state {
+            ConnectionState::Connected { server_url, .. } => server_url,
+            other => panic!("expected ConnectionState::Connected, got {other:?}"),
+        };
+
+        assert!(
+            !server_url.contains("eyJ"),
+            "ConnectionState::Connected.server_url must not contain JWT-prefix `eyJ`, got {server_url:?}"
+        );
+        assert!(
+            !server_url.contains("?token="),
+            "ConnectionState::Connected.server_url must not contain `?token=`, got {server_url:?}"
+        );
+        assert!(
+            !server_url.contains("instance_id="),
+            "ConnectionState::Connected.server_url must not contain `instance_id=`, got {server_url:?}"
+        );
+        assert!(
+            !server_url.contains('#'),
+            "ConnectionState::Connected.server_url must not contain a fragment delimiter, got {server_url:?}"
+        );
+        assert_eq!(
+            server_url, "https://webtransport.example.com:4433/lobby",
+            "redacted server_url must equal scheme://host:port/path with no query/fragment"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // F3 regression: the `ConnectionState::Failed.last_known_server` field
+    // emitted via the `on_state_changed` callback must NOT contain the JWT.
+    // -------------------------------------------------------------------
+    #[test]
+    fn failed_state_last_known_server_is_redacted() {
+        let mut mgr = make_test_manager();
+        let conn_id = "wt_0".to_string();
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        let measurement = ServerRttMeasurement {
+            url: dirty_url.clone(),
+            is_webtransport: true,
+            measurements: VecDeque::new(),
+            average_rtt: Some(42.0),
+            connection_id: conn_id.clone(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+        };
+        mgr.rtt_measurements.insert(conn_id.clone(), measurement);
+        // Set the active connection so `last_known_server` is populated from it.
+        *mgr.active_connection_id.borrow_mut() = Some(conn_id.clone());
+        mgr.election_state = ElectionState::Failed {
+            reason: "test-failure".to_string(),
+            failed_at: 0.0,
+        };
+
+        let state = mgr.get_connection_state();
+        let last_known = match state {
+            ConnectionState::Failed {
+                last_known_server, ..
+            } => last_known_server,
+            other => panic!("expected ConnectionState::Failed, got {other:?}"),
+        };
+
+        let url = last_known.expect("active connection was set; last_known_server must be Some");
+
+        assert!(
+            !url.contains("eyJ"),
+            "ConnectionState::Failed.last_known_server must not contain JWT-prefix `eyJ`, got {url:?}"
+        );
+        assert!(
+            !url.contains("?token="),
+            "ConnectionState::Failed.last_known_server must not contain `?token=`, got {url:?}"
+        );
+        assert!(
+            !url.contains("instance_id="),
+            "ConnectionState::Failed.last_known_server must not contain `instance_id=`, got {url:?}"
+        );
+        assert!(
+            !url.contains('#'),
+            "ConnectionState::Failed.last_known_server must not contain a fragment delimiter, got {url:?}"
+        );
+        assert_eq!(
+            url, "https://webtransport.example.com:4433/lobby",
+            "redacted last_known_server must equal scheme://host:port/path with no query/fragment"
+        );
+    }
 }

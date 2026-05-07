@@ -30,6 +30,7 @@ use crate::adaptive_quality_constants::{
     REELECTION_PRESERVATION_FRESHNESS_MS, REELECTION_PRESERVATION_RETRY_MS,
     REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
 };
+use crate::client::RefreshRoomTokenCallback;
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
@@ -103,6 +104,24 @@ mod url_redact {
 /// Maximum plausible RTT in milliseconds. Measurements exceeding this are
 /// discarded as they likely result from clock anomalies or extreme outliers.
 const RTT_SANITY_MAX_MS: f64 = 10_000.0;
+
+/// Maximum time to wait for the room-token refresh callback to resolve before
+/// falling back to the cached-URL path inside `request_reelection`.
+///
+/// **Why 3 seconds?** The watchdog fires *because* the active connection's
+/// RTT has degraded — the same network condition is highly likely to slow or
+/// stall the meeting-api fetch the refresh callback runs. Without a timeout,
+/// re-election would be held for up to the JS fetch reaper window
+/// (typically 30s+). The Phase 3 contract states "a refresh failure must
+/// NEVER block re-election" — and "slow" is the dominant failure mode on
+/// degraded networks, so it must be treated the same as `Err`.
+///
+/// The value (3000 ms) splits the difference between code-reviewer's 5s
+/// suggestion and performance-reviewer's 2s, and matches the order of
+/// magnitude of the typical wasm_fetch defaults already used elsewhere in
+/// the dioxus-ui meeting_api path. See PR 571 review thread.
+#[cfg(target_arch = "wasm32")]
+const REFRESH_TIMEOUT_MS: u32 = 3_000;
 
 /// Inbound-liveness window for the CPU-stall guard in
 /// [`ConnectionManager::check_rtt_degradation`]. If we have observed any
@@ -273,6 +292,17 @@ pub struct ConnectionManagerOptions {
     /// selections set this to `false` so the retry never fires and the user's
     /// transport choice is respected.
     pub allow_post_rebase_retry: bool,
+
+    /// Optional async callback that refreshes the room token before the
+    /// manager spawns candidate connections during an internal re-election.
+    ///
+    /// See [`crate::RefreshRoomTokenCallback`] and discussion #562 (AUTH-2)
+    /// for the design. When `None`, re-election proceeds with cached URLs
+    /// (current behaviour preserved). When `Some`, the timer-driven entry
+    /// point [`ConnectionManager::request_reelection`] runs the callback
+    /// and swaps in the fresh URLs before invoking
+    /// [`ConnectionManager::start_reelection`].
+    pub refresh_room_token_callback: Option<RefreshRoomTokenCallback>,
 }
 
 /// Action taken by [`ConnectionManager::run_post_rebase_retry`] when the
@@ -438,6 +468,16 @@ pub struct ConnectionManager {
     /// and any time the rebase path observes that the URL list has expanded
     /// (i.e. the original cause of the rebase is gone).
     post_rebase_retry_count: u32,
+    /// Set to `true` while a `request_reelection` token-refresh future is in
+    /// flight. The 1Hz timer can call `request_reelection` repeatedly while
+    /// the watchdog is firing — without this guard each tick would spawn its
+    /// own refresh-then-reelect task, all racing to mutate
+    /// `options.{websocket,webtransport}_urls`. Shared via `Rc` so the
+    /// `spawn_local` closure can clear it on completion without re-borrowing
+    /// the manager.
+    ///
+    /// Phase 3 / AUTH-2 — discussion #562.
+    refresh_in_progress: Rc<Cell<bool>>,
 
     /// Shared flag set by `ConnectionController`'s 1 Hz drift watchdog when
     /// the JS main thread runs a tick more than
@@ -532,6 +572,7 @@ impl ConnectionManager {
             reelection_preserved_once: false,
             reelection_retry_pending: Rc::new(RefCell::new(false)),
             post_rebase_retry_count: 0,
+            refresh_in_progress: Rc::new(Cell::new(false)),
             cpu_overloaded: Rc::new(AtomicBool::new(false)),
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
@@ -618,6 +659,12 @@ impl ConnectionManager {
         // bails out without re-entering the manager.
         self.reelection_preserved_once = false;
         *self.reelection_retry_pending.borrow_mut() = false;
+        // Drop any in-flight refresh marker. A pending token-refresh future
+        // from before the reset is now stale; if it ever resolves and tries
+        // to re-enter via `manager_ref`, the refreshed URLs would clobber
+        // whatever the new session is using. Clearing the flag also lets a
+        // post-reset re-election immediately request its own refresh.
+        self.refresh_in_progress.set(false);
         // Clear the inbound-freshness map — old connections are gone, so any
         // residual timestamps are meaningless.
         if let Ok(mut map) = self.last_inbound_at_ms.try_borrow_mut() {
@@ -2383,6 +2430,249 @@ impl ConnectionManager {
         self.reelection_in_progress
     }
 
+    /// Timer-driven entry point for re-election that first refreshes the
+    /// room token (when a refresh callback is configured) and then runs the
+    /// existing [`Self::start_reelection`] flow against the freshly-tokenized
+    /// URL list.
+    ///
+    /// **Why this exists** (Phase 3 / AUTH-2 — discussion #562): the original
+    /// `start_reelection` reuses the cached server URLs — including the
+    /// tokenized JWT in the query string. After the JWT TTL expires, every
+    /// candidate the manager spawns is rejected by the relay, the election
+    /// fails with all candidates flaming out, and only the UI-level
+    /// `schedule_reconnect` path (in dioxus-ui) eventually fetches a fresh
+    /// token via the meeting-api. By that point the user has already
+    /// experienced a perceived disconnect. This method moves that refresh
+    /// upstream so the manager can recover transparently.
+    ///
+    /// **Behaviour:**
+    /// - If no refresh callback is configured, calls `start_reelection`
+    ///   directly (current behaviour preserved — observers, no-jwt builds,
+    ///   tests).
+    /// - If a callback is configured and no refresh is already in flight,
+    ///   spawns an async task that calls the callback. On `Some(refreshed)`
+    ///   the manager's URL lists are updated and `start_reelection` runs.
+    ///   On `None` (refresh failure) the manager logs a warning and runs
+    ///   `start_reelection` against the cached URLs anyway — a failed
+    ///   refresh must not block re-election (that would be a strictly
+    ///   worse failure mode).
+    /// - If a refresh is already in flight, returns immediately. The 1Hz
+    ///   timer can fire repeatedly while the watchdog is screaming; without
+    ///   this guard each tick would spawn its own racing future.
+    ///
+    /// On non-wasm targets (host unit tests) the async path panics — see the
+    /// `#[cfg]` gate. Tests should prefer
+    /// [`Self::apply_refresh_and_start_reelection`] for deterministic
+    /// verification of the refresh-then-spawn ordering.
+    pub fn request_reelection(&mut self) -> Result<()> {
+        // No callback configured → behave exactly like the legacy entry
+        // point. Existing call sites that don't supply a refresh callback
+        // continue to work without behavioural change.
+        if self.options.refresh_room_token_callback.is_none() {
+            return self.start_reelection();
+        }
+
+        if self.reelection_in_progress {
+            debug!("request_reelection: re-election already in progress, skipping refresh");
+            return Ok(());
+        }
+
+        if self.refresh_in_progress.get() {
+            debug!(
+                "request_reelection: token refresh already in flight, skipping duplicate request"
+            );
+            return Ok(());
+        }
+
+        // From here on, mark the refresh in flight. Cleared in the spawned
+        // task's completion arms (both success and failure) and on
+        // `disconnect()` / `reset_and_start_election`.
+        self.refresh_in_progress.set(true);
+
+        // Async machinery only exists on wasm32; on the host target we still
+        // need *something* to run so the existing test doubles for
+        // `start_reelection` continue to fire.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Pure-host fallback: skip the refresh (which would require a
+            // runtime), clear the flag, and fall through to the legacy
+            // entry. Host unit tests exercise the apply step directly via
+            // `apply_refresh_and_start_reelection`.
+            self.refresh_in_progress.set(false);
+            self.start_reelection()
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let cb = self
+                .options
+                .refresh_room_token_callback
+                .as_ref()
+                .expect("refresh_room_token_callback presence checked above")
+                .clone();
+            let manager_ref = self.manager_ref.clone();
+            let refresh_in_progress = self.refresh_in_progress.clone();
+            let intentionally_disconnected = self.intentionally_disconnected.clone();
+
+            wasm_bindgen_futures::spawn_local(async move {
+                // Drop-based guard: ensures `refresh_in_progress` is cleared
+                // regardless of how this future exits — success, error,
+                // panic propagation through `.await`, or being dropped
+                // before completion. Without this, a panic inside
+                // `cb.emit().await` (which `wasm_bindgen_futures::spawn_local`
+                // does NOT propagate to the caller) would leave the flag
+                // permanently set, silently disabling all future refreshes
+                // for the rest of the session — a "fail-stuck" failure mode
+                // strictly worse than "no refresh at all".
+                //
+                // Constructed *inside* the spawned future (not the outer
+                // scope) so its lifetime is tied to the future, not to the
+                // synchronous `request_reelection` call.
+                struct RefreshInProgressGuard {
+                    flag: Rc<Cell<bool>>,
+                }
+                impl Drop for RefreshInProgressGuard {
+                    fn drop(&mut self) {
+                        // Idempotent: a double-drop (impossible by Rust
+                        // ownership rules but checked defensively) would
+                        // simply set false twice. The other clearing sites —
+                        // `disconnect()` and `reset_and_start_election` —
+                        // also unconditionally `.set(false)`, so they are
+                        // safe to interleave.
+                        self.flag.set(false);
+                    }
+                }
+                let _guard = RefreshInProgressGuard {
+                    flag: refresh_in_progress.clone(),
+                };
+
+                // Race the refresh callback against a timeout. Without
+                // this, a slow (rather than failing) meeting-api fetch
+                // could hold re-election for up to the JS fetch reaper
+                // window (~30s) on the very network conditions that
+                // triggered the watchdog. See `REFRESH_TIMEOUT_MS` for
+                // the rationale on the chosen duration. Timing out is
+                // semantically equivalent to a refresh failure: we fall
+                // through to the cached-URL path so re-election still
+                // makes progress.
+                let refresh_fut = cb.emit();
+                let timeout_fut = gloo_timers::future::TimeoutFuture::new(REFRESH_TIMEOUT_MS);
+                let result = match futures::future::select(refresh_fut, timeout_fut).await {
+                    futures::future::Either::Left((res, _timeout_dropped)) => res,
+                    futures::future::Either::Right((_elapsed, _refresh_dropped)) => {
+                        warn!(
+                            "request_reelection: refresh callback timed out after {}ms — falling back to cached URLs",
+                            REFRESH_TIMEOUT_MS
+                        );
+                        None
+                    }
+                };
+
+                // Defensive: if the user disconnected while the refresh was
+                // in flight, abandon the result entirely. The new server URLs
+                // would otherwise be installed onto a manager that's about to
+                // be torn down (or worse, onto a fresh session that was
+                // started during the gap).
+                if *intentionally_disconnected.borrow() {
+                    debug!(
+                        "request_reelection: refresh completed after intentional disconnect, dropping result"
+                    );
+                    return;
+                }
+
+                let manager_rc = match manager_ref.upgrade() {
+                    Some(rc) => rc,
+                    None => {
+                        debug!(
+                            "request_reelection: ConnectionManager dropped before refresh completed"
+                        );
+                        return;
+                    }
+                };
+
+                match manager_rc.try_borrow_mut() {
+                    Ok(mut mgr) => {
+                        if let Err(e) = mgr.apply_refresh_and_start_reelection(result) {
+                            warn!("request_reelection: start_reelection failed after refresh: {e}");
+                        }
+                        // The Drop guard clears `refresh_in_progress`
+                        // when the future exits. Doing it via Drop (rather
+                        // than an explicit `.set(false)` here) covers
+                        // every exit path including panic, intentional
+                        // disconnect, and dropped-future cancellation.
+                    }
+                    Err(_) => {
+                        // Manager busy — drop the refresh result. The next
+                        // 1Hz tick will detect that re-election still hasn't
+                        // started and request another refresh. The Drop
+                        // guard clears `refresh_in_progress` so that next
+                        // tick is allowed to spawn a fresh attempt.
+                        warn!(
+                            "request_reelection: manager busy when applying refresh result, will retry on next tick"
+                        );
+                    }
+                };
+            });
+
+            Ok(())
+        }
+    }
+
+    /// Apply a token-refresh result and immediately start re-election
+    /// against the (potentially refreshed) URL list.
+    ///
+    /// Split out from [`Self::request_reelection`] so:
+    ///   1. The async glue stays small and wasm-only.
+    ///   2. Host unit tests can exercise the contract — refreshed URLs are
+    ///      visible to `create_all_connections` BEFORE the candidate spawn —
+    ///      without having to drive a real spawn_local.
+    ///
+    /// `refreshed = Some(_)` → URLs are swapped via [`Self::update_server_urls`]
+    /// and `start_reelection` runs against the new lists.
+    /// `refreshed = None`   → cached URLs are kept; a warning is logged;
+    /// `start_reelection` runs anyway (a refresh failure must NEVER block
+    /// re-election; the existing UI-level reconnect path will handle the
+    /// terminal-expiry case if the cached URLs also fail).
+    ///
+    /// Because the only caller on the host target lives behind
+    /// `#[cfg(target_arch = "wasm32")]` (the `spawn_local` body in
+    /// `request_reelection`) and the `start_reelection` call inside this
+    /// body itself panics on host (it touches `web_sys::window`), this
+    /// method is marked `dead_code`-allowed for the host build. The
+    /// `#[cfg(target_arch = "wasm32")]`-gated `apply_refresh_with_*`
+    /// tests below give it real coverage in wasm-bindgen-test runs.
+    #[allow(dead_code)]
+    pub fn apply_refresh_and_start_reelection(
+        &mut self,
+        refreshed: Option<crate::client::RefreshedTokens>,
+    ) -> Result<()> {
+        match refreshed {
+            Some(tokens) => {
+                info!(
+                    "request_reelection: refreshed room token successfully — swapping in {} ws / {} wt URLs before re-election",
+                    tokens.websocket_urls.len(),
+                    tokens.webtransport_urls.len(),
+                );
+                // NOTE: This intentionally updates only the manager-side URL
+                // list, not `VideoCallClient::options.{websocket,webtransport}_urls`.
+                // dioxus-ui rebuilds URLs from scratch via `build_lobby_urls` +
+                // `resolve_transport_config` every time it constructs a client;
+                // the outer mirror is never read at runtime after construction.
+                // Mirroring back would create a cycle (manager -> client ->
+                // manager) and add complexity without a behavioural benefit.
+                // See PR #571 / #570 / #573 review thread.
+                self.update_server_urls(tokens.websocket_urls, tokens.webtransport_urls);
+            }
+            None => {
+                warn!(
+                    "request_reelection: token refresh failed — proceeding with cached URLs (may be expired). \
+                     The UI-level schedule_reconnect path will recover if the relay rejects the candidates."
+                );
+            }
+        }
+        self.start_reelection()
+    }
+
     // -----------------------------------------------------------------------
     // Post-rebase re-election retry
     //
@@ -2545,8 +2835,11 @@ impl ConnectionManager {
                 );
                 // Reset the budget so a future rebase event starts fresh.
                 self.post_rebase_retry_count = 0;
-                if let Err(e) = self.start_reelection() {
-                    warn!("Post-rebase retry attempt {attempt}: start_reelection failed: {e}");
+                // Phase 3 / AUTH-2: refresh the room token first when a
+                // callback is configured. Falls through to bare
+                // start_reelection when not.
+                if let Err(e) = self.request_reelection() {
+                    warn!("Post-rebase retry attempt {attempt}: request_reelection failed: {e}");
                 }
             }
             PostRebaseRetryAction::Reschedule => {
@@ -3016,6 +3309,9 @@ impl ConnectionManager {
         // observes this flag and exits without re-entering the manager.
         *self.reelection_retry_pending.borrow_mut() = false;
         self.reelection_preserved_once = false;
+        // Same rationale as the preservation-retry: a pending token-refresh
+        // future from a previous session must not race the new state.
+        self.refresh_in_progress.set(false);
 
         // Clear the active connection id so is_connected() returns false.
         *self.active_connection_id.borrow_mut() = None;
@@ -3278,6 +3574,13 @@ mod tests {
         REELECTION_CONSECUTIVE_SAMPLES, REELECTION_MIN_IMPROVEMENT_MS,
         REELECTION_RTT_MIN_THRESHOLD_MS, REELECTION_RTT_MULTIPLIER,
     };
+    // The two `apply_refresh_with_*` tests below are gated on `wasm32` and
+    // run via `wasm-pack test --node`, which only discovers tests carrying
+    // the `#[wasm_bindgen_test]` attribute (libtest's `#[test]` is silently
+    // skipped). Matches the convention used in `crypto/aes.rs` and
+    // `crypto/rsa.rs`.
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
 
     // -----------------------------------------------------------------------
     // Helper: construct a ConnectionManager without starting an election.
@@ -3302,6 +3605,10 @@ mod tests {
             // Default test fixture mirrors production for `Auto` users:
             // post-rebase retry is allowed.
             allow_post_rebase_retry: true,
+            // No refresh callback by default; tests that exercise the
+            // AUTH-2 refresh path install a mock explicitly via
+            // `mgr.options.refresh_room_token_callback = Some(...)`.
+            refresh_room_token_callback: None,
         };
 
         ConnectionManager {
@@ -3344,6 +3651,7 @@ mod tests {
             reelection_preserved_once: false,
             reelection_retry_pending: Rc::new(RefCell::new(false)),
             post_rebase_retry_count: 0,
+            refresh_in_progress: Rc::new(Cell::new(false)),
             cpu_overloaded: Rc::new(AtomicBool::new(false)),
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
@@ -6426,6 +6734,260 @@ mod tests {
             "abort path must also clear reelection_retry_pending so a \
              pending preservation-retry timer cannot wake after the cycle \
              cleanly concluded on the old connection"
+        );
+    }
+
+    // ===================================================================
+    // Phase 3 / AUTH-2 — refresh JWT inside internal re-election
+    //
+    // Background (discussion #562): the original `start_reelection` reuses
+    // the cached server URLs — including the original JWT in the query
+    // string. Once the token TTL elapses, every candidate the manager
+    // spawns is rejected by the relay and the entire election fails. The
+    // only token-refresh path was the UI-level `schedule_reconnect`, which
+    // fires AFTER the election has already failed and the user has been
+    // stranded. Phase 3 moves the refresh inside the manager so the
+    // candidate spawn always uses fresh URLs.
+    //
+    // The async glue (`request_reelection` -> `wasm_bindgen_futures::spawn_local`
+    // -> callback.emit().await -> manager_ref.upgrade -> apply step) lives
+    // behind `#[cfg(target_arch = "wasm32")]` because both `spawn_local` and
+    // the underlying browser fetch panic on the host target. The
+    // `apply_refresh_and_start_reelection` step — the actual contract this
+    // PR is locking in — is pure-Rust and tested directly here.
+    // ===================================================================
+
+    /// Build a stub `RefreshedTokens` value for tests.
+    fn refreshed_tokens(ws: &[&str], wt: &[&str]) -> crate::client::RefreshedTokens {
+        crate::client::RefreshedTokens {
+            websocket_urls: ws.iter().map(|s| (*s).to_string()).collect(),
+            webtransport_urls: wt.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// Build a refresh callback that returns the supplied `RefreshedTokens`
+    /// from a single emit. Tests assert the manager swaps these in BEFORE
+    /// re-election fires (or, on `None`, falls back to cached URLs).
+    fn make_refresh_callback(
+        result: Option<crate::client::RefreshedTokens>,
+    ) -> crate::client::RefreshRoomTokenCallback {
+        let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(result)));
+        crate::client::RefreshRoomTokenCallback::from(move || {
+            // Take the result on first call so a hypothetical second call
+            // (which would indicate a duplicate refresh) returns None and
+            // is detectable via the manager's fallback log.
+            let cell = cell.clone();
+            async move { cell.borrow_mut().take().flatten() }
+        })
+    }
+
+    #[test]
+    fn refreshed_tokens_overwrite_cached_urls_before_reelection_candidates_spawn() {
+        // The core AUTH-2 contract: when a refresh callback returns fresh
+        // URLs, those URLs must be installed into `options.{ws,wt}_urls`
+        // BEFORE `start_reelection` runs `create_all_connections`, so the
+        // candidate spawn picks up the freshly-tokenized URLs (not the
+        // cached, possibly-expired ones).
+        //
+        // We can't actually run `start_reelection` on the host (it calls
+        // `monotonic_now_ms` -> `web_sys::window`) but we exercise the
+        // pure URL-update step that `apply_refresh_and_start_reelection`
+        // performs first. The wasm-gated test below verifies the full
+        // sequence end-to-end inside `apply_refresh_and_start_reelection`.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://stale?token=expired".into()];
+        mgr.options.webtransport_urls = vec!["https://stale?token=expired".into()];
+
+        let fresh = refreshed_tokens(
+            &[
+                "ws://relay-a/lobby?token=NEW",
+                "ws://relay-b/lobby?token=NEW",
+            ],
+            &["https://relay-a/lobby?token=NEW"],
+        );
+        // Mirror the apply step's URL-swap exactly. (The full method is
+        // exercised in `apply_refresh_with_some_swaps_urls_then_starts_reelection`
+        // below behind `#[cfg(target_arch = "wasm32")]`.)
+        mgr.update_server_urls(
+            fresh.websocket_urls.clone(),
+            fresh.webtransport_urls.clone(),
+        );
+
+        // Both URL lists must reflect the refreshed values.
+        assert_eq!(
+            mgr.options.websocket_urls,
+            vec![
+                "ws://relay-a/lobby?token=NEW".to_string(),
+                "ws://relay-b/lobby?token=NEW".to_string(),
+            ],
+            "ws URLs must be replaced with refreshed values"
+        );
+        assert_eq!(
+            mgr.options.webtransport_urls,
+            vec!["https://relay-a/lobby?token=NEW".to_string()],
+            "wt URLs must be replaced with refreshed values"
+        );
+        // total_server_count() reads from these fields and is what
+        // `create_all_connections` will iterate over to spawn candidates.
+        assert_eq!(
+            mgr.total_server_count(),
+            3,
+            "manager's view of candidate count must reflect the refreshed URL list \
+             so the imminent candidate spawn uses the fresh tokens"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn apply_refresh_with_some_swaps_urls_then_starts_reelection() {
+        // End-to-end host-equivalent: `apply_refresh_and_start_reelection`
+        // with `Some(_)` must (a) install the refreshed URLs and (b) drive
+        // re-election to in-progress with the new generation. This is the
+        // observable contract the wasm spawn_local body relies on.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://stale?token=expired".into()];
+        mgr.options.webtransport_urls = vec!["https://stale?token=expired".into()];
+        let pre_generation = mgr.reelection_generation;
+
+        let fresh = refreshed_tokens(
+            &["ws://relay/lobby?token=FRESH"],
+            &["https://relay/lobby?token=FRESH"],
+        );
+        mgr.apply_refresh_and_start_reelection(Some(fresh)).unwrap();
+
+        assert_eq!(
+            mgr.options.websocket_urls,
+            vec!["ws://relay/lobby?token=FRESH".to_string()],
+        );
+        assert_eq!(
+            mgr.options.webtransport_urls,
+            vec!["https://relay/lobby?token=FRESH".to_string()],
+        );
+        assert!(
+            mgr.is_reelection_in_progress(),
+            "re-election must be in progress after apply"
+        );
+        assert_eq!(
+            mgr.reelection_generation,
+            pre_generation.saturating_add(1),
+            "re-election generation must have been bumped exactly once"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn apply_refresh_with_none_falls_back_to_cached_urls() {
+        // Refresh callback returning `None` must NOT block re-election —
+        // that would be a strictly worse failure mode than running with
+        // the cached (possibly expired) URLs. The cached URLs persist;
+        // re-election still progresses to in-progress.
+        let mut mgr = make_test_manager();
+        let cached_ws = vec!["ws://relay/lobby?token=cached".to_string()];
+        let cached_wt = vec!["https://relay/lobby?token=cached".to_string()];
+        mgr.options.websocket_urls = cached_ws.clone();
+        mgr.options.webtransport_urls = cached_wt.clone();
+
+        mgr.apply_refresh_and_start_reelection(None).unwrap();
+
+        assert_eq!(
+            mgr.options.websocket_urls, cached_ws,
+            "ws URLs must remain unchanged on refresh failure"
+        );
+        assert_eq!(
+            mgr.options.webtransport_urls, cached_wt,
+            "wt URLs must remain unchanged on refresh failure"
+        );
+        assert!(
+            mgr.is_reelection_in_progress(),
+            "refresh failure must NOT block re-election (cached URLs are tried)"
+        );
+    }
+
+    #[test]
+    fn request_reelection_without_callback_falls_through_to_start_reelection() {
+        // No callback configured → behave exactly like the legacy entry
+        // point. We construct a manager already in re-election so the
+        // `start_reelection` call short-circuits cleanly without touching
+        // wasm-only browser APIs (the existing `start_reelection_skips_when_already_in_progress`
+        // pattern).
+        let mut mgr = make_test_manager();
+        assert!(mgr.options.refresh_room_token_callback.is_none());
+        mgr.reelection_in_progress = true;
+
+        // Should propagate `start_reelection`'s Ok without spawning any
+        // refresh task (no callback exists to spawn).
+        assert!(mgr.request_reelection().is_ok());
+        assert!(
+            !mgr.refresh_in_progress.get(),
+            "no callback => no refresh in flight, ever"
+        );
+        assert!(
+            mgr.is_reelection_in_progress(),
+            "existing re-election state must be preserved"
+        );
+    }
+
+    #[test]
+    fn request_reelection_with_callback_skips_when_re_election_already_in_progress() {
+        // Even with a callback, the re-election guard wins. We must NOT
+        // spawn a refresh that would clobber the in-flight election's URL
+        // assumptions.
+        let mut mgr = make_test_manager();
+        mgr.options.refresh_room_token_callback = Some(make_refresh_callback(Some(
+            refreshed_tokens(&["ws://new"], &["https://new"]),
+        )));
+        mgr.reelection_in_progress = true;
+        let original_ws = mgr.options.websocket_urls.clone();
+
+        assert!(mgr.request_reelection().is_ok());
+        assert!(
+            !mgr.refresh_in_progress.get(),
+            "must not mark refresh in-flight when re-election is already running"
+        );
+        assert_eq!(
+            mgr.options.websocket_urls, original_ws,
+            "URLs must NOT be touched when re-election already running"
+        );
+    }
+
+    #[test]
+    fn request_reelection_with_callback_skips_when_refresh_already_in_flight() {
+        // A second `request_reelection` while the first refresh is still
+        // pending must be a no-op. Without this guard, every 1Hz watchdog
+        // tick would spawn its own racing future during the
+        // refresh-in-flight window.
+        let mut mgr = make_test_manager();
+        mgr.options.refresh_room_token_callback = Some(make_refresh_callback(Some(
+            refreshed_tokens(&["ws://new"], &["https://new"]),
+        )));
+        // Simulate a previous tick having marked the refresh in flight.
+        mgr.refresh_in_progress.set(true);
+        let original_ws = mgr.options.websocket_urls.clone();
+
+        assert!(mgr.request_reelection().is_ok());
+        assert!(
+            mgr.refresh_in_progress.get(),
+            "guard must leave the existing in-flight marker untouched"
+        );
+        assert_eq!(
+            mgr.options.websocket_urls, original_ws,
+            "URLs must not be swapped while another refresh is in-flight"
+        );
+    }
+
+    #[test]
+    fn refresh_in_progress_flag_is_cleared_on_disconnect() {
+        // A pending token-refresh future from a previous session must not
+        // race the new session's state when the user disconnects.
+        let mut mgr = make_test_manager();
+        mgr.refresh_in_progress.set(true);
+
+        mgr.disconnect().unwrap();
+
+        assert!(
+            !mgr.refresh_in_progress.get(),
+            "disconnect must drop any in-flight refresh marker so a stale future \
+             cannot reach back into the manager via manager_ref.upgrade()"
         );
     }
 

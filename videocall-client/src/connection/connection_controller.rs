@@ -170,8 +170,17 @@ impl ConnectionController {
 
                         // Check whether the active connection's RTT has degraded
                         // enough to warrant a quality re-election.
+                        //
+                        // We call `request_reelection` instead of
+                        // `start_reelection` directly so that, when a
+                        // refresh callback is configured (Phase 3 /
+                        // AUTH-2), the manager refreshes the room token
+                        // before spawning candidates. This prevents
+                        // post-TTL re-elections from cascade-failing with
+                        // all candidates rejected by the relay. See
+                        // discussion #562.
                         if mgr.check_rtt_degradation() {
-                            if let Err(e) = mgr.start_reelection() {
+                            if let Err(e) = mgr.request_reelection() {
                                 log::error!("Failed to start re-election: {e}");
                             }
                         }
@@ -461,6 +470,7 @@ mod tests {
             instance_id: "test-instance-id".to_string(),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
             allow_post_rebase_retry: true,
+            refresh_room_token_callback: None,
         }
     }
 

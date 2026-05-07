@@ -97,12 +97,7 @@ async function updateMeeting(
     waiting_room_enabled?: boolean;
   },
 ): Promise<void> {
-  const res = await apiPatch(
-    `/api/v1/meetings/${meetingId}`,
-    hostEmail,
-    hostName,
-    settings,
-  );
+  const res = await apiPatch(`/api/v1/meetings/${meetingId}`, hostEmail, hostName, settings);
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`PATCH /api/v1/meetings/${meetingId} failed (${res.status}): ${body}`);
@@ -113,11 +108,7 @@ async function updateMeeting(
  * POST /join for an authenticated user. Returns the raw Response so callers
  * can inspect both success and error paths.
  */
-async function joinMeetingRaw(
-  email: string,
-  name: string,
-  meetingId: string,
-): Promise<Response> {
+async function joinMeetingRaw(email: string, name: string, meetingId: string): Promise<Response> {
   return apiPost(`/api/v1/meetings/${meetingId}/join`, email, name, {
     display_name: name,
   });

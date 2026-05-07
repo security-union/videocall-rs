@@ -591,14 +591,21 @@ impl ChatServer {
             None => return false,
         };
 
-        // Multi-device coexistence: if both the existing session and the
-        // new session carry distinct instance_ids, they represent different
-        // browser tabs or devices. Do not evict — let them coexist.
+        // Multi-device coexistence guard: if the existing session has a
+        // different instance_id from the newcomer AND has not yet been
+        // activated (no entry in `active_subs`), it represents a genuinely
+        // concurrent join from another device/tab that hasn't started
+        // publishing yet. Let them coexist.
+        //
+        // If the existing session IS activated, the new session is treated as
+        // a page-reload / rejoin: the client generated a fresh instance_id on
+        // `connect()`, but the user is the same — "latest joiner wins" and
+        // the stale session is evicted.
         if let (Some(prev_iid), Some(new_iid)) = (
             self.session_instance.get(&prev_sid),
             self.session_instance.get(&skip_session_id),
         ) {
-            if prev_iid != new_iid {
+            if prev_iid != new_iid && !self.active_subs.contains_key(&prev_sid) {
                 return false;
             }
         }

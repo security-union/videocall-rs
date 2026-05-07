@@ -139,6 +139,29 @@ fn build_outbound(data: Vec<u8>, is_media: bool, is_audio: bool) -> WtOutbound {
     }
 }
 
+/// Classify a dropped outbound packet for the
+/// `videocall_outbound_channel_drops_total{kind=...}` label.
+///
+/// Mirrors the WS site (`ws_chat_session::Handler<Message>`):
+/// * `parsed=false` → `"unknown"` — the upstream `PacketWrapper` parse
+///   failed, so we cannot trust `is_media`. Emit the same fallback the
+///   WS path uses so alerts tuned on `kind` behave consistently across
+///   transports (issue #610).
+/// * `parsed=true && is_media`  → `"media"`.
+/// * `parsed=true && !is_media` → `"control"`.
+///
+/// Extracted as a free function so the mapping can be unit-tested
+/// without spinning up a real `WtChatSession`.
+fn drop_kind_label(parsed: bool, is_media: bool) -> &'static str {
+    if !parsed {
+        "unknown"
+    } else if is_media {
+        "media"
+    } else {
+        "control"
+    }
+}
+
 impl WtChatSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -236,7 +259,20 @@ impl WtChatSession {
     /// The `is_media` and `is_audio` hints are pre-computed by the caller
     /// from an already-parsed `PacketWrapper` / `MediaPacket`, avoiding a
     /// redundant protobuf parse on every outbound packet.
-    fn send_auto(&self, data: Vec<u8>, is_media: bool, is_audio: bool) -> WtSendResult {
+    ///
+    /// `parsed` is a tri-state signal: `true` if the upstream
+    /// `PacketWrapper` parsed successfully (so `is_media` is trustworthy),
+    /// `false` if the parse failed and `is_media` is the safe-default
+    /// fallback (`false`). This is used only for the drop-counter `kind`
+    /// label so it matches the WS site's `unknown` fallback — routing
+    /// continues to honour the same safe default it always has.
+    fn send_auto(
+        &self,
+        data: Vec<u8>,
+        is_media: bool,
+        is_audio: bool,
+        parsed: bool,
+    ) -> WtSendResult {
         let outbound = build_outbound(data, is_media, is_audio);
 
         match self.outbound_tx.try_send(outbound) {
@@ -257,10 +293,17 @@ impl WtChatSession {
                 // alerting). `kind` is derived from the already-parsed
                 // `is_media` hint — we explicitly avoid an extra protobuf
                 // parse on the drop hot path.
+                //
+                // Issue #610: when the upstream parse failed (`parsed=false`)
+                // we cannot trust `is_media`, so emit `kind="unknown"` to
+                // match the WS site's fallback. Without this, malformed
+                // wire-bytes would silently inflate WT's `control` series
+                // while WS would distinguish them as `unknown`, breaking
+                // alerts tuned on the same label across transports.
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
                     .inc();
-                let kind = if is_media { "media" } else { "control" };
+                let kind = drop_kind_label(parsed, is_media);
                 OUTBOUND_CHANNEL_DROPS_TOTAL
                     .with_label_values(&["webtransport", kind])
                     .inc();
@@ -423,6 +466,10 @@ impl Handler<Message> for WtChatSession {
         // user_id, and packet_type. This avoids a redundant parse in send_auto
         // and ensures congestion tracking targets the correct (sender) session.
         let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
+        // Whether the outer `PacketWrapper` parsed at all. Threaded into
+        // `send_auto` so the drop-counter `kind` label can fall back to
+        // "unknown" on parse failure (issue #610) — matching the WS site.
+        let parse_succeeded = parsed.is_some();
         let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
         let sender_user_id = parsed
             .as_ref()
@@ -446,7 +493,7 @@ impl Handler<Message> for WtChatSession {
             false
         };
 
-        match self.send_auto(bytes, is_media, is_audio) {
+        match self.send_auto(bytes, is_media, is_audio, parse_succeeded) {
             WtSendResult::Sent => {}
             WtSendResult::Dead => {
                 ctx.stop();
@@ -741,5 +788,67 @@ mod tests {
             "is_audio without is_media should fall through to control routing, got {:?}",
             out
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #610: WT outbound-drop label parity with WS
+    //
+    // The WS site emits `kind="unknown"` when the upstream PacketWrapper
+    // parse fails. WT used to hard-code `kind="control"` for the same
+    // path because it lost the parse-success signal before reaching the
+    // drop counter. These tests lock in the new tri-state mapping so a
+    // future revert to the old `if is_media { "media" } else { "control" }`
+    // branch fails CI.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drop_kind_unknown_when_parse_failed() {
+        // Issue #610: when the outer PacketWrapper parse failed upstream,
+        // we cannot trust `is_media`, so the counter must record this
+        // drop as `kind="unknown"` to match the WS site.
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ false, /*is_media=*/ false),
+            "unknown",
+            "parse-fail must map to `unknown` regardless of is_media"
+        );
+        // Even if a stale `is_media=true` somehow propagates, parse-fail
+        // wins — we never want to attribute a malformed packet to `media`
+        // since we did not actually classify it.
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ false, /*is_media=*/ true),
+            "unknown",
+            "parse-fail must override stale is_media=true"
+        );
+    }
+
+    #[test]
+    fn drop_kind_media_when_parsed_and_is_media() {
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ true, /*is_media=*/ true),
+            "media",
+        );
+    }
+
+    #[test]
+    fn drop_kind_control_when_parsed_and_not_media() {
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ true, /*is_media=*/ false),
+            "control",
+        );
+    }
+
+    #[test]
+    fn drop_kind_label_emits_only_documented_values() {
+        // Guard against typos / future drift: the only kinds this mapping
+        // ever returns are the three documented in metrics.rs (`media`,
+        // `control`, `unknown`). The fourth documented value, `rtt`, is
+        // emitted by the inbound-echo path, not by this helper.
+        for (parsed, is_media) in [(false, false), (false, true), (true, false), (true, true)] {
+            let kind = drop_kind_label(parsed, is_media);
+            assert!(
+                matches!(kind, "media" | "control" | "unknown"),
+                "drop_kind_label returned unexpected kind={kind} for (parsed={parsed}, is_media={is_media})"
+            );
+        }
     }
 }

@@ -31,7 +31,7 @@ See [`values.yaml`](values.yaml) for all options. Notable:
 
 - `env` — list of environment variables passed to the container. `--set env[N]` overrides replace the entire list, so include everything you need.
 - `consoleLogs.enabled` — mounts a PVC at `/data/console-logs` to capture browser console uploads. Incompatible with replicas > 1 (ReadWriteOnce PVC). When enabled, the meeting-api process itself purges files older than `consoleLogs.retentionDays` at 00:00 UTC daily (see `meeting-api/src/console_log_purge.rs`); no separate CronJob is deployed.
-- `consoleLogs.retentionDays` — injected as `CONSOLE_LOG_RETENTION_DAYS` and read by the in-process purge scheduler (default 30).
+- `consoleLogs.retentionDays` — injected as `CONSOLE_LOG_RETENTION_DAYS` and read by the in-process purge scheduler (default 2). Short by design — browser console logs are primarily useful for diagnosing *yesterday's* incidents, and the 10 Gi PVC cannot hold a 30-day window at the per-user upload quota.
 - `consoleLogs.storageSize` — size of the `console-logs` PVC.
 - `ingress.enabled` / `ingress.hosts` — standard ingress config.
 - `resources` / `autoscaling` — standard.

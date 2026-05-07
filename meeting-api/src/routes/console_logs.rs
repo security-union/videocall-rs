@@ -71,11 +71,19 @@ pub(crate) const CONSOLE_LOG_RETENTION_DAYS_ENV: &str = "CONSOLE_LOG_RETENTION_D
 
 /// Default retention window (in days) used when `CONSOLE_LOG_RETENTION_DAYS`
 /// is unset or unparseable.
-pub(crate) const DEFAULT_RETENTION_DAYS: u32 = 30;
+pub(crate) const DEFAULT_RETENTION_DAYS: u32 = 2;
 
-/// Default per-user daily upload quota: 50 MB. Override with
+/// Default per-user daily upload quota: 500 MB. Override with
 /// `CONSOLE_LOG_USER_QUOTA_BYTES` env var.
-const DEFAULT_USER_QUOTA_BYTES: u64 = 50 * 1024 * 1024;
+///
+/// The quota is measured in **raw wire bytes** before server-side gzip, so the
+/// on-disk cost is ~8-10× smaller. 500 MB/day comfortably covers several long
+/// problem sessions where chatty logging (reconnects, AQ swings, PLI storms)
+/// can drive ~15-40 MB/hour while still tripping on a runaway `console.log`
+/// loop quickly enough to signal the issue via a 429 + `warn!`. Do not halve
+/// this without re-reading the discussion in the change that set it — a
+/// too-low cap silently cuts off logs precisely when they are most valuable.
+const DEFAULT_USER_QUOTA_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Per-user daily byte counter for rate limiting console log uploads.
 /// Key: user_id, Value: (day-of-year ordinal, bytes uploaded today).

@@ -64,6 +64,7 @@ fn build_app_with_nats(pool: sqlx::PgPool, nats: async_nats::Client) -> axum::Ro
         display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         search: None,
         allow_anonymous: true,
+        display_name_rate_limit_disabled: false,
         dev_user: None,
     };
     routes::router().with_state(state)

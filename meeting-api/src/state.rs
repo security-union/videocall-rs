@@ -62,6 +62,12 @@ pub struct AppState {
     /// Opt-in anonymous-auth fallback flag (mirrors [`crate::config::Config::allow_anonymous`]).
     /// Only intended for local development; guards path 3 in the auth extractor.
     pub allow_anonymous: bool,
+    /// Opt-in display-name rate-limit bypass (mirrors
+    /// [`crate::config::Config::display_name_rate_limit_disabled`]).  When
+    /// `true`, the per-user rename rate-limit check inside the join /
+    /// update-display-name handlers short-circuits to allow.  Only intended
+    /// for the E2E test harness — production must leave this `false`.
+    pub display_name_rate_limit_disabled: bool,
     /// Dev-only auto-login user. When `Some`, `GET /api/v1/dev/auto-login`
     /// issues a session cookie for this identity without any authentication.
     pub dev_user: Option<DevUser>,
@@ -106,6 +112,7 @@ impl AppState {
             display_name_rate_limiter_ops: Arc::new(AtomicU64::new(0)),
             search: config.search.clone(),
             allow_anonymous: config.allow_anonymous,
+            display_name_rate_limit_disabled: config.display_name_rate_limit_disabled,
             dev_user: config.dev_user.clone(),
         }
     }

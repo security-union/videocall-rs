@@ -226,6 +226,14 @@ async fn meeting_ended_by_host_consumer_marks_meeting_ended() {
         nats_consumers::spawn_meeting_ended_by_host_consumer(Some(nats.clone()), pool.clone())
             .expect("Consumer should be spawned when NATS is available");
 
+    // Allow time for the spawned task's `nats.subscribe()` to complete.
+    // The subscribe call runs inside a `tokio::spawn`ed task and there is
+    // no synchronization point back to the test. Without this yield the
+    // publish can arrive at NATS before the subscription is established,
+    // causing the consumer to never see the message (flaky failure).
+    // 100ms is generous — subscribe round-trips in <1ms on local NATS.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     // Publish the synthetic host-leave payload. In production this comes
     // from chat_server's leave_rooms host-broadcast path.
     let payload = MeetingEndedByHostPayload {

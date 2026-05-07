@@ -221,7 +221,17 @@ test.describe("Host-gone join check", () => {
       hostName,
       {},
     );
-    // Proceed whether or not the admit succeeds (meeting may auto-admit in some configs).
+    // Discard the result intentionally.  The test's goal is to verify the
+    // late-joiner path — not the admit path — and the admit is best-effort
+    // setup scaffolding.  Two known reasons it may fail without affecting
+    // test validity:
+    //   1. Timing: the WR join request races with the admit call; if the
+    //      participant row isn't yet committed the endpoint returns 404.
+    //   2. Config drift: if a future CI change pre-admits participants (e.g.
+    //      via admitted_can_admit=true), the endpoint becomes a no-op and
+    //      may return a non-2xx status that is still correct behaviour.
+    // Either way, Attendee A's presence in the meeting (which keeps it alive
+    // after the host leaves) is confirmed implicitly by step 4 succeeding.
     void admitRes;
 
     // 4. Host leaves.

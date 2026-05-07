@@ -55,6 +55,14 @@ services:
       - AFTER_LOGIN_URL=http://localhost:3001
       - ALLOWED_REDIRECT_URLS=http://localhost:3001
       - NATS_URL=nats:4222
+      # Bypass the per-user display-name rename rate limiter (5 renames per
+      # 60s window) — the Playwright suite runs many tests under the same
+      # `dev_user` identity, and shared parallel workers legitimately exceed
+      # the production budget across one window. Without this bypass, every
+      # `POST /api/v1/meetings/{id}/join` after the first ~5 fails with 429
+      # (`RATE_LIMIT_EXCEEDED`) and the cascade times out downstream
+      # `toBeVisible()` assertions. See issue #608.
+      - DISPLAY_NAME_RATE_LIMIT_DISABLED=true
       - RUST_LOG=info
       - CARGO_TARGET_DIR=/app/meeting-api/target
       - CARGO_INCREMENTAL=1

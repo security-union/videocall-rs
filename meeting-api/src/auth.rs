@@ -355,6 +355,9 @@ mod tests {
             // themselves.  Tests that want to verify 401-on-missing-credentials
             // use `make_test_state_with_oauth()` which overrides this.
             allow_anonymous: true,
+            // Match production default — auth tests don't exercise the
+            // rename rate-limit path at all.
+            display_name_rate_limit_disabled: false,
             dev_user: None,
         }
     }
@@ -691,6 +694,7 @@ mod tests {
             // JWKS-mode tests exercise the OAuth path; unauthenticated
             // requests must not fall through to an anonymous identity.
             allow_anonymous: false,
+            display_name_rate_limit_disabled: false,
             dev_user: None,
         }
     }

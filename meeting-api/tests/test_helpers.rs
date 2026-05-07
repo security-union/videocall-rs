@@ -74,6 +74,7 @@ pub fn build_app(pool: PgPool) -> Router {
         // Match production default: anonymous access is NOT allowed.
         // Tests that need authenticated access use `request_with_cookie`.
         allow_anonymous: false,
+        display_name_rate_limit_disabled: false,
         dev_user: None,
     };
     routes::router().with_state(state)

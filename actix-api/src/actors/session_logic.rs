@@ -411,17 +411,24 @@ impl SessionLogic {
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
                 InboundAction::Processed
             }
-            PacketKind::KeyframeRequest => {
+            PacketKind::KeyframeRequest { target_user_id } => {
                 if self.observer {
                     return InboundAction::Processed;
                 }
-                // Rate-limit KEYFRAME_REQUEST packets to prevent abuse.
-                // A malicious client could flood these to force senders to
-                // continuously generate expensive keyframes.
-                if !self.keyframe_limiter.allow() {
+                // Rate-limit KEYFRAME_REQUEST packets per
+                // `(receiver, target_sender)` pair. The per-pair dimension
+                // is what allows a fresh joiner into a populated room to
+                // request keyframes from every existing sender within the
+                // first second after joining without being clipped — the
+                // fix for the frozen-video-on-join bug. A coarser global
+                // cap inside the limiter still bounds total fan-out as a
+                // defense against abuse.
+                if !self.keyframe_limiter.allow(&target_user_id) {
                     warn!(
-                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {})",
-                        self.id, self.user_id
+                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting {}",
+                        self.id,
+                        self.user_id,
+                        String::from_utf8_lossy(&target_user_id),
                     );
                     return InboundAction::Processed;
                 }

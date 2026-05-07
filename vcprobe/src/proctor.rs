@@ -102,6 +102,7 @@ async fn run_inner(
             // Keyboard input
             maybe_event = event_stream.next() => {
                 match maybe_event {
+                    #[allow(clippy::collapsible_match)]
                     Some(Ok(Event::Key(key))) => {
                         if handle_key(key, &state, &mut view) {
                             break;

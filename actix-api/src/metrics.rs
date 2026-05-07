@@ -568,4 +568,149 @@ lazy_static! {
         &["room", "direction"]
     )
     .expect("Failed to create relay_room_bytes_total metric");
+
+    // ===== AUTH & TRANSPORT TELEMETRY (Phase 8b — TELEM-7, TELEM-8, AUTH-3) =====
+    //
+    // These counters back the alerting rules that fire when JWT rejection rate
+    // or relay outbound-channel drops cross threshold. Designed so on-call can
+    // query rate(...)[5m] without log scraping. See discussion #562 Phase 8b.
+
+    /// JWT room-token rejections, labeled by reason.
+    ///
+    /// CARDINALITY: bounded — exactly 5 series (`token_expired`, `invalid_signature`,
+    /// `missing_claim`, `malformed`, `other`). Safe for indefinite retention.
+    ///
+    /// Incremented from `token_validator::decode_room_token` and
+    /// `validate_room_token` on the error-return path so every JWT auth failure
+    /// is counted regardless of whether it came from the WS or WT entry point.
+    pub static ref AUTH_REJECTIONS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_auth_rejections_total",
+        "Total JWT room-token rejections by reason",
+        &["reason"]
+    )
+    .expect("Failed to create videocall_auth_rejections_total metric");
+
+    /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
+    ///
+    /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
+    /// `kind` is one of `media`|`control`|`rtt`|`unknown`. ~8 series total.
+    ///
+    /// CARDINALITY TRADE-OFF: We deliberately do NOT include `session_id` as a
+    /// label — session IDs are unbounded and would explode storage. The existing
+    /// `relay_packet_drops_total` carries `room` for room-level attribution; this
+    /// new counter is the protocol-wide aggregate that backs alerting (rate()
+    /// over 5m). Use `relay_packet_drops_total` for per-room investigation.
+    ///
+    /// `kind` values:
+    /// - `media`: derived from `PacketWrapper.packet_type == MEDIA` (already
+    ///   parsed by the caller in `wt_chat_session::Handler<Message>`)
+    /// - `control`: any non-media outbound (heartbeats, session-assigned, etc.)
+    /// - `rtt`: RTT echo path that drops on a full datagram queue
+    /// - `unknown`: caller could not classify (parse failure / unparsed paths)
+    pub static ref OUTBOUND_CHANNEL_DROPS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_outbound_channel_drops_total",
+        "Total outbound channel drops (try_send full) by transport and packet kind",
+        &["transport", "kind"]
+    )
+    .expect("Failed to create videocall_outbound_channel_drops_total metric");
+}
+
+// =============================================================================
+// Phase 8b unit tests
+// =============================================================================
+//
+// These tests verify the counter wiring in isolation. End-to-end behavior is
+// covered by `token_validator::tests` (auth) and is the responsibility of the
+// integration test suite for the transport drop sites.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Snapshot the counter, mutate, and assert delta. The counter is a global
+    /// static so any concurrent test in the same process could alter it; we
+    /// gate with `#[serial]` to keep deltas exact.
+    fn snapshot(counter: &CounterVec, labels: &[&str]) -> f64 {
+        counter.with_label_values(labels).get()
+    }
+
+    #[test]
+    #[serial(outbound_channel_drops_metric)]
+    fn outbound_channel_drops_increments_per_kind() {
+        let kinds = ["media", "control", "rtt", "unknown"];
+        let before: Vec<f64> = kinds
+            .iter()
+            .map(|k| snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", k]))
+            .collect();
+
+        for k in &kinds {
+            OUTBOUND_CHANNEL_DROPS_TOTAL
+                .with_label_values(&["webtransport", k])
+                .inc();
+        }
+
+        for (i, k) in kinds.iter().enumerate() {
+            let after = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", k]);
+            assert_eq!(
+                after - before[i],
+                1.0,
+                "kind={k} should have incremented exactly once"
+            );
+        }
+    }
+
+    #[test]
+    #[serial(outbound_channel_drops_metric)]
+    fn outbound_channel_drops_distinguishes_transport_label() {
+        // Verify that `webtransport` and `websocket` series are independent —
+        // bumping one must not bump the other. This is a regression guard:
+        // mistakenly hard-coding "webtransport" in the WS path would cause
+        // the WS counter to silently stay at zero in production.
+        let wt_before = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", "media"]);
+        let ws_before = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["websocket", "media"]);
+        OUTBOUND_CHANNEL_DROPS_TOTAL
+            .with_label_values(&["websocket", "media"])
+            .inc();
+        let wt_after = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", "media"]);
+        let ws_after = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["websocket", "media"]);
+        assert_eq!(
+            ws_after - ws_before,
+            1.0,
+            "websocket+media bump should land on the websocket series"
+        );
+        assert_eq!(
+            wt_after - wt_before,
+            0.0,
+            "websocket+media bump must not leak into the webtransport series"
+        );
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn auth_rejections_counter_is_labeled_by_reason() {
+        // Cardinality contract: only the five documented reasons are valid
+        // labels. This test bumps each one and asserts independence.
+        let reasons = [
+            "token_expired",
+            "invalid_signature",
+            "missing_claim",
+            "malformed",
+            "other",
+        ];
+        let before: Vec<f64> = reasons
+            .iter()
+            .map(|r| snapshot(&AUTH_REJECTIONS_TOTAL, &[r]))
+            .collect();
+        for r in &reasons {
+            AUTH_REJECTIONS_TOTAL.with_label_values(&[r]).inc();
+        }
+        for (i, r) in reasons.iter().enumerate() {
+            let after = snapshot(&AUTH_REJECTIONS_TOTAL, &[r]);
+            assert_eq!(
+                after - before[i],
+                1.0,
+                "reason={r} should have incremented exactly once"
+            );
+        }
+    }
 }

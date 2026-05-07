@@ -29,6 +29,7 @@ use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
 use log::debug;
 use protobuf::Message;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -817,12 +818,36 @@ pub struct PeerDecodeManager {
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Rc<DiagnosticManager>>,
     pub on_peer_removed: Callback<String>,
+    /// Batched companion of `on_peer_removed` fired once per
+    /// `run_peer_monitor` pass with **all** peers removed in that pass.
+    ///
+    /// Phase 6 watchdog-cascade fix (cc7tp 2026-05-06): when N peers time
+    /// out together (e.g. a network blip drops 5 simultaneously), the
+    /// per-peer `on_peer_removed.emit(...)` loop triggered N consecutive
+    /// `peer_list_version` bumps in the dioxus UI, each of which forced a
+    /// full meeting-view re-render before the next removal completed. On
+    /// 2-core machines this could chain into a 5-second main-thread stall
+    /// that itself tripped the CPU-stall guard. Subscribers that only need
+    /// "something changed" (e.g. version bumps) should listen on this
+    /// callback and bump exactly once per pass; subscribers that need
+    /// per-peer cleanup (e.g. removing entries from per-peer maps) keep
+    /// using `on_peer_removed`. Both fire — they are not mutually
+    /// exclusive.
+    pub on_peers_removed_batch: Callback<Vec<String>>,
     vad_threshold: Option<f32>,
     /// Callback for sending packets back through the connection (used for
     /// KEYFRAME_REQUEST). Set by `VideoCallClient` after construction.
     send_packet: Option<Callback<PacketWrapper>>,
     /// The local user_id, needed to construct outgoing KEYFRAME_REQUEST packets.
     local_user_id: String,
+    /// Cached snapshot of `connected_peers.ordered_keys()` rendered as
+    /// `Vec<String>`. Phase 6 fix: avoids walking the ordered key list and
+    /// allocating a fresh `Vec<String>` on every `sorted_peer_keys()` call
+    /// from the UI render path. Held as `Rc<Vec<String>>` so a single
+    /// allocation can be shared cheaply across many callers within one
+    /// render frame. Invalidated to `None` whenever the peer set changes
+    /// (insert / remove / drain) — see `invalidate_sorted_string_keys()`.
+    cached_sorted_string_keys: RefCell<Option<Rc<Vec<String>>>>,
 }
 
 impl Default for PeerDecodeManager {
@@ -842,9 +867,11 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
             on_peer_removed: Callback::noop(),
+            on_peers_removed_batch: Callback::noop(),
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            cached_sorted_string_keys: RefCell::new(None),
         }
     }
 
@@ -858,9 +885,11 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: Some(diagnostics),
             on_peer_removed: Callback::noop(),
+            on_peers_removed_batch: Callback::noop(),
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            cached_sorted_string_keys: RefCell::new(None),
         }
     }
 
@@ -939,6 +968,38 @@ impl PeerDecodeManager {
         self.connected_peers.ordered_keys()
     }
 
+    /// Memoised string-form of [`sorted_keys`] for hot UI render paths.
+    ///
+    /// Phase 6 fix (cc7tp 2026-05-06): the dioxus meeting view called
+    /// `VideoCallClient::sorted_peer_keys()` on every render, which used
+    /// to walk the ordered-key list and clone each `u64` into a fresh
+    /// `String`. With many peers and a render-storm bug bumping
+    /// `peer_list_version` 20+ times per second, that allocation cost
+    /// became measurable on 2-core hardware. The cache stores the
+    /// rendered `Vec<String>` inside an `Rc` so successive callers in
+    /// the same frame share one allocation, and is invalidated by
+    /// [`invalidate_sorted_string_keys`] whenever the peer set changes.
+    pub fn sorted_string_keys(&self) -> Rc<Vec<String>> {
+        if let Some(existing) = self.cached_sorted_string_keys.borrow().as_ref() {
+            return Rc::clone(existing);
+        }
+        let computed: Rc<Vec<String>> = Rc::new(
+            self.connected_peers
+                .ordered_keys()
+                .iter()
+                .map(|k| k.to_string())
+                .collect(),
+        );
+        *self.cached_sorted_string_keys.borrow_mut() = Some(Rc::clone(&computed));
+        computed
+    }
+
+    /// Invalidate the [`sorted_string_keys`] cache. Called from every code
+    /// path that mutates the peer set. Cheap (sets one `Option` to `None`).
+    fn invalidate_sorted_string_keys(&self) {
+        *self.cached_sorted_string_keys.borrow_mut() = None;
+    }
+
     pub fn get(&self, key: &u64) -> Option<&Peer> {
         self.connected_peers.get(key)
     }
@@ -989,6 +1050,15 @@ impl PeerDecodeManager {
             }
             removed_ids.push(peer.sid_str.clone());
             self.on_peer_removed.emit(peer.sid_str);
+        }
+        if !removed_ids.is_empty() {
+            // Invalidate the sorted-keys cache and emit a single batched
+            // event so subscribers that only care about "something
+            // changed" can coalesce their work (e.g. a single
+            // peer_list_version bump on the dioxus side, instead of one
+            // per dead peer). See Phase 6 watchdog-cascade fix.
+            self.invalidate_sorted_string_keys();
+            self.on_peers_removed_batch.emit(removed_ids.clone());
         }
         removed_ids
     }
@@ -1141,6 +1211,9 @@ impl PeerDecodeManager {
             peer.display_name = Some(cached_name.clone());
         }
         self.connected_peers.insert(session_id, peer);
+        // Phase 6: invalidate the sorted-keys cache so the next
+        // `sorted_string_keys()` call rebuilds with the new peer.
+        self.invalidate_sorted_string_keys();
         Ok(())
     }
 
@@ -1151,7 +1224,15 @@ impl PeerDecodeManager {
             }
             self.display_name_cache.remove(&session_id);
             self.is_guest_cache.remove(&session_id);
+            // Phase 6: invalidate the sorted-keys cache before notifying
+            // observers so any read in the callback sees a fresh list.
+            self.invalidate_sorted_string_keys();
+            let sid_str = peer.sid_str.clone();
             self.on_peer_removed.emit(peer.sid_str);
+            // Single-peer removals also fire the batched callback so
+            // subscribers can coalesce on it without subscribing to two
+            // separate notifications.
+            self.on_peers_removed_batch.emit(vec![sid_str]);
         }
     }
 
@@ -1161,16 +1242,25 @@ impl PeerDecodeManager {
     /// consume WASM memory while the client reconnects.
     pub fn clear_all_peers(&mut self) {
         let removed = self.connected_peers.drain_all();
+        let mut removed_ids: Vec<String> = Vec::with_capacity(removed.len());
         for (_session_id, peer) in removed {
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
+            removed_ids.push(peer.sid_str.clone());
             self.on_peer_removed.emit(peer.sid_str);
         }
         // Clear the display name cache so stale names don't persist
         // across reconnections.
         self.display_name_cache.clear();
         self.is_guest_cache.clear();
+        // Phase 6: invalidate the sorted-keys cache and emit a single
+        // batched event so observers can coalesce the bulk-clear into
+        // one notification.
+        self.invalidate_sorted_string_keys();
+        if !removed_ids.is_empty() {
+            self.on_peers_removed_batch.emit(removed_ids);
+        }
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
@@ -1258,11 +1348,18 @@ impl PeerDecodeManager {
     }
 
     /// Get the display name for a peer by session_id string.
+    ///
+    /// Checks the live peer entry first, then falls back to the persistent
+    /// `display_name_cache` (populated by PARTICIPANT_JOINED events that may
+    /// arrive before the first media packet creates the peer entry).
     pub fn get_peer_display_name(&self, session_id_str: &str) -> Option<String> {
         let sid: u64 = session_id_str.parse().ok()?;
-        self.connected_peers
-            .get(&sid)
-            .and_then(|peer| peer.display_name.clone())
+        if let Some(peer) = self.connected_peers.get(&sid) {
+            if peer.display_name.is_some() {
+                return peer.display_name.clone();
+            }
+        }
+        self.display_name_cache.get(&sid).cloned()
     }
 
     /// Get the server-vouched guest status for a peer by session_id string.
@@ -1446,6 +1543,7 @@ mod tests {
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
@@ -3224,13 +3322,12 @@ mod tests {
         let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
         let collected_clone = collected.clone();
 
-        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
             collected_clone.borrow_mut().push(pkt);
         });
 
         let mut manager = PeerDecodeManager::new();
-        manager.set_local_user_id("me@example.com".to_string());
-        manager.send_packet = Some(callback);
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
 
         // Clear the send counter baseline.
         let baseline = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
@@ -3279,13 +3376,12 @@ mod tests {
     fn set_active_decode_set_sends_video_pli_for_newly_visible_peers() {
         let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
         let collected_clone = collected.clone();
-        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
             collected_clone.borrow_mut().push(pkt);
         });
 
         let mut manager = PeerDecodeManager::new();
-        manager.set_local_user_id("me@example.com".to_string());
-        manager.send_packet = Some(callback);
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
 
         // Insert N=4 peers, all with video_enabled=true and currently invisible.
         let peer_ids = [500u64, 501, 502, 503];
@@ -3314,6 +3410,7 @@ mod tests {
                 has_received_heartbeat: false,
                 is_speaking: false,
                 audio_level: 0.0,
+                transport_type: TransportType::TRANSPORT_UNKNOWN,
                 vad_threshold: None,
                 video_seq_tracker: SequenceTracker::new(),
                 screen_seq_tracker: SequenceTracker::new(),
@@ -3368,13 +3465,12 @@ mod tests {
     fn set_active_decode_set_no_duplicate_plis_on_same_set() {
         let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
         let collected_clone = collected.clone();
-        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
             collected_clone.borrow_mut().push(pkt);
         });
 
         let mut manager = PeerDecodeManager::new();
-        manager.set_local_user_id("me@example.com".to_string());
-        manager.send_packet = Some(callback);
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
 
         let (mock_audio, _) = MockAudioDecoder::new();
         let peer = Peer {
@@ -3399,6 +3495,7 @@ mod tests {
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
@@ -3424,13 +3521,12 @@ mod tests {
     fn set_active_decode_set_no_pli_for_camera_off_peer() {
         let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
         let collected_clone = collected.clone();
-        let callback = crate::utils::Callback::from(move |pkt: PacketWrapper| {
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
             collected_clone.borrow_mut().push(pkt);
         });
 
         let mut manager = PeerDecodeManager::new();
-        manager.set_local_user_id("me@example.com".to_string());
-        manager.send_packet = Some(callback);
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
 
         let (mock_audio, _) = MockAudioDecoder::new();
         let peer = Peer {
@@ -3455,6 +3551,7 @@ mod tests {
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
@@ -3467,6 +3564,301 @@ mod tests {
             collected.borrow().len(),
             0,
             "No PLI should be sent for a peer with camera off"
+        );
+    }
+
+    // -- display_name_cache fallback tests ------------------------------------
+
+    /// When PARTICIPANT_JOINED seeds the cache before the first media packet
+    /// creates the peer entry, `get_peer_display_name` should return the
+    /// cached value via `display_name_cache` fallback.
+    #[wasm_bindgen_test]
+    fn display_name_cache_fallback_when_no_peer_entry() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 200;
+
+        // No peer entry exists yet — simulates PARTICIPANT_JOINED arriving
+        // before the first media packet.
+        manager.set_peer_display_name(session_id, "Alice".to_string());
+
+        // get_peer_display_name should find the name in the cache fallback.
+        let name = manager.get_peer_display_name(&session_id.to_string());
+        assert_eq!(
+            name,
+            Some("Alice".to_string()),
+            "should fall back to display_name_cache when peer entry is missing"
+        );
+    }
+
+    /// When a peer entry exists WITH a display_name, the peer entry value
+    /// takes priority over the cache.
+    #[wasm_bindgen_test]
+    fn display_name_peer_entry_takes_priority_over_cache() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 201;
+
+        // Seed cache with one name.
+        manager.set_peer_display_name(session_id, "OldName".to_string());
+
+        // Manually insert a peer entry with a different display name.
+        let (mut peer, _muted) = make_test_peer(session_id);
+        peer.display_name = Some("NewName".to_string());
+        manager.connected_peers.insert(session_id, peer);
+
+        let name = manager.get_peer_display_name(&session_id.to_string());
+        assert_eq!(
+            name,
+            Some("NewName".to_string()),
+            "peer entry display_name should take priority over cache"
+        );
+    }
+
+    /// When a peer entry exists but display_name is None, the cache fallback
+    /// should be used. This is the key scenario for the host display-name bug:
+    /// media packets create the peer entry, but PARTICIPANT_JOINED (which
+    /// populates display_name) never fires for the local user.
+    #[wasm_bindgen_test]
+    fn display_name_cache_fallback_when_peer_has_no_name() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 202;
+
+        // Seed cache (e.g. from SESSION_ASSIGNED or earlier PARTICIPANT_JOINED).
+        manager.set_peer_display_name(session_id, "HostUser".to_string());
+
+        // Insert a peer entry WITHOUT display_name (simulates add_peer called
+        // before cache was populated, or cache was populated for a different
+        // reason).
+        let (peer, _muted) = make_test_peer(session_id);
+        assert!(peer.display_name.is_none());
+        manager.connected_peers.insert(session_id, peer);
+
+        let name = manager.get_peer_display_name(&session_id.to_string());
+        assert_eq!(
+            name,
+            Some("HostUser".to_string()),
+            "should fall back to cache when peer entry has no display_name"
+        );
+    }
+
+    /// No peer entry and no cache → should return None.
+    #[wasm_bindgen_test]
+    fn display_name_returns_none_when_completely_unknown() {
+        let manager = PeerDecodeManager::new();
+        let name = manager.get_peer_display_name("999");
+        assert_eq!(name, None, "should return None for unknown session_id");
+    }
+
+    // -- Phase 6: sorted_string_keys memoisation tests --------------------
+
+    /// Insert a peer, then call `sorted_string_keys()` twice. The two
+    /// returned `Rc<Vec<String>>` should point at the **same** allocation
+    /// (verified via `Rc::ptr_eq`) because no peer-set mutation happened
+    /// between the calls. This is the core caching contract.
+    #[wasm_bindgen_test]
+    fn sorted_string_keys_returns_cached_rc_when_unchanged() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(700);
+        manager.connected_peers.insert(700, peer);
+
+        let first = manager.sorted_string_keys();
+        let second = manager.sorted_string_keys();
+
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "sorted_string_keys should return the same Rc on back-to-back calls"
+        );
+        assert_eq!(*first, vec!["700".to_string()]);
+    }
+
+    /// Adding a peer must invalidate the cache: the next call returns a
+    /// fresh `Rc` (not pointer-equal to the prior one) and reflects the
+    /// new peer set.
+    #[wasm_bindgen_test]
+    fn sorted_string_keys_invalidates_on_add_peer() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer1, _muted1) = make_test_peer(710);
+        manager.connected_peers.insert(710, peer1);
+
+        let first = manager.sorted_string_keys();
+        assert_eq!(*first, vec!["710".to_string()]);
+
+        // Add a second peer through the public API so invalidation runs.
+        manager
+            .add_peer("user711@test.com", 711, None)
+            .expect("add_peer should succeed");
+
+        let second = manager.sorted_string_keys();
+        assert!(
+            !Rc::ptr_eq(&first, &second),
+            "cache must be invalidated after add_peer"
+        );
+        assert_eq!(second.len(), 2, "fresh result should include both peers");
+        assert!(second.contains(&"710".to_string()));
+        assert!(second.contains(&"711".to_string()));
+    }
+
+    /// Removing a peer via `delete_peer` must also invalidate the cache.
+    #[wasm_bindgen_test]
+    fn sorted_string_keys_invalidates_on_delete_peer() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer1, _muted1) = make_test_peer(720);
+        let (peer2, _muted2) = make_test_peer(721);
+        manager.connected_peers.insert(720, peer1);
+        manager.connected_peers.insert(721, peer2);
+
+        let first = manager.sorted_string_keys();
+        assert_eq!(first.len(), 2);
+
+        manager.delete_peer(720);
+
+        let second = manager.sorted_string_keys();
+        assert!(
+            !Rc::ptr_eq(&first, &second),
+            "cache must be invalidated after delete_peer"
+        );
+        assert_eq!(*second, vec!["721".to_string()]);
+    }
+
+    /// `clear_all_peers` must invalidate the cache; subsequent reads
+    /// return an empty `Vec`.
+    #[wasm_bindgen_test]
+    fn sorted_string_keys_invalidates_on_clear_all() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(730);
+        manager.connected_peers.insert(730, peer);
+
+        let first = manager.sorted_string_keys();
+        assert_eq!(first.len(), 1);
+
+        manager.clear_all_peers();
+
+        let second = manager.sorted_string_keys();
+        assert!(
+            !Rc::ptr_eq(&first, &second),
+            "cache must be invalidated after clear_all_peers"
+        );
+        assert!(second.is_empty(), "after clear_all the cache is empty");
+    }
+
+    // -- Phase 6: batched on_peers_removed_batch test ---------------------
+
+    /// Synthesise 5 peers timing out in the same `run_peer_monitor` pass
+    /// and assert:
+    ///   - `on_peer_removed` fires 5 times (per-peer)
+    ///   - `on_peers_removed_batch` fires **exactly once** with all 5 IDs
+    ///   - the returned `removed_ids` Vec contains all 5
+    ///
+    /// Reproduces the cc7tp 2026-05-06 watchdog cascade: without
+    /// batching, 5 simultaneous peer removals triggered 5 sequential
+    /// `peer_list_version` bumps in the dioxus UI, each forcing a full
+    /// re-render before the next removal completed.
+    #[wasm_bindgen_test]
+    fn run_peer_monitor_emits_single_batch_for_simultaneous_timeouts() {
+        let mut manager = PeerDecodeManager::new();
+
+        // Wire callbacks. We use shared Rc<RefCell<Vec<...>>> sinks so
+        // tests can inspect the per-peer and batched sequences.
+        let per_peer_sink: Rc<std::cell::RefCell<Vec<String>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let batch_sink: Rc<std::cell::RefCell<Vec<Vec<String>>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        {
+            let sink = per_peer_sink.clone();
+            manager.on_peer_removed = Callback::from(move |sid: String| {
+                sink.borrow_mut().push(sid);
+            });
+        }
+        {
+            let sink = batch_sink.clone();
+            manager.on_peers_removed_batch = Callback::from(move |sids: Vec<String>| {
+                sink.borrow_mut().push(sids);
+            });
+        }
+
+        // Insert 5 peers and force them into the "about to time out"
+        // state: missed_heartbeat_checks=2, activity_count=0. The next
+        // run_peer_monitor pass increments to 3, which triggers removal.
+        let session_ids: [u64; 5] = [801, 802, 803, 804, 805];
+        for sid in &session_ids {
+            let (mut peer, _muted) = make_test_peer(*sid);
+            peer.activity_count = 0;
+            peer.missed_heartbeat_checks = 2;
+            manager.connected_peers.insert(*sid, peer);
+        }
+        assert_eq!(manager.connected_peers.ordered_keys().len(), 5);
+
+        let removed_ids = manager.run_peer_monitor();
+
+        // All 5 peers should be in removed_ids.
+        assert_eq!(
+            removed_ids.len(),
+            5,
+            "all 5 dead peers should be returned by run_peer_monitor"
+        );
+        // The peer set should now be empty.
+        assert_eq!(
+            manager.connected_peers.ordered_keys().len(),
+            0,
+            "all dead peers should be removed from the peer map"
+        );
+
+        // Per-peer callback fires once per dead peer.
+        assert_eq!(
+            per_peer_sink.borrow().len(),
+            5,
+            "on_peer_removed should fire once per dead peer"
+        );
+
+        // Batch callback fires exactly once with all 5 IDs.
+        let batches = batch_sink.borrow();
+        assert_eq!(
+            batches.len(),
+            1,
+            "on_peers_removed_batch should fire exactly once for the whole pass"
+        );
+        let batch = &batches[0];
+        assert_eq!(
+            batch.len(),
+            5,
+            "the single batch should contain all 5 removed peer IDs"
+        );
+        for sid in &session_ids {
+            assert!(
+                batch.contains(&sid.to_string()),
+                "batch should include peer {sid}"
+            );
+        }
+    }
+
+    /// `run_peer_monitor` with no dead peers must NOT fire the batch
+    /// callback. Only fires when there is something to report.
+    #[wasm_bindgen_test]
+    fn run_peer_monitor_no_dead_peers_skips_batch_callback() {
+        let mut manager = PeerDecodeManager::new();
+        let batch_sink: Rc<std::cell::RefCell<Vec<Vec<String>>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let sink = batch_sink.clone();
+            manager.on_peers_removed_batch = Callback::from(move |sids: Vec<String>| {
+                sink.borrow_mut().push(sids);
+            });
+        }
+
+        // make_test_peer initialises activity_count=1, so check_heartbeat
+        // returns true — the peer is alive.
+        let (peer, _muted) = make_test_peer(810);
+        manager.connected_peers.insert(810, peer);
+
+        let removed = manager.run_peer_monitor();
+        assert!(
+            removed.is_empty(),
+            "no peers should be removed when all are alive"
+        );
+        assert_eq!(
+            batch_sink.borrow().len(),
+            0,
+            "batch callback must not fire when no peers were removed"
         );
     }
 }

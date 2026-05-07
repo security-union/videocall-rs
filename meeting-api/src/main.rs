@@ -123,6 +123,11 @@ async fn main() {
     let _ended_consumer =
         nats_consumers::spawn_meeting_ended_by_host_consumer(nats.clone(), pool.clone());
 
+    // Spawn the in-process console-log retention task. Returns `None` (no-op)
+    // when `CONSOLE_LOG_UPLOAD_ENABLED` is not `"true"`. The handle is leaked
+    // for the life of the process, mirroring the NATS consumer above.
+    let _purge_handle = meeting_api::console_log_purge::spawn_purge_task();
+
     let state = AppState::new(pool, &config, nats);
     let app = routes::router().layer(cors).with_state(state);
 

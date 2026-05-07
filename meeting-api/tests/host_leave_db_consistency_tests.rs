@@ -64,6 +64,7 @@ fn build_app_with_nats(pool: sqlx::PgPool, nats: async_nats::Client) -> axum::Ro
         display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         search: None,
         allow_anonymous: true,
+        display_name_rate_limit_disabled: false,
         dev_user: None,
     };
     routes::router().with_state(state)
@@ -173,8 +174,6 @@ async fn patch_meeting_publishes_internal_settings_update() {
 #[tokio::test]
 #[serial]
 async fn meeting_ended_by_host_consumer_marks_meeting_ended() {
-    use meeting_api::nats_consumers;
-
     let Some(nats) = maybe_connect_nats().await else {
         eprintln!("NATS_URL not set — skipping host_leave integration test");
         return;
@@ -221,10 +220,30 @@ async fn meeting_ended_by_host_consumer_marks_meeting_ended() {
         "Test precondition: meeting should be active before the simulated host-leave NATS event"
     );
 
-    // Spawn the consumer (the way main.rs does it).
-    let _handle =
-        nats_consumers::spawn_meeting_ended_by_host_consumer(Some(nats.clone()), pool.clone())
-            .expect("Consumer should be spawned when NATS is available");
+    // Spawn the consumer (the way main.rs does it), but use the ready-signal
+    // variant so we know the subscription is live before we publish.
+    // Without this, there is a window between spawn() returning and the
+    // task's subscribe() call completing where a published message is lost.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let _handle = meeting_api::nats_consumers::spawn_consumer_inner(
+        Some(nats.clone()),
+        pool.clone(),
+        Some(ready_tx),
+    )
+    .expect("Consumer should be spawned when NATS is available");
+
+    // Wait for the subscription to be established before publishing.
+    ready_rx
+        .await
+        .expect("Consumer must signal subscription readiness");
+
+    // Allow time for the spawned task's `nats.subscribe()` to complete.
+    // The subscribe call runs inside a `tokio::spawn`ed task and there is
+    // no synchronization point back to the test. Without this yield the
+    // publish can arrive at NATS before the subscription is established,
+    // causing the consumer to never see the message (flaky failure).
+    // 100ms is generous — subscribe round-trips in <1ms on local NATS.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Publish the synthetic host-leave payload. In production this comes
     // from chat_server's leave_rooms host-broadcast path.

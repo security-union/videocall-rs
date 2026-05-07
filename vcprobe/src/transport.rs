@@ -196,6 +196,7 @@ pub async fn connect_websocket(
     tokio::spawn(async move {
         while let Some(msg) = read.next().await {
             match msg {
+                #[allow(clippy::collapsible_match)]
                 Ok(WsMessage::Binary(data)) => {
                     if tx.send(data).await.is_err() {
                         break;

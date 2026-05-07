@@ -314,13 +314,10 @@ test.describe("Screen-share split-layout", () => {
   //   const rightStyleAfter = await rightPanel.getAttribute("style");
   //   expect(extractGridAutoRows(rightStyleAfter)).toBe(rowsBefore);
   // ──────────────────────────────────────────────────────────────────────
-  test.skip(
-    "right panel tiles have fixed height independent of resize handle position (requires screen-share automation)",
-    () => {
-      // Skipped: getDisplayMedia() cannot be automated in headless Chromium.
-      // See the block comment above for the full assertion plan.
-    },
-  );
+  test.skip("right panel tiles have fixed height independent of resize handle position (requires screen-share automation)", () => {
+    // Skipped: getDisplayMedia() cannot be automated in headless Chromium.
+    // See the block comment above for the full assertion plan.
+  });
 
   // ──────────────────────────────────────────────────────────────────────
   // 3. Single-column switch when screen share occupies ≥ 75% of screen
@@ -358,11 +355,8 @@ test.describe("Screen-share split-layout", () => {
   //   style = await rightPanel.getAttribute("style");
   //   expect(style).toContain("grid-template-columns: 1fr");
   // ──────────────────────────────────────────────────────────────────────
-  test.skip(
-    "right panel switches to single column when screen share occupies ≥ 75% of screen (requires screen-share automation)",
-    () => {
-      // Skipped: getDisplayMedia() cannot be automated in headless Chromium.
-      // See the block comment above for the full assertion plan.
-    },
-  );
+  test.skip("right panel switches to single column when screen share occupies ≥ 75% of screen (requires screen-share automation)", () => {
+    // Skipped: getDisplayMedia() cannot be automated in headless Chromium.
+    // See the block comment above for the full assertion plan.
+  });
 });

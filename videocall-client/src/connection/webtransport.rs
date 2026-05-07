@@ -22,6 +22,7 @@
 // on_inbound_media
 //
 use super::connection_lost_reason::ConnectionLostReason;
+use super::url_log::strip_query_for_log;
 use super::webmedia::{ConnectOptions, WebMedia};
 use js_sys::Boolean;
 use js_sys::JsString;
@@ -102,7 +103,10 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
                 }
             })
         };
-        info!("WebTransport connecting to {}", &options.webtransport_url);
+        info!(
+            "WebTransport connecting to {}",
+            strip_query_for_log(&options.webtransport_url)
+        );
         let task = WebTransportService::connect(
             &options.webtransport_url,
             on_datagram,

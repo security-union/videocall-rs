@@ -22,6 +22,12 @@ use dioxus_ui::context::DisplayNameCtx;
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
+#[derive(Clone, Routable, PartialEq, Debug)]
+enum TestRoute {
+    #[route("/")]
+    Home {},
+}
+
 /// Inject just the `meetingApiBaseUrl` field that `meeting_api_client()`
 /// requires. The full `__APP_CONFIG` injection from `support` is heavier
 /// than these tests need.
@@ -55,13 +61,14 @@ fn remove_config() {
 /// Mock `fetch` so any request to `/api/v1/meetings/feed` returns the given
 /// JSON body with status 200.
 fn mock_fetch_feed(body: &str) {
-    let escaped = body.replace('\\', "\\\\").replace('"', "\\\"");
+    let body_literal =
+        serde_json::to_string(body).expect("feed body should serialize as a JS string literal");
     let script = format!(
         r#"
         window.__original_fetch = window.__original_fetch || window.fetch;
         window.fetch = function(input) {{
             var url = typeof input === 'string' ? input : input.url;
-            var resp = new Response("{escaped}", {{
+            var resp = new Response({body_literal}, {{
                 status: 200,
                 headers: {{ 'Content-Type': 'application/json' }}
             }});
@@ -124,6 +131,13 @@ fn feed_body_with_one_owned_one_not_owned() -> String {
 fn meetings_list_wrapper() -> Element {
     let username_signal = use_signal(|| Some("Test".to_string()));
     use_context_provider(|| DisplayNameCtx(username_signal));
+    rsx! {
+        Router::<TestRoute> {}
+    }
+}
+
+#[component]
+fn Home() -> Element {
     rsx! {
         MeetingsList {}
     }

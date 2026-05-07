@@ -11,9 +11,10 @@
 use wasm_bindgen_test::*;
 
 use dioxus_ui::context::{
-    clear_display_name_from_storage, email_to_display_name, load_display_name_from_storage,
-    load_transport_preference, resolve_transport_config, save_display_name_to_storage,
-    save_transport_preference, validate_display_name, TransportPreference, DISPLAY_NAME_MAX_LEN,
+    clear_display_name_from_storage, clear_transport_sticky_and_pref, email_to_display_name,
+    load_display_name_from_storage, load_transport_preference, resolve_transport_config,
+    save_display_name_to_storage, save_transport_preference, save_transport_sticky,
+    validate_display_name, TransportPreference, DISPLAY_NAME_MAX_LEN,
 };
 use videocall_types::validation::normalize_spaces;
 
@@ -513,40 +514,37 @@ fn resolve_auto_preserves_order_of_multiple_urls() {
 
 #[wasm_bindgen_test]
 fn transport_preference_storage_round_trip() {
-    // Clear any previous value
-    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.remove_item("vc_transport_preference");
-    }
+    // Start clean — no sticky, no pref, no session value.
+    clear_transport_sticky_and_pref();
 
-    // Default (nothing stored) should return Auto
+    // Default (nothing stored) should return Auto.
     assert_eq!(
         load_transport_preference(),
         TransportPreference::Auto,
         "With nothing stored, load_transport_preference should return Auto"
     );
 
-    // Save WebTransportOnly and reload
+    // The sticky path: save_transport_preference writes to localStorage and is
+    // only honoured by load_transport_preference when sticky == true.
+    save_transport_sticky(true);
+
     save_transport_preference(TransportPreference::WebTransportOnly);
     assert_eq!(
         load_transport_preference(),
         TransportPreference::WebTransportOnly,
     );
 
-    // Save WebSocketOnly and reload
     save_transport_preference(TransportPreference::WebSocketOnly);
     assert_eq!(
         load_transport_preference(),
         TransportPreference::WebSocketOnly,
     );
 
-    // Save Auto explicitly and reload
     save_transport_preference(TransportPreference::Auto);
     assert_eq!(load_transport_preference(), TransportPreference::Auto);
 
-    // Cleanup
-    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.remove_item("vc_transport_preference");
-    }
+    // Cleanup — restore to default state.
+    clear_transport_sticky_and_pref();
 }
 
 #[wasm_bindgen_test]

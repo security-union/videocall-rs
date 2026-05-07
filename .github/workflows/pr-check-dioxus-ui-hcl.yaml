@@ -1,0 +1,134 @@
+name: Dioxus UI Component Tests (HCL)
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    paths:
+      - 'dioxus-ui/**'
+      - 'videocall-client/**'
+      - 'videocall-codecs/**'
+      - 'videocall-types/**'
+      - 'videocall-transport/**'
+      - 'protobuf/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+concurrency:
+  group: pr-check-dioxus-ui-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  CARGO_HOME: /var/lib/ci/cargo
+  RUSTUP_HOME: /var/lib/ci/rustup
+  CARGO_INCREMENTAL: "0"
+  PATH: /var/lib/ci/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  CHROMEDRIVER: /usr/bin/chromedriver
+
+jobs:
+  component-tests:
+    name: Dioxus UI component tests
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build all test binaries once up front so Chrome is never launched during compilation.
+      - name: Build test binaries
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo test --target wasm32-unknown-unknown --no-run
+
+      # Run each test binary in its own step with a Chrome cleanup between them.
+      # This prevents renderer state from accumulating across sessions and causing
+      # the 5-minute "Timed out receiving message from renderer" flake.
+
+      - name: test lib (unit tests)
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --lib
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test context_unit
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --test context_unit
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test device_selector
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --test device_selector
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test device_integration
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --test device_integration
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test home_integration
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --test home_integration
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test login_provider_logo
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --test login_provider_logo
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test meeting_ended_overlay
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --test meeting_ended_overlay
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test meetings_list_owner_gating
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --test meetings_list_owner_gating
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test screen_share_state
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --test screen_share_state
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test speaking_indicators
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          cargo test --target wasm32-unknown-unknown --test speaking_indicators
+          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+
+      - name: test video_control_buttons
+        working-directory: dioxus-ui
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo test --target wasm32-unknown-unknown --test video_control_buttons

@@ -16,14 +16,17 @@
  * conditions.
  */
 
-use super::connection_manager::{ConnectionManager, ConnectionManagerOptions, ConnectionState};
+use super::connection_manager::{
+    monotonic_now_ms, ConnectionManager, ConnectionManagerOptions, ConnectionState,
+    CPU_OVERLOADED_DURATION_MS, CPU_OVERLOAD_DRIFT_THRESHOLD_MS,
+};
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
 use log::{debug, info, warn};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 #[derive(Debug)]
@@ -49,11 +52,25 @@ impl ConnectionController {
             .borrow_mut()
             .set_manager_ref(Rc::downgrade(&manager));
 
+        // Wire the shared CPU-overload signal between this controller's
+        // drift watchdog (in `start_timers` below) and the manager's
+        // `check_rtt_degradation`. The flag is the kill-switch for spurious
+        // re-elections caused by JS event-loop stalls.
+        let cpu_overloaded = Rc::new(AtomicBool::new(false));
+        let main_thread_drift_ms = Rc::new(RefCell::new(0.0_f64));
+        manager
+            .borrow_mut()
+            .set_cpu_overloaded_signal(cpu_overloaded.clone(), main_thread_drift_ms.clone());
+
         // Start the initial election AFTER set_manager_ref so that
         // connection-lost callbacks capture a valid Weak back-reference.
         manager.borrow_mut().initialize()?;
 
-        let timers = Self::start_timers(Rc::downgrade(&manager));
+        let timers = Self::start_timers(
+            Rc::downgrade(&manager),
+            cpu_overloaded,
+            main_thread_drift_ms,
+        );
 
         info!("ConnectionController created with all timers started");
         Ok(Self {
@@ -62,13 +79,81 @@ impl ConnectionController {
         })
     }
 
-    /// Start all necessary timers for connection management
-    fn start_timers(mgr_weak: Weak<RefCell<ConnectionManager>>) -> Vec<Interval> {
+    /// Start all necessary timers for connection management.
+    ///
+    /// `cpu_overloaded` and `main_thread_drift_ms` are the shared drift-watchdog
+    /// signals already handed to the `ConnectionManager` in `new()`. The 1 Hz
+    /// timer measures `performance.now()` drift relative to its scheduled
+    /// cadence; when a tick runs more than [`CPU_OVERLOAD_DRIFT_THRESHOLD_MS`]
+    /// late, the flag is asserted for [`CPU_OVERLOADED_DURATION_MS`] so the
+    /// manager-side guard suppresses re-election while the local main thread
+    /// is overloaded.
+    fn start_timers(
+        mgr_weak: Weak<RefCell<ConnectionManager>>,
+        cpu_overloaded: Rc<AtomicBool>,
+        main_thread_drift_ms: Rc<RefCell<f64>>,
+    ) -> Vec<Interval> {
         let mut timers = Vec::new();
+
+        // Drift watchdog state. `last_tick` is the wall-clock reading of the
+        // *previous* 1 Hz tick; on each new tick we compute how much real
+        // time elapsed and compare against the 1000 ms cadence. `clear_at_ms`
+        // is the timestamp when the suppression flag should be allowed to
+        // drop back to false.
+        let last_tick = Rc::new(RefCell::new(monotonic_now_ms()));
+        let clear_at_ms = Rc::new(RefCell::new(0.0_f64));
 
         // 1Hz diagnostics reporting timer + RTT degradation monitoring
         let mgr_ref = mgr_weak.clone();
+        let cpu_overloaded_t = cpu_overloaded.clone();
+        let drift_ref = main_thread_drift_ms.clone();
+        let last_tick_t = last_tick.clone();
+        let clear_at_t = clear_at_ms.clone();
         timers.push(Interval::new(1000, move || {
+            // --- Main-thread drift measurement ---------------------------
+            // Run BEFORE the diagnostics report so the published metric
+            // reflects this tick's drift, not the previous one.
+            let now = monotonic_now_ms();
+            let actual_delta = now - *last_tick_t.borrow();
+            *last_tick_t.borrow_mut() = now;
+            // `drift` is how much later than the 1000 ms cadence this tick
+            // fired. Negative values are clamped to 0 — running early means
+            // the timer was fine.
+            let drift = (actual_delta - 1000.0).max(0.0);
+            *drift_ref.borrow_mut() = drift;
+
+            if drift > CPU_OVERLOAD_DRIFT_THRESHOLD_MS {
+                let new_clear_at = now + CPU_OVERLOADED_DURATION_MS;
+                // Scope the RefCell borrow narrowly so it cannot interleave
+                // with the warn! call below (defense-in-depth — there is no
+                // current code path that re-enters this map, but logging is
+                // permitted to acquire arbitrary thread-local resources).
+                {
+                    let mut clear_at = clear_at_t.borrow_mut();
+                    // Extend, never retract: a fresh stall during the
+                    // suppression window pushes the deadline forward.
+                    if new_clear_at > *clear_at {
+                        *clear_at = new_clear_at;
+                    }
+                }
+                if !cpu_overloaded_t.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "CPU-overload watchdog: main-thread drift {drift:.0}ms exceeded \
+                         threshold {CPU_OVERLOAD_DRIFT_THRESHOLD_MS:.0}ms — suppressing \
+                         re-election for {CPU_OVERLOADED_DURATION_MS:.0}ms",
+                    );
+                }
+            } else if cpu_overloaded_t.load(Ordering::Relaxed) {
+                let clear_at = *clear_at_t.borrow();
+                if now >= clear_at {
+                    cpu_overloaded_t.store(false, Ordering::Relaxed);
+                    log::info!(
+                        "CPU-overload watchdog: main-thread drift recovered \
+                         (last drift {drift:.0}ms) — clearing suppression flag",
+                    );
+                }
+            }
+
             if let Some(mgr) = mgr_ref.upgrade() {
                 if let Ok(mut mgr) = mgr.try_borrow_mut() {
                     // Always drive diagnostics once per second
@@ -85,8 +170,17 @@ impl ConnectionController {
 
                         // Check whether the active connection's RTT has degraded
                         // enough to warrant a quality re-election.
+                        //
+                        // We call `request_reelection` instead of
+                        // `start_reelection` directly so that, when a
+                        // refresh callback is configured (Phase 3 /
+                        // AUTH-2), the manager refreshes the room token
+                        // before spawning candidates. This prevents
+                        // post-TTL re-elections from cascade-failing with
+                        // all candidates rejected by the relay. See
+                        // discussion #562.
                         if mgr.check_rtt_degradation() {
-                            if let Err(e) = mgr.start_reelection() {
+                            if let Err(e) = mgr.request_reelection() {
                                 log::error!("Failed to start re-election: {e}");
                             }
                         }
@@ -376,6 +470,7 @@ mod tests {
             instance_id: "test-instance-id".to_string(),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
             allow_post_rebase_retry: true,
+            refresh_room_token_callback: None,
         }
     }
 

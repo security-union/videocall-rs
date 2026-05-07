@@ -28,6 +28,7 @@ use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
+use futures::future::LocalBoxFuture;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info, warn};
@@ -79,6 +80,88 @@ fn generate_instance_id() -> String {
 }
 
 const MAX_SESSION_ID_HISTORY: usize = 16;
+
+/// Result of refreshing a room token. Both URL lists carry the new token
+/// in their query string (e.g. `https://relay.example/lobby?token=<JWT>`),
+/// ready to be plugged into the connection manager via
+/// [`crate::VideoCallClient::update_server_urls`].
+///
+/// Returned by the [`RefreshRoomTokenCallback`] that the dioxus-ui (or any
+/// other consumer) registers via
+/// [`VideoCallClientOptions::refresh_room_token_callback`]. See discussion
+/// #562 (AUTH-2) for the full Phase 3 design.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefreshedTokens {
+    /// Tokenized WebSocket URLs for the relay candidates.
+    pub websocket_urls: Vec<String>,
+    /// Tokenized WebTransport URLs for the relay candidates.
+    pub webtransport_urls: Vec<String>,
+}
+
+/// Async callback the client invokes when it needs a fresh room token,
+/// e.g. before a candidate-rebuilding re-election.
+///
+/// The callback returns `Some(RefreshedTokens)` on success (the new tokenized
+/// URLs for WS and WT will replace the cached ones before the manager spawns
+/// candidates) or `None` if the refresh failed (network error, server 5xx,
+/// meeting ended, etc.). On `None`, the manager logs a warning and proceeds
+/// with the cached URLs — re-election is never blocked entirely on a refresh
+/// failure, since that would be a worse failure mode than running with an
+/// expired token (which the relay will simply reject, triggering normal
+/// reconnect-with-refresh in the UI layer).
+///
+/// The callback is set by the dioxus-ui layer (where `refresh_room_token`
+/// already exists) and consumed by `ConnectionManager` during the
+/// timer-driven re-election entry path. See discussion #562 (AUTH-2).
+///
+/// Single-threaded (`LocalBoxFuture`) because the videocall-client targets
+/// `wasm32-unknown-unknown`, where everything runs on the JS main thread.
+pub struct RefreshRoomTokenCallback {
+    cb: Rc<dyn Fn() -> LocalBoxFuture<'static, Option<RefreshedTokens>>>,
+}
+
+impl RefreshRoomTokenCallback {
+    /// Build a `RefreshRoomTokenCallback` from any closure that returns a
+    /// future resolving to `Option<RefreshedTokens>`.
+    pub fn from<F, Fut>(func: F) -> Self
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = Option<RefreshedTokens>> + 'static,
+    {
+        Self {
+            cb: Rc::new(move || Box::pin(func())),
+        }
+    }
+
+    /// Invoke the callback. Returns the future the caller must drive to
+    /// completion (typically via `wasm_bindgen_futures::spawn_local`).
+    pub fn emit(&self) -> LocalBoxFuture<'static, Option<RefreshedTokens>> {
+        (self.cb)()
+    }
+}
+
+impl Clone for RefreshRoomTokenCallback {
+    fn clone(&self) -> Self {
+        Self {
+            cb: self.cb.clone(),
+        }
+    }
+}
+
+#[allow(ambiguous_wide_pointer_comparisons)]
+impl PartialEq for RefreshRoomTokenCallback {
+    fn eq(&self, other: &Self) -> bool {
+        // Mirror `videocall_types::Callback`'s identity-based equality so
+        // `VideoCallClientOptions` can stay `PartialEq`-derivable.
+        Rc::ptr_eq(&self.cb, &other.cb)
+    }
+}
+
+impl std::fmt::Debug for RefreshRoomTokenCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RefreshRoomTokenCallback<_>")
+    }
+}
 
 /// Configuration options for creating a [`VideoCallClient`].
 ///
@@ -183,6 +266,25 @@ pub struct VideoCallClientOptions {
     /// Defaults to `true`. The dioxus-ui derives the value from the user's
     /// `TransportPreference` context signal.
     pub allow_post_rebase_retry: bool,
+
+    /// Async callback the client invokes when it needs a fresh room token,
+    /// e.g. before a candidate-rebuilding re-election.
+    ///
+    /// When set, the connection manager calls this callback at the start of
+    /// every internal re-election triggered by the RTT-degradation watchdog
+    /// (1Hz timer) or post-rebase retry. On success the manager swaps in the
+    /// freshly-tokenized URLs before spawning candidates, so re-elections
+    /// after the original token's expiry no longer fail with all candidates
+    /// rejected by the relay (the failure mode AUTH-2 was filed against —
+    /// see discussion #562).
+    ///
+    /// On failure (`None`), the manager logs a warning and proceeds with
+    /// the cached URLs; the existing UI-level `schedule_reconnect` path
+    /// remains the safety net for terminal token expiry.
+    ///
+    /// Set to `None` for clients that don't have a refresh endpoint
+    /// (no-jwt builds, observers, tests).
+    pub refresh_room_token_callback: Option<RefreshRoomTokenCallback>,
 }
 
 #[derive(Debug)]
@@ -557,6 +659,10 @@ impl VideoCallClient {
             instance_id: generate_instance_id(),
             reelection_completed_signal: self.inner.borrow().reelection_completed_signal.clone(),
             allow_post_rebase_retry: self.options.allow_post_rebase_retry,
+            // Phase 3 / AUTH-2: forward the dioxus-ui's room-token refresh
+            // callback so the manager can preempt token expiry from inside
+            // re-election. See discussion #562.
+            refresh_room_token_callback: self.options.refresh_room_token_callback.clone(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -2001,6 +2107,7 @@ mod disconnect_tests {
             on_peer_added: VcCallback::noop(),
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: None,
+            refresh_room_token_callback: None,
             get_peer_video_canvas_id: VcCallback::from(|id| id),
             get_peer_screen_canvas_id: VcCallback::from(|id| id),
             on_connected: VcCallback::noop(),

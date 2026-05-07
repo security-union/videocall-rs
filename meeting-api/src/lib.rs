@@ -19,6 +19,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod console_log_purge;
 pub mod db;
 pub mod error;
 pub mod nats_consumers;

@@ -67,6 +67,15 @@ pub struct ConnectionManagerState {
     pub election_state: String,
     pub election_progress: Option<f64>,
     pub servers_total: Option<u64>,
+    /// Total configured servers (WS + WT URLs) the manager was set up with,
+    /// independent of the `ElectionState`. Emitted as `configured_servers_total`
+    /// from the connection-manager bus. Phase 7 (discussion #562).
+    pub configured_servers_total: Option<u64>,
+    /// `true` when the manager has at most one configured server. The UI
+    /// renders a "Limited connectivity" badge while this is set, since
+    /// re-elections are gated on having multiple candidates. Phase 7
+    /// (discussion #562).
+    pub single_server_only: Option<bool>,
     pub active_connection_id: Option<String>,
     pub active_server_url: Option<String>,
     pub active_server_type: Option<String>,
@@ -93,6 +102,8 @@ impl Default for ConnectionManagerState {
             election_state: "unknown".to_string(),
             election_progress: None,
             servers_total: None,
+            configured_servers_total: None,
+            single_server_only: None,
             active_connection_id: None,
             active_server_url: None,
             active_server_type: None,
@@ -148,6 +159,18 @@ impl ConnectionManagerState {
                 "servers_total" => {
                     if let MetricValue::U64(total) = &metric.value {
                         state.servers_total = Some(*total);
+                    }
+                }
+                "configured_servers_total" => {
+                    if let MetricValue::U64(total) = &metric.value {
+                        state.configured_servers_total = Some(*total);
+                    }
+                }
+                "single_server_only" => {
+                    if let MetricValue::U64(flag) = &metric.value {
+                        // Encoded as u64-bool to match the
+                        // `server_active`/`server_connected` convention.
+                        state.single_server_only = Some(*flag != 0);
                     }
                 }
                 "active_connection_id" => {
@@ -284,6 +307,28 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                             div { class: "status-item",
                                 span { class: "status-label", "Total Servers:" }
                                 span { class: "status-value", "{total}" }
+                            }
+                        }
+                        if let Some(total) = state.configured_servers_total {
+                            div { class: "status-item",
+                                span { class: "status-label", "Configured Servers:" }
+                                span { class: "status-value", "{total}" }
+                            }
+                        }
+                    }
+                    if state.single_server_only == Some(true) {
+                        // Phase 7 (discussion #562): when only one (or zero)
+                        // candidates are configured, the watchdog suppresses
+                        // re-election (it would re-elect onto the same host).
+                        // Surface a badge so the user knows recovery is gated
+                        // and isn't just a silent stall.
+                        div { class: "limited-connectivity-badge",
+                            role: "alert",
+                            aria_live: "polite",
+                            span { class: "badge-icon", "!" }
+                            span { class: "badge-text",
+                                "Limited connectivity \u{2014} only 1 server reachable. \
+                                 Re-elections disabled."
                             }
                         }
                     }

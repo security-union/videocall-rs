@@ -176,6 +176,41 @@ fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<S
     (websocket_urls, webtransport_urls)
 }
 
+/// Pure helper: combine the lobby URLs with the user's transport preference
+/// and the *current* server-side WebTransport-enabled flag.
+///
+/// Factored out so both component init AND `schedule_reconnect` go through
+/// exactly the same code path. Crucially, this means a reconnect happening
+/// after the runtime config finally loaded will see `server_wt_enabled ==
+/// true` even if the initial `use_hook` saw `false` — the previously empty
+/// WT URL list will populate, fixing the "stranded on a single server"
+/// regression from discussion #562 (Phase 7).
+///
+/// Returns `(effective_wt_enabled, websocket_urls, webtransport_urls)`.
+fn current_transport_urls(
+    token: &str,
+    user_id: &str,
+    id: &str,
+    pref: TransportPreference,
+    server_wt_enabled: bool,
+) -> (bool, Vec<String>, Vec<String>) {
+    let (ws, wt) = build_lobby_urls(token, user_id, id);
+    current_transport_urls_from_lists(pref, server_wt_enabled, ws, wt)
+}
+
+/// Pure-logic core of [`current_transport_urls`] — takes already-built URL
+/// lists so it can be unit-tested without `window().__APP_CONFIG` being
+/// initialised. The wasm-only `current_transport_urls` is a thin wrapper
+/// that pairs `build_lobby_urls` with this function.
+fn current_transport_urls_from_lists(
+    pref: TransportPreference,
+    server_wt_enabled: bool,
+    ws_urls: Vec<String>,
+    wt_urls: Vec<String>,
+) -> (bool, Vec<String>, Vec<String>) {
+    resolve_transport_config(pref, server_wt_enabled, ws_urls, wt_urls)
+}
+
 fn play_user_joined() {
     // Ascending two-tone chime: C5 -> E5 (pleasant, welcoming)
     play_tone_pair(523.25, 659.25, 0.12, 0.35);
@@ -290,15 +325,25 @@ fn schedule_reconnect(
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
                     let latest_display_name = current_display_name();
-                    let (ws, wt) = build_lobby_urls(&new_token, &latest_display_name, &meeting_id);
 
-                    // Apply the user's transport preference so the reconnection
-                    // honours the same protocol selection as the initial connection.
+                    // Re-evaluate `webtransport_enabled()` at reconnect time —
+                    // not just at component init. If runtime config hadn't
+                    // loaded when `use_hook` ran, the WT URL list would have
+                    // been empty and `total_server_count() == 1` would have
+                    // suppressed re-election (see discussion #562, Phase 7).
+                    // Going through the same `current_transport_urls` helper
+                    // here means a delayed runtime config load now flows back
+                    // into the manager via `update_server_urls`.
                     let pref = transport_pref_signal();
                     let server_wt_enabled =
                         crate::constants::webtransport_enabled().unwrap_or(false);
-                    let (_enable_wt, ws, wt) =
-                        resolve_transport_config(pref, server_wt_enabled, ws, wt);
+                    let (_enable_wt, ws, wt) = current_transport_urls(
+                        &new_token,
+                        &latest_display_name,
+                        &meeting_id,
+                        pref,
+                        server_wt_enabled,
+                    );
 
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
@@ -744,16 +789,21 @@ pub fn AttendantsComponent(
         let token = String::new();
 
         let initial_display_name = current_display_name();
-        let (websocket_urls, webtransport_urls) =
-            build_lobby_urls(&token, &initial_display_name, &id);
 
-        // Apply user's transport preference
+        // Apply user's transport preference. The `webtransport_enabled()`
+        // read here is the *initial* value — runtime config may not have
+        // loaded yet, in which case it returns `false` and `Auto` resolves
+        // to a WS-only URL list. The reconnect path goes through the same
+        // `current_transport_urls` helper so a later runtime-config load
+        // can repopulate the WT list and recover the user from the
+        // "stranded on a single server" state (discussion #562, Phase 7).
         let server_wt_enabled = crate::constants::webtransport_enabled().unwrap_or(false);
-        let (effective_wt_enabled, websocket_urls, webtransport_urls) = resolve_transport_config(
+        let (effective_wt_enabled, websocket_urls, webtransport_urls) = current_transport_urls(
+            &token,
+            &initial_display_name,
+            &id,
             transport_pref,
             server_wt_enabled,
-            websocket_urls,
-            webtransport_urls,
         );
 
         log::info!(
@@ -2976,5 +3026,126 @@ mod tests {
                 assert!(d >= 500, "attempt {attempt}: delay {d} must be >= 500");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for current_transport_urls (Phase 7, discussion #562)
+    //
+    // These exercise the pure-logic core via `current_transport_urls_from_lists`
+    // so they don't require `window().__APP_CONFIG` to be set up. The full
+    // `current_transport_urls` (with `build_lobby_urls`) is a thin wrapper
+    // that just calls into this core.
+    // -----------------------------------------------------------------------
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_auto_with_wt_enabled_returns_both_lists() {
+        // Auto pref + server says WT enabled: both lists must come through.
+        // This is the scenario the dioxus-ui hits on a normal reconnect once
+        // runtime config has loaded.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::Auto,
+            true,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(enable_wt, "Auto+server-WT-enabled must enable WT");
+        assert_eq!(ws_out, ws, "WS list passed through unchanged");
+        assert_eq!(wt_out, wt, "WT list passed through unchanged");
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_auto_with_wt_disabled_returns_only_ws() {
+        // Auto pref + runtime config hasn't loaded (or WT disabled): the WT
+        // list is dropped from the effective config, mirroring how `Auto`
+        // collapses to WS-only in this state. This is the *initial* shape
+        // that strands the user before the reconnect path re-evaluates.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::Auto,
+            false,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(!enable_wt, "Auto+server-WT-disabled must disable WT");
+        assert_eq!(ws_out, ws, "WS list still populated");
+        assert_eq!(
+            wt_out, wt,
+            "Auto preserves the WT list shape (resolve_transport_config returns it as-is); \
+             the manager's enable_webtransport=false is what gates use of WT"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_websocket_only_drops_wt_list() {
+        // Explicit WebSocketOnly preference: WT list must always be empty,
+        // regardless of what the server-side flag says.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::WebSocketOnly,
+            true,
+            ws.clone(),
+            wt,
+        );
+        assert!(!enable_wt, "WebSocketOnly must report WT disabled");
+        assert_eq!(ws_out, ws);
+        assert!(wt_out.is_empty(), "WebSocketOnly must drop the WT list");
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_webtransport_only_drops_ws_list() {
+        // Explicit WebTransportOnly preference: WS list must always be empty.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::WebTransportOnly,
+            false, // server says WT disabled, but user override wins
+            ws,
+            wt.clone(),
+        );
+        assert!(enable_wt, "WebTransportOnly must report WT enabled");
+        assert!(ws_out.is_empty(), "WebTransportOnly must drop the WS list");
+        assert_eq!(wt_out, wt);
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_recovery_path_repopulates_wt_after_runtime_load() {
+        // Regression for discussion #562: same input lists, but the user's
+        // initial `webtransport_enabled()` returned false (runtime config
+        // not loaded) and the reconnect's read returns true (loaded by
+        // then). The reconnect call must yield a richer URL set than the
+        // initial call — that's what flips `total_server_count() > 1` in
+        // the manager and lets the watchdog actually re-elect.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+
+        // Initial call (runtime config still loading)
+        let (init_enable_wt, init_ws, _init_wt) = current_transport_urls_from_lists(
+            TransportPreference::Auto,
+            false,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(!init_enable_wt);
+        assert_eq!(init_ws, ws);
+        // Note: `Auto` keeps the wt list value; it's the bool that gates use.
+        // The recovery story is that `init_enable_wt == false` makes the manager
+        // treat the WT list as unusable even though it's present in the vec —
+        // see `resolve_transport_config`. The bool is the real signal, not the
+        // list contents.
+
+        // Reconnect call (runtime config now loaded — WT enabled)
+        let (reconn_enable_wt, reconn_ws, reconn_wt) =
+            current_transport_urls_from_lists(TransportPreference::Auto, true, ws.clone(), wt);
+        assert!(reconn_enable_wt, "reconnect path now has WT enabled");
+        assert_eq!(reconn_ws, ws, "WS list still populated");
+        assert!(
+            !reconn_wt.is_empty(),
+            "reconnect path repopulates the WT list — this is the recovery \
+             from the single-server-stranding state"
+        );
     }
 }

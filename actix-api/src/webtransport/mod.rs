@@ -761,9 +761,14 @@ mod tests {
             }
         });
 
-        // Craft a MEDIA packet that is not RTT and not health
+        // Craft a MEDIA packet that is not RTT and not health.
+        // Using VIDEO (not AUDIO) so the packet routes via the persistent
+        // UniStream — which is what this test reads from. Phase 4 routes
+        // small AUDIO MediaPackets via QUIC datagrams instead, so an AUDIO
+        // packet would arrive on a different transport and miss the unistream
+        // assertion below.
         let media = VcMediaPacket {
-            media_type: VcMediaType::AUDIO.into(),
+            media_type: VcMediaType::VIDEO.into(),
             user_id: user_a.as_bytes().to_vec(),
             ..Default::default()
         };
@@ -1234,8 +1239,11 @@ mod tests {
     /// stream without needing protobuf framing.
     fn create_sequenced_test_packet(sender: &str, seq_num: u32) -> Vec<u8> {
         let marker = format!("SEQ:{seq_num:04}:END");
+        // Use VIDEO (not AUDIO) so the packet routes via the persistent
+        // UniStream — Phase 4 sends small AUDIO MediaPackets via QUIC
+        // datagrams which would bypass the ordered-stream assertions.
         let media = VcMediaPacket {
-            media_type: VcMediaType::AUDIO.into(),
+            media_type: VcMediaType::VIDEO.into(),
             user_id: sender.as_bytes().to_vec(),
             data: marker.into_bytes(),
             ..Default::default()

@@ -4095,6 +4095,7 @@ mod tests {
     // joins (user "alice", instance_id="inst-tab2"). Both should coexist
     // in room_members because different instance_ids mean different
     // browser tabs / devices.
+    //
     #[actix_rt::test]
     #[serial]
     async fn test_multi_device_safe_coexistence() {

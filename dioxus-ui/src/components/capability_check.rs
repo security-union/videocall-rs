@@ -30,7 +30,7 @@
 //! browser. [`assess_capability`] is the wasm32 wrapper that sources real
 //! navigator data.
 //!
-//! See discussion #562 (Phase 9).
+//! See discussion 562 (Phase 9).
 //!
 //! ## Verdict semantics
 //!

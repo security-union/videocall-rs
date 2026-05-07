@@ -1893,7 +1893,7 @@ pub fn AttendantsComponent(
                                         if is_owner { "Start Meeting" } else { "Join Meeting" }
                                     }
                                 }
-                                p { style: "text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem; margin-top: 0.5rem; margin-bottom: 0.25rem;",
+                                p { style: "text-align: center; color: var(--color-text-secondary); font-size: 0.8rem; margin-top: 0.5rem; margin-bottom: 0.25rem;",
                                     "Meeting join is disabled for this device."
                                 }
                             }

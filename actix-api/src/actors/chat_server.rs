@@ -591,25 +591,6 @@ impl ChatServer {
             None => return false,
         };
 
-        // Multi-device coexistence guard: if the existing session has a
-        // different instance_id from the newcomer AND has not yet been
-        // activated (no entry in `active_subs`), it represents a genuinely
-        // concurrent join from another device/tab that hasn't started
-        // publishing yet. Let them coexist.
-        //
-        // If the existing session IS activated, the new session is treated as
-        // a page-reload / rejoin: the client generated a fresh instance_id on
-        // `connect()`, but the user is the same — "latest joiner wins" and
-        // the stale session is evicted.
-        if let (Some(prev_iid), Some(new_iid)) = (
-            self.session_instance.get(&prev_sid),
-            self.session_instance.get(&skip_session_id),
-        ) {
-            if prev_iid != new_iid && !self.active_subs.contains_key(&prev_sid) {
-                return false;
-            }
-        }
-
         info!(
             "Evicting prior session {} for user {} in room {} (same-user dedup, \
              new session {}). Policy: latest joiner wins; previous tab/instance \
@@ -4117,6 +4098,10 @@ mod tests {
     #[actix_rt::test]
     #[serial]
     async fn test_multi_device_safe_coexistence() {
+        // Policy: "latest joiner wins". Even with different instance_ids,
+        // same (room, user_id) collapses to one session. The server cannot
+        // distinguish "two real devices" from "page reload with fresh UUID"
+        // because connect() always generates a fresh instance_id.
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
@@ -4152,8 +4137,8 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Session B joins with a different instance_id for tab 2
-        // (multi-device scenario — different UUIDs = different KV keys)
+        // Session B joins with a different instance_id for tab 2.
+        // Despite different instance_ids, same-user dedup evicts session A.
         let dummy_b = DummySession.start();
         connect_and_join(
             &chat_server,
@@ -4167,7 +4152,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Both sessions should coexist in room_members
+        // Only session B should remain — session A was evicted by same-user dedup
         let members = chat_server
             .send(GetRoomMembers {
                 room: room.to_string(),
@@ -4176,48 +4161,38 @@ mod tests {
             .expect("GetRoomMembers should succeed");
         assert_eq!(
             members.len(),
-            2,
-            "Room should have 2 members (different instance_ids, same user, no eviction)"
+            1,
+            "Room should have 1 member (latest joiner wins, session A evicted)"
         );
 
         let session_ids: Vec<SessionId> = members.iter().map(|m| m.session).collect();
         assert!(
-            session_ids.contains(&session_a),
-            "Session A should still be in room_members"
+            !session_ids.contains(&session_a),
+            "Session A should NOT be in room_members (evicted)"
         );
         assert!(
             session_ids.contains(&session_b),
             "Session B should be in room_members"
         );
 
-        // Session A should still be registered
+        // Session A should no longer be registered
         let has_session_a = chat_server
             .send(HasSession { session: session_a })
             .await
             .expect("HasSession should succeed");
         assert!(
-            has_session_a,
-            "Session A should still be registered (multi-device, not evicted)"
+            !has_session_a,
+            "Session A should NOT be registered (evicted by latest joiner wins)"
         );
 
-        // Neither session should have suppressed PARTICIPANT_JOINED
-        // (both are fresh joins from different devices)
-        let suppressed_a = chat_server
-            .send(IsSuppressedJoinBroadcast { session: session_a })
-            .await
-            .expect("IsSuppressedJoinBroadcast should succeed");
-        assert!(
-            !suppressed_a,
-            "Session A should NOT suppress PARTICIPANT_JOINED"
-        );
-
+        // Session B suppresses PARTICIPANT_JOINED (same-user dedup fires)
         let suppressed_b = chat_server
             .send(IsSuppressedJoinBroadcast { session: session_b })
             .await
             .expect("IsSuppressedJoinBroadcast should succeed");
         assert!(
-            !suppressed_b,
-            "Session B (different instance_id) should NOT suppress PARTICIPANT_JOINED"
+            suppressed_b,
+            "Session B should suppress PARTICIPANT_JOINED (same-user dedup evicted session A)"
         );
     }
 

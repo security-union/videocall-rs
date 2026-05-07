@@ -301,13 +301,14 @@ async fn test_auto_admitted_guest_receives_observer_token_in_active_meeting() {
 
 #[tokio::test]
 #[serial]
-async fn test_auto_admitted_guest_receives_observer_token_when_meeting_not_active() {
+async fn test_guest_receives_observer_token_and_waits_when_meeting_not_active() {
     let pool = get_test_pool().await;
     let room_id = "test-guest-observer-auto-admit-not-active";
     cleanup_test_data(&pool, room_id).await;
 
-    // Create an idle meeting with waiting room off so guest join auto-activates
-    // and auto-admits through the non-active join path.
+    // Only authenticated (non-guest) users may activate a meeting. A guest
+    // joining an idle meeting with WR off therefore gets waiting_for_meeting
+    // (not admitted) together with an observer token for polling.
     let app = build_app(pool.clone());
     let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
         .header("Content-Type", "application/json")
@@ -335,16 +336,19 @@ async fn test_auto_admitted_guest_receives_observer_token_when_meeting_not_activ
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
-    assert_eq!(body.result.status, "admitted");
+    // Guest cannot activate an idle meeting — must wait for the host.
+    assert_eq!(body.result.status, "waiting_for_meeting");
     assert!(body.result.is_guest);
     assert!(
-        body.result.room_token.is_some(),
-        "Auto-admitted guest should receive a room_token"
+        body.result.room_token.is_none(),
+        "Guest waiting for meeting activation must NOT receive a room_token"
     );
+    // An observer token is always issued on the waiting_for_meeting path so
+    // the client can receive a push notification when the host activates.
     let observer = body
         .result
         .observer_token
-        .expect("Auto-admitted guest must receive an observer_token");
+        .expect("Guest waiting for meeting must receive an observer_token");
     let claims = decode_token(&observer);
     assert!(claims.observer);
     assert!(!claims.room_join);

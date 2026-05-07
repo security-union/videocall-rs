@@ -197,14 +197,23 @@ async fn test_attendee_blocked_when_host_gone_wr_on_and_end_on_host_leave_false(
         let app = build_app(pool.clone());
         let req = request_with_cookie(
             "POST",
-            &format!("/api/v1/meetings/{room_id}/admit/attendee-a@example.com"),
+            &format!("/api/v1/meetings/{room_id}/admit"),
             "host@example.com",
         )
-        .body(Body::empty())
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "user_id": "attendee-a@example.com"
+            }))
+            .unwrap(),
+        ))
         .unwrap();
-        // If the admit endpoint returns non-OK the test still continues;
-        // the important thing is that participant_count > 0 keeps the meeting alive.
-        let _ = app.oneshot(req).await.unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Host must successfully admit Attendee A"
+        );
     }
 
     // 4. Host leaves.  Because `end_on_host_leave=false` and Attendee A is

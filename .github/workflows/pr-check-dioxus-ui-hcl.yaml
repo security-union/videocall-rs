@@ -32,6 +32,7 @@ jobs:
   component-tests:
     name: Dioxus UI component tests
     runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 

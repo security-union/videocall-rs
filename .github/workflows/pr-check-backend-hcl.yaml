@@ -35,6 +35,7 @@ jobs:
   test:
     name: cargo tests
     runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

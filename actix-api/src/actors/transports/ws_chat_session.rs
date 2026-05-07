@@ -450,6 +450,8 @@ mod tests {
                                     session_manager,
                                     false, // tests use non-observer sessions
                                     None,  // no instance_id
+                                    false, // is_host
+                                    false, // end_on_host_leave
                                 );
                                 ws::start(actor, &req, stream)
                                     .map_err(actix_web::error::ErrorInternalServerError)

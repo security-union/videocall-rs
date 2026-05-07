@@ -186,6 +186,7 @@ fn start_observer_connection(
         on_peer_added: VcCallback::noop(),
         on_peer_first_frame: VcCallback::noop(),
         on_peer_removed: None,
+        on_peers_removed_batch: None,
         get_peer_video_canvas_id: VcCallback::from(|id| id),
         get_peer_screen_canvas_id: VcCallback::from(|id| id),
         enable_diagnostics: false,
@@ -243,6 +244,14 @@ fn start_observer_connection(
         // Guest observer client: short-lived, recovery is via meeting
         // activation push, not re-election. No post-rebase retry.
         allow_post_rebase_retry: false,
+        // Observer mode (guest pre-admission): no refresh callback needed.
+        // Observers don't trigger the watchdog re-election path that
+        // consumes the callback (their session lifetime is bounded by the
+        // meeting state — admission or activation push — not by RTT
+        // degradation), so leaving this `None` is the right behaviour.
+        // The Phase 3 / AUTH-2 refresh path is for full participants
+        // whose JWT might outlive a long-running meeting.
+        refresh_room_token_callback: None,
     };
 
     let mut client = VideoCallClient::new(opts);

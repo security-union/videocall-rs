@@ -22,6 +22,7 @@ mod connection_controller;
 mod connection_lost_reason;
 mod connection_manager;
 mod task;
+mod url_log;
 mod webmedia;
 mod websocket;
 mod webtransport;

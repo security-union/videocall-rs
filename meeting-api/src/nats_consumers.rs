@@ -52,8 +52,23 @@ pub fn spawn_meeting_ended_by_host_consumer(
     nats: Option<async_nats::Client>,
     pool: PgPool,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_consumer_inner(nats, pool, None)
+}
+
+/// Internal variant used by tests to eliminate the publish-before-subscribe
+/// race.  `ready_tx` is signalled once the initial NATS subscription is
+/// live; callers await the paired receiver before publishing test messages.
+#[doc(hidden)]
+pub fn spawn_consumer_inner(
+    nats: Option<async_nats::Client>,
+    pool: PgPool,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let nats = nats?;
     let handle = tokio::spawn(async move {
+        // Wrap in `Option` so `take()` can move the sender out exactly once
+        // inside the loop body without violating Rust's move rules.
+        let mut ready_tx = ready_tx;
         loop {
             match nats.subscribe(MEETING_ENDED_BY_HOST_SUBJECT).await {
                 Ok(mut sub) => {
@@ -61,6 +76,12 @@ pub fn spawn_meeting_ended_by_host_consumer(
                         "Subscribed to {} (host-disconnect DB-write fanout)",
                         MEETING_ENDED_BY_HOST_SUBJECT
                     );
+                    // Signal readiness exactly once — on the first successful
+                    // subscription. Subsequent re-subscribe iterations see
+                    // `None` and skip the signal.
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(());
+                    }
                     while let Some(msg) = sub.next().await {
                         let payload =
                             match serde_json::from_slice::<MeetingEndedByHostPayload>(&msg.payload)

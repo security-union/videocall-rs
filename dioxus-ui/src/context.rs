@@ -668,3 +668,93 @@ pub use videocall_types::validation::{
     email_to_display_name, is_allowed_display_name_char, is_guid_like, is_valid_meeting_id,
     validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
+
+// ── Theme preference ──────────────────────────────────────────────────────────
+
+/// Application colour theme.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Theme {
+    #[default]
+    Dark,
+    /// Follow the OS `prefers-color-scheme` media query.
+    System,
+    Light,
+}
+
+impl Theme {
+    /// Stored value written to localStorage.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::Dark => "dark",
+            Theme::System => "system",
+            Theme::Light => "light",
+        }
+    }
+
+    /// Label shown in the UI toggle.
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Dark => "Dark",
+            Theme::System => "System",
+            Theme::Light => "Light",
+        }
+    }
+}
+
+impl std::str::FromStr for Theme {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "system" => Ok(Theme::System),
+            "light" | "dawn" => Ok(Theme::Light),
+            _ => Ok(Theme::Dark),
+        }
+    }
+}
+
+/// Context providing the active theme signal to the component tree.
+#[derive(Clone, Copy)]
+pub struct ThemePreferenceCtx(pub Signal<Theme>);
+
+const THEME_STORAGE_KEY: &str = "ui-theme";
+
+/// Load theme from localStorage; falls back to `Theme::Dark`.
+pub fn load_theme_from_storage() -> Theme {
+    LocalStorage::get::<String>(&THEME_STORAGE_KEY.to_string())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default()
+}
+
+/// Apply `data-theme` on `<html>` without touching localStorage.
+/// Use this for the FOUC-prevention path where the value is already loaded.
+/// When `theme` is `Theme::System` the resolved value is read from the
+/// `prefers-color-scheme` media query at call time.
+pub fn apply_theme_to_dom(theme: Theme) {
+    let resolved = match theme {
+        Theme::System => {
+            let prefers_dark = web_sys::window()
+                .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten())
+                .map(|mql| mql.matches())
+                .unwrap_or(true);
+            if prefers_dark {
+                "dark"
+            } else {
+                "light"
+            }
+        }
+        _ => theme.as_str(),
+    };
+    if let Some(root) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+    {
+        let _ = root.set_attribute("data-theme", resolved);
+    }
+}
+
+/// Persist theme to localStorage and apply `data-theme` on `<html>`.
+pub fn apply_and_save_theme(theme: Theme) {
+    LocalStorage::set(THEME_STORAGE_KEY.to_string(), &theme.as_str().to_string());
+    apply_theme_to_dom(theme);
+}

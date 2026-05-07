@@ -90,6 +90,7 @@ features = [
     "OscillatorType",
     "Performance",
     "Storage",
+    "MediaQueryList",
     "Window",
     "console",
 ]

@@ -78,6 +78,10 @@ html {
   line-height: 1.5;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, system-ui, sans-serif;
   background-color: var(--bg);
+  background-image: var(--bg-image);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -90,11 +94,17 @@ body {
   margin: 0;
   padding: 0;
   background-color: var(--bg);
+  background-image: var(--bg-image);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
 }
 
-/* Design tokens — leptos-website dark palette + Liquid Glass material */
-:root {
+/* Design tokens — scoped palette + stable aliases/scales/effects */
+html:not([data-theme]),
+html[data-theme="dark"] {
   --bg: #000000;
+  --bg-image: none;
   --surface: #1C1C1E;
   --surface-elevated: #2C2C2E;
   --surface-overlay: rgba(28, 28, 30, 0.9);
@@ -121,13 +131,187 @@ body {
    */
   --error-text: #FF7A6E;
 
-  /* Liquid Glass material */
+  /* Liquid Glass material (theme-dependent) */
   --glass-bg: rgba(255, 255, 255, 0.06);
   --glass-bg-hover: rgba(255, 255, 255, 0.10);
   --glass-border: rgba(255, 255, 255, 0.15);
   --glass-border-hover: rgba(255, 255, 255, 0.25);
   --glass-highlight: rgba(255, 255, 255, 0.20);
   --glass-shadow: rgba(0, 0, 0, 0.4);
+
+  --overlay-backdrop: rgba(0, 0, 0, 0.35);
+  --overlay-strong: rgba(0, 0, 0, 0.5);
+  --overlay-heavy: rgba(0, 0, 0, 0.6);
+  --overlay-opaque: rgba(0, 0, 0, 0.8);
+  --field-bg: rgba(255, 255, 255, 0.05);
+  --field-bg-hover: rgba(255, 255, 255, 0.07);
+  --grid-item-border: rgba(100, 100, 100, 0.3);
+  --signal-popup-bg: rgba(26, 26, 46, 0.97);
+  --signal-popup-border: rgba(255, 255, 255, 0.12);
+  --signal-popup-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  --tooltip-bg: rgba(0, 0, 0, 0.92);
+  --tooltip-border: rgba(255, 255, 255, 0.15);
+  --tooltip-text: #ddd;
+  --search-modal-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+  --search-badge-active-bg: rgba(22, 163, 74, 0.15);
+  --search-badge-active-text: #4ade80;
+  --search-badge-ended-bg: rgba(75, 85, 99, 0.2);
+  --search-badge-ended-text: #9ca3af;
+  --search-badge-idle-bg: rgba(202, 138, 4, 0.15);
+  --search-badge-idle-text: #facc15;
+  --shadow-overlay: 0 8px 20px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --hairline: rgba(255, 255, 255, 0.14);
+}
+
+html[data-theme="light"] {
+  --bg: #f5f5f5;
+  --bg-image: url('/static/themes/theme_v4.png');
+  --surface: #ffffff;
+  --surface-elevated: #f9f9fb;
+  --surface-overlay: rgba(255, 255, 255, 0.95);
+  --border: #e0e0e2;
+  --border-emphasis: #d0d0d4;
+  --text-primary: #1a1a1a;
+  --text-secondary: #636366;
+  --text-tertiary: #8e8e93;
+  --text-quaternary: #a9a9ae;
+  --accent: #007aff;
+  --accent-hover: #0a84ff;
+  --success: #30b959;
+  --warning: #ff9f0a;
+  --error: #ff3b30;
+  --error-text: #d70015;
+
+  /* Liquid Glass material — light theme uses much lighter, more transparent glass */
+  --glass-bg: rgba(255, 255, 255, 0.08);
+  --glass-bg-hover: rgba(255, 255, 255, 0.12);
+  --glass-border: rgba(150, 150, 180, 0.18);
+  --glass-border-hover: rgba(150, 150, 180, 0.28);
+  --glass-highlight: rgba(255, 255, 255, 0.40);
+  --glass-shadow: rgba(0, 0, 0, 0.08);
+
+  --overlay-backdrop: rgba(0, 0, 0, 0.20);
+  --overlay-strong: rgba(0, 0, 0, 0.30);
+  --overlay-heavy: rgba(0, 0, 0, 0.40);
+  --overlay-opaque: rgba(0, 0, 0, 0.60);
+  --field-bg: rgba(0, 0, 0, 0.04);
+  --field-bg-hover: rgba(0, 0, 0, 0.06);
+  --grid-item-border: rgba(100, 100, 100, 0.15);
+  --signal-popup-bg: rgba(250, 250, 252, 0.98);
+  --signal-popup-border: rgba(200, 200, 220, 0.25);
+  --signal-popup-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+  --tooltip-bg: rgba(40, 40, 50, 0.96);
+  --tooltip-border: rgba(255, 255, 255, 0.15);
+  --tooltip-text: #f0f0f2;
+  --search-modal-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15);
+  --search-badge-active-bg: rgba(76, 217, 100, 0.12);
+  --search-badge-active-text: #34c759;
+  --search-badge-ended-bg: rgba(142, 142, 147, 0.15);
+  --search-badge-ended-text: #636366;
+  --search-badge-idle-bg: rgba(255, 149, 0, 0.12);
+  --search-badge-idle-text: #ff9500;
+  --shadow-overlay: 0 8px 20px rgba(0, 0, 0, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.50);
+  --hairline: rgba(100, 100, 120, 0.12);
+}
+
+/* Settings-specific tokens — dark theme (default) */
+html:not([data-theme]),
+html[data-theme="dark"] {
+  /* Modal structure — simple frosted glass */
+  --settings-modal-bg: rgba(15, 15, 20, 0.12);
+  --settings-modal-border: rgba(190, 205, 235, 0.14);
+  --settings-modal-shadow: 0 24px 60px rgba(0, 0, 0, 0.30);
+  
+  /* Rim layer (::before) — very subtle glass edge */
+  --settings-rim-color: linear-gradient(to right, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%);
+  --settings-rim-opacity: 0.12;
+  
+  /* Surface reflection (::after) — nearly invisible */
+  --settings-reflection-opacity: 0.02;
+  
+  /* Sidebar & navigation */
+  --settings-sidebar-bg: transparent;
+  --settings-sidebar-border: rgba(186, 205, 240, 0.18);
+  --settings-nav-text: rgba(230, 238, 255, 0.70);
+  --settings-nav-text-hover: rgba(230, 238, 255, 0.92);
+  --settings-nav-active-bg: rgba(160, 180, 220, 0.18);
+  --settings-nav-active-border: rgba(165, 195, 240, 0.34);
+  
+  /* Sections & panels */
+  --settings-section-text: rgba(255, 255, 255, 0.92);
+  --settings-divider: linear-gradient(90deg, transparent, rgba(150, 185, 240, 0.22), transparent);
+  
+  /* Controls */
+  --settings-swatch-border: rgba(255, 255, 255, 0.30);
+  --settings-swatch-border-hover: rgba(255, 255, 255, 0.50);
+  --settings-swatch-shadow-hover: rgba(255, 255, 255, 0.16);
+  --settings-swatch-shadow-active: rgba(255, 255, 255, 0.18);
+  --settings-input-bg: var(--glass-bg);
+  --settings-input-border: rgba(255, 255, 255, 0.14);
+  --settings-input-border-focus: rgba(255, 255, 255, 0.32);
+  --settings-slider-track: rgba(255, 255, 255, 0.12);
+  
+  /* Popover & overlay */
+  --settings-popover-bg: rgba(30, 30, 34, 0.92);
+  --settings-popover-border: var(--glass-bg-hover);
+  --settings-error-border: var(--error-text);
+  --settings-error-shadow: rgba(255, 80, 80, 0.10);
+  --settings-overlay-z-back: 99;
+  --settings-overlay-z-front: 100;
+}
+
+/* Settings-specific tokens — light theme */
+html[data-theme="light"] {
+  /* Modal structure — simple frosted glass */
+  --settings-modal-bg: rgba(255, 255, 255, 0.06);
+  --settings-modal-border: rgba(100, 140, 180, 0.10);
+  --settings-modal-shadow: 0 16px 40px rgba(80, 100, 130, 0.10);
+  
+  /* Rim layer (::before) — very subtle glass edge */
+  --settings-rim-color: linear-gradient(to right, rgba(0, 0, 0, 0.03) 0%, rgba(0, 0, 0, 0.01) 100%);
+  --settings-rim-opacity: 0.08;
+  
+  /* Surface reflection (::after) — nearly invisible */
+  --settings-reflection-opacity: 0.01;
+  
+  /* Sidebar & navigation */
+  --settings-sidebar-bg: transparent;
+  --settings-sidebar-border: rgba(140, 160, 185, 0.12);
+  --settings-nav-text: rgba(35, 52, 78, 0.76);
+  --settings-nav-text-hover: rgba(20, 34, 56, 0.96);
+  --settings-nav-active-bg: rgba(135, 170, 220, 0.15);
+  --settings-nav-active-border: rgba(135, 170, 220, 0.28);
+  
+  /* Sections & panels */
+  --settings-section-text: rgba(16, 26, 44, 0.96);
+  --settings-divider: linear-gradient(90deg, transparent, rgba(100, 140, 180, 0.16), transparent);
+  
+  /* Controls */
+  --settings-swatch-border: rgba(60, 65, 72, 0.34);
+  --settings-swatch-border-hover: rgba(60, 65, 72, 0.60);
+  --settings-swatch-shadow-hover: rgba(100, 150, 220, 0.12);
+  --settings-swatch-shadow-active: rgba(100, 150, 220, 0.18);
+  --settings-input-bg: rgba(0, 0, 0, 0.04);
+  --settings-input-border: rgba(100, 140, 180, 0.20);
+  --settings-input-border-focus: rgba(100, 150, 220, 0.40);
+  --settings-slider-track: rgba(100, 140, 180, 0.18);
+  
+  /* Popover & overlay */
+  --settings-popover-bg: rgba(240, 235, 230, 0.94);
+  --settings-popover-border: rgba(100, 150, 220, 0.18);
+  --settings-error-border: rgba(200, 80, 80, 0.70);
+  --settings-error-shadow: rgba(200, 100, 100, 0.15);
+  --settings-overlay-z-back: 99;
+  --settings-overlay-z-front: 100;
+}
+
+/* Light theme invite window text — override for dark text readability */
+html[data-theme="light"] #invite-overlay h4,
+html[data-theme="light"] #invite-overlay p {
+  color: #3A3A3C;
+}
+
+:root {
   --glass-blur: 20px;
   --glass-saturate: 180%;
 
@@ -156,8 +340,6 @@ body {
   --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.25);
   --shadow-md: 0 8px 32px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
-  --shadow-overlay: 0 8px 20px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
-
   --motion-fast: 0.15s;
   --motion-base: 0.2s;
   --motion-emphasized: cubic-bezier(0.4, 0, 0.2, 1);
@@ -166,27 +348,6 @@ body {
   --effect-blur-sm: 4px;
   --effect-blur-md: 14px;
   --effect-blur-lg: var(--glass-blur);
-  --overlay-backdrop: rgba(0, 0, 0, 0.35);
-  --overlay-strong: rgba(0, 0, 0, 0.5);
-  --overlay-heavy: rgba(0, 0, 0, 0.6);
-  --overlay-opaque: rgba(0, 0, 0, 0.8);
-  --field-bg: rgba(255, 255, 255, 0.05);
-  --field-bg-hover: rgba(255, 255, 255, 0.07);
-  --grid-item-border: rgba(100, 100, 100, 0.3);
-  --signal-popup-bg: rgba(26, 26, 46, 0.97);
-  --signal-popup-border: rgba(255, 255, 255, 0.12);
-  --signal-popup-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-  --tooltip-bg: rgba(0, 0, 0, 0.92);
-  --tooltip-border: rgba(255, 255, 255, 0.15);
-  --tooltip-text: #ddd;
-  --search-modal-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-  --search-badge-active-bg: rgba(22, 163, 74, 0.15);
-  --search-badge-active-text: #4ade80;
-  --search-badge-ended-bg: rgba(75, 85, 99, 0.2);
-  --search-badge-ended-text: #9ca3af;
-  --search-badge-idle-bg: rgba(202, 138, 4, 0.15);
-  --search-badge-idle-text: #facc15;
-
   /* Concentric radius scale */
   --radius-outer: 24px;
   --radius-card: 16px;
@@ -194,8 +355,14 @@ body {
   --radius-button: 10px;
   --radius-pill: 9999px;
 
+  /* Gradient tokens — consolidated fade/rim/reflection effects */
+  --gradient-fade-video: linear-gradient(to top, rgba(0, 0, 0, 0.24), rgba(0, 0, 0, 0));
+  --gradient-divider-dark: linear-gradient(90deg, transparent, rgba(150, 185, 240, 0.22), transparent);
+  --gradient-divider-light: linear-gradient(90deg, transparent, rgba(60, 75, 100, 0.20), transparent);
+  --gradient-divider-accent: linear-gradient(90deg, transparent, rgba(124, 160, 216, 0.22), transparent);
+  --gradient-toggle-thumb: linear-gradient(160deg, rgba(255,255,255,0.92) 0%, rgba(210,220,235,0.70) 100%);
+
   /* Legacy aliases for non-landing components */
-  --hairline: rgba(255, 255, 255, 0.14);
   --accent-1: #0A84FF;
   --accent-2: #8E66FF;
   --accent-3: #BF5AF2;
@@ -203,10 +370,18 @@ body {
 
 /* Accessibility: high-contrast fallback */
 @media (prefers-contrast: more) {
-  :root {
+  html:not([data-theme]),
+  html[data-theme="dark"] {
     --glass-bg: rgba(0, 0, 0, 0.85);
     --glass-border: rgba(255, 255, 255, 0.4);
     --glass-highlight: rgba(255, 255, 255, 0.3);
+    --glass-blur: 0px;
+  }
+
+  html[data-theme="light"] {
+    --glass-bg: rgba(255, 255, 255, 0.92);
+    --glass-border: rgba(145, 114, 82, 0.60);
+    --glass-highlight: rgba(255, 255, 255, 0.90);
     --glass-blur: 0px;
   }
 }
@@ -362,7 +537,11 @@ body {
   justify-content: center;
   align-items: flex-start;
   padding: 2rem 0;
-  background: var(--bg);
+  background-color: var(--bg);
+  background-image: var(--bg-image);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
   overflow-y: auto;
   overflow-x: hidden;
   z-index: 0;

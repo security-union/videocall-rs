@@ -19,8 +19,9 @@ mod types;
 use crate::components::search_modal::SearchVisibleCtx;
 use crate::routing::Route;
 use context::{
-    load_display_name_from_storage, load_transport_preference, migrate_legacy_storage,
-    DisplayNameCtx, TransportPreferenceCtx,
+    apply_and_save_theme, apply_theme_to_dom, load_display_name_from_storage,
+    load_theme_from_storage, load_transport_preference, migrate_legacy_storage, DisplayNameCtx,
+    ThemePreferenceCtx, TransportPreferenceCtx,
 };
 use dioxus::prelude::*;
 
@@ -44,6 +45,27 @@ fn main() {
 
 #[component]
 fn App() -> Element {
+    use_hook(|| {
+        initialize_document_theme();
+    });
+
+    let theme = use_signal(load_theme_from_storage);
+    use_context_provider(|| ThemePreferenceCtx(theme));
+
+    // Keep html[data-theme] in sync whenever the user changes the signal.
+    // Skip the first firing: initialize_document_theme() already applied the
+    // correct theme synchronously before the first render, so re-running it
+    // here would cause a redundant (and potentially slower CBOR) write.
+    let is_first_effect = use_hook(|| std::cell::Cell::new(true));
+    use_effect(move || {
+        let current_theme = theme();
+        if is_first_effect.get() {
+            is_first_effect.set(false);
+            return;
+        }
+        apply_and_save_theme(current_theme);
+    });
+
     let display_name = use_signal(load_display_name_from_storage);
     use_context_provider(|| DisplayNameCtx(display_name));
 
@@ -79,6 +101,15 @@ fn App() -> Element {
     rsx! {
         Router::<Route> {}
     }
+}
+
+fn initialize_document_theme() {
+    // Use the CBOR-aware loader so this stays consistent with apply_and_save_theme,
+    // which writes via dioxus_sdk_storage (CBOR+zlib encoded). Reading with raw
+    // web_sys::Storage::get_item would see the encoded blob and fall back to "dark"
+    // for every non-default theme, causing a flash-of-wrong-theme on each page load.
+    let theme = load_theme_from_storage();
+    apply_theme_to_dom(theme);
 }
 
 /// Handle to the Cmd-K / Ctrl-K global keyboard listener.

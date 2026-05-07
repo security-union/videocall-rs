@@ -77,11 +77,34 @@ pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 // KEYFRAME_REQUEST Rate Limiting
 // ---------------------------------------------------------------------------
 
-/// Maximum number of KEYFRAME_REQUEST packets allowed per session within
-/// [`KEYFRAME_REQUEST_WINDOW_MS`]. Excess requests are silently dropped to
-/// prevent a malicious client from forcing senders to continuously generate
-/// expensive keyframes (5-10x larger than delta frames).
-pub const KEYFRAME_REQUEST_MAX_PER_SEC: u32 = 2;
+/// Maximum number of KEYFRAME_REQUEST packets allowed per receiver session
+/// within [`KEYFRAME_REQUEST_WINDOW_MS`], **across all target senders**.
+///
+/// This is a coarse, defense-in-depth ceiling that prevents a malicious or
+/// malfunctioning client from issuing an unbounded fan-out of requests in a
+/// short window. Per-target throttling is enforced separately by
+/// [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`]. This global cap is sized to
+/// allow a fresh joiner to request keyframes from many existing senders
+/// simultaneously without being clipped (legitimate behaviour during the
+/// first second after joining a populated room) while still bounding abuse.
+pub const KEYFRAME_REQUEST_MAX_PER_SEC: u32 = 32;
+
+/// Maximum number of KEYFRAME_REQUEST packets allowed per
+/// `(receiver, target_sender)` pair within [`KEYFRAME_REQUEST_WINDOW_MS`].
+///
+/// Sized to 1/sec because a healthy decoder should at most need a single
+/// keyframe per second per remote stream. The global per-receiver cap above
+/// still applies as a safety net. Per-pair limiting is what fixes the
+/// frozen-video-on-join bug observed in cc7tp on 2026-05-06: with the prior
+/// global-only limiter at 2/sec, a fresh joiner into a 17-peer meeting could
+/// only get keyframes for the first 2 of the 16 existing senders.
+pub const KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER: u32 = 1;
 
 /// Time window (in milliseconds) for KEYFRAME_REQUEST rate limiting.
 pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
+
+/// Stale-entry cleanup interval for the per-pair KEYFRAME_REQUEST limiter.
+///
+/// Cleanup runs every N requests (where N = this value) to amortize the
+/// O(n) `retain()` cost. Mirrors the strategy used by `CongestionTracker`.
+pub const KEYFRAME_LIMITER_CLEANUP_INTERVAL: u32 = 64;

@@ -24,9 +24,9 @@ pub struct Config {
     pub database_url: String,
     /// Shared secret used to sign room access tokens (HMAC-SHA256).
     pub jwt_secret: String,
-    /// Room access token time-to-live in seconds (default: 60 = 1 minute).
-    /// Tokens are "single-burner": short-lived admission tickets that the UI
-    /// refreshes automatically on every reconnect.
+    /// Room access token time-to-live in seconds (default: 86400 = 24 hours).
+    /// Must cover the longest expected meeting plus any connection re-election —
+    /// see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
     pub token_ttl_secs: i64,
     /// Session JWT time-to-live in seconds (default: 315360000 = ~10 years).
     pub session_ttl_secs: i64,
@@ -172,7 +172,12 @@ impl Config {
     ///
     /// # Optional
     /// - `LISTEN_ADDR` (default: `"0.0.0.0:8081"`)
-    /// - `TOKEN_TTL_SECS` (default: `"60"`)
+    /// - `TOKEN_TTL_SECS` (default: `"86400"`) — room access token lifetime in seconds.
+    ///   MUST be long enough to cover the duration of any meeting a client might join
+    ///   plus connection re-election. Setting this too short causes cached tokens in
+    ///   WT/WS URLs to expire before a re-election can complete, stranding users with
+    ///   "No valid connections". See
+    ///   [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
     /// - `COOKIE_DOMAIN`
     /// - `COOKIE_NAME` (default: `"session"`) — set to a unique value (e.g. `"pr-session"`)
     ///   in PR preview environments to avoid collision with the production cookie
@@ -197,8 +202,11 @@ impl Config {
             env::var("JWT_SECRET").map_err(|_| "JWT_SECRET environment variable is required")?;
 
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
+        // Default: 24 hours. Must exceed both the longest expected meeting and
+        // the client's connection re-election window, or cached tokens in WT/WS
+        // URLs expire mid-meeting and re-election fails. See discussion #562.
         let token_ttl_secs = env::var("TOKEN_TTL_SECS")
-            .unwrap_or_else(|_| "60".to_string())
+            .unwrap_or_else(|_| "86400".to_string())
             .parse::<i64>()
             .map_err(|_| "TOKEN_TTL_SECS must be a valid integer")?;
         let session_ttl_secs = env::var("SESSION_TTL_SECS")
@@ -469,5 +477,54 @@ impl Config {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Run `body` with `key` removed from the process environment, then restore
+    /// the prior value. Required because [`Config::from_env`] reads process env,
+    /// which is shared across the test binary's parallel runners.
+    fn with_env_unset<F: FnOnce()>(key: &str, body: F) {
+        let prior = std::env::var(key).ok();
+        std::env::remove_var(key);
+        body();
+        if let Some(v) = prior {
+            std::env::set_var(key, v);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn token_ttl_secs_defaults_to_86400_when_env_unset() {
+        // Regression test for discussion #562: the previous default of 60s
+        // caused production stranding when re-election fired more than 60s
+        // after a client joined, expiring the cached token in the WT/WS URL.
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+
+        with_env_unset("TOKEN_TTL_SECS", || {
+            let cfg = Config::from_env().expect("from_env with TOKEN_TTL_SECS unset must succeed");
+            assert_eq!(
+                cfg.token_ttl_secs, 86400,
+                "default must be 24h — see discussion #562"
+            );
+        });
+
+        // Restore surrounding env so we don't pollute sibling tests.
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
     }
 }

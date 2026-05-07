@@ -88,7 +88,7 @@ Key points:
 - Issued when a participant's status becomes `admitted`
 - Scoped to a specific room and participant
 - Contains identity, room, host status, and display name
-- **Single-burner design**: tokens have a short TTL (default: 60 seconds, configurable via `TOKEN_TTL_SECS`). They are intended as one-time admission tickets, not long-lived credentials
+- **Meeting-scoped lifetime**: tokens default to `TOKEN_TTL_SECS=86400` (24 hours). TTL must cover both the longest expected meeting and connection re-election — short TTLs cause cached tokens in WT/WS URLs to expire mid-meeting and strand users. See [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562). Tokens are scoped to a single room + participant identity; a leak grants only meeting admission for that one user/room for the TTL duration.
 - Delivered in the `room_token` field of API responses
 - A fresh token is generated on every call to `GET /api/v1/meetings/{id}/status` when the participant is admitted
 

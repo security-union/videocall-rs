@@ -26,7 +26,9 @@ use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL, WS_OUTBOUND_CHANNEL_CAPACITY};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
-use crate::metrics::{RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL};
+use crate::metrics::{
+    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL,
+};
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use actix::ActorFutureExt;
@@ -235,12 +237,27 @@ impl Handler<Message> for WsChatSession {
                     .inc();
                 // Parse sender session_id only on drops (not on every packet)
                 // to avoid a protobuf parse + heap alloc on the hot path.
-                if let Ok(pw) = PacketWrapper::parse_from_bytes(&msg.msg) {
+                // Phase 8b TELEM-8: derive `kind` from the same parse so the
+                // protocol-wide aggregate counter can distinguish media vs
+                // control drops without a second parse.
+                let kind = if let Ok(pw) = PacketWrapper::parse_from_bytes(&msg.msg) {
                     let sender_session_id = pw.session_id;
                     if sender_session_id != 0 {
                         self.logic.on_outbound_drop(sender_session_id, &pw.user_id);
                     }
-                }
+                    if pw.packet_type
+                        == videocall_types::protos::packet_wrapper::packet_wrapper::PacketType::MEDIA.into()
+                    {
+                        "media"
+                    } else {
+                        "control"
+                    }
+                } else {
+                    "unknown"
+                };
+                OUTBOUND_CHANNEL_DROPS_TOTAL
+                    .with_label_values(&["websocket", kind])
+                    .inc();
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 ctx.stop();

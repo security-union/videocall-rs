@@ -27,7 +27,9 @@ use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, WT_OUTBOUND_CHANNEL_CAPACITY};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
-use crate::metrics::{RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL};
+use crate::metrics::{
+    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL,
+};
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use actix::{
@@ -167,6 +169,13 @@ impl WtChatSession {
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
                     .inc();
+                // Phase 8b TELEM-8: Protocol-wide aggregate counter that backs
+                // alerting (rate(...)[5m]) without high-cardinality `room`.
+                // `send()` is used for non-media control packets (heartbeats,
+                // session-assigned, meeting-started), hence kind="control".
+                OUTBOUND_CHANNEL_DROPS_TOTAL
+                    .with_label_values(&["webtransport", "control"])
+                    .inc();
                 error!(
                     "Outbound channel full for session {}, dropping message",
                     self.logic.id
@@ -205,6 +214,21 @@ impl WtChatSession {
                 WtSendResult::Dead
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                // Phase 8b TELEM-8: this drop site previously lacked any
+                // counter increment, so a flood of media drops only surfaced
+                // in the log line below. Increment both the room-tagged
+                // RELAY_PACKET_DROPS_TOTAL (for per-room investigation) and
+                // the protocol-wide OUTBOUND_CHANNEL_DROPS_TOTAL (for
+                // alerting). `kind` is derived from the already-parsed
+                // `is_media` hint — we explicitly avoid an extra protobuf
+                // parse on the drop hot path.
+                RELAY_PACKET_DROPS_TOTAL
+                    .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
+                    .inc();
+                let kind = if is_media { "media" } else { "control" };
+                OUTBOUND_CHANNEL_DROPS_TOTAL
+                    .with_label_values(&["webtransport", kind])
+                    .inc();
                 error!(
                     "Outbound channel full for session {}, dropping message",
                     self.logic.id
@@ -425,6 +449,13 @@ impl Handler<WtInbound> for WtChatSession {
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         RELAY_PACKET_DROPS_TOTAL
                             .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
+                            .inc();
+                        // Phase 8b TELEM-8: protocol-wide aggregate. RTT echo
+                        // gets its own `kind` so we can distinguish probe
+                        // congestion (early signal) from media congestion
+                        // (already-degraded call) in the alerting layer.
+                        OUTBOUND_CHANNEL_DROPS_TOTAL
+                            .with_label_values(&["webtransport", "rtt"])
                             .inc();
                         error!(
                             "Outbound channel full, dropping RTT echo for session {}",

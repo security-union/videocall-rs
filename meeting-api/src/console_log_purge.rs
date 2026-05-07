@@ -355,16 +355,29 @@ pub fn spawn_purge_task() -> Option<tokio::task::JoinHandle<()>> {
 
             match result {
                 Ok(summary) => {
-                    tracing::info!(
-                        base_dir = %base_dir,
-                        retention_days,
-                        files_deleted = summary.files_deleted,
-                        bytes_reclaimed = summary.bytes_reclaimed,
-                        dirs_removed = summary.dirs_removed,
-                        errors = summary.errors,
-                        elapsed_ms = elapsed.as_millis() as u64,
-                        "Console log purge complete"
-                    );
+                    if summary.errors > 0 {
+                        tracing::warn!(
+                            base_dir = %base_dir,
+                            retention_days,
+                            files_deleted = summary.files_deleted,
+                            bytes_reclaimed = summary.bytes_reclaimed,
+                            dirs_removed = summary.dirs_removed,
+                            errors = summary.errors,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            "Console log purge completed with errors"
+                        );
+                    } else {
+                        tracing::info!(
+                            base_dir = %base_dir,
+                            retention_days,
+                            files_deleted = summary.files_deleted,
+                            bytes_reclaimed = summary.bytes_reclaimed,
+                            dirs_removed = summary.dirs_removed,
+                            errors = summary.errors,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            "Console log purge complete"
+                        );
+                    }
                 }
                 Err(join_err) => {
                     tracing::error!(

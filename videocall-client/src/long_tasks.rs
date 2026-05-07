@@ -50,9 +50,44 @@ use js_sys::{Array, Reflect};
 #[cfg(target_arch = "wasm32")]
 use log::warn;
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
+use wasm_bindgen::{prelude::wasm_bindgen, prelude::Closure, JsCast, JsValue};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{PerformanceObserver, PerformanceObserverInit};
+
+// `PerformanceObserver::observe` re-bound with `catch` so that a `TypeError`
+// thrown by browsers that don't recognise the `"longtask"` entry type
+// (Firefox <127) doesn't propagate as a wasm panic — instead returns
+// `Err(JsValue)` we can fall through on. The strongly-typed web-sys binding
+// lacks `catch`, which would crash the whole `VideoCallClient` constructor
+// on those browsers (see issue #606).
+//
+// Implementation note: wasm-bindgen's `method` attribute generates an
+// inherent `impl` for the `this:` type, which is forbidden by Rust's
+// orphan rule when the type lives in a foreign crate (here, `web_sys`).
+// We work around this by declaring a *local* extern type alias
+// (`PerformanceObserverFb` — "fallible-bind") that points at the same
+// underlying JS class via `js_class = "PerformanceObserver"`. Calls cast
+// the `&web_sys::PerformanceObserver` to `&PerformanceObserverFb` for the
+// duration of the throw-safe `observe` invocation; both bindings refer
+// to the same JS object, so the cast is a no-op at runtime.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = PerformanceObserver)]
+    type PerformanceObserverFb;
+
+    #[wasm_bindgen(
+        catch,
+        method,
+        structural,
+        js_class = "PerformanceObserver",
+        js_name = observe
+    )]
+    fn observe_safe(
+        this: &PerformanceObserverFb,
+        options: &PerformanceObserverInit,
+    ) -> Result<(), JsValue>;
+}
 
 /// Subsystem label attached to every emitted [`DiagEvent`]. Kept short so
 /// it shows up cleanly in metrics dashboards.
@@ -171,7 +206,28 @@ impl LongTaskObserver {
         let entry_types = Array::new();
         entry_types.push(&JsValue::from_str("longtask"));
         let init = PerformanceObserverInit::new(&entry_types);
-        observer.observe(&init);
+        // `observe_safe` is our `#[wasm_bindgen(catch)]` rebinding of
+        // `PerformanceObserver::observe`; per MDN the underlying call
+        // throws `TypeError` when `entryTypes` contains an unrecognised
+        // entry type. Firefox added `"longtask"` only in v127 (June
+        // 2024), so Firefox 57-126 successfully construct the observer
+        // and then throw here. Without `catch`, that throw bubbles up
+        // as a wasm panic at `VideoCallClient::new` time and hard-fails
+        // the call (issue #606). Catching it lets us fall through to
+        // `None` so long-task telemetry is silently disabled instead.
+        //
+        // The `unchecked_ref` cast is sound: both `web_sys::PerformanceObserver`
+        // and our local `PerformanceObserverFb` are wasm-bindgen views over
+        // the same JS class (`PerformanceObserver`); see the extern-block
+        // doc comment for why we needed a local alias.
+        let observer_fb: &PerformanceObserverFb = observer.unchecked_ref();
+        if let Err(e) = observer_fb.observe_safe(&init) {
+            debug!(
+                "long_tasks: observe() rejected 'longtask' entry type \
+                 (likely Firefox <127); long-task telemetry disabled (err={e:?})"
+            );
+            return None;
+        }
 
         Some(Self {
             observer: Some(observer),
@@ -342,5 +398,44 @@ mod tests {
         // The non-wasm shim should always return Some(_) so the integration
         // call site doesn't have to special-case the host build.
         let _ = LongTaskObserver::start().expect("native stub should start");
+    }
+
+    /// Compile-only contract test for issue #606.
+    ///
+    /// `observe_safe` is the `#[wasm_bindgen(catch)]` rebinding of
+    /// `PerformanceObserver::observe` that protects `LongTaskObserver::start`
+    /// from a wasm panic when a browser (e.g. Firefox <127) throws
+    /// `TypeError` on an unrecognised `entryTypes` value. The strongly-typed
+    /// `web_sys::PerformanceObserver::observe` binding does *not* declare
+    /// `catch`, so any future refactor that swaps `observe_safe` back for the
+    /// raw web-sys binding would silently reintroduce the crash.
+    ///
+    /// This test enforces, at compile time, that:
+    ///   * `observe_safe` exists with the expected signature, and
+    ///   * its return type is `Result<(), JsValue>` (i.e. fallible — not
+    ///     the unit-returning web-sys binding).
+    ///
+    /// The body never actually runs — the test is purely a type-shape lock.
+    /// It only compiles on wasm32 because that's where `observe_safe` lives.
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn observe_safe_returns_result_unit_jsvalue_for_issue_606() {
+        // If this stops compiling, audit the call-site in
+        // `LongTaskObserver::start` — the issue #606 panic regression is
+        // probably back.
+        fn _assert_signature(
+            obs: &super::PerformanceObserverFb,
+            init: &web_sys::PerformanceObserverInit,
+        ) -> Result<(), wasm_bindgen::JsValue> {
+            obs.observe_safe(init)
+        }
+        // Don't actually invoke at runtime — there's no live JS heap under
+        // `cargo test --lib` on wasm32 unless a wasm-bindgen-test harness is
+        // running. The compile check above is the assertion.
+        let _ = _assert_signature
+            as fn(
+                &super::PerformanceObserverFb,
+                &web_sys::PerformanceObserverInit,
+            ) -> Result<(), wasm_bindgen::JsValue>;
     }
 }

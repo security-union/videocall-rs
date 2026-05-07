@@ -365,9 +365,11 @@ async fn handle_webtransport_session(
     is_host: bool,
     end_on_host_leave: bool,
 ) -> anyhow::Result<()> {
-    // Create channel for actor → WebTransport I/O
+    // Create channel for actor → WebTransport I/O.
+    // Capacity is env-tunable via `WT_OUTBOUND_CHANNEL_CAPACITY` and resolved
+    // once on first call; see `crate::constants::wt_outbound_channel_capacity`.
     let (outbound_tx, outbound_rx) =
-        mpsc::channel::<WtOutbound>(crate::constants::WT_OUTBOUND_CHANNEL_CAPACITY);
+        mpsc::channel::<WtOutbound>(crate::constants::wt_outbound_channel_capacity());
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(

@@ -2107,6 +2107,7 @@ mod disconnect_tests {
             on_peer_added: VcCallback::noop(),
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: None,
+            refresh_room_token_callback: None,
             get_peer_video_canvas_id: VcCallback::from(|id| id),
             get_peer_screen_canvas_id: VcCallback::from(|id| id),
             on_connected: VcCallback::noop(),

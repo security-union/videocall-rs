@@ -1127,7 +1127,7 @@ pub fn AttendantsComponent(
             // automatic retry — the single-candidate state in those modes is
             // intentional, not a recoverable system condition.
             allow_post_rebase_retry: transport_pref == TransportPreference::Auto,
-            // Phase 3 / AUTH-2 — discussion #562: let the connection
+            // Phase 3 / AUTH-2 — discussion 562: let the connection
             // manager preempt token expiry from inside its internal
             // re-election. Without this, the manager re-uses the cached
             // server URLs (with the original JWT in the query string) and

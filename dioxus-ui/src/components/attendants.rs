@@ -52,7 +52,7 @@ use dioxus::web::WebEventExt;
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::error;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
@@ -725,6 +725,10 @@ pub fn AttendantsComponent(
     let meeting_ended_message = use_signal(|| None::<String>);
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
+    // Phase 6 render-storm fix: shared "bump pending?" flag for the
+    // `peer_speaking` event handler. Lives on a `use_hook` so it survives
+    // across renders. See `schedule_throttled_bump`.
+    let peer_list_bump_pending: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     let mut screen_share_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
     let mic_error = use_signal(|| None::<MediaErrorState>);
@@ -928,6 +932,12 @@ pub fn AttendantsComponent(
                 //
                 // Note: we rebind to a local `mut` copy so the closure stays
                 // `Fn` (Signal is Copy; only the local is mutated each call).
+                //
+                // Phase 6 (cc7tp 2026-05-06): the `peer_list_version` bump
+                // moved to `on_peers_removed_batch` below so that a 5-peer
+                // watchdog cascade fires one re-render instead of five.
+                // Per-peer cleanup of side-maps stays here — these are O(1)
+                // and observers may rely on the per-peer fan-out.
                 let mut map = peer_status_map;
                 map.write().remove(&peer_id);
                 // Also remove the departed peer's signal history so the shared
@@ -941,8 +951,25 @@ pub fn AttendantsComponent(
                 let mut ct_map = cropped_tiles_signal;
                 ct_map.write().remove(&peer_id);
                 ct_map.write().remove(&format!("screen-share-{peer_id}"));
+            })),
+            on_peers_removed_batch: Some(VcCallback::from(move |peer_ids: Vec<String>| {
+                // Phase 6 fix: bump `peer_list_version` exactly once per
+                // removal pass, not once per dead peer. When the
+                // PeerDecodeManager watchdog times out N peers in a single
+                // tick (cc7tp incident: N=5), the per-peer
+                // `on_peer_removed` callback still fires N times for
+                // side-map cleanup, but the version-driven re-render
+                // happens only once.
+                if peer_ids.is_empty() {
+                    return;
+                }
+                log::info!(
+                    "Batched peer removal: {} peer(s) removed in one pass",
+                    peer_ids.len()
+                );
                 let mut v = peer_list_version;
-                v.set(v() + 1);
+                let next = *v.peek() + 1;
+                v.set(next);
             })),
             get_peer_video_canvas_id: VcCallback::from(|id| id),
             get_peer_screen_canvas_id: VcCallback::from(|id| format!("screen-share-{}", &id)),
@@ -1448,7 +1475,9 @@ pub fn AttendantsComponent(
     // Instead of each PeerTile spawning its own async task, one task
     // dispatches peer_status events into a shared HashMap.
     let mut diagnostics_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
+    let bump_pending_for_effect = peer_list_bump_pending.clone();
     use_effect(move || {
+        let bump_pending = bump_pending_for_effect.clone();
         let task = spawn(async move {
             let mut rx = videocall_diagnostics::subscribe();
             while let Ok(evt) = rx.recv().await {
@@ -1470,9 +1499,29 @@ pub fn AttendantsComponent(
                         };
                         if should_update {
                             peer_speech_priority.write().insert(peer_id, now);
-                            let mut v = peer_list_version;
-                            let next = *v.peek() + 1;
-                            v.set(next);
+                            // Phase 6 render-storm fix (cc7tp 2026-05-06):
+                            // coalesce bursty speaker activity into one
+                            // `peer_list_version` bump per 50 ms window
+                            // instead of per-event. Without this, multiple
+                            // active speakers triggered 3-5 full meeting-
+                            // view re-renders per second, which on 2-core
+                            // hardware compounded into 5 s main-thread
+                            // stalls.
+                            //
+                            // Signal<u32> is `Copy`, so we move a copy into
+                            // the throttled callback and re-bind it as
+                            // `mut` inside to satisfy the `Fn` bound on
+                            // the boxed closure.
+                            let v = peer_list_version;
+                            schedule_throttled_bump(
+                                bump_pending.clone(),
+                                PEER_LIST_VERSION_THROTTLE_MS,
+                                Rc::new(move || {
+                                    let mut v = v;
+                                    let next = *v.peek() + 1;
+                                    v.set(next);
+                                }),
+                            );
                         }
                     }
                     continue;
@@ -2938,6 +2987,53 @@ pub fn AttendantsComponent(
     }
 }
 
+/// Default 50 ms coalescing window for [`schedule_throttled_bump`].
+///
+/// Selected as a render-friendly upper bound: at 60 fps a frame is ~16 ms,
+/// so 50 ms guarantees at most one re-render per ~3 frames even under a
+/// sustained burst of speech events. See Phase 6 render-storm fix
+/// (cc7tp 2026-05-06).
+pub(crate) const PEER_LIST_VERSION_THROTTLE_MS: u32 = 50;
+
+/// Coalesce a burst of "something tiny changed" events into at most one
+/// invocation of `bump` per `delay_ms` window.
+///
+/// `pending` is an `Rc<Cell<bool>>` that survives across calls (typically
+/// stored via `use_hook`). When clear, this function sets it and schedules
+/// a [`Timeout`] of `delay_ms` that will:
+///   1. Invoke `bump` (the actual work — e.g. a `peer_list_version.set()`).
+///   2. Clear `pending` so the next call schedules a new window.
+///
+/// When `pending` is already set, this call is a no-op — the bump is
+/// already inbound. This is the kernel of the Phase 6 render-storm fix:
+/// `peer_speaking` events fire 3-5×/sec/speaker on a busy call, and
+/// without coalescing each one drove a full meeting-view re-render. With
+/// the throttle, bursty speech activity collapses into one re-render
+/// every 50 ms regardless of how many speakers are active.
+///
+/// Note: only "soft" bumps (the ones driven by speech activity, where
+/// the peer set is unchanged and the version bump exists purely to nudge
+/// memo-keyed children) should go through this throttle. Real peer
+/// add/remove events must bump immediately.
+pub(crate) fn schedule_throttled_bump(pending: Rc<Cell<bool>>, delay_ms: u32, bump: Rc<dyn Fn()>) {
+    if pending.get() {
+        return;
+    }
+    pending.set(true);
+    let pending_clone = pending.clone();
+    let bump_clone = bump.clone();
+    Timeout::new(delay_ms, move || {
+        // Clear the flag BEFORE running `bump` so any new event fired
+        // synchronously from inside `bump` (or from a subscriber that
+        // reacts to the version change) can re-arm the throttle for the
+        // next 50 ms window. Otherwise the next event would silently
+        // drop and we'd miss a coalescing boundary.
+        pending_clone.set(false);
+        bump_clone();
+    })
+    .forget();
+}
+
 /// Parse a `peer_status` diagnostics event into a `(peer_id, PeerMediaState)`.
 fn parse_peer_status_event(
     evt: &videocall_diagnostics::DiagEvent,
@@ -3203,6 +3299,116 @@ mod tests {
             !reconn_wt.is_empty(),
             "reconnect path repopulates the WT list — this is the recovery \
              from the single-server-stranding state"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 6: schedule_throttled_bump tests
+    // -----------------------------------------------------------------
+
+    use gloo_timers::future::TimeoutFuture;
+
+    /// 5 calls to `schedule_throttled_bump` within the throttle window
+    /// should result in exactly **one** invocation of the bump callback.
+    /// Reproduces the cc7tp 2026-05-06 render-storm scenario where 5
+    /// `peer_speaking` events from different speakers all coalesce
+    /// into a single `peer_list_version` bump.
+    #[wasm_bindgen_test]
+    async fn throttled_bump_coalesces_burst_into_single_invocation() {
+        let pending = Rc::new(Cell::new(false));
+        let counter = Rc::new(Cell::new(0u32));
+
+        let make_bump = || -> Rc<dyn Fn()> {
+            let counter = counter.clone();
+            Rc::new(move || {
+                counter.set(counter.get() + 1);
+            })
+        };
+
+        // Use a 50 ms throttle window. We then issue 5 bumps within ~30
+        // ms (roughly back-to-back) and wait long enough for the timer
+        // to fire.
+        for _ in 0..5 {
+            schedule_throttled_bump(pending.clone(), 50, make_bump());
+            // Tiny await to make sure each call observes a real `await`
+            // boundary but stays inside the 50 ms window.
+            TimeoutFuture::new(5).await;
+        }
+
+        // Wait for the throttle window plus generous margin.
+        TimeoutFuture::new(120).await;
+
+        assert_eq!(
+            counter.get(),
+            1,
+            "5 bumps within the throttle window must coalesce into 1 invocation"
+        );
+        assert!(
+            !pending.get(),
+            "pending flag should be cleared after the bump fires"
+        );
+    }
+
+    /// 5 calls spaced 100 ms apart (well outside a 50 ms throttle
+    /// window) must each get their own bump — the throttle re-arms
+    /// between windows.
+    #[wasm_bindgen_test]
+    async fn throttled_bump_does_not_drop_events_outside_window() {
+        let pending = Rc::new(Cell::new(false));
+        let counter = Rc::new(Cell::new(0u32));
+
+        let make_bump = || -> Rc<dyn Fn()> {
+            let counter = counter.clone();
+            Rc::new(move || {
+                counter.set(counter.get() + 1);
+            })
+        };
+
+        for _ in 0..5 {
+            schedule_throttled_bump(pending.clone(), 50, make_bump());
+            // Wait > 50 ms so each call sees an empty `pending` flag and
+            // schedules a fresh window.
+            TimeoutFuture::new(100).await;
+        }
+
+        // Final tail wait so the last scheduled timeout has fired.
+        TimeoutFuture::new(100).await;
+
+        assert_eq!(
+            counter.get(),
+            5,
+            "5 bumps spaced > throttle window must each fire their own invocation"
+        );
+    }
+
+    /// Once the throttle window completes the flag must be clear so
+    /// the next event can schedule a new window. Equivalent to: bump,
+    /// wait for fire, bump again — both should fire.
+    #[wasm_bindgen_test]
+    async fn throttled_bump_rearm_after_window_completes() {
+        let pending = Rc::new(Cell::new(false));
+        let counter = Rc::new(Cell::new(0u32));
+
+        let make_bump = || -> Rc<dyn Fn()> {
+            let counter = counter.clone();
+            Rc::new(move || {
+                counter.set(counter.get() + 1);
+            })
+        };
+
+        schedule_throttled_bump(pending.clone(), 50, make_bump());
+        assert!(pending.get(), "pending should be set after first schedule");
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(counter.get(), 1, "first bump should have fired");
+        assert!(!pending.get(), "pending should be cleared after fire");
+
+        schedule_throttled_bump(pending.clone(), 50, make_bump());
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            counter.get(),
+            2,
+            "second bump should have fired after re-arm"
         );
     }
 }

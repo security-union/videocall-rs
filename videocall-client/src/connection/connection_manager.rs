@@ -19,6 +19,7 @@
 use std::collections::VecDeque;
 
 use super::connection::Connection;
+use super::url_log::strip_query_for_log;
 use super::webmedia::ConnectOptions;
 use crate::adaptive_quality_constants::{
     ELECTION_MAX_EXTENSIONS, ELECTION_MIN_RTT_SAMPLES, POST_REBASE_RETRY_DELAY_MS,
@@ -779,10 +780,16 @@ impl ConnectionManager {
                             consecutive_implausible_discards: 0,
                         },
                     );
-                    debug!("Created WebSocket connection {conn_id}: {url}");
+                    debug!(
+                        "Created WebSocket connection {conn_id}: {}",
+                        strip_query_for_log(&url)
+                    );
                 }
                 Err(e) => {
-                    error!("Failed to create WebSocket connection to {url}: {e}");
+                    error!(
+                        "Failed to create WebSocket connection to {}: {e}",
+                        strip_query_for_log(&url)
+                    );
                 }
             }
         }
@@ -817,10 +824,16 @@ impl ConnectionManager {
                             consecutive_implausible_discards: 0,
                         },
                     );
-                    debug!("Created WebTransport connection {conn_id}: {url}");
+                    debug!(
+                        "Created WebTransport connection {conn_id}: {}",
+                        strip_query_for_log(&url)
+                    );
                 }
                 Err(e) => {
-                    error!("Failed to create WebTransport connection to {url}: {e}");
+                    error!(
+                        "Failed to create WebTransport connection to {}: {e}",
+                        strip_query_for_log(&url)
+                    );
                 }
             }
         }
@@ -1198,7 +1211,9 @@ impl ConnectionManager {
                 };
                 info!(
                     "Elected connection {}: {} (avg RTT: {}ms)",
-                    connection_id, measurement.url, winner_rtt,
+                    connection_id,
+                    strip_query_for_log(&measurement.url),
+                    winner_rtt,
                 );
 
                 // --- Re-election fallback check ---

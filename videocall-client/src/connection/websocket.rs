@@ -20,6 +20,7 @@
 // This submodule implements our WebMedia trait for WebSocketTask.
 //
 use super::connection_lost_reason::ConnectionLostReason;
+use super::url_log::strip_query_for_log;
 use super::webmedia::{ConnectOptions, WebMedia};
 use log::debug;
 use std::cell::Cell;
@@ -80,7 +81,10 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
                 }
             }
         });
-        debug!("WebSocket connecting to {}", &options.websocket_url);
+        debug!(
+            "WebSocket connecting to {}",
+            strip_query_for_log(&options.websocket_url)
+        );
         let task = WebSocketService::connect(
             &options.websocket_url,
             options.on_inbound_media,

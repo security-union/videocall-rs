@@ -67,7 +67,8 @@ const RTT_SANITY_MAX_MS: f64 = 10_000.0;
 /// The value (3000 ms) splits the difference between code-reviewer's 5s
 /// suggestion and performance-reviewer's 2s, and matches the order of
 /// magnitude of the typical wasm_fetch defaults already used elsewhere in
-/// the dioxus-ui meeting_api path. See PR #571 review thread.
+/// the dioxus-ui meeting_api path. See PR 571 review thread.
+#[cfg(target_arch = "wasm32")]
 const REFRESH_TIMEOUT_MS: u32 = 3_000;
 
 /// Returns a monotonic, high-resolution timestamp in milliseconds using
@@ -2196,7 +2197,7 @@ impl ConnectionManager {
             // entry. Host unit tests exercise the apply step directly via
             // `apply_refresh_and_start_reelection`.
             self.refresh_in_progress.set(false);
-            return self.start_reelection();
+            self.start_reelection()
         }
 
         #[cfg(target_arch = "wasm32")]

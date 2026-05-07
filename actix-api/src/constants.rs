@@ -60,11 +60,73 @@ pub const CONGESTION_WINDOW: Duration = Duration::from_millis(1000);
 /// packets are dropped in quick succession.
 pub const CONGESTION_NOTIFY_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 
-/// Bounded channel capacity for WebTransport outbound relay queue.
+/// Default bounded channel capacity for WebTransport outbound relay queue.
 ///
 /// Sized for MTU-limited datagrams (~1200 bytes) and small stream
-/// messages. 256 slots provides headroom for bursty traffic.
-pub const WT_OUTBOUND_CHANNEL_CAPACITY: usize = 256;
+/// messages. The previous 256-slot bound was exceeded by ~1.6x during
+/// a 17-peer cc7tp meeting on 2026-05-06, producing ~38.5k
+/// `Outbound channel full` drops over the meeting (~480 inbound
+/// msg/sec/receiver into a 256-slot queue).
+///
+/// 1024 gives ~4x headroom for typical 17-peer meetings; the value
+/// can be raised further at deploy-time via the
+/// `WT_OUTBOUND_CHANNEL_CAPACITY` environment variable for larger
+/// meetings.
+pub const WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT: usize = 1024;
+
+/// Resolve the WebTransport outbound channel capacity from the
+/// `WT_OUTBOUND_CHANNEL_CAPACITY` environment variable, falling back
+/// to [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`] if unset, unparseable,
+/// or zero.
+///
+/// The lookup is memoised: the env var is read exactly once on the
+/// first call. A non-zero `usize` parse yields the env value;
+/// unparseable values (e.g. `"abc"`) emit a `warn!` and fall back to
+/// the default. A literal `0` is also rejected so the channel is
+/// never constructed with zero capacity (which would panic inside
+/// `tokio::sync::mpsc::channel`).
+pub fn wt_outbound_channel_capacity() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        resolve_wt_outbound_channel_capacity(
+            std::env::var("WT_OUTBOUND_CHANNEL_CAPACITY")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Pure resolver for [`wt_outbound_channel_capacity`]: maps the raw
+/// optional environment string to the concrete channel capacity,
+/// applying the same parse, zero-rejection and warn-on-failure rules
+/// without touching any process-global state.
+///
+/// Extracted as a free function so unit tests can exercise the
+/// resolution logic without racing against the `OnceLock` cache or
+/// mutating the real process environment.
+pub(crate) fn resolve_wt_outbound_channel_capacity(raw: Option<&str>) -> usize {
+    match raw {
+        Some(value) => match value.parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "WT_OUTBOUND_CHANNEL_CAPACITY=0 is invalid; falling back to default {}",
+                    WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
+                );
+                WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
+            }
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse WT_OUTBOUND_CHANNEL_CAPACITY={:?} as usize ({}); falling back to default {}",
+                    value, e, WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
+                );
+                WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
+            }
+        },
+        None => WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT,
+    }
+}
 
 /// Bounded channel capacity for WebSocket outbound relay queue.
 ///
@@ -85,3 +147,55 @@ pub const KEYFRAME_REQUEST_MAX_PER_SEC: u32 = 2;
 
 /// Time window (in milliseconds) for KEYFRAME_REQUEST rate limiting.
 pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_wt_outbound_channel_capacity_unset_uses_default() {
+        assert_eq!(
+            resolve_wt_outbound_channel_capacity(None),
+            WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
+        );
+    }
+
+    #[test]
+    fn resolve_wt_outbound_channel_capacity_valid_value_used_verbatim() {
+        assert_eq!(resolve_wt_outbound_channel_capacity(Some("512")), 512);
+        assert_eq!(resolve_wt_outbound_channel_capacity(Some("4096")), 4096);
+    }
+
+    #[test]
+    fn resolve_wt_outbound_channel_capacity_garbage_falls_back_to_default() {
+        assert_eq!(
+            resolve_wt_outbound_channel_capacity(Some("abc")),
+            WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
+        );
+    }
+
+    #[test]
+    fn resolve_wt_outbound_channel_capacity_zero_falls_back_to_default() {
+        // A literal "0" must be rejected; mpsc::channel(0) panics.
+        assert_eq!(
+            resolve_wt_outbound_channel_capacity(Some("0")),
+            WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
+        );
+    }
+
+    #[test]
+    fn resolve_wt_outbound_channel_capacity_negative_falls_back_to_default() {
+        assert_eq!(
+            resolve_wt_outbound_channel_capacity(Some("-1")),
+            WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
+        );
+    }
+
+    #[test]
+    fn resolve_wt_outbound_channel_capacity_empty_falls_back_to_default() {
+        assert_eq!(
+            resolve_wt_outbound_channel_capacity(Some("")),
+            WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
+        );
+    }
+}

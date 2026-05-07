@@ -34,6 +34,7 @@ jobs:
   fmt:
     name: cargo fmt
     runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: cargo fmt check
@@ -44,6 +45,7 @@ jobs:
   clippy:
     name: cargo clippy
     runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: clippy (native targets)
@@ -54,6 +56,7 @@ jobs:
   wasm-check:
     name: wasm32 check
     runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: cargo check videocall-client (default features)
@@ -72,6 +75,7 @@ jobs:
   wasm-test:
     name: wasm-pack tests
     runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: wasm-pack test videocall-client

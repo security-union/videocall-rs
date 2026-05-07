@@ -18,6 +18,7 @@ jobs:
   lint:
     name: ESLint + Prettier + TypeCheck
     runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: e2e

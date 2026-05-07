@@ -62,6 +62,8 @@ use videocall_client::{
     MediaPermissionsErrorState, PermissionState, ScreenShareEvent, VideoCallClient,
     VideoCallClientOptions,
 };
+#[cfg(feature = "media-server-jwt-auth")]
+use videocall_client::{RefreshRoomTokenCallback, RefreshedTokens};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -1152,6 +1154,61 @@ pub fn AttendantsComponent(
             // automatic retry — the single-candidate state in those modes is
             // intentional, not a recoverable system condition.
             allow_post_rebase_retry: transport_pref == TransportPreference::Auto,
+            // Phase 3 / AUTH-2 — discussion 562: let the connection
+            // manager preempt token expiry from inside its internal
+            // re-election. Without this, the manager re-uses the cached
+            // server URLs (with the original JWT in the query string) and
+            // every candidate gets rejected by the relay once the token
+            // has expired; only the UI-level `schedule_reconnect` path
+            // would eventually refresh — by which time the user has
+            // already perceived a disconnect.
+            //
+            // We supply this callback ONLY in the JWT-auth build, which is
+            // the build with token expiry at all. The non-JWT build keeps
+            // re-election simple (no refresh exists to perform).
+            #[cfg(feature = "media-server-jwt-auth")]
+            refresh_room_token_callback: {
+                let meeting_id_for_refresh = id.clone();
+                let display_name_signal = current_display_name;
+                let transport_pref_signal = transport_pref_ctx.0;
+                Some(RefreshRoomTokenCallback::from(move || {
+                    let meeting_id = meeting_id_for_refresh.clone();
+                    async move {
+                        match crate::meeting_api::refresh_room_token(&meeting_id).await {
+                            Ok(new_token) => {
+                                let dn = display_name_signal();
+                                let (ws, wt) = build_lobby_urls(&new_token, &dn, &meeting_id);
+                                // Apply the user's transport preference so
+                                // the refreshed URL list matches what
+                                // the initial connection (and the existing
+                                // schedule_reconnect path) would build.
+                                let pref = transport_pref_signal();
+                                let server_wt_enabled =
+                                    crate::constants::webtransport_enabled().unwrap_or(false);
+                                let (_enable_wt, ws, wt) =
+                                    resolve_transport_config(pref, server_wt_enabled, ws, wt);
+                                log::info!(
+                                    "DIOXUS-UI: refresh_room_token_callback succeeded — providing {} ws / {} wt URLs to ConnectionManager",
+                                    ws.len(),
+                                    wt.len(),
+                                );
+                                Some(RefreshedTokens {
+                                    websocket_urls: ws,
+                                    webtransport_urls: wt,
+                                })
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "DIOXUS-UI: refresh_room_token_callback failed ({e}); ConnectionManager will re-election with cached URLs"
+                                );
+                                None
+                            }
+                        }
+                    }
+                }))
+            },
+            #[cfg(not(feature = "media-server-jwt-auth"))]
+            refresh_room_token_callback: None,
         };
 
         let client = VideoCallClient::new(opts);

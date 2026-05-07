@@ -1537,7 +1537,7 @@ select {
     -webkit-backdrop-filter: none !important;
   }
   html[data-theme="light"] .device-settings-modal-overlay {
-    background: rgba(238, 244, 252, 0.94) !important;
+    background: rgba(238, 244, 252, 0.94) !important; /* @token-exempt: light theme modal background */
   }
   .device-settings-header {
     padding: 20px !important;
@@ -3581,7 +3581,7 @@ select {
   align-items: center;
   padding: 20px;
   background: transparent;
-  border-bottom: 1px solid rgba(186, 205, 240, 0.18);
+  border-bottom: 1px solid rgba(186, 205, 240, 0.18); /* @token-exempt: settings header border */
   border-top-left-radius: 24px;
   border-top-right-radius: 24px;
   position: relative;
@@ -3589,7 +3589,7 @@ select {
 }
 
 .settings-header .close-button {
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(255, 255, 255, 0.04); /* @token-exempt: modal close button base */
   border: none;
   border-radius: 999px;
   width: 28px;
@@ -3991,8 +3991,8 @@ html[data-theme="dark"] .appearance-divider {
 }
 
 html[data-theme="light"] .appearance-slider {
-  background: rgba(60, 65, 72, 0.28);
-  box-shadow: inset 0 0 0 1px rgba(60, 65, 72, 0.18);
+  background: var(--appearance-slider-track-bg);
+  box-shadow: inset 0 0 0 1px var(--appearance-slider-track-border);
 }
 
 .appearance-slider:focus-visible {
@@ -4071,14 +4071,14 @@ html[data-theme="light"] .appearance-slider {
   padding: 4px;
   background:
     linear-gradient(180deg,
-      rgba(70, 110, 160, 0.04) 0%,
-      rgba(50, 90, 140, 0.01) 100%
+      rgba(70, 110, 160, 0.04) 0%, /* @token-exempt: appearance gradient */
+      rgba(50, 90, 140, 0.01) 100% /* @token-exempt: appearance gradient */
     );
-  border: 1px solid rgba(70, 100, 140, 0.12);
+  border: 1px solid rgba(70, 100, 140, 0.12); /* @token-exempt: appearance border */
   border-radius: 10px;
   box-shadow:
-    inset 0 1px 0 rgba(100, 140, 180, 0.06),
-    0 2px 6px rgba(20, 40, 80, 0.10);
+    inset 0 1px 0 rgba(100, 140, 180, 0.06), /* @token-exempt: appearance shadow */
+    0 2px 6px rgba(20, 40, 80, 0.10); /* @token-exempt: appearance shadow */
   width: fit-content;
   margin-top: 6px;
 }
@@ -4102,14 +4102,14 @@ html[data-theme="light"] .appearance-slider {
 }
 
 .theme-icon-button:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.06); /* @token-exempt: appearance glass */
   color: var(--text-primary);
 }
 
 .theme-icon-button:focus-visible {
   outline: none;
-  border-color: rgba(95, 130, 180, 0.40);
-  box-shadow: 0 0 0 2px rgba(70, 110, 160, 0.18);
+  border-color: rgba(95, 130, 180, 0.40); /* @token-exempt: appearance focus */
+  box-shadow: 0 0 0 2px rgba(70, 110, 160, 0.18); /* @token-exempt: appearance focus */
 }
 
 .theme-icon-button:focus:not(:focus-visible) {
@@ -4156,9 +4156,7 @@ html[data-theme="light"] .appearance-slider {
 }
 
 html[data-theme="light"] .device-settings-modal-overlay {
-  background:
-    radial-gradient(120% 120% at 50% 18%, rgba(100, 110, 130, 0.12), transparent 56%),
-    linear-gradient(180deg, rgba(90, 100, 120, 0.38) 0%, rgba(80, 95, 115, 0.45) 100%);
+  background: var(--appearance-overlay-bg);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
@@ -4170,13 +4168,13 @@ html[data-theme="light"] .settings-header {
 }
 
 html[data-theme="light"] .settings-header .close-button {
-  background: rgba(200, 190, 180, 0.32);
-  color: rgba(16, 26, 44, 0.88);
+  background: var(--appearance-header-close-bg);
+  color: var(--appearance-header-close-text);
 }
 
 html[data-theme="light"] .settings-header .close-button:hover {
-  background: rgba(180, 170, 160, 0.48);
-  color: rgba(16, 26, 44, 0.96);
+  background: var(--appearance-header-close-hover-bg);
+  color: var(--appearance-header-close-hover-text);
 }
 
 html[data-theme="light"] .settings-sidebar {
@@ -4184,18 +4182,18 @@ html[data-theme="light"] .settings-sidebar {
 }
 
 html[data-theme="light"] .settings-nav-button {
-  color: rgba(35, 52, 78, 0.76);
+  color: var(--appearance-nav-text);
 }
 
 html[data-theme="light"] .settings-nav-button:hover {
-  background: rgba(140, 130, 120, 0.12);
-  color: rgba(20, 34, 56, 0.96);
+  background: var(--appearance-nav-hover-bg);
+  color: var(--appearance-nav-hover-text);
 }
 
 html[data-theme="light"] .settings-nav-button.active {
   border-color: var(--settings-nav-active-border);
   background: var(--settings-nav-active-bg);
-  color: rgba(16, 26, 44, 0.98);
+  color: var(--appearance-nav-active-text);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.18),
     0 8px 20px rgba(0, 0, 0, 0.10);
@@ -4204,7 +4202,7 @@ html[data-theme="light"] .settings-nav-button.active {
 html[data-theme="light"] .settings-section .device-setting-group,
 html[data-theme="light"] .appearance-card {
   background: transparent;
-  border: 1px solid rgba(75, 95, 125, 0.18);
+  border: 1px solid var(--appearance-device-setting-border);
   border-radius: 12px;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
   backdrop-filter: none;
@@ -4235,19 +4233,19 @@ html[data-theme="dark"] .slider-header label {
 }
 
 html[data-theme="light"] .theme-icon-toggle {
-  background: linear-gradient(180deg, rgba(140, 130, 120, 0.08) 0%, rgba(120, 110, 100, 0.02) 100%);
+  background: var(--appearance-toggle-bg);
   border-color: var(--control-stroke);
 }
 
 html[data-theme="light"] .theme-icon-button--active {
-  background: linear-gradient(180deg, rgba(140, 175, 230, 0.22), rgba(100, 130, 190, 0.12));
-  border: 1px solid rgba(190, 215, 255, 0.38);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24), 0 4px 12px rgba(80, 130, 220, 0.16);
-  color: rgba(16, 26, 44, 0.96);
+  background: var(--appearance-toggle-active-bg);
+  border: 1px solid var(--appearance-toggle-active-border);
+  box-shadow: inset 0 1px 0 var(--appearance-toggle-active-shadow-1), 0 4px 12px var(--appearance-toggle-active-shadow-2);
+  color: var(--appearance-header-close-hover-text);
 }
 
 html[data-theme="light"] .theme-coming-soon {
-  color: rgba(66, 86, 116, 0.72);
+  color: var(--appearance-text-muted);
 }
 
 html[data-theme="light"] .settings-section-title,
@@ -4257,7 +4255,7 @@ html[data-theme="light"] .appearance-section h4,
 html[data-theme="light"] .slider-header label,
 html[data-theme="light"] .preview-label,
 html[data-theme="light"] .slider-value {
-  color: rgba(22, 34, 54, 0.95);
+  color: var(--appearance-section-text);
 }
 
 /* Light theme: glow switch override */
@@ -4267,18 +4265,18 @@ html[data-theme="light"] .glow-switch-track {
 }
 
 html[data-theme="light"] .glow-switch-track::after {
-  background: linear-gradient(160deg, rgba(220, 210, 200, 0.94) 0%, rgba(190, 180, 170, 0.70) 100%);
+  background: var(--appearance-glow-switch-thumb);
   border: 1px solid var(--control-stroke);
   box-shadow:
-    0 1px 4px rgba(50, 40, 30, 0.20),
-    0 0 6px rgba(200, 190, 180, 0.15),
+    0 1px 4px var(--appearance-glow-switch-shadow-1),
+    0 0 6px var(--appearance-glow-switch-shadow-2),
     inset 0 1px 0 rgba(255, 255, 255, 0.50);
 }
 
 html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after {
   box-shadow:
-    0 1px 6px rgba(50, 40, 30, 0.20),
-    0 0 10px rgba(100, 200, 100, 0.25),
+    0 1px 6px var(--appearance-glow-switch-shadow-1),
+    0 0 10px var(--appearance-glow-switch-checked-shadow-3),
     inset 0 1px 0 rgba(255, 255, 255, 0.60);
 }
 

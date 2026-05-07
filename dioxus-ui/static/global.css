@@ -303,6 +303,41 @@ html[data-theme="light"] {
   --settings-error-shadow: rgba(200, 100, 100, 0.15);
   --settings-overlay-z-back: 99;
   --settings-overlay-z-front: 100;
+  
+  /* Appearance panel — light theme specific */
+  --appearance-header-close-bg: rgba(200, 190, 180, 0.32);
+  --appearance-header-close-hover-bg: rgba(180, 170, 160, 0.48);
+  --appearance-header-close-text: rgba(16, 26, 44, 0.88);
+  --appearance-header-close-hover-text: rgba(16, 26, 44, 0.96);
+  --appearance-nav-text: rgba(35, 52, 78, 0.76);
+  --appearance-nav-hover-bg: rgba(140, 130, 120, 0.12);
+  --appearance-nav-hover-text: rgba(20, 34, 56, 0.96);
+  --appearance-nav-active-text: rgba(16, 26, 44, 0.98);
+  --appearance-device-setting-border: rgba(75, 95, 125, 0.18);
+  --appearance-divider-border: rgba(186, 205, 240, 0.18);
+  --appearance-slider-track-bg: rgba(60, 65, 72, 0.28);
+  --appearance-slider-track-border: rgba(60, 65, 72, 0.18);
+  --appearance-slider-focus-border: rgba(70, 100, 140, 0.12);
+  --appearance-slider-focus-shadow-1: rgba(100, 140, 180, 0.06);
+  --appearance-slider-focus-shadow-2: rgba(20, 40, 80, 0.10);
+  --appearance-slider-focus-shadow-3: rgba(20, 40, 80, 0.18);
+  --appearance-slider-hover-border: rgba(95, 130, 180, 0.40);
+  --appearance-slider-hover-shadow: rgba(70, 110, 160, 0.18);
+  --appearance-slider-active-border: rgba(95, 130, 180, 0.30);
+  --appearance-slider-active-shadow-1: rgba(120, 160, 210, 0.12);
+  --appearance-slider-active-shadow-2: rgba(20, 40, 80, 0.18);
+  --appearance-section-text: rgba(22, 34, 54, 0.95);
+  --appearance-text-muted: rgba(66, 86, 116, 0.72);
+  --appearance-toggle-bg: linear-gradient(180deg, rgba(140, 130, 120, 0.08) 0%, rgba(120, 110, 100, 0.02) 100%);
+  --appearance-toggle-active-bg: linear-gradient(180deg, rgba(140, 175, 230, 0.22), rgba(100, 130, 190, 0.12));
+  --appearance-toggle-active-border: rgba(190, 215, 255, 0.38);
+  --appearance-toggle-active-shadow-1: rgba(255, 255, 255, 0.24);
+  --appearance-toggle-active-shadow-2: rgba(80, 130, 220, 0.16);
+  --appearance-overlay-bg: linear-gradient(120% 120% at 50% 18%, rgba(100, 110, 130, 0.12), transparent 56%), linear-gradient(180deg, rgba(90, 100, 120, 0.38) 0%, rgba(80, 95, 115, 0.45) 100%);
+  --appearance-glow-switch-thumb: linear-gradient(160deg, rgba(220, 210, 200, 0.94) 0%, rgba(190, 180, 170, 0.70) 100%);
+  --appearance-glow-switch-shadow-1: rgba(50, 40, 30, 0.20);
+  --appearance-glow-switch-shadow-2: rgba(200, 190, 180, 0.15);
+  --appearance-glow-switch-checked-shadow-3: rgba(100, 200, 100, 0.25);
 }
 
 /* Light theme invite window text — override for dark text readability */

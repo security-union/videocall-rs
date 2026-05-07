@@ -27,6 +27,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use chrono::{Datelike, Utc};
@@ -57,11 +58,33 @@ pub struct ConsoleLogQuery {
 pub const MAX_BODY_SIZE: usize = 1_048_576;
 
 /// Default base directory for console log storage.
-const DEFAULT_LOG_DIR: &str = "/data/console-logs";
+pub(crate) const DEFAULT_LOG_DIR: &str = "/data/console-logs";
 
-/// Default per-user daily upload quota: 50 MB. Override with
+/// Env var that gates both the upload endpoint and the in-process purge task.
+/// When set to `"true"`, uploads are accepted and the purge scheduler runs.
+pub(crate) const CONSOLE_LOG_UPLOAD_ENABLED_ENV: &str = "CONSOLE_LOG_UPLOAD_ENABLED";
+
+/// Env var overriding the on-disk base directory for console log storage.
+pub(crate) const CONSOLE_LOG_DIR_ENV: &str = "CONSOLE_LOG_DIR";
+
+/// Env var controlling the retention window (in days) used by the purge task.
+pub(crate) const CONSOLE_LOG_RETENTION_DAYS_ENV: &str = "CONSOLE_LOG_RETENTION_DAYS";
+
+/// Default retention window (in days) used when `CONSOLE_LOG_RETENTION_DAYS`
+/// is unset or unparseable.
+pub(crate) const DEFAULT_RETENTION_DAYS: u32 = 2;
+
+/// Default per-user daily upload quota: 500 MB. Override with
 /// `CONSOLE_LOG_USER_QUOTA_BYTES` env var.
-const DEFAULT_USER_QUOTA_BYTES: u64 = 50 * 1024 * 1024;
+///
+/// The quota is measured in **raw wire bytes** before server-side gzip, so the
+/// on-disk cost is ~8-10× smaller. 500 MB/day comfortably covers several long
+/// problem sessions where chatty logging (reconnects, AQ swings, PLI storms)
+/// can drive ~15-40 MB/hour while still tripping on a runaway `console.log`
+/// loop quickly enough to signal the issue via a 429 + `warn!`. Do not halve
+/// this without re-reading the discussion in the change that set it — a
+/// too-low cap silently cuts off logs precisely when they are most valuable.
+const DEFAULT_USER_QUOTA_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Per-user daily byte counter for rate limiting console log uploads.
 /// Key: user_id, Value: (day-of-year ordinal, bytes uploaded today).
@@ -73,6 +96,62 @@ const DEFAULT_USER_QUOTA_BYTES: u64 = 50 * 1024 * 1024;
 /// 15 meetings × 20 users), memory growth is negligible over typical pod lifetime.
 static UPLOAD_QUOTAS: LazyLock<Mutex<HashMap<String, (u32, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Minimum seconds between "disk full" log lines emitted from the upload
+/// handler. A wedged PVC can otherwise cause hundreds of `error!` lines per
+/// minute at design scale (300 concurrent users × ~1 chunk / 30s each).
+const DISK_FULL_LOG_DEDUP_SECS: u64 = 60;
+
+/// Unix timestamp (seconds) of the most recent "disk full" log emitted by the
+/// upload handler. Paired with [`DISK_FULL_SUPPRESSED_COUNT`] to produce a
+/// single "N additional occurrences suppressed" line per window.
+static LAST_DISK_FULL_LOG_UNIX: AtomicU64 = AtomicU64::new(0);
+
+/// Count of disk-full errors suppressed since the last emitted log line. Read
+/// and reset atomically when the next line is emitted.
+static DISK_FULL_SUPPRESSED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Linux `EDQUOT` errno. Used to detect filesystem-quota-exceeded errors since
+/// `std::io::ErrorKind::FilesystemQuotaExceeded` is not yet stable on the
+/// toolchain this crate builds against (tracked under `io_error_more`).
+#[cfg(target_os = "linux")]
+const EDQUOT: i32 = 122;
+
+/// Returns a `Some(count)` of previously-suppressed events if this error should
+/// emit a log line, or `None` if it should be rate-limited. For non-disk-full
+/// errors, always returns `Some(0)` (always log). For `StorageFull` or a
+/// filesystem-quota-exceeded error (Linux `EDQUOT`), returns `Some(N)` at most
+/// once per `DISK_FULL_LOG_DEDUP_SECS` window, where N is the number of
+/// suppressed events since the last emitted line.
+fn classify_io_error_for_logging(err: &std::io::Error) -> Option<u64> {
+    let is_storage_full = matches!(err.kind(), std::io::ErrorKind::StorageFull);
+    // `FilesystemQuotaExceeded` is still nightly-only — detect EDQUOT from the
+    // raw OS error on Linux. On other platforms this check is a no-op.
+    #[cfg(target_os = "linux")]
+    let is_quota = err.raw_os_error() == Some(EDQUOT);
+    #[cfg(not(target_os = "linux"))]
+    let is_quota = false;
+    let is_disk_full = is_storage_full || is_quota;
+    if !is_disk_full {
+        return Some(0);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_DISK_FULL_LOG_UNIX.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < DISK_FULL_LOG_DEDUP_SECS {
+        DISK_FULL_SUPPRESSED_COUNT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // Race between multiple threads is acceptable — the worst case is a small
+    // burst of ENOSPC logs at the boundary of each window rather than strictly
+    // one line. A CAS loop would guarantee strictly-one but is not worth the
+    // complexity for this purpose.
+    LAST_DISK_FULL_LOG_UNIX.store(now, Ordering::Relaxed);
+    let suppressed = DISK_FULL_SUPPRESSED_COUNT.swap(0, Ordering::Relaxed);
+    Some(suppressed)
+}
 
 /// Check and update the per-user daily byte quota. Returns `Err(429)` if exceeded.
 fn check_upload_quota(user_id: &str, body_len: u64) -> Result<(), AppError> {
@@ -181,7 +260,7 @@ pub async fn upload_console_logs(
     body: Bytes,
 ) -> Result<StatusCode, AppError> {
     // --- Feature gate ---
-    let enabled = std::env::var("CONSOLE_LOG_UPLOAD_ENABLED").unwrap_or_default();
+    let enabled = std::env::var(CONSOLE_LOG_UPLOAD_ENABLED_ENV).unwrap_or_default();
     if enabled != "true" {
         return Err(AppError::new(
             StatusCode::NOT_FOUND,
@@ -353,18 +432,23 @@ pub async fn upload_console_logs(
     let filename = format!("{user_id}_{session_ts}_{chunk_suffix}.log.gz");
 
     // --- Create directory and write file ---
-    let base_dir = std::env::var("CONSOLE_LOG_DIR").unwrap_or_else(|_| DEFAULT_LOG_DIR.to_string());
+    let base_dir =
+        std::env::var(CONSOLE_LOG_DIR_ENV).unwrap_or_else(|_| DEFAULT_LOG_DIR.to_string());
     let date_str = Utc::now().format("%Y-%m-%d").to_string();
     let dir_path = std::path::PathBuf::from(&base_dir)
         .join(&meeting_id)
         .join(&date_str);
 
     tokio::fs::create_dir_all(&dir_path).await.map_err(|e| {
-        tracing::error!(
-            path = %dir_path.display(),
-            error = %e,
-            "Failed to create console log directory"
-        );
+        if let Some(suppressed) = classify_io_error_for_logging(&e) {
+            tracing::error!(
+                path = %dir_path.display(),
+                error = %e,
+                error_kind = ?e.kind(),
+                suppressed_disk_full = suppressed,
+                "Failed to create console log directory"
+            );
+        }
         AppError::internal("Failed to store console log chunk")
     })?;
 
@@ -380,19 +464,27 @@ pub async fn upload_console_logs(
     // lives under the configured base_dir. This prevents a pre-planted symlink
     // from redirecting writes outside the log directory (TOCTOU defense).
     let canonical_dir = tokio::fs::canonicalize(&dir_path).await.map_err(|e| {
-        tracing::error!(
-            path = %dir_path.display(),
-            error = %e,
-            "Failed to canonicalize console log directory"
-        );
+        if let Some(suppressed) = classify_io_error_for_logging(&e) {
+            tracing::error!(
+                path = %dir_path.display(),
+                error = %e,
+                error_kind = ?e.kind(),
+                suppressed_disk_full = suppressed,
+                "Failed to canonicalize console log directory"
+            );
+        }
         AppError::internal("Failed to store console log chunk")
     })?;
     let canonical_base = tokio::fs::canonicalize(&base_dir).await.map_err(|e| {
-        tracing::error!(
-            path = %base_dir,
-            error = %e,
-            "Failed to canonicalize console log base directory"
-        );
+        if let Some(suppressed) = classify_io_error_for_logging(&e) {
+            tracing::error!(
+                path = %base_dir,
+                error = %e,
+                error_kind = ?e.kind(),
+                suppressed_disk_full = suppressed,
+                "Failed to canonicalize console log base directory"
+            );
+        }
         AppError::internal("Failed to store console log chunk")
     })?;
     if !canonical_dir.starts_with(&canonical_base) {
@@ -439,11 +531,15 @@ pub async fn upload_console_logs(
             ));
         }
         Err(e) => {
-            tracing::error!(
-                path = %file_path.display(),
-                error = %e,
-                "Failed to create console log file"
-            );
+            if let Some(suppressed) = classify_io_error_for_logging(&e) {
+                tracing::error!(
+                    path = %file_path.display(),
+                    error = %e,
+                    error_kind = ?e.kind(),
+                    suppressed_disk_full = suppressed,
+                    "Failed to create console log file"
+                );
+            }
             return Err(AppError::internal("Failed to store console log chunk"));
         }
     };
@@ -467,11 +563,15 @@ pub async fn upload_console_logs(
     })?;
 
     file.write_all(&compressed).await.map_err(|e| {
-        tracing::error!(
-            path = %file_path.display(),
-            error = %e,
-            "Failed to write console log data"
-        );
+        if let Some(suppressed) = classify_io_error_for_logging(&e) {
+            tracing::error!(
+                path = %file_path.display(),
+                error = %e,
+                error_kind = ?e.kind(),
+                suppressed_disk_full = suppressed,
+                "Failed to write console log data"
+            );
+        }
         AppError::internal("Failed to store console log chunk")
     })?;
 
@@ -564,5 +664,66 @@ mod tests {
     fn accepts_max_length() {
         let max = "a".repeat(255);
         assert!(validate_id(&max, "test", &SAFE_MEETING_ID_RE).is_ok());
+    }
+
+    // --- Rate-limited ENOSPC logging helper ---
+
+    /// Resets the rate-limiter's global state. Required because the helper
+    /// reads/writes process-wide statics and tests share that state.
+    fn reset_disk_full_rate_limiter() {
+        LAST_DISK_FULL_LOG_UNIX.store(0, Ordering::Relaxed);
+        DISK_FULL_SUPPRESSED_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn classify_io_error_non_disk_full_always_logs() {
+        reset_disk_full_rate_limiter();
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope");
+        // Non-disk-full errors should always return Some(0).
+        assert_eq!(classify_io_error_for_logging(&err), Some(0));
+        assert_eq!(classify_io_error_for_logging(&err), Some(0));
+        assert_eq!(classify_io_error_for_logging(&err), Some(0));
+        // And must never increment the suppressed counter.
+        assert_eq!(DISK_FULL_SUPPRESSED_COUNT.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn classify_io_error_disk_full_is_rate_limited() {
+        reset_disk_full_rate_limiter();
+        let err = std::io::Error::from(std::io::ErrorKind::StorageFull);
+
+        // First call in a fresh window emits (suppressed = 0).
+        assert_eq!(classify_io_error_for_logging(&err), Some(0));
+
+        // Subsequent calls within the window are suppressed.
+        assert_eq!(classify_io_error_for_logging(&err), None);
+        assert_eq!(classify_io_error_for_logging(&err), None);
+        assert_eq!(classify_io_error_for_logging(&err), None);
+
+        // Simulate the window having elapsed by backdating the last-log
+        // timestamp beyond DISK_FULL_LOG_DEDUP_SECS. This avoids sleeping.
+        LAST_DISK_FULL_LOG_UNIX.store(1, Ordering::Relaxed);
+
+        // Next call emits and reports the 3 suppressed events.
+        assert_eq!(classify_io_error_for_logging(&err), Some(3));
+
+        // Counter resets after emitting.
+        assert_eq!(DISK_FULL_SUPPRESSED_COUNT.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn classify_io_error_filesystem_quota_exceeded_is_rate_limited() {
+        reset_disk_full_rate_limiter();
+        // `FilesystemQuotaExceeded` is not stable on this toolchain — construct
+        // the error from the raw Linux EDQUOT errno, which is what the helper
+        // matches on.
+        let err = std::io::Error::from_raw_os_error(EDQUOT);
+
+        assert_eq!(classify_io_error_for_logging(&err), Some(0));
+        assert_eq!(classify_io_error_for_logging(&err), None);
     }
 }

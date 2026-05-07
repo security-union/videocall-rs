@@ -293,11 +293,11 @@ fn duration_until_next_utc_midnight(now: chrono::DateTime<Utc>) -> Duration {
 /// Returns `None` when `CONSOLE_LOG_UPLOAD_ENABLED` is unset or not `"true"` —
 /// in which case no task is spawned and no filesystem work is done.
 ///
-/// When enabled, spawns a Tokio task that sleeps until the next UTC midnight,
-/// runs a single [`purge_once`] pass inside [`tokio::task::spawn_blocking`], logs
-/// a structured summary, and then recomputes the next midnight. The task never
-/// returns; if the blocking pass panics it is logged and the scheduler continues
-/// so a single bad run cannot disable retention.
+/// When enabled, spawns a Tokio task that runs one immediate [`purge_once`] pass
+/// at startup, then sleeps until the next UTC midnight, runs another pass inside
+/// [`tokio::task::spawn_blocking`], logs a structured summary, and repeats. The
+/// task never returns; if the blocking pass panics it is logged and the scheduler
+/// continues so a single bad run cannot disable retention.
 pub fn spawn_purge_task() -> Option<tokio::task::JoinHandle<()>> {
     let enabled = std::env::var(CONSOLE_LOG_UPLOAD_ENABLED_ENV).unwrap_or_default();
     if enabled != "true" {
@@ -332,6 +332,65 @@ pub fn spawn_purge_task() -> Option<tokio::task::JoinHandle<()>> {
     );
 
     let handle = tokio::spawn(async move {
+        let run_purge_pass = |base: PathBuf| {
+            tokio::task::spawn_blocking(move || purge_once(&base, retention_days, SystemTime::now()))
+        };
+
+        let log_summary =
+            |summary: PurgeSummary, elapsed: std::time::Duration, startup: bool| {
+                let message = if startup {
+                    if summary.errors > 0 {
+                        "Startup console log purge completed with errors"
+                    } else {
+                        "Startup console log purge complete"
+                    }
+                } else if summary.errors > 0 {
+                    "Console log purge completed with errors"
+                } else {
+                    "Console log purge complete"
+                };
+
+                if summary.errors > 0 {
+                    tracing::warn!(
+                        base_dir = %base_dir,
+                        retention_days,
+                        files_deleted = summary.files_deleted,
+                        bytes_reclaimed = summary.bytes_reclaimed,
+                        dirs_removed = summary.dirs_removed,
+                        errors = summary.errors,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "{message}"
+                    );
+                } else {
+                    tracing::info!(
+                        base_dir = %base_dir,
+                        retention_days,
+                        files_deleted = summary.files_deleted,
+                        bytes_reclaimed = summary.bytes_reclaimed,
+                        dirs_removed = summary.dirs_removed,
+                        errors = summary.errors,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "{message}"
+                    );
+                }
+            };
+
+        let started = std::time::Instant::now();
+        let startup_result = run_purge_pass(base_path.clone()).await;
+        let elapsed = started.elapsed();
+        match startup_result {
+            Ok(summary) => log_summary(summary, elapsed, true),
+            Err(join_err) => {
+                tracing::error!(
+                    base_dir = %base_dir,
+                    retention_days,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    error = %join_err,
+                    "Startup console log purge blocking task failed; scheduler continuing"
+                );
+            }
+        }
+
         loop {
             // Recompute on every iteration for self-healing against suspend/resume
             // and long-running passes that cross midnight.
@@ -345,40 +404,12 @@ pub fn spawn_purge_task() -> Option<tokio::task::JoinHandle<()>> {
             );
             tokio::time::sleep(sleep_for).await;
 
-            let base = base_path.clone();
             let started = std::time::Instant::now();
-            let result = tokio::task::spawn_blocking(move || {
-                purge_once(&base, retention_days, SystemTime::now())
-            })
-            .await;
+            let result = run_purge_pass(base_path.clone()).await;
             let elapsed = started.elapsed();
 
             match result {
-                Ok(summary) => {
-                    if summary.errors > 0 {
-                        tracing::warn!(
-                            base_dir = %base_dir,
-                            retention_days,
-                            files_deleted = summary.files_deleted,
-                            bytes_reclaimed = summary.bytes_reclaimed,
-                            dirs_removed = summary.dirs_removed,
-                            errors = summary.errors,
-                            elapsed_ms = elapsed.as_millis() as u64,
-                            "Console log purge completed with errors"
-                        );
-                    } else {
-                        tracing::info!(
-                            base_dir = %base_dir,
-                            retention_days,
-                            files_deleted = summary.files_deleted,
-                            bytes_reclaimed = summary.bytes_reclaimed,
-                            dirs_removed = summary.dirs_removed,
-                            errors = summary.errors,
-                            elapsed_ms = elapsed.as_millis() as u64,
-                            "Console log purge complete"
-                        );
-                    }
-                }
+                Ok(summary) => log_summary(summary, elapsed, false),
                 Err(join_err) => {
                     tracing::error!(
                         base_dir = %base_dir,

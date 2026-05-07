@@ -41,7 +41,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -2920,14 +2920,21 @@ impl ConnectionManager {
         self.report_diagnostics();
     }
 
-    /// Report RTT metrics to diagnostics system
-    fn report_diagnostics(&self) {
-        debug!(
-            "ConnectionManager::report_diagnostics - Active: {:?}, Election State: {:?}",
-            self.active_connection_id.borrow(),
-            self.election_state
-        );
-
+    /// Build the list of metrics for the main `connection_manager` diagnostic
+    /// event (the `stream_id == None` event). This is split out from
+    /// [`Self::report_diagnostics`] so it can be unit-tested directly without
+    /// having to subscribe to the global broadcast bus.
+    ///
+    /// Always includes the configured-server cardinality fields:
+    ///
+    /// - `configured_servers_total` — `u64`, the total number of WS+WT URLs
+    ///   the manager was configured with (independent of `ElectionState`).
+    /// - `single_server_only` — `u64`-encoded bool (matches the
+    ///   `server_active`/`server_connected` convention from PR #542). Set to
+    ///   `1` when `total_server_count() <= 1`. The dioxus UI surfaces a
+    ///   "Limited connectivity" badge when this flag is `1` to explain why
+    ///   re-elections are suppressed (Phase 7 from discussion 562).
+    fn build_main_diagnostic_metrics(&self) -> Vec<Metric> {
         let mut metrics = Vec::new();
 
         // Report current election state
@@ -2982,6 +2989,18 @@ impl ConnectionManager {
             }
         }
 
+        // Always emit the configured-server cardinality so the UI can render
+        // a "Limited connectivity" badge regardless of which `ElectionState`
+        // we're in. The existing `servers_total` field above is scoped to
+        // Testing only (it counts in-flight candidate `connections`); this
+        // new field reads the configured URL list and is always present.
+        let configured_total = self.total_server_count() as u64;
+        metrics.push(metric!("configured_servers_total", configured_total));
+        metrics.push(metric!(
+            "single_server_only",
+            (configured_total <= 1) as u64
+        ));
+
         // CPU-stall observability. The drift watchdog in
         // `ConnectionController::start_timers` updates these so the dioxus-ui
         // can surface "your machine is overloaded" feedback in the diagnostics
@@ -2997,6 +3016,19 @@ impl ConnectionManager {
             "main_thread_drift_ms",
             *self.main_thread_drift_ms.borrow()
         ));
+
+        metrics
+    }
+
+    /// Report RTT metrics to diagnostics system
+    fn report_diagnostics(&self) {
+        debug!(
+            "ConnectionManager::report_diagnostics - Active: {:?}, Election State: {:?}",
+            self.active_connection_id.borrow(),
+            self.election_state
+        );
+
+        let metrics = self.build_main_diagnostic_metrics();
 
         // Send overall connection manager state
         debug!(
@@ -6750,6 +6782,123 @@ mod tests {
              pending preservation-retry timer cannot wake after the cycle \
              cleanly concluded on the old connection"
         );
+    }
+
+    // ===================================================================
+    // Phase 7. single_server_only diagnostic metric (discussion 562)
+    //
+    // The watchdog at `check_rtt_degradation` short-circuits re-election
+    // when `total_server_count() <= 1`, which is correct (a one-server
+    // config can't elect anywhere else) but leaves the user stranded on a
+    // degraded path with no UI indication that recovery is gated. We emit
+    // a `single_server_only` metric so the dioxus UI can surface a
+    // "Limited connectivity" badge. These tests lock in the metric's
+    // emission contract.
+    // ===================================================================
+
+    /// Helper: extract a `u64`-encoded metric value by name.
+    fn find_u64_metric(metrics: &[Metric], name: &str) -> Option<u64> {
+        metrics.iter().find(|m| m.name == name).and_then(|m| {
+            if let videocall_diagnostics::MetricValue::U64(v) = m.value {
+                Some(v)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn diagnostic_metrics_emit_single_server_only_when_one_server() {
+        // One configured URL (matches the production scenario from
+        // discussion 562 where runtime config hadn't loaded so the WT
+        // list was empty and only one WS URL was set).
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://only".into()];
+        mgr.options.webtransport_urls = vec![];
+        assert_eq!(mgr.total_server_count(), 1);
+
+        let metrics = mgr.build_main_diagnostic_metrics();
+
+        assert_eq!(
+            find_u64_metric(&metrics, "single_server_only"),
+            Some(1),
+            "single-server config must set single_server_only=1"
+        );
+        assert_eq!(
+            find_u64_metric(&metrics, "configured_servers_total"),
+            Some(1),
+            "configured_servers_total must reflect the one configured URL"
+        );
+    }
+
+    #[test]
+    fn diagnostic_metrics_emit_single_server_only_when_zero_servers() {
+        // Zero configured URLs: still single-server semantics — no candidate
+        // alternatives exist. The metric must equal 1 so the UI badge fires
+        // (a zero-server manager is just as stranded as a one-server one).
+        let mgr = make_test_manager();
+        assert_eq!(mgr.total_server_count(), 0);
+
+        let metrics = mgr.build_main_diagnostic_metrics();
+
+        assert_eq!(
+            find_u64_metric(&metrics, "single_server_only"),
+            Some(1),
+            "zero-server config must also set single_server_only=1 \
+             (no candidate alternatives)"
+        );
+        assert_eq!(
+            find_u64_metric(&metrics, "configured_servers_total"),
+            Some(0),
+        );
+    }
+
+    #[test]
+    fn diagnostic_metrics_clear_single_server_only_when_multi_server() {
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.options.webtransport_urls = vec!["https://c".into()];
+        assert_eq!(mgr.total_server_count(), 3);
+
+        let metrics = mgr.build_main_diagnostic_metrics();
+
+        assert_eq!(
+            find_u64_metric(&metrics, "single_server_only"),
+            Some(0),
+            "multi-server config must clear single_server_only"
+        );
+        assert_eq!(
+            find_u64_metric(&metrics, "configured_servers_total"),
+            Some(3),
+        );
+    }
+
+    #[test]
+    fn diagnostic_metrics_track_url_propagation() {
+        // Regression for the Phase 7 fix: when dioxus-ui calls
+        // `update_server_urls` to rebuild the URL list (e.g. because
+        // `webtransport_enabled()` flipped to true after runtime config
+        // finally loaded), the diagnostic metric must immediately flip
+        // from `single_server_only=1` to `single_server_only=0`. This is
+        // the signal the UI uses to clear the "Limited connectivity"
+        // badge once recovery actually becomes possible.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec![];
+
+        let before = mgr.build_main_diagnostic_metrics();
+        assert_eq!(find_u64_metric(&before, "single_server_only"), Some(1));
+
+        mgr.update_server_urls(vec!["ws://a".into()], vec!["https://b".into()]);
+
+        let after = mgr.build_main_diagnostic_metrics();
+        assert_eq!(
+            find_u64_metric(&after, "single_server_only"),
+            Some(0),
+            "after update_server_urls expanded the candidate set, the \
+             single_server_only flag must clear so the UI badge is removed"
+        );
+        assert_eq!(find_u64_metric(&after, "configured_servers_total"), Some(2),);
     }
 
     // ===================================================================

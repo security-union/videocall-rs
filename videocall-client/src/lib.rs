@@ -206,6 +206,7 @@ pub mod adaptive_quality_constants {
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;
+pub mod capability;
 mod client;
 mod connection;
 pub mod constants;
@@ -214,6 +215,7 @@ pub mod decode;
 pub mod diagnostics;
 pub mod encode;
 pub mod health_reporter;
+pub mod long_tasks;
 mod media_devices;
 pub mod utils;
 mod wrappers;

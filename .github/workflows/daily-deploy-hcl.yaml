@@ -262,7 +262,7 @@ jobs:
             --set "env[6].name=KEY_PATH" \
             --set "env[6].value=/certs/tls.key" \
             --set "env[7].name=TOKIO_WORKER_THREADS" \
-            --set-string "env[7].value=1" \
+            --set-string "env[7].value=4" \
             --set "env[8].name=TOKIO_BLOCKING_THREADS" \
             --set-string "env[8].value=2" \
             --set ingress.enabled=true \

@@ -215,6 +215,7 @@ pub fn MeetingPage(id: String) -> Element {
                 on_peer_added: VcCallback::noop(),
                 on_peer_first_frame: VcCallback::noop(),
                 on_peer_removed: None,
+                on_peers_removed_batch: None,
                 get_peer_video_canvas_id: VcCallback::from(|id| id),
                 get_peer_screen_canvas_id: VcCallback::from(|id| id),
                 enable_diagnostics: false,

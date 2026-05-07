@@ -92,6 +92,14 @@ pub struct VideoCallClientOptions {
     pub on_peer_added: Callback<String>,
     pub on_peer_first_frame: Callback<(String, MediaType)>,
     pub on_peer_removed: Option<Callback<String>>,
+    /// Batched companion of `on_peer_removed` fired once per
+    /// `PeerDecodeManager` removal pass with **all** peers removed in
+    /// that pass. Subscribers that only need a single notification (e.g.
+    /// to bump a UI version counter) should listen here so a 5-peer
+    /// watchdog timeout does not trigger 5 sequential UI re-renders.
+    /// `on_peer_removed` continues to fire per-peer for cleanup of
+    /// per-peer state. See Phase 6 watchdog-cascade fix.
+    pub on_peers_removed_batch: Option<Callback<Vec<String>>>,
     pub get_peer_video_canvas_id: Callback<String, String>,
     pub get_peer_screen_canvas_id: Callback<String, String>,
     pub user_id: String,
@@ -654,6 +662,9 @@ impl VideoCallClient {
         if let Some(cb) = opts.on_peer_removed.as_ref() {
             peer_decode_manager.on_peer_removed = cb.clone();
         }
+        if let Some(cb) = opts.on_peers_removed_batch.as_ref() {
+            peer_decode_manager.on_peers_removed_batch = cb.clone();
+        }
         peer_decode_manager.set_vad_threshold(opts.vad_threshold);
         peer_decode_manager
     }
@@ -807,12 +818,13 @@ impl VideoCallClient {
 
     pub fn sorted_peer_keys(&self) -> Vec<String> {
         match self.inner.try_borrow() {
-            Ok(inner) => inner
-                .peer_decode_manager
-                .sorted_keys()
-                .iter()
-                .map(|k| k.to_string())
-                .collect(),
+            // Phase 6 fix: read from the cached `Rc<Vec<String>>` on the
+            // peer decode manager rather than re-walking the ordered key
+            // list and allocating a fresh `Vec<String>` on every call.
+            // The dioxus meeting view calls this on every render of every
+            // peer tile; with many peers this allocation cost was
+            // measurable on 2-core hardware.
+            Ok(inner) => (*inner.peer_decode_manager.sorted_string_keys()).clone(),
             Err(_) => Vec::<String>::new(),
         }
     }
@@ -2001,6 +2013,7 @@ mod disconnect_tests {
             on_peer_added: VcCallback::noop(),
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: None,
+            on_peers_removed_batch: None,
             get_peer_video_canvas_id: VcCallback::from(|id| id),
             get_peer_screen_canvas_id: VcCallback::from(|id| id),
             on_connected: VcCallback::noop(),

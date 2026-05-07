@@ -49,6 +49,58 @@ use videocall_types::Callback;
 
 use super::connection_lost_reason::ConnectionLostReason;
 
+/// URL redaction helpers used at the diagnostic-bus boundary.
+///
+/// The lobby URL stored in `ServerRttMeasurement.url` carries the user's room JWT
+/// in `?token=<JWT>&instance_id=<UUID>`. That URL must never be emitted to the
+/// diagnostic bus: the health reporter republishes diagnostic values onto the
+/// NATS telemetry topic, and any connected health-pipeline consumer would
+/// otherwise receive the JWT in cleartext (P0 credential leak — fix branch
+/// `fix/security-redact-jwt-active-server-url`).
+mod url_redact {
+    /// Return the URL with its query string AND fragment stripped.
+    ///
+    /// - `https://wt:4433/lobby?token=eyJ...&instance_id=abc` → `https://wt:4433/lobby`
+    /// - `https://wt:4433/lobby#token=eyJ...`                 → `https://wt:4433/lobby`
+    /// - `https://wt:4433/lobby?a=1#token=eyJ...`             → `https://wt:4433/lobby`
+    /// - `https://wt:4433/lobby` → `https://wt:4433/lobby` (unchanged)
+    /// - `not-a-url`, `""` → `""` (defensive fallback; never emit a partial URL)
+    ///
+    /// Plain string ops only — no new dependency, no URL parser. We do not need
+    /// to canonicalise; we only need to guarantee that no part of the URL after
+    /// the path (query OR fragment) escapes the client process. Fragments are
+    /// included because some signaling shapes encode credentials in the
+    /// fragment to keep them out of server-side request logs (RFC 3986 §3.5
+    /// — fragments are not transmitted in HTTP requests, but ARE visible to
+    /// any in-process JavaScript / WASM logger and would still leak via this
+    /// diagnostic path).
+    pub(super) fn redact_for_diag(url: &str) -> String {
+        // Defensive: require a scheme separator. Anything else is malformed and we
+        // refuse to leak it to the diagnostic bus.
+        if !url.contains("://") {
+            return String::new();
+        }
+        // Cut at the first occurrence of either `?` or `#`, whichever comes
+        // first. This handles all four canonical orderings:
+        //   path
+        //   path?query
+        //   path#fragment
+        //   path?query#fragment
+        let q = url.find('?');
+        let f = url.find('#');
+        let cut = match (q, f) {
+            (Some(qi), Some(fi)) => Some(qi.min(fi)),
+            (Some(qi), None) => Some(qi),
+            (None, Some(fi)) => Some(fi),
+            (None, None) => None,
+        };
+        match cut {
+            Some(idx) => url[..idx].to_string(),
+            None => url.to_string(),
+        }
+    }
+}
+
 /// Maximum plausible RTT in milliseconds. Measurements exceeding this are
 /// discarded as they likely result from clock anomalies or extreme outliers.
 const RTT_SANITY_MAX_MS: f64 = 10_000.0;
@@ -71,6 +123,35 @@ const RTT_SANITY_MAX_MS: f64 = 10_000.0;
 #[cfg(target_arch = "wasm32")]
 const REFRESH_TIMEOUT_MS: u32 = 3_000;
 
+/// Inbound-liveness window for the CPU-stall guard in
+/// [`ConnectionManager::check_rtt_degradation`]. If we have observed any
+/// inbound traffic on the active connection more recently than this many
+/// milliseconds ago, the watchdog suppresses re-election: elevated RTT
+/// samples are treated as JS-event-loop stall artifacts (the wall clock ran
+/// late while the network was quietly delivering packets), not as proof that
+/// the network actually degraded.
+///
+/// 2 s is roughly 2× the 1 Hz probe cadence — wide enough to absorb normal
+/// scheduling jitter, narrow enough that a genuine stall (no inbound for >2 s)
+/// stops suppressing and lets the existing re-election logic fire.
+const LAST_INBOUND_LIVENESS_MS: f64 = 2_000.0;
+
+/// Main-thread drift threshold consulted by the CPU-overloaded watchdog in
+/// `ConnectionController::start_timers`. The 1 Hz timer measures how much
+/// `performance.now()` advanced versus its scheduled cadence; a single tick
+/// running >500 ms late means the JS event loop was blocked for at least that
+/// long. Synthetic RTT samples generated during such a stall are not
+/// network signal and must not trigger re-election.
+pub(super) const CPU_OVERLOAD_DRIFT_THRESHOLD_MS: f64 = 500.0;
+
+/// Once the drift watchdog observes a stall, it asserts the shared
+/// `cpu_overloaded` flag for this many milliseconds. The flag is OR'd with
+/// the inbound-liveness guard in `check_rtt_degradation`. 5 s gives the
+/// system enough time to drain any backed-up RTT probes that were queued
+/// during the stall, so the post-stall samples don't immediately trip the
+/// elevated-RTT detector.
+pub(super) const CPU_OVERLOADED_DURATION_MS: f64 = 5_000.0;
+
 /// Returns a monotonic, high-resolution timestamp in milliseconds using
 /// `performance.now()`. This is immune to NTP adjustments, DST changes, and
 /// user clock manipulation — unlike `js_sys::Date::now()` — making it safe
@@ -78,11 +159,25 @@ const REFRESH_TIMEOUT_MS: u32 = 3_000;
 ///
 /// Falls back to `js_sys::Date::now()` when the Performance API is
 /// unavailable (e.g. some headless WASM runtimes).
-fn monotonic_now_ms() -> f64 {
+///
+/// On non-wasm targets (host unit tests), the wasm-bindgen imports are
+/// unavailable; we return monotonic millis derived from `Instant` instead so
+/// `cargo test --lib` can exercise the same code paths.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn monotonic_now_ms() -> f64 {
     web_sys::window()
         .and_then(|w| w.performance())
         .map(|p| p.now())
         .unwrap_or_else(js_sys::Date::now)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn monotonic_now_ms() -> f64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_secs_f64() * 1000.0
 }
 
 /// Cumulative count of connections lost during the handshake phase.
@@ -383,6 +478,43 @@ pub struct ConnectionManager {
     ///
     /// Phase 3 / AUTH-2 — discussion #562.
     refresh_in_progress: Rc<Cell<bool>>,
+
+    /// Shared flag set by `ConnectionController`'s 1 Hz drift watchdog when
+    /// the JS main thread runs a tick more than
+    /// [`CPU_OVERLOAD_DRIFT_THRESHOLD_MS`] late. While true, the elevated-RTT
+    /// and implausible-discards triggers in `check_rtt_degradation` are
+    /// suppressed: synthetic samples generated by event-loop starvation are
+    /// not evidence of network degradation. Held high for
+    /// [`CPU_OVERLOADED_DURATION_MS`] after the last observed stall so the
+    /// post-stall RTT-probe backlog has time to drain.
+    ///
+    /// `Rc<AtomicBool>` so the controller's timer closure can update it from
+    /// outside the manager's `&mut self` borrow.
+    cpu_overloaded: Rc<AtomicBool>,
+
+    /// Shared most-recent main-thread drift measurement (milliseconds) emitted
+    /// by the controller's 1 Hz drift watchdog. Read by `report_diagnostics`
+    /// for observability into when (and how badly) the local main thread is
+    /// stalling. `RefCell<f64>` instead of an atomic because f64 has no
+    /// stable atomic primitive in `core::sync::atomic` and the read/write
+    /// pattern is single-threaded (wasm is single-threaded; native tests do
+    /// not exercise the timer).
+    main_thread_drift_ms: Rc<RefCell<f64>>,
+
+    /// Tracks whether the previous call to `check_rtt_degradation` was
+    /// suppressed by the CPU-stall guard. Used to log the suppression event
+    /// only on the *transition* from "would have fired" to "suppressed", so
+    /// the 1 Hz timer doesn't spam the log every tick during a sustained
+    /// stall.
+    was_suppressed_last_check: bool,
+
+    /// Monotonic-millis timestamp captured when the CPU-stall guard fires
+    /// the rising-edge suppression log (i.e. when `was_suppressed_last_check`
+    /// goes false -> true). Used to compute the duration printed in the
+    /// falling-edge "suppression cleared" log so operators can see how long
+    /// the stall lasted. Cleared back to `None` on the falling edge.
+    /// Single-threaded access — no atomic needed.
+    suppression_started_at_ms: Option<f64>,
 }
 
 impl ConnectionManager {
@@ -441,9 +573,26 @@ impl ConnectionManager {
             reelection_retry_pending: Rc::new(RefCell::new(false)),
             post_rebase_retry_count: 0,
             refresh_in_progress: Rc::new(Cell::new(false)),
+            cpu_overloaded: Rc::new(AtomicBool::new(false)),
+            main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
+            was_suppressed_last_check: false,
+            suppression_started_at_ms: None,
         };
 
         Ok(manager)
+    }
+
+    /// Install the shared CPU-overload signal owned by `ConnectionController`.
+    ///
+    /// The controller's 1 Hz timer toggles this flag when it detects main-thread
+    /// drift; `check_rtt_degradation` consults it to suppress re-election. Must
+    /// be called once after construction. If never called, the manager retains
+    /// the standalone default created in `new()` and the suppression simply
+    /// never fires — preserving prior behaviour for any synthetic test fixture
+    /// that does not wire a controller.
+    pub fn set_cpu_overloaded_signal(&mut self, flag: Rc<AtomicBool>, drift: Rc<RefCell<f64>>) {
+        self.cpu_overloaded = flag;
+        self.main_thread_drift_ms = drift;
     }
 
     /// Store a weak self-reference so that reconnection callbacks can access
@@ -883,7 +1032,12 @@ impl ConnectionManager {
             };
 
             on_state_changed.emit(ConnectionState::Reconnecting {
-                server_url: server_url.clone(),
+                // SECURITY: redact — `server_url` here is the raw lobby URL
+                // captured at connection-creation time, including
+                // `?token=<JWT>&instance_id=<UUID>`. Subscribers in dioxus-ui
+                // may render or log this field; the callback contract must
+                // never carry a JWT.
+                server_url: url_redact::redact_for_diag(server_url.as_str()),
                 attempt: 1,
             });
 
@@ -1716,7 +1870,10 @@ impl ConnectionManager {
                 next_delay_ms: delay_ms,
             };
             on_state_changed.emit(ConnectionState::Reconnecting {
-                server_url: last_server_url.clone(),
+                // SECURITY: redact — `last_server_url` is the raw lobby URL
+                // (including `?token=<JWT>&instance_id=<UUID>`). See the
+                // identical redaction in `create_connection_lost_callback`.
+                server_url: url_redact::redact_for_diag(last_server_url.as_str()),
                 attempt,
             });
 
@@ -1748,7 +1905,10 @@ impl ConnectionManager {
                     *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
                     on_state_changed.emit(ConnectionState::Failed {
                         error: "Connection manager destroyed during reconnection".to_string(),
-                        last_known_server: Some(last_server_url),
+                        // SECURITY: redact — see sibling emission above.
+                        last_known_server: Some(url_redact::redact_for_diag(
+                            last_server_url.as_str(),
+                        )),
                     });
                     return;
                 }
@@ -1852,7 +2012,10 @@ impl ConnectionManager {
                         "Server rejected connection ({} consecutive failures — possible auth/session error)",
                         consecutive_zero_connections
                     ),
-                    last_known_server: Some(last_server_url),
+                    // SECURITY: redact — see sibling emission above.
+                    last_known_server: Some(url_redact::redact_for_diag(
+                        last_server_url.as_str(),
+                    )),
                 });
                 return;
             }
@@ -1887,6 +2050,45 @@ impl ConnectionManager {
     /// connection for more than `REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD`
     /// consecutive samples — defense-in-depth against a broken time base
     /// starving the elevated-RTT detector of data (see discussion #539).
+    ///
+    /// **CPU-stall guard.** Both triggers above interpret elevated RTT samples
+    /// as proof of network state — but on CPU-starved low-power machines, a
+    /// JS-event-loop stall of several seconds produces synthetic "RTT" samples
+    /// that purely reflect a late timer, not a slow network. Two local
+    /// signals tell us this is happening:
+    ///
+    ///   1. We *are* receiving inbound traffic on the active connection
+    ///      within the last [`LAST_INBOUND_LIVENESS_MS`] ms (so the network
+    ///      cannot be broken).
+    ///   2. The controller's drift watchdog has set `cpu_overloaded`,
+    ///      indicating the main thread itself was blocked for at least
+    ///      [`CPU_OVERLOAD_DRIFT_THRESHOLD_MS`] ms recently.
+    ///
+    /// Either signal is sufficient to suppress re-election. We log the
+    /// suppression once on the *transition* from "would have fired" to
+    /// "suppressed" so a sustained stall does not flood the log at 1 Hz,
+    /// and emit a one-shot recovery log on the falling edge.
+    ///
+    /// # CPU-stall guard trade-off
+    ///
+    /// When the suppression guard fires (recent inbound traffic on the active
+    /// connection within [`LAST_INBOUND_LIVENESS_MS`], or the main-thread
+    /// drift watchdog has fired within [`CPU_OVERLOADED_DURATION_MS`]), the
+    /// `degradation_counter` for the elevated-RTT path is reset to 0 — those
+    /// samples are presumed to be main-thread stall artifacts, not network
+    /// signal. However, `consecutive_implausible_discards` is NOT reset; that
+    /// counter reflects ongoing plausibility-filter rejections on real
+    /// packets, so when suppression releases the trigger fires immediately
+    /// if the streak still exceeds threshold.
+    ///
+    /// One consequence: a chronically CPU-overloaded machine that ALSO has a
+    /// genuinely degraded network may not fire elevated-RTT re-election until
+    /// either the CPU recovers or the implausible-discards path crosses
+    /// [`REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD`]. The trade-off is
+    /// intentional — false positives (re-election on a stalled main thread)
+    /// cause the user-visible cascades documented in discussion #562, while
+    /// false negatives (delayed re-election under sustained CPU+network
+    /// distress) only delay recovery.
     pub fn check_rtt_degradation(&mut self) -> bool {
         if self.reelection_in_progress {
             return false;
@@ -1897,16 +2099,116 @@ impl ConnectionManager {
             None => return false,
         };
 
-        // --- Sustained-implausible-RTT watchdog -----------------------------
-        // Independent of the elevated-RTT path: if the plausibility filter has
-        // been rejecting measurements consecutively on the active connection,
-        // the detector below would never see a usable sample and silently
-        // wait forever. Treat a sustained streak as an actionable signal.
+        // --- CPU-stall guard ----------------------------------------------
+        // Pre-compute the suppression decision so both trigger paths share it
+        // and the transition log fires exactly once.
+        //
+        // `recent_inbound` is true iff the active connection has produced
+        // inbound traffic within `LAST_INBOUND_LIVENESS_MS` AND its RTT
+        // measurement entry is marked `connected`. The connectivity check
+        // protects against stale freshness stamps lingering after a
+        // hand-tested transport drops mid-cycle.
+        let active_connected = self
+            .rtt_measurements
+            .get(&active_id)
+            .map(|m| m.connected)
+            .unwrap_or(false);
+        let now = monotonic_now_ms();
+        let last_inbound = self.last_inbound_at_ms.borrow().get(&active_id).copied();
+        let recent_inbound = active_connected
+            && matches!(last_inbound, Some(ts) if (now - ts) < LAST_INBOUND_LIVENESS_MS);
+        let cpu_overloaded = self.cpu_overloaded.load(Ordering::Relaxed);
+
+        // Pre-compute "would have fired" against the inputs as they stand
+        // *now*, before mutating any counters. Both triggers are subject to
+        // the same suppression decision, so we evaluate them up front.
         let discard_streak = self
             .rtt_measurements
             .get(&active_id)
             .map(|m| m.consecutive_implausible_discards)
             .unwrap_or(0);
+        let discards_would_fire = discard_streak > REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD;
+
+        // Elevated-RTT path: detect whether the *current* sample is elevated
+        // (any tick where the trigger would advance toward firing). We use
+        // "currently elevated" rather than "about to fire on this tick" so
+        // the guard suppresses the entire elevated streak — not just the
+        // final sample. Letting intermediate ticks fall through would cause
+        // `degradation_counter` to accumulate across the stall window and
+        // fire immediately after the guard releases, defeating the purpose.
+        let elevated_currently = self
+            .baseline_rtt
+            .filter(|b| *b > 0.0)
+            .and_then(|baseline| {
+                self.rtt_measurements
+                    .get(&active_id)
+                    .and_then(|m| m.average_rtt)
+                    .map(|current_rtt| {
+                        let threshold = f64::max(
+                            baseline * REELECTION_RTT_MULTIPLIER,
+                            REELECTION_RTT_MIN_THRESHOLD_MS,
+                        );
+                        current_rtt > threshold
+                    })
+            })
+            .unwrap_or(false);
+
+        let would_have_fired = discards_would_fire || elevated_currently;
+
+        if (recent_inbound || cpu_overloaded) && would_have_fired {
+            // Log only on the rising edge: false -> true. A sustained stall
+            // would otherwise emit the same line every second.
+            if !self.was_suppressed_last_check {
+                // Stamp the suppression-start time so the falling-edge log
+                // can report how long suppression lasted.
+                self.suppression_started_at_ms = Some(now);
+                if cpu_overloaded {
+                    let drift_ms = *self.main_thread_drift_ms.borrow();
+                    info!(
+                        "Re-election suppressed: main-thread drift {:.0}ms exceeds threshold \
+                         — interpreting elevated RTT as compute-bound, not network degradation",
+                        drift_ms,
+                    );
+                } else {
+                    let age_ms = last_inbound.map(|ts| now - ts).unwrap_or(0.0);
+                    info!(
+                        "Re-election suppressed: recent inbound traffic on {} (last inbound \
+                         {:.0}ms ago) — interpreting elevated RTT as main-thread stall, not \
+                         network degradation",
+                        active_id, age_ms,
+                    );
+                }
+            }
+            // Reset the degradation counter so post-stall samples start a
+            // fresh streak. The samples we just suppressed are CPU-stall
+            // artifacts, not network evidence — they must not carry over.
+            self.degradation_counter = 0;
+            self.was_suppressed_last_check = true;
+            return false;
+        }
+
+        // No suppression this tick — clear the transition latch so the next
+        // suppression will log again. If we were suppressed last tick, this
+        // is the falling edge: emit a one-shot recovery log so operators can
+        // see suppression END (not just START) and how long it lasted.
+        if self.was_suppressed_last_check {
+            let suppression_duration_ms = self
+                .suppression_started_at_ms
+                .map(|started| now - started)
+                .unwrap_or(0.0);
+            info!(
+                "Re-election suppression cleared after {:.0}ms on {} — RTT degradation triggers re-armed",
+                suppression_duration_ms, active_id,
+            );
+            self.suppression_started_at_ms = None;
+        }
+        self.was_suppressed_last_check = false;
+
+        // --- Sustained-implausible-RTT watchdog -----------------------------
+        // Independent of the elevated-RTT path: if the plausibility filter has
+        // been rejecting measurements consecutively on the active connection,
+        // the detector below would never see a usable sample and silently
+        // wait forever. Treat a sustained streak as an actionable signal.
         if discard_streak > REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD {
             // Re-electing to the only server is pointless (would just produce
             // the same brokenness). Reset the streak so we do not log every
@@ -2641,7 +2943,12 @@ impl ConnectionManager {
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     if let Some(avg_rtt) = measurement.average_rtt {
                         metrics.push(metric!("active_server_rtt", avg_rtt));
-                        metrics.push(metric!("active_server_url", measurement.url.as_str()));
+                        // SECURITY: redact (strip query + fragment) before emitting
+                        // to the diagnostic bus. `measurement.url` carries the room
+                        // JWT in `?token=<JWT>&instance_id=<UUID>` — see
+                        // `url_redact` doc.
+                        let redacted_url = url_redact::redact_for_diag(measurement.url.as_str());
+                        metrics.push(metric!("active_server_url", redacted_url.as_str()));
                         metrics.push(metric!(
                             "active_server_type",
                             if measurement.is_webtransport {
@@ -2659,6 +2966,22 @@ impl ConnectionManager {
                 metrics.push(metric!("failed_at", *failed_at));
             }
         }
+
+        // CPU-stall observability. The drift watchdog in
+        // `ConnectionController::start_timers` updates these so the dioxus-ui
+        // can surface "your machine is overloaded" feedback in the diagnostics
+        // panel when re-election is being suppressed. `MetricValue::Bool` does
+        // not exist (see videocall-diagnostics/src/lib.rs); the project
+        // convention for boolean metrics is to encode them as `u64` (see
+        // `server_active as u64`, `server_connected as u64` below, and
+        // `is_speaking { 1u64 } else { 0u64 }` in the NetEQ audio decoder)
+        // so dashboards and consumers don't have to special-case text.
+        let cpu_overloaded = self.cpu_overloaded.load(Ordering::Relaxed);
+        metrics.push(metric!("cpu_overloaded", cpu_overloaded as u64));
+        metrics.push(metric!(
+            "main_thread_drift_ms",
+            *self.main_thread_drift_ms.borrow()
+        ));
 
         // Send overall connection manager state
         debug!(
@@ -2711,8 +3034,17 @@ impl ConnectionManager {
                 "connecting"
             };
 
+            // SECURITY: redact the per-server URL before emitting to the
+            // diagnostic bus. `measurement.url` carries the room JWT in its
+            // query string (`?token=<JWT>&instance_id=<UUID>`) — see
+            // `url_redact` doc. This metric is consumed by the dioxus-ui
+            // diagnostics popup (`div.server-url, "{server.url}"`) and would
+            // otherwise expose the JWT in screenshots, screen-shares, and
+            // DevTools captures. Same redaction shape as `active_server_url`
+            // above.
+            let redacted_server_url = url_redact::redact_for_diag(measurement.url.as_str());
             let server_metrics = vec![
-                metric!("server_url", measurement.url.as_str()),
+                metric!("server_url", redacted_server_url.as_str()),
                 metric!(
                     "server_type",
                     if measurement.is_webtransport {
@@ -2777,7 +3109,12 @@ impl ConnectionManager {
             ElectionState::Elected { connection_id, .. } => {
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     ConnectionState::Connected {
-                        server_url: measurement.url.clone(),
+                        // SECURITY: redact before handing the URL to the
+                        // `on_state_changed` callback. Subscribers in dioxus-ui
+                        // may render or log this field; the callback contract
+                        // must never carry a JWT regardless of who's
+                        // subscribing now or in the future.
+                        server_url: url_redact::redact_for_diag(measurement.url.as_str()),
                         rtt: measurement.average_rtt.unwrap_or(0.0),
                         is_webtransport: measurement.is_webtransport,
                     }
@@ -2790,12 +3127,13 @@ impl ConnectionManager {
             }
             ElectionState::Failed { reason, .. } => ConnectionState::Failed {
                 error: reason.clone(),
+                // SECURITY: redact — same rationale as the `Connected` branch above.
                 last_known_server: self
                     .active_connection_id
                     .borrow()
                     .as_deref()
                     .and_then(|id| self.rtt_measurements.get(id))
-                    .map(|m| m.url.clone()),
+                    .map(|m| url_redact::redact_for_diag(m.url.as_str())),
             },
         };
 
@@ -3086,7 +3424,11 @@ impl ConnectionManager {
             ElectionState::Elected { connection_id, .. } => {
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     ConnectionState::Connected {
-                        server_url: measurement.url.clone(),
+                        // SECURITY: redact — see `report_state` for rationale.
+                        // `get_connection_state` is invoked by the reconnection
+                        // loop (which then emits via `on_state_changed`) and may
+                        // be invoked directly by UI/diagnostic callers.
+                        server_url: url_redact::redact_for_diag(measurement.url.as_str()),
                         rtt: measurement.average_rtt.unwrap_or(0.0),
                         is_webtransport: measurement.is_webtransport,
                     }
@@ -3099,12 +3441,13 @@ impl ConnectionManager {
             }
             ElectionState::Failed { reason, .. } => ConnectionState::Failed {
                 error: reason.clone(),
+                // SECURITY: redact — see `Connected` branch above.
                 last_known_server: self
                     .active_connection_id
                     .borrow()
                     .as_deref()
                     .and_then(|id| self.rtt_measurements.get(id))
-                    .map(|m| m.url.clone()),
+                    .map(|m| url_redact::redact_for_diag(m.url.as_str())),
             },
         }
     }
@@ -3309,6 +3652,10 @@ mod tests {
             reelection_retry_pending: Rc::new(RefCell::new(false)),
             post_rebase_retry_count: 0,
             refresh_in_progress: Rc::new(Cell::new(false)),
+            cpu_overloaded: Rc::new(AtomicBool::new(false)),
+            main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
+            was_suppressed_last_check: false,
+            suppression_started_at_ms: None,
         }
     }
 
@@ -4430,6 +4777,370 @@ mod tests {
         assert!(
             RTT_SANITY_MAX_MS <= 30_000.0,
             "Sanity max should not exceed 30s"
+        );
+    }
+
+    // ===================================================================
+    // 5b. CPU-stall guard (Phase 2 — discussion #562)
+    //
+    // The guard suppresses both re-election triggers when the local main
+    // thread is overloaded. Two independent signals are sufficient:
+    //   (1) recent inbound traffic on the active connection (network is
+    //       observably alive — elevated RTT must be a local stall artifact)
+    //   (2) the controller's drift watchdog has set `cpu_overloaded`
+    // ===================================================================
+
+    /// Helper: mark `wt_0` as the elected, connected, active connection,
+    /// then push a synthetic measurement entry. Used by the guard tests
+    /// below to avoid repeating the same fixture wiring.
+    fn setup_active_elected(mgr: &mut ConnectionManager, conn_id: &str) {
+        *mgr.active_connection_id.borrow_mut() = Some(conn_id.to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: conn_id.to_string(),
+            elected_at: 0.0,
+        };
+    }
+
+    /// Helper: stamp a fresh inbound timestamp (now) for `conn_id`.
+    fn mark_inbound_now(mgr: &mut ConnectionManager, conn_id: &str) {
+        mgr.last_inbound_at_ms
+            .borrow_mut()
+            .insert(conn_id.to_string(), monotonic_now_ms());
+    }
+
+    /// Helper: stamp a stale inbound timestamp (5 s ago — well past the
+    /// liveness window) for `conn_id`.
+    fn mark_inbound_stale(mgr: &mut ConnectionManager, conn_id: &str) {
+        mgr.last_inbound_at_ms
+            .borrow_mut()
+            .insert(conn_id.to_string(), monotonic_now_ms() - 5_000.0);
+    }
+
+    #[test]
+    fn cpu_stall_guard_suppresses_elevated_rtt_when_inbound_recent() {
+        // Two servers configured: re-election would normally fire after
+        // REELECTION_CONSECUTIVE_SAMPLES elevated samples.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_inbound_now(&mut mgr, "wt_0");
+
+        // Drive enough samples that the trigger would otherwise fire.
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 1) {
+            assert!(
+                !mgr.check_rtt_degradation(),
+                "recent inbound traffic must suppress re-election from the elevated-RTT path"
+            );
+        }
+        // The transition latch should be set so the suppression log only
+        // fires once across the whole streak.
+        assert!(
+            mgr.was_suppressed_last_check,
+            "guard must remember it suppressed last tick"
+        );
+    }
+
+    #[test]
+    fn cpu_stall_guard_does_not_suppress_when_inbound_is_stale() {
+        // Same setup, but the active connection has not produced inbound
+        // traffic for 5 s — the guard must NOT suppress.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_inbound_stale(&mut mgr, "wt_0");
+
+        // First REELECTION_CONSECUTIVE_SAMPLES - 1 calls: counter increments,
+        // no fire yet.
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
+            assert!(!mgr.check_rtt_degradation());
+        }
+        // Threshold reached on the next call — re-election fires.
+        assert!(
+            mgr.check_rtt_degradation(),
+            "stale inbound timestamp must NOT suppress re-election"
+        );
+    }
+
+    #[test]
+    fn cpu_stall_guard_suppresses_even_with_single_server() {
+        // Single-server case still benefits from suppression: a stalled main
+        // thread on a single-server config would otherwise hit the rebase
+        // path and pin baseline_rtt to a synthetic value. Keeping the guard
+        // active here prevents the false positive from ever reaching the
+        // rebase logic.
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://only-server".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_inbound_now(&mut mgr, "wt_0");
+
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 1) {
+            assert!(
+                !mgr.check_rtt_degradation(),
+                "single-server config must still benefit from CPU-stall suppression"
+            );
+        }
+        // Baseline must NOT have been rebased — the guard short-circuits
+        // before the rebase path runs.
+        assert!(
+            (mgr.baseline_rtt.unwrap() - 50.0).abs() < 0.01,
+            "guard must short-circuit before the single-server rebase path"
+        );
+    }
+
+    #[test]
+    fn cpu_stall_guard_suppresses_implausible_discards_when_inbound_recent() {
+        // The implausible-discards path (commit 645572e) is subject to the
+        // same false-positive failure mode under main-thread stalls.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec!["https://b".into()];
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .consecutive_implausible_discards = REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 1;
+        mark_inbound_now(&mut mgr, "wt_0");
+
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "recent inbound traffic must suppress the implausible-discards trigger"
+        );
+    }
+
+    #[test]
+    fn cpu_stall_guard_does_not_suppress_implausible_when_inbound_stale() {
+        // Stale inbound timestamp: the implausible-discards trigger fires
+        // normally because we cannot rule out that the network is actually
+        // broken.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into()];
+        mgr.options.webtransport_urls = vec!["https://b".into()];
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .consecutive_implausible_discards = REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 1;
+        mark_inbound_stale(&mut mgr, "wt_0");
+
+        assert!(
+            mgr.check_rtt_degradation(),
+            "stale inbound must let the implausible-discards trigger fire"
+        );
+    }
+
+    #[test]
+    fn cpu_overloaded_flag_suppresses_elevated_rtt_regardless_of_inbound() {
+        // The flag is OR'd with the inbound-liveness signal: even with a
+        // stale inbound timestamp, an asserted cpu_overloaded flag must
+        // suppress.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_inbound_stale(&mut mgr, "wt_0");
+        mgr.cpu_overloaded.store(true, Ordering::Relaxed);
+
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 1) {
+            assert!(
+                !mgr.check_rtt_degradation(),
+                "asserted cpu_overloaded flag must suppress re-election"
+            );
+        }
+        assert!(mgr.was_suppressed_last_check);
+
+        // Once the flag clears AND no inbound, the trigger fires (give it
+        // one full cycle of REELECTION_CONSECUTIVE_SAMPLES to re-arm because
+        // the previous calls did not increment the counter — we returned
+        // false before the increment).
+        mgr.cpu_overloaded.store(false, Ordering::Relaxed);
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
+            assert!(!mgr.check_rtt_degradation());
+        }
+        assert!(
+            mgr.check_rtt_degradation(),
+            "with cpu_overloaded cleared and stale inbound, trigger must fire"
+        );
+    }
+
+    #[test]
+    fn cpu_stall_guard_logs_suppression_only_on_transition() {
+        // The was_suppressed_last_check field is the proxy for the log
+        // transition: it goes false -> true on the first suppression and
+        // stays true on subsequent ticks. When the suppression condition
+        // clears, it goes back to false.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_inbound_now(&mut mgr, "wt_0");
+
+        assert!(!mgr.was_suppressed_last_check, "starts in cleared state");
+
+        // Tick 1: current RTT (500) > threshold (max(50*3, 50) = 150), so
+        // the elevated-RTT trigger would otherwise advance — guard
+        // suppresses and the latch flips true.
+        assert!(!mgr.check_rtt_degradation());
+        assert!(
+            mgr.was_suppressed_last_check,
+            "first suppressed tick must set the latch"
+        );
+
+        // Tick 2: still suppressed; latch stays true (no transition log).
+        assert!(!mgr.check_rtt_degradation());
+        assert!(
+            mgr.was_suppressed_last_check,
+            "subsequent suppressed ticks keep the latch set"
+        );
+
+        // Make the guard inactive (stale inbound, no cpu_overloaded). The
+        // latch must clear so a future suppression logs again.
+        mark_inbound_stale(&mut mgr, "wt_0");
+        // Lower the RTT so the trigger does not actually fire — we just
+        // want to observe the latch reset.
+        mgr.rtt_measurements.get_mut("wt_0").unwrap().average_rtt = Some(80.0);
+        assert!(!mgr.check_rtt_degradation());
+        assert!(
+            !mgr.was_suppressed_last_check,
+            "no-op tick must clear the latch"
+        );
+    }
+
+    #[test]
+    fn cpu_stall_does_not_trigger_reelection_when_inbound_is_recent() {
+        // Integration-style scenario from the test gate (Phase 2 plan):
+        // simulate the 5-second tick-pause case where inbound traffic IS
+        // arriving (server is healthy) but the local main thread stalled.
+        // Both signals fire: recent inbound timestamp AND the drift
+        // watchdog has asserted cpu_overloaded.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        // Synthetic post-stall RTT sample reflects the 5-second timer
+        // delay, not the network.
+        insert_measurement(&mut mgr, "wt_0", true, Some(5_500.0), vec![5_500.0]);
+        // Server kept sending packets through the stall; main thread sees
+        // the inbound timestamp from a recent packet draining the queue.
+        mark_inbound_now(&mut mgr, "wt_0");
+        // Drift watchdog detected the 5 s stall.
+        mgr.cpu_overloaded.store(true, Ordering::Relaxed);
+        // Plus the implausible-discards path also primed (high samples
+        // exceeding RTT_SANITY_MAX_MS).
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .consecutive_implausible_discards = REELECTION_IMPLAUSIBLE_DISCARDS_THRESHOLD + 1;
+
+        // Even with both triggers primed, suppression wins.
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 2) {
+            assert!(
+                !mgr.check_rtt_degradation(),
+                "5-second tick-pause must not trigger re-election when inbound is recent"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_stall_guard_inbound_path_requires_connected_measurement() {
+        // The inbound-liveness path requires `measurement.connected == true`
+        // because a stale inbound stamp could otherwise erroneously suppress
+        // after the transport dropped mid-cycle. (The cpu_overloaded path
+        // has NO `connected` gate — that's intentional and tested in
+        // `cpu_overloaded_flag_suppresses_even_when_disconnected` below:
+        // CPU stall is a local signal independent of transport state.)
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        // Mark the measurement as not connected.
+        mgr.rtt_measurements.get_mut("wt_0").unwrap().connected = false;
+        mark_inbound_now(&mut mgr, "wt_0");
+
+        // Inbound is "recent" by timestamp but the connection is not
+        // marked connected — the guard must not apply.
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES - 1) {
+            assert!(!mgr.check_rtt_degradation());
+        }
+        assert!(
+            mgr.check_rtt_degradation(),
+            "guard must not suppress when the measurement is not marked connected"
+        );
+    }
+
+    #[test]
+    fn cpu_overloaded_flag_suppresses_even_when_disconnected() {
+        // Sibling to `cpu_stall_guard_inbound_path_requires_connected_measurement`.
+        // The OR-composition's two suppression signals are independent: the
+        // cpu_overloaded path is purely local (drift watchdog observed the
+        // main thread stall) and must fire regardless of transport state.
+        // With `connected=false` AND a stale inbound stamp, the inbound path
+        // cannot suppress, but the cpu_overloaded path still must — otherwise
+        // a CPU-stalled, momentarily-disconnected machine would re-elect on
+        // synthetic RTT samples, exactly the false positive we are guarding
+        // against.
+        let mut mgr = make_test_manager();
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        // Disconnected measurement + stale inbound stamp -> inbound path
+        // cannot suppress.
+        mgr.rtt_measurements.get_mut("wt_0").unwrap().connected = false;
+        mark_inbound_stale(&mut mgr, "wt_0");
+        // ...but the drift watchdog flag is asserted.
+        mgr.cpu_overloaded.store(true, Ordering::Relaxed);
+
+        // Push more than REELECTION_CONSECUTIVE_SAMPLES elevated samples;
+        // suppression must hold the entire time.
+        for _ in 0..(REELECTION_CONSECUTIVE_SAMPLES + 1) {
+            assert!(
+                !mgr.check_rtt_degradation(),
+                "cpu_overloaded must suppress regardless of transport-connected state"
+            );
+        }
+        assert!(
+            mgr.was_suppressed_last_check,
+            "guard latch should reflect that cpu_overloaded suppressed last tick"
+        );
+    }
+
+    #[test]
+    fn cpu_stall_constants_are_reasonable() {
+        // Sanity check the new constants. The drift threshold should be
+        // generous enough to ignore normal scheduling jitter (which is
+        // typically <50 ms on healthy machines) but small enough to catch
+        // genuine stalls before they trip the existing detectors.
+        assert!(
+            CPU_OVERLOAD_DRIFT_THRESHOLD_MS >= 100.0,
+            "drift threshold must tolerate normal scheduling jitter"
+        );
+        assert!(
+            CPU_OVERLOAD_DRIFT_THRESHOLD_MS <= 2_000.0,
+            "drift threshold must catch stalls before REELECTION_CONSECUTIVE_SAMPLES (5s)"
+        );
+        // Suppression duration covers at least one full elevated-RTT cycle
+        // (REELECTION_CONSECUTIVE_SAMPLES at 1 Hz = ~5 s) so the post-stall
+        // RTT-probe backlog has time to drain.
+        assert!(
+            CPU_OVERLOADED_DURATION_MS >= 3_000.0,
+            "suppression must outlast at least one re-election sample window"
+        );
+        // Liveness window is roughly 2× the 1 Hz probe cadence — wide
+        // enough for jitter, narrow enough to detect genuine silence.
+        assert!(
+            (1_000.0..=5_000.0).contains(&LAST_INBOUND_LIVENESS_MS),
+            "liveness window should be 1-5 s"
         );
     }
 
@@ -6305,4 +7016,380 @@ mod tests {
     // - `create_connection_lost_callback` -> spawns reconnection loop
     //
     // These should be covered by wasm-bindgen-test integration tests or E2E tests.
+
+    // ===================================================================
+    // Security: URL redaction at the diagnostic-bus boundary
+    // ===================================================================
+    //
+    // These tests guard the JWT-leak fix on branch
+    // `fix/security-redact-jwt-active-server-url`. Regressions here mean the
+    // user's room JWT escapes the client over the NATS health pipeline.
+
+    mod url_redact_tests {
+        use super::super::url_redact::redact_for_diag;
+
+        #[test]
+        fn strips_query_string_with_jwt_and_instance_id() {
+            // Realistic shape: `token=<JWT>&instance_id=<UUID>` — both must go.
+            let input = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555";
+            let out = redact_for_diag(input);
+            assert_eq!(out, "https://webtransport.example.com:4433/lobby");
+            assert!(
+                !out.contains("token="),
+                "redaction must remove the token query parameter, got {out:?}"
+            );
+            assert!(
+                !out.contains("eyJ"),
+                "redaction must remove the JWT body (eyJ prefix), got {out:?}"
+            );
+            assert!(
+                !out.contains("instance_id="),
+                "redaction must remove the instance_id query parameter, got {out:?}"
+            );
+        }
+
+        #[test]
+        fn passes_through_url_without_query_string() {
+            let input = "https://webtransport.example.com/lobby";
+            assert_eq!(
+                redact_for_diag(input),
+                "https://webtransport.example.com/lobby"
+            );
+        }
+
+        #[test]
+        fn preserves_explicit_port() {
+            let input = "https://webtransport.example.com:4433/lobby?token=eyJabc";
+            assert_eq!(
+                redact_for_diag(input),
+                "https://webtransport.example.com:4433/lobby"
+            );
+        }
+
+        #[test]
+        fn malformed_input_falls_back_to_empty_string() {
+            // No scheme separator — refuse to emit anything rather than risk a
+            // partial credential reaching the diagnostic bus.
+            assert_eq!(redact_for_diag(""), "");
+            assert_eq!(redact_for_diag("not-a-url"), "");
+            assert_eq!(redact_for_diag("?token=eyJabc"), "");
+            assert_eq!(redact_for_diag("/lobby?token=eyJabc"), "");
+        }
+
+        #[test]
+        fn handles_websocket_scheme() {
+            // The same helper guards the WebSocket transport URL.
+            let input = "wss://ws.example.com/lobby?token=eyJabc.def.ghi";
+            assert_eq!(redact_for_diag(input), "wss://ws.example.com/lobby");
+        }
+
+        #[test]
+        fn strips_fragment_when_no_query_string() {
+            // Fragments can carry credentials too (some signaling shapes encode
+            // tokens after `#` to keep them out of server-side request logs).
+            // The diagnostic bus has full visibility into the in-process URL
+            // and would still leak the fragment; redact it.
+            let input = "https://webtransport.example.com:4433/lobby#token=eyJabc.def.ghi";
+            let out = redact_for_diag(input);
+            assert_eq!(out, "https://webtransport.example.com:4433/lobby");
+            assert!(
+                !out.contains('#'),
+                "redaction must remove the fragment delimiter, got {out:?}"
+            );
+            assert!(
+                !out.contains("eyJ"),
+                "redaction must remove the JWT body in the fragment, got {out:?}"
+            );
+        }
+
+        #[test]
+        fn strips_query_and_fragment_together() {
+            // Worst-case shape: `?` before `#`. We must cut at the earlier of
+            // the two delimiters and drop everything after.
+            let input = "https://webtransport.example.com:4433/lobby?a=1#token=eyJabc.def.ghi";
+            let out = redact_for_diag(input);
+            assert_eq!(out, "https://webtransport.example.com:4433/lobby");
+            assert!(
+                !out.contains('?'),
+                "redaction must remove the query delimiter, got {out:?}"
+            );
+            assert!(
+                !out.contains('#'),
+                "redaction must remove the fragment delimiter, got {out:?}"
+            );
+            assert!(
+                !out.contains("eyJ"),
+                "redaction must remove the JWT body, got {out:?}"
+            );
+        }
+
+        #[test]
+        fn strips_fragment_before_query_in_pathological_input() {
+            // Pathological (RFC-violating) shape: `#` before `?`. We still cut
+            // at the earlier delimiter — fragment, in this case — so neither
+            // half can leak. The "query" segment after the fragment would be
+            // semantically nonsense to a parser, but we don't want to special-
+            // case it: the contract is "everything after path is gone".
+            let input = "https://webtransport.example.com/lobby#frag?token=eyJabc";
+            let out = redact_for_diag(input);
+            assert_eq!(out, "https://webtransport.example.com/lobby");
+            assert!(
+                !out.contains("eyJ"),
+                "redaction must drop the JWT regardless of delimiter order, got {out:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Helper: assert the diagnostic-bus emission of `active_server_url`
+    // never contains `?token=` or the JWT-prefix `eyJ`. This is the
+    // contract that the NATS health pipeline depends on.
+    // -------------------------------------------------------------------
+    #[test]
+    fn report_diagnostics_does_not_emit_token_in_active_server_url() {
+        use videocall_diagnostics::MetricValue;
+
+        // Build a manager and seed an Elected state with an `rtt_measurements`
+        // entry whose URL embeds a JWT and instance_id — exactly what the live
+        // path produces.
+        let mut mgr = make_test_manager();
+        let conn_id = "wt_0".to_string();
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        // Seed an `rtt_measurements` entry whose URL embeds a JWT — exactly what
+        // the live path produces. `average_rtt = Some(_)` is required so the
+        // `Elected` branch emits the URL metric.
+        let measurement = ServerRttMeasurement {
+            url: dirty_url.clone(),
+            is_webtransport: true,
+            measurements: VecDeque::new(),
+            average_rtt: Some(42.0),
+            connection_id: conn_id.clone(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+        };
+        mgr.rtt_measurements.insert(conn_id.clone(), measurement);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: conn_id.clone(),
+            elected_at: 0.0,
+        };
+
+        // Re-implement the metric construction inline (cannot drive
+        // `report_diagnostics` directly without a live diagnostics broadcaster
+        // in the test runtime). This mirrors the production path at the call
+        // site we just patched.
+        let measurement = mgr.rtt_measurements.get(&conn_id).unwrap();
+        let redacted_url = url_redact::redact_for_diag(measurement.url.as_str());
+        let m = metric!("active_server_url", redacted_url.as_str());
+
+        let value = match m.value {
+            MetricValue::Text(s) => s,
+            other => panic!("expected Text metric, got {other:?}"),
+        };
+
+        assert!(
+            !value.contains("?token="),
+            "active_server_url metric must not contain `?token=`, got {value:?}"
+        );
+        assert!(
+            !value.contains("eyJ"),
+            "active_server_url metric must not contain JWT-prefix `eyJ`, got {value:?}"
+        );
+        assert!(
+            !value.contains("instance_id="),
+            "active_server_url metric must not contain `instance_id=`, got {value:?}"
+        );
+        assert_eq!(
+            value, "https://webtransport.example.com:4433/lobby",
+            "redacted URL must equal scheme://host:port/path with no query"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // F1 regression: the per-server `server_url` metric (the one consumed
+    // by the dioxus-ui diagnostics popup, `div.server-url`) must NOT
+    // contain the JWT, instance_id, or any query/fragment delimiter.
+    // -------------------------------------------------------------------
+    #[test]
+    fn report_diagnostics_does_not_emit_token_in_per_server_url() {
+        use videocall_diagnostics::MetricValue;
+
+        // Mirror the live path: an `rtt_measurements` entry whose URL embeds
+        // the JWT exactly as `append_instance_id` produces.
+        let mut mgr = make_test_manager();
+        let conn_id = "wt_0".to_string();
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        let measurement = ServerRttMeasurement {
+            url: dirty_url.clone(),
+            is_webtransport: true,
+            measurements: VecDeque::new(),
+            average_rtt: Some(42.0),
+            connection_id: conn_id.clone(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+        };
+        mgr.rtt_measurements.insert(conn_id.clone(), measurement);
+
+        // Re-implement the per-server metric construction inline. This mirrors
+        // production exactly: same input, same redaction call, same metric
+        // name. Driving `report_diagnostics` end-to-end would require a live
+        // diagnostics broadcaster (not available in the unit-test runtime).
+        let measurement = mgr.rtt_measurements.get(&conn_id).unwrap();
+        let redacted_server_url = url_redact::redact_for_diag(measurement.url.as_str());
+        let m = metric!("server_url", redacted_server_url.as_str());
+
+        let value = match m.value {
+            MetricValue::Text(s) => s,
+            other => panic!("expected Text metric, got {other:?}"),
+        };
+
+        assert!(
+            !value.contains("eyJ"),
+            "server_url metric must not contain JWT-prefix `eyJ`, got {value:?}"
+        );
+        assert!(
+            !value.contains("?token="),
+            "server_url metric must not contain `?token=`, got {value:?}"
+        );
+        assert!(
+            !value.contains("instance_id="),
+            "server_url metric must not contain `instance_id=`, got {value:?}"
+        );
+        assert!(
+            !value.contains('#'),
+            "server_url metric must not contain a fragment delimiter, got {value:?}"
+        );
+        assert_eq!(
+            value, "https://webtransport.example.com:4433/lobby",
+            "redacted per-server URL must equal scheme://host:port/path with no query/fragment"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // F3 regression: the `ConnectionState::Connected.server_url` field
+    // emitted via the `on_state_changed` callback must NOT contain the
+    // JWT. Subscribers in dioxus-ui may render or log this field.
+    //
+    // Driving the full state-machine transition (Election -> Elected ->
+    // emit) requires async timer plumbing not available in the host
+    // unit-test runtime. We mirror the production line inline using the
+    // exact same redacted-input contract — same shape as the
+    // `active_server_url` test above.
+    // -------------------------------------------------------------------
+    #[test]
+    fn connected_state_server_url_is_redacted() {
+        let mut mgr = make_test_manager();
+        let conn_id = "wt_0".to_string();
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        let measurement = ServerRttMeasurement {
+            url: dirty_url.clone(),
+            is_webtransport: true,
+            measurements: VecDeque::new(),
+            average_rtt: Some(42.0),
+            connection_id: conn_id.clone(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+        };
+        mgr.rtt_measurements.insert(conn_id.clone(), measurement);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: conn_id.clone(),
+            elected_at: 0.0,
+        };
+
+        // Drive the production `get_connection_state` accessor — this is the
+        // exact code path that constructs `ConnectionState::Connected` for
+        // the reconnection loop and for any UI poll.
+        let state = mgr.get_connection_state();
+
+        let server_url = match state {
+            ConnectionState::Connected { server_url, .. } => server_url,
+            other => panic!("expected ConnectionState::Connected, got {other:?}"),
+        };
+
+        assert!(
+            !server_url.contains("eyJ"),
+            "ConnectionState::Connected.server_url must not contain JWT-prefix `eyJ`, got {server_url:?}"
+        );
+        assert!(
+            !server_url.contains("?token="),
+            "ConnectionState::Connected.server_url must not contain `?token=`, got {server_url:?}"
+        );
+        assert!(
+            !server_url.contains("instance_id="),
+            "ConnectionState::Connected.server_url must not contain `instance_id=`, got {server_url:?}"
+        );
+        assert!(
+            !server_url.contains('#'),
+            "ConnectionState::Connected.server_url must not contain a fragment delimiter, got {server_url:?}"
+        );
+        assert_eq!(
+            server_url, "https://webtransport.example.com:4433/lobby",
+            "redacted server_url must equal scheme://host:port/path with no query/fragment"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // F3 regression: the `ConnectionState::Failed.last_known_server` field
+    // emitted via the `on_state_changed` callback must NOT contain the JWT.
+    // -------------------------------------------------------------------
+    #[test]
+    fn failed_state_last_known_server_is_redacted() {
+        let mut mgr = make_test_manager();
+        let conn_id = "wt_0".to_string();
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        let measurement = ServerRttMeasurement {
+            url: dirty_url.clone(),
+            is_webtransport: true,
+            measurements: VecDeque::new(),
+            average_rtt: Some(42.0),
+            connection_id: conn_id.clone(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+        };
+        mgr.rtt_measurements.insert(conn_id.clone(), measurement);
+        // Set the active connection so `last_known_server` is populated from it.
+        *mgr.active_connection_id.borrow_mut() = Some(conn_id.clone());
+        mgr.election_state = ElectionState::Failed {
+            reason: "test-failure".to_string(),
+            failed_at: 0.0,
+        };
+
+        let state = mgr.get_connection_state();
+        let last_known = match state {
+            ConnectionState::Failed {
+                last_known_server, ..
+            } => last_known_server,
+            other => panic!("expected ConnectionState::Failed, got {other:?}"),
+        };
+
+        let url = last_known.expect("active connection was set; last_known_server must be Some");
+
+        assert!(
+            !url.contains("eyJ"),
+            "ConnectionState::Failed.last_known_server must not contain JWT-prefix `eyJ`, got {url:?}"
+        );
+        assert!(
+            !url.contains("?token="),
+            "ConnectionState::Failed.last_known_server must not contain `?token=`, got {url:?}"
+        );
+        assert!(
+            !url.contains("instance_id="),
+            "ConnectionState::Failed.last_known_server must not contain `instance_id=`, got {url:?}"
+        );
+        assert!(
+            !url.contains('#'),
+            "ConnectionState::Failed.last_known_server must not contain a fragment delimiter, got {url:?}"
+        );
+        assert_eq!(
+            url, "https://webtransport.example.com:4433/lobby",
+            "redacted last_known_server must equal scheme://host:port/path with no query/fragment"
+        );
+    }
 }

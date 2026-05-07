@@ -7,7 +7,7 @@ tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
 		nix develop /app#backend-dev --command bash -c "\
 		set -euo pipefail && \
-		cd /app/dbmate && dbmate wait && dbmate up && \
+		cd /app/dbmate && DBMATE_WAIT_TIMEOUT=60s dbmate wait && dbmate up && \
 		cd /app && \
 		cargo clippy --all -- -D warnings && \
 		cargo fmt --all --check && \
@@ -18,7 +18,7 @@ tests_build:
 	docker compose -f $(COMPOSE_IT) build
 
 tests_down:
-	docker compose -f $(COMPOSE_IT) down -v
+	docker compose -f $(COMPOSE_IT) down -v --remove-orphans --timeout 30
 
 COMPOSE := docker compose --env-file .env -f docker/docker-compose.yaml
 

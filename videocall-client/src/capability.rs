@@ -129,6 +129,16 @@ pub fn run_capability_benchmark_now(budget_ms: f64) -> u64 {
     }
 }
 
+/// Host-target stub for callers (e.g. dioxus-ui) that compile against the
+/// host toolchain for `cargo check --all` / clippy. The browser-only path
+/// uses `performance.now()`; on host there is no JS clock and no caller
+/// actually executes this — but the symbol must exist for the host build
+/// of dioxus-ui to resolve the import.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_capability_benchmark_now(_budget_ms: f64) -> u64 {
+    0
+}
+
 /// JS-callable shim used by the dioxus-ui console-log preamble.
 ///
 /// The preamble runs in JavaScript (see

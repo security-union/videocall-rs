@@ -554,12 +554,15 @@ pub async fn leave_meeting(
     // drops their principal from the ACL set on the next push.
     search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
-    // End the meeting when the host leaves only if end_on_host_leave is set,
-    // otherwise continue until the last participant leaves.
+    // End the meeting based on who left and the meeting's end_on_host_leave setting:
+    // - Host leaves + end_on_host_leave=true  → end immediately.
+    // - Host leaves + end_on_host_leave=false → keep alive; the host chose to allow
+    //   the meeting to continue without them, so an empty room is intentional.
+    // - Non-host leaves → end only if no admitted participants remain.
     let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
     if is_host && meeting.end_on_host_leave {
         db_meetings::end_meeting(&state.db, meeting.id).await?;
-    } else {
+    } else if !is_host {
         let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
         if remaining == 0 {
             db_meetings::end_meeting(&state.db, meeting.id).await?;

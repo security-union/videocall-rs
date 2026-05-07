@@ -333,47 +333,48 @@ pub fn spawn_purge_task() -> Option<tokio::task::JoinHandle<()>> {
 
     let handle = tokio::spawn(async move {
         let run_purge_pass = |base: PathBuf| {
-            tokio::task::spawn_blocking(move || purge_once(&base, retention_days, SystemTime::now()))
+            tokio::task::spawn_blocking(move || {
+                purge_once(&base, retention_days, SystemTime::now())
+            })
         };
 
-        let log_summary =
-            |summary: PurgeSummary, elapsed: std::time::Duration, startup: bool| {
-                let message = if startup {
-                    if summary.errors > 0 {
-                        "Startup console log purge completed with errors"
-                    } else {
-                        "Startup console log purge complete"
-                    }
-                } else if summary.errors > 0 {
-                    "Console log purge completed with errors"
-                } else {
-                    "Console log purge complete"
-                };
-
+        let log_summary = |summary: PurgeSummary, elapsed: std::time::Duration, startup: bool| {
+            let message = if startup {
                 if summary.errors > 0 {
-                    tracing::warn!(
-                        base_dir = %base_dir,
-                        retention_days,
-                        files_deleted = summary.files_deleted,
-                        bytes_reclaimed = summary.bytes_reclaimed,
-                        dirs_removed = summary.dirs_removed,
-                        errors = summary.errors,
-                        elapsed_ms = elapsed.as_millis() as u64,
-                        "{message}"
-                    );
+                    "Startup console log purge completed with errors"
                 } else {
-                    tracing::info!(
-                        base_dir = %base_dir,
-                        retention_days,
-                        files_deleted = summary.files_deleted,
-                        bytes_reclaimed = summary.bytes_reclaimed,
-                        dirs_removed = summary.dirs_removed,
-                        errors = summary.errors,
-                        elapsed_ms = elapsed.as_millis() as u64,
-                        "{message}"
-                    );
+                    "Startup console log purge complete"
                 }
+            } else if summary.errors > 0 {
+                "Console log purge completed with errors"
+            } else {
+                "Console log purge complete"
             };
+
+            if summary.errors > 0 {
+                tracing::warn!(
+                    base_dir = %base_dir,
+                    retention_days,
+                    files_deleted = summary.files_deleted,
+                    bytes_reclaimed = summary.bytes_reclaimed,
+                    dirs_removed = summary.dirs_removed,
+                    errors = summary.errors,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "{message}"
+                );
+            } else {
+                tracing::info!(
+                    base_dir = %base_dir,
+                    retention_days,
+                    files_deleted = summary.files_deleted,
+                    bytes_reclaimed = summary.bytes_reclaimed,
+                    dirs_removed = summary.dirs_removed,
+                    errors = summary.errors,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "{message}"
+                );
+            }
+        };
 
         let started = std::time::Instant::now();
         let startup_result = run_purge_pass(base_path.clone()).await;

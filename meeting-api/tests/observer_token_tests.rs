@@ -301,14 +301,14 @@ async fn test_auto_admitted_guest_receives_observer_token_in_active_meeting() {
 
 #[tokio::test]
 #[serial]
-async fn test_guest_receives_observer_token_and_waits_when_meeting_not_active() {
+async fn test_guest_receives_observer_token_when_meeting_not_active() {
     let pool = get_test_pool().await;
     let room_id = "test-guest-observer-auto-admit-not-active";
     cleanup_test_data(&pool, room_id).await;
 
-    // Only authenticated (non-guest) users may activate a meeting. A guest
-    // joining an idle meeting with WR off therefore gets waiting_for_meeting
-    // (not admitted) together with an observer token for polling.
+    // Create an idle meeting with allow_guests=true. Guests cannot activate
+    // idle meetings — only authenticated non-host users can. The guest must
+    // receive waiting_for_meeting + an observer token so the client can poll.
     let app = build_app(pool.clone());
     let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
         .header("Content-Type", "application/json")
@@ -336,15 +336,13 @@ async fn test_guest_receives_observer_token_and_waits_when_meeting_not_active() 
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
-    // Guest cannot activate an idle meeting — must wait for the host.
+    // Guests cannot activate idle meetings; they wait until the host joins.
     assert_eq!(body.result.status, "waiting_for_meeting");
     assert!(body.result.is_guest);
     assert!(
         body.result.room_token.is_none(),
-        "Guest waiting for meeting activation must NOT receive a room_token"
+        "Guest waiting for meeting must not receive a room_token"
     );
-    // An observer token is always issued on the waiting_for_meeting path so
-    // the client can receive a push notification when the host activates.
     let observer = body
         .result
         .observer_token

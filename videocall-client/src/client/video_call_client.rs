@@ -349,6 +349,13 @@ struct Inner {
     /// Signal set by `ConnectionManager` when a re-election completes. The
     /// camera encoder reads and clears this to suppress crash ceiling arming.
     reelection_completed_signal: Rc<AtomicBool>,
+    /// Long Tasks API observer that emits `client_longtask_duration_ms` /
+    /// `client_longtask_count` to the diagnostic bus whenever the main
+    /// thread blocks for more than 50 ms. Held for its drop side-effect:
+    /// the underlying `PerformanceObserver` is disconnected automatically
+    /// when this field goes out of scope. May be `None` on browsers that
+    /// don't expose [`PerformanceObserver`] (Safari < 16.4 etc.).
+    _long_task_observer: Option<crate::long_tasks::LongTaskObserver>,
 }
 
 /// The main client handle for a video call session.
@@ -444,6 +451,21 @@ impl VideoCallClient {
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
         let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
+        // Phase 8a / TELEM-1: register a Long Tasks API observer once per
+        // VideoCallClient lifetime. Each main-thread stall > 50 ms is
+        // forwarded to the diagnostic bus as `client_longtask_duration_ms`
+        // and `client_longtask_count`. `start()` returns `None` on
+        // browsers that don't expose `PerformanceObserver` (Safari < 16.4,
+        // Web Worker globals, etc.); in that case we silently skip — long
+        // task telemetry is a nice-to-have, not a hard dependency.
+        let long_task_observer = crate::long_tasks::LongTaskObserver::start();
+        if long_task_observer.is_none() {
+            log::debug!(
+                "VideoCallClient::new — Long Tasks API not available; \
+                 client_longtask_duration_ms metric will not be emitted"
+            );
+        }
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -485,6 +507,7 @@ impl VideoCallClient {
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
+                _long_task_observer: long_task_observer,
             })),
             connection_controller,
             aes,

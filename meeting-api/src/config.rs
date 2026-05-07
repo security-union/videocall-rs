@@ -24,9 +24,9 @@ pub struct Config {
     pub database_url: String,
     /// Shared secret used to sign room access tokens (HMAC-SHA256).
     pub jwt_secret: String,
-    /// Room access token time-to-live in seconds (default: 60 = 1 minute).
-    /// Tokens are "single-burner": short-lived admission tickets that the UI
-    /// refreshes automatically on every reconnect.
+    /// Room access token time-to-live in seconds (default: 86400 = 24 hours).
+    /// Must cover the longest expected meeting plus any connection re-election —
+    /// see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
     pub token_ttl_secs: i64,
     /// Session JWT time-to-live in seconds (default: 315360000 = ~10 years).
     pub session_ttl_secs: i64,
@@ -477,5 +477,54 @@ impl Config {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Run `body` with `key` removed from the process environment, then restore
+    /// the prior value. Required because [`Config::from_env`] reads process env,
+    /// which is shared across the test binary's parallel runners.
+    fn with_env_unset<F: FnOnce()>(key: &str, body: F) {
+        let prior = std::env::var(key).ok();
+        std::env::remove_var(key);
+        body();
+        if let Some(v) = prior {
+            std::env::set_var(key, v);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn token_ttl_secs_defaults_to_86400_when_env_unset() {
+        // Regression test for discussion #562: the previous default of 60s
+        // caused production stranding when re-election fired more than 60s
+        // after a client joined, expiring the cached token in the WT/WS URL.
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+
+        with_env_unset("TOKEN_TTL_SECS", || {
+            let cfg = Config::from_env().expect("from_env with TOKEN_TTL_SECS unset must succeed");
+            assert_eq!(
+                cfg.token_ttl_secs, 86400,
+                "default must be 24h — see discussion #562"
+            );
+        });
+
+        // Restore surrounding env so we don't pollute sibling tests.
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
     }
 }

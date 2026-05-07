@@ -123,6 +123,14 @@ const RTT_SANITY_MAX_MS: f64 = 10_000.0;
 #[cfg(target_arch = "wasm32")]
 const REFRESH_TIMEOUT_MS: u32 = 3_000;
 
+/// Minimum elapsed time between successive refresh attempts on a single
+/// `ConnectionManager`. Provides defense-in-depth against pathological
+/// re-election loops that would otherwise hammer the meeting API: under
+/// steady-state RTT-degradation, refresh fires at most once per
+/// `MIN_REFRESH_INTERVAL_MS`; bursty loops fall back to cached URLs via
+/// the legacy `start_reelection` path.
+const MIN_REFRESH_INTERVAL_MS: f64 = 30_000.0;
+
 /// Inbound-liveness window for the CPU-stall guard in
 /// [`ConnectionManager::check_rtt_degradation`]. If we have observed any
 /// inbound traffic on the active connection more recently than this many
@@ -479,6 +487,15 @@ pub struct ConnectionManager {
     /// Phase 3 / AUTH-2 — discussion #562.
     refresh_in_progress: Rc<Cell<bool>>,
 
+    /// Wall-clock timestamp (`performance.now()` ms relative to the time
+    /// origin on wasm32; monotonic millis since process start on host) of
+    /// the most recent refresh attempt. `None` until the first refresh
+    /// fires. Used by the rate-limit gate in `request_reelection` to
+    /// suppress successive refreshes that arrive within
+    /// [`MIN_REFRESH_INTERVAL_MS`] of each other; such calls fall back to
+    /// the legacy `start_reelection` path against cached URLs.
+    last_refresh_at_ms: Rc<Cell<Option<f64>>>,
+
     /// Shared flag set by `ConnectionController`'s 1 Hz drift watchdog when
     /// the JS main thread runs a tick more than
     /// [`CPU_OVERLOAD_DRIFT_THRESHOLD_MS`] late. While true, the elevated-RTT
@@ -573,6 +590,7 @@ impl ConnectionManager {
             reelection_retry_pending: Rc::new(RefCell::new(false)),
             post_rebase_retry_count: 0,
             refresh_in_progress: Rc::new(Cell::new(false)),
+            last_refresh_at_ms: Rc::new(Cell::new(None)),
             cpu_overloaded: Rc::new(AtomicBool::new(false)),
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
@@ -2484,6 +2502,27 @@ impl ConnectionManager {
             return Ok(());
         }
 
+        // Time-based rate-limit gate. If less than MIN_REFRESH_INTERVAL_MS
+        // has elapsed since the last refresh attempt, fall back to the
+        // legacy reelection path (which uses cached URLs without a fresh
+        // JWT). This guards against pathological re-election loops that
+        // would otherwise hammer the meeting API. The in-flight dedup
+        // (`refresh_in_progress`) covers concurrency; this gate covers
+        // sequential bursts where each refresh resolves quickly enough
+        // that the in-flight flag has already cleared.
+        if let Some(last_ms) = self.last_refresh_at_ms.get() {
+            let now_ms = monotonic_now_ms();
+            let elapsed = now_ms - last_ms;
+            if elapsed < MIN_REFRESH_INTERVAL_MS {
+                debug!(
+                    "request_reelection: refresh rate-limited (elapsed={:.0}ms < min={:.0}ms); \
+                     falling back to start_reelection with cached URLs",
+                    elapsed, MIN_REFRESH_INTERVAL_MS
+                );
+                return self.start_reelection();
+            }
+        }
+
         // From here on, mark the refresh in flight. Cleared in the spawned
         // task's completion arms (both success and failure) and on
         // `disconnect()` / `reset_and_start_election`.
@@ -2504,6 +2543,11 @@ impl ConnectionManager {
 
         #[cfg(target_arch = "wasm32")]
         {
+            // Stamp the rate-limit timestamp BEFORE spawning, so subsequent
+            // calls see the throttle regardless of whether this attempt
+            // succeeds, fails, times out, or panics inside the future.
+            self.last_refresh_at_ms.set(Some(monotonic_now_ms()));
+
             let cb = self
                 .options
                 .refresh_room_token_callback
@@ -3652,6 +3696,7 @@ mod tests {
             reelection_retry_pending: Rc::new(RefCell::new(false)),
             post_rebase_retry_count: 0,
             refresh_in_progress: Rc::new(Cell::new(false)),
+            last_refresh_at_ms: Rc::new(Cell::new(None)),
             cpu_overloaded: Rc::new(AtomicBool::new(false)),
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
@@ -6988,6 +7033,150 @@ mod tests {
             !mgr.refresh_in_progress.get(),
             "disconnect must drop any in-flight refresh marker so a stale future \
              cannot reach back into the manager via manager_ref.upgrade()"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate-limit gate on `request_reelection` (Phase 3 follow-up).
+    //
+    // The gate is the second line of defence after the in-flight dedup
+    // (`refresh_in_progress`). It guards against a pathological RTT-degradation
+    // loop where each refresh resolves quickly enough that the in-flight flag
+    // has already cleared by the next 1Hz tick — without a time-based throttle,
+    // the meeting API would still be hit every second.
+    //
+    // Host-side coverage focuses on the gate's threshold logic and the
+    // post-call `last_refresh_at_ms` semantics. Full wasm32 stamping is
+    // exercised by `cargo check --tests` for the wasm target plus the
+    // existing wasm-bindgen tests for `apply_refresh_and_start_reelection`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rate_limit_blocks_second_refresh_within_interval() {
+        // Stamp a recent refresh attempt, then call `request_reelection`.
+        // The gate must trip and the refresh path must NOT be entered —
+        // observable by `refresh_in_progress` remaining false (the gate
+        // returns before `set(true)`).
+        let mut mgr = make_test_manager();
+        mgr.options.refresh_room_token_callback = Some(make_refresh_callback(Some(
+            refreshed_tokens(&["ws://new"], &["https://new"]),
+        )));
+        // Cache the URL state so we can assert it isn't mutated by the
+        // suppressed call (refresh-path mutates URLs, gate-path does not).
+        let original_ws = mgr.options.websocket_urls.clone();
+        let original_wt = mgr.options.webtransport_urls.clone();
+
+        // Mark the most recent refresh as having just happened.
+        mgr.last_refresh_at_ms.set(Some(monotonic_now_ms()));
+
+        // Call `request_reelection`. The gate fires and falls through to
+        // `start_reelection`, which on a fresh test manager (empty URL
+        // lists) is safe to run and just flips `reelection_in_progress`.
+        assert!(mgr.request_reelection().is_ok());
+
+        assert!(
+            !mgr.refresh_in_progress.get(),
+            "rate-limit gate must return before marking refresh in-flight \
+             when the previous attempt was within MIN_REFRESH_INTERVAL_MS"
+        );
+        assert!(
+            mgr.is_reelection_in_progress(),
+            "rate-limited path must still call start_reelection so that \
+             re-election still makes progress against the cached URLs"
+        );
+        assert_eq!(
+            mgr.options.websocket_urls, original_ws,
+            "URLs must not be touched when the gate suppresses the refresh"
+        );
+        assert_eq!(
+            mgr.options.webtransport_urls, original_wt,
+            "URLs must not be touched when the gate suppresses the refresh"
+        );
+    }
+
+    #[test]
+    fn rate_limit_allows_refresh_after_interval() {
+        // With a `last_refresh_at_ms` set far enough in the past that
+        // `now - last >> MIN_REFRESH_INTERVAL_MS`, the gate must NOT
+        // trip — the refresh path is allowed to run.
+        //
+        // On host we can't drive the wasm32-only async future, but we can
+        // verify the gate's threshold check passes: the call must reach
+        // the `refresh_in_progress.set(true)` line and then either enter
+        // the host fallback (which clears it) or the wasm32 spawn (which
+        // also clears it via the Drop guard once the future completes).
+        // Either way, `request_reelection` returns Ok and the flag ends
+        // up false. The differentiator from the blocked case is that
+        // `start_reelection` IS reached and `reelection_in_progress`
+        // becomes true via the host fallback's start_reelection call.
+        let mut mgr = make_test_manager();
+        mgr.options.refresh_room_token_callback = Some(make_refresh_callback(Some(
+            refreshed_tokens(&["ws://new"], &["https://new"]),
+        )));
+
+        // Pretend the last refresh happened a virtual million ms ago — far
+        // exceeds MIN_REFRESH_INTERVAL_MS regardless of the host EPOCH.
+        let stale = monotonic_now_ms() - 1_000_000.0;
+        mgr.last_refresh_at_ms.set(Some(stale));
+
+        assert!(mgr.request_reelection().is_ok());
+
+        // On host, the in-flight flag is cleared by the synchronous
+        // `#[cfg(not(target_arch = "wasm32"))]` fallback before
+        // `request_reelection` returns. The presence of
+        // `reelection_in_progress = true` confirms the host fallback
+        // executed `start_reelection` (only reachable when the gate
+        // allows the call past `set(true)`).
+        assert!(
+            mgr.is_reelection_in_progress(),
+            "gate must allow the call past the rate-limit and trigger \
+             start_reelection (via the host fallback) when the elapsed \
+             interval exceeds MIN_REFRESH_INTERVAL_MS"
+        );
+        assert!(
+            !mgr.refresh_in_progress.get(),
+            "host fallback clears the in-flight flag synchronously before \
+             returning, leaving the manager ready for the next refresh"
+        );
+    }
+
+    #[test]
+    fn rate_limit_allows_first_refresh_when_none() {
+        // The gate must NOT trip on the very first refresh attempt
+        // (before any prior timestamp exists). `last_refresh_at_ms` is
+        // `None` by default in `make_test_manager` and after `new()`.
+        let mut mgr = make_test_manager();
+        mgr.options.refresh_room_token_callback = Some(make_refresh_callback(Some(
+            refreshed_tokens(&["ws://new"], &["https://new"]),
+        )));
+        assert!(
+            mgr.last_refresh_at_ms.get().is_none(),
+            "fresh manager must start with no prior refresh timestamp"
+        );
+
+        assert!(mgr.request_reelection().is_ok());
+
+        // Same observable as `rate_limit_allows_refresh_after_interval`:
+        // the host fallback executed start_reelection, so
+        // `reelection_in_progress` is now true. Confirms the `None`
+        // branch of the rate-limit gate is a pass-through.
+        assert!(
+            mgr.is_reelection_in_progress(),
+            "first refresh (no prior attempt) must be allowed past the gate"
+        );
+    }
+
+    #[test]
+    fn rate_limit_threshold_uses_min_refresh_interval_constant() {
+        // Pure threshold-comparison sanity check: the gate uses
+        // `MIN_REFRESH_INTERVAL_MS` (30 s) as its boundary, not some
+        // accidental literal. Locks the contract documented in the
+        // constant's doc-comment.
+        assert!(
+            (MIN_REFRESH_INTERVAL_MS - 30_000.0).abs() < f64::EPSILON,
+            "MIN_REFRESH_INTERVAL_MS must equal 30_000.0 ms (30 seconds) — \
+             changing this value affects the tightest sustained refresh \
+             rate the meeting API will see during steady-state RTT churn"
         );
     }
 

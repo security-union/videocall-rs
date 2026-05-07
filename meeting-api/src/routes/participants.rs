@@ -214,7 +214,14 @@ async fn join_as_attendee(
     let is_host = meeting.creator_id.as_deref() == Some(user_id);
     let current_state = meeting.state.as_deref().unwrap_or("idle");
     if current_state != "active" {
-        if !meeting.waiting_room_enabled {
+        // Only authenticated (non-guest) users may activate a meeting.
+        // For ended meetings we additionally require end_on_host_leave=false:
+        // when the host configured the session to end on their departure we
+        // respect that intent and do not let a non-host re-open it.
+        let can_auto_activate = !meeting.waiting_room_enabled
+            && !is_guest
+            && (current_state != "ended" || !meeting.end_on_host_leave);
+        if can_auto_activate {
             // No waiting room: auto-activate the meeting and admit
             // a non-host joiner so they can wait inside the call.
             db_meetings::activate(&state.db, meeting.id).await?;
@@ -300,7 +307,17 @@ async fn join_as_attendee(
     }
     // Folding this check into the transaction closes the TOCTOU window where
     // concurrent requests could both pass an out-of-transaction host-status read.
-    let check_creator = if !meeting.end_on_host_leave && !meeting.admitted_can_admit {
+    //
+    // The host-presence check only applies when the waiting room is ON.
+    // When WR is off, admission is self-service — no host is needed to click
+    // "admit", so blocking a joiner because the host isn't present is wrong.
+    // The original guard was: "if nobody (host or admitted participant) can
+    // admit people from the WR, the host must be present". That reasoning
+    // only holds when there IS a waiting room.
+    let check_creator = if !meeting.end_on_host_leave
+        && !meeting.admitted_can_admit
+        && meeting.waiting_room_enabled
+    {
         meeting.creator_id.as_deref()
     } else {
         None
@@ -579,6 +596,12 @@ pub async fn leave_meeting_as_guest(
         Some(r) => r,
         None => return Err(AppError::not_in_meeting()),
     };
+
+    // End the meeting if no admitted participants remain after the guest leaves.
+    let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
+    if remaining == 0 {
+        db_meetings::end_meeting(&state.db, meeting.id).await?;
+    }
 
     // Notify the host that the waiting room list changed.
     nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id).await;

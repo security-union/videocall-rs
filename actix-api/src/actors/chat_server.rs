@@ -591,18 +591,6 @@ impl ChatServer {
             None => return false,
         };
 
-        // Multi-device coexistence: if both the existing session and the
-        // new session carry distinct instance_ids, they represent different
-        // browser tabs or devices. Do not evict — let them coexist.
-        if let (Some(prev_iid), Some(new_iid)) = (
-            self.session_instance.get(&prev_sid),
-            self.session_instance.get(&skip_session_id),
-        ) {
-            if prev_iid != new_iid {
-                return false;
-            }
-        }
-
         info!(
             "Evicting prior session {} for user {} in room {} (same-user dedup, \
              new session {}). Policy: latest joiner wins; previous tab/instance \

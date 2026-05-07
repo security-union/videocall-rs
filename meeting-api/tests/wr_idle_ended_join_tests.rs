@@ -20,7 +20,8 @@
 //! 1. Non-host joins **idle** meeting with WR **off**  
 //!    → meeting is activated and participant is auto-admitted.
 //!
-//! 2. Non-host joins **ended** meeting with WR **off**  
+//! 2. Authenticated non-host joins **ended** meeting with WR **off** and
+//!    `end_on_host_leave = false`  
 //!    → meeting is re-activated AND participant is auto-admitted.
 //!
 //! 3. Non-host joins **idle** meeting with WR **on**  
@@ -32,6 +33,25 @@
 //!
 //! 5. **No authorization bypass** — with WR on and meeting idle, a non-host
 //!    cannot activate the meeting; it remains `idle`.
+//!
+//! 6. Non-host joins **ended** meeting with WR **off** but `end_on_host_leave = true`  
+//!    → participant gets `waiting_for_meeting`; meeting stays `ended`.
+//!
+//! 7. Authenticated non-host joins **active** meeting with WR **off** (host still present)  
+//!    → participant is auto-admitted immediately with a room_token.
+//!
+//! 8. Last admitted participant leaves an **active** meeting  
+//!    → meeting is automatically ended.
+//!
+//! 9. Authenticated non-host joins **active** meeting with WR **off** and
+//!    `end_on_host_leave = false` after the **host has already left**  
+//!    → participant is still auto-admitted; host presence is not required when
+//!    WR is off.
+//!
+//! 9. Authenticated non-host joins **active** meeting with WR **off** and
+//!    `end_on_host_leave = false` after the **host has already left**  
+//!    → participant is still auto-admitted; host presence is not required when
+//!    WR is off.
 
 mod test_helpers;
 
@@ -158,17 +178,41 @@ async fn test_non_host_joins_idle_wr_off_auto_admitted() {
     cleanup_test_data(&pool, room_id).await;
 }
 
-// ── Scenario 2: ended meeting + WR off → re-activated and admitted ────────────
+// ── Scenario 2: ended meeting + WR off + end_on_host_leave=false → re-activated ─
 
-/// Non-host joins a meeting whose state is `ended` with WR off.
+/// Authenticated non-host joins an `ended` meeting with WR off and
+/// `end_on_host_leave = false`.
 /// Expected: meeting is re-activated, participant is auto-admitted with a
 /// room_token, and the meeting state is back to `active`.
 #[tokio::test]
 #[serial]
-async fn test_non_host_joins_ended_wr_off_reactivates_and_admits() {
+async fn test_non_host_joins_ended_wr_off_eohl_false_reactivates_and_admits() {
     let pool = get_test_pool().await;
-    let room_id = "wr-ended-off-readmit";
-    create_idle_meeting_wr_off(&pool, room_id).await;
+    let room_id = "wr-ended-off-eohl-false-readmit";
+    cleanup_test_data(&pool, room_id).await;
+
+    // Create meeting with WR off AND end_on_host_leave=false.
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "meeting_id": room_id,
+                    "attendees": [],
+                    "waiting_room_enabled": false,
+                    "end_on_host_leave": false
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "meeting creation must succeed"
+        );
+    }
 
     // Host joins to activate.
     let app = build_app(pool.clone());
@@ -197,7 +241,7 @@ async fn test_non_host_joins_ended_wr_off_reactivates_and_admits() {
     let info = get_meeting_info(&pool, room_id).await;
     assert_eq!(info.state, "ended", "meeting must be in ended state");
 
-    // Non-host joins the ended meeting.
+    // Authenticated non-host joins the ended meeting.
     let app = build_app(pool.clone());
     let req = request_with_cookie(
         "POST",
@@ -215,7 +259,7 @@ async fn test_non_host_joins_ended_wr_off_reactivates_and_admits() {
     assert!(body.success, "join must succeed");
     assert_eq!(
         body.result.status, "admitted",
-        "non-host must be auto-admitted when WR is off even on an ended meeting"
+        "authenticated non-host must be auto-admitted on ended meeting with WR off and end_on_host_leave=false"
     );
     assert!(
         body.result.room_token.is_some(),
@@ -226,7 +270,113 @@ async fn test_non_host_joins_ended_wr_off_reactivates_and_admits() {
     let info = get_meeting_info(&pool, room_id).await;
     assert_eq!(
         info.state, "active",
-        "ended meeting must be re-activated when non-host joins with WR off"
+        "ended meeting must be re-activated when authenticated non-host joins with WR off and end_on_host_leave=false"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Scenario 6: ended meeting + WR off + end_on_host_leave=true → waiting_for_meeting ─
+
+/// Non-host joins an `ended` meeting with WR off but `end_on_host_leave = true`.
+/// The host configured the meeting to end when they leave, so we must NOT
+/// allow a non-host to re-activate it.
+/// Expected: status is `waiting_for_meeting`, no room_token, meeting stays `ended`.
+#[tokio::test]
+#[serial]
+async fn test_non_host_joins_ended_wr_off_eohl_true_waiting_for_meeting() {
+    let pool = get_test_pool().await;
+    let room_id = "wr-ended-off-eohl-true-wait";
+    cleanup_test_data(&pool, room_id).await;
+
+    // Create meeting with WR off and end_on_host_leave=true (the default).
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "meeting_id": room_id,
+                    "attendees": [],
+                    "waiting_room_enabled": false,
+                    "end_on_host_leave": true
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "meeting creation must succeed"
+        );
+    }
+
+    // Host joins to activate.
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie(
+            "POST",
+            &format!("/api/v1/meetings/{room_id}/join"),
+            "host@example.com",
+        )
+        .body(Body::empty())
+        .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+    }
+
+    // Host ends the meeting.
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie(
+            "POST",
+            &format!("/api/v1/meetings/{room_id}/end"),
+            "host@example.com",
+        )
+        .body(Body::empty())
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "end meeting must succeed");
+    }
+
+    // Verify ended state.
+    let info = get_meeting_info(&pool, room_id).await;
+    assert_eq!(info.state, "ended", "meeting must be in ended state");
+
+    // Non-host attempts to join the ended meeting.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        "attendee@example.com",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(r#"{"display_name":"Late Joiner"}"#))
+    .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    assert!(body.success, "join call must succeed");
+    assert_eq!(
+        body.result.status, "waiting_for_meeting",
+        "non-host must NOT re-activate an ended meeting when end_on_host_leave=true"
+    );
+    assert!(
+        body.result.room_token.is_none(),
+        "waiting_for_meeting must NOT include a room_token"
+    );
+    assert!(
+        body.result.observer_token.is_some(),
+        "waiting_for_meeting must include an observer_token"
+    );
+
+    // Meeting must remain ended.
+    let info = get_meeting_info(&pool, room_id).await;
+    assert_eq!(
+        info.state, "ended",
+        "meeting must remain ended — non-host must not override end_on_host_leave=true"
     );
 
     cleanup_test_data(&pool, room_id).await;
@@ -480,6 +630,278 @@ async fn test_non_host_cannot_activate_meeting_with_wr_on() {
         info.state, "idle",
         "meeting must remain idle after stranger joins with WR on — \
          only the host can activate the meeting"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Scenario 7: active meeting + WR off (host present) → auto-admitted ────────
+
+/// Authenticated non-host joins an already-**active** meeting with WR disabled
+/// while the host is still in the meeting.
+/// Expected: participant is immediately admitted, receives a room_token, and
+/// the meeting remains `active`.
+#[tokio::test]
+#[serial]
+async fn test_non_host_joins_active_wr_off_auto_admitted() {
+    let pool = get_test_pool().await;
+    let room_id = "wr-active-off-auto-admit";
+    cleanup_test_data(&pool, room_id).await;
+
+    // Create meeting with WR off.
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "meeting_id": room_id,
+                    "attendees": [],
+                    "waiting_room_enabled": false,
+                    "end_on_host_leave": false
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "meeting creation must succeed"
+        );
+    }
+
+    // Host joins to activate the meeting.
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie(
+            "POST",
+            &format!("/api/v1/meetings/{room_id}/join"),
+            "host@example.com",
+        )
+        .body(Body::empty())
+        .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+    }
+
+    // Verify the meeting is active.
+    let info = get_meeting_info(&pool, room_id).await;
+    assert_eq!(
+        info.state, "active",
+        "meeting must be active before non-host joins"
+    );
+
+    // Authenticated non-host joins the active meeting.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        "attendee@example.com",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(r#"{"display_name":"Active Joiner"}"#))
+    .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    assert!(body.success, "join must succeed");
+    assert_eq!(
+        body.result.status, "admitted",
+        "non-host must be auto-admitted when joining an active meeting with WR off"
+    );
+    assert!(!body.result.is_host, "attendee must not be flagged as host");
+    assert!(
+        body.result.room_token.is_some(),
+        "auto-admitted attendee must receive a room_token"
+    );
+
+    // Meeting must remain active.
+    let info = get_meeting_info(&pool, room_id).await;
+    assert_eq!(
+        info.state, "active",
+        "meeting must remain active after non-host joins"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Scenario 8: last participant leaves → meeting ends ────────────────────────
+
+/// When the only admitted participant leaves an active meeting, the meeting
+/// must be automatically ended.
+///
+/// Setup: idle meeting with WR off, no host join. An authenticated non-host
+/// joins — this auto-activates the meeting and admits them as the sole
+/// participant.  They then leave.  Expected: meeting state flips to `ended`.
+#[tokio::test]
+#[serial]
+async fn test_meeting_ends_when_last_participant_leaves() {
+    let pool = get_test_pool().await;
+    let room_id = "wr-last-leaves-end-meeting";
+    create_idle_meeting_wr_off(&pool, room_id).await;
+
+    // Non-host joins the idle meeting — auto-activates and is admitted.
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie(
+            "POST",
+            &format!("/api/v1/meetings/{room_id}/join"),
+            "attendee@example.com",
+        )
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"display_name":"Solo Attendee"}"#))
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+        assert_eq!(
+            body.result.status, "admitted",
+            "attendee must be auto-admitted"
+        );
+    }
+
+    // Meeting should be active with one participant.
+    let info = get_meeting_info(&pool, room_id).await;
+    assert_eq!(
+        info.state, "active",
+        "meeting must be active after first join"
+    );
+    assert_eq!(
+        info.participant_count, 1,
+        "exactly one admitted participant"
+    );
+
+    // The sole admitted participant leaves.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/leave"),
+        "attendee@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "leave must succeed");
+
+    // Meeting must be automatically ended — no admitted participants remain.
+    let info = get_meeting_info(&pool, room_id).await;
+    assert_eq!(
+        info.state, "ended",
+        "meeting must be ended after the last admitted participant leaves"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Scenario 9: active meeting + WR off + host absent → still auto-admitted ──
+
+/// Authenticated non-host joins an **active** meeting with WR **off** and
+/// `end_on_host_leave = false` **after the host has already left**.
+///
+/// When WR is off, admission is self-service — no host is needed to click
+/// "admit".  The `check_creator` host-presence guard must be skipped, and the
+/// joining participant must be auto-admitted even though the host is absent.
+#[tokio::test]
+#[serial]
+async fn test_non_host_joins_active_wr_off_host_absent_auto_admitted() {
+    let pool = get_test_pool().await;
+    let room_id = "wr-active-off-host-absent";
+    cleanup_test_data(&pool, room_id).await;
+
+    // Create meeting with WR off and end_on_host_leave=false.
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie("POST", "/api/v1/meetings", "host@example.com")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "meeting_id": room_id,
+                    "attendees": [],
+                    "waiting_room_enabled": false,
+                    "end_on_host_leave": false
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "meeting creation must succeed"
+        );
+    }
+
+    // Host joins to activate the meeting.
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie(
+            "POST",
+            &format!("/api/v1/meetings/{room_id}/join"),
+            "host@example.com",
+        )
+        .body(Body::empty())
+        .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+    }
+
+    // Host leaves — end_on_host_leave=false so the meeting must stay active.
+    {
+        let app = build_app(pool.clone());
+        let req = request_with_cookie(
+            "POST",
+            &format!("/api/v1/meetings/{room_id}/leave"),
+            "host@example.com",
+        )
+        .body(Body::empty())
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "host leave must succeed");
+    }
+
+    // Meeting must still be active (end_on_host_leave=false).
+    let info = get_meeting_info(&pool, room_id).await;
+    assert_eq!(
+        info.state, "active",
+        "meeting must remain active after host leaves when end_on_host_leave=false"
+    );
+    assert_eq!(
+        info.participant_count, 0,
+        "no admitted participants after host leaves"
+    );
+
+    // Authenticated non-host joins the host-less active meeting.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        "attendee@example.com",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(r#"{"display_name":"Late Arrival"}"#))
+    .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    assert!(body.success, "join must succeed");
+    assert_eq!(
+        body.result.status, "admitted",
+        "non-host must be auto-admitted on an active WR-off meeting even when the host is absent"
+    );
+    assert!(!body.result.is_host, "attendee must not be flagged as host");
+    assert!(
+        body.result.room_token.is_some(),
+        "auto-admitted attendee must receive a room_token"
+    );
+
+    // Meeting must remain active.
+    let info = get_meeting_info(&pool, room_id).await;
+    assert_eq!(
+        info.state, "active",
+        "meeting must remain active after non-host joins the host-absent session"
     );
 
     cleanup_test_data(&pool, room_id).await;

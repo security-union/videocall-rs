@@ -184,7 +184,7 @@ fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<S
 /// after the runtime config finally loaded will see `server_wt_enabled ==
 /// true` even if the initial `use_hook` saw `false` — the previously empty
 /// WT URL list will populate, fixing the "stranded on a single server"
-/// regression from discussion #562 (Phase 7).
+/// regression from discussion 562 (Phase 7).
 ///
 /// Returns `(effective_wt_enabled, websocket_urls, webtransport_urls)`.
 fn current_transport_urls(
@@ -330,7 +330,7 @@ fn schedule_reconnect(
                     // not just at component init. If runtime config hadn't
                     // loaded when `use_hook` ran, the WT URL list would have
                     // been empty and `total_server_count() == 1` would have
-                    // suppressed re-election (see discussion #562, Phase 7).
+                    // suppressed re-election (see discussion 562, Phase 7).
                     // Going through the same `current_transport_urls` helper
                     // here means a delayed runtime config load now flows back
                     // into the manager via `update_server_urls`.
@@ -796,7 +796,7 @@ pub fn AttendantsComponent(
         // to a WS-only URL list. The reconnect path goes through the same
         // `current_transport_urls` helper so a later runtime-config load
         // can repopulate the WT list and recover the user from the
-        // "stranded on a single server" state (discussion #562, Phase 7).
+        // "stranded on a single server" state (discussion 562, Phase 7).
         let server_wt_enabled = crate::constants::webtransport_enabled().unwrap_or(false);
         let (effective_wt_enabled, websocket_urls, webtransport_urls) = current_transport_urls(
             &token,
@@ -3029,7 +3029,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tests for current_transport_urls (Phase 7, discussion #562)
+    // Tests for current_transport_urls (Phase 7, discussion 562)
     //
     // These exercise the pure-logic core via `current_transport_urls_from_lists`
     // so they don't require `window().__APP_CONFIG` to be set up. The full
@@ -3113,7 +3113,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn current_transport_urls_recovery_path_repopulates_wt_after_runtime_load() {
-        // Regression for discussion #562: same input lists, but the user's
+        // Regression for discussion 562: same input lists, but the user's
         // initial `webtransport_enabled()` returned false (runtime config
         // not loaded) and the reconnect's read returns true (loaded by
         // then). The reconnect call must yield a richer URL set than the

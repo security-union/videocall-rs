@@ -2323,7 +2323,7 @@ impl ConnectionManager {
     ///   `server_active`/`server_connected` convention from PR #542). Set to
     ///   `1` when `total_server_count() <= 1`. The dioxus UI surfaces a
     ///   "Limited connectivity" badge when this flag is `1` to explain why
-    ///   re-elections are suppressed (Phase 7 from discussion #562).
+    ///   re-elections are suppressed (Phase 7 from discussion 562).
     fn build_main_diagnostic_metrics(&self) -> Vec<Metric> {
         let mut metrics = Vec::new();
 
@@ -5751,7 +5751,7 @@ mod tests {
     }
 
     // ===================================================================
-    // Phase 7. single_server_only diagnostic metric (discussion #562)
+    // Phase 7. single_server_only diagnostic metric (discussion 562)
     //
     // The watchdog at `check_rtt_degradation` short-circuits re-election
     // when `total_server_count() <= 1`, which is correct (a one-server
@@ -5776,7 +5776,7 @@ mod tests {
     #[test]
     fn diagnostic_metrics_emit_single_server_only_when_one_server() {
         // One configured URL (matches the production scenario from
-        // discussion #562 where runtime config hadn't loaded so the WT
+        // discussion 562 where runtime config hadn't loaded so the WT
         // list was empty and only one WS URL was set).
         let mut mgr = make_test_manager();
         mgr.options.websocket_urls = vec!["ws://only".into()];

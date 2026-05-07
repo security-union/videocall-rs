@@ -69,12 +69,12 @@ pub struct ConnectionManagerState {
     pub servers_total: Option<u64>,
     /// Total configured servers (WS + WT URLs) the manager was set up with,
     /// independent of the `ElectionState`. Emitted as `configured_servers_total`
-    /// from the connection-manager bus. Phase 7 (discussion #562).
+    /// from the connection-manager bus. Phase 7 (discussion 562).
     pub configured_servers_total: Option<u64>,
     /// `true` when the manager has at most one configured server. The UI
     /// renders a "Limited connectivity" badge while this is set, since
     /// re-elections are gated on having multiple candidates. Phase 7
-    /// (discussion #562).
+    /// (discussion 562).
     pub single_server_only: Option<bool>,
     pub active_connection_id: Option<String>,
     pub active_server_url: Option<String>,
@@ -317,7 +317,7 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                         }
                     }
                     if state.single_server_only == Some(true) {
-                        // Phase 7 (discussion #562): when only one (or zero)
+                        // Phase 7 (discussion 562): when only one (or zero)
                         // candidates are configured, the watchdog suppresses
                         // re-election (it would re-elect onto the same host).
                         // Surface a badge so the user knows recovery is gated

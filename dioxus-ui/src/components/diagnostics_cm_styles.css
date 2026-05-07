@@ -84,7 +84,7 @@
 .connection-error { background: #2C2C2E; color: #FF453A; padding: 12px; border-radius: 8px; border-left: 4px solid #FF453A; }
 .error-reason { margin: 6px 0 0 0; font-size: 12px; font-style: italic; }
 
-/* Phase 7 (discussion #562): warns the user that re-elections are
+/* Phase 7 (discussion 562): warns the user that re-elections are
  * suppressed because only one candidate server is configured. */
 .limited-connectivity-badge {
     display: flex;
@@ -92,10 +92,10 @@
     gap: 8px;
     margin: 12px 0 0 0;
     padding: 10px 12px;
-    background: #2C2C2E;
+    background: var(--color-surface-elevated);
     border-radius: 8px;
-    border-left: 4px solid #FF9F0A;
-    color: #FF9F0A;
+    border-left: 4px solid var(--status-warning);
+    color: var(--status-warning);
     font-size: 12px;
     font-weight: 600;
     line-height: 1.4;
@@ -105,11 +105,11 @@
     width: 18px;
     height: 18px;
     border-radius: 50%;
-    background: #FF9F0A;
-    color: #1C1C1E;
+    background: var(--status-warning);
+    color: var(--surface);
     text-align: center;
     line-height: 18px;
     font-size: 12px;
     font-weight: 700;
 }
-.limited-connectivity-badge .badge-text { color: #FFFFFF; }
+.limited-connectivity-badge .badge-text { color: var(--color-text-primary); }

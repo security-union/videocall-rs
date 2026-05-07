@@ -81,6 +81,7 @@
 //!     decode_media: true,
 //!     is_guest: false,
 //!     allow_post_rebase_retry: true,
+//!     refresh_room_token_callback: None,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -118,6 +119,7 @@
 //! #     decode_media: true,
 //! #     is_guest: false,
 //! #     allow_post_rebase_retry: true,
+//! #     refresh_room_token_callback: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(
@@ -218,7 +220,9 @@ mod media_devices;
 pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;
-pub use client::{VideoCallClient, VideoCallClientOptions};
+pub use client::{
+    RefreshRoomTokenCallback, RefreshedTokens, VideoCallClient, VideoCallClientOptions,
+};
 pub use connection::{ConnectionLostReason, ConnectionState};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,

@@ -38,10 +38,18 @@ env:
     value: webtransport
   - name: SERVER_STATS_INTERVAL_SECS
     value: "5"
+  # Bumped from 2 to 4: 2 worker threads serialised ~30 sessions in
+  # the 17-peer cc7tp meeting on 2026-05-06, contributing to outbound
+  # channel back-pressure. 4 threads matches the new 1500m CPU limit.
   - name: TOKIO_WORKER_THREADS
-    value: "2"
+    value: "4"
   - name: TOKIO_BLOCKING_THREADS
     value: "2"
+  # WT outbound mpsc capacity per session. Default in code is 1024 (up
+  # from 256 to absorb 17-peer fan-out bursts). Override here only for
+  # exceptionally large meetings.
+  # - name: WT_OUTBOUND_CHANNEL_CAPACITY
+  #   value: "2048"
   # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.
   # Create the secret with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
   - name: JWT_SECRET
@@ -50,9 +58,16 @@ env:
         name: jwt-secret
         key: secret
 resources:
+  # Bumped from 500m / 256Mi: a 17-peer cc7tp meeting on 2026-05-06
+  # peaked at 0.47 CPU against the 0.5 limit and saw the outbound mpsc
+  # queue overflow ~38.5k times. 1500m gives ~3x headroom for 17-peer
+  # meetings; the observed 7d memory peak was 60 MiB, so 512Mi keeps
+  # ~8x headroom for the larger 1024-slot queue plus per-session
+  # buffers under burst while keeping the customer-facing default
+  # right-sized rather than over-inflated.
   limits:
-    cpu: "500m"
-    memory: "256Mi"
+    cpu: "1500m"
+    memory: "512Mi"
   requests:
     cpu: "100m"
     memory: "32Mi"
@@ -74,5 +89,24 @@ autoscaling:
   targetMemoryUtilizationPercentage: 80
 nodeSelector: {}
 tolerations: []
-affinity: {}
+# Soft anti-affinity so the replicas of a single 30-person meeting do
+# not all land on the same node. `preferred` (not `required`) so a
+# small cluster with fewer nodes than replicas still schedules.
+#
+# The selector value matches the chart's `app.kubernetes.io/name`
+# label as defined in `_helpers.tpl` -> `rustlemania.selectorLabels`,
+# which defaults to the chart name `rustlemania-webtransport`.
+# Override `nameOverride` in values to match if you change the chart.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - rustlemania-webtransport
+          topologyKey: kubernetes.io/hostname
 loadBalancerAnnotations: {}

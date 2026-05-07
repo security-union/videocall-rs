@@ -1,0 +1,30 @@
+# Based on https://github.com/actions-rs/meta/blob/master/recipes/quickstart.md
+
+on:
+  pull_request:
+    paths:
+      - 'actix-api/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
+      - 'dioxus-ui/**'
+      - 'docker/**'
+      - 'neteq/**'
+      - 'videocall-client/**'
+      - 'dbmate/**'
+name: check backend
+
+jobs:
+  test:
+    name: cargo tests_run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clean up Docker resources
+        run: docker system prune -f --volumes
+
+      - run: make tests_run
+
+      - name: Teardown
+        if: always()
+        run: make tests_down

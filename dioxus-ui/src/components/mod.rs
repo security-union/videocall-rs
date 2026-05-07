@@ -4,6 +4,7 @@ pub mod appearance_settings_panel;
 pub mod attendants;
 pub mod browser_compatibility;
 pub mod call_timer;
+pub mod capability_check;
 pub mod config_error;
 pub mod connection_quality_indicator;
 mod density;

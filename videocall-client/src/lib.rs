@@ -65,6 +65,7 @@
 //!     rtt_probe_interval_ms: None,
 //!     health_reporting_interval_ms: Some(5000), // Send health every 5 seconds
 //!     on_peer_removed: None,
+//!     on_peers_removed_batch: None,
 //!     on_meeting_info: None,
 //!     on_meeting_ended: None,
 //!     on_speaking_changed: None,
@@ -81,6 +82,7 @@
 //!     decode_media: true,
 //!     is_guest: false,
 //!     allow_post_rebase_retry: true,
+//!     refresh_room_token_callback: None,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -102,6 +104,7 @@
 //! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
 //! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
 //! #     on_peer_removed: None,
+//! #     on_peers_removed_batch: None,
 //! #     on_meeting_info: None,
 //! #     on_meeting_ended: None,
 //! #     on_speaking_changed: None,
@@ -118,6 +121,7 @@
 //! #     decode_media: true,
 //! #     is_guest: false,
 //! #     allow_post_rebase_retry: true,
+//! #     refresh_room_token_callback: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(
@@ -193,10 +197,20 @@
 //!
 //! ```
 
-pub mod adaptive_quality_constants;
+/// Re-export shim for the centralized adaptive-quality constants.
+///
+/// The constants themselves now live in the `videocall-aq` crate so they can
+/// be shared between the browser client and native consumers (e.g. the
+/// load-test bot). Browser code that previously imported from
+/// `videocall_client::adaptive_quality_constants::*` continues to resolve
+/// unchanged.
+pub mod adaptive_quality_constants {
+    pub use videocall_aq::constants::*;
+}
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;
+pub mod capability;
 mod client;
 mod connection;
 pub mod constants;
@@ -205,11 +219,14 @@ pub mod decode;
 pub mod diagnostics;
 pub mod encode;
 pub mod health_reporter;
+pub mod long_tasks;
 mod media_devices;
 pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;
-pub use client::{VideoCallClient, VideoCallClientOptions};
+pub use client::{
+    RefreshRoomTokenCallback, RefreshedTokens, VideoCallClient, VideoCallClientOptions,
+};
 pub use connection::{ConnectionLostReason, ConnectionState};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,

@@ -24,10 +24,12 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::DATAGRAM_MAX_SIZE;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
-use crate::constants::{CLIENT_TIMEOUT, WT_OUTBOUND_CHANNEL_CAPACITY};
+use crate::constants::{wt_outbound_channel_capacity, CLIENT_TIMEOUT};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
-use crate::metrics::{RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL};
+use crate::metrics::{
+    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL,
+};
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use actix::{
@@ -39,6 +41,8 @@ use protobuf::Message as ProtobufMessage;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -107,6 +111,57 @@ pub struct WtChatSession {
     activated: bool,
 }
 
+/// Pure outbound-routing decision used by [`WtChatSession::send_auto`].
+///
+/// Extracted as a free function so it can be unit-tested in isolation
+/// (constructing a real `WtChatSession` requires a populated
+/// `SessionLogic`, which requires NATS, addresses, etc.).
+///
+/// Routing rules (priority order):
+/// 1. Non-media, fits MTU → datagram (control / heartbeats / RTT).
+/// 2. Media + audio + fits MTU → datagram (Opus frames are 50-200B,
+///    well below the ~1200B MTU; avoids per-receiver UniStream HOL
+///    blocking when a single UDP segment is lost).
+/// 3. Everything else (video, screen, oversized audio, oversized
+///    control) → reliable unidirectional stream.
+fn build_outbound(data: Vec<u8>, is_media: bool, is_audio: bool) -> WtOutbound {
+    let fits_datagram = data.len() <= DATAGRAM_MAX_SIZE;
+    if is_media {
+        if is_audio && fits_datagram {
+            WtOutbound::Datagram(data.into())
+        } else {
+            WtOutbound::UniStream(data.into())
+        }
+    } else if fits_datagram {
+        WtOutbound::Datagram(data.into())
+    } else {
+        WtOutbound::UniStream(data.into())
+    }
+}
+
+/// Classify a dropped outbound packet for the
+/// `videocall_outbound_channel_drops_total{kind=...}` label.
+///
+/// Mirrors the WS site (`ws_chat_session::Handler<Message>`):
+/// * `parsed=false` → `"unknown"` — the upstream `PacketWrapper` parse
+///   failed, so we cannot trust `is_media`. Emit the same fallback the
+///   WS path uses so alerts tuned on `kind` behave consistently across
+///   transports (issue #610).
+/// * `parsed=true && is_media`  → `"media"`.
+/// * `parsed=true && !is_media` → `"control"`.
+///
+/// Extracted as a free function so the mapping can be unit-tested
+/// without spinning up a real `WtChatSession`.
+fn drop_kind_label(parsed: bool, is_media: bool) -> &'static str {
+    if !parsed {
+        "unknown"
+    } else if is_media {
+        "media"
+    } else {
+        "control"
+    }
+}
+
 impl WtChatSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -167,6 +222,13 @@ impl WtChatSession {
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
                     .inc();
+                // Phase 8b TELEM-8: Protocol-wide aggregate counter that backs
+                // alerting (rate(...)[5m]) without high-cardinality `room`.
+                // `send()` is used for non-media control packets (heartbeats,
+                // session-assigned, meeting-started), hence kind="control".
+                OUTBOUND_CHANNEL_DROPS_TOTAL
+                    .with_label_values(&["webtransport", "control"])
+                    .inc();
                 error!(
                     "Outbound channel full for session {}, dropping message",
                     self.logic.id
@@ -178,22 +240,40 @@ impl WtChatSession {
 
     /// Send outbound message, automatically choosing datagram or stream.
     ///
-    /// Control packets (heartbeats, RTT probes, diagnostics) that fit within
-    /// the datagram MTU are sent via unreliable datagrams — they are periodic
-    /// and expendable, so lower overhead matters more than guaranteed delivery.
+    /// Routing rules (in priority order):
     ///
-    /// Media packets (VIDEO, AUDIO, SCREEN) use reliable unidirectional streams
-    /// to avoid visual/audio artifacts from packet loss.
+    /// 1. **Non-media control packets** (heartbeats, RTT probes, diagnostics,
+    ///    AES key exchange, …) that fit within `DATAGRAM_MAX_SIZE` use
+    ///    unreliable datagrams. They are periodic and expendable, so lower
+    ///    overhead matters more than guaranteed delivery.
+    /// 2. **Audio media** packets (Opus frames are typically 50-200B,
+    ///    well below the ~1200B datagram MTU) also use datagrams so a
+    ///    single dropped UDP segment does not head-of-line block every
+    ///    subsequent audio frame on a shared per-receiver UniStream.
+    ///    Lossy audio is far less perceptible than a multi-hundred-ms
+    ///    audio gap waiting on QUIC retransmit.
+    /// 3. **Video / screen media**, oversized audio, and any other media
+    ///    use the reliable unidirectional stream — keeping ordered delivery
+    ///    avoids visual artifacts and matches encoder expectations.
     ///
-    /// The `is_media` hint is pre-computed by the caller from an already-parsed
-    /// `PacketWrapper`, avoiding a redundant protobuf parse on every outbound
-    /// packet.
-    fn send_auto(&self, data: Vec<u8>, is_media: bool) -> WtSendResult {
-        let outbound = if !is_media && data.len() <= DATAGRAM_MAX_SIZE {
-            WtOutbound::Datagram(data.into())
-        } else {
-            WtOutbound::UniStream(data.into())
-        };
+    /// The `is_media` and `is_audio` hints are pre-computed by the caller
+    /// from an already-parsed `PacketWrapper` / `MediaPacket`, avoiding a
+    /// redundant protobuf parse on every outbound packet.
+    ///
+    /// `parsed` is a tri-state signal: `true` if the upstream
+    /// `PacketWrapper` parsed successfully (so `is_media` is trustworthy),
+    /// `false` if the parse failed and `is_media` is the safe-default
+    /// fallback (`false`). This is used only for the drop-counter `kind`
+    /// label so it matches the WS site's `unknown` fallback — routing
+    /// continues to honour the same safe default it always has.
+    fn send_auto(
+        &self,
+        data: Vec<u8>,
+        is_media: bool,
+        is_audio: bool,
+        parsed: bool,
+    ) -> WtSendResult {
+        let outbound = build_outbound(data, is_media, is_audio);
 
         match self.outbound_tx.try_send(outbound) {
             Ok(()) => WtSendResult::Sent,
@@ -205,6 +285,28 @@ impl WtChatSession {
                 WtSendResult::Dead
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                // Phase 8b TELEM-8: this drop site previously lacked any
+                // counter increment, so a flood of media drops only surfaced
+                // in the log line below. Increment both the room-tagged
+                // RELAY_PACKET_DROPS_TOTAL (for per-room investigation) and
+                // the protocol-wide OUTBOUND_CHANNEL_DROPS_TOTAL (for
+                // alerting). `kind` is derived from the already-parsed
+                // `is_media` hint — we explicitly avoid an extra protobuf
+                // parse on the drop hot path.
+                //
+                // Issue #610: when the upstream parse failed (`parsed=false`)
+                // we cannot trust `is_media`, so emit `kind="unknown"` to
+                // match the WS site's fallback. Without this, malformed
+                // wire-bytes would silently inflate WT's `control` series
+                // while WS would distinguish them as `unknown`, breaking
+                // alerts tuned on the same label across transports.
+                RELAY_PACKET_DROPS_TOTAL
+                    .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
+                    .inc();
+                let kind = drop_kind_label(parsed, is_media);
+                OUTBOUND_CHANNEL_DROPS_TOTAL
+                    .with_label_values(&["webtransport", kind])
+                    .inc();
                 error!(
                     "Outbound channel full for session {}, dropping message",
                     self.logic.id
@@ -222,7 +324,9 @@ impl WtChatSession {
     /// Start heartbeat check (WebTransport-specific timing)
     fn start_heartbeat(&self, ctx: &mut Context<Self>) {
         ctx.run_interval(WT_HEARTBEAT_INTERVAL, |act, ctx| {
-            let depth = WT_OUTBOUND_CHANNEL_CAPACITY - act.outbound_tx.capacity();
+            // `depth = total_capacity - free_capacity`. Resolved capacity is
+            // memoised, so the call is a single pointer read after init.
+            let depth = wt_outbound_channel_capacity().saturating_sub(act.outbound_tx.capacity());
             RELAY_OUTBOUND_QUEUE_DEPTH
                 .with_label_values(&[&act.logic.room, "webtransport"])
                 .set(depth as f64);
@@ -327,18 +431,31 @@ impl Actor for WtChatSession {
 
 /// Handle outbound messages from ChatServer.
 ///
-/// Uses `send_auto` to route control packets (heartbeats, RTT, diagnostics)
-/// via datagrams (periodic and expendable) and media packets (VIDEO, AUDIO,
-/// SCREEN) via reliable streams (avoids visual/audio artifacts).
+/// Uses `send_auto` to route packets across two QUIC primitives:
 ///
-/// The outbound `msg.msg` is a serialized `PacketWrapper`. We parse it once
-/// to extract both the sender's `session_id` (for congestion tracking) and
-/// the `packet_type` (for datagram vs. stream routing), avoiding a second
-/// parse inside `send_auto`.
+/// * Datagrams — non-media control packets (heartbeats, RTT, diagnostics,
+///   AES key exchange) **and** small audio media packets that fit within
+///   the datagram MTU. Routing audio over datagrams avoids head-of-line
+///   blocking on the shared per-receiver UniStream when a single UDP
+///   segment is lost: the next audio frame still arrives on time even
+///   though QUIC has not yet retransmitted the lost one.
+/// * Reliable unidirectional streams — video/screen media (which would
+///   show visual artifacts under loss) and any oversized audio/control
+///   that exceeds the datagram MTU.
+///
+/// The outbound `msg.msg` is a serialized `PacketWrapper`. We parse it
+/// once to extract the sender's `session_id` (for congestion tracking),
+/// the `packet_type`, and — when MEDIA — the inner `MediaType`, so
+/// `send_auto` does not need to re-parse anything.
+///
+/// Encrypted media payloads cannot be inspected for `MediaType`; in
+/// that case `is_audio` falls back to `false` and the packet uses the
+/// reliable stream — preserving today's behaviour for end-to-end
+/// encrypted streams.
 ///
 /// Note: `msg.session` is the **receiver's** session ID (set by
-/// `chat_server::handle_msg`), NOT the sender's. The sender's session ID
-/// lives inside the serialized `PacketWrapper.session_id` field.
+/// `chat_server::handle_msg`), NOT the sender's. The sender's session
+/// ID lives inside the serialized `PacketWrapper.session_id` field.
 impl Handler<Message> for WtChatSession {
     type Result = ();
 
@@ -349,6 +466,10 @@ impl Handler<Message> for WtChatSession {
         // user_id, and packet_type. This avoids a redundant parse in send_auto
         // and ensures congestion tracking targets the correct (sender) session.
         let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
+        // Whether the outer `PacketWrapper` parsed at all. Threaded into
+        // `send_auto` so the drop-counter `kind` label can fall back to
+        // "unknown" on parse failure (issue #610) — matching the WS site.
+        let parse_succeeded = parsed.is_some();
         let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
         let sender_user_id = parsed
             .as_ref()
@@ -359,7 +480,20 @@ impl Handler<Message> for WtChatSession {
             .map(|pw| pw.packet_type == PacketType::MEDIA.into())
             .unwrap_or(false);
 
-        match self.send_auto(bytes, is_media) {
+        // For MEDIA packets, peek at the inner MediaType to decide if this is
+        // audio (datagram-eligible). Encrypted payloads will fail to parse and
+        // therefore route via the reliable stream — the safer default.
+        let is_audio = if is_media {
+            parsed
+                .as_ref()
+                .and_then(|pw| MediaPacket::parse_from_bytes(&pw.data).ok())
+                .map(|mp| mp.media_type == MediaType::AUDIO.into())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        match self.send_auto(bytes, is_media, is_audio, parse_succeeded) {
             WtSendResult::Sent => {}
             WtSendResult::Dead => {
                 ctx.stop();
@@ -426,6 +560,13 @@ impl Handler<WtInbound> for WtChatSession {
                         RELAY_PACKET_DROPS_TOTAL
                             .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
                             .inc();
+                        // Phase 8b TELEM-8: protocol-wide aggregate. RTT echo
+                        // gets its own `kind` so we can distinguish probe
+                        // congestion (early signal) from media congestion
+                        // (already-degraded call) in the alerting layer.
+                        OUTBOUND_CHANNEL_DROPS_TOTAL
+                            .with_label_values(&["webtransport", "rtt"])
+                            .inc();
                         error!(
                             "Outbound channel full, dropping RTT echo for session {}",
                             self.logic.id
@@ -486,5 +627,228 @@ impl WtChatSession {
                 fut::ready(())
             })
             .wait(ctx);
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: construct an `is_audio` test packet of the requested size.
+    /// Size is the *outbound bytes* length passed into `build_outbound`.
+    fn audio_bytes(size: usize) -> Vec<u8> {
+        vec![0xAA; size]
+    }
+
+    /// Helper: construct a `is_video / control` test packet of the requested size.
+    fn other_bytes(size: usize) -> Vec<u8> {
+        vec![0xBB; size]
+    }
+
+    fn is_datagram(o: &WtOutbound) -> bool {
+        matches!(o, WtOutbound::Datagram(_))
+    }
+
+    fn is_unistream(o: &WtOutbound) -> bool {
+        matches!(o, WtOutbound::UniStream(_))
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-change B: audio-via-datagram routing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn audio_media_under_mtu_routes_via_datagram() {
+        // Opus frames are typically 50-200B; 100B sits comfortably below the
+        // ~1200B datagram MTU, so audio should now travel by datagram.
+        let out = build_outbound(
+            audio_bytes(100),
+            /*is_media=*/ true,
+            /*is_audio=*/ true,
+        );
+        assert!(
+            is_datagram(&out),
+            "small audio should route to datagram, got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn audio_media_at_mtu_routes_via_datagram() {
+        // Boundary case: payload exactly at the MTU still uses datagram.
+        let out = build_outbound(
+            audio_bytes(DATAGRAM_MAX_SIZE),
+            /*is_media=*/ true,
+            /*is_audio=*/ true,
+        );
+        assert!(
+            is_datagram(&out),
+            "audio at MTU boundary should still use datagram, got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn audio_media_over_mtu_falls_back_to_unistream() {
+        // Oversized audio (rare — e.g. concatenated frames) must use the
+        // reliable stream because datagrams above MTU would be rejected
+        // by the QUIC layer.
+        let out = build_outbound(
+            audio_bytes(1500),
+            /*is_media=*/ true,
+            /*is_audio=*/ true,
+        );
+        assert!(
+            is_unistream(&out),
+            "oversized audio must fall back to UniStream, got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn video_media_under_mtu_still_routes_via_unistream() {
+        // Even tiny video media (e.g. KEYFRAME_REQUEST replays) keep the
+        // reliable stream — we do not want any per-frame loss for video.
+        let out = build_outbound(
+            other_bytes(100),
+            /*is_media=*/ true,
+            /*is_audio=*/ false,
+        );
+        assert!(
+            is_unistream(&out),
+            "video media under MTU must still use UniStream, got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn video_media_large_routes_via_unistream() {
+        // A representative 50KB video packet (e.g. an I-frame fragment).
+        let out = build_outbound(
+            other_bytes(50_000),
+            /*is_media=*/ true,
+            /*is_audio=*/ false,
+        );
+        assert!(
+            is_unistream(&out),
+            "video media must route via UniStream, got {:?}",
+            out
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing-behaviour preservation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn small_control_packet_still_routes_via_datagram() {
+        // Control / non-media packets ≤ MTU keep their existing datagram path.
+        let out = build_outbound(
+            other_bytes(100),
+            /*is_media=*/ false,
+            /*is_audio=*/ false,
+        );
+        assert!(
+            is_datagram(&out),
+            "small control packet must still use datagram, got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn oversized_control_packet_routes_via_unistream() {
+        let out = build_outbound(
+            other_bytes(DATAGRAM_MAX_SIZE + 1),
+            /*is_media=*/ false,
+            /*is_audio=*/ false,
+        );
+        assert!(
+            is_unistream(&out),
+            "oversized control packet must use UniStream, got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn defensive_is_audio_without_is_media_still_routes_as_control() {
+        // If a caller incorrectly sets is_audio=true while is_media=false,
+        // we treat it as a regular non-media control packet (datagram if
+        // small, stream otherwise). is_audio is meaningful only for media.
+        let out = build_outbound(
+            audio_bytes(100),
+            /*is_media=*/ false,
+            /*is_audio=*/ true,
+        );
+        assert!(
+            is_datagram(&out),
+            "is_audio without is_media should fall through to control routing, got {:?}",
+            out
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #610: WT outbound-drop label parity with WS
+    //
+    // The WS site emits `kind="unknown"` when the upstream PacketWrapper
+    // parse fails. WT used to hard-code `kind="control"` for the same
+    // path because it lost the parse-success signal before reaching the
+    // drop counter. These tests lock in the new tri-state mapping so a
+    // future revert to the old `if is_media { "media" } else { "control" }`
+    // branch fails CI.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drop_kind_unknown_when_parse_failed() {
+        // Issue #610: when the outer PacketWrapper parse failed upstream,
+        // we cannot trust `is_media`, so the counter must record this
+        // drop as `kind="unknown"` to match the WS site.
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ false, /*is_media=*/ false),
+            "unknown",
+            "parse-fail must map to `unknown` regardless of is_media"
+        );
+        // Even if a stale `is_media=true` somehow propagates, parse-fail
+        // wins — we never want to attribute a malformed packet to `media`
+        // since we did not actually classify it.
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ false, /*is_media=*/ true),
+            "unknown",
+            "parse-fail must override stale is_media=true"
+        );
+    }
+
+    #[test]
+    fn drop_kind_media_when_parsed_and_is_media() {
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ true, /*is_media=*/ true),
+            "media",
+        );
+    }
+
+    #[test]
+    fn drop_kind_control_when_parsed_and_not_media() {
+        assert_eq!(
+            drop_kind_label(/*parsed=*/ true, /*is_media=*/ false),
+            "control",
+        );
+    }
+
+    #[test]
+    fn drop_kind_label_emits_only_documented_values() {
+        // Guard against typos / future drift: the only kinds this mapping
+        // ever returns are the three documented in metrics.rs (`media`,
+        // `control`, `unknown`). The fourth documented value, `rtt`, is
+        // emitted by the inbound-echo path, not by this helper.
+        for (parsed, is_media) in [(false, false), (false, true), (true, false), (true, true)] {
+            let kind = drop_kind_label(parsed, is_media);
+            assert!(
+                matches!(kind, "media" | "control" | "unknown"),
+                "drop_kind_label returned unexpected kind={kind} for (parsed={parsed}, is_media={is_media})"
+            );
+        }
     }
 }

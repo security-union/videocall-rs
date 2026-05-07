@@ -130,6 +130,8 @@ For significant changes that require broader discussion, we use a Request for Co
 * Ensure all tests pass before submitting a PR
 * Include integration tests for API changes
 * Test browser compatibility for frontend changes
+* Use the testing guide to choose the right test layer:
+  [docs/TESTING.md](docs/TESTING.md)
 
 ### Documentation
 

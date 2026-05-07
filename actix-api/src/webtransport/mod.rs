@@ -365,9 +365,11 @@ async fn handle_webtransport_session(
     is_host: bool,
     end_on_host_leave: bool,
 ) -> anyhow::Result<()> {
-    // Create channel for actor → WebTransport I/O
+    // Create channel for actor → WebTransport I/O.
+    // Capacity is env-tunable via `WT_OUTBOUND_CHANNEL_CAPACITY` and resolved
+    // once on first call; see `crate::constants::wt_outbound_channel_capacity`.
     let (outbound_tx, outbound_rx) =
-        mpsc::channel::<WtOutbound>(crate::constants::WT_OUTBOUND_CHANNEL_CAPACITY);
+        mpsc::channel::<WtOutbound>(crate::constants::wt_outbound_channel_capacity());
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(
@@ -759,9 +761,14 @@ mod tests {
             }
         });
 
-        // Craft a MEDIA packet that is not RTT and not health
+        // Craft a MEDIA packet that is not RTT and not health.
+        // Using VIDEO (not AUDIO) so the packet routes via the persistent
+        // UniStream — which is what this test reads from. Phase 4 routes
+        // small AUDIO MediaPackets via QUIC datagrams instead, so an AUDIO
+        // packet would arrive on a different transport and miss the unistream
+        // assertion below.
         let media = VcMediaPacket {
-            media_type: VcMediaType::AUDIO.into(),
+            media_type: VcMediaType::VIDEO.into(),
             user_id: user_a.as_bytes().to_vec(),
             ..Default::default()
         };
@@ -1232,8 +1239,11 @@ mod tests {
     /// stream without needing protobuf framing.
     fn create_sequenced_test_packet(sender: &str, seq_num: u32) -> Vec<u8> {
         let marker = format!("SEQ:{seq_num:04}:END");
+        // Use VIDEO (not AUDIO) so the packet routes via the persistent
+        // UniStream — Phase 4 sends small AUDIO MediaPackets via QUIC
+        // datagrams which would bypass the ordered-stream assertions.
         let media = VcMediaPacket {
-            media_type: VcMediaType::AUDIO.into(),
+            media_type: VcMediaType::VIDEO.into(),
             user_id: sender.as_bytes().to_vec(),
             data: marker.into_bytes(),
             ..Default::default()
@@ -1705,6 +1715,7 @@ mod tests {
             "wt-jwt-room-1",
             true,
             "Alice",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1729,6 +1740,7 @@ mod tests {
             "wt-jwt-room-2",
             false,
             "Alice",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1751,6 +1763,7 @@ mod tests {
             "wt-jwt-room-3",
             false,
             "Alice",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1784,6 +1797,7 @@ mod tests {
             "wt-special-room",
             false,
             "Bob",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1840,6 +1854,7 @@ mod tests {
             room,
             true,
             "Host",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate host token");
@@ -1851,6 +1866,7 @@ mod tests {
             room,
             false,
             "Attendee",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate attendee token");

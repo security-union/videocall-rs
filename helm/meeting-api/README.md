@@ -30,7 +30,9 @@ code default is also `86400`. Any reasonable deployment should pass a value
 See [`values.yaml`](values.yaml) for all options. Notable:
 
 - `env` — list of environment variables passed to the container. `--set env[N]` overrides replace the entire list, so include everything you need.
-- `consoleLogs.enabled` — mounts a PVC at `/data/console-logs` to capture browser console uploads. Incompatible with replicas > 1 (ReadWriteOnce PVC).
+- `consoleLogs.enabled` — mounts a PVC at `/data/console-logs` to capture browser console uploads. Incompatible with replicas > 1 (ReadWriteOnce PVC). When enabled, the meeting-api process itself purges files older than `consoleLogs.retentionDays` at 00:00 UTC daily (see `meeting-api/src/console_log_purge.rs`); no separate CronJob is deployed.
+- `consoleLogs.retentionDays` — injected as `CONSOLE_LOG_RETENTION_DAYS` and read by the in-process purge scheduler (default 30).
+- `consoleLogs.storageSize` — size of the `console-logs` PVC.
 - `ingress.enabled` / `ingress.hosts` — standard ingress config.
 - `resources` / `autoscaling` — standard.
 

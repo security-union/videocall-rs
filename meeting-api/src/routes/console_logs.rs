@@ -57,7 +57,21 @@ pub struct ConsoleLogQuery {
 pub const MAX_BODY_SIZE: usize = 1_048_576;
 
 /// Default base directory for console log storage.
-const DEFAULT_LOG_DIR: &str = "/data/console-logs";
+pub(crate) const DEFAULT_LOG_DIR: &str = "/data/console-logs";
+
+/// Env var that gates both the upload endpoint and the in-process purge task.
+/// When set to `"true"`, uploads are accepted and the purge scheduler runs.
+pub(crate) const CONSOLE_LOG_UPLOAD_ENABLED_ENV: &str = "CONSOLE_LOG_UPLOAD_ENABLED";
+
+/// Env var overriding the on-disk base directory for console log storage.
+pub(crate) const CONSOLE_LOG_DIR_ENV: &str = "CONSOLE_LOG_DIR";
+
+/// Env var controlling the retention window (in days) used by the purge task.
+pub(crate) const CONSOLE_LOG_RETENTION_DAYS_ENV: &str = "CONSOLE_LOG_RETENTION_DAYS";
+
+/// Default retention window (in days) used when `CONSOLE_LOG_RETENTION_DAYS`
+/// is unset or unparseable.
+pub(crate) const DEFAULT_RETENTION_DAYS: u32 = 30;
 
 /// Default per-user daily upload quota: 50 MB. Override with
 /// `CONSOLE_LOG_USER_QUOTA_BYTES` env var.
@@ -181,7 +195,7 @@ pub async fn upload_console_logs(
     body: Bytes,
 ) -> Result<StatusCode, AppError> {
     // --- Feature gate ---
-    let enabled = std::env::var("CONSOLE_LOG_UPLOAD_ENABLED").unwrap_or_default();
+    let enabled = std::env::var(CONSOLE_LOG_UPLOAD_ENABLED_ENV).unwrap_or_default();
     if enabled != "true" {
         return Err(AppError::new(
             StatusCode::NOT_FOUND,
@@ -353,7 +367,8 @@ pub async fn upload_console_logs(
     let filename = format!("{user_id}_{session_ts}_{chunk_suffix}.log.gz");
 
     // --- Create directory and write file ---
-    let base_dir = std::env::var("CONSOLE_LOG_DIR").unwrap_or_else(|_| DEFAULT_LOG_DIR.to_string());
+    let base_dir =
+        std::env::var(CONSOLE_LOG_DIR_ENV).unwrap_or_else(|_| DEFAULT_LOG_DIR.to_string());
     let date_str = Utc::now().format("%Y-%m-%d").to_string();
     let dir_path = std::path::PathBuf::from(&base_dir)
         .join(&meeting_id)

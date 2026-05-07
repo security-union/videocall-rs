@@ -45,6 +45,7 @@ services:
       - rustlemania-it-tests-registry:/root/.cargo/registry
       - rustlemania-it-tests-git:/root/.cargo/git
       - rustlemania-it-tests-cache:/app/actix-api/target
+    stop_grace_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,7 +55,7 @@ services:
       nix develop /app#backend-dev --command bash -c '
         set -euo pipefail
         echo "=== RUNNING DATABASE MIGRATIONS ==="
-        cd /app/dbmate && dbmate wait && dbmate up
+        cd /app/dbmate && DBMATE_WAIT_TIMEOUT=60s dbmate wait && dbmate up
         cd /app/actix-api
         echo "=== TESTING videocall-api ==="
         cargo test -p videocall-api -- --nocapture --test-threads=1

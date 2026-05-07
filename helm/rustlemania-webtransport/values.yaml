@@ -61,11 +61,13 @@ resources:
   # Bumped from 500m / 256Mi: a 17-peer cc7tp meeting on 2026-05-06
   # peaked at 0.47 CPU against the 0.5 limit and saw the outbound mpsc
   # queue overflow ~38.5k times. 1500m gives ~3x headroom for 17-peer
-  # meetings, 1Gi tolerates the larger 1024-slot queue plus per-session
-  # buffers under burst.
+  # meetings; the observed 7d memory peak was 60 MiB, so 512Mi keeps
+  # ~8x headroom for the larger 1024-slot queue plus per-session
+  # buffers under burst while keeping the customer-facing default
+  # right-sized rather than over-inflated.
   limits:
     cpu: "1500m"
-    memory: "1Gi"
+    memory: "512Mi"
   requests:
     cpu: "100m"
     memory: "32Mi"
@@ -80,14 +82,10 @@ service:
   port: 443
   healthPort: 444
 autoscaling:
-  # Enabled to spread large meetings across multiple WT pods. Keeping
-  # at least 2 replicas avoids a single-pod brown-out during pod
-  # rollover, and the 70% CPU target gives roughly 1.4x headroom over
-  # the steady-state load observed in a 17-peer meeting.
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 5
-  targetCPUUtilizationPercentage: 70
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: 80
 nodeSelector: {}
 tolerations: []
